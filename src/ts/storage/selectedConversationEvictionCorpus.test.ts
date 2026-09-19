@@ -4,7 +4,8 @@ const PLUGIN_ACCESS_OWNER = 'test-plugin'
 import './tests/selectedConversationEvictionNodeDom.setup'
 import 'fake-indexeddb/auto'
 import { IDBKeyRange, indexedDB } from 'fake-indexeddb'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest'
+import type { LuaEngine } from 'wasmoon'
 import { writable } from 'svelte/store'
 import {
     captureChatMessageTarget,
@@ -31,6 +32,34 @@ import { createPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
 
 const INITIAL_MESSAGE_COUNT = 10_000
 const VIEWPORT_ROW_BUDGET = 64
+
+const interfaceMockModules = [
+    '../parser/parser.svelte', '../parser/chatML', '../alert', '../globalApi.svelte',
+    '../platform', '../tokenizer', '../util', './database.svelte', '../stores.svelte',
+    './persistentDataRuntime.svelte', '../../lang', '../process/modules',
+    '../process/files/inlays', '../process/lorebook.svelte', '../process/memory/hypamemory',
+    '../process/request/request', '../process/stableDiff', '../process/luaRuntime',
+    '../process/scripts', '../process/triggers', '../process/command',
+    '../process/templates/templates', '../process/exampleMessages', '../process/tts',
+    '../process/memory/supaMemory', '../process/group', '../process/embedding/addinfo',
+    '../process/models/modelString', '../process/inlayScreen', '../process/transformers',
+    '../process/memory/hanuraiMemory', '../process/memory/hypav2', '../process/memory/hypav3',
+    '../process/scriptings', '../plugins/plugins.svelte', '../process/presetChain',
+    '../model/modellist', '../sync/multiuser',
+]
+
+afterEach(() => {
+    try {
+        vi.restoreAllMocks()
+    } finally {
+        try {
+            vi.unstubAllGlobals()
+        } finally {
+            for (const moduleId of interfaceMockModules) vi.doUnmock(moduleId)
+            vi.resetModules()
+        }
+    }
+})
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -356,6 +385,7 @@ describe('selected conversation eviction correctness corpus', () => {
         ) => {
             const target = runtime.captureSelectedConversationTarget()
             const lease = await runtime.acquireCompleteConversation(reason, target)
+            onTestFinished(() => lease.release())
             expect(lease.session.totalMessages).toBe(oracle.message.length)
             expect('evictionEnabled' in lease.session).toBe(false)
             mutateRuntime(lease.session)
@@ -407,6 +437,7 @@ describe('selected conversation eviction correctness corpus', () => {
 
         const branchEnd = 257
         const branchLease = await runtime.acquireCompleteConversation('branch-gateway')
+        onTestFinished(() => branchLease.release())
         const branchTarget = captureChatMessageTarget({
             ...context,
             absoluteIndex: branchEnd,
@@ -487,6 +518,7 @@ describe('selected conversation eviction correctness corpus', () => {
             'bookmark',
             bookmarkTarget!.kind === 'persistent' ? bookmarkTarget!.selection : null,
         )
+        onTestFinished(() => bookmarkLease.release())
         bookmarkLease.session.setBookmark(bookmarkLease.session.locate(bookmarkTarget!.absoluteIndex), {
             bookmarked: true,
             name: 'Far bookmark',
@@ -518,6 +550,7 @@ describe('selected conversation eviction correctness corpus', () => {
             saying: 'stable conflict evidence',
         }
         const staleLease = await runtime.acquireCompleteConversation('revision-conflict-stale')
+        onTestFinished(() => staleLease.release())
         staleLease.session.append(structuredClone(conflictMessage))
         staleLease.release()
         const competingRoot = await store.readRoot()
@@ -535,6 +568,7 @@ describe('selected conversation eviction correctness corpus', () => {
         expect(refresh.projection).toBe('applied')
         await waitForWindowed(runtime, 'refresh after competing commit')
         const retryLease = await runtime.acquireCompleteConversation('revision-conflict-retry')
+        onTestFinished(() => retryLease.release())
         retryLease.session.append(structuredClone(conflictMessage))
         retryLease.release()
         oracle.message.push(structuredClone(conflictMessage))
@@ -547,6 +581,7 @@ describe('selected conversation eviction correctness corpus', () => {
         await assertWindowed('revision conflict exact retry')
 
         const regexLease = await runtime.acquireCompleteConversation('regex-operation-context')
+        onTestFinished(() => regexLease.release())
         const regexOperation = createConversationOperationContext(
             regexLease.session,
             selectedConversation(),
@@ -585,10 +620,34 @@ describe('selected conversation eviction correctness corpus', () => {
         await assertWindowed('regex operation context')
 
         const luaLease = await runtime.acquireCompleteConversation('lua-operation-context')
+        onTestFinished(() => luaLease.release())
+        const luaEngines: LuaEngine[] = []
+        onTestFinished(() => {
+            for (const engine of luaEngines) {
+                if (!engine.global.isClosed()) engine.global.close()
+            }
+        })
+        vi.doMock('../process/luaRuntime', async () => {
+            const actual = await vi.importActual<typeof import('../process/luaRuntime')>('../process/luaRuntime')
+            return {
+                ...actual,
+                async createLuaFactory() {
+                    const factory = await actual.createLuaFactory()
+                    const createEngine = factory.createEngine.bind(factory)
+                    factory.createEngine = async (options) => {
+                        const engine = await createEngine(options)
+                        luaEngines.push(engine)
+                        return engine
+                    }
+                    return factory
+                },
+            }
+        })
         const luaOperation = createConversationOperationContext(
             luaLease.session,
             selectedConversation(),
         )
+        onTestFinished(() => luaOperation.release())
         expect(luaOperation.mode).toBe('compatibility')
         vi.doMock('../parser/parser.svelte', () => ({
             hasher: vi.fn(),
@@ -644,42 +703,42 @@ describe('selected conversation eviction correctness corpus', () => {
         const { readFile } = await import('node:fs/promises')
         const { resolve } = await import('node:path')
         const jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
-        const originalFetch = globalThis.fetch
-        vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLuaSource, { status: 200 })))
-        const nodeDomGlobals = {
-            window: globalThis.window,
-            document: globalThis.document,
-            navigator: globalThis.navigator,
-            location: globalThis.location,
+        const nodeDomGlobals = new Map(
+            ['window', 'document', 'navigator', 'location', 'fetch'].map((key) =>
+                [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const),
+        )
+        try {
+            vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLuaSource, { status: 200 })))
+            for (const key of ['window', 'document', 'navigator', 'location']) {
+                Reflect.deleteProperty(globalThis, key)
+            }
+            const { runScripted } = await import('../process/scriptings')
+            const luaResult = await runScripted(`
+                listenEdit('editInput', function(id, value, meta)
+                    addChat(id, 'user', 'Lua compatibility output')
+                    return false
+                end)
+            `, {
+                char: workingCopy.characters[0],
+                mode: 'editInput',
+                operationContext: luaOperation,
+            })
+            expect(luaResult.stopSending).toBe(true)
+            const luaMessage = luaOperation.chat.message.at(-1)!
+            luaMessage.chatId = 'op-lua'
+            luaMessage.saying = 'Lua visited complete history'
+            luaOperation.commit(luaLease.session)
+            luaLease.release()
+            oracle.message.push(structuredClone(luaMessage))
+            await runtime.flushPendingData('lua-operation-context')
+            expectedRevision += 1
+            await assertWindowed('Lua operation context')
+        } finally {
+            for (const [key, descriptor] of nodeDomGlobals) {
+                if (descriptor) Object.defineProperty(globalThis, key, descriptor)
+                else Reflect.deleteProperty(globalThis, key)
+            }
         }
-        for (const key of Object.keys(nodeDomGlobals)) {
-            Reflect.deleteProperty(globalThis, key)
-        }
-        const { runScripted } = await import('../process/scriptings')
-        const luaResult = await runScripted(`
-            listenEdit('editInput', function(id, value, meta)
-                addChat(id, 'user', 'Lua compatibility output')
-                return false
-            end)
-        `, {
-            char: workingCopy.characters[0],
-            mode: 'editInput',
-            operationContext: luaOperation,
-        })
-        expect(luaResult.stopSending).toBe(true)
-        const luaMessage = luaOperation.chat.message.at(-1)!
-        luaMessage.chatId = 'op-lua'
-        luaMessage.saying = 'Lua visited complete history'
-        luaOperation.commit(luaLease.session)
-        luaLease.release()
-        oracle.message.push(structuredClone(luaMessage))
-        await runtime.flushPendingData('lua-operation-context')
-        expectedRevision += 1
-        await assertWindowed('Lua operation context')
-        for (const [key, value] of Object.entries(nodeDomGlobals)) {
-            Object.defineProperty(globalThis, key, { configurable: true, value })
-        }
-        vi.stubGlobal('fetch', originalFetch)
         for (const moduleId of [
             '../parser/parser.svelte',
             '../alert',
@@ -695,6 +754,7 @@ describe('selected conversation eviction correctness corpus', () => {
             '../process/memory/hypamemory',
             '../process/request/request',
             '../process/stableDiff',
+            '../process/luaRuntime',
         ]) vi.doUnmock(moduleId)
         vi.resetModules()
 
@@ -809,10 +869,12 @@ describe('selected conversation eviction correctness corpus', () => {
         vi.resetModules()
 
         const cbsLease = await runtime.acquireCompleteConversation('cbs-operation-context')
+        onTestFinished(() => cbsLease.release())
         const cbsOperation = createConversationOperationContext(
             cbsLease.session,
             selectedConversation(),
         )
+        onTestFinished(() => cbsOperation.release())
         const cbsCallbacks = new Map<string, import('../cbs').RegisterCallback>()
         vi.doMock('../stores.svelte', () => ({ CurrentTriggerIdStore: writable(null) }))
         const { defaultCBSRegisterArg, registerCBS } = await import('../cbs')
@@ -841,6 +903,7 @@ describe('selected conversation eviction correctness corpus', () => {
         vi.resetModules()
 
         const triggerLease = await runtime.acquireCompleteConversation('trigger-operation-context')
+        onTestFinished(() => triggerLease.release())
         const triggerOperation = createConversationOperationContext(
             triggerLease.session,
             selectedConversation(),
@@ -916,6 +979,7 @@ describe('selected conversation eviction correctness corpus', () => {
             chatId: 'chat-a',
             renderContext: screenshotRenderContext(workingCopy.characters[0] as character),
         }, runtime)
+        onTestFinished(() => screenshot.close())
         const screenshotJob = await screenshot.createJob(9_501, 9_502)
         expect(screenshotJob.messages).toEqual(oracle.message.slice(9_500, 9_502))
         await screenshot.close()

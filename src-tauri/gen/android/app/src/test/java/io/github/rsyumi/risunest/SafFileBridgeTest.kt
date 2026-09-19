@@ -13,10 +13,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class SafFileBridgeTest {
-  private fun temporaryDirectory(): File = Files.createTempDirectory("risu-saf-test").toFile()
+  @get:Rule val temporaryFolder = TemporaryFolder.builder().assureDeletion().build()
+
+  private fun temporaryDirectory(): File = temporaryFolder.newFolder()
 
   private fun terminalDestinationRecord(
     requestId: String,

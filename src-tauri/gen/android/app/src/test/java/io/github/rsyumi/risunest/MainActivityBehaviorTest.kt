@@ -2,16 +2,19 @@ package io.github.rsyumi.risunest
 
 import android.content.ComponentCallbacks2
 import androidx.core.view.WindowInsetsCompat
-import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 class MainActivityBehaviorTest {
+  @get:Rule val temporaryFolder = TemporaryFolder.builder().assureDeletion().build()
+
   @Test
   fun `content picker recognizes binary cards and upstream metadata formats only`() {
     for (name in listOf("card.CHARX", "card.png", "module.risum", "book.lorebook", "module.json", "card.JPEG")) {
@@ -636,7 +639,7 @@ class MainActivityBehaviorTest {
 
   @Test
   fun `legacy opened file cleanup removes only stale regular files`() {
-    val directory = Files.createTempDirectory("risu-opened-files").toFile()
+    val directory = temporaryFolder.newFolder()
     val stale = directory.resolve("stale.risup").apply {
       writeBytes(byteArrayOf(1))
       setLastModified(1_000)

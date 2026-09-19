@@ -1,7 +1,6 @@
 package io.github.rsyumi.risunest
 
 import java.io.File
-import java.nio.file.Files
 import javax.xml.parsers.DocumentBuilderFactory
 import org.w3c.dom.Element
 import org.junit.Assert.assertEquals
@@ -9,7 +8,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 
 /**
  * Characterization guard for the native export/import filename taxonomy that
@@ -19,6 +20,8 @@ import org.junit.Test
  * any side fails that side's suite.
  */
 class SafFileTaxonomyGoldenTest {
+  @get:Rule val temporaryFolder = TemporaryFolder.builder().assureDeletion().build()
+
   private data class HandoffGrammar(val kind: String, val prefix: String, val suffixes: List<String>)
 
   private data class Taxonomy(
@@ -79,7 +82,7 @@ class SafFileTaxonomyGoldenTest {
     )
   }
 
-  private fun temporaryAppDataRoot(): File = Files.createTempDirectory("risu-taxonomy-test").toFile()
+  private fun temporaryAppDataRoot(): File = temporaryFolder.newFolder()
 
   @Test
   fun `spool allowlist equals the fixture database and content union`() {

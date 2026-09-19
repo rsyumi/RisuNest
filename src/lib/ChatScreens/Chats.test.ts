@@ -285,6 +285,12 @@ function probeElements(target: HTMLElement): HTMLElement[] {
         .filter((element) => element.dataset.index !== '-1')
 }
 
+async function settleParserProjection(): Promise<void> {
+    await tick()
+    await vi.advanceTimersByTimeAsync(0)
+    await tick()
+}
+
 function conversationStartProbe(target: HTMLElement): HTMLElement | null {
     return target.querySelector<HTMLElement>('[data-chat-probe][data-index="-1"]')
 }
@@ -318,13 +324,17 @@ describe('Chats imperative mount lifecycle', () => {
     })
 
     afterEach(async () => {
-        if (mounted) await unmount(mounted)
-        mounted = undefined
-        schedulingMocks.state.controlled = false
-        schedulingMocks.releaseAll()
-        await Promise.resolve()
-        document.body.replaceChildren()
-        vi.unstubAllGlobals()
+        try {
+            if (mounted) await unmount(mounted)
+        } finally {
+            mounted = undefined
+            vi.useRealTimers()
+            schedulingMocks.state.controlled = false
+            schedulingMocks.releaseAll()
+            await Promise.resolve()
+            document.body.replaceChildren()
+            vi.unstubAllGlobals()
+        }
     })
 
     test('keeps DOM order and settled component state, then cleans up a removed message', async () => {
@@ -1540,6 +1550,7 @@ describe('Chats imperative mount lifecycle', () => {
     })
 
     test('stops retrying a permanent initial parser projection failure and lets the user retry', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
         const messages = [makeMessage(0)]
         const source = makePersistentViewportSource(messages)
         const currentCharacter = makeMetadataOnlyCharacter()
@@ -1555,24 +1566,33 @@ describe('Chats imperative mount lifecycle', () => {
             },
         })
 
-        await vi.waitFor(() =>
-            expect(target.querySelector('[data-chat-load-error]')).not.toBeNull(),
-        )
+        await settleParserProjection()
+        expect(resolve).toHaveBeenCalledTimes(1)
+        expect(probeElements(target)).toHaveLength(0)
+        await vi.advanceTimersByTimeAsync(250)
+        await settleParserProjection()
+        expect(resolve).toHaveBeenCalledTimes(2)
+        await vi.advanceTimersByTimeAsync(250)
+        await settleParserProjection()
         expect(resolve).toHaveBeenCalledTimes(3)
+        expect(target.querySelector('[data-chat-load-error]')).not.toBeNull()
         expect(probeElements(target)).toHaveLength(0)
         await expect((mounted as HarnessInstance).jumpTo(0)).resolves.toBe(false)
-        await new Promise((done) => setTimeout(done, 300))
+        await vi.advanceTimersByTimeAsync(1_000)
+        await settleParserProjection()
         expect(resolve).toHaveBeenCalledTimes(3)
 
         resolve.mockResolvedValue(boundedProjection(currentCharacter, 0))
         target.querySelector<HTMLButtonElement>('[data-chat-load-retry]')!.click()
-        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        await settleParserProjection()
+        expect(probeElements(target)).toHaveLength(1)
         expect(resolve).toHaveBeenCalledTimes(4)
         expect(target.querySelector('[data-chat-load-error]')).toBeNull()
         expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
     })
 
     test('keeps rendered history visible while a later parser failure waits for manual retry', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
         const messages = [makeMessage(0)]
         const currentCharacter = makeCharacter(messages)
         const { session, source } = makeViewportSource(currentCharacter)
@@ -1590,26 +1610,34 @@ describe('Chats imperative mount lifecycle', () => {
                 parserProjectionResolver: { resolve },
             },
         })
-        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(1))
+        await settleParserProjection()
+        expect(probeElements(target)).toHaveLength(1)
         session.append(makeMessage(1))
 
-        await vi.waitFor(() =>
-            expect(target.querySelector('[data-chat-load-error]')).not.toBeNull(),
-        )
+        const latestAttempts = () =>
+            resolve.mock.calls.filter(([input]) => input.row.absoluteIndex === 1)
+                .length
+        await settleParserProjection()
+        expect(latestAttempts()).toBe(1)
+        await vi.advanceTimersByTimeAsync(250)
+        await settleParserProjection()
+        expect(latestAttempts()).toBe(2)
+        await vi.advanceTimersByTimeAsync(250)
+        await settleParserProjection()
+        expect(latestAttempts()).toBe(3)
+        expect(target.querySelector('[data-chat-load-error]')).not.toBeNull()
         expect(probeElements(target).map((row) => row.dataset.message)).toEqual([
             'message-0',
         ])
         expect(target.querySelector('[data-chat-initial-loading]')).toBeNull()
-        const latestAttempts = () =>
-            resolve.mock.calls.filter(([input]) => input.row.absoluteIndex === 1)
-                .length
-        expect(latestAttempts()).toBe(3)
-        await new Promise((done) => setTimeout(done, 300))
+        await vi.advanceTimersByTimeAsync(1_000)
+        await settleParserProjection()
         expect(latestAttempts()).toBe(3)
 
         failLatest = false
         target.querySelector<HTMLButtonElement>('[data-chat-load-retry]')!.click()
-        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(2))
+        await settleParserProjection()
+        expect(probeElements(target)).toHaveLength(2)
         expect(latestAttempts()).toBe(4)
         expect(target.querySelector('[data-chat-load-error]')).toBeNull()
     })
