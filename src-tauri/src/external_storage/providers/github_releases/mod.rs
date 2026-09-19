@@ -439,10 +439,46 @@ impl GithubReleases {
             return Err(common::error(ErrorKind::PreconditionFailed, 422));
         }
         if !asset.uploaded() {
-            // An unfinished asset holds the name; it is never deleted or replaced.
+            // Other unfinished states cannot authorize replacement.
             return Err(common::error(ErrorKind::Transient, 422));
         }
         Ok(())
+    }
+
+    async fn remove_owned_starter(
+        &self,
+        context: &Context,
+        tag: &str,
+        release: u64,
+        asset: &AssetView,
+        intent: &ObjectIntent,
+        cancel: &Cancellation,
+    ) -> Result<bool> {
+        let batch = api::batch_key(intent.role, &intent.job_id);
+        let name = api::asset_name(intent.role, &intent.object_id);
+        if !batch.starts_with(api::JOB_BATCH_PREFIX)
+            || asset.name != name || asset.state != "starter" || asset.size != 0 {
+            return Ok(false);
+        }
+        let request = self.request(context, Method::GET, context.release_url(release)?, ProviderOperation::Metadata);
+        let response = self.send(request, cancel).await?;
+        let owner: ReleaseView = self.decode(response, cancel).await?;
+        if owner.id != release || owner.tag_name != tag || !owner.draft {
+            return Ok(false);
+        }
+        let request = self.request(context, Method::GET, context.asset_url(asset.id)?, ProviderOperation::Metadata);
+        let response = self.send(request, cancel).await?;
+        if response.status == 404 { return Ok(true); }
+        let current: AssetView = self.decode(response, cancel).await?;
+        if current.id != asset.id || current.name != name || current.state != "starter" || current.size != 0 {
+            return Ok(false);
+        }
+        let request = self.request(context, Method::DELETE, context.asset_url(asset.id)?, ProviderOperation::Delete);
+        let response = self.send(request, cancel).await?;
+        match response.status {
+            204 | 404 => Ok(true),
+            status => Err(api::classify(status, &response.headers, self.now())),
+        }
     }
 
     fn receipt(
@@ -673,41 +709,48 @@ impl Provider for GithubReleases {
             let batch = api::batch_key(intent.role, &intent.job_id);
             let name = api::asset_name(intent.role, &intent.object_id);
             let (release, tag) = self.batch_release(context, &batch, cancel).await?;
-            let url = context.upload_url(release, &name)?;
-            let mut request = self.request(context, Method::POST, url, ProviderOperation::Create);
-            request
-                .headers
-                .insert("content-type".to_owned(), api::BINARY_ACCEPT.to_owned());
-            request.content_length = Some(intent.byte_length);
-            request.body = Some(source.open(0, intent.byte_length, cancel).await?);
-            let response = self.send(request, cancel).await?;
-            match response.status {
-                201 => {
-                    let asset: AssetView = self.decode(response, cancel).await?;
-                    Self::verify(&asset, intent)?;
-                    {
-                        let mut batches = context.batches();
-                        if let Some(state) = batches.get_mut(&batch) {
-                            if state.release == release {
-                                state.assets += 1;
+            for attempt in 0..2 {
+                let url = context.upload_url(release, &name)?;
+                let mut request = self.request(context, Method::POST, url, ProviderOperation::Create);
+                request
+                    .headers
+                    .insert("content-type".to_owned(), api::BINARY_ACCEPT.to_owned());
+                request.content_length = Some(intent.byte_length);
+                request.body = Some(source.open(0, intent.byte_length, cancel).await?);
+                let response = self.send(request, cancel).await?;
+                match response.status {
+                    201 => {
+                        let asset: AssetView = self.decode(response, cancel).await?;
+                        Self::verify(&asset, intent)?;
+                        {
+                            let mut batches = context.batches();
+                            if let Some(state) = batches.get_mut(&batch) {
+                                if state.release == release {
+                                    state.assets += 1;
+                                }
                             }
                         }
+                        return Ok(Self::receipt(context, &tag, release, &asset, intent));
                     }
-                    Ok(Self::receipt(context, &tag, release, &asset, intent))
+                    422 => {
+                        // The name is taken. A retry of the same object converges on
+                        // the stored asset; different bytes are refused, never replaced.
+                        let conflict = api::classify(422, &response.headers, self.now());
+                        let Some(asset) = self.find_asset(context, release, &name, cancel).await?
+                        else {
+                            return Err(conflict);
+                        };
+                        if self.remove_owned_starter(context, &tag, release, &asset, intent, cancel).await? {
+                            if attempt == 0 { continue; }
+                            return Err(ProviderError::new(ErrorKind::Transient));
+                        }
+                        Self::verify(&asset, intent)?;
+                        return Ok(Self::receipt(context, &tag, release, &asset, intent));
+                    }
+                    status => return Err(api::classify(status, &response.headers, self.now())),
                 }
-                422 => {
-                    // The name is taken. A retry of the same object converges on
-                    // the stored asset; different bytes are refused, never replaced.
-                    let conflict = api::classify(422, &response.headers, self.now());
-                    let Some(asset) = self.find_asset(context, release, &name, cancel).await?
-                    else {
-                        return Err(conflict);
-                    };
-                    Self::verify(&asset, intent)?;
-                    Ok(Self::receipt(context, &tag, release, &asset, intent))
-                }
-                status => Err(api::classify(status, &response.headers, self.now())),
             }
+            Err(ProviderError::new(ErrorKind::Transient))
         })
     }
 
@@ -913,6 +956,9 @@ impl Provider for GithubReleases {
                 let Some(asset) = self.find_asset(context, release, &name, cancel).await? else {
                     continue;
                 };
+                if self.remove_owned_starter(context, &tag, release, &asset, intent, cancel).await? {
+                    return Ok(UploadResolution::RestartRequired);
+                }
                 return Ok(if asset.uploaded() && asset.matches(intent) {
                     UploadResolution::Complete(Self::receipt(
                         context, &tag, release, &asset, intent,

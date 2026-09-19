@@ -1717,3 +1717,128 @@ fn the_lease_collection_uses_its_own_tag_and_asset_prefix() {
         assert_eq!(server.requests.lock().unwrap().len(), 4);
     });
 }
+
+#[test]
+fn a_zero_length_owned_starter_recovers_after_a_failed_upload() {
+    runtime().block_on(async {
+        for reconcile in [false, true] {
+            let bytes = vec![7u8; 64];
+            let starter = json!({ "id": 88, "name": "pack-object-1", "size": 0, "state": "starter" });
+            let mut replies = vec![repository_reply(true), reply(200, json!([])),
+                reply(201, release(20, &job_tag("job-1", 0)))];
+            if reconcile {
+                replies.push(reply(502, json!({})));
+                replies.push(reply(200, json!([release(20, &job_tag("job-1", 0))])));
+            } else {
+                replies.push(reply(422, json!({})));
+            }
+            replies.extend([
+                reply(200, json!([starter.clone()])),
+                reply(200, release(20, &job_tag("job-1", 0))),
+                reply(200, starter), reply(204, json!(null)),
+                reply(201, asset(99, "pack-object-1", 64, Some(digest_of(&bytes)))),
+            ]);
+            let server = github_server(replies);
+            let test = dependencies();
+            let provider = adapter(test.dependencies.clone());
+            let handle = open(provider.as_ref(), &server, OpenMode::Create).await.unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source = source(directory.path(), "pack", &bytes);
+            let intent = object_intent(&handle, ObjectRole::Pack, "object-1", &bytes);
+            let cancel = Cancellation::default();
+            if reconcile {
+                assert_eq!(provider.create_object(&handle, &intent, &source, None, &cancel).await.unwrap_err().kind, ErrorKind::Transient);
+                assert!(matches!(provider.reconcile_upload(&handle, &intent, None, &cancel).await.unwrap(), UploadResolution::RestartRequired));
+            }
+            let receipt = provider.create_object(&handle, &intent, &source, None, &cancel).await.unwrap();
+            assert_eq!(receipt.locator.object, "20/99");
+            let requests = server.requests.lock().unwrap();
+            let deleted: Vec<_> = requests.iter().filter(|r| method_of(r) == "DELETE").collect();
+            assert_eq!(deleted.len(), 1);
+            assert!(head_line(deleted[0]).contains("/releases/assets/88"));
+            assert_eq!(requests.last().unwrap().body, bytes);
+        }
+    });
+}
+
+#[test]
+fn starter_cleanup_refuses_changed_incomplete_and_foreign_metadata() {
+    runtime().block_on(async {
+        let bytes = vec![7u8; 64];
+        let starter = json!({ "id": 88, "name": "pack-object-1", "size": 0, "state": "starter" });
+        for case in 0..8 {
+            let mut listed = starter.clone();
+            let mut current = starter.clone();
+            let mut owner = release(20, &job_tag("job-1", 0));
+            match case {
+                0 => { listed["size"] = json!(1); }
+                1 => { listed["state"] = json!("uploaded"); }
+                2 => { owner["tag_name"] = json!(job_tag("other-job", 0)); }
+                3 => { owner["draft"] = json!(false); }
+                4 => { current["state"] = json!("uploaded"); }
+                5 => { current["name"] = json!("pack-other"); }
+                6 => { current["size"] = json!(1); }
+                _ => { current.as_object_mut().unwrap().remove("size"); }
+            }
+            let mut replies = vec![repository_reply(true), reply(200, json!([])),
+                reply(201, release(20, &job_tag("job-1", 0))), reply(422, json!({})), reply(200, json!([listed]))];
+            if case >= 2 { replies.push(reply(200, owner)); }
+            if case >= 4 { replies.push(reply(200, current)); }
+            let server = github_server(replies);
+            let test = dependencies();
+            let provider = adapter(test.dependencies.clone());
+            let handle = open(provider.as_ref(), &server, OpenMode::Create).await.unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source = source(directory.path(), "pack", &bytes);
+            let intent = object_intent(&handle, ObjectRole::Pack, "object-1", &bytes);
+            assert!(provider.create_object(&handle, &intent, &source, None, &Cancellation::default()).await.is_err(), "case {case}");
+            assert!(server.requests.lock().unwrap().iter().all(|r| method_of(r) != "DELETE"), "case {case}");
+        }
+    });
+}
+
+#[test]
+fn starter_recovery_stops_after_one_immediate_retry() {
+    runtime().block_on(async {
+        let bytes = vec![7u8; 64];
+        let starter = json!({ "id": 88, "name": "pack-object-1", "size": 0, "state": "starter" });
+        let mut replies = vec![repository_reply(true), reply(200, json!([])),
+            reply(201, release(20, &job_tag("job-1", 0)))];
+        for _ in 0..2 {
+            replies.extend([reply(422, json!({})), reply(200, json!([starter.clone()])),
+                reply(200, release(20, &job_tag("job-1", 0))), reply(200, starter.clone()), reply(204, json!(null))]);
+        }
+        let server = github_server(replies);
+        let test = dependencies();
+        let provider = adapter(test.dependencies.clone());
+        let handle = open(provider.as_ref(), &server, OpenMode::Create).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = source(directory.path(), "pack", &bytes);
+        let intent = object_intent(&handle, ObjectRole::Pack, "object-1", &bytes);
+        let error = provider.create_object(&handle, &intent, &source, None, &Cancellation::default()).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Transient);
+        assert_eq!(server.requests.lock().unwrap().iter().filter(|r| method_of(r) == "POST").count(), 3);
+    });
+}
+
+#[test]
+fn shared_descriptor_and_lease_starters_are_never_removed() {
+    runtime().block_on(async {
+        let bytes = vec![7u8; 64];
+        for role in [ObjectRole::Descriptor, ObjectRole::Lease] {
+            let name = api::asset_name(role, "object-1");
+            let tag = format!("{PREFIX}-{}-0", api::batch_key(role, "job-1"));
+            let server = github_server(vec![repository_reply(true), reply(200, json!([])),
+                reply(201, release(20, &tag)), reply(422, json!({})),
+                reply(200, json!([{ "id": 88, "name": name, "size": 0, "state": "starter" }]))]);
+            let test = dependencies();
+            let provider = adapter(test.dependencies.clone());
+            let handle = open(provider.as_ref(), &server, OpenMode::Create).await.unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let source = source(directory.path(), "object", &bytes);
+            let intent = object_intent(&handle, role, "object-1", &bytes);
+            assert!(provider.create_object(&handle, &intent, &source, None, &Cancellation::default()).await.is_err());
+            assert!(server.requests.lock().unwrap().iter().all(|r| method_of(r) != "DELETE"));
+        }
+    });
+}

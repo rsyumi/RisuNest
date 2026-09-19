@@ -352,7 +352,6 @@ pub(super) struct AssetView {
     pub(super) id: u64,
     #[serde(default)]
     pub(super) name: String,
-    #[serde(default)]
     pub(super) size: u64,
     #[serde(default)]
     pub(super) state: String,
