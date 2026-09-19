@@ -406,6 +406,13 @@ pub(crate) trait Provider: Send + Sync {
         locator: &'a RemoteLocator,
         cancel: &'a Cancellation,
     ) -> ProviderFuture<'a, ()>;
+    fn delete_empty_container<'a>(
+        &'a self,
+        _repository: &'a RepositoryHandle,
+        _locator: &'a RemoteLocator,
+        _protected_jobs: &'a [String],
+        _cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> { Box::pin(async { Ok(()) }) }
     fn reconcile_upload<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

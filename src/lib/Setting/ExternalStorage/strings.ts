@@ -97,8 +97,8 @@ const english = {
     interrupted: 'This stopped before it finished. Try again.',
     errorGeneric: 'Could not complete this. Try again.',
     oldDriveNote: 'Google Drive backup here uses the official RisuAI account method. To back up to your own Drive folder or another cloud, use External storage in the RisuNest tab.',
-    jobKinds: { backup: 'Backup', sync: 'Sync', restore: 'Restore', 'pin-history': 'Keep', 'resolve-conflict': 'Resolve conflict' },
-    jobActive: { backup: 'Backing up', sync: 'Syncing', restore: 'Restoring', 'pin-history': 'Keeping', 'resolve-conflict': 'Resolving conflict' },
+    jobKinds: { cleanup: 'Cleanup', backup: 'Backup', sync: 'Sync', restore: 'Restore', 'pin-history': 'Keep', 'resolve-conflict': 'Resolve conflict' },
+    jobActive: { cleanup: 'Cleaning up', backup: 'Backing up', sync: 'Syncing', restore: 'Restoring', 'pin-history': 'Keeping', 'resolve-conflict': 'Resolving conflict' },
     historyKinds: { snapshot: 'Sync', 'backup-point': 'Backup', conflict: 'Conflict backup', 'recovery-candidate': 'Recovery candidate' },
     endpointWarnings: {
         'github-dedicated-repository': 'Use a separate private repository. This connection is backup only.',
@@ -232,8 +232,8 @@ const korean: typeof english = {
     interrupted: '끝나기 전에 멈췄습니다. 다시 시도하세요.',
     errorGeneric: '작업을 마치지 못했습니다. 다시 시도하세요.',
     oldDriveNote: '여기의 Google Drive 백업은 RisuAI 공식 계정 방식입니다. 내 Drive 폴더나 다른 클라우드에 백업하려면 RisuNest 탭의 외부 저장소를 쓰세요.',
-    jobKinds: { backup: '백업', sync: '동기화', restore: '복원', 'pin-history': '보관', 'resolve-conflict': '충돌 해결' },
-    jobActive: { backup: '백업 중', sync: '동기화 중', restore: '복원 중', 'pin-history': '보관 중', 'resolve-conflict': '충돌 해결 중' },
+    jobKinds: { cleanup: '정리', backup: '백업', sync: '동기화', restore: '복원', 'pin-history': '보관', 'resolve-conflict': '충돌 해결' },
+    jobActive: { cleanup: '정리 중', backup: '백업 중', sync: '동기화 중', restore: '복원 중', 'pin-history': '보관 중', 'resolve-conflict': '충돌 해결 중' },
     historyKinds: { snapshot: '동기화', 'backup-point': '백업', conflict: '충돌 백업', 'recovery-candidate': '복구 후보' },
     endpointWarnings: {
         'github-dedicated-repository': '백업 전용 비공개 저장소를 따로 쓰세요. 이 연결은 백업만 합니다.',

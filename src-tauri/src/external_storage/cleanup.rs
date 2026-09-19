@@ -130,6 +130,8 @@ pub(crate) trait RepositoryView: Sync {
     fn snapshots<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, Vec<ObjectReceipt>>;
     fn job_roots(&self) -> Result<JobRoots>;
     fn known_objects(&self) -> Result<Vec<RemoteObject>>;
+    fn confirmed_removed(&self, _object: &RemoteObject) -> Result<()> { Ok(()) }
+    fn protected_jobs(&self) -> Vec<String> { Vec::new() }
 }
 pub(crate) struct CleanupRequest<'a> {
     pub job_id: &'a str,
@@ -289,6 +291,7 @@ async fn run_owned(
     }
     outcome.stop_reason = StopReason::Complete;
     let mut sent = 0;
+    let mut containers = Vec::new();
     'batches: for batch in marked.candidates.chunks(request.limits.batch) {
         if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
             outcome.stop_reason = reason;
@@ -311,6 +314,8 @@ async fn run_owned(
             let key = locator_key(&object.receipt.locator)?;
             let Some(current) = source.probe(object).await? else {
                 GcStore::open(context.root)?.forget_observation(context.connection_id, &key)?;
+                view.confirmed_removed(object)?;
+                containers.push(object.receipt.locator.clone());
                 before.removed(object);
                 continue;
             };
@@ -350,6 +355,8 @@ async fn run_owned(
             if removed {
                 owner.set_delete_in_flight(false);
                 GcStore::open(context.root)?.forget_observation(context.connection_id, &key)?;
+                view.confirmed_removed(object)?;
+                containers.push(object.receipt.locator.clone());
                 before.removed(object);
                 outcome.deleted_objects = outcome.deleted_objects.checked_add(1)
                     .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
@@ -357,6 +364,27 @@ async fn run_owned(
                     .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
             }
         }
+    }
+    containers.sort_by(|a, b| a.collection.cmp(&b.collection));
+    containers.dedup_by(|a, b| a.collection == b.collection);
+    let mut protected_jobs = view.protected_jobs();
+    protected_jobs.push(request.job_id.to_owned());
+    for locator in containers {
+        if !matches!(outcome.stop_reason, StopReason::Complete | StopReason::Limit) { break; }
+        if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
+            outcome.stop_reason = reason;
+            break;
+        }
+        owner.renew_if_due(context, cancel).await?;
+        if let Some(reason) = recheck(context, owner, view, &before, &jobs, cancel).await? {
+            outcome.stop_reason = reason;
+            break;
+        }
+        owner.set_delete_in_flight(true);
+        leases::control_request(cancel, context.provider.delete_empty_container(
+            context.repository, &locator, &protected_jobs, cancel,
+        )).await?;
+        owner.set_delete_in_flight(false);
     }
     if matches!(outcome.stop_reason, StopReason::Complete | StopReason::Limit) {
         if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
@@ -520,6 +548,12 @@ impl RepositoryView for ConnectedRepositoryView<'_> {
         })
     }
     fn job_roots(&self) -> Result<JobRoots> { job_roots_of(&self.unfinished) }
+    fn confirmed_removed(&self, object: &RemoteObject) -> Result<()> {
+        packaging::forget_remote_object(self.cache_root, &self.connected.handle, object)
+    }
+    fn protected_jobs(&self) -> Vec<String> {
+        self.unfinished.iter().map(|job| job.job_id.clone()).collect()
+    }
     fn known_objects(&self) -> Result<Vec<RemoteObject>> {
         packaging::known_remote_objects(
             self.cache_root, &self.connected.stored.descriptor.repository_id, &self.connected.handle,
@@ -610,6 +644,7 @@ mod tests {
         reads: AtomicUsize,
         change_at: AtomicUsize,
         listing_error: Mutex<Option<ErrorKind>>,
+        removed: Mutex<Vec<String>>,
     }
     impl RepositoryView for View {
         fn roots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
@@ -634,6 +669,10 @@ mod tests {
         }
         fn job_roots(&self) -> Result<JobRoots> { Ok(self.jobs.lock().unwrap().clone()) }
         fn known_objects(&self) -> Result<Vec<RemoteObject>> { Ok(self.known.clone()) }
+        fn confirmed_removed(&self, object: &RemoteObject) -> Result<()> {
+            self.removed.lock().unwrap().push(object.object_id.clone());
+            Ok(())
+        }
     }
     struct Probes<'a> {
         source: &'a Source,
@@ -685,7 +724,7 @@ mod tests {
                 view: View {
                     roots: Mutex::new(ObservedRoots::default()), jobs: Mutex::new(JobRoots::default()), known,
                     reads: AtomicUsize::new(0), change_at: AtomicUsize::new(usize::MAX),
-                    listing_error: Mutex::new(None),
+                    listing_error: Mutex::new(None), removed: Mutex::new(Vec::new()),
                 },
             }
         }
@@ -845,6 +884,7 @@ mod tests {
                 let result = h.run().await.unwrap();
                 assert_eq!(result.stop_reason, reason);
                 assert_eq!(result.deleted_objects, deleted);
+                assert_eq!(h.view.removed.lock().unwrap().len(), deleted as usize);
                 assert_eq!(h.provider.delete_attempts("child-pack"), if deleted == 2 { 1 } else { 0 });
             }
         });

@@ -162,6 +162,7 @@ export type ExternalJobKind =
     | 'sync'
     | 'restore'
     | 'pin-history'
+    | 'cleanup'
     | 'resolve-conflict'
 
 /** The areas beside the library that a backup can carry. */
@@ -220,6 +221,9 @@ export interface ExternalJobSummary {
         receivedRevision?: DecimalString
         receiveReady?: boolean
         expectedRevision?: DecimalString
+        deletedObjects?: DecimalString
+        deletedBytes?: DecimalString
+        stopReason?: string
     }
 }
 

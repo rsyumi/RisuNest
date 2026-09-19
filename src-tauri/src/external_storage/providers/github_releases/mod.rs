@@ -932,6 +932,44 @@ impl Provider for GithubReleases {
     /// its own. Reconciliation asks the service what it actually stored for
     /// this object and reports that, which is the recovery path after a lost
     /// upload response.
+    fn delete_empty_container<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        locator: &'a RemoteLocator,
+        protected_jobs: &'a [String],
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, ()> {
+        Box::pin(async move {
+            let context = self.context(repository)?;
+            locator.validate_for(repository)?;
+            let (release, _) = api::parse_locator(&locator.object)?;
+            let request = self.request(context, Method::GET, context.release_url(release)?, ProviderOperation::Metadata);
+            let response = self.send(request, cancel).await?;
+            if response.status == 404 { return Ok(()); }
+            let view: ReleaseView = self.decode(response, cancel).await?;
+            let Some(tag) = locator.collection.as_deref() else { return Ok(()); };
+            let prefix = context.tag(api::JOB_BATCH_PREFIX, 0);
+            let prefix = prefix.strip_suffix("-0").ok_or_else(corrupt)?;
+            let Some((batch_tag, sequence)) = tag.rsplit_once('-') else { return Ok(()); };
+            let Some(job_hash) = batch_tag.strip_prefix(prefix) else { return Ok(()); };
+            if view.id != release || view.tag_name != tag || !view.draft
+                || job_hash.len() != 16 || !job_hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                || sequence.parse::<u32>().ok().is_none_or(|value| value.to_string() != sequence)
+                || protected_jobs.iter().any(|job| context.tag(&api::batch_key(ObjectRole::Pack, job), 0)
+                    .strip_suffix("-0") == Some(batch_tag)) {
+                return Ok(());
+            }
+            // Any member, including an unfinished upload, keeps the release alive.
+            if !self.assets_page(context, release, 1, cancel).await?.is_empty() { return Ok(()); }
+            let request = self.request(context, Method::DELETE, context.release_url(release)?, ProviderOperation::Delete);
+            let response = self.send(request, cancel).await?;
+            match response.status {
+                204 | 404 => Ok(()),
+                status => Err(api::classify(status, &response.headers, self.now())),
+            }
+        })
+    }
+
     fn reconcile_upload<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

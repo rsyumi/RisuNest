@@ -43,6 +43,22 @@ function deferred<T>() {
 }
 
 describe('external storage controller', () => {
+    it('finishes cleanup without inventing a published revision or applying received data', async () => {
+        const applyReceived = vi.fn()
+        const bridge: ExternalStorageJobBridge = {
+            startJob: vi.fn(async (): Promise<ExternalJobSummary> => ({ ...job('cleanup-1', 'succeeded'), kind: 'cleanup',
+                result: { deletedObjects: '2', deletedBytes: '100', stopReason: 'complete' } })),
+            getJob: vi.fn(), cancelJob: vi.fn(),
+        }
+        const controller = createExternalStorageController(bridge, state, { applyReceived })
+        const result = await controller.request({ connectionId: 'sync-1', kind: 'cleanup', targetRevision: '0',
+            reason: 'manual', session: { kind: 'foreground', id: 'session' } })
+        expect(result).toMatchObject({ kind: 'complete', job: { result: { deletedObjects: '2' } } })
+        expect(applyReceived).not.toHaveBeenCalled()
+        expect(bridge.startJob).toHaveBeenCalledOnce()
+        expect(vi.mocked(bridge.startJob).mock.calls[0][0]).not.toHaveProperty('targetRevision')
+    })
+
     it('keeps the latest dirty revision while resolving an earlier manual goal', async () => {
         const firstPoll = deferred<ExternalJobSummary>()
         let starts = 0

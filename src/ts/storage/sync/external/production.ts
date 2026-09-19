@@ -194,6 +194,17 @@ export function installExternalStorageProduction(): Promise<() => void> {
                 && document.visibilityState !== 'hidden' && navigator.onLine,
             destinations: () => destinations(holder.current?.state ?? state),
             session: () => holder.current?.session ?? session,
+            maintenance: () => {
+                const current = holder.current?.state ?? state
+                return destinations(current).filter(destination => {
+                    const capabilities = current.connections.find(item => item.id === destination.connectionId)?.capabilities
+                    return capabilities?.snapshotDiscovery && capabilities.leaseOperations && capabilities.deleteObjects
+                }).map(destination => ({ connectionId: destination.connectionId,
+                    lastAttemptAt: Math.max(0, ...current.jobs.filter(job =>
+                        job.connectionId === destination.connectionId && job.kind === 'cleanup',
+                    ).map(job => Number(job.startedAtMs))) || undefined,
+                }))
+            },
         })
         const disposers: Array<() => void> = []
         const current: ProductionRuntime = {
@@ -282,10 +293,10 @@ export async function refreshExternalStorageProductionState(): Promise<void> {
 /** Flushes local state, captures its durable revision, then waits for that goal. */
 export async function requestExternalStorageNow(
     connectionId: string,
-    kind: 'sync' | 'backup',
+    kind: 'sync' | 'backup' | 'cleanup',
 ): Promise<ExternalControllerResult> {
     assertNoPendingApplication()
-    await flushPendingDataLocally(kind === 'sync' ? 'external-sync-now' : 'external-backup-now')
+    if (kind !== 'cleanup') await flushPendingDataLocally(kind === 'sync' ? 'external-sync-now' : 'external-backup-now')
     const token = await capturePersistentMutationToken('external-storage-manual')
     const current = runtime
     if (!current) throw new Error('External storage production is not installed')

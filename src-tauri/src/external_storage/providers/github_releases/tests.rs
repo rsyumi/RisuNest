@@ -1842,3 +1842,35 @@ fn shared_descriptor_and_lease_starters_are_never_removed() {
         }
     });
 }
+
+#[test]
+fn empty_job_release_cleanup_requires_complete_empty_inventory_and_no_active_owner() {
+    runtime().block_on(async {
+        for case in 0..8 {
+            let tag = match case {
+                3 => format!("{PREFIX}-l-0"),
+                4 => format!("{PREFIX}-d-0"),
+                _ => job_tag("job-1", 0),
+            };
+            let actual = if case == 5 { job_tag("other", 0) } else { tag.clone() };
+            let mut replies = vec![repository_reply(true), reply(200, json!([])), reply(200, release(20, &actual))];
+            if matches!(case, 0 | 2 | 6 | 7) {
+                replies.push(reply(200, if case == 2 { json!([asset(88, "pack-kept", 64, None)]) }
+                    else if case == 6 { json!({"incomplete": true}) } else { json!([]) }));
+            }
+            if case == 0 || case == 7 { replies.push(reply(if case == 7 { 202 } else { 204 }, json!(null))); }
+            let server = github_server(replies);
+            let test = dependencies();
+            let provider = adapter(test.dependencies.clone());
+            let handle = open(provider.as_ref(), &server, OpenMode::Create).await.unwrap();
+            let locator = RemoteLocator { connection_identity: handle.connection_identity.clone(), collection: Some(tag), object: "20/88".into() };
+            let protected = if case == 1 { vec!["job-1".to_owned()] } else { Vec::new() };
+            let result = provider.delete_empty_container(&handle, &locator, &protected, &Cancellation::default()).await;
+            assert_eq!(result.is_err(), case == 6 || case == 7, "case {case}");
+            let records = server.requests.lock().unwrap();
+            let deletes: Vec<_> = records.iter().filter(|r| method_of(r) == "DELETE").collect();
+            assert_eq!(deletes.len(), usize::from(case == 0 || case == 7), "case {case}");
+            if let Some(request) = deletes.first() { assert!(head_line(request).contains("/releases/20 ")); }
+        }
+    });
+}

@@ -21,6 +21,53 @@ describe('external storage scheduler', () => {
         return { scheduler, request, cancel }
     }
 
+    it('runs idle maintenance once across several backups and observes its cooldown', async () => {
+        const request = vi.fn(async input => ({ kind: 'complete' as const, revision: input.targetRevision, job: {} as never }))
+        const scheduler = createExternalStorageScheduler({ request, cancel: vi.fn() } as unknown as ExternalStorageController, {
+            available: () => true,
+            destinations: () => [{ connectionId: 'backup-1', kind: 'backup' }],
+            maintenance: () => [{ connectionId: 'backup-1' }],
+            session: () => ({ kind: 'foreground', id: 'session' }),
+        })
+        scheduler.durableRevision('1')
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(request.mock.calls.map(([input]) => input.kind)).toEqual(['backup'])
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(request.mock.calls.map(([input]) => input.kind)).toEqual(['backup', 'cleanup'])
+        for (let value = 2; value <= 4; value++) {
+            scheduler.durableRevision(String(value) as `${number}`)
+            await vi.advanceTimersByTimeAsync(60_000)
+        }
+        expect(request.mock.calls.filter(([input]) => input.kind === 'cleanup')).toHaveLength(1)
+        scheduler.stop()
+    })
+
+    it('defers automatic maintenance while offline or a write is in flight', async () => {
+        let available = true
+        let finish!: (value: unknown) => void
+        const request = vi.fn(input => input.kind === 'backup'
+            ? new Promise(resolve => { finish = resolve })
+            : Promise.resolve({ kind: 'complete', revision: '0', job: {} }))
+        const scheduler = createExternalStorageScheduler({ request, cancel: vi.fn() } as unknown as ExternalStorageController, {
+            available: () => available,
+            destinations: () => [{ connectionId: 'backup-1', kind: 'backup' }],
+            maintenance: () => [{ connectionId: 'backup-1' }],
+            session: () => ({ kind: 'foreground', id: 'session' }),
+        })
+        scheduler.durableRevision('1')
+        await vi.advanceTimersByTimeAsync(180_000)
+        expect(request).toHaveBeenCalledTimes(1)
+        finish({ kind: 'complete', revision: '1', job: {} })
+        available = false
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(request).toHaveBeenCalledTimes(1)
+        available = true
+        scheduler.resume()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'cleanup' }))
+        scheduler.stop()
+    })
+
     it('coalesces edits to the latest revision after 15 seconds of quiet', async () => {
         const { scheduler, request } = harness()
         scheduler.durableRevision('1')

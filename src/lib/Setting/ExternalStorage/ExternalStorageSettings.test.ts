@@ -38,6 +38,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
 }))
 
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
+import { requestExternalStorageNow } from 'src/ts/storage/sync/external/production'
 import { externalStorageStrings } from './strings'
 
 const strings = externalStorageStrings('en')
@@ -116,6 +117,24 @@ describe('the storage usage tab', () => {
         component = undefined
         target.remove()
         vi.clearAllMocks()
+    })
+
+    it('runs manual cleanup through the production queue only for a capable connection', async () => {
+        await openStorageUsage()
+        expect([...target.querySelectorAll('button')].some(button => button.textContent?.trim() === strings.cleanup)).toBe(false)
+        if (component) unmount(component)
+        const capable = connection(10, 30)
+        capable.capabilities.leaseOperations = true
+        capable.capabilities.deleteObjects = true
+        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'none', selectionEpoch: '0', paused: false, decisionRequired: false }, connections: [capable], jobs: [] })
+        component = mount(ExternalStorageSettings, { target })
+        await settle()
+        await openStorageUsage()
+        const button = [...target.querySelectorAll('button')].find(button => button.textContent?.trim() === strings.cleanup)
+        expect(button).toBeDefined()
+        button!.click()
+        await settle()
+        expect(requestExternalStorageNow).toHaveBeenCalledWith('connection-1', 'cleanup')
     })
 
     it('shows the stored limits even when the usage request fails', async () => {

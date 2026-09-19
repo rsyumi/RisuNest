@@ -27,7 +27,7 @@ export interface ExternalStorageControllerDependencies {
 
 export interface ExternalControllerRequest {
     connectionId: string
-    kind: Extract<ExternalJobKind, 'sync' | 'backup'>
+    kind: Extract<ExternalJobKind, 'sync' | 'backup' | 'cleanup'>
     targetRevision: DecimalString
     reason: ExternalJobReason
     session: ExternalExecutionSession
@@ -211,7 +211,9 @@ export function createExternalStorageController(
                 const started = await bridge.startJob({
                     connectionId,
                     kind: request.kind,
-                    targetRevision: latest.revision.toString() as DecimalString,
+                    ...(request.kind === 'cleanup' ? {} : {
+                        targetRevision: latest.revision.toString() as DecimalString,
+                    }),
                     reason: request.reason,
                     session: request.session.kind,
                     sessionId: request.session.id,
@@ -235,6 +237,12 @@ export function createExternalStorageController(
                     settleKind(run, request.kind, {
                         kind: 'blocked', reason, error: completed.error, job: completed,
                     })
+                    continue
+                }
+                if (request.kind === 'cleanup') {
+                    errors.delete(connectionId)
+                    settleKind(run, 'cleanup', { kind: 'complete', revision: '0', job: completed })
+                    publish()
                     continue
                 }
                 const achieved = resultRevision(completed)

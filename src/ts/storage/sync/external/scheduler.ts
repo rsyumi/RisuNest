@@ -18,6 +18,7 @@ export interface ExternalSchedulerDependencies {
     available(): boolean
     destinations(): ExternalScheduledDestination[]
     session(): ExternalExecutionSession
+    maintenance?(): Array<{ connectionId: string; lastAttemptAt?: number }>
     now?(): number
     setTimer?(callback: () => void, delay: number): unknown
     clearTimer?(timer: unknown): void
@@ -55,6 +56,16 @@ export function createExternalStorageScheduler(
             value as ReturnType<typeof globalThis.setTimeout>,
         ))
 
+    const lastCleanup = new Map<string, number>()
+    const inFlight = new Map<string, number>()
+    const started = (id: string) => inFlight.set(id, (inFlight.get(id) ?? 0) + 1)
+    const finished = (id: string) => {
+        const remaining = (inFlight.get(id) ?? 1) - 1
+        if (remaining > 0) inFlight.set(id, remaining)
+        else inFlight.delete(id)
+    }
+    let maintenanceAt = now() + 60_000
+    const cleanupInterval = 6 * 60 * 60 * 1000
     const clear = (): void => {
         if (timer !== undefined) clearTimer(timer)
         timer = undefined
@@ -63,8 +74,10 @@ export function createExternalStorageScheduler(
         `${destination.kind}:${destination.connectionId}`
     const scheduleNext = (): void => {
         clear()
-        if (stopped || !dependencies.available() || pending.size === 0) return
-        const next = Math.min(...[...pending.values()].map(item => item.dueAt))
+        if (stopped || !dependencies.available()) return
+        const next = Math.min(...[...pending.values()].map(item => item.dueAt),
+            dependencies.maintenance ? maintenanceAt : Number.POSITIVE_INFINITY)
+        if (!Number.isFinite(next)) return
         timer = setTimer(runDue, Math.max(0, next - now()))
     }
     const merge = (
@@ -130,6 +143,7 @@ export function createExternalStorageScheduler(
                 reason: 'automatic',
                 session: dependencies.session(),
             }
+            started(destination.connectionId)
             void controller.request(request).then((result) => {
                 if (result.kind !== 'blocked' || result.error?.retryable === false) return
                 if (
@@ -148,7 +162,21 @@ export function createExternalStorageScheduler(
                     || result.reason === 'publication-unknown') return
                 merge(destination, item.revision, 'edit')
                 scheduleNext()
-            })
+            }).finally(() => finished(destination.connectionId))
+        }
+        if (dependencies.maintenance && currentTime >= maintenanceAt) {
+            maintenanceAt = currentTime + 60_000
+            for (const candidate of dependencies.maintenance()) {
+                const last = Math.max(lastCleanup.get(candidate.connectionId) ?? -Infinity,
+                    candidate.lastAttemptAt ?? -Infinity)
+                if (currentTime - last < cleanupInterval || inFlight.has(candidate.connectionId)
+                    || [...pending.keys()].some(key => key.endsWith(`:${candidate.connectionId}`))) continue
+                lastCleanup.set(candidate.connectionId, currentTime)
+                started(candidate.connectionId)
+                void controller.request({ connectionId: candidate.connectionId, kind: 'cleanup',
+                    targetRevision: '0', reason: 'automatic', session: dependencies.session(),
+                }).finally(() => finished(candidate.connectionId))
+            }
         }
         scheduleNext()
     }
@@ -161,7 +189,7 @@ export function createExternalStorageScheduler(
         },
         requestNow(
             connectionId: string,
-            kind: 'sync' | 'backup',
+            kind: 'sync' | 'backup' | 'cleanup',
             value: DecimalString,
         ) {
             const target = parseRevision(value)
@@ -169,13 +197,15 @@ export function createExternalStorageScheduler(
             const newer = pending.get(key)
             if (!newer || newer.revision <= target) pending.delete(key)
             scheduleNext()
+            if (kind === 'cleanup') lastCleanup.set(connectionId, now())
+            started(connectionId)
             return controller.request({
                 connectionId,
                 kind,
                 targetRevision: target.toString() as DecimalString,
                 reason: 'manual',
                 session: dependencies.session(),
-            })
+            }).finally(() => finished(connectionId))
         },
         resume(): void {
             scheduleNext()

@@ -148,7 +148,7 @@
 
     async function runJob(
         connection: ExternalConnectionSummary,
-        job: 'backup' | 'sync' | 'restore' | 'pin-history' | 'resolve-conflict',
+        job: 'backup' | 'sync' | 'restore' | 'pin-history' | 'resolve-conflict' | 'cleanup',
         details: {
             snapshotId?: string
             conflictId?: string
@@ -159,7 +159,7 @@
         if (job === 'restore' && !(await alertConfirm(strings.restore))) return
         busy = true
         try {
-            if (job === 'backup' || job === 'sync') {
+            if (job === 'backup' || job === 'sync' || job === 'cleanup') {
                 const operation = requestExternalStorageNow(connection.id, job)
                 schedulePoll(true)
                 await operation
@@ -504,6 +504,10 @@
     }
 
     function jobSummary(job: ExternalJobSummary): string {
+        if (job.kind === 'cleanup' && job.state === 'succeeded' && job.result?.deletedObjects !== undefined && job.result.deletedBytes !== undefined) {
+            const summary = strings.cleanupSummary.replace('{0}', job.result.deletedObjects).replace('{1}', bytes(job.result.deletedBytes))
+            return job.result.stopReason === 'complete' ? summary : `${summary} ${strings.cleanupPartial}`
+        }
         const progress = externalJobProgress(job)
         const size = `${bytes(job.completedBytes)}${job.totalBytes ? ` / ${bytes(job.totalBytes)}` : ''}`
         const state = externalJobIsActive(job) ? strings.jobActive[job.kind] : `${strings.jobKinds[job.kind]} · ${jobLabel(job)}`
@@ -703,6 +707,11 @@
                                 </dl>
                             {/if}
                         {/if}
+                        {#if connection.capabilities.snapshotDiscovery && connection.capabilities.leaseOperations && connection.capabilities.deleteObjects}
+                            <SettingButton disabled={busy || connection.status !== 'ready' || storageState.jobs.some(job => job.connectionId === connection.id && externalJobIsActive(job))} onclick={() => runJob(connection, 'cleanup')}>{strings.cleanup}</SettingButton>
+                        {/if}
+                        <p class="text-textcolor2">{strings.retentionHelp} {strings.retentionOtherDevices}</p>
+                        <p class="text-textcolor2">{strings.cleanupTrashNotice}</p>
                         <label class="policy-row fixed">
                             <span>{strings.retentionCount}</span>
                             <span class="amount">

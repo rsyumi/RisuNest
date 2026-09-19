@@ -468,6 +468,10 @@ impl PackageCache {
 }
 /// The existing upload inventory bounds collection ownership. Reading it never
 /// discovers foreign packs or treats historical receipts as current existence.
+pub(crate) fn forget_remote_object(root: &Path, repository: &RepositoryHandle, object: &RemoteObject) -> Result<()> {
+    PackageCache::open(root)?.forget_object(&object.repository_id, repository, &object.object_id)
+}
+
 pub(crate) fn known_remote_objects(
     root: &Path,
     format_repository_id: &str,
