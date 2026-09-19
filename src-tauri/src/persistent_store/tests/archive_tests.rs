@@ -2,6 +2,7 @@ use super::*;
 use crate::asset_repository::PayloadCas;
 use crate::logical_records::{LogicalRecordEnvelope, LogicalRecordLocator};
 use crate::persistent_store::record_apply::apply_materialized_record;
+use std::cell::Cell;
 
 fn archive_store() -> (tempfile::TempDir, PersistentStore, PayloadCas) {
     let directory = tempfile::tempdir().expect("create archive directory");
@@ -285,6 +286,86 @@ fn archiving_moves_conversations_into_one_object_and_restoring_puts_them_back() 
             .expect("read archived object")
             .is_none()
     );
+}
+
+#[test]
+fn cancelling_streamed_archive_keeps_the_live_character_and_revision() {
+    let (_directory, mut store, _cas) = archive_store();
+    let before = store
+        .read_character("middle-archived", None)
+        .expect("read active character")
+        .expect("character exists")
+        .value;
+    let revision = store.revision().expect("read revision");
+    let checks = Cell::new(0_u32);
+    let is_cancelled = || {
+        let next = checks.get() + 1;
+        checks.set(next);
+        next >= 6
+    };
+
+    let error = store
+        .archive_character_with_cancellation(
+            "middle-archived",
+            revision,
+            10,
+            &is_cancelled,
+        )
+        .expect_err("cancel archive while streaming");
+
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(store.revision().expect("read revision after cancellation"), revision);
+    assert_eq!(
+        store
+            .read_character("middle-archived", None)
+            .expect("read character after cancellation")
+            .expect("live character remains")
+            .value,
+        before,
+    );
+}
+
+#[test]
+fn cancelling_streamed_restore_keeps_the_archive_object_and_cleans_staging() {
+    let (_directory, mut store, cas) = archive_store();
+    let revision = store.revision().expect("read revision");
+    store
+        .archive_character("middle-archived", revision, 10)
+        .expect("archive character");
+    let archived = archived_object(&store, "middle-archived");
+    let revision = store.revision().expect("read archived revision");
+    let checks = Cell::new(0_u32);
+    let is_cancelled = || {
+        let next = checks.get() + 1;
+        checks.set(next);
+        next >= 5
+    };
+
+    let error = store
+        .restore_character_with_cancellation("middle-archived", revision, &is_cancelled)
+        .expect_err("cancel restore while staging");
+
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(store.revision().expect("read revision after cancellation"), revision);
+    assert_eq!(archived_object(&store, "middle-archived"), archived);
+    assert!(cas
+        .stat_object(&archived.object_hash)
+        .expect("stat retained archive")
+        .is_some());
+    let staging_tables: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_temp_master
+             WHERE name IN ('archive_restore_conversations', 'archive_restore_messages')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count restore staging tables");
+    assert_eq!(staging_tables, 0);
+
+    store
+        .restore_character("middle-archived", revision)
+        .expect("retained archive remains restorable");
 }
 
 #[test]

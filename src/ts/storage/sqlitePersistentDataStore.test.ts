@@ -199,6 +199,55 @@ describe('SqlitePersistentDataStore', () => {
         await expect(store.readRoot()).rejects.toEqual(new Error('disk I/O error'))
     })
 
+    it('cancels an in-flight native character archive operation with the same operation id', async () => {
+        let rejectArchive!: (error: unknown) => void
+        mocks.invoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'pds_archive_character') {
+                return new Promise((_resolve, reject) => { rejectArchive = reject })
+            }
+            if (command === 'pds_cancel_character_archive_operation') {
+                rejectArchive({
+                    code: 'validation',
+                    message: 'character archive operation cancelled',
+                })
+                return Promise.resolve(true)
+            }
+            throw new Error(`unexpected command ${command}`)
+        })
+        const store = new SqlitePersistentDataStore()
+        const controller = new AbortController()
+
+        const archive = store.archiveCharacter('char-a', 12, controller.signal)
+        controller.abort()
+
+        await expect(archive).rejects.toMatchObject({ name: 'AbortError' })
+        const archiveArgs = mocks.invoke.mock.calls[0][1] as Record<string, unknown>
+        expect(mocks.invoke.mock.calls).toEqual([
+            [
+                'pds_archive_character',
+                {
+                    characterId: 'char-a',
+                    expectedRevision: 12,
+                    operationId: archiveArgs.operationId,
+                },
+            ],
+            [
+                'pds_cancel_character_archive_operation',
+                { operationId: archiveArgs.operationId },
+            ],
+        ])
+    })
+
+    it('does not start a character restore whose signal is already cancelled', async () => {
+        const store = new SqlitePersistentDataStore()
+        const controller = new AbortController()
+        controller.abort()
+
+        await expect(store.restoreCharacter('char-a', 12, controller.signal))
+            .rejects.toMatchObject({ name: 'AbortError' })
+        expect(mocks.invoke).not.toHaveBeenCalled()
+    })
+
     it('forwards valid absolute ranges and rejects invalid ranges before native IPC', async () => {
         mocks.invoke.mockResolvedValue({ revision: 9, value: null })
         const store = new SqlitePersistentDataStore()

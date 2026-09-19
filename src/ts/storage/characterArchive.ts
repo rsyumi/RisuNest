@@ -84,7 +84,10 @@ async function runArchiveMutation(
     }
 }
 
-export async function archiveCharacterWithConfirmation(characterId: string): Promise<boolean> {
+export async function archiveCharacterWithConfirmation(
+    characterId: string,
+    signal?: AbortSignal,
+): Promise<boolean> {
     if (!archiveIsAvailable()) return false
     const store = getPersistentDataStore()
     let preview: ArchivePreview
@@ -102,16 +105,17 @@ export async function archiveCharacterWithConfirmation(characterId: string): Pro
     const characters = DBState.db.characters
     if (characters[get(selectedCharID)]?.chaId === characterId) selectedCharID.set(-1)
     return await runArchiveMutation('character-archive', (expectedRevision) =>
-        store.archiveCharacter(characterId, expectedRevision))
+        store.archiveCharacter(characterId, expectedRevision, signal))
 }
 
 export async function restoreArchivedCharacterWithConfirmation(
     characterId: string,
+    signal?: AbortSignal,
 ): Promise<boolean> {
     if (!archiveIsAvailable()) return false
     const store = getPersistentDataStore()
     const strings = language.risuNest.archive
     if (!await confirmWithTitle(strings.restoreTitle, strings.restoreBody)) return false
     return await runArchiveMutation('character-restore', (expectedRevision) =>
-        store.restoreCharacter(characterId, expectedRevision))
+        store.restoreCharacter(characterId, expectedRevision, signal))
 }

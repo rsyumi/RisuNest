@@ -1811,6 +1811,24 @@ impl PersistentStore {
         )
     }
 
+    pub(crate) fn archive_character_with_cancellation(
+        &mut self,
+        character_id: &str,
+        expected_revision: i64,
+        now_ms: i64,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        archive::archive_character_with_cancellation(
+            &mut self.connection,
+            &cas,
+            character_id,
+            expected_revision,
+            now_ms,
+            is_cancelled,
+        )
+    }
+
     pub(crate) fn restore_character(
         &mut self,
         character_id: &str,
@@ -1818,6 +1836,22 @@ impl PersistentStore {
     ) -> StoreResult<RevisionResult> {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         archive::restore_character(&mut self.connection, &cas, character_id, expected_revision)
+    }
+
+    pub(crate) fn restore_character_with_cancellation(
+        &mut self,
+        character_id: &str,
+        expected_revision: i64,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        archive::restore_character_with_cancellation(
+            &mut self.connection,
+            &cas,
+            character_id,
+            expected_revision,
+            is_cancelled,
+        )
     }
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {

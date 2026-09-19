@@ -95,6 +95,31 @@ async function invokeStore<T>(command: string, args?: Record<string, unknown>): 
     }
 }
 
+async function invokeArchiveOperation<T>(
+    command: 'pds_archive_character' | 'pds_restore_character',
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+): Promise<T> {
+    if (signal?.aborted) {
+        throw new DOMException('Character archive operation was cancelled', 'AbortError')
+    }
+    const operationId = `character-archive-${globalThis.crypto.randomUUID()}`
+    const cancel = () => {
+        void invokeStore('pds_cancel_character_archive_operation', { operationId }).catch(() => {})
+    }
+    signal?.addEventListener('abort', cancel, { once: true })
+    try {
+        return await invokeStore<T>(command, { ...args, operationId })
+    } catch (error) {
+        if (signal?.aborted) {
+            throw new DOMException('Character archive operation was cancelled', 'AbortError')
+        }
+        throw error
+    } finally {
+        signal?.removeEventListener('abort', cancel)
+    }
+}
+
 function characterBatches(
     characters: Database['characters'],
 ): Array<Database['characters']> {
@@ -333,15 +358,25 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     archiveCharacter(
         characterId: string,
         expectedRevision: DataRevision,
+        signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }> {
-        return invokeStore('pds_archive_character', { characterId, expectedRevision })
+        return invokeArchiveOperation(
+            'pds_archive_character',
+            { characterId, expectedRevision },
+            signal,
+        )
     }
 
     restoreCharacter(
         characterId: string,
         expectedRevision: DataRevision,
+        signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }> {
-        return invokeStore('pds_restore_character', { characterId, expectedRevision })
+        return invokeArchiveOperation(
+            'pds_restore_character',
+            { characterId, expectedRevision },
+            signal,
+        )
     }
 
     async replaceFromDatabase(

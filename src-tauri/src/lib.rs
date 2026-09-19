@@ -839,6 +839,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_archive_preview,
         persistent_store::commands::pds_archive_character,
         persistent_store::commands::pds_restore_character,
+        persistent_store::commands::pds_cancel_character_archive_operation,
         persistent_store::commands::pds_replace_begin,
         persistent_store::commands::pds_replace_put_root,
         persistent_store::commands::pds_replace_put_presets,

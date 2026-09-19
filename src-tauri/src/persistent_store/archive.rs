@@ -8,10 +8,55 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 const ARCHIVE_PAYLOAD_VERSION: u32 = 1;
 const MAX_DECODED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ARCHIVE_CANCELLED_MESSAGE: &str = "character archive operation cancelled";
+
+fn ensure_not_cancelled(is_cancelled: &dyn Fn() -> bool) -> StoreResult<()> {
+    if is_cancelled() {
+        return validation(ARCHIVE_CANCELLED_MESSAGE);
+    }
+    Ok(())
+}
+
+struct CancellationAwareIo<'a, T> {
+    inner: T,
+    is_cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<'a, T> CancellationAwareIo<'a, T> {
+    fn new(inner: T, is_cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self { inner, is_cancelled }
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if (self.is_cancelled)() {
+            return Err(io::Error::other(ARCHIVE_CANCELLED_MESSAGE));
+        }
+        Ok(())
+    }
+}
+
+impl<T: Read> Read for CancellationAwareIo<'_, T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.read(buffer)
+    }
+}
+
+impl<T: Write> Write for CancellationAwareIo<'_, T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.check()?;
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
 
 /// The value stored in `characters.archived_object`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -200,7 +245,9 @@ fn write_payload_to(
     generation: &str,
     character_id: &str,
     mut writer: impl Write,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> StoreResult<ArchivePayloadMetadata> {
+    ensure_not_cancelled(is_cancelled)?;
     let row: Option<(String, String, Option<String>)> = connection
         .query_row(
             "SELECT detail, type, archived_object FROM characters
@@ -239,6 +286,7 @@ fn write_payload_to(
     let mut conversation_count = 0_i64;
     let mut total_message_count = 0_i64;
     while let Some(row) = rows.next()? {
+        ensure_not_cancelled(is_cancelled)?;
         let conversation_id = row.get::<_, String>(0)?;
         let configured_index = row.get::<_, i64>(1)?;
         let recent_at = row.get::<_, i64>(2)?;
@@ -273,6 +321,7 @@ fn write_payload_to(
             statement.query(params![generation, character_id, conversation_id])?;
         let mut written_messages = 0_i64;
         while let Some(row) = message_rows.next()? {
+            ensure_not_cancelled(is_cancelled)?;
             let message_index = row.get::<_, i64>(0)?;
             let message_id = row.get::<_, Option<String>>(1)?;
             let value = row.get::<_, String>(2)?;
@@ -341,6 +390,7 @@ struct StagedArchivePayload {
 
 struct ArchivePayloadSeed<'a> {
     connection: &'a Connection,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ArchivePayloadSeed<'_> {
@@ -352,12 +402,14 @@ impl<'de> DeserializeSeed<'de> for ArchivePayloadSeed<'_> {
     {
         deserializer.deserialize_map(ArchivePayloadVisitor {
             connection: self.connection,
+            is_cancelled: self.is_cancelled,
         })
     }
 }
 
 struct ArchivePayloadVisitor<'a> {
     connection: &'a Connection,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> Visitor<'de> for ArchivePayloadVisitor<'_> {
@@ -384,6 +436,7 @@ impl<'de> Visitor<'de> for ArchivePayloadVisitor<'_> {
                     &mut counts,
                     map.next_value_seed(ConversationsSeed {
                         connection: self.connection,
+                        is_cancelled: self.is_cancelled,
                     })?,
                     "conversations",
                 )?,
@@ -426,6 +479,7 @@ fn set_once<E: de::Error, T>(
 
 struct ConversationsSeed<'a> {
     connection: &'a Connection,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ConversationsSeed<'_> {
@@ -437,12 +491,14 @@ impl<'de> DeserializeSeed<'de> for ConversationsSeed<'_> {
     {
         deserializer.deserialize_seq(ConversationsVisitor {
             connection: self.connection,
+            is_cancelled: self.is_cancelled,
         })
     }
 }
 
 struct ConversationsVisitor<'a> {
     connection: &'a Connection,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> Visitor<'de> for ConversationsVisitor<'_> {
@@ -460,10 +516,14 @@ impl<'de> Visitor<'de> for ConversationsVisitor<'_> {
         let mut message_count = 0_i64;
         let mut previous_index = None;
         loop {
+            if (self.is_cancelled)() {
+                return Err(de::Error::custom(ARCHIVE_CANCELLED_MESSAGE));
+            }
             let ordinal = conversation_count;
             let Some(conversation) = sequence.next_element_seed(ConversationSeed {
                 connection: self.connection,
                 ordinal,
+                is_cancelled: self.is_cancelled,
             })?
             else {
                 break;
@@ -520,6 +580,7 @@ struct StagedConversation {
 struct ConversationSeed<'a> {
     connection: &'a Connection,
     ordinal: i64,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ConversationSeed<'_> {
@@ -532,6 +593,7 @@ impl<'de> DeserializeSeed<'de> for ConversationSeed<'_> {
         deserializer.deserialize_map(ConversationVisitor {
             connection: self.connection,
             ordinal: self.ordinal,
+            is_cancelled: self.is_cancelled,
         })
     }
 }
@@ -539,6 +601,7 @@ impl<'de> DeserializeSeed<'de> for ConversationSeed<'_> {
 struct ConversationVisitor<'a> {
     connection: &'a Connection,
     ordinal: i64,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> Visitor<'de> for ConversationVisitor<'_> {
@@ -576,6 +639,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
                     map.next_value_seed(MessagesSeed {
                         connection: self.connection,
                         conversation_ordinal: self.ordinal,
+                        is_cancelled: self.is_cancelled,
                     })?,
                     "messages",
                 )?,
@@ -608,6 +672,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
 struct MessagesSeed<'a> {
     connection: &'a Connection,
     conversation_ordinal: i64,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> DeserializeSeed<'de> for MessagesSeed<'_> {
@@ -620,6 +685,7 @@ impl<'de> DeserializeSeed<'de> for MessagesSeed<'_> {
         deserializer.deserialize_seq(MessagesVisitor {
             connection: self.connection,
             conversation_ordinal: self.conversation_ordinal,
+            is_cancelled: self.is_cancelled,
         })
     }
 }
@@ -627,6 +693,7 @@ impl<'de> DeserializeSeed<'de> for MessagesSeed<'_> {
 struct MessagesVisitor<'a> {
     connection: &'a Connection,
     conversation_ordinal: i64,
+    is_cancelled: &'a dyn Fn() -> bool,
 }
 
 impl<'de> Visitor<'de> for MessagesVisitor<'_> {
@@ -642,7 +709,13 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
     {
         let mut count = 0_i64;
         let mut previous_index = None;
-        while let Some(message) = sequence.next_element::<ArchivedMessage>()? {
+        loop {
+            if (self.is_cancelled)() {
+                return Err(de::Error::custom(ARCHIVE_CANCELLED_MESSAGE));
+            }
+            let Some(message) = sequence.next_element::<ArchivedMessage>()? else {
+                break;
+            };
             if previous_index.is_some_and(|previous| message.message_index <= previous) {
                 return Err(de::Error::custom(
                     "archived messages are not in message order",
@@ -705,12 +778,18 @@ fn clear_restore_staging(connection: &Connection) -> StoreResult<()> {
 fn stage_payload(
     connection: &Connection,
     file: std::fs::File,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> StoreResult<StagedArchivePayload> {
+    ensure_not_cancelled(is_cancelled)?;
     let decoder = GzDecoder::new(BufReader::new(file));
     let mut limited = decoder.take(MAX_DECODED_ARCHIVE_BYTES.saturating_add(1));
     let payload = {
         let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
-        let payload = ArchivePayloadSeed { connection }.deserialize(&mut deserializer)?;
+        let payload = ArchivePayloadSeed {
+            connection,
+            is_cancelled,
+        }
+        .deserialize(&mut deserializer)?;
         deserializer.end()?;
         payload
     };
@@ -779,6 +858,25 @@ pub(super) fn archive_character(
     expected_revision: i64,
     now_ms: i64,
 ) -> StoreResult<RevisionResult> {
+    archive_character_with_cancellation(
+        connection,
+        cas,
+        character_id,
+        expected_revision,
+        now_ms,
+        &|| false,
+    )
+}
+
+pub(super) fn archive_character_with_cancellation(
+    connection: &mut Connection,
+    cas: &PayloadCas,
+    character_id: &str,
+    expected_revision: i64,
+    now_ms: i64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> StoreResult<RevisionResult> {
+    ensure_not_cancelled(is_cancelled)?;
     if now_ms < 0 {
         return validation("archive timestamp must be nonnegative");
     }
@@ -798,13 +896,25 @@ pub(super) fn archive_character(
     )?;
     let mut staging = cas.create_ipc_staging_file()?;
     let metadata = {
-        let mut encoder = GzEncoder::new(staging.as_file_mut(), Compression::default());
-        let metadata = write_payload_to(connection, &generation, character_id, &mut encoder)?;
+        let mut encoder = GzEncoder::new(
+            CancellationAwareIo::new(staging.as_file_mut(), is_cancelled),
+            Compression::default(),
+        );
+        let metadata = write_payload_to(
+            connection,
+            &generation,
+            character_id,
+            &mut encoder,
+            is_cancelled,
+        )?;
         encoder.finish()?;
         metadata
     };
+    ensure_not_cancelled(is_cancelled)?;
     staging.as_file_mut().seek(SeekFrom::Start(0))?;
-    let prepared = cas.prepare_reader(staging.as_file_mut())?;
+    let mut reader = CancellationAwareIo::new(staging.as_file_mut(), is_cancelled);
+    let prepared = cas.prepare_reader(&mut reader)?;
+    ensure_not_cancelled(is_cancelled)?;
     super::AssetObjectCatalog::new(connection).register(
         &[super::asset_object_catalog::AssetObjectRegistration {
             object_hash: prepared.content_hash.clone(),
@@ -830,12 +940,14 @@ pub(super) fn archive_character(
         connection,
         expected_revision,
         |transaction, active| {
+            ensure_not_cancelled(is_cancelled)?;
             if is_archived(transaction, active, character_id)? {
                 return Err(archived_error(character_id));
             }
             Ok(())
         },
         |transaction, generation, ()| {
+            ensure_not_cancelled(is_cancelled)?;
             transaction.execute(
                 "DELETE FROM messages WHERE generation = ?1 AND character_id = ?2",
                 params![generation, character_id],
@@ -864,6 +976,23 @@ pub(super) fn restore_character(
     character_id: &str,
     expected_revision: i64,
 ) -> StoreResult<RevisionResult> {
+    restore_character_with_cancellation(
+        connection,
+        cas,
+        character_id,
+        expected_revision,
+        &|| false,
+    )
+}
+
+pub(super) fn restore_character_with_cancellation(
+    connection: &mut Connection,
+    cas: &PayloadCas,
+    character_id: &str,
+    expected_revision: i64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> StoreResult<RevisionResult> {
+    ensure_not_cancelled(is_cancelled)?;
     let generation = super::active_generation(connection)?;
     let actual_revision = super::current_revision(connection)?;
     if actual_revision != expected_revision {
@@ -882,7 +1011,8 @@ pub(super) fn restore_character(
     };
     create_restore_staging(connection)?;
     let result = (|| {
-        let payload = stage_payload(connection, file)?;
+        let payload = stage_payload(connection, file, is_cancelled)?;
+        ensure_not_cancelled(is_cancelled)?;
         if payload.version != ARCHIVE_PAYLOAD_VERSION {
             return validation("archived character payload version is unsupported");
         }
@@ -909,12 +1039,14 @@ pub(super) fn restore_character(
             connection,
             expected_revision,
             |transaction, active| {
+                ensure_not_cancelled(is_cancelled)?;
                 if !is_archived(transaction, active, character_id)? {
                     return validation(format!("Character {character_id} is not archived"));
                 }
                 Ok(())
             },
             |transaction, generation, ()| {
+                ensure_not_cancelled(is_cancelled)?;
                 let inserted_conversations = transaction.execute(
                     "INSERT INTO conversations (
                         generation, character_id, conversation_id, configured_index, recent_at,
@@ -929,6 +1061,7 @@ pub(super) fn restore_character(
                 if inserted_conversations as i64 != payload.conversation_count {
                     return validation("archived character conversation staging is incomplete");
                 }
+                ensure_not_cancelled(is_cancelled)?;
                 let inserted_messages = transaction.execute(
                     "INSERT INTO messages (
                         generation, character_id, conversation_id, message_index,
@@ -945,6 +1078,7 @@ pub(super) fn restore_character(
                 if inserted_messages as i64 != payload.message_count {
                     return validation("archived character message staging is incomplete");
                 }
+                ensure_not_cancelled(is_cancelled)?;
                 let updated = transaction.execute(
                     "UPDATE characters
                      SET detail = ?3, archived_object = NULL, conversation_count = ?4, recent_at = ?5

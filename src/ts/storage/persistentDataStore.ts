@@ -573,10 +573,12 @@ export interface PersistentDataStore {
     archiveCharacter(
         characterId: string,
         expectedRevision: DataRevision,
+        signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }>
     restoreCharacter(
         characterId: string,
         expectedRevision: DataRevision,
+        signal?: AbortSignal,
     ): Promise<{ revision: DataRevision }>
     replaceFromDatabase(
         database: Database,
