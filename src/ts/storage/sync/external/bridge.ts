@@ -150,8 +150,10 @@ export class ExternalStorageBridge {
         })
     }
 
-    startJob(request: StartExternalJobRequest): Promise<ExternalJobSummary> {
-        return this.native<ExternalJobSummary>('external_storage_start_job', { request })
+    startJob(request: StartExternalJobRequest, jobId?: string): Promise<ExternalJobSummary> {
+        return this.native<ExternalJobSummary>('external_storage_start_job', {
+            request, ...(jobId === undefined ? {} : { jobId }),
+        })
     }
 
     cancelJob(jobId: string): Promise<ExternalJobSummary> {

@@ -1909,6 +1909,10 @@ export const languageEnglish = {
     risuNest: {
         persistentData: {
             followupFailed: 'The restore is saved, but a follow-up step could not finish. Do not import the backup again. Check sync status or restart the app.',
+            confirmApplicationTitle: 'The external operation still needs confirmation',
+            confirmApplicationHelp: 'The operation may still be running or may have applied only part of the data. Editing is paused to protect it. Retry checks or resumes the same operation; it does not start a new restore.',
+            confirmApplication: 'Check the same operation again',
+            confirmApplicationFailed: 'The result is still unconfirmed. Check your connection and available storage, then retry. No successful rollback has been confirmed.',
             refreshTitle: 'Saved changes need a screen refresh',
             refreshHelp: 'Your changes are saved. Editing is paused until the saved data can be read back into the screen. Refreshing does not save or import the data again.',
             refresh: 'Refresh screen',

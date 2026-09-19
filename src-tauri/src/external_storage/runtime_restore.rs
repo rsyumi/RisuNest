@@ -95,6 +95,19 @@ pub(crate) fn completed_restore(app: &AppHandle, job: &DurableJob) -> Result<Opt
     completed_restore_in_store(&runtime::native_store(app)?, job)
 }
 
+pub(crate) fn application_started(job: &DurableJob) -> bool {
+    job.request.kind == JobKind::Restore && job.summary["applicationStarted"] == true
+}
+
+fn mark_application_started(root: &Path, job: &DurableJob) -> Result<()> {
+    let jobs = JobStore::open(root)?;
+    let mut current = jobs.read(&job.id)?;
+    current.summary["applicationStarted"] = json!(true);
+    current.summary["phase"] = json!("applying-local");
+    current.summary["updatedAtMs"] = json!(runtime::now_ms().to_string());
+    jobs.put(&current)
+}
+
 fn corrupt() -> ProviderError {
     ProviderError::new(ErrorKind::Corrupt)
 }
@@ -420,17 +433,19 @@ fn prepare_local_restore(
     // bundle with a missing object from installing half of itself.
     let prepared_sections =
         super::sections::prepare_received_backup_sections(&sections, &cancel)?;
+    let marker = restore_marker(job, expected_revision)?;
+    let marker_value = serde_json::to_value(&marker).map_err(runtime::local_error)?;
+    cancel.check()?;
+    mark_application_started(&runtime::root(app)?, job)?;
     let device = store.device_store_mut().map_err(pds_error)?;
     for rows in &prepared_sections {
-        cancel.check()?;
         device.restore_prepared_backup_section(rows).map_err(pds_error)?;
     }
-    let marker = restore_marker(job, expected_revision)?;
     let revision = store
         .finish_prepared_replace_with_app_kv(
             prepared,
             &restore_marker_key(&job.id),
-            &serde_json::to_value(&marker).map_err(runtime::local_error)?,
+            &marker_value,
         )
         .map_err(pds_error)?;
     if revision.revision.to_string() != marker.received_revision {
@@ -469,6 +484,33 @@ mod tests {
             selection_epoch: "selection".into(),
             revision: 0,
         }
+    }
+
+    #[test]
+    fn local_application_evidence_survives_reopen_and_later_phase_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let input = serde_json::from_value(json!({
+            "connectionId":"synthetic-connection", "kind":"restore",
+            "snapshotId":"synthetic-snapshot", "targetRevision":"0"
+        })).unwrap();
+        let job = DurableJob::new(input, false, 1, identity());
+        JobStore::open(root.path()).unwrap().put(&job).unwrap();
+        mark_application_started(root.path(), &job).unwrap();
+        update_phase(root.path(), &job, "downloading").unwrap();
+        let reopened = JobStore::open(root.path()).unwrap().read(&job.id).unwrap();
+        assert!(application_started(&reopened));
+        assert_eq!(reopened.summary["phase"], "downloading");
+        let mut store = PersistentStore::open(root.path()).unwrap();
+        assert!(completed_restore_in_store(&store, &reopened).unwrap().is_none());
+        let stage = store.replace_begin().unwrap();
+        store.replace_put_root(&stage.staging_id, &json!({"marker":"restored"})).unwrap();
+        let prepared = store.prepare_replace_commit(&stage.staging_id, Some(0)).unwrap();
+        let marker = serde_json::to_value(restore_marker(&job, 0).unwrap()).unwrap();
+        store.finish_prepared_replace_with_app_kv(prepared, &restore_marker_key(&job.id), &marker).unwrap();
+        for _ in 0..2 {
+            assert_eq!(completed_restore_in_store(&store, &reopened).unwrap().unwrap()["receivedRevision"], "1");
+        }
+        assert_eq!(store.revision().unwrap(), 1);
     }
 
     #[test]

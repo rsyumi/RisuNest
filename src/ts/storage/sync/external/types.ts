@@ -187,6 +187,12 @@ export interface StartExternalJobRequest {
 
 export interface ExternalJobSummary {
     id: string
+    applicationStarted?: boolean
+    restoreRequest?: {
+        snapshotId: string
+        targetRevision: DecimalString
+        restoreAreas: ExternalRestoreArea[]
+    }
     connectionId: string
     kind: ExternalJobKind
     state:

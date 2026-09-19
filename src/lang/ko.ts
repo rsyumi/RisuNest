@@ -1721,6 +1721,10 @@ export const languageKorean = {
     risuNest: {
         persistentData: {
             followupFailed: '복원 내용은 저장되었지만 후속 작업을 마치지 못했습니다. 백업을 다시 가져오지 말고 동기화 상태를 확인하거나 앱을 재시작해주세요.',
+            confirmApplicationTitle: '외부 저장소 작업을 확인해야 합니다',
+            confirmApplicationHelp: '작업이 진행 중이거나 일부 데이터만 적용되었을 수 있어 편집을 잠시 멈췄습니다. 다시 확인하면 새 복원을 시작하지 않고 같은 작업을 확인하거나 이어서 처리합니다.',
+            confirmApplication: '같은 작업 다시 확인',
+            confirmApplicationFailed: '아직 결과를 확인하지 못했습니다. 연결과 저장 공간을 확인한 뒤 다시 시도해주세요. 데이터가 이전 상태로 돌아갔다고 확인된 것은 아닙니다.',
             refreshTitle: '저장은 완료되었지만 화면을 새로 고쳐야 합니다',
             refreshHelp: '변경 사항은 저장되어 있습니다. 저장된 데이터를 화면에 다시 불러올 때까지 편집이 잠시 중단됩니다. 화면 새로 고침은 저장이나 가져오기를 다시 실행하지 않습니다.',
             refresh: '화면 새로 고침',

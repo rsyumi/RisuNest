@@ -122,6 +122,16 @@ impl DurableJob {
             receive_staging_id: None,
         }
     }
+    pub fn with_restore_id(mut self, id: String) -> Result<Self> {
+        if self.request.kind != JobKind::Restore
+            || uuid::Uuid::parse_str(&id).ok().is_none_or(|parsed| parsed.to_string() != id)
+        {
+            return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+        }
+        self.summary["id"] = json!(id);
+        self.id = id;
+        Ok(self)
+    }
     pub fn terminal(&self) -> bool {
         matches!(
             self.summary["state"].as_str(),
@@ -173,6 +183,17 @@ impl JobStore {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
         Ok(())
+    }
+    /// Unlike put, a retried start must never replace a worker's durable state.
+    pub fn insert_new(&self, job: &DurableJob) -> Result<bool> {
+        let encoded = serde_json::to_string(job).map_err(failure)?;
+        Ok(self.0.execute(
+            "INSERT OR IGNORE INTO external_requests
+             SELECT ?1,?2,?3 WHERE NOT EXISTS(
+                 SELECT 1 FROM external_requests WHERE connection_id=?2
+                 AND COALESCE(json_extract(value,'$.summary.state'),'') NOT IN ('succeeded','failed','cancelled'))",
+            rusqlite::params![job.id, job.request.connection_id, encoded],
+        ).map_err(failure)? == 1)
     }
     pub fn read(&self, id: &str) -> Result<DurableJob> {
         let bytes: Option<String> = self
@@ -388,6 +409,39 @@ mod tests {
             revision: 1,
         }
     }
+    #[test]
+    fn a_retried_restore_start_never_overwrites_its_original_job() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs = JobStore::open(root.path()).unwrap();
+        let input = serde_json::from_value(json!({
+            "connectionId":"synthetic", "kind":"restore",
+            "snapshotId":"snapshot", "targetRevision":"1"
+        })).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let queued = DurableJob::new(input, false, 1, identity())
+            .with_restore_id(id.clone()).unwrap();
+        assert_eq!(queued.summary["id"], id);
+        assert!(jobs.insert_new(&queued).unwrap());
+        let mut running = queued.clone();
+        running.summary["state"] = json!("running");
+        running.summary["applicationStarted"] = json!(true);
+        jobs.put(&running).unwrap();
+        assert!(!jobs.insert_new(&queued).unwrap());
+        assert_eq!(jobs.read(&id).unwrap().summary, running.summary);
+        let other = queued.clone().with_restore_id(uuid::Uuid::new_v4().to_string()).unwrap();
+        assert!(!jobs.insert_new(&other).unwrap());
+        assert!(jobs.read(&other.id).is_err());
+        running.summary["state"] = json!("succeeded");
+        running.summary["result"] = json!({"receivedRevision":"2"});
+        jobs.put(&running).unwrap();
+        drop(jobs);
+        let reopened = JobStore::open(root.path()).unwrap();
+        assert!(!reopened.insert_new(&queued).unwrap());
+        assert_eq!(reopened.read(&id).unwrap().summary, running.summary);
+        assert!(queued.clone().with_restore_id("../job".into()).is_err());
+        assert!(DurableJob::new(request(), false, 1, identity()).with_restore_id(id).is_err());
+    }
+
     #[test]
     fn revisions_and_session_inputs_are_validated() {
         let mut input = request();

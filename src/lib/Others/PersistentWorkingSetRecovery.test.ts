@@ -4,7 +4,14 @@ import { mount, tick, unmount } from 'svelte'
 import type { Writable } from 'svelte/store'
 import type { CommittedApplyOutcome } from 'src/ts/storage/persistentDataRuntime'
 
-const mocks = vi.hoisted(() => ({ retry: vi.fn() }))
+const mocks = vi.hoisted(() => ({ retry: vi.fn(), retryExternal: vi.fn() }))
+vi.mock('src/ts/storage/sync/external/applicationRecovery', async () => {
+    const { writable } = await import('svelte/store')
+    return {
+        externalApplicationRecovery: writable(null),
+        retryExternalApplication: mocks.retryExternal,
+    }
+})
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => {
     const { writable } = await import('svelte/store')
     return {
@@ -16,11 +23,13 @@ vi.mock('src/lang', async () => ({
     language: (await import('src/lang/en')).languageEnglish,
 }))
 
+import { externalApplicationRecovery } from 'src/ts/storage/sync/external/applicationRecovery'
 import Recovery from './PersistentWorkingSetRecovery.svelte'
 import { persistentWorkingSetRefreshRevision } from 'src/ts/storage/persistentDataRuntime.svelte'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
 
+const external = externalApplicationRecovery as Writable<{ jobId: string; confirmationPending: boolean } | null>
 const revision = persistentWorkingSetRefreshRevision as Writable<number | null>
 const copy = languageEnglish.risuNest.persistentData
 
@@ -30,6 +39,8 @@ describe('committed working-set recovery', () => {
 
     beforeEach(() => {
         mocks.retry.mockReset()
+        mocks.retryExternal.mockReset()
+        external.set(null)
         revision.set(null)
         target = document.createElement('div')
         document.body.append(target)
@@ -89,6 +100,30 @@ describe('committed working-set recovery', () => {
         expect(target.querySelector('[role="dialog"]')).not.toBeNull()
         expect(target.querySelector('button')!.disabled).toBe(false)
         expect(mocks.retry).toHaveBeenCalledOnce()
+    })
+
+    it('distinguishes an unconfirmed operation from a confirmed commit and retries its owner', async () => {
+        external.set({ jobId: 'synthetic', confirmationPending: true })
+        mocks.retryExternal.mockRejectedValueOnce(new Error('still unknown'))
+        await setup(null)
+        expect(target.textContent).toContain(copy.confirmApplicationTitle)
+        expect(target.textContent).not.toContain(copy.refreshHelp)
+        expect(target.querySelector('button')?.textContent?.trim()).toBe(copy.confirmApplication)
+        target.querySelector('button')!.click()
+        await vi.waitFor(() => expect(target.textContent).toContain(copy.confirmApplicationFailed))
+        expect(mocks.retry).not.toHaveBeenCalled()
+        expect(mocks.retryExternal).toHaveBeenCalledOnce()
+    })
+
+    it('keeps plugin-only recovery available after the runtime guard has cleared', async () => {
+        external.set({ jobId: 'synthetic', confirmationPending: false })
+        mocks.retryExternal.mockImplementation(async () => { external.set(null) })
+        await setup(null)
+        expect(target.textContent).toContain(copy.refreshTitle)
+        target.querySelector('button')!.click()
+        await vi.waitFor(() => expect(target.querySelector('[role="dialog"]')).toBeNull())
+        expect(mocks.retry).not.toHaveBeenCalled()
+        expect(mocks.retryExternal).toHaveBeenCalledOnce()
     })
 
     it('provides Korean and English text for every recovery message', () => {

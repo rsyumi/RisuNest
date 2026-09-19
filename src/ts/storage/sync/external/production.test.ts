@@ -26,6 +26,9 @@ const mocks = vi.hoisted(() => ({
     refreshWorkingSet: vi.fn(async (revision: number): Promise<CommittedApplyOutcome> => ({
         kind: 'committed', revision, projection: 'applied',
     })),
+    refreshReleased: vi.fn(async (revision: number): Promise<CommittedApplyOutcome> => ({
+        kind: 'committed', revision, projection: 'applied',
+    })),
     releaseFence: vi.fn(),
     reloadPlugins: vi.fn(async () => {}),
     pendingContinuation: undefined as undefined | (() => void | Promise<void>),
@@ -46,6 +49,7 @@ vi.mock('../../persistentDataRuntime.svelte', () => ({
         refreshCommittedWorkingSet: mocks.refreshWorkingSet,
         release: mocks.releaseFence,
     })),
+    refreshActiveWorkingSetFromStore: mocks.refreshReleased,
     getPersistentStorageAuthorityEpoch: vi.fn(() => 2),
     getPersistentDataRuntime: vi.fn(() => mocks.persistentRuntime),
 }))
@@ -127,7 +131,19 @@ function succeeded(connectionId: string, revision: string): ExternalJobSummary {
 
 describe('external storage production integration', () => {
     beforeEach(() => {
+        vi.resetModules()
         vi.clearAllMocks()
+        mocks.releaseFence.mockReset()
+        mocks.flush.mockReset().mockResolvedValue(undefined)
+        mocks.reloadPlugins.mockReset().mockResolvedValue(undefined)
+        mocks.refreshWorkingSet.mockReset().mockImplementation(async revision => ({
+            kind: 'committed', revision, projection: 'applied',
+        }))
+        mocks.refreshReleased.mockReset().mockImplementation(async revision => ({
+            kind: 'committed', revision, projection: 'applied',
+        }))
+        mocks.bridge.getJob.mockReset()
+        mocks.bridge.applyReceived.mockReset()
         mocks.pendingContinuation = undefined
         mocks.restoreConflictSource.mockImplementation(async (source) => {
             await source({
@@ -256,6 +272,90 @@ describe('external storage production integration', () => {
             .toBe('external:new-sync:new-epoch')
     })
 
+    it.each(['start', 'poll'] as const)('recovers a lost restore %s response with the original job ID', async (failure) => {
+        const { installExternalStorageProduction, requestExternalStorageRestore, requestExternalStorageNow } = await import('./production')
+        const recovery = await import('./applicationRecovery')
+        await installExternalStorageProduction()
+        mocks.bridge.startJob.mockImplementationOnce(async (_request, id) => {
+            if (failure === 'start') throw new Error('synthetic lost response')
+            return { ...succeeded('old-sync', '8'), id, kind: 'restore', state: 'running', result: undefined }
+        })
+        mocks.bridge.getJob.mockRejectedValueOnce(new Error('synthetic lost response'))
+        await expect(requestExternalStorageRestore('old-sync', 'snapshot-1', ['library']))
+            .rejects.toThrow('lost response')
+        expect(mocks.releaseFence).not.toHaveBeenCalled()
+        await expect(requestExternalStorageNow('old-sync', 'sync')).rejects.toThrow('pending external application')
+        await expect(requestExternalStorageRestore('old-sync', 'different', ['library']))
+            .rejects.toThrow('pending external application')
+        const id = mocks.bridge.startJob.mock.calls[0][1]
+        mocks.bridge.startJob.mockImplementation(async (_request, resumedId) => ({
+            ...succeeded('old-sync', '8'), id: resumedId, kind: 'restore',
+            applicationStarted: true, result: { snapshotId: 'snapshot-1', receivedRevision: '9' },
+        }))
+        await recovery.retryExternalApplication()
+        expect(mocks.bridge.startJob.mock.calls.map(call => call[1])).toEqual([id, id])
+        expect(mocks.bridge.startJob.mock.calls.map(call => call[0].targetRevision)).toEqual(['8', '8'])
+        expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(9)
+        expect(mocks.releaseFence).toHaveBeenCalledOnce()
+        expect(recovery.hasPendingExternalApplication()).toBe(false)
+    })
+
+    it.each([false, true])('uses a matching unfinished restore after reopen and refuses a different request (%s)', async (different) => {
+        const { installExternalStorageProduction, requestExternalStorageRestore } = await import('./production')
+        const pending = {
+            ...succeeded('old-sync', '8'), id: 'existing-restore', kind: 'restore',
+            state: 'uncertain', phase: 'local-apply-unknown', applicationStarted: true,
+            restoreRequest: { snapshotId: 'snapshot-1', targetRevision: '8', restoreAreas: ['library'] },
+        }
+        mocks.bridge.getState.mockResolvedValue({ ...initialState, jobs: [pending] })
+        await installExternalStorageProduction()
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...pending, id, state: 'succeeded', result: { receivedRevision: '9' },
+        }))
+        const operation = requestExternalStorageRestore('old-sync', different ? 'other' : 'snapshot-1', ['library'])
+        if (different) {
+            await expect(operation).rejects.toThrow('different snapshot')
+            expect(mocks.bridge.startJob).not.toHaveBeenCalled()
+            expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+        } else {
+            await expect(operation).resolves.toMatchObject({ state: 'succeeded' })
+            expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
+                snapshotId: 'snapshot-1', targetRevision: '8', restoreAreas: ['library'],
+            }), 'existing-restore')
+        }
+    })
+
+    it.each([false, true])('unlocks a failed restore only when applicationStarted is false (%s)', async (started) => {
+        const { installExternalStorageProduction, requestExternalStorageRestore } = await import('./production')
+        const recovery = await import('./applicationRecovery')
+        await installExternalStorageProduction()
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...succeeded('old-sync', '8'), id, kind: 'restore', state: 'failed',
+            applicationStarted: started, result: undefined,
+        }))
+        await expect(requestExternalStorageRestore('old-sync', 'snapshot-1', ['library'])).rejects.toThrow()
+        expect(mocks.releaseFence).toHaveBeenCalledTimes(started ? 0 : 1)
+        expect(recovery.hasPendingExternalApplication()).toBe(started)
+        expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+    })
+
+    it('recovers a lost receive response from its committed job receipt', async () => {
+        const { installExternalStorageProduction, requestExternalStorageResolveConflict } = await import('./production')
+        await installExternalStorageProduction()
+        mocks.bridge.startJob.mockResolvedValue({
+            ...succeeded('old-sync', '8'), kind: 'resolve-conflict', state: 'waiting', phase: 'remote-apply',
+            result: { receiveReady: true, expectedRevision: '8' },
+        })
+        mocks.bridge.applyReceived.mockRejectedValueOnce(new Error('synthetic lost receive reply'))
+        mocks.bridge.getJob.mockResolvedValue({
+            ...succeeded('old-sync', '8'), result: { receivedRevision: '9' },
+        })
+        await requestExternalStorageResolveConflict('old-sync', 'synthetic-conflict', 'remote')
+        expect(mocks.bridge.applyReceived).toHaveBeenCalledOnce()
+        expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(9)
+        expect(mocks.releaseFence).toHaveBeenCalledOnce()
+    })
+
     it('releases the replacement fence before authoritative restore plugin reload', async () => {
         const {
             installExternalStorageProduction,
@@ -263,11 +363,11 @@ describe('external storage production integration', () => {
         } = await import('./production')
         await installExternalStorageProduction()
         mocks.revision = 23
-        mocks.bridge.startJob.mockResolvedValue({
-            ...succeeded('old-sync', '23'),
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...succeeded('old-sync', '23'), id,
             kind: 'restore',
             result: { snapshotId: 'snapshot-1', receivedRevision: '24' },
-        })
+        }))
         const events: string[] = []
         mocks.releaseFence.mockImplementation(() => events.push('fence-released'))
         mocks.reloadPlugins.mockImplementation(async () => { events.push('plugins-reloaded') })
@@ -279,7 +379,7 @@ describe('external storage production integration', () => {
         expect(mocks.flush).toHaveBeenCalledWith('external-storage-restore')
         expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
             targetRevision: '23', snapshotId: 'snapshot-1', kind: 'restore',
-        }))
+        }), expect.any(String))
         expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(24)
         expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
@@ -293,11 +393,11 @@ describe('external storage production integration', () => {
         } = await import('./production')
         await installExternalStorageProduction()
         mocks.revision = 23
-        mocks.bridge.startJob.mockResolvedValue({
-            ...succeeded('old-sync', '23'),
+        mocks.bridge.startJob.mockImplementation(async (_request, id) => ({
+            ...succeeded('old-sync', '23'), id,
             kind: 'restore',
             result: { snapshotId: 'snapshot-1', receivedRevision: '24' },
-        })
+        }))
         mocks.refreshWorkingSet.mockResolvedValueOnce({
             kind: 'committed', revision: 24, projection: 'refresh-required',
         })
@@ -310,15 +410,9 @@ describe('external storage production integration', () => {
 
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
         expect(mocks.reloadPlugins).not.toHaveBeenCalled()
-        expect(mocks.registerContinuation).toHaveBeenCalledWith(
-            24,
-            mocks.persistentRuntime,
-            2,
-            expect.any(Function),
-        )
         expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
-        expect(mocks.pendingContinuation).toBeTypeOf('function')
-        await mocks.pendingContinuation!()
+        await (await import('./applicationRecovery')).retryExternalApplication()
+        expect(mocks.refreshReleased).toHaveBeenCalledWith(24)
         expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
         expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
         expect(mocks.refreshWorkingSet).toHaveBeenCalledOnce()
@@ -377,13 +471,16 @@ describe('external storage production integration', () => {
             mocks.bridge.applyReceived.mockResolvedValue({
                 snapshotId: 'remote', receivedRevision,
             })
+            mocks.bridge.getJob.mockResolvedValue({
+                ...succeeded('old-sync', '11'), result: { receivedRevision },
+            })
             await installExternalStorageProduction()
 
             await expect(
                 requestExternalStorageResolveConflict('old-sync', 'conflict-1', 'remote'),
             ).rejects.toBeInstanceOf(RangeError)
             expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
-            expect(mocks.releaseFence).toHaveBeenCalledOnce()
+            expect(mocks.releaseFence).not.toHaveBeenCalled()
         },
     )
 
@@ -455,7 +552,8 @@ describe('external storage production integration', () => {
         expect(mocks.bridge.applyReceived).toHaveBeenCalledOnce()
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
         expect(mocks.reloadPlugins).not.toHaveBeenCalled()
-        await mocks.pendingContinuation!()
+        await (await import('./applicationRecovery')).retryExternalApplication()
+        expect(mocks.refreshReleased).toHaveBeenCalledWith(12)
         expect(mocks.bridge.applyReceived).toHaveBeenCalledOnce()
         expect(mocks.refreshWorkingSet).toHaveBeenCalledOnce()
         expect(mocks.reloadPlugins).toHaveBeenCalledOnce()
