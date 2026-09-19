@@ -338,10 +338,14 @@ content, not wire traffic; it excludes reused local objects. Progress polling
 cannot delay completion or update a subsequent cycle after cancellation.
 
 Conflicts retain the local revision and remote head used for the preview. Both
-complete `.risulossless` packages are verified before applying either choice.
-The settings page can restore either archive through the normal validated
-lossless-import workflow, which backs up the current library and refreshes plugin
-state. Restored content remains paused for inspection. Parent/child and order
+library sides are preserved as verified references before applying either choice.
+These entries are not independent offline backup files. Each side reports whether
+its content is available locally, requires the server connection, or is unavailable.
+The settings page restores an available side through the validated restore workflow,
+which backs up the current library and refreshes plugin state. Export a portable
+backup to keep a self-contained file. Restored content remains paused for inspection.
+Optional device sections are not included in this library conflict preservation.
+Parent/child and order
 conflicts are resolved as groups. Plugin clear retains its original scope and
 membership, including empty clear and clear followed by an identical set.
 

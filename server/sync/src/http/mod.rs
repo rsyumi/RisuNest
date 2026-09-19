@@ -28,6 +28,7 @@ use tokio::sync::Semaphore;
 /// How long a held notification stream waits before confirming the head on its
 /// own. It bounds the delay of a change no writer announced.
 const HEAD_NOTICE_INTERVAL: Duration = Duration::from_secs(20);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 struct App {
@@ -57,7 +58,7 @@ pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
     let maintenance_workload = workload.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(MAINTENANCE_INTERVAL).await;
             if maintenance_alive.strong_count() == 0 {
                 break;
             }
@@ -67,12 +68,14 @@ pub fn router_with_workload(store: Arc<Store>, workload: Workload) -> Router {
             let Ok(mut work) = maintenance_workload.begin(WorkKind::Background) else {
                 continue;
             };
-            let _ = blocking(move || {
+            if let Err(error) = blocking(move || {
                 let result = store.maintain();
                 work.set_performed_work(true);
                 result
             })
-            .await;
+            .await {
+                eprintln!("sync maintenance failed: {}", error.code);
+            }
         }
     });
     let uploads_alive = Arc::downgrade(&lifetime);
