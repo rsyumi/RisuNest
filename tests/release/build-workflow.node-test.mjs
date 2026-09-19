@@ -4,6 +4,7 @@ import test from "node:test";
 import { runInNewContext } from "node:vm";
 
 const workflow = readFileSync(new URL("../../.github/workflows/release.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const stableWorkflow = readFileSync(new URL("../../.github/workflows/stable-release.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const cacheWorkflow = readFileSync(new URL("../../.github/workflows/release-cache.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const checkWorkflow = readFileSync(new URL("../../.github/workflows/release-check.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
@@ -72,6 +73,23 @@ test("WASM jobs verify native artifacts afterward and Android includes barcode t
 test("release source input uses one run timestamp instead of the commit timestamp", () => {
   assert.match(workflow, /published_at=\$\(date -u/);
   assert.doesNotMatch(workflow, /git show[^\n]*--format=%cI/);
+});
+
+test("stable tags publish automatically only from commits contained in main", () => {
+  assert.match(stableWorkflow, /tags:\n\s+- "app-v\*"\n\s+- "sync-v\*"/);
+  assert.match(stableWorkflow, /source_ref: \$\{\{ github\.sha \}\}/);
+  assert.match(stableWorkflow, /publish: true/);
+  assert.match(workflow, /fetch-depth: 0/);
+  assert.match(workflow, /if \[\[ "\$GITHUB_EVENT_NAME" == "push" \]\]/);
+  assert.match(workflow, /test "\$GITHUB_REF_TYPE" = "tag"/);
+  assert.match(workflow, /git merge-base --is-ancestor "\$source_commit" refs\/remotes\/origin\/main/);
+  assert.match(workflow, /git rev-parse "\$TAG\^\{commit\}"/);
+});
+
+test("manual release runs default to a non-publishing main rehearsal", () => {
+  const dispatch = workflow.slice(workflow.indexOf("  workflow_dispatch:"), workflow.indexOf("\npermissions:"));
+  assert.match(dispatch, /source_ref:\n\s+description:[^\n]+\n\s+type: string\n\s+default: main/);
+  assert.match(dispatch, /publish:\n\s+description:[^\n]+\n\s+type: boolean\n\s+default: false/);
 });
 
 test("stable release runs serialize per tag while different tags can build together", () => {
