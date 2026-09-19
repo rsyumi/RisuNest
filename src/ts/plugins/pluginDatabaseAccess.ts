@@ -28,6 +28,7 @@ import {
     iterateUnarchivedPinnedCharacterSummaries,
     iteratePinnedCharacters,
     iteratePinnedConversations,
+    releasePersistentRevisionLease,
     withPersistentRevisionLease,
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
@@ -234,6 +235,10 @@ export interface PluginDatabaseAccess {
         includeOnly: string[] | 'all',
         allowedKeys: readonly string[],
     ): Promise<Record<string, unknown>>
+    getDatabaseSnapshotStream(
+        includeOnly: string[] | 'all',
+        allowedKeys: readonly string[],
+    ): Promise<ReadableStream<PluginDatabaseSnapshotChunk>>
     setDatabaseLite(
         database: Record<string, unknown>,
         allowedKeys: readonly string[],
@@ -243,6 +248,13 @@ export interface PluginDatabaseAccess {
         allowedKeys: readonly string[],
     ): Promise<void>
 }
+
+export type PluginDatabaseSnapshotChunk =
+    | { type: 'set'; key: string; value: unknown }
+    | { type: 'arrayStart'; key: string }
+    | { type: 'arrayPush'; key: string; value: unknown }
+    | { type: 'recordStart'; key: string }
+    | { type: 'recordSet'; key: string; entryKey: string; value: unknown }
 
 const SYNCHRONOUS_CHARACTER_SET_ERROR =
     'Synchronous plugin character updates are unavailable. Use async setDatabase().'
@@ -1010,6 +1022,123 @@ export function createPluginDatabaseAccess(
             const result = await dependencies.store.readConversationWindow(query)
             throwIfQueryAborted(input.signal)
             return result ? { ...result.value, revision: result.revision } : null
+        },
+
+        async getDatabaseSnapshotStream(includeOnly, allowedKeys) {
+            const requestedKeys =
+                includeOnly === 'all'
+                    ? [...allowedKeys]
+                    : allowedKeys.filter((key) => includeOnly.includes(key))
+            await dependencies.flushPendingData('plugin-full-database-snapshot')
+            await openStore()
+            const reader = await acquireCurrentRevisionReader()
+            const iterator = (async function* (): AsyncGenerator<PluginDatabaseSnapshotChunk> {
+                let failed = false
+                try {
+                    const pinnedRoot = await reader.readRoot()
+                    assertPinnedRevision(reader.revision, pinnedRoot.revision, 'Root')
+                    for (const key of requestedKeys) {
+                        if (key === 'characters') {
+                            yield { type: 'arrayStart', key }
+                            for await (const character of iteratePinnedCharacters(reader)) {
+                                const chats: Database['characters'][number]['chats'] = []
+                                for await (const conversation of iteratePinnedConversations(
+                                    reader,
+                                    character.summary.id,
+                                )) {
+                                    chats.push(conversation.value)
+                                }
+                                yield {
+                                    type: 'arrayPush',
+                                    key,
+                                    value: {
+                                        ...character.detail,
+                                        chats,
+                                    } as Database['characters'][number],
+                                }
+                            }
+                            continue
+                        }
+                        if (key === 'botPresets') {
+                            yield { type: 'arrayStart', key }
+                            const catalog = await reader.queryPresets()
+                            assertPinnedRevision(reader.revision, catalog.revision, 'Preset catalog')
+                            for (const summary of catalog.items) {
+                                const preset = await reader.readPreset(summary.id)
+                                if (!preset) throw new Error(`Missing preset ${summary.id}`)
+                                assertPinnedRevision(
+                                    reader.revision,
+                                    preset.revision,
+                                    `Preset ${summary.id}`,
+                                )
+                                yield { type: 'arrayPush', key, value: preset.value }
+                            }
+                            continue
+                        }
+                        if (key === 'pluginCustomStorage') {
+                            yield { type: 'recordStart', key }
+                            const catalog = await reader.queryPluginStorage()
+                            assertPinnedRevision(
+                                reader.revision,
+                                catalog.revision,
+                                'Plugin storage catalog',
+                            )
+                            for (const summary of catalog.items) {
+                                if (summary.owner !== dependencies.owner) continue
+                                const value = await reader.readPluginStorage(
+                                    dependencies.owner,
+                                    summary.key,
+                                )
+                                if (!value) {
+                                    throw new Error(
+                                        `Missing plugin storage value for ${summary.key}`,
+                                    )
+                                }
+                                assertPinnedRevision(
+                                    reader.revision,
+                                    value.revision,
+                                    `Plugin storage value ${summary.key}`,
+                                )
+                                yield {
+                                    type: 'recordSet',
+                                    key,
+                                    entryKey: summary.key,
+                                    value: value.value,
+                                }
+                            }
+                            continue
+                        }
+                        yield {
+                            type: 'set',
+                            key,
+                            value: (pinnedRoot.value as unknown as Record<string, unknown>)[key],
+                        }
+                    }
+                } catch (error) {
+                    failed = true
+                    throw error
+                } finally {
+                    try {
+                        await releasePersistentRevisionLease(reader)
+                    } catch (error) {
+                        if (!failed) throw error
+                    }
+                }
+            })()
+            return new ReadableStream<PluginDatabaseSnapshotChunk>({
+                async pull(controller) {
+                    try {
+                        const next = await iterator.next()
+                        if (next.done) controller.close()
+                        else controller.enqueue(next.value)
+                    } catch (error) {
+                        controller.error(error)
+                    }
+                },
+                async cancel() {
+                    await iterator.return(undefined)
+                },
+            })
         },
 
         async getDatabaseSnapshot(includeOnly, allowedKeys) {

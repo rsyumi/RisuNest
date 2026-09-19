@@ -522,6 +522,46 @@ describe('plugin database access', () => {
         expect(JSON.stringify(result)).not.toContain('archived-b')
     })
 
+    it('streams full snapshot characters one at a time without a parent snapshot clone', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase([
+            makeCharacter('active-a'),
+            makeCharacter('active-b'),
+        ]))
+
+        const stream = await harness.access.getDatabaseSnapshotStream(
+            ['characters'],
+            ['characters'],
+        )
+        const chunks = []
+        for await (const chunk of stream as any) chunks.push(chunk)
+
+        expect(chunks.map((chunk) => chunk.type)).toEqual([
+            'arrayStart',
+            'arrayPush',
+            'arrayPush',
+        ])
+        expect(chunks.slice(1).map((chunk) => chunk.value.chaId)).toEqual([
+            'active-a',
+            'active-b',
+        ])
+        expect(harness.snapshot).not.toHaveBeenCalled()
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
+    it('releases a streamed snapshot lease when iframe assembly is cancelled', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push(makeFullObjectDatabase([makeCharacter('active')]))
+        const stream = await harness.access.getDatabaseSnapshotStream(
+            ['characters'],
+            ['characters'],
+        )
+        const reader = stream.getReader()
+        await reader.read()
+        await reader.cancel()
+        expect(harness.releasedLeases[0]).toHaveBeenCalledOnce()
+    })
+
     // Invariants 20 and 27.
     it('resolves every index to the character the whole database read holds there', async () => {
         const harness = createHarness()

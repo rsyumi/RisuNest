@@ -116,7 +116,53 @@ await (async function() {
             }
             return val.value;
         }
+        if (val && typeof val === 'object' && val.__type === 'IFRAME_OBJECT_STREAM') {
+            return assembleIframeObjectStream(val.value);
+        }
         return val;
+    }
+
+    async function assembleIframeObjectStream(stream) {
+        const result = {};
+        const reader = stream.getReader();
+        try {
+            while (true) {
+                const next = await reader.read();
+                if (next.done) return result;
+                const chunk = next.value;
+                if (!chunk || typeof chunk.key !== 'string') {
+                    throw new Error('Invalid iframe object stream chunk');
+                }
+                if (chunk.type === 'set') {
+                    Object.defineProperty(result, chunk.key, {
+                        value: chunk.value, enumerable: true, configurable: true, writable: true
+                    });
+                } else if (chunk.type === 'arrayStart') {
+                    Object.defineProperty(result, chunk.key, {
+                        value: [], enumerable: true, configurable: true, writable: true
+                    });
+                } else if (chunk.type === 'arrayPush') {
+                    if (!Array.isArray(result[chunk.key])) throw new Error('Invalid iframe array chunk');
+                    result[chunk.key].push(chunk.value);
+                } else if (chunk.type === 'recordStart') {
+                    Object.defineProperty(result, chunk.key, {
+                        value: {}, enumerable: true, configurable: true, writable: true
+                    });
+                } else if (chunk.type === 'recordSet') {
+                    const record = result[chunk.key];
+                    if (!record || Object.getPrototypeOf(record) !== Object.prototype || typeof chunk.entryKey !== 'string') {
+                        throw new Error('Invalid iframe record chunk');
+                    }
+                    Object.defineProperty(record, chunk.entryKey, {
+                        value: chunk.value, enumerable: true, configurable: true, writable: true
+                    });
+                } else {
+                    throw new Error('Unknown iframe object stream chunk');
+                }
+            }
+        } finally {
+            reader.releaseLock();
+        }
     }
 
     function collectTransferables(obj, transferables = []) {
@@ -244,7 +290,7 @@ await (async function() {
         }
 
         if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
-        if (obj.constructor === Object) {
+        if (Object.prototype.toString.call(obj) === '[object Object]') {
             const out = {};
             for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
             return out;

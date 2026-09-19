@@ -891,7 +891,13 @@ const makeRisuaiAPIV3 = (
             if(!conf){
                 return null;
             }
-            return getPluginDatabaseAccess(plugin.name).getDatabaseSnapshot(includeOnly, allowedDbKeys)
+            const access = getPluginDatabaseAccess(plugin.name)
+            const needsCharacters = includeOnly === 'all' || includeOnly.includes('characters')
+            if (!needsCharacters) return access.getDatabaseSnapshot(includeOnly, allowedDbKeys)
+            return {
+                __type: 'IFRAME_OBJECT_STREAM',
+                value: await access.getDatabaseSnapshotStream(includeOnly, allowedDbKeys),
+            }
         },
         queryCharacters: async (input?: PluginCharacterQuery) => {
             const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
