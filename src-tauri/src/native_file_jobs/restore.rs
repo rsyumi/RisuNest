@@ -863,6 +863,19 @@ fn parse_and_stage<R: Read>(
         if encoded_length > reader.total.saturating_sub(reader.completed) {
             return Err(truncated(format!("truncated block body for {name}")));
         }
+        // Compressed framing does not provide a trustworthy decoded size.
+        // Release completed characters before materializing that next block.
+        if !character_batch.is_empty()
+            && (compression != 0
+                || !matches!(block_type, 2 | 7)
+                || (character_batch_bytes as u64).saturating_add(encoded_length)
+                    > CHARACTER_BATCH_BYTES as u64)
+        {
+            sink.add_characters(staging_id, &character_batch)
+                .map_err(store_error)?;
+            character_batch.clear();
+            character_batch_bytes = 0;
+        }
         let (mut value, decoded_bytes) =
             read_block_value(reader, &name, compression, encoded_length, limits, job)?;
 
@@ -873,10 +886,9 @@ fn parse_and_stage<R: Read>(
                 }
             }
             1 if name == "root" => {
-                let mut object = value
-                    .as_object()
-                    .cloned()
-                    .ok_or_else(|| invalid("root block must be a JSON object"))?;
+                let Value::Object(mut object) = value else {
+                    return Err(invalid("root block must be a JSON object"));
+                };
                 directory = Some(parse_directory(object.shift_remove("__directory"))?);
                 root = Some(object);
             }
@@ -889,16 +901,6 @@ fn parse_and_stage<R: Read>(
                     return Err(invalid(format!(
                         "character block name does not match chaId {name}"
                     )));
-                }
-                if !character_batch.is_empty()
-                    && (character_batch.len() >= CHARACTER_BATCH_COUNT
-                        || character_batch_bytes.saturating_add(decoded_bytes)
-                            > CHARACTER_BATCH_BYTES)
-                {
-                    sink.add_characters(staging_id, &character_batch)
-                        .map_err(store_error)?;
-                    character_batch.clear();
-                    character_batch_bytes = 0;
                 }
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
                 pocket_features::character(&mut value, &format!("character:{character_count}"))
@@ -916,10 +918,9 @@ fn parse_and_stage<R: Read>(
                 }
             }
             4 if name == "preset" => {
-                let list = value
-                    .as_array()
-                    .cloned()
-                    .ok_or_else(|| invalid("preset block must be a JSON array"))?;
+                let Value::Array(list) = value else {
+                    return Err(invalid("preset block must be a JSON array"));
+                };
                 reader.counts.presets = list.len() as u64;
                 presets = Some(list);
             }
@@ -1036,18 +1037,21 @@ fn parse_and_stage<R: Read>(
 }
 
 fn parse_directory(value: Option<Value>) -> Result<HashSet<String>, NativeJobError> {
-    let values = value
-        .and_then(|value| value.as_array().cloned())
-        .ok_or_else(|| invalid("root block requires __directory string array"))?;
+    let Some(Value::Array(values)) = value else {
+        return Err(invalid("root block requires __directory string array"));
+    };
     let mut directory = HashSet::new();
     for value in values {
-        let name = value
-            .as_str()
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| invalid("root __directory contains an invalid name"))?;
-        if name == "root" || !directory.insert(name.to_owned()) {
+        let Value::String(name) = value else {
+            return Err(invalid("root __directory contains an invalid name"));
+        };
+        if name.is_empty() {
+            return Err(invalid("root __directory contains an invalid name"));
+        }
+        if name == "root" || directory.contains(&name) {
             return Err(invalid(format!("duplicate block {name} in root directory")));
         }
+        directory.insert(name);
     }
     Ok(directory)
 }
@@ -2863,6 +2867,33 @@ mod tests {
         let mut reopened = PersistentStore::open(directory.path()).unwrap();
         assert!(reopened.replace_commit(&staging_id, None).is_err());
         assert_eq!(reopened.revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn stages_completed_characters_before_reading_the_next_compressed_body() {
+        let (_directory, mut sink) = fixture();
+        sink.fail_character_batches = true;
+        let first = block(2, true, "char-1", &json!({ "chaId": "char-1", "chats": [] }));
+        let second = block(2, true, "char-2", &json!({ "chaId": "char-2", "chats": [] }));
+        let second_body = RISU_SAVE_HEADER.len() + first.len() + 3 + "char-2".len() + 4;
+        let bytes = save_bytes([first, second]);
+        let mut reader = io::Cursor::new(&bytes);
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        let error = restore_block_risu_save_reader(
+            &mut reader, bytes.len() as u64, 1, &job, &sink, RestoreLimits::default(),
+        ).unwrap_err();
+        assert_eq!(error.code, "store-error");
+        assert_eq!(reader.position(), second_body as u64);
+        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn consumed_directory_values_keep_name_and_duplicate_validation() {
+        assert_eq!(parse_directory(Some(json!(["preset", "char-1"]))).unwrap(), HashSet::from(["preset".to_owned(), "char-1".to_owned()]));
+        for value in [None, Some(json!({})), Some(json!([null])), Some(json!([""])), Some(json!(["root"])), Some(json!(["a", "a"]))] {
+            assert!(parse_directory(value).is_err());
+        }
     }
 
     #[test]
