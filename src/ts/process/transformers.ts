@@ -152,6 +152,28 @@ export const runImageEmbedding = async (dataurl: string) => {
 let synthesizer: TextToAudioPipeline = null
 let lastSynth: string = null
 
+export async function releaseIdleTransformerModels(): Promise<void> {
+    const releases: Promise<void>[] = []
+    if (!embeddingMutex.isLocked) {
+        releases.push(embeddingMutex.runExclusive(async () => {
+            const previous = extractor
+            extractor = null
+            lastEmbeddingModelQuery = ''
+            if (previous) await disposePipeline(previous)
+        }))
+    }
+    if (!synthesisMutex.isLocked) {
+        releases.push(synthesisMutex.runExclusive(async () => {
+            const previous = synthesizer
+            synthesizer = null
+            lastSynth = null
+            tfMap = {}
+            if (previous) await disposePipeline(previous)
+        }))
+    }
+    await Promise.all(releases)
+}
+
 export interface OnnxModelFiles {
     files: { [key: string]: string },
     id: string,

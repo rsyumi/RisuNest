@@ -15,6 +15,10 @@ export class Mutex {
 
     private _isLocked = false
 
+    get isLocked(): boolean {
+        return this._isLocked
+    }
+
     /**
      * Wait until the lock is acquired.
      * @returns A function that releases the acquired lock.

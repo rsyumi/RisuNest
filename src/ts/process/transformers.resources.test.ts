@@ -136,8 +136,9 @@ it('keeps embedding order and values across low-spec batches without replacing t
     }
 })
 
-it('does not initialize models for empty embeddings or absent speech', async () => {
-    const { runEmbedding, runVITS } = await import('./transformers')
+it('does not initialize models for empty embeddings, absent speech, or idle cleanup', async () => {
+    const { runEmbedding, runVITS, releaseIdleTransformerModels } = await import('./transformers')
+    await releaseIdleTransformerModels()
     expect(await runEmbedding([], undefined, 'wasm')).toEqual([])
     await runVITS('text', null)
     expect(harness.pipeline).not.toHaveBeenCalled()
@@ -183,6 +184,45 @@ it.each(['decode', 'start'] as const)('releases audio after %s failure and prese
     const { runVITS } = await import('./transformers')
     await expect(runVITS('text')).rejects.toThrow('audio failure')
     expect(AudioContextFixture.instances[0].close).toHaveBeenCalledTimes(1)
+})
+
+it('releases idle models once, reloads on demand, and leaves active audio playing', async () => {
+    const embedding = model({ data: new Float32Array([1]) })
+    const speech = model({ sampling_rate: 16000, audio: new Float32Array([0]) })
+    const reloaded = model({ data: new Float32Array([2]) })
+    harness.pipeline.mockResolvedValueOnce(embedding).mockResolvedValueOnce(speech).mockResolvedValueOnce(reloaded)
+    const { runEmbedding, runVITS, releaseIdleTransformerModels } = await import('./transformers')
+    await runEmbedding(['a'], undefined, 'wasm')
+    await runVITS('text', 'synthetic/speech')
+    await releaseIdleTransformerModels()
+    await releaseIdleTransformerModels()
+    expect(embedding.dispose).toHaveBeenCalledTimes(1)
+    expect(speech.dispose).toHaveBeenCalledTimes(1)
+    const audio = AudioContextFixture.instances[0]
+    expect(audio.close).not.toHaveBeenCalled()
+    expect(await runEmbedding(['b'], undefined, 'wasm')).toEqual([new Float32Array([2])])
+    expect(harness.pipeline).toHaveBeenCalledTimes(3)
+    audio.source.onended!()
+    expect(audio.close).toHaveBeenCalledTimes(1)
+})
+
+it.each(['embedding', 'speech'] as const)('skips an active %s model without waiting for its inference', async (kind) => {
+    const result = kind === 'embedding' ? { data: new Float32Array([1]) }
+        : { sampling_rate: 16000, audio: new Float32Array([0]) }
+    const pending = deferred<typeof result>()
+    const instance = model(result)
+    instance.mockReturnValueOnce(pending.promise)
+    harness.pipeline.mockResolvedValue(instance)
+    const { runEmbedding, runVITS, releaseIdleTransformerModels } = await import('./transformers')
+    const inference = kind === 'embedding' ? runEmbedding(['a'], undefined, 'wasm') : runVITS('text')
+    await vi.waitFor(() => expect(instance).toHaveBeenCalledTimes(1))
+    await releaseIdleTransformerModels()
+    expect(instance.dispose).not.toHaveBeenCalled()
+    pending.resolve(result)
+    await inference
+    await releaseIdleTransformerModels()
+    expect(instance.dispose).toHaveBeenCalledTimes(1)
+    for (const audio of AudioContextFixture.instances) audio.source.onended!()
 })
 
 it('serializes synthesis before disposing a replaced speech model', async () => {
