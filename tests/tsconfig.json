@@ -1,0 +1,16 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "../src/**/*.d.ts",
+    "../vitest.config.ts",
+    "../vitest.benchmark.config.ts",
+    "../vitest.setup.ts",
+    "./**/*.ts",
+    "./**/*.svelte"
+  ],
+  "exclude": ["./**/node_modules/**", "./**/target/**"],
+  "references": []
+}

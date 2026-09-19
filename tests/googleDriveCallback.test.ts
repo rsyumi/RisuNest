@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { Window } from 'happy-dom'
+import { Window, type HTMLButtonElement, type HTMLElement } from 'happy-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const html = readFileSync(new URL('../public/oauth/google-drive-callback.html', import.meta.url), 'utf8')
@@ -43,7 +43,8 @@ describe('standalone Google Drive callback', () => {
         expect(url.searchParams.get('state')).toBe('synthetic-state')
         expect([...url.searchParams.keys()].sort()).toEqual(['code', 'state'])
         expect(window.location.search).toBe('')
-        document.getElementById('copy')!.click()
+        const copyButton = document.getElementById('copy') as HTMLButtonElement
+        copyButton.click()
         await Promise.resolve()
         expect(copy).toHaveBeenCalledWith('https://update.rsyumi.workers.dev/oauth/google-drive-callback.html?state=synthetic-state&code=synthetic%2Bcode')
         expect(document.getElementById('notice')!.textContent).toContain('Copied')
@@ -55,7 +56,7 @@ describe('standalone Google Drive callback', () => {
         '?code=a&state=s#fragment', '?code=a&state=has%20space',
     ])('keeps incomplete or ambiguous callbacks inert: %s', query => {
         const { window, document } = open(query)
-        expect(document.getElementById('actions')!.hidden).toBe(true)
+        expect((document.getElementById('actions') as HTMLElement).hidden).toBe(true)
         expect(document.getElementById('open')!.hasAttribute('href')).toBe(false)
         expect(window.location.search).toBe('')
     })
@@ -72,9 +73,10 @@ describe('standalone Google Drive callback', () => {
     it('provides a selectable manual result when clipboard permission is denied', async () => {
         const { document, copy } = open('?code=synthetic&state=synthetic-state')
         copy.mockRejectedValueOnce(new Error('synthetic denied'))
-        document.getElementById('copy')!.click()
+        const copyButton = document.getElementById('copy') as HTMLButtonElement
+        copyButton.click()
         await Promise.resolve()
-        expect(document.getElementById('manual')!.hidden).toBe(false)
+        expect((document.getElementById('manual') as HTMLElement).hidden).toBe(false)
         expect((document.getElementById('result') as unknown as HTMLTextAreaElement).value).toContain('code=synthetic')
     })
 })
