@@ -49,6 +49,9 @@ jobs:
       - name: Run svelte-check
         run: pnpm check
 
+      - name: Check test and configuration types
+        run: pnpm check:tests
+
       - name: Build
         run: pnpm build
 

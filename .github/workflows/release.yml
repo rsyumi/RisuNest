@@ -143,6 +143,7 @@ jobs:
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+      - run: pnpm check:tests
       - run: pnpm test --project app --project app-extended
       - run: pnpm check:plugin-dts
       - run: pnpm check:production-bundle
