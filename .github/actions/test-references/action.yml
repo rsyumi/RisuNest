@@ -1,0 +1,17 @@
+name: Prepare pinned compatibility references
+description: Check out approved reference source without starting or installing either application
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: kwaroran/Risuai
+        ref: c454df882aaf32e02a22da26d3718c8cadc97814
+        path: .tmp/test-references/risuai
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: PocketRisu/PocketRisu
+        ref: b315d898abd543fffaf5346d8eb3246b20da92cd
+        path: .tmp/test-references/pocket
+        persist-credentials: false

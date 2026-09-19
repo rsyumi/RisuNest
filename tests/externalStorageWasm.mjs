@@ -73,11 +73,11 @@ assert.deepEqual(
 
 const documents = [
   {
-    bytes: vector.snapshot,
-    envelope: vector.snapshotEnvelope,
-    objectId: "snapshot-synthetic",
-    role: "snapshot",
-    canonical: wasm.canonical_snapshot_document,
+    bytes: vector.state,
+    envelope: vector.stateEnvelope,
+    objectId: "state-synthetic",
+    role: "state",
+    canonical: wasm.canonical_sync_state_document,
   },
   {
     bytes: vector.head,
@@ -85,6 +85,13 @@ const documents = [
     objectId: "head",
     role: "head",
     canonical: wasm.canonical_head_document,
+  },
+  {
+    bytes: vector.bundle,
+    envelope: vector.bundleEnvelope,
+    objectId: "bundle-synthetic",
+    role: "bundle",
+    canonical: wasm.canonical_backup_bundle_document,
   },
   {
     bytes: vector.point,
@@ -123,11 +130,11 @@ for (const document of documents) {
 }
 assert.throws(() =>
   wasm.open_object_envelope(
-    asBytes(vector.snapshotEnvelope),
+    asBytes(vector.stateEnvelope),
     key,
     "synthetic-repository",
-    "another-snapshot",
-    "snapshot",
+    "another-state",
+    "state",
     64 * 1024,
   ),
 );
@@ -136,35 +143,25 @@ assert.throws(() =>
     new Uint8Array([1]),
     key,
     "synthetic-repository",
-    "invalid-snapshot",
-    "snapshot",
+    "invalid-state",
+    "state",
   ),
 );
 
-const snapshotHash = wasm.content_hash(asBytes(vector.snapshot));
-const keyedPackId = wasm.keyed_object_id(
-  key,
-  vector.objectNamespace,
-  "pack",
-  snapshotHash,
-);
-const keyedCatalogId = wasm.keyed_object_id(
-  key,
-  vector.objectNamespace,
-  "catalog",
-  snapshotHash,
-);
+const stateHash = wasm.content_hash(asBytes(vector.state));
+const keyedPackId = wasm.keyed_object_id(key, vector.objectNamespace, "pack", stateHash);
+const keyedCatalogId = wasm.keyed_object_id(key, vector.objectNamespace, "catalog", stateHash);
 assert.equal(keyedPackId, vector.keyedPackId);
 assert.equal(keyedCatalogId, vector.keyedCatalogId);
 assert.match(keyedPackId, /^pack-[0-9a-f]{64}$/u);
 assert.match(keyedCatalogId, /^catalog-[0-9a-f]{64}$/u);
 assert.notEqual(
-  wasm.keyed_object_id(key, "another-capture-job", "pack", snapshotHash),
+  wasm.keyed_object_id(key, "another-capture-job", "pack", stateHash),
   keyedPackId,
 );
-assert.throws(() => wasm.keyed_object_id(key, "", "pack", snapshotHash));
+assert.throws(() => wasm.keyed_object_id(key, "", "pack", stateHash));
 assert.throws(() =>
-  wasm.keyed_object_id(key, vector.objectNamespace, "snapshot", snapshotHash),
+  wasm.keyed_object_id(key, vector.objectNamespace, "state", stateHash),
 );
 
 const compressed = wasm.compress_chunk(plain, false);
@@ -193,6 +190,35 @@ for (const envelope of wasmEnvelopes) {
   assert.equal(String.fromCharCode(...envelope.slice(0, 4)), "RNX1");
 }
 
+// Independently encode the section fixture in JavaScript, rather than echoing
+// Rust's byte arrays back. These entries are not a WASM SectionEntry API test.
+const section = (kind, key, value, version = null) => ({
+  codec: "risunest.section-codec/v1", kind, key, value, version,
+});
+const sectionEntries = [
+  section("hypa", "3f2a1b0c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8", {
+    hypa: {
+      producer: "hypa-v2", model: "text-embedding-3-small", endpoint: null,
+      preprocessVersion: 1, dimensions: 8,
+      vector: { inline: Buffer.from(Array.from({ length: 32 }, (_, index) => index)).toString("base64url") },
+      metadata: null,
+    },
+  }, { writeClock: "1", writerId: "writer-a" }),
+  section("hypa", "0".repeat(64), {
+    tombstone: { firstPublishedGeneration: "9", firstPublishedAtMs: 1760000000000 },
+  }, { writeClock: "18446744073709551615", writerId: "writer-b" }),
+  section("local-plugins", JSON.stringify(["provider-manager", "json", "settings"]), {
+    localPlugin: { space: "json", value: { zeta: [1, 2], alpha: null } },
+  }, { writeClock: "4", writerId: "writer-a" }),
+  section("local-plugins", JSON.stringify(["yumi-translator", "string", "cache:index"]), {
+    localPlugin: { space: "string", value: "kept verbatim" },
+  }),
+  section("local-settings", "risuNestDeviceSettings", {
+    localSetting: { value: { startup: "restore" } },
+  }),
+].map(value => asArray(new TextEncoder().encode(JSON.stringify(value))));
+assert.deepEqual(sectionEntries, vector.sectionEntries);
+
 writeFileSync(
   process.argv[4],
   JSON.stringify({
@@ -200,9 +226,11 @@ writeFileSync(
     compressed: asArray(compressed),
     recovery: asArray(recovery),
     code: vector.code,
-    snapshotEnvelope: asArray(wasmEnvelopes[0]),
+    stateEnvelope: asArray(wasmEnvelopes[0]),
     headEnvelope: asArray(wasmEnvelopes[1]),
-    pointEnvelope: asArray(wasmEnvelopes[2]),
+    bundleEnvelope: asArray(wasmEnvelopes[2]),
+    pointEnvelope: asArray(wasmEnvelopes[3]),
+    sectionEntries,
     keyedPackId,
     keyedCatalogId,
   }),

@@ -1,5 +1,6 @@
 /** Test/build-time contract generator. Never imported by the product runtime. */
 import fs from "node:fs";
+import assert from "node:assert/strict";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
@@ -17,17 +18,43 @@ export const contractDirectory = fileURLToPath(
 export const references = {
   risuai: {
     directory:
-      process.env.RISUAI_REFERENCE ?? "E:/Programming/Github/Risuai-original",
+      process.env.RISUAI_REFERENCE ?? fileURLToPath(new URL("../.tmp/test-references/risuai/", import.meta.url)),
     revision: "c454df882aaf32e02a22da26d3718c8cadc97814",
   },
   pocket: {
     directory:
-      process.env.POCKETRISU_REFERENCE ?? "E:/Programming/Github/PocketRisu",
+      process.env.POCKETRISU_REFERENCE ?? fileURLToPath(new URL("../.tmp/test-references/pocket/", import.meta.url)),
     revision: "b315d898abd543fffaf5346d8eb3246b20da92cd",
   },
 };
 export const sha256 = (value) =>
   crypto.createHash("sha256").update(value).digest("hex");
+
+// Approved source pins may have either checkout newline style. Only text line
+// endings are interchangeable; revisions, source contents and binary hashes are not.
+export function matchesSourcePin(bytes, expected) {
+  const text = Buffer.from(bytes).toString("utf8");
+  return [bytes, text.replace(/\r\n/g, "\n"), text.replace(/\r?\n/g, "\r\n")]
+    .some(value => sha256(value) === expected);
+}
+
+export function verifySourceFilePins(target, actualFiles, pins) {
+  assert.deepEqual([...actualFiles].sort(), Object.keys(pins).sort(), `${target} source dependency drift`);
+  for (const [file, expected] of Object.entries(pins)) {
+    if (!matchesSourcePin(fs.readFileSync(path.join(references[target].directory, file)), expected)) {
+      throw new Error(`${target} reference drift: ${file}`);
+    }
+  }
+}
+
+export function verifyGeneratedContract(actual, expected) {
+  const shape = contract => ({
+    ...contract,
+    reference: { ...contract.reference, files: Object.keys(contract.reference.files).sort() },
+  });
+  assert.deepEqual(shape(actual), shape(expected), `${actual.target} generated contract drift`);
+  verifySourceFilePins(actual.target, Object.keys(actual.reference.files), expected.reference.files);
+}
 
 export function generateContract(target) {
   const reference = references[target];
@@ -208,11 +235,7 @@ export function generateContract(target) {
 }
 
 export function verifySourcePins(contract) {
-  const reference = references[contract.target];
-  for (const [file, hash] of Object.entries(contract.reference.files)) {
-    if (sha256(fs.readFileSync(path.join(reference.directory, file))) !== hash)
-      throw new Error(`${contract.target} reference drift: ${file}`);
-  }
+  verifySourceFilePins(contract.target, Object.keys(contract.reference.files), contract.reference.files);
 }
 
 // Present-field acceptance oracle independent of the native projector. Omitted
@@ -279,9 +302,7 @@ if (
     const file = path.join(contractDirectory, `${target}.json`);
     if (check) {
       const committed = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (JSON.stringify(committed) !== JSON.stringify(contract))
-        throw new Error(`${target} generated contract drift`);
-      verifySourcePins(committed);
+      verifyGeneratedContract(contract, committed);
     } else fs.writeFileSync(file, JSON.stringify(contract, null, 2) + "\n");
     console.log(
       `${target}: ${Object.keys(contract.nodes).length} nodes, ${Object.keys(contract.reference.files).length} pinned sources`,

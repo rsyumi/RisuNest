@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 const workflow = readFileSync(new URL("../../.github/workflows/release.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const cacheWorkflow = readFileSync(new URL("../../.github/workflows/release-cache.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
@@ -11,9 +12,61 @@ test("both products and pull requests run shared native signature and catalog te
   assert.doesNotMatch(commonTests, /if: inputs\.product/);
   for (const contents of [commonTests, checkWorkflow]) {
     assert.match(contents, /uses: dtolnay\/rust-toolchain@1\.97\.1/);
-    assert.match(contents, /cargo test --manifest-path crates\/release-update\/Cargo\.toml --release --locked/);
   }
+  assert.match(commonTests, /pnpm test:protocol/);
+  assert.match(commonTests, /pnpm test:node/);
+  assert.match(commonTests, /pnpm test --project harness/);
+  assert.doesNotMatch(commonTests, /pnpm test:release/);
+  assert.match(checkWorkflow, /cargo test --manifest-path crates\/release-update\/Cargo\.toml --release --locked/);
   assert.match(workflow, /needs: \[source, release-tooling-tests,/);
+});
+
+function assertRequiredVerificationGates(contents) {
+  const preparation = contents.slice(contents.indexOf("\n  prepare-draft:\n"));
+  const expression = /if: >-\n([\s\S]*?)\n    needs:/.exec(preparation)?.[1];
+  const dependencies = /needs: \[([^\]]+)\]/.exec(preparation)?.[1].split(",").map(value => value.trim());
+  assert(expression && dependencies, "Missing preparation gate");
+  const shared = ["source", "release-tooling-tests", "endpoint-registry-tests", "shared-wasm-tests"];
+  const products = {
+    app: ["app-web-tests", "app-native-tests", "app-android-tests", "app-ios-tests"],
+    sync: ["sync-tests", "sync-gui-tests"],
+  };
+  const all = [...shared, ...products.app, ...products.sync];
+  for (const job of all) assert(dependencies.includes(job), `Missing dependency: ${job}`);
+  const permits = (product, results) => runInNewContext(expression
+    .replace(/always\(\)/g, "true")
+    .replace(/inputs\.product/g, JSON.stringify(product))
+    .replace(/needs\.([\w-]+)\.result/g, (_, job) => JSON.stringify(results[job])),
+  Object.create(null), { timeout: 100, contextCodeGeneration: { strings: false, wasm: false } });
+  for (const product of Object.keys(products)) {
+    const baseline = Object.fromEntries(all.map(job => [job, "skipped"]));
+    for (const job of [...shared, ...products[product]]) baseline[job] = "success";
+    assert.equal(permits(product, baseline), true, `${product} successful verification`);
+    for (const job of [...shared, ...products[product]]) {
+      for (const result of ["failure", "cancelled", "skipped"]) {
+        assert.equal(permits(product, { ...baseline, [job]: result }), false, `${product}: ${job} ${result}`);
+      }
+    }
+  }
+}
+
+test("failed or cancelled mandatory checks cannot prepare either release", () => {
+  assertRequiredVerificationGates(workflow);
+  for (const job of ["endpoint-registry-tests", "shared-wasm-tests"]) {
+    assert.throws(() => assertRequiredVerificationGates(workflow.replace(`${job}, `, "")), /Missing dependency/);
+    assert.throws(() => assertRequiredVerificationGates(workflow.replace(new RegExp(`needs\\.${job}\\.result == 'success' &&\\s*`), "")));
+    const block = new RegExp(`\\n  ${job}:\\n([\\s\\S]*?)(?=\\n  [a-z][\\w-]*:|$)`).exec(workflow)?.[1];
+    assert(block);
+    assert.match(block, /needs: source/);
+    assert.match(block, /ref: "\$\{\{ needs\.source\.outputs\.source_commit \}\}"/);
+    assert.doesNotMatch(block, /if: inputs\.product|secrets\./);
+  }
+});
+
+test("WASM jobs verify native artifacts afterward and Android includes barcode tests", () => {
+  assert.match(workflow, /pnpm test:wasm[\s\S]*dbus-run-session -- bash scripts\/linux-native-tests\.sh --lib external_storage/);
+  assert.match(workflow, /:app:testLowMemorySafCopy :tauri-plugin-barcode-scanner:testDebugUnitTest/);
+  assert.match(workflow, /pnpm test --project app --project app-extended/);
 });
 
 test("release source input uses one run timestamp instead of the commit timestamp", () => {

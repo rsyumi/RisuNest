@@ -11,6 +11,7 @@ import { createPocketTransactionHarness } from "./compatibleExportPocketTransact
 import {
   references,
   sha256,
+  verifySourceFilePins,
   contractDirectory,
   acceptsContract,
   verifySourcePins,
@@ -458,6 +459,10 @@ export function referenceRuntimePins(target, harness) {
       sha256(fs.readFileSync(path.join(references[target].directory, file))),
     ]),
   );
+}
+
+export function verifyReferenceRuntimePins(target, harness, expected) {
+  verifySourceFilePins(target, harness.sources, expected);
 }
 
 /** Synthetic acceptance only: compare declared local asset references before

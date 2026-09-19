@@ -1,7 +1,23 @@
-param([switch]$FullNative, [switch]$CheckAndroid, [ValidateRange(1, 64)][int]$NativeTestThreads = 1, [string]$NdkHome = $env:ANDROID_NDK_HOME)
+param([switch]$CoreOnly, [switch]$Help, [switch]$FullNative, [switch]$CheckAndroid, [ValidateRange(1, 64)][int]$NativeTestThreads = 1, [string]$NdkHome = $env:ANDROID_NDK_HOME)
 
 $ErrorActionPreference = 'Stop'
 $taskRepo = Split-Path -Parent $PSScriptRoot
+if ($Help) {
+    $lock = Get-Content -Raw -LiteralPath (Join-Path $taskRepo 'crates/external-storage-wasm/Cargo.lock')
+    $version = [regex]::Match($lock, 'name = "wasm-bindgen"\r?\nversion = "([^"]+)"').Groups[1].Value
+    if (-not $version) { throw 'Cannot resolve wasm-bindgen version from the checked-in lockfile' }
+    Write-Output @"
+Usage: pwsh -NoProfile -File scripts/testExternalStorageCore.ps1 [-CoreOnly]
+Install prerequisites separately:
+  rustup target add wasm32-unknown-unknown
+  cargo install wasm-bindgen-cli --version $version --locked
+  pnpm install --frozen-lockfile
+PowerShell 7, Rust, Node.js, clang and llvm-ar are required. On Windows the existing Android NDK 28 can supply clang/llvm-ar; otherwise set CC_wasm32_unknown_unknown and AR_wasm32_unknown_unknown explicitly.
+-CoreOnly verifies both Rust/WASM vector directions without app-native/Android compilation. Full host verification must run app-native tests afterward in the same shared target directory.
+"@
+    return
+}
+if ($CoreOnly -and ($FullNative -or $CheckAndroid)) { throw '-CoreOnly cannot be combined with native/Android checks' }
 $taskPreviousTarget = $env:CARGO_TARGET_DIR
 $taskCompilerVariables = @('CC_wasm32_unknown_unknown', 'AR_wasm32_unknown_unknown', 'CC_aarch64_linux_android', 'AR_aarch64_linux_android', 'CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER')
 $taskPreviousCompilers = @{}
@@ -54,14 +70,15 @@ try {
     $taskReverseVector = Join-Path $taskOutput 'wasm-vector.json'
     Invoke-CoreCheck 'node' @('tests/externalStorageWasm.mjs', (Join-Path $taskOutput 'risunest_external_storage_wasm.js'), $taskVectorPath, $taskReverseVector)
     Invoke-CoreCheck 'cargo' @('run', '--manifest-path', 'crates/external-storage-format/Cargo.toml', '--locked', '--example', 'golden', '--', $taskReverseVector)
-    # Native must compile again AFTER standalone core/WASM builds. This ordering
-    # catches dependency artifact collisions inside the shared target directory.
-    $taskNative = @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--locked', '--lib')
-    if (-not $FullNative) { $taskNative += 'external_storage' }
-    $taskNative += @('--', "--test-threads=$NativeTestThreads")
-    Invoke-CoreCheck 'cargo' $taskNative
-    if ($CheckAndroid) {
-        Invoke-CoreCheck 'cargo' @('build', '--manifest-path', 'crates/external-storage-format/Cargo.toml', '--locked', '--target', 'aarch64-linux-android', '--example', 'golden')
+    if (-not $CoreOnly) {
+        # Compile native again after standalone builds to catch shared-cache artifact collisions.
+        $taskNative = @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--locked', '--lib')
+        if (-not $FullNative) { $taskNative += 'external_storage' }
+        $taskNative += @('--', "--test-threads=$NativeTestThreads")
+        Invoke-CoreCheck 'cargo' $taskNative
+        if ($CheckAndroid) {
+            Invoke-CoreCheck 'cargo' @('build', '--manifest-path', 'crates/external-storage-format/Cargo.toml', '--locked', '--target', 'aarch64-linux-android', '--example', 'golden')
+        }
     }
     Write-Output "External storage core checks passed. Synthetic artifacts: $taskOutput"
 } finally {

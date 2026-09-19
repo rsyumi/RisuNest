@@ -7,11 +7,11 @@ import { createRequire } from "node:module";
 import {
   contractDirectory,
   generateContract,
-  verifySourcePins,
+  verifyGeneratedContract,
 } from "../scripts/compatibleExportContract.mjs";
 import {
   createReferenceHarness,
-  referenceRuntimePins,
+  verifyReferenceRuntimePins,
   createNestReimportHarness,
   verifyRoundTripAssets,
 } from "../scripts/compatibleExportReferenceHarness.mjs";
@@ -93,22 +93,13 @@ for (const target of ["risuai", "pocket"]) {
       const contract = JSON.parse(
         fs.readFileSync(path.join(contractDirectory, `${target}.json`), "utf8"),
       );
-      assert.deepEqual(
-        generateContract(target),
-        contract,
-        "generated schema drift",
-      );
-      verifySourcePins(contract);
+      verifyGeneratedContract(generateContract(target), contract);
       const harness = createReferenceHarness(target);
       t.after(() => harness.close());
       const runtime = JSON.parse(
         fs.readFileSync(path.join(contractDirectory, "runtime.json"), "utf8"),
       );
-      assert.deepEqual(
-        referenceRuntimePins(target, harness),
-        runtime[target],
-        "runtime dependency/source drift",
-      );
+      verifyReferenceRuntimePins(target, harness, runtime[target]);
 
       await t.test(
         "wire values decode with actual reference function",

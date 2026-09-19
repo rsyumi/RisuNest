@@ -57,6 +57,9 @@ dist.zip
 !/scripts/linux-native-tests.sh
 !/scripts/linux-package-smoke.py
 !/scripts/testExternalStorageCore.ps1
+!/scripts/runNodeTests.mjs
+!/scripts/testNative.mjs
+!/scripts/testAndroid.ps1
 .env
 /server/node/ssl/certificate
 .worktrees/

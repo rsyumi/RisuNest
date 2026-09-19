@@ -117,8 +117,10 @@ jobs:
           key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test:release
-      - run: cargo test --manifest-path crates/release-update/Cargo.toml --release --locked
+      - uses: ./.github/actions/test-references
+      - run: pnpm test:node
+      - run: pnpm test --project harness
+      - run: pnpm test:protocol
 
   app-web-tests:
     if: inputs.product == 'app'
@@ -141,7 +143,7 @@ jobs:
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
-      - run: pnpm test
+      - run: pnpm test --project app --project app-extended
       - run: pnpm check:plugin-dts
       - run: pnpm check:production-bundle
 
@@ -218,7 +220,7 @@ jobs:
           git diff --exit-code -- src-tauri/gen/android
       - run: chmod +x src-tauri/gen/android/gradlew
       - working-directory: src-tauri/gen/android
-        run: ./gradlew :app:testArmDebugUnitTest :app:testLowMemorySafCopy --no-daemon
+        run: ./gradlew :app:testArmDebugUnitTest :app:testLowMemorySafCopy :tauri-plugin-barcode-scanner:testDebugUnitTest --no-daemon
 
   app-ios-tests:
     if: inputs.product == 'app'
@@ -374,12 +376,57 @@ jobs:
       - run: pnpm --dir server/manager/gui --ignore-workspace test
       - run: cargo test --manifest-path server/manager/gui/src-tauri/Cargo.toml --release --locked
 
+  endpoint-registry-tests:
+    needs: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - run: pnpm --dir server/endpoint-registry --ignore-workspace install --frozen-lockfile
+      - run: pnpm --dir server/endpoint-registry --ignore-workspace check
+      - run: pnpm --dir server/endpoint-registry --ignore-workspace test
+
+  shared-wasm-tests:
+    needs: source
+    runs-on: ubuntu-24.04
+    env:
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
+      - uses: pnpm/action-setup@v5
+        with: { version: "10.34.1" }
+      - uses: actions/setup-node@v6
+        with: { node-version: "24", package-manager-cache: false }
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with: { targets: wasm32-unknown-unknown }
+      - name: Install native and WASM build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+      - run: pnpm install --frozen-lockfile
+      - name: Install the locked WASM binding generator
+        shell: pwsh
+        run: |
+          $lock = Get-Content -Raw crates/external-storage-wasm/Cargo.lock
+          $version = [regex]::Match($lock, 'name = "wasm-bindgen"\r?\nversion = "([^"]+)"').Groups[1].Value
+          if (-not $version) { throw 'Missing wasm-bindgen lockfile version' }
+          cargo install wasm-bindgen-cli --version $version --locked
+          if ($LASTEXITCODE -ne 0) { throw 'wasm-bindgen installation failed' }
+      - run: pnpm test:wasm
+      - name: Recheck native artifacts after the standalone WASM build
+        run: dbus-run-session -- bash scripts/linux-native-tests.sh --lib external_storage -- --test-threads=1
+
   prepare-draft:
     if: >-
       always() && needs.source.result == 'success' && needs.release-tooling-tests.result == 'success' &&
+      needs.endpoint-registry-tests.result == 'success' && needs.shared-wasm-tests.result == 'success' &&
       ((inputs.product == 'app' && needs.app-web-tests.result == 'success' && needs.app-native-tests.result == 'success' && needs.app-android-tests.result == 'success' && needs.app-ios-tests.result == 'success') ||
        (inputs.product == 'sync' && needs.sync-tests.result == 'success' && needs.sync-gui-tests.result == 'success'))
-    needs: [source, release-tooling-tests, app-web-tests, app-native-tests, app-android-tests, app-ios-tests, sync-tests, sync-gui-tests]
+    needs: [source, release-tooling-tests, endpoint-registry-tests, shared-wasm-tests, app-web-tests, app-native-tests, app-android-tests, app-ios-tests, sync-tests, sync-gui-tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
