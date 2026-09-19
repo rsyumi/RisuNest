@@ -359,6 +359,41 @@ fn apply_recovery_platform_client(
     Ok(())
 }
 
+fn authorization_config(
+    state: &ConnectionCommandState,
+    preparation_id: &str,
+    current_platform_client_id: Option<String>,
+) -> Result<super::contract::ConnectionConfig> {
+    let mut pending = lock(&state.preparations)?;
+    let preparation = pending
+        .get_mut(preparation_id)
+        .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
+    if preparation.expires_at_ms <= now_ms() {
+        return Err(ProviderError::new(ErrorKind::Cancelled));
+    }
+    if preparation.request.mode == ConnectionOpenMode::Existing
+        && preparation.recovery_key.is_none()
+    {
+        return Err(ProviderError::new(ErrorKind::ReauthRequired));
+    }
+    apply_recovery_platform_client(preparation, current_platform_client_id)?;
+    Ok(preparation.request.config.clone())
+}
+
+fn validate_authenticated_account(
+    preparation: &PendingPreparation,
+    account_id: Option<&String>,
+) -> Result<()> {
+    if account_id.is_some_and(|account_id| {
+        preparation.request.mode == ConnectionOpenMode::Existing
+            && !preparation.request.config.account_id.is_empty()
+            && account_id != &preparation.request.config.account_id
+    }) {
+        return Err(ProviderError::new(ErrorKind::ReauthRequired));
+    }
+    Ok(())
+}
+
 fn google_project_number(client_id: &str) -> Option<&str> {
     let (project, suffix) = client_id.split_once('-')?;
     (!project.is_empty()
@@ -459,20 +494,7 @@ pub(crate) async fn external_storage_begin_authorization(
         current_platform_client_id,
     } = request;
     let mut exchange_config = {
-        let mut pending = lock(&state.preparations)?;
-        let preparation = pending
-            .get_mut(&preparation_id)
-            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
-        if preparation.expires_at_ms <= now_ms() {
-            return Err(ProviderError::new(ErrorKind::Cancelled));
-        }
-        if preparation.request.mode == ConnectionOpenMode::Existing
-            && !preparation.transferred
-        {
-            return Err(ProviderError::new(ErrorKind::ReauthRequired));
-        }
-        apply_recovery_platform_client(preparation, current_platform_client_id)?;
-        preparation.request.config.clone()
+        authorization_config(&state, &preparation_id, current_platform_client_id)?
     };
     let provider = exchange_config.provider.clone();
     let (flow, authorization_url) = match provider.as_str() {
@@ -529,20 +551,7 @@ pub(crate) async fn external_storage_begin_authorization(
         current_platform_client_id,
     } = request;
     let config = {
-        let mut pending = lock(&state.preparations)?;
-        let preparation = pending
-            .get_mut(&preparation_id)
-            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
-        if preparation.expires_at_ms <= now_ms() {
-            return Err(ProviderError::new(ErrorKind::Cancelled));
-        }
-        if preparation.request.mode == ConnectionOpenMode::Existing
-            && !preparation.transferred
-        {
-            return Err(ProviderError::new(ErrorKind::ReauthRequired));
-        }
-        apply_recovery_platform_client(preparation, current_platform_client_id)?;
-        preparation.request.config.clone()
+        authorization_config(&state, &preparation_id, current_platform_client_id)?
     };
     let mut exchange_config = config;
     let flow = match exchange_config.provider.as_str() {
@@ -604,20 +613,7 @@ pub(crate) async fn external_storage_begin_authorization(
         current_platform_client_id,
     } = request;
     let config = {
-        let mut pending = lock(&state.preparations)?;
-        let preparation = pending
-            .get_mut(&preparation_id)
-            .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
-        if preparation.expires_at_ms <= now_ms() {
-            return Err(ProviderError::new(ErrorKind::Cancelled));
-        }
-        if preparation.request.mode == ConnectionOpenMode::Existing
-            && !preparation.transferred
-        {
-            return Err(ProviderError::new(ErrorKind::ReauthRequired));
-        }
-        apply_recovery_platform_client(preparation, current_platform_client_id)?;
-        preparation.request.config.clone()
+        authorization_config(&state, &preparation_id, current_platform_client_id)?
     };
     let authorization_id = uuid::Uuid::new_v4().to_string();
     let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
@@ -1047,11 +1043,11 @@ async fn commit_preparation(
         CredentialInput::Bytes(secret) => secret.account_id.as_ref(),
         CredentialInput::Reference { account_id, .. } => account_id.as_ref(),
     };
-    if provided_account_id.is_some_and(|account_id| {
-        preparation.request.mode == ConnectionOpenMode::Existing
-            && account_id != &config.account_id
-    }) {
-        return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
+    if let Err(error) = validate_authenticated_account(preparation, provided_account_id) {
+        if let CredentialInput::Reference { reference, .. } = &credential {
+            let _ = provider_vault.remove(reference).await;
+        }
+        return Err(error.into());
     }
     if let Some(account_id) = provided_account_id {
         config.account_id = account_id.clone();
@@ -1832,6 +1828,61 @@ mod tests {
         let last = damaged.len() - 1;
         damaged[last] ^= 1;
         assert!(recovery::import_connection_settings(&damaged, &key).is_err());
+    }
+
+    #[test]
+    fn manual_recovery_can_authorize_and_bind_the_authenticated_account() {
+        let state = ConnectionCommandState::default();
+        let prepared = insert_preparation(
+            &state,
+            PrepareConnectionRequest {
+                config: super::super::contract::ConnectionConfig {
+                    provider: "google_drive".into(),
+                    profile: Some("drive".into()),
+                    endpoint: "https://www.googleapis.com".into(),
+                    account_id: String::new(),
+                    location: BTreeMap::from([
+                        ("folderId".into(), "synthetic-folder".into()),
+                        ("space".into(), "drive".into()),
+                    ]),
+                    oauth_profile: Some(super::super::contract::OAuthProfile {
+                        project_id: "synthetic-project".into(),
+                        platform_client_ids: BTreeMap::from([(
+                            platform_key().into(),
+                            "123-current.apps.googleusercontent.com".into(),
+                        )]),
+                    }),
+                },
+                mode: ConnectionOpenMode::Existing,
+                purpose: ConnectionPurpose::Backup,
+                capture_policy: Some(CapturePolicy::default()),
+                recovery_key: Some(recovery::generate_key().unwrap().to_string()),
+                acknowledgements: Vec::new(),
+            },
+            None,
+            None,
+            false,
+        ).unwrap();
+        let id = prepared.preparation_id;
+        assert!(authorization_config(&state, &id, None).is_ok());
+        let authenticated = "authenticated-account".to_string();
+        {
+            let mut preparations = state.preparations.lock().unwrap();
+            let pending = preparations.get_mut(&id).unwrap();
+            assert!(!pending.transferred);
+            validate_authenticated_account(pending, Some(&authenticated)).unwrap();
+            pending.request.config.account_id = authenticated.clone();
+            validate_authenticated_account(pending, Some(&authenticated)).unwrap();
+            assert_eq!(
+                validate_authenticated_account(pending, Some(&"another-account".into()))
+                    .unwrap_err().kind,
+                ErrorKind::ReauthRequired,
+            );
+            pending.recovery_key = None;
+        }
+        assert_eq!(authorization_config(&state, &id, None).err().unwrap().kind, ErrorKind::ReauthRequired);
+        state.preparations.lock().unwrap().get_mut(&id).unwrap().expires_at_ms = 0;
+        assert_eq!(authorization_config(&state, &id, None).err().unwrap().kind, ErrorKind::Cancelled);
     }
 
     #[test]

@@ -186,7 +186,7 @@ mod recovery_ciphertext {
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        if encoded.len() > 24 * 1024 {
+        if encoded.len() > super::MAX_CONNECTION_SETTINGS_BYTES {
             return Err(serde::de::Error::custom("recovery-ciphertext-limit"));
         }
         URL_SAFE_NO_PAD.decode(encoded).map_err(|_| serde::de::Error::custom("invalid-recovery-ciphertext"))
@@ -345,7 +345,7 @@ impl ConnectionSettingsEnvelope {
     }
 }
 
-/// Only returned after authenticating the entire independent recovery envelope.
+/// Only returned after authenticating the entire repository bootstrap.
 pub struct RecoveredRepository {
     pub root: Zeroizing<[u8; 32]>,
     pub connection_metadata: Zeroizing<String>,
@@ -568,6 +568,19 @@ mod tests {
         )
         .is_err());
     }
+    #[test]
+    fn connection_settings_file_roundtrips_the_largest_supported_payload() {
+        let key = RecoveryKey::generate().unwrap();
+        let plaintext = vec![b'x'; 32 * 1024];
+        let encoded = ConnectionSettingsEnvelope::protect("repository".into(), &plaintext, &key)
+            .unwrap().encode().unwrap();
+        assert!(encoded.len() > 24 * 1024);
+        let decoded = ConnectionSettingsEnvelope::decode(&encoded).unwrap();
+        assert_eq!(decoded.open("repository", &key).unwrap().as_slice(), plaintext);
+        assert!(ConnectionSettingsEnvelope::protect("repository".into(), &vec![b'x'; 32 * 1024 + 1], &key).is_err());
+        assert!(ConnectionSettingsEnvelope::decode(&vec![b' '; MAX_CONNECTION_SETTINGS_BYTES + 1]).is_err());
+    }
+
     #[test]
     fn recovery_code_rejects_passwords_typos_and_noncanonical_grouping() {
         let code = RecoveryKey::generate().unwrap();

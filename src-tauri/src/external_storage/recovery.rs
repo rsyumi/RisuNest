@@ -84,6 +84,10 @@ fn parse_key(value: &str) -> Result<RecoveryKey> {
     RecoveryKey::parse(value).map_err(|_| corrupt())
 }
 
+fn bootstrap_identity(repository: &RepositoryHandle) -> String {
+    hex::encode(hash(repository.repository_id.as_bytes()))
+}
+
 async fn read_object(
     root: &Path,
     provider: &dyn Provider,
@@ -152,11 +156,12 @@ async fn scan_bootstrap(
             let Ok(envelope) = RepositoryBootstrapEnvelope::decode(&bytes) else {
                 continue;
             };
-            if found.is_some() || envelope.repository_id != repository.repository_id {
+            let identity = bootstrap_identity(repository);
+            if found.is_some() || envelope.repository_id != identity {
                 return Err(corrupt());
             }
             let recovered = envelope
-                .recover(&repository.repository_id, code)
+                .recover(&identity, code)
                 .map_err(|_| corrupt())?;
             let metadata: BootstrapMetadata =
                 serde_json::from_str(&recovered.connection_metadata).map_err(|_| corrupt())?;
@@ -221,7 +226,7 @@ pub(crate) async fn publish_bootstrap(
         return Err(ProviderError::new(ErrorKind::PreconditionFailed));
     }
     let envelope = RepositoryBootstrapEnvelope::protect(
-        repository.repository_id.clone(),
+        bootstrap_identity(repository),
         serde_json::to_string(metadata).map_err(|_| corrupt())?,
         root_key,
         &code,
@@ -399,7 +404,8 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let root = tempfile::tempdir().unwrap();
             let provider = fake::FakeProvider::new(true);
-            let repository = fake::repository();
+            let mut repository = fake::repository();
+            repository.repository_id = format!("onedrive|{}", "synthetic-provider-identity/".repeat(10));
             let descriptor = Descriptor::new("repository".into(), None).unwrap();
             let root_key = [7; 32];
             let recovery_key = generate_key().unwrap();
@@ -466,7 +472,7 @@ mod tests {
 
             let code = parse_key(&recovery_key).unwrap();
             let mut tampered = RepositoryBootstrapEnvelope::protect(
-                repository.repository_id.clone(),
+                bootstrap_identity(&repository),
                 serde_json::to_string(&metadata).unwrap(),
                 &root_key,
                 &code,
