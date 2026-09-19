@@ -10,10 +10,11 @@ import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
 import { changeChar } from "./characters"
 import { deactivateActiveWorkingSet } from "./storage/persistentDataRuntime.svelte"
 
-import { shortcutModifier } from './hotkeyModifier'
+import { isCompositionKey, shortcutModifier } from './hotkeyModifier'
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
+        if (isCompositionKey(ev)) return
         if (
             !shortcutModifier(ev) &&
             !ev.altKey &&
@@ -285,7 +286,7 @@ async function quickMenu(){
 }
 
 export function hotkeyMatches(hotkey: typeof DBState.db.hotkeys[number], ev: KeyboardEvent): boolean {
-    if(!hotkey){
+    if(!hotkey || isCompositionKey(ev)){
         return false
     }
     
@@ -325,9 +326,10 @@ export function initMobileGesture(){
 
     document.addEventListener('touchstart', (ev) => {
         for(const touch of ev.changedTouches){
-            const ele = touch.target as HTMLElement
-            if(ele.tagName === 'BUTTON' || ele.tagName === 'INPUT' || ele.tagName === 'SELECT' || ele.tagName === 'TEXTAREA'){
-                return
+            const ele = touch.target instanceof Element ? touch.target : null
+            if (ele?.closest('button, input, select, textarea, a, label, [role="button"], [contenteditable]:not([contenteditable="false"])')) {
+                pressingPointers.delete(touch.identifier)
+                continue
             }
             pressingPointers.set(touch.identifier, {x: touch.clientX, y: touch.clientY})
         }
@@ -337,9 +339,10 @@ export function initMobileGesture(){
     document.addEventListener('touchend', (ev) => {
         for(const touch of ev.changedTouches){
             const d = pressingPointers.get(touch.identifier)
+            pressingPointers.delete(touch.identifier)
+            if (!d) continue
             const moveX = touch.clientX - d.x
             const moveY = touch.clientY - d.y
-            pressingPointers.delete(touch.identifier)
 
             if(moveX > 50 && Math.abs(moveY) < Math.abs(moveX)){
                 if(get(selectedCharID) === -1){
@@ -369,6 +372,9 @@ export function initMobileGesture(){
     }, {
         passive: true
     })
+    document.addEventListener('touchcancel', (ev) => {
+        for (const touch of ev.changedTouches) pressingPointers.delete(touch.identifier)
+    }, { passive: true })
 }
 
 async function changeToPreset(num:number){

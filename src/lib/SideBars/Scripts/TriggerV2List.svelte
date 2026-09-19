@@ -11,6 +11,7 @@
     import Help from "src/lib/Others/Help.svelte";
     import { type triggerEffectV2, type triggerEffect, type triggerscript, displayAllowList, requestAllowList, type triggerV2IfAdvanced } from "src/ts/process/triggers";
     import { onDestroy, onMount } from "svelte";
+    import { isCompositionKey, shortcutModifier } from 'src/ts/hotkeyModifier';
     import { DBState } from "src/ts/stores.svelte";
     import { RISU_EFFECT_DRAG_TYPE, RISU_TRIGGER_DRAG_TYPE } from "src/ts/dragTypes";
     import { downloadFile } from "src/ts/globalApi.svelte";
@@ -2044,6 +2045,9 @@
     }
 
     const handleKeydown = (e:KeyboardEvent) => {
+        if (isCompositionKey(e)) return;
+        const target = e.target instanceof Element ? e.target : document.activeElement;
+        if (e.key !== 'Escape' && target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
         if(e.key === 'Escape'){
             if(contextMenu){
                 contextMenu = false
@@ -2105,11 +2109,11 @@
                 }
                 e.preventDefault()
             }
-            if(e.key === 'c' && e.ctrlKey){
+            if(e.key === 'c' && shortcutModifier(e)){
                 copyEffect()
                 e.preventDefault()
             }
-            if(e.key === 'v' && e.ctrlKey){
+            if(e.key === 'v' && shortcutModifier(e)){
                 //paste
                 pasteEffect()
                 e.preventDefault()
@@ -2146,11 +2150,11 @@
                 }
                 e.preventDefault()
             }
-            if(e.key === 'c' && e.ctrlKey){
+            if(e.key === 'c' && shortcutModifier(e)){
                 copyTrigger()
                 e.preventDefault()
             }
-            if(e.key === 'v' && e.ctrlKey){
+            if(e.key === 'v' && shortcutModifier(e)){
                 pasteTrigger()
                 e.preventDefault()
             }

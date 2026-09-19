@@ -68,8 +68,9 @@
                 onchange(e)
             }}
             onkeydown={async (e) => {
+                if (isCompositionKey(e)) return;
                 if(
-                    (e.ctrlKey || e.shiftKey || e.altKey)    
+                    (shortcutModifier(e) || e.shiftKey || e.altKey)
                     && hotkeyMatches(DBState.db.hotkeys.find(hk => hk.action === 'popupEditor'), e)
                 ){
                     e.preventDefault()
@@ -144,6 +145,7 @@
   import { DBState, disableHighlight, popUpEditorStore } from 'src/ts/stores.svelte';
   import { isMobile } from 'src/ts/platform'
     import { hotkeyMatches } from 'src/ts/hotkey';
+    import { isCompositionKey, shortcutModifier } from 'src/ts/hotkeyModifier';
     interface Props {
         size?: 'xs'|'sm'|'md'|'lg'|'xl'|'default';
         autocomplete?: 'on'|'off';
@@ -290,6 +292,7 @@
     }
 
     const handleKeyDown = (e:KeyboardEvent) => {
+        if (isCompositionKey(e)) return;
         if(autocompleteContents.length >= 1){
             switch(e.key){
                 case 'ArrowDown':

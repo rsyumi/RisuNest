@@ -1,6 +1,7 @@
 <script lang="ts">
     import { CheckIcon, XIcon } from '@lucide/svelte';
     import { createEventDispatcher, onDestroy } from 'svelte';
+    import { isCompositionKey } from 'src/ts/hotkeyModifier';
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from 'src/lang';
     import { 
@@ -450,7 +451,7 @@
     function handleKeydown(e: KeyboardEvent) {
         // While an IME is composing, Escape and Enter belong to the composition,
         // not to this editor; acting on them discards the pending edit.
-        if (e.isComposing) return;
+        if (isCompositionKey(e)) return;
         if (e.key === 'Escape') {
             handleCancel();
         } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {

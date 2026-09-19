@@ -7,6 +7,7 @@
     import { CameraIcon, DatabaseIcon, DicesIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, SparkleIcon } from "@lucide/svelte";
     import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, easyPanelStore, chatPanelStore } from "../../ts/stores.svelte";
     import { onDestroy } from 'svelte';
+    import { isCompositionKey } from 'src/ts/hotkeyModifier';
     import { type Chat as ChatRecord, type Database, type character, type groupChat, type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { chatProcessStage, doingChat, sendChat, notifyGenerationCompletion } from "../../ts/process/index.svelte";
@@ -1175,7 +1176,8 @@
                           bind:value={messageInput}
                           bind:this={inputEle}
                           onkeydown={(e) => {
-                        if(e.key.toLocaleLowerCase() === "enter" && !e.isComposing){
+                        if (isCompositionKey(e)) return;
+                        if(e.key.toLocaleLowerCase() === "enter"){
                             if(DBState.db.sendWithEnter && (!e.shiftKey)){
                                 send()
                                 e.preventDefault()
@@ -1279,7 +1281,8 @@
                               bind:value={messageInputTranslate}
                               bind:this={inputTranslateEle}
                               onkeydown={(e) => {
-                            if(e.key.toLocaleLowerCase() === "enter" && (!e.shiftKey) && !e.isComposing){
+                            if (isCompositionKey(e)) return;
+                            if(e.key.toLocaleLowerCase() === "enter" && (!e.shiftKey)){
                                 if(DBState.db.sendWithEnter){
                                     send()
                                     e.preventDefault()

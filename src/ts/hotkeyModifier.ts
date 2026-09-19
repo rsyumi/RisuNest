@@ -1,5 +1,10 @@
 import { platform } from '@tauri-apps/plugin-os'
 
+/** Some WebKit versions report the IME confirmation key after compositionend. */
+export function isCompositionKey(event: Pick<KeyboardEvent, 'isComposing' | 'keyCode'>): boolean {
+    return event.isComposing || event.keyCode === 229
+}
+
 /** Keep existing Ctrl bindings usable and add the native Mac Command equivalent. */
 export function shortcutModifier(
     event: Pick<KeyboardEvent, 'ctrlKey' | 'metaKey'>,
