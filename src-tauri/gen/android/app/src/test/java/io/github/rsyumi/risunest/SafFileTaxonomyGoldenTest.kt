@@ -119,35 +119,57 @@ class SafFileTaxonomyGoldenTest {
     val document = factory.newDocumentBuilder().parse(manifest)
     val filters = document.getElementsByTagName("intent-filter")
     val androidNamespace = "http://schemas.android.com/apk/res/android"
-    val registered = mutableSetOf<String>()
+    val registered = mutableMapOf<String, MutableSet<String>>()
+    var mimeAssociationFound = false
     for (index in 0 until filters.length) {
       val filter = filters.item(index) as Element
       val actions = filter.getElementsByTagName("action")
       val actionNames = (0 until actions.length).map {
         (actions.item(it) as Element).getAttributeNS(androidNamespace, "name")
       }.toSet()
-      if (!actionNames.containsAll(listOf(
-          "android.intent.action.VIEW", "android.intent.action.SEND", "android.intent.action.SEND_MULTIPLE",
-        ))) continue
+      if (!actionNames.contains("android.intent.action.VIEW")) continue
       val data = filter.getElementsByTagName("data")
+      val dataElements = (0 until data.length).map { data.item(it) as Element }
+      if (dataElements.any {
+          it.getAttributeNS(androidNamespace, "mimeType") == "application/x-risunest"
+        }) {
+        assertTrue(actionNames.contains("android.intent.action.SEND"))
+        assertTrue(actionNames.contains("android.intent.action.SEND_MULTIPLE"))
+        mimeAssociationFound = true
+      }
+      val schemes = dataElements.map {
+        it.getAttributeNS(androidNamespace, "scheme")
+      }.filter { it == "content" || it == "file" }.toSet()
+      if (schemes.isEmpty()) continue
+      assertEquals(setOf("*"), dataElements.map {
+        it.getAttributeNS(androidNamespace, "host")
+      }.filter { it.isNotEmpty() }.toSet())
+      val patterns = mutableSetOf<String>()
       for (dataIndex in 0 until data.length) {
-        registered.add((data.item(dataIndex) as Element).getAttributeNS(androidNamespace, "pathPattern"))
+        patterns.add((data.item(dataIndex) as Element).getAttributeNS(androidNamespace, "pathPattern"))
+      }
+      for (scheme in schemes) {
+        registered.getOrPut(scheme) { mutableSetOf() }.addAll(patterns)
       }
     }
+    assertTrue(mimeAssociationFound)
+    assertEquals(setOf("content", "file"), registered.keys)
     val configuration = repository.resolve("src-tauri/tauri.conf.json").readText(Charsets.UTF_8)
     val configured = Regex("\"ext\"\\s*:\\s*\\[([^\\]]*)\\]")
       .findAll(configuration).flatMap { quotedStrings(it.groupValues[1]) }.toSet()
     for (suffix in taxonomy.databaseSuffixes) {
       if (suffix == ".bin") {
         // Generic binary backups remain explicit picker inputs, not an OS-wide association.
-        assertFalse(registered.contains(".*\\\\$suffix"))
+        assertTrue(registered.values.none { it.contains(".*\\\\$suffix") })
         assertFalse(configured.contains("bin"))
       } else {
-        assertTrue(suffix, registered.contains(".*\\\\$suffix"))
+        for (scheme in listOf("content", "file")) {
+          assertTrue("$scheme:$suffix", registered.getValue(scheme).contains(".*\\\\$suffix"))
+        }
         assertTrue(suffix, configured.contains(suffix.removePrefix(".")))
       }
     }
-    assertFalse(registered.contains(".*\\\\.risulossless"))
+    assertTrue(registered.values.none { it.contains(".*\\\\.risulossless") })
     assertFalse(configured.contains("risulossless"))
   }
 

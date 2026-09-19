@@ -37,12 +37,19 @@ private fun replaceOnce(source: String, from: String, to: String): String {
 }
 
 internal fun patchRendererClient(source: String): String {
-    if (source.contains("// RisuNest renderer recovery callback")) return source
-    check(!source.contains("onRenderProcessGone(")) { "Wry already handles renderer exit; review its recovery contract" }
-    return replaceOnce(source.replace("\r\n", "\n"),
+    val normalized = source.replace("\r\n", "\n")
+    val callback = "    override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {"
+    val guardedCallback = "    @androidx.annotation.RequiresApi(26)\n$callback"
+    if (normalized.contains("// RisuNest renderer recovery callback")) {
+        if (normalized.contains(guardedCallback)) return normalized
+        return replaceOnce(normalized, callback, guardedCallback)
+    }
+    check(!normalized.contains("onRenderProcessGone(")) { "Wry already handles renderer exit; review its recovery contract" }
+    return replaceOnce(normalized,
         "    override fun onPageFinished(view: WebView, url: String) {",
         """
     // RisuNest renderer recovery callback
+    @androidx.annotation.RequiresApi(26)
     override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
         val host = view.context as? RendererRecoveryHost ?: return false
         return host.recoverRenderer(view, detail.didCrash())

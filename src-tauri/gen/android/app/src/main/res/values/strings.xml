@@ -1,6 +1,6 @@
 <resources>
-    <string name="app_name">"RisuNest"</string>
-    <string name="main_activity_title">"RisuNest"</string>
+    <string name="app_name" translatable="false">"RisuNest"</string>
+    <string name="main_activity_title" translatable="false">"RisuNest"</string>
     <string name="press_back_again_to_exit">Press back again to exit</string>
     <string name="renderer_recovery_warning">The Android WebView renderer stopped during the previous session. Saved data was reopened, but recent unsaved changes may need to be entered again.</string>
     <string name="webview_provider_missing">Android System WebView is unavailable. Install or enable it before using the app.</string>

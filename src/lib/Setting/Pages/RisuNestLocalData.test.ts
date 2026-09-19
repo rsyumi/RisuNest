@@ -100,7 +100,7 @@ describe('RisuNestLocalData', () => {
 
         toggle('local-plugins').click()
         await settle()
-        dialogButton(strings.cancel).click()
+        dialogButton(languageEnglish.cancel).click()
         await settle()
 
         expect(sections.setLocalDataParticipating).not.toHaveBeenCalled()

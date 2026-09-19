@@ -15,6 +15,7 @@ class RustWebViewClient {
 }
 """.trimIndent()
         val patched = patchRendererClient(source)
+        assertTrue(patched.contains("@androidx.annotation.RequiresApi(26)"))
         assertTrue(patched.contains("override fun onRenderProcessGone"))
         assertTrue(patched.contains("return host.recoverRenderer(view, detail.didCrash())"))
         assertTrue(patched.contains("Rust.handleRequest(view, request)"))

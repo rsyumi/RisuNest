@@ -109,7 +109,7 @@
                 <p class="text-sm text-textcolor2">{strings.enableBodyPlugin}</p>
             {/if}
             <div class="flex flex-wrap justify-end gap-2">
-                <SettingButton variant="secondary" disabled={busy} onclick={cancelEnable}>{strings.cancel}</SettingButton>
+                <SettingButton variant="secondary" disabled={busy} onclick={cancelEnable}>{language.cancel}</SettingButton>
                 <SettingButton disabled={busy} onclick={() => void apply(section, true)}>{strings.enableConfirm}</SettingButton>
             </div>
         </div>

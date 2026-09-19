@@ -2037,7 +2037,6 @@ export const languageEnglish = {
             enableBodyPlugin:
                 'To manage individual plugin values, open plugin data in RisuNest settings.',
             enableConfirm: 'Turn on',
-            cancel: 'Cancel',
         },
         plugins: {
             unsupportedApiVersionInstall:
