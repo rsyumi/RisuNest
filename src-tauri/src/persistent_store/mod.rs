@@ -1894,6 +1894,58 @@ impl PersistentStore {
         commit::replace_add_characters(&mut self.connection, staging_id, characters)
     }
 
+    pub(crate) fn replace_put_character_detail(
+        &mut self,
+        staging_id: &str,
+        detail: &Value,
+        conversation_count: i64,
+    ) -> StoreResult<()> {
+        commit::replace_put_character_detail(
+            &mut self.connection,
+            staging_id,
+            detail,
+            conversation_count,
+        )
+    }
+
+    pub(crate) fn replace_put_conversation_row(
+        &mut self,
+        staging_id: &str,
+        character_id: &str,
+        configured_index: i64,
+        detail: &Value,
+        recent_at: i64,
+        message_count: i64,
+    ) -> StoreResult<()> {
+        commit::replace_put_conversation_row(
+            &mut self.connection,
+            staging_id,
+            character_id,
+            configured_index,
+            detail,
+            recent_at,
+            message_count,
+        )
+    }
+
+    pub(crate) fn replace_add_conversation_messages(
+        &mut self,
+        staging_id: &str,
+        character_id: &str,
+        conversation_id: &str,
+        start: i64,
+        messages: &[Value],
+    ) -> StoreResult<()> {
+        commit::replace_add_conversation_messages(
+            &mut self.connection,
+            staging_id,
+            character_id,
+            conversation_id,
+            start,
+            messages,
+        )
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn replace_commit(
         &mut self,

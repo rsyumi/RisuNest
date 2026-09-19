@@ -7,10 +7,15 @@ use super::{
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
 use flate2::bufread::GzDecoder;
 use rmpv::Value as MessagePackValue;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, BufReader, Read};
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 const LEGACY_RISU_SAVE_PREFIX: &[u8] = b"\0RISUSAVE\0";
@@ -18,6 +23,8 @@ const HISTORICAL_RISU_PREFIX: &[u8] = b"\0\0RISU";
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const CHARACTER_BATCH_COUNT: usize = 16;
 const CHARACTER_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const MESSAGE_PAGE_COUNT: usize = 128;
+const MESSAGE_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RestoreLimits {
@@ -39,6 +46,45 @@ pub(crate) trait ReplacementSink: Send + Sync {
     fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()>;
     fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()>;
     fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()>;
+    fn supports_incremental_characters(&self) -> bool {
+        false
+    }
+    fn put_character_detail(
+        &self,
+        _staging_id: &str,
+        _detail: &Value,
+        _conversation_count: i64,
+    ) -> StoreResult<()> {
+        Err(StoreError::Store {
+            message: "incremental character staging is unavailable".to_owned(),
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn put_conversation_row(
+        &self,
+        _staging_id: &str,
+        _character_id: &str,
+        _configured_index: i64,
+        _detail: &Value,
+        _recent_at: i64,
+        _message_count: i64,
+    ) -> StoreResult<()> {
+        Err(StoreError::Store {
+            message: "incremental conversation staging is unavailable".to_owned(),
+        })
+    }
+    fn add_conversation_messages(
+        &self,
+        _staging_id: &str,
+        _character_id: &str,
+        _conversation_id: &str,
+        _start: i64,
+        _messages: &[Value],
+    ) -> StoreResult<()> {
+        Err(StoreError::Store {
+            message: "incremental message staging is unavailable".to_owned(),
+        })
+    }
     fn preserve_active_repositories(
         &self,
         _staging_id: &str,
@@ -877,6 +923,25 @@ fn parse_and_stage<R: Read>(
             character_batch.clear();
             character_batch_bytes = 0;
         }
+        if matches!(block_type, 2 | 7) && sink.supports_incremental_characters() {
+            read_character_block(
+                reader,
+                staging_id,
+                &name,
+                compression,
+                encoded_length,
+                character_count,
+                limits,
+                job,
+                sink,
+            )?;
+            character_count += 1;
+            reader.counts.characters = character_count;
+            reader.counts.blocks += 1;
+            reader.complete_item()?;
+            continue;
+        }
+
         let (mut value, decoded_bytes) =
             read_block_value(reader, &name, compression, encoded_length, limits, job)?;
 
@@ -1106,6 +1171,531 @@ fn read_block_value<R: Read>(
         return Err(corrupt(format!("trailing data in gzip block {name}")));
     }
     Ok((value, decoded_bytes))
+}
+
+fn read_character_block<R: Read>(
+    reader: &mut TrackedReader<'_, R>,
+    staging_id: &str,
+    name: &str,
+    compression: u8,
+    encoded_length: u64,
+    character_index: u64,
+    limits: RestoreLimits,
+    job: &dyn RestoreControl,
+    sink: &dyn ReplacementSink,
+) -> Result<(), NativeJobError> {
+    let block = EncodedBlockReader {
+        reader,
+        remaining: encoded_length,
+    };
+    let staging_error = RefCell::new(None);
+    let seed = CharacterSeed {
+        staging_id,
+        expected_id: name,
+        character_index,
+        job,
+        sink,
+        staging_error: &staging_error,
+    };
+    if compression == 0 {
+        if encoded_length > limits.max_decoded_block_bytes {
+            return Err(invalid(format!("decoded block limit exceeded for {name}")));
+        }
+        let decoded = DecodedLimitReader::new(block, limits.max_decoded_block_bytes, job, name);
+        let mut buffered = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut buffered);
+        if let Err(error) = seed.deserialize(&mut deserializer) {
+            if let Some(error) = staging_error.take() {
+                return Err(store_error(error));
+            }
+            return Err(json_error(name, compression, error, job));
+        }
+        deserializer
+            .end()
+            .map_err(|error| json_error(name, compression, error, job))?;
+        if !buffered.buffer().is_empty() || buffered.get_ref().inner.remaining != 0 {
+            return Err(corrupt(format!("trailing data in block {name}")));
+        }
+        return Ok(());
+    }
+
+    let buffered = BufReader::with_capacity(READ_CHUNK_BYTES, block);
+    let decoder = GzDecoder::new(buffered);
+    let decoded = DecodedLimitReader::new(decoder, limits.max_decoded_block_bytes, job, name);
+    let mut json_reader = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut json_reader);
+    if let Err(error) = seed.deserialize(&mut deserializer) {
+        if let Some(error) = staging_error.take() {
+            return Err(store_error(error));
+        }
+        return Err(json_error(name, compression, error, job));
+    }
+    deserializer
+        .end()
+        .map_err(|error| json_error(name, compression, error, job))?;
+    drop(deserializer);
+    let mut decoded = json_reader.into_inner();
+    let mut buffer = [0u8; READ_CHUNK_BYTES];
+    while decoded
+        .read(&mut buffer)
+        .map_err(|error| gzip_io_error(name, error, job))?
+        != 0
+    {}
+    let decoder = decoded.into_inner();
+    let buffered = decoder.into_inner();
+    if !buffered.buffer().is_empty() || buffered.get_ref().remaining != 0 {
+        return Err(corrupt(format!("trailing data in gzip block {name}")));
+    }
+    Ok(())
+}
+
+trait IgnoredJsonValue: Sized {
+    fn ignored<E: de::Error>() -> Result<Self, E>;
+}
+
+impl IgnoredJsonValue for i64 {
+    fn ignored<E: de::Error>() -> Result<Self, E> {
+        Ok(0)
+    }
+}
+
+macro_rules! ignored_visits {
+    ($value:ty) => {
+        fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: de::Deserializer<'de>,
+        {
+            IgnoredAny::deserialize(deserializer)?;
+            <$value as IgnoredJsonValue>::ignored()
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            <$value as IgnoredJsonValue>::ignored()
+        }
+    };
+}
+
+struct CharacterSeed<'a> {
+    staging_id: &'a str,
+    expected_id: &'a str,
+    character_index: u64,
+    job: &'a dyn RestoreControl,
+    sink: &'a dyn ReplacementSink,
+    staging_error: &'a RefCell<Option<StoreError>>,
+}
+
+impl<'de> DeserializeSeed<'de> for CharacterSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(CharacterVisitor(self))
+    }
+}
+
+struct CharacterVisitor<'a>(CharacterSeed<'a>);
+
+impl<'de> Visitor<'de> for CharacterVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a character object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut detail = Map::new();
+        let mut conversation_count = 0i64;
+        let mut saw_chats = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if self.0.job.is_cancel_requested() {
+                return Err(de::Error::custom("restore cancelled while reading character"));
+            }
+            if key == "chats" {
+                if saw_chats {
+                    return Err(de::Error::custom("duplicate chats field in character"));
+                }
+                saw_chats = true;
+                conversation_count = map.next_value_seed(ChatsSeed {
+                    staging_id: self.0.staging_id,
+                    character_id: self.0.expected_id,
+                    character_index: self.0.character_index,
+                    job: self.0.job,
+                    sink: self.0.sink,
+                    staging_error: self.0.staging_error,
+                })?;
+            } else {
+                detail.insert(key, map.next_value()?);
+            }
+        }
+        let character_id = detail
+            .get("chaId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| de::Error::custom("character block requires chaId"))?;
+        if character_id != self.0.expected_id {
+            return Err(de::Error::custom(
+                "character block name does not match chaId",
+            ));
+        }
+        self.0.sink.put_character_detail(
+            self.0.staging_id,
+            &Value::Object(detail),
+            conversation_count,
+        )
+            .map_err(|error| {
+                *self.0.staging_error.borrow_mut() = Some(error);
+                de::Error::custom("incremental character staging failed")
+            })
+    }
+}
+
+struct ChatsSeed<'a> {
+    staging_id: &'a str,
+    character_id: &'a str,
+    character_index: u64,
+    job: &'a dyn RestoreControl,
+    sink: &'a dyn ReplacementSink,
+    staging_error: &'a RefCell<Option<StoreError>>,
+}
+
+impl<'de> DeserializeSeed<'de> for ChatsSeed<'_> {
+    type Value = i64;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ChatsVisitor(self))
+    }
+}
+
+struct ChatsVisitor<'a>(ChatsSeed<'a>);
+
+impl<'de> Visitor<'de> for ChatsVisitor<'_> {
+    type Value = i64;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a chats array or ignored non-array value")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut count = 0i64;
+        while sequence
+            .next_element_seed(ConversationSeed {
+                staging_id: self.0.staging_id,
+                character_id: self.0.character_id,
+                configured_index: count,
+                fallback: format!(
+                    "character:{}:chat:{count}",
+                    self.0.character_index
+                ),
+                job: self.0.job,
+                sink: self.0.sink,
+                staging_error: self.0.staging_error,
+            })?
+            .is_some()
+        {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    ignored_visits!(i64);
+}
+
+struct ConversationSeed<'a> {
+    staging_id: &'a str,
+    character_id: &'a str,
+    configured_index: i64,
+    fallback: String,
+    job: &'a dyn RestoreControl,
+    sink: &'a dyn ReplacementSink,
+    staging_error: &'a RefCell<Option<StoreError>>,
+}
+
+impl<'de> DeserializeSeed<'de> for ConversationSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ConversationVisitor(self))
+    }
+}
+
+struct ConversationVisitor<'a>(ConversationSeed<'a>);
+
+impl<'de> Visitor<'de> for ConversationVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a conversation object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut detail = Map::new();
+        let mut messages = MessageSpool::new().map_err(de::Error::custom)?;
+        let mut saw_messages = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if self.0.job.is_cancel_requested() {
+                return Err(de::Error::custom("restore cancelled while reading conversation"));
+            }
+            if key == "message" {
+                if saw_messages {
+                    return Err(de::Error::custom("duplicate message field in conversation"));
+                }
+                saw_messages = true;
+                messages = map.next_value_seed(MessagesSeed {
+                    job: self.0.job,
+                })?;
+            } else {
+                detail.insert(key, map.next_value()?);
+            }
+        }
+        let conversation_id = detail
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| de::Error::custom("conversation requires a nonempty id"))?
+            .to_owned();
+        let mut normalized_detail = Value::Object(detail);
+        pocket_features::chat(&mut normalized_detail, &self.0.fallback)
+            .map_err(de::Error::custom)?;
+        let recent_at = normalized_detail
+            .get("lastDate")
+            .and_then(Value::as_i64)
+            .or(messages.last_time)
+            .unwrap_or_default();
+        self.0.sink.put_conversation_row(
+            self.0.staging_id,
+            self.0.character_id,
+            self.0.configured_index,
+            &normalized_detail,
+            recent_at,
+            messages.entries.len() as i64,
+        )
+            .map_err(|error| {
+                *self.0.staging_error.borrow_mut() = Some(error);
+                de::Error::custom("incremental conversation staging failed")
+            })?;
+        messages
+            .replay(
+                self.0.staging_id,
+                self.0.character_id,
+                &conversation_id,
+                self.0.job,
+                self.0.sink,
+                self.0.staging_error,
+            )
+            .map_err(de::Error::custom)
+    }
+}
+
+struct MessageSpool {
+    file: File,
+    entries: Vec<(u64, u64)>,
+    last_time: Option<i64>,
+}
+
+impl IgnoredJsonValue for MessageSpool {
+    fn ignored<E: de::Error>() -> Result<Self, E> {
+        Self::new().map_err(E::custom)
+    }
+}
+
+impl MessageSpool {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile()?,
+            entries: Vec::new(),
+            last_time: None,
+        })
+    }
+
+    fn replay(
+        &mut self,
+        staging_id: &str,
+        character_id: &str,
+        conversation_id: &str,
+        job: &dyn RestoreControl,
+        sink: &dyn ReplacementSink,
+        staging_error: &RefCell<Option<StoreError>>,
+    ) -> Result<(), String> {
+        let mut page = Vec::with_capacity(MESSAGE_PAGE_COUNT);
+        let mut page_bytes = 0u64;
+        let mut start = 0i64;
+        for (index, (offset, length)) in self.entries.iter().copied().enumerate() {
+            if job.is_cancel_requested() {
+                return Err("restore cancelled while staging messages".to_owned());
+            }
+            if !page.is_empty()
+                && (page.len() >= MESSAGE_PAGE_COUNT
+                    || page_bytes.saturating_add(length) > MESSAGE_PAGE_BYTES)
+            {
+                sink.add_conversation_messages(
+                    staging_id,
+                    character_id,
+                    conversation_id,
+                    start,
+                    &page,
+                )
+                .map_err(|error| {
+                    let message = error.to_string();
+                    *staging_error.borrow_mut() = Some(error);
+                    message
+                })?;
+                start += page.len() as i64;
+                page.clear();
+                page_bytes = 0;
+            }
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|error| error.to_string())?;
+            let mut bytes = vec![0u8; length as usize];
+            self.file
+                .read_exact(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            let mut message: Value =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            pocket_features::message(
+                &mut message,
+                &format!("{conversation_id}:response:{index}"),
+            )?;
+            page.push(message);
+            page_bytes = page_bytes.saturating_add(length);
+        }
+        if !page.is_empty() {
+            sink.add_conversation_messages(
+                staging_id,
+                character_id,
+                conversation_id,
+                start,
+                &page,
+            )
+            .map_err(|error| {
+                let message = error.to_string();
+                *staging_error.borrow_mut() = Some(error);
+                message
+            })?;
+        }
+        Ok(())
+    }
+}
+
+struct MessagesSeed<'a> {
+    job: &'a dyn RestoreControl,
+}
+
+impl<'de> DeserializeSeed<'de> for MessagesSeed<'_> {
+    type Value = MessageSpool;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(MessagesVisitor(self))
+    }
+}
+
+struct MessagesVisitor<'a>(MessagesSeed<'a>);
+
+impl<'de> Visitor<'de> for MessagesVisitor<'_> {
+    type Value = MessageSpool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a message array or ignored non-array value")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut spool = MessageSpool::new().map_err(de::Error::custom)?;
+        while let Some(message) = sequence.next_element::<Value>()? {
+            if self.0.job.is_cancel_requested() {
+                return Err(de::Error::custom("restore cancelled while reading messages"));
+            }
+            let offset = spool.file.stream_position().map_err(de::Error::custom)?;
+            serde_json::to_writer(&mut spool.file, &message).map_err(de::Error::custom)?;
+            let end = spool.file.stream_position().map_err(de::Error::custom)?;
+            spool.entries.push((offset, end - offset));
+            spool.last_time = message.get("time").and_then(Value::as_i64);
+        }
+        Ok(spool)
+    }
+
+    ignored_visits!(MessageSpool);
 }
 
 struct EncodedBlockReader<'a, 'b, R: Read> {
@@ -1504,6 +2094,9 @@ mod tests {
         fail_character_batches: bool,
         abort_calls: AtomicUsize,
         preserve_calls: AtomicUsize,
+        full_character_calls: AtomicUsize,
+        incremental_character_calls: AtomicUsize,
+        max_message_page: AtomicUsize,
     }
 
     impl ReplacementSink for StoreSink {
@@ -1526,6 +2119,7 @@ mod tests {
         }
 
         fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()> {
+            self.full_character_calls.fetch_add(1, Ordering::AcqRel);
             if self.fail_character_batches {
                 return Err(crate::persistent_store::StoreError::Store {
                     message: "simulated disk full".to_owned(),
@@ -1535,6 +2129,76 @@ mod tests {
                 .lock()
                 .unwrap()
                 .replace_add_characters(staging_id, characters)
+        }
+
+        fn supports_incremental_characters(&self) -> bool {
+            true
+        }
+
+        fn put_character_detail(
+            &self,
+            staging_id: &str,
+            detail: &Value,
+            conversation_count: i64,
+        ) -> StoreResult<()> {
+            self.incremental_character_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_character_batches {
+                return Err(crate::persistent_store::StoreError::Store {
+                    message: "simulated disk full".to_owned(),
+                });
+            }
+            self.store.lock().unwrap().replace_put_character_detail(
+                staging_id,
+                detail,
+                conversation_count,
+            )
+        }
+
+        fn put_conversation_row(
+            &self,
+            staging_id: &str,
+            character_id: &str,
+            configured_index: i64,
+            detail: &Value,
+            recent_at: i64,
+            message_count: i64,
+        ) -> StoreResult<()> {
+            if self.fail_character_batches {
+                return Err(crate::persistent_store::StoreError::Store {
+                    message: "simulated disk full".to_owned(),
+                });
+            }
+            self.store.lock().unwrap().replace_put_conversation_row(
+                staging_id,
+                character_id,
+                configured_index,
+                detail,
+                recent_at,
+                message_count,
+            )
+        }
+
+        fn add_conversation_messages(
+            &self,
+            staging_id: &str,
+            character_id: &str,
+            conversation_id: &str,
+            start: i64,
+            messages: &[Value],
+        ) -> StoreResult<()> {
+            self.max_message_page.fetch_max(messages.len(), Ordering::AcqRel);
+            if self.fail_character_batches {
+                return Err(crate::persistent_store::StoreError::Store {
+                    message: "simulated disk full".to_owned(),
+                });
+            }
+            self.store.lock().unwrap().replace_add_conversation_messages(
+                staging_id,
+                character_id,
+                conversation_id,
+                start,
+                messages,
+            )
         }
 
         fn preserve_active_repositories(
@@ -1580,6 +2244,9 @@ mod tests {
                 fail_character_batches: false,
                 abort_calls: AtomicUsize::new(0),
                 preserve_calls: AtomicUsize::new(0),
+                full_character_calls: AtomicUsize::new(0),
+                incremental_character_calls: AtomicUsize::new(0),
+                max_message_page: AtomicUsize::new(0),
             },
         )
     }
@@ -2460,6 +3127,9 @@ mod tests {
             fail_character_batches: false,
             abort_calls: AtomicUsize::new(0),
             preserve_calls: AtomicUsize::new(0),
+            full_character_calls: AtomicUsize::new(0),
+            incremental_character_calls: AtomicUsize::new(0),
+            max_message_page: AtomicUsize::new(0),
         };
         let job = JobRegistry::default()
             .create(JobKind::RestoreBlockRisuSave)
@@ -2469,6 +3139,9 @@ mod tests {
 
         assert_eq!(result.revision, 2);
         assert_eq!(result.character_count, 1);
+        assert_eq!(sink.full_character_calls.load(Ordering::Acquire), 0);
+        assert_eq!(sink.incremental_character_calls.load(Ordering::Acquire), 1);
+        assert!(sink.max_message_page.load(Ordering::Acquire) <= MESSAGE_PAGE_COUNT);
         let mut store = sink.store.lock().unwrap();
         store.release_revision(&lease).unwrap();
         store.cleanup_risu_save_export(&exported_path).unwrap();
@@ -2876,7 +3549,7 @@ mod tests {
         sink.fail_character_batches = true;
         let first = block(2, true, "char-1", &json!({ "chaId": "char-1", "chats": [] }));
         let second = block(2, true, "char-2", &json!({ "chaId": "char-2", "chats": [] }));
-        let second_body = RISU_SAVE_HEADER.len() + first.len() + 3 + "char-2".len() + 4;
+        let first_end = RISU_SAVE_HEADER.len() + first.len();
         let bytes = save_bytes([first, second]);
         let mut reader = io::Cursor::new(&bytes);
         let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
@@ -2884,7 +3557,7 @@ mod tests {
             &mut reader, bytes.len() as u64, 1, &job, &sink, RestoreLimits::default(),
         ).unwrap_err();
         assert_eq!(error.code, "store-error");
-        assert_eq!(reader.position(), second_body as u64);
+        assert_eq!(reader.position(), first_end as u64);
         assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
     }
