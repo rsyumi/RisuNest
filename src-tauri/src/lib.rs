@@ -354,6 +354,20 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     let native_startup_state = NativeStartupState::default();
     let setup_native_startup_state = native_startup_state.clone();
     let mut builder = tauri::Builder::default().manage(native_startup_state);
+    #[cfg(desktop)]
+    {
+        // Reject a second process before plugins with startup side effects run.
+        builder = builder
+            .manage(opened_files::OpenedFilesState::from_launch_arguments())
+            .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+                opened_files::deliver_single_instance_arguments(app, &args, &cwd);
+            }));
+    }
     #[cfg(target_os = "ios")]
     {
         builder = builder
@@ -506,20 +520,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 
     #[cfg(desktop)]
     {
-        builder = builder
-            .manage(opened_files::OpenedFilesState::from_launch_arguments())
-            .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-                let _ = app.get_webview_window("main").map(|window| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                    }
-                    let _ = window.set_focus();
-                });
-                opened_files::deliver_single_instance_arguments(app, &args, &cwd);
-            }))
-            .plugin(tauri_plugin_updater::Builder::new().build());
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
 
     builder
