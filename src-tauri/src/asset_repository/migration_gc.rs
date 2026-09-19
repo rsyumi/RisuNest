@@ -1,6 +1,6 @@
 use super::journal_frame::{self, JournalFrameLabels};
 use super::owner_manifest_codec::{decode_owner_manifest, owner_manifest_identity};
-use super::payload_cas::{PayloadCas, PreparedPayload};
+use super::payload_cas::{PayloadCas, PayloadCasReadScan, PreparedPayload};
 use crate::trust_boundary::is_lower_hex_256;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -550,6 +550,55 @@ pub(crate) fn mark_asset_roots_with_remote(
     roots: impl IntoIterator<Item = AssetRootSet>,
     remote: impl Fn(&str) -> io::Result<Option<u64>>,
 ) -> io::Result<AssetGcMarks> {
+    let marks = collect_asset_root_marks(cas, roots)?;
+    for hash in &marks.marked_hashes {
+        if cas.stat_object(hash)?.is_none() && remote(hash)?.is_none() {
+            return invalid_data("marked CAS object is missing");
+        }
+    }
+    Ok(marks)
+}
+
+pub(crate) fn mark_asset_roots_with_remote_scan(
+    scan: &PayloadCasReadScan,
+    roots: impl IntoIterator<Item = AssetRootSet>,
+    remote: impl Fn(&str) -> io::Result<Option<u64>>,
+) -> io::Result<AssetGcMarks> {
+    let marks = collect_asset_root_marks_scan(scan, roots)?;
+    let mut hashes = marks.marked_hashes.iter().map(String::as_str);
+    loop {
+        let batch = hashes.by_ref().take(128).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let local_sizes = scan.stat_objects(batch.iter().copied())?;
+        for (hash, local_size) in batch.into_iter().zip(local_sizes) {
+            if local_size.is_none() && remote(hash)?.is_none() {
+                return invalid_data("marked CAS object is missing");
+            }
+        }
+    }
+    Ok(marks)
+}
+
+fn collect_asset_root_marks(
+    cas: &PayloadCas,
+    roots: impl IntoIterator<Item = AssetRootSet>,
+) -> io::Result<AssetGcMarks> {
+    collect_asset_root_marks_with(roots, |hash| cas.read_object(hash))
+}
+
+fn collect_asset_root_marks_scan(
+    scan: &PayloadCasReadScan,
+    roots: impl IntoIterator<Item = AssetRootSet>,
+) -> io::Result<AssetGcMarks> {
+    collect_asset_root_marks_with(roots, |hash| scan.read_object(hash))
+}
+
+fn collect_asset_root_marks_with(
+    roots: impl IntoIterator<Item = AssetRootSet>,
+    read_object: impl Fn(&str) -> io::Result<Option<Vec<u8>>>,
+) -> io::Result<AssetGcMarks> {
     let mut manifest_hashes = BTreeSet::new();
     let mut marked_hashes = BTreeSet::new();
     let mut blockers = BTreeSet::new();
@@ -573,8 +622,7 @@ pub(crate) fn mark_asset_roots_with_remote(
         }
     }
     for manifest_hash in manifest_hashes {
-        let canonical = cas
-            .read_object(&manifest_hash)?
+        let canonical = read_object(&manifest_hash)?
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "root manifest is missing"))?;
         if owner_manifest_identity(&canonical) != manifest_hash {
             return invalid_data("root manifest content hash mismatch");
@@ -588,12 +636,6 @@ pub(crate) fn mark_asset_roots_with_remote(
             }
         }
     }
-    for hash in &marked_hashes {
-        if cas.stat_object(hash)?.is_none() && remote(hash)?.is_none() {
-            return invalid_data("marked CAS object is missing");
-        }
-    }
-
     Ok(AssetGcMarks {
         marked_hashes,
         blockers,
@@ -601,12 +643,44 @@ pub(crate) fn mark_asset_roots_with_remote(
     })
 }
 
-pub(crate) fn sweep_asset_candidates_with_remote(
-    cas: &PayloadCas,
+pub(crate) fn sweep_asset_candidates_with_remote_scan(
+    scan: &PayloadCasReadScan,
     candidates: impl IntoIterator<Item = AssetGcCandidate>,
     marks: &AssetGcMarks,
     now_ms: i64,
     minimum_grace_ms: i64,
+    remote: impl Fn(&str) -> io::Result<Option<u64>>,
+) -> io::Result<AssetGcDryRunReport> {
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    let local_sizes = scan.stat_objects(
+        candidates
+            .iter()
+            .map(|candidate| candidate.object_hash.as_str()),
+    )?;
+    let mut local_sizes = local_sizes.into_iter();
+    sweep_asset_candidates_with_local(
+        candidates,
+        marks,
+        now_ms,
+        minimum_grace_ms,
+        |_| {
+            local_sizes.next().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    "asset GC local size scan ended before its candidate page",
+                )
+            })
+        },
+        remote,
+    )
+}
+
+fn sweep_asset_candidates_with_local(
+    candidates: impl IntoIterator<Item = AssetGcCandidate>,
+    marks: &AssetGcMarks,
+    now_ms: i64,
+    minimum_grace_ms: i64,
+    mut local: impl FnMut(&str) -> io::Result<Option<u64>>,
     remote: impl Fn(&str) -> io::Result<Option<u64>>,
 ) -> io::Result<AssetGcDryRunReport> {
     if now_ms < 0 || minimum_grace_ms < 0 {
@@ -624,12 +698,10 @@ pub(crate) fn sweep_asset_candidates_with_remote(
         if candidate.created_at_ms < 0 || !seen_candidates.insert(candidate.object_hash.clone()) {
             return invalid_data("asset GC candidate is invalid or duplicated");
         }
-        let physical = cas.stat_object(&candidate.object_hash)?;
-        let actual_size = physical
-            .or(remote(&candidate.object_hash)?)
-            .ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidData, "asset GC candidate is missing")
-            })?;
+        let physical = local(&candidate.object_hash)?;
+        let actual_size = physical.or(remote(&candidate.object_hash)?).ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidData, "asset GC candidate is missing")
+        })?;
         if actual_size != candidate.byte_size {
             return invalid_data("asset GC candidate size mismatch");
         }
@@ -666,6 +738,24 @@ pub(crate) fn sweep_asset_candidates_with_remote(
         blockers: marks.blockers.iter().cloned().collect(),
         deletion_enabled: false,
     })
+}
+
+pub(crate) fn sweep_asset_candidates_with_remote(
+    cas: &PayloadCas,
+    candidates: impl IntoIterator<Item = AssetGcCandidate>,
+    marks: &AssetGcMarks,
+    now_ms: i64,
+    minimum_grace_ms: i64,
+    remote: impl Fn(&str) -> io::Result<Option<u64>>,
+) -> io::Result<AssetGcDryRunReport> {
+    sweep_asset_candidates_with_local(
+        candidates,
+        marks,
+        now_ms,
+        minimum_grace_ms,
+        |hash| cas.stat_object(hash),
+        remote,
+    )
 }
 
 #[cfg(test)]

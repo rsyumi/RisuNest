@@ -44,18 +44,25 @@ fn run_preview(total: usize) -> usize {
     let (_directory, state, expected_bytes) = preview_fixture(total);
     let guard = state.admit_renderer_operation().unwrap();
     ASSET_ROOT_SCANS.with(|count| count.set(0));
+    crate::asset_repository::reset_root_path_validations();
     let start = Instant::now();
     let result = pds_asset_gc_preview_all(&state, &guard).unwrap();
     let elapsed = start.elapsed();
     let scans = ASSET_ROOT_SCANS.with(|count| count.get());
+    let root_path_validations = crate::asset_repository::root_path_validations();
     assert_eq!(result.candidate_count, total.div_ceil(10) as u64);
     assert_eq!(result.candidate_bytes, expected_bytes);
     assert_eq!(result.deleted_count, 0);
     assert_eq!(result.deleted_bytes, 0);
     assert!(result.blockers.is_empty());
     eprintln!(
-        "synthetic GC preview: objects={total}, root_scans={scans}, elapsed_ms={:.3}",
+        "synthetic GC preview: objects={total}, root_scans={scans}, root_path_validations={root_path_validations}, elapsed_ms={:.3}",
         elapsed.as_secs_f64() * 1000.0
+    );
+    assert_eq!(
+        root_path_validations,
+        1 + total.div_ceil(128) * 2 + (total - total.div_ceil(10)).div_ceil(128) * 2,
+        "fixed CAS ancestry validation must be bounded by preview pages, not object count; got {root_path_validations}",
     );
     scans
 }
