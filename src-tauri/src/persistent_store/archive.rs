@@ -2,11 +2,11 @@
 //! messages and detail move into one compressed CAS object and the row records it.
 use super::{RevisionResult, StoreError, StoreResult};
 use crate::asset_repository::PayloadCas;
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{bufread::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 
 const ARCHIVE_PAYLOAD_VERSION: u32 = 1;
 const MAX_DECODED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -291,14 +291,67 @@ fn compress(payload: &ArchivePayload) -> StoreResult<Vec<u8>> {
 }
 
 fn decompress(bytes: &[u8]) -> StoreResult<ArchivePayload> {
-    let mut decoder = GzDecoder::new(bytes).take(MAX_DECODED_ARCHIVE_BYTES);
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded)?;
-    let payload: ArchivePayload = serde_json::from_slice(&decoded)?;
+    decompress_bounded(bytes, MAX_DECODED_ARCHIVE_BYTES)
+}
+
+fn decompress_bounded(bytes: &[u8], max_bytes: u64) -> StoreResult<ArchivePayload> {
+    let mut decoder = BufReader::new(GzDecoder::new(bytes).take(max_bytes.saturating_add(1)));
+    let payload: ArchivePayload = serde_json::from_reader(&mut decoder)?;
+    if decoder.get_ref().limit() == 0 {
+        return validation("archived character exceeds the decoded size limit");
+    }
+    if !decoder.into_inner().into_inner().into_inner().is_empty() {
+        return validation("archived character has trailing compressed data");
+    }
     if payload.version != ARCHIVE_PAYLOAD_VERSION {
         return validation("archived character payload version is unsupported");
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod decoding_tests {
+    use super::*;
+
+    fn encoded(json: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(json).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    const PAYLOAD: &[u8] = br#"{"version":1,"characterId":"synthetic","detail":{"name":"Test"},"conversations":[]}"#;
+
+    #[test]
+    fn reads_a_buffered_payload_at_the_exact_limit_and_rejects_overflow() {
+        let compressed = encoded(PAYLOAD);
+        let payload = decompress_bounded(&compressed, PAYLOAD.len() as u64).unwrap();
+        assert_eq!(payload.character_id, "synthetic");
+        assert_eq!(payload.detail["name"], "Test");
+        assert!(decompress_bounded(&compressed, PAYLOAD.len() as u64 - 1).is_err());
+        let mut padded = PAYLOAD.to_vec();
+        padded.extend_from_slice(b"  ");
+        assert!(decompress_bounded(&encoded(&padded), PAYLOAD.len() as u64).is_err());
+    }
+
+    #[test]
+    fn checks_gzip_integrity_and_rejects_extra_members_and_trailing_json() {
+        let compressed = encoded(PAYLOAD);
+        assert!(decompress(&compressed[..compressed.len() - 3]).is_err());
+        let mut damaged = compressed.clone();
+        let checksum = damaged.len() - 8;
+        damaged[checksum] ^= 1;
+        assert!(decompress(&damaged).is_err());
+        assert!(decompress(&[compressed.clone(), compressed].concat()).is_err());
+        assert!(decompress(&encoded(&[PAYLOAD, b"{}"].concat())).is_err());
+    }
+
+    #[test]
+    fn preserves_version_and_shape_validation() {
+        let mut value: Value = serde_json::from_slice(PAYLOAD).unwrap();
+        value["version"] = Value::from(2);
+        assert!(decompress(&encoded(&serde_json::to_vec(&value).unwrap())).is_err());
+        assert!(decompress(&encoded(br#"{"version":1}"#)).is_err());
+    }
 }
 
 /// Writes the payload object first and commits the row change afterwards, so a
