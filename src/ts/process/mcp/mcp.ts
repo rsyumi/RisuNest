@@ -8,6 +8,7 @@ import type { MCPClientLike } from "./internalmcp";
 import { isTauriDesktop } from "src/ts/platform"
 import { sleep } from "src/ts/util";
 import { registeredCustomPluginMCPs } from "./pluginmcp";
+import { spawnMCPProcess, writeMCPMessage } from "./stdio";
 
 export type MCPToolWithURL = MCPTool & {
     mcpURL: string;
@@ -125,13 +126,13 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
                                 console.error('Failed to parse MCP JSON:', error);
                             }
                         }))
-                        const child = await cmd.spawn();
+                        const child = await spawnMCPProcess(command, () => cmd.spawn());
 
                         const client = new MCPClient(mcp);
                         client.customTransport = {
                             send: async (data) => {
                                 console.log('Sending data to MCP:', data);
-                                await child.write(JSON.stringify(data))
+                                await writeMCPMessage(child, data)
                             },
                             addListener: (callback) => {
                                 listeners.add(callback);
@@ -153,11 +154,11 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
                             const pingId = v4();
                             pingIds.push(pingId);
                             console.log('Sending ping to MCP:', pingId);
-                            await child.write(JSON.stringify({
+                            await writeMCPMessage(child, {
                                 jsonrpc: "2.0",
                                 id: pingId,
                                 method: "ping"
-                            }))
+                            })
                             await sleep(1000)
                             if(gotPong){
                                 break;
@@ -177,7 +178,7 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
                     }
                 }                   
                 catch (error) {
-                    throw new Error(`Failed to parse MCP JSON: ${error}`);
+                    throw new Error(`Failed to initialize stdio MCP: ${error}`, { cause: error });
                 }
             }
 
