@@ -10,9 +10,12 @@ import { assertBinaryArchitecture } from "../../scripts/release/platform/native.
 import { assertPackageFormat } from "../../scripts/release/platform/package.mjs";
 import {
   assertIosBundleMetadata,
+  assertMacBundleMetadata,
+  assertMacAdHocSignature,
   inspectMacAppRoot,
   validateIosArchiveEntries,
 } from "../../scripts/release/package-app.mjs";
+import { assertAppIdentifier, mergeTauriConfig, releaseTauriConfig } from "../../scripts/release/tauri-config.mjs";
 import { validateOwnedInventory } from "../../server/manager/install/package.mjs";
 
 function pe(machine) {
@@ -277,4 +280,31 @@ test("iOS package proof requires imported and exported custom document types", (
   const invalid = structuredClone(info);
   delete invalid.CFBundleDocumentTypes[0].LSItemContentTypes;
   assert.throws(() => assertIosBundleMetadata(invalid, releaseInput, config, iosConfig), /bundle metadata/);
+});
+
+
+test("effective configuration preserves the approved desktop and mobile identities", () => {
+  const base = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+  for (const os of ["windows", "linux", "macos", "android", "ios"]) {
+    const overlay = JSON.parse(readFileSync(`src-tauri/tauri.${os}.conf.json`, "utf8"));
+    const config = mergeTauriConfig(base, overlay, releaseTauriConfig({ product: "app", version: "1.2.3" }, "synthetic"));
+    assert.equal(assertAppIdentifier(config, os), ["android", "ios"].includes(os) ? "io.github.rsyumi.risunest" : "RisuNest");
+    assert.equal(config.version, "1.2.3");
+    if (os === "macos") assert.equal(config.bundle.macOS.signingIdentity, "-");
+    assert.throws(() => assertAppIdentifier({ ...config, identifier: "wrong" }, os), /effective/);
+  }
+});
+
+test("macOS package metadata and intentional ad-hoc signatures are checked", () => {
+  const config = { ...tauriConfig, identifier: "RisuNest", productName: "RisuNest", mainBinaryName: "RisuNest",
+    bundle: { ...tauriConfig.bundle, macOS: { minimumSystemVersion: "14.0" } },
+    plugins: { "deep-link": { desktop: { schemes: ["risunestlocal"] } } },
+  };
+  const info = { ...iosInfo(), CFBundleIdentifier: "RisuNest", CFBundleName: "RisuNest", LSMinimumSystemVersion: "14.0" };
+  assert.equal(assertMacBundleMetadata(info, releaseInput, config).identifier, "RisuNest");
+  for (const key of ["CFBundleIdentifier", "CFBundleExecutable", "CFBundleName", "CFBundleShortVersionString", "CFBundleVersion", "LSMinimumSystemVersion", "CFBundleDocumentTypes", "CFBundleURLTypes"]) {
+    assert.throws(() => assertMacBundleMetadata({ ...info, [key]: undefined }, releaseInput, config), /metadata/);
+  }
+  assert.doesNotThrow(() => assertMacAdHocSignature("Executable=RisuNest\nSignature=adhoc\nTeamIdentifier=not set\n"));
+  assert.throws(() => assertMacAdHocSignature("Signature size=123\nAuthority=Unexpected\n"), /ad-hoc/);
 });

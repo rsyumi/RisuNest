@@ -172,6 +172,10 @@ pub(crate) fn export_block_risu_save(
     );
     let published = match published {
         Ok(result) => Ok(JobResultSummary {
+            export_exclusions: Some(super::ExportExclusions {
+                archived_characters: encoded.excluded_archived_character_count,
+                colliding_plugin_values: encoded.excluded_colliding_plugin_value_count,
+            }),
             revision: prepared.revision,
             source_bytes: result.bytes,
             source_sha256: result.sha256,
@@ -393,6 +397,8 @@ mod tests {
     #[test]
     fn job_owned_connection_exports_the_pinned_revision_after_the_live_store_advances() {
         let (directory, mut store, revision) = fixture();
+        store.archive_character("live-second", revision, 10).unwrap();
+        let revision = store.revision().unwrap();
         let baseline_lease = store.acquire_revision(revision).unwrap().lease;
         let baseline = store.export_risu_save(&baseline_lease, false).unwrap();
         let expected = fs::read(&baseline.path).unwrap();
@@ -419,6 +425,9 @@ mod tests {
         let result = export_block_risu_save(prepared, &destination, false, &job).unwrap();
 
         assert_eq!(result.revision, revision);
+        assert_eq!(result.export_exclusions, Some(super::super::ExportExclusions {
+            archived_characters: 1, colliding_plugin_values: 0,
+        }));
         assert_eq!(fs::read(destination).unwrap(), expected);
         assert_eq!(store.revision().unwrap(), next_revision);
     }

@@ -329,6 +329,7 @@ fn restore_risu_save_reader_controlled<R: Read>(
             .map_err(store_error)?
             .revision;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision,
             source_bytes: reader.completed,
             source_sha256: hex::encode(reader.hasher.finalize()),

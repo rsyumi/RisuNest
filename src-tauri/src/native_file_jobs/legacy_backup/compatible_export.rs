@@ -311,6 +311,7 @@ pub(crate) fn export_compatible_local_backup(
         )
         .map_err(|error| destination_job_error(error, phase_error.into_inner()))?;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision: expected_revision,
             source_bytes: published.bytes,
             source_sha256: published.sha256,

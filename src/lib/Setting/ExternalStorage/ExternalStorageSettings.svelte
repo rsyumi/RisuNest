@@ -711,7 +711,7 @@
                             <SettingButton disabled={busy || connection.status !== 'ready' || storageState.jobs.some(job => job.connectionId === connection.id && externalJobIsActive(job))} onclick={() => runJob(connection, 'cleanup')}>{strings.cleanup}</SettingButton>
                         {/if}
                         <p class="text-textcolor2">{strings.retentionHelp} {strings.retentionOtherDevices}</p>
-                        <p class="text-textcolor2">{strings.cleanupTrashNotice}</p>
+                        <p class="text-textcolor2">{strings.cleanupTrashNotice} {strings.providerCapacityHelp}</p>
                         <label class="policy-row fixed">
                             <span>{strings.retentionCount}</span>
                             <span class="amount">

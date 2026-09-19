@@ -65,12 +65,13 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
             revision: 4,
             sourceBytes: 8192,
             sourceSha256: 'b'.repeat(64),
+            exportExclusions: { archivedCharacters: 1, collidingPluginValues: 2 },
             characterCount: 2,
             presetCount: 1,
             warningCodes: [],
         })),
         decodeRisuSave: vi.fn(async () => ({ username: 'Web import', characters: [] })),
-        collectWebExport: vi.fn(async () => Uint8Array.from([4, 5, 6])),
+        collectWebExport: vi.fn(async () => ({ bytes: Uint8Array.from([4, 5, 6]), exclusions: { archivedCharacters: 1, collidingPluginValues: 2 } })),
         downloadWebExport: vi.fn(async () => undefined),
         withFlushedExport: vi.fn(async () => {
             throw new Error('Unexpected managed Android export')
@@ -150,13 +151,13 @@ describe('RisuSave picker route', () => {
                     revision: 4,
                     withNativeFile: async (
                         options: unknown,
-                        nativeCallback: (file: { path: string; bytes: number }) => Promise<unknown>,
+                        nativeCallback: (file: import('./nativePersistentExport').NativePersistentExportFile) => Promise<unknown>,
                     ) => {
                         events.push(`native-file:${JSON.stringify(options)}`)
                         try {
                             return await nativeCallback({
                                 path: '/app/persistent/exports/risusave-a.risudat',
-                                bytes: 8_192,
+                                bytes: 8_192, excludedArchivedCharacterCount: 1, excludedCollidingPluginValueCount: 2,
                             })
                         }
                         finally {
@@ -198,6 +199,7 @@ describe('RisuSave picker route', () => {
         await expect(pending).resolves.toEqual({
             mode: 'native',
             bytes: 8_192,
+            exclusions: { archivedCharacters: 1, collidingPluginValues: 2 },
             warningCodes: ['android-saf-provider-not-atomic'],
         })
         expect(events).toEqual([
@@ -417,7 +419,7 @@ describe('RisuSave picker route', () => {
         installAndroidExport(deps, {
             withFlushedExport: async (_runtime, _reason, callback) => await callback({
                 withNativeFile: async (_options: unknown, nativeCallback: Function) =>
-                    await nativeCallback({ path: '/app/persistent/exports/source.risudat', bytes: 10 }),
+                    await nativeCallback({ path: '/app/persistent/exports/source.risudat', bytes: 10, excludedArchivedCharacterCount: 1, excludedCollidingPluginValueCount: 2 }),
             }),
             copyAndroidExport: async () => ({
                 requestId: 'saf-request-2',
@@ -464,7 +466,7 @@ describe('RisuSave picker route', () => {
         installAndroidExport(deps, {
             withFlushedExport: async (_runtime, _reason, callback) => await callback({
                 withNativeFile: async (_options: unknown, nativeCallback: Function) =>
-                    await nativeCallback({ path: '/app/persistent/exports/source.risudat', bytes: 10 }),
+                    await nativeCallback({ path: '/app/persistent/exports/source.risudat', bytes: 10, excludedArchivedCharacterCount: 1, excludedCollidingPluginValueCount: 2 }),
             }),
             copyAndroidExport: async () => ({
                 requestId: 'saf-request-3',
@@ -480,6 +482,7 @@ describe('RisuSave picker route', () => {
         await expect(exportRisuSaveFromPicker({}, deps)).resolves.toEqual({
             mode: 'native',
             bytes: 10,
+            exclusions: { archivedCharacters: 1, collidingPluginValues: 2 },
             warningCodes: [
                 'android-saf-provider-not-atomic',
                 'partial-destination-may-remain',

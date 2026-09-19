@@ -386,6 +386,7 @@ fn export_portable_running(
         super::job_transition(job, job.set_phase(JobPhase::PublishingDestination))?;
         let published = publish(&path, &destination, owned, job)?;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision,
             source_bytes: published.bytes,
             source_sha256: published.sha256,
@@ -649,6 +650,7 @@ pub(crate) fn restore_portable(
                 revision
             };
             Ok(JobResultSummary {
+                export_exclusions: None,
                 revision: final_revision,
                 source_bytes: source.total_bytes,
                 source_sha256,

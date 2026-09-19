@@ -351,6 +351,7 @@ fn import_jpeg_asset_with_before_commit(
             )
             .map_err(super::native_store_error)?;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision: committed.revision,
             source_bytes: prepared.byte_size,
             source_sha256: prepared.content_hash,

@@ -466,6 +466,7 @@ pub(crate) fn run_job(
                     "KEI backup cancelled during upload",
                 )?;
                 Ok(JobResultSummary {
+                    export_exclusions: None,
                     revision,
                     source_bytes: payload.bytes,
                     source_sha256: payload.sha256.clone(),

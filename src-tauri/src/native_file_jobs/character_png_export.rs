@@ -462,6 +462,7 @@ where
                 .unwrap_or_else(|| destination_error(error))
         })?;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision: prepared.revision,
             source_bytes: published.bytes,
             source_sha256: published.sha256,

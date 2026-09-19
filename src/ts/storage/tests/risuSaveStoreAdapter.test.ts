@@ -121,7 +121,8 @@ describe('RisuSave persistent store adapter', () => {
         const materialize = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
             new Error('streaming export must not materialize the database'),
         )
-        const iterator = streamRisuSaveFromStore(store, imported.revision)[Symbol.asyncIterator]()
+        const reports: unknown[] = []
+        const iterator = streamRisuSaveFromStore(store, imported.revision, { onExclusions: report => reports.push(report) })[Symbol.asyncIterator]()
 
         const header = await iterator.next()
         expect(new TextDecoder().decode(header.value)).toBe('RISUSAVE\0')
@@ -131,6 +132,7 @@ describe('RisuSave persistent store adapter', () => {
             root: { ...root, username: 'Later User' },
             pluginStorage: [
                 { type: 'set', owner: 'test-plugin', key: 'fixture', value: { value: 'later' } },
+                { type: 'set', owner: 'second-plugin', key: 'fixture', value: { value: 'collision' } },
             ],
         })
         const remaining = await concatenate({
@@ -146,6 +148,13 @@ describe('RisuSave persistent store adapter', () => {
         expect((await store.readRoot()).value.username).toBe('Later User')
         expect((await store.readPluginStorage('test-plugin', 'fixture'))?.value).toEqual({ value: 'later' })
         expect(materialize).not.toHaveBeenCalled()
+        expect(reports).toEqual([{ archivedCharacters: 0, collidingPluginValues: 0 }])
+        const nextReports: unknown[] = []
+        const latest = (await store.readRoot()).revision
+        const nextExport = await concatenate(streamRisuSaveFromStore(store, latest, { onExclusions: report => nextReports.push(report) }))
+        expect(nextReports).toEqual([{ archivedCharacters: 0, collidingPluginValues: 1 }])
+        expect((await decodeRisuSave(nextExport)).pluginCustomStorage).not.toHaveProperty('fixture')
+
     })
 
     it('exports plugin storage in legacy Object.keys order from the pinned catalog', async () => {

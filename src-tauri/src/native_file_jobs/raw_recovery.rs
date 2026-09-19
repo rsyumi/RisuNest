@@ -358,6 +358,7 @@ pub(super) fn publish(
         Some(handoff.to_string_lossy().into_owned())
     };
     Ok(JobResultSummary {
+        export_exclusions: None,
         revision: 0,
         source_bytes: captured.bytes,
         source_sha256: captured.sha256,

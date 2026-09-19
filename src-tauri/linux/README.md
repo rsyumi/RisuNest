@@ -41,8 +41,10 @@ chmod +x ./RisuNest_1.0.0_amd64.AppImage
 
 AppImage needs FUSE 2 for normal execution. On hosts without FUSE, its
 `--appimage-extract-and-run` option is available. No WebKit sandbox override is
-required by the build configuration. Updates are manual package replacements;
-no update service or release publication is configured.
+required by the build configuration. The in-app updater verifies the signed release
+manifest. AppImage updates replace the running AppImage after local data is saved.
+DEB updates download a verified package for you to install with the system package
+manager. Both x86_64 and aarch64 packages are published by the release workflow.
 
 Native credential storage needs an unlocked Secret Service provider, such as
 GNOME Keyring, in the user's desktop session. Headless sessions need their own

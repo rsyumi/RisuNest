@@ -1,3 +1,4 @@
+import type { ExportExclusions } from './exportExcludedReport'
 import type { Database } from './database.svelte'
 import {
     AndroidSafDestinationError,
@@ -61,7 +62,7 @@ export interface RisuSaveFileRouteDependencies {
         options: NativeFileExportJobOptions,
     ): Promise<NativeFileJobResult>
     decodeRisuSave(bytes: Uint8Array): Promise<unknown>
-    collectWebExport(omitAccount: boolean): Promise<Uint8Array>
+    collectWebExport(omitAccount: boolean): Promise<{ bytes: Uint8Array; exclusions: ExportExclusions }>
     downloadWebExport(name: string, bytes: Uint8Array): Promise<void>
     withFlushedExport<T>(
         runtime: RisuSaveExportRuntime,
@@ -192,6 +193,7 @@ async function exportThroughAndroidSaf(
                                 mode: 'native' as const,
                                 warningCodes,
                                 bytes: file.bytes,
+                                exclusions: { archivedCharacters: file.excludedArchivedCharacterCount, collidingPluginValues: file.excludedCollidingPluginValueCount },
                             },
                         }
                     }
@@ -314,6 +316,7 @@ export interface RisuSaveFileRouteOptions extends NativeFileRestoreJobOptions {
 }
 
 export interface RisuSaveFileRouteResult {
+    exclusions?: ExportExclusions
     mode: 'native' | 'web'
     warningCodes: string[]
     bytes?: number
@@ -395,9 +398,9 @@ async function exportWithWebCodec(
     omitAccount: boolean,
     dependencies: RisuSaveFileRouteDependencies,
 ): Promise<RisuSaveFileRouteResult> {
-    const bytes = await dependencies.collectWebExport(omitAccount)
+    const { bytes, exclusions } = await dependencies.collectWebExport(omitAccount)
     await dependencies.downloadWebExport(name, bytes)
-    return { mode: 'web', warningCodes: [], bytes: bytes.byteLength }
+    return { mode: 'web', warningCodes: [], bytes: bytes.byteLength, exclusions }
 }
 
 export async function importRisuSaveFromPicker(
@@ -491,6 +494,7 @@ export async function exportRisuSaveFromPicker(
             mode: 'native',
             warningCodes: result.warningCodes,
             bytes: result.sourceBytes,
+            exclusions: result.exportExclusions,
         }
     }
 

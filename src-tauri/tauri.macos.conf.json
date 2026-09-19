@@ -3,7 +3,8 @@
   "identifier": "RisuNest",
   "bundle": {
     "macOS": {
-      "minimumSystemVersion": "14.0"
+      "minimumSystemVersion": "14.0",
+      "signingIdentity": "-"
     }
   }
 }

@@ -1,3 +1,4 @@
+import type { ExportExclusions } from './exportExcludedReport'
 import type { Database } from './database.svelte'
 import {
     hasNativePersistentRevisionLease,
@@ -12,7 +13,7 @@ import type {
 } from './persistentDataStore'
 import {
     assertPinnedRevision,
-    collectPinnedCharacterIds,
+    iteratePinnedCharacterSummaries,
     countPinnedCharacters,
     iteratePinnedCharacters,
     iteratePinnedConversations,
@@ -64,6 +65,7 @@ export async function* streamRisuSaveFromStore(
 }
 
 export interface RisuSaveStreamOptions {
+    onExclusions?: (report: ExportExclusions) => void
     replaceResources?: Readonly<Record<string, string>>
     omitAccount?: boolean
 }
@@ -88,7 +90,7 @@ async function presetValues(reader: PersistentRevisionReader): Promise<Database[
  */
 async function pluginStorageValues(
     reader: PersistentRevisionReader,
-): Promise<{ storage: Database['pluginCustomStorage']; meta: PluginStorageMeta }> {
+): Promise<{ storage: Database['pluginCustomStorage']; meta: PluginStorageMeta; excluded: number }> {
     const storage: Database['pluginCustomStorage'] = {}
     const meta: PluginStorageMeta = {}
     const catalog = await reader.queryPluginStorage()
@@ -113,7 +115,7 @@ async function pluginStorageValues(
             meta[summary.key] = { plugin: summary.owner, updatedAt: 0 }
         }
     }
-    return { storage, meta }
+    return { storage, meta, excluded: [...owners.values()].filter(holders => holders.size > 1).length }
 }
 
 export async function* streamRisuSaveFromLease(
@@ -150,7 +152,13 @@ export async function* streamRisuSaveFromLease(
         'pluginStorage',
         'pluginStorageMeta',
     ]
-    const characterIds = await collectPinnedCharacterIds(reader)
+    const characterIds: string[] = []
+    let archivedCharacters = 0
+    for await (const summary of iteratePinnedCharacterSummaries(reader)) {
+        if (summary.archived) archivedCharacters += 1
+        else characterIds.push(summary.id)
+    }
+    options?.onExclusions?.({ archivedCharacters, collidingPluginValues: storedPluginStorage.excluded })
     directory.push(...characterIds, 'config')
 
     const {

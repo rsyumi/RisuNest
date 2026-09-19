@@ -1,3 +1,4 @@
+import type { ExportExclusions } from './exportExcludedReport'
 import { open, save } from '@tauri-apps/plugin-dialog'
 
 import { downloadFile } from '../globalApi.svelte'
@@ -20,6 +21,7 @@ import {
     runSharedNativeFileOperation,
 } from './nativeFileJobManager'
 import {
+    type NativeFileJobResult,
     runNativeBlockRisuSaveExport,
     runNativeBlockRisuSaveRestore,
 } from './nativeFileJobs'
@@ -79,8 +81,9 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
             )
     },
     runNativeExport: async (runtime, destination, options) => {
+        let result: NativeFileJobResult | undefined
         try {
-            const result = await runNativeBlockRisuSaveExport(
+            result = await runNativeBlockRisuSaveExport(
                 runtime,
                 destination,
                 options,
@@ -91,6 +94,7 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
                     suggestedName: destination.split('/').at(-1)!,
                     signal: options?.signal,
                 })
+                result.warningCodes = [...new Set([...result.warningCodes, ...(published.warningCodes ?? [])])]
                 if (published.bytes !== result.sourceBytes)
                     throw new Error(
                         'Published RisuSave length differs from its source',
@@ -99,9 +103,10 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
             return result
         } finally {
             if (isTauriIOS)
-                await remove(destination).catch((error) =>
-                    console.error('iOS export cleanup failed', error),
-                )
+                await remove(destination.substring(0, destination.lastIndexOf('/')), { recursive: true }).catch((error) => {
+                    if (result) result.warningCodes = [...new Set([...result.warningCodes, 'cleanup-failed'])]
+                    else console.error('iOS export cleanup failed', error)
+                })
         }
     },
     decodeRisuSave,
@@ -109,7 +114,12 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
         withFlushedRisuSaveExport(
             getPersistentDataRuntime(),
             'risu-save-file-export',
-            (pinned) => pinned.collectBytes({ omitAccount }),
+            async (pinned) => {
+                let exclusions: ExportExclusions | undefined
+                const bytes = await pinned.collectBytes({ omitAccount, onExclusions: report => { exclusions = report } })
+                if (!exclusions) throw new Error('The export did not return its exclusion report')
+                return { bytes, exclusions }
+            },
         ),
     downloadWebExport: async (name, bytes) => {
         await downloadFile(name, bytes)

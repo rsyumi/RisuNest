@@ -3461,7 +3461,16 @@ pub(crate) struct JobStatus {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ExportExclusions {
+    pub(crate) archived_characters: u64,
+    pub(crate) colliding_plugin_values: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct JobResultSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) export_exclusions: Option<ExportExclusions>,
     pub(crate) revision: i64,
     pub(crate) source_bytes: u64,
     pub(crate) source_sha256: String,
@@ -4728,6 +4737,7 @@ mod tests {
 
     fn result(revision: i64) -> JobResultSummary {
         JobResultSummary {
+            export_exclusions: None,
             revision,
             source_bytes: 1,
             source_sha256: "a".repeat(64),
@@ -7248,6 +7258,7 @@ mod tests {
         success.start(JobPhase::ReadingSource).unwrap();
         assert!(success
             .finish_success(JobResultSummary {
+                export_exclusions: None,
                 revision: 2,
                 source_bytes: 128,
                 source_sha256: "a".repeat(64),

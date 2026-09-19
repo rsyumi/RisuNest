@@ -44,12 +44,13 @@ export async function exportIOSFile(request: {
             requestId,
         },
     )
+    let cleanupFailed = false
     if (result.cancelled || !request.requestId) {
-        await acknowledgeIOSPublication(requestId).catch(() => {})
+        await acknowledgeIOSPublication(requestId).catch(() => { cleanupFailed = true })
     }
     if (result.cancelled) throw cancelled()
     // Publication has completed. A late abort must not turn a published file into a reported failure.
-    return { bytes: result.bytes }
+    return { bytes: result.bytes, ...(cleanupFailed ? { warningCodes: ['cleanup-failed'] } : {}) }
 }
 
 export const acknowledgeIOSPublication = (id: string) =>

@@ -2,6 +2,27 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs, readJson, requireArg, writeJson } from "./common.mjs";
 
+export function mergeTauriConfig(base, ...overrides) {
+  const result = structuredClone(base);
+  for (const override of overrides) {
+    for (const [key, value] of Object.entries(override ?? {})) {
+      if (value === null) delete result[key];
+      else if (typeof value === "object" && !Array.isArray(value))
+        result[key] = mergeTauriConfig(result[key] ?? {}, value);
+      else result[key] = structuredClone(value);
+    }
+  }
+  return result;
+}
+
+export function assertAppIdentifier(config, os) {
+  const expected = ["windows", "linux", "macos"].includes(os) ? "RisuNest"
+    : ["android", "ios"].includes(os) ? "io.github.rsyumi.risunest" : null;
+  if (!expected || config.identifier !== expected)
+    throw new Error(`Unexpected effective ${os} app identifier: ${config.identifier}`);
+  return expected;
+}
+
 export function releaseTauriConfig(releaseInput, publicKey) {
   if (!publicKey) throw new Error("RISUNEST_UPDATE_PUBLIC_KEY is required.");
   const config = {

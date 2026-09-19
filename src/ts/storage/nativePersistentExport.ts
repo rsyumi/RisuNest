@@ -20,6 +20,8 @@ export interface NativePersistentExportDependencies {
 }
 
 export interface NativePersistentExportFile {
+    excludedArchivedCharacterCount: number
+    excludedCollidingPluginValueCount: number
     path: string
     bytes: number
 }

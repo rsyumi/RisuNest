@@ -188,6 +188,7 @@ pub(super) fn run_job(
         })
         .map_err(|error| job_control_error(&job, error))?;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision,
             source_bytes: payload.bytes,
             source_sha256: payload.sha256.clone(),

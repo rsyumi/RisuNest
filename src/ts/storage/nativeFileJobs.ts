@@ -1,3 +1,4 @@
+import type { ExportExclusions } from './exportExcludedReport'
 import { exportIOSFile } from './iosFiles'
 import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
 import { invoke } from '@tauri-apps/api/core'
@@ -57,6 +58,7 @@ export interface NativeCompatibilityReport {
 }
 
 export interface NativeFileJobResult {
+    exportExclusions?: ExportExclusions
     revision: number
     sourceBytes: number
     sourceSha256: string

@@ -161,6 +161,7 @@ fn finish_reference_restore(
             .map_err(super::native_store_error)?
             .revision;
         Ok(JobResultSummary {
+            export_exclusions: None,
             revision,
             source_bytes,
             source_sha256,
@@ -363,6 +364,7 @@ pub(crate) fn export_reference_source(
                 })?
                 .len();
             let result = JobResultSummary {
+                export_exclusions: None,
                 revision: receipt.revision,
                 source_bytes,
                 source_sha256: receipt.sha256,

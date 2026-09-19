@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 import { parseArgs, readJson, requireArg, writeJson } from "./common.mjs";
+import { assertAppIdentifier, mergeTauriConfig } from "./tauri-config.mjs";
 import { assertBinaryArchitecture } from "./platform/native.mjs";
 
 function run(program, args, capture = false, cwd) {
@@ -141,18 +142,51 @@ function assertBundleSelection(path, expected) {
     throw new Error(`${path} does not have the ${expected} active Tauri bundle selection.`);
 }
 
-export function inspectMacAppRoot(root, arch, proofPath) {
+export function assertMacBundleMetadata(info, releaseInput, config) {
+  assertAppIdentifier(config, "macos");
+  const expected = {
+    identifier: config.identifier, version: releaseInput.version,
+    executable: config.mainBinaryName, name: config.productName,
+    minimumOS: config.bundle.macOS.minimumSystemVersion,
+    documents: expectedIosDocuments(config),
+    schemes: config.plugins["deep-link"].desktop.schemes.slice().sort(),
+  };
+  const actual = {
+    identifier: info.CFBundleIdentifier, version: info.CFBundleShortVersionString,
+    executable: info.CFBundleExecutable, name: info.CFBundleName,
+    minimumOS: info.LSMinimumSystemVersion,
+    documents: info.CFBundleDocumentTypes,
+    schemes: (info.CFBundleURLTypes ?? []).flatMap(value => value.CFBundleURLSchemes ?? []).sort(),
+  };
+  if (!isDeepStrictEqual(actual, expected) || info.CFBundleVersion !== releaseInput.version)
+    throw new Error("macOS bundle metadata does not match the effective release configuration.");
+  return actual;
+}
+
+export function assertMacAdHocSignature(description) {
+  if (!/^Signature=adhoc\s*$/m.test(description))
+    throw new Error("macOS package must carry the configured ad-hoc signature.");
+}
+
+export function inspectMacAppRoot(root, arch, proofPath, releaseInput, config) {
   const apps = readdirSync(root, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name.endsWith(".app"));
   if (apps.length !== 1 || apps[0].name !== "RisuNest.app")
     throw new Error("macOS package must contain exactly one RisuNest.app bundle.");
   const executable = join(root, apps[0].name, "Contents/MacOS/RisuNest");
   assertBinaryArchitecture(executable, arch, "macho");
+  const app = join(root, apps[0].name);
+  const info = JSON.parse(run("plutil", ["-convert", "json", "-o", "-", join(app, "Contents/Info.plist")], true));
+  assertMacBundleMetadata(info, releaseInput, config);
+  run("codesign", ["--verify", "--deep", "--strict", app]);
+  const signature = spawnSync("codesign", ["--display", "--verbose=4", app], { encoding: "utf8", windowsHide: true });
+  if (signature.error || signature.status !== 0) throw new Error("macOS package signature could not be inspected.");
+  assertMacAdHocSignature(`${signature.stdout}\n${signature.stderr}`);
   copyFileSync(executable, proofPath);
   return proofPath;
 }
 
-function desktopAssets({ os, arch, bundleDirectory, binary, output }) {
+function desktopAssets({ os, arch, bundleDirectory, binary, output, releaseInput, tauriConfig }) {
   const proof = [{ path: resolve(binary), arch, format: binaryFormat(os), role: "app" }];
   if (os === "windows") {
     assertBundleSelection(binary, "UNK");
@@ -211,7 +245,7 @@ function desktopAssets({ os, arch, bundleDirectory, binary, output }) {
   const stage = mkdtempSync(join(output, ".mac-proof-"));
   run("tar", ["-xzf", updater, "-C", stage]);
   const packagedProof = join(output, "macos-app-proof");
-  inspectMacAppRoot(stage, arch, packagedProof);
+  inspectMacAppRoot(stage, arch, packagedProof, releaseInput, tauriConfig);
   rmSync(stage, { recursive: true, force: true });
   const dmg = unique(bundleDirectory, (path) => path.endsWith(".dmg"), "DMG");
   const dmgStage = mkdtempSync(join(output, ".dmg-proof-"));
@@ -220,14 +254,14 @@ function desktopAssets({ os, arch, bundleDirectory, binary, output }) {
   try {
     run("hdiutil", ["attach", "-readonly", "-nobrowse", "-noautoopen", "-mountpoint", dmgStage, dmg]);
     mounted = true;
-    inspectMacAppRoot(dmgStage, arch, dmgProof);
+    inspectMacAppRoot(dmgStage, arch, dmgProof, releaseInput, tauriConfig);
   } finally {
     if (mounted) run("hdiutil", ["detach", dmgStage]);
     rmSync(dmgStage, { recursive: true, force: true });
   }
   return [
-    { download: { product: "app", variant: "desktop", os, arch, format: "dmg" }, path: dmg, binaries: [{ path: dmgProof, arch, format: "macho", role: "packaged-app" }], checks: ["app-bundle-layout", "dmg-mounted"] },
-    { download: { product: "app", variant: "desktop", os, arch, format: "app.tar.gz" }, path: updater, binaries: [{ path: packagedProof, arch, format: "macho", role: "packaged-app" }], checks: ["whole-app"] },
+    { download: { product: "app", variant: "desktop", os, arch, format: "dmg" }, path: dmg, binaries: [{ path: dmgProof, arch, format: "macho", role: "packaged-app" }], checks: ["app-bundle-layout", "dmg-mounted", "bundle-metadata", "ad-hoc-signature"] },
+    { download: { product: "app", variant: "desktop", os, arch, format: "app.tar.gz" }, path: updater, binaries: [{ path: packagedProof, arch, format: "macho", role: "packaged-app" }], checks: ["whole-app", "bundle-metadata", "ad-hoc-signature"] },
   ];
 }
 
@@ -300,13 +334,19 @@ function iosAssets({ arch, packagePath, releaseInput, output, tauriConfig, iosCo
 export function packageApp(options) {
   const output = resolve(options.output);
   mkdirSync(output, { recursive: true });
+  const os = options.kind === "desktop" ? options.os : options.kind;
+  const platformConfig = options.kind === "ios" && options.iosConfig
+    ? options.iosConfig : readJson(resolve(`src-tauri/tauri.${os}.conf.json`));
+  const tauriConfig = mergeTauriConfig(options.tauriConfig ?? readJson(resolve("src-tauri/tauri.conf.json")),
+    platformConfig, { version: options.releaseInput.version });
+  assertAppIdentifier(tauriConfig, os);
   let assets;
-  if (options.kind === "desktop") assets = desktopAssets({ ...options, output });
+  if (options.kind === "desktop") assets = desktopAssets({ ...options, output, tauriConfig });
   else if (options.kind === "android") assets = androidAssets(options);
   else if (options.kind === "ios") assets = iosAssets({
     ...options,
     output,
-    tauriConfig: options.tauriConfig ?? readJson(resolve("src-tauri/tauri.conf.json")),
+    tauriConfig,
     iosConfig: options.iosConfig ?? readJson(resolve("src-tauri/tauri.ios.conf.json")),
   });
   else throw new Error(`Unsupported app package kind: ${options.kind}.`);
