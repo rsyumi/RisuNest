@@ -2436,6 +2436,12 @@ export const languageKorean = {
             warningUnknown: '경고: {0}',
         },
         platform: {
+            appImageLinks: 'AppImage 링크 연결',
+            appImageLinksHelp: 'RisuNest 링크를 이 AppImage로 엽니다. 파일을 이동한 경우 다시 연결해주세요.',
+            appImageRegister: '연결',
+            appImageRegistered: 'RisuNest 링크를 이 AppImage로 열도록 연결되었습니다.',
+            appImageReplace: 'RisuNest 링크를 이 AppImage로 열도록 기존 연결을 변경하시겠습니까?',
+
             iosNotificationsHelp: '디스플레이 설정에서 완료 알림을 켤 수 있습니다. 대화 내용 없이 완료 메시지만 표시합니다.',
             iosBackgroundHelp: '생성 중에는 추가 실행 시간을 요청합니다. 앱 전환·잠금 후 iOS가 작업을 중단할 수 있으며, 시간이 만료되면 생성을 취소하고 앱이 실행될 수 있을 때 부분 응답을 저장합니다.',
             title: '플랫폼',

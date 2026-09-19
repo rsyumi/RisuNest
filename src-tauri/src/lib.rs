@@ -3,6 +3,8 @@ mod account_credential;
 mod android_commit_transport;
 mod app_data_root;
 mod app_update;
+#[cfg(desktop)]
+mod appimage_integration;
 mod asset_repository;
 mod boot_marker;
 mod cold_payload_codec;
@@ -718,6 +720,10 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         check_auth,
         #[cfg(desktop)]
         opened_files::opened_files_take,
+        #[cfg(desktop)]
+        appimage_integration::appimage_integration_state,
+        #[cfg(desktop)]
+        appimage_integration::appimage_integration_register,
         persistent_store::commands::pds_storage_stats,
         persistent_store::commands::pds_snapshot_delete,
         persistent_store::commands::pds_asset_gc_preview,

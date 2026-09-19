@@ -1,3 +1,4 @@
+import { offerHtmlClipboardExport } from './htmlClipboardExport'
 import { defaultChatToggleBinding } from './toggleBindings'
 import { get, writable } from "svelte/store";
 import { saveImage, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex } from "./storage/database.svelte";
@@ -384,15 +385,13 @@ export async function exportChat(page:number){
                 <p>Chat from RisuNest</p>
             `
 
-            //copy to clipboard
-
-            const item = new ClipboardItem({
-                'text/html': new Blob([template], { type: 'text/html' }),
-                'text/plain': new Blob([template], { type: 'text/plain' })
+            offerHtmlClipboardExport(template, `${char.name}_${date}_chat`.replace(/[<>:"/\\|?*\.\,]/g, "") + '.html', {
+                present: value => alertStore.set(value),
+                download: downloadFile,
+                success: copied => alertNormal(copied ? language.clipboardSuccess : language.successExport),
+                error: error => alertError(String(error)),
+                labels: { copy: language.copy, download: language.download, cancel: language.cancel },
             })
-            await navigator.clipboard.write([item])
-
-            alertNormal(language.clipboardSuccess)
             return
 
         }

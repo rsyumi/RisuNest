@@ -128,6 +128,18 @@ describe('AlertComp branch view', () => {
         vi.clearAllMocks()
     })
 
+    it('runs a selected action synchronously inside its button click', async () => {
+        const onSelect = vi.fn();
+        alertStore.set({ type: 'select', msg: '__DISPLAY__Prepared export||Copy||Cancel', onSelect });
+        const target = document.createElement('div');
+        document.body.appendChild(target);
+        mounted = mount(AlertComp, { target });
+        await tick();
+        const button = [...target.querySelectorAll('button')].find(button => button.textContent === 'Copy')!;
+        button.click();
+        expect(onSelect).toHaveBeenCalledExactlyOnceWith(0);
+    });
+
     it('ignores a late authoritative branch result after the alert target changes', async () => {
         const firstResult = deferred<ReturnType<typeof branch>[]>()
         branchMocks.getChatBranches.mockImplementation((characterId: string) =>

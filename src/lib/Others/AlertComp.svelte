@@ -358,20 +358,24 @@
                     <div class="mb-4 text-textcolor">{parts[0]}</div>
                     {#each parts.slice(1) as n, i}
                         <Button className="mt-4" onclick={() => {
+                            const onSelect = $alertStore.onSelect
                             alertStore.set({
                                 type: 'none',
                                 msg: i.toString()
                             })
+                            onSelect?.(i)
                         }}>{n}</Button>
                     {/each}
                 {:else}
                     {@const parts = $alertStore.msg.split('||')}
                     {#each parts as n, i}
                         <Button className="mt-4" onclick={() => {
+                            const onSelect = $alertStore.onSelect
                             alertStore.set({
                                 type: 'none',
                                 msg: i.toString()
                             })
+                            onSelect?.(i)
                         }}>{n}</Button>
                     {/each}
                 {/if}

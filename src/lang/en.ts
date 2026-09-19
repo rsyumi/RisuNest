@@ -2626,6 +2626,12 @@ export const languageEnglish = {
             warningUnknown: 'Warning: {0}',
         },
         platform: {
+            appImageLinks: 'AppImage links',
+            appImageLinksHelp: 'Open RisuNest links with this AppImage. Register again after moving the file.',
+            appImageRegister: 'Register',
+            appImageRegistered: 'RisuNest links open with this AppImage.',
+            appImageReplace: 'Change the existing RisuNest link handler to this AppImage?',
+
             iosNotificationsHelp: 'Enable completion alerts in Display settings. Only a completion message is shown, without conversation text.',
             iosBackgroundHelp: 'RisuNest requests extra time while generating. iOS may suspend work after switching apps or locking the screen. A time limit cancels generation and preserves the partial response when the app can run.',
             title: 'Platform',

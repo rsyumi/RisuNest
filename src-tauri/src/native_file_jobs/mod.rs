@@ -17,6 +17,8 @@ pub(crate) use backup_source::*;
 mod official_snapshot;
 mod risum_export;
 mod verified_read;
+#[cfg(windows)]
+mod windows_cloud_source;
 
 #[cfg(test)]
 mod screenshot_output_test;
@@ -421,6 +423,10 @@ pub(crate) struct OpenedJobSource {
 }
 
 fn open_regular_file_no_follow(path: &Path) -> Result<OpenedJobSource, NativeJobError> {
+    open_source_file(path, false)
+}
+
+fn open_source_file(path: &Path, _allow_cloud_source: bool) -> Result<OpenedJobSource, NativeJobError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -450,6 +456,15 @@ fn open_regular_file_no_follow(path: &Path) -> Result<OpenedJobSource, NativeJob
     };
     #[cfg(not(windows))]
     let is_reparse_point = false;
+    #[cfg(windows)]
+    if is_reparse_point && _allow_cloud_source && metadata.is_file() && !metadata.file_type().is_symlink() {
+        let file = windows_cloud_source::reopen_cloud_source(file)?;
+        let metadata = file.metadata().map_err(|error| invalid_source_error(error.to_string()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(invalid_source_error("source must be a regular file"));
+        }
+        return Ok(OpenedJobSource { file, total_bytes: metadata.len() });
+    }
     if metadata.file_type().is_symlink() || is_reparse_point || !metadata.is_file() {
         return Err(invalid_source_error("source must be a regular file"));
     }
@@ -471,7 +486,7 @@ pub(crate) fn open_job_source(
                     "desktop source must be an absolute file path",
                 ));
             }
-            open_regular_file_no_follow(path)
+            open_source_file(path, true)
         }
         JobSource::AndroidSpool { token } => {
             let path = resolve_spool_source(job_root, token)?;

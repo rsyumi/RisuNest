@@ -16,6 +16,7 @@ export interface alertData{
     datalist?: [string, string][],
     stackTrace?: string;
     defaultValue?: string
+    onSelect?: (index: number) => void
 }
 
 export type AlertGenerationInfoStoreData = {

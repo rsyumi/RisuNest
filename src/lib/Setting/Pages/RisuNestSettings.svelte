@@ -10,6 +10,7 @@
     import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
     import RisuNestDataHealth from './RisuNestDataHealth.svelte'
     import RisuNestBackupRestore from './RisuNestBackupRestore.svelte'
+    import RisuNestAppImage from './RisuNestAppImage.svelte'
     import RisuNestIOSPlatform from './RisuNestIOSPlatform.svelte'
     import RisuNestAndroidPlatform from './RisuNestAndroidPlatform.svelte'
     import RisuNestLogViewer from './RisuNestLogViewer.svelte'
@@ -62,6 +63,9 @@
         <RisuNestDataHealth onOpenUnusedImages={() => jumpTo('risunest-storage')} />
     {/if}
     <RisuNestBackupRestore />
+    {#if isTauri && !isTauriAndroid && !isTauriIOS}
+        <RisuNestAppImage />
+    {/if}
     {#if isTauriIOS}
         <RisuNestIOSPlatform />
     {/if}

@@ -28,6 +28,10 @@ The Linux override adds a desktop launcher, icons and MIME definitions for
 `.risum`, `.risup`, `.charx`, `.risunest` and `.risudat`. It also registers
 `risunestlocal:` URLs. Generic `.bin` files are not associated. AppImage contains
 these desktop resources but does not install them into the host desktop.
+Production AppImages expose **Settings > RisuNest > Platform > AppImage links**
+for explicit URL registration. Replacing an existing handler requires confirmation.
+Register again after moving the AppImage; registration failure does not block startup.
+Development and agent builds cannot register a handler.
 
 ```sh
 sudo apt-get install ./RisuNest_1.0.0_amd64.deb
