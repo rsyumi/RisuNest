@@ -355,8 +355,7 @@ fn cancelling_streamed_restore_keeps_the_archive_object_and_cleans_staging() {
     let staging_tables: i64 = store
         .connection
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_temp_master
-             WHERE name IN ('archive_restore_conversations', 'archive_restore_messages')",
+            "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'archive_restore'",
             [],
             |row| row.get(0),
         )
@@ -440,8 +439,7 @@ fn malformed_streamed_restore_keeps_the_archive_and_cleans_partial_staging() {
     let staging_tables: i64 = store
         .connection
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_temp_master
-             WHERE name IN ('archive_restore_conversations', 'archive_restore_messages')",
+            "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'archive_restore'",
             [],
             |row| row.get(0),
         )

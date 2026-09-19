@@ -99,9 +99,10 @@ describe('summary-aware bounded generation memory evidence', () => {
         expect(result.route).toBe('summary-aware')
         if (result.route !== 'summary-aware') return
         const retainedHeapUsedBytes = process.memoryUsage().heapUsed
+        peakHeapUsedBytes = Math.max(peakHeapUsedBytes, retainedHeapUsedBytes)
         expect(bodyReads).toHaveLength(suffixMessages)
         expect(bodyReads[0]).toBe(boundary)
-        console.log('BOUNDED_GENERATION_MEMORY', JSON.stringify({
+        process.stdout.write('BOUNDED_GENERATION_MEMORY ' + JSON.stringify({
             totalMessages,
             summarizedMessages: boundary,
             suffixMessages,
@@ -110,9 +111,9 @@ describe('summary-aware bounded generation memory evidence', () => {
             retainedHeapUsedBytes,
             ...result.preparation.metrics,
             classificationRows: totalMessages,
-            commonPreprocessingRows: suffixMessages,
+            scope: 'Node preparation helper with synthetic store; CBS, regex and tokenizer are not executed',
             coveredBodyTransfers: 0,
-        }))
+        }) + '\n')
         await result.preparation.release()
     })
 })

@@ -9,6 +9,15 @@ const fixture = vi.hoisted(() => ({
     pluginPermissionReads: vi.fn(),
     listeners: new Set<Function>(),
     scopedAccess: {
+        getFullObjectSnapshotStream: async (target: { characterIndex?: number; chatIndex?: number }, context: unknown) => {
+            const access = fixture.scopedAccess
+            const value = await (target.characterIndex === undefined
+                ? access.getCurrentCharacter(context)
+                : target.chatIndex === undefined
+                    ? access.getCharacterFromIndex(target.characterIndex, context)
+                    : access.getChatFromIndex(target.characterIndex, target.chatIndex, context))
+            return value
+        },
         getCurrentCharacter: vi.fn(),
         getCharacterFromIndex: vi.fn(),
         getChatFromIndex: vi.fn(),

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
     planSummaryAwarePromptHistory,
     planSummaryAwarePromptMetadata,
+    planSummaryAwareProcessedHistory,
 } from './summaryAwarePromptHistory'
 
 const chat = (messages: any[], summaries: any[]) => ({
@@ -104,6 +105,41 @@ describe('summary-aware prompt history admission', () => {
         ], false)).toEqual({
             route: 'complete',
             reason: 'summarized-message-has-dynamic-processing',
+        })
+    })
+})
+
+
+describe('summary-aware preprocessing with a complete compatibility history', () => {
+    it('admits plain substitutions and output-only rules without removing stored messages', () => {
+        const source = chat([
+            { chatId: 'a', role: 'user', data: 'covered' },
+            { chatId: 'b', role: 'user', data: 'recent' },
+        ], [{ chatMemos: ['a'] }])
+        const original = structuredClone(source)
+        const decision = planSummaryAwareProcessedHistory(source, [
+            { type: 'editprocess', in: 'covered', out: 'replaced', flag: 'g', ableFlag: true, comment: '' },
+            { type: 'editoutput', in: '.', out: '@@inject', flag: 'g', ableFlag: true, comment: '' },
+        ], false, 1, 'character')
+        expect(decision.route).toBe('summary-aware')
+        expect(source).toEqual(original)
+    })
+
+    it.each(['@@inject', '@@repeat_back', '{{setvar::x::1}}', '<tag>'])
+    ('retains complete processing for nonlocal or parser-producing replacement %s', (out) => {
+        expect(planSummaryAwareProcessedHistory(chat([
+            { chatId: 'a', role: 'user', data: 'covered' },
+        ], [{ chatMemos: ['a'] }]), [
+            { type: 'editprocess', in: '.', out, flag: 'g', ableFlag: true, comment: '' },
+        ], false, 0, 'character')).toMatchObject({ route: 'complete' })
+    })
+
+    it('retains the covered suffix needed by a memory similarity query', () => {
+        expect(planSummaryAwareProcessedHistory(chat([
+            { chatId: 'a', role: 'user', data: 'covered' },
+            { chatId: 'b', role: 'user', data: 'recent' },
+        ], [{ chatMemos: ['a'] }]), [], false, 2, 'character')).toMatchObject({
+            route: 'complete', reason: 'memory-query-needs-covered-history',
         })
     })
 })

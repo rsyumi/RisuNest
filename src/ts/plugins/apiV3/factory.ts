@@ -117,18 +117,22 @@ await (async function() {
             return val.value;
         }
         if (val && typeof val === 'object' && val.__type === 'IFRAME_OBJECT_STREAM') {
-            return assembleIframeObjectStream(val.value);
+            return assembleIframeObjectStream(val.value, val.select);
         }
         return val;
     }
 
-    async function assembleIframeObjectStream(stream) {
+    async function assembleIframeObjectStream(stream, select) {
         const result = {};
         const reader = stream.getReader();
         try {
             while (true) {
                 const next = await reader.read();
-                if (next.done) return result;
+                if (next.done) {
+                    if (select === 'character') return result.characters[0];
+                    if (select === 'conversation') return result.characters[0].chats[0];
+                    return result;
+                }
                 const chunk = next.value;
                 if (!chunk || typeof chunk.key !== 'string') {
                     throw new Error('Invalid iframe object stream chunk');
@@ -144,6 +148,12 @@ await (async function() {
                 } else if (chunk.type === 'arrayPush') {
                     if (!Array.isArray(result[chunk.key])) throw new Error('Invalid iframe array chunk');
                     result[chunk.key].push(chunk.value);
+                } else if (chunk.type === 'characterStart') {
+                    result.characters.push({ ...chunk.value, chats: [] });
+                } else if (chunk.type === 'conversationStart') {
+                    result.characters.at(-1).chats.push({ ...chunk.value, message: [] });
+                } else if (chunk.type === 'message') {
+                    result.characters.at(-1).chats.at(-1).message.push(chunk.value);
                 } else if (chunk.type === 'recordStart') {
                     Object.defineProperty(result, chunk.key, {
                         value: {}, enumerable: true, configurable: true, writable: true
@@ -160,6 +170,9 @@ await (async function() {
                     throw new Error('Unknown iframe object stream chunk');
                 }
             }
+        } catch (error) {
+            await reader.cancel().catch(() => {});
+            throw error;
         } finally {
             reader.releaseLock();
         }

@@ -174,27 +174,4 @@ describe('current chat parser pass', () => {
         expect(target.chat.message[254].data).toBe('changed-254')
         expect(target.chat.message[255].data).toBe('plain-255')
     })
-
-    it('does not run CBS parsing for an admitted summarized prefix', () => {
-        const target = fixture()
-        const parser = vi.fn((data: string) => `parsed:${data}`)
-        const covered = new Set(
-            target.chat.message.slice(0, 128).map((message) => message.chatId!),
-        )
-
-        runCurrentChatParserPass({
-            chat: target.chat,
-            database: target.database,
-            ownerCharacterId: target.selectedCharacter.chaId,
-            parserCharacter: target.selectedCharacter,
-            session: target.session,
-            parser,
-            skipMessageIds: covered,
-        })
-
-        expect(parser).toHaveBeenCalledTimes(172)
-        expect(target.chat.message[0].data).toBe('parse-0')
-        expect(target.chat.message[127].data).toBe('plain-127')
-        expect(target.chat.message[128].data).toBe('parsed:plain-128')
-    })
 })

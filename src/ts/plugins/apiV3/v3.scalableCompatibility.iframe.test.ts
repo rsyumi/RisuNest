@@ -11,6 +11,33 @@ const fixture = vi.hoisted(() => {
     const releaseRevisionLease = vi.fn()
     const projectScalable = vi.fn()
     const scopedAccess = {
+        getFullObjectSnapshotStream: async (target: { characterIndex?: number; chatIndex?: number }, context: unknown) => {
+            const access = fixture.scopedAccess
+            const value = await (target.characterIndex === undefined
+                ? access.getCurrentCharacter(context)
+                : target.chatIndex === undefined
+                    ? access.getCharacterFromIndex(target.characterIndex, context)
+                    : access.getChatFromIndex(target.characterIndex, target.chatIndex, context))
+            if (!value) return value
+            const isConversation = target.chatIndex !== undefined
+            return {
+                __type: 'IFRAME_OBJECT_STREAM',
+                select: isConversation ? 'conversation' : 'character',
+                value: new ReadableStream({
+                    start(controller) {
+                        controller.enqueue({ type: 'arrayStart', key: 'characters' })
+                        const { chats, ...detail } = isConversation ? { chats: [value] } : value
+                        controller.enqueue({ type: 'characterStart', key: 'characters', value: detail })
+                        for (const chat of chats) {
+                            const { message, ...metadata } = chat
+                            controller.enqueue({ type: 'conversationStart', key: 'characters', value: metadata })
+                            for (const value of message) controller.enqueue({ type: 'message', key: 'characters', value })
+                        }
+                        controller.close()
+                    },
+                }),
+            }
+        },
         getCurrentCharacter: vi.fn(),
         getCharacterFromIndex: vi.fn(),
         getChatFromIndex: vi.fn(),
@@ -207,8 +234,8 @@ async function executeIframeSrcdoc(frame: HTMLIFrameElement): Promise<void> {
     vi.spyOn(child.parent, 'postMessage').mockImplementation((data) => {
         window.dispatchEvent(new MessageEvent('message', { data, source: child }))
     })
-    vi.spyOn(child, 'postMessage').mockImplementation((data) => {
-        child.dispatchEvent(new childRealm.MessageEvent('message', { data, source: window }))
+    vi.spyOn(child, 'postMessage').mockImplementation((data, _origin, transfer?: Transferable[]) => {
+        child.dispatchEvent(new childRealm.MessageEvent('message', { data, source: window, ports: transfer ?? [] }))
     })
     const source = frame.srcdoc.match(/<script nonce="[^"]+">([\s\S]*)<\/script>/)?.[1]
     if (!source) throw new Error('Sandbox guest script was not found')

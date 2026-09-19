@@ -18,6 +18,8 @@ vi.mock('../request/request', () => ({
 
 import { setDatabaseLite, type Chat, type character } from 'src/ts/storage/database.svelte'
 import { createHypaV3Preset, hypaMemoryV3 } from './hypav3'
+import { planSummaryAwareProcessedHistory } from '../summaryAwarePromptHistory'
+import { getRegexExecutionPlan, executeRegexPlanSync } from '../regexExecutionPlan'
 
 function tokenizer(calls: string[]) {
     const count = (chat: { content: string; memo?: string }) => {
@@ -57,6 +59,38 @@ beforeEach(() => {
 })
 
 describe('Hypa V3 prepared history parity', () => {
+    it('preserves real Hypa output and memory when plain regex preprocessing omits covered bodies', async () => {
+        const room = {
+            id: 'chat', name: 'Chat',
+            message: ['a', 'b', 'c'].map(chatId => ({ role: 'user', data: 'old ' + chatId, chatId })),
+            hypaV3Data: { summaries: [{ text: 'Earlier events', chatMemos: ['a', 'b'], isImportant: false }] },
+        } as Chat
+        const scripts = [{ type: 'editprocess', in: 'old', out: 'new expanded', flag: 'g', ableFlag: true, comment: '' }]
+        const decision = planSummaryAwareProcessedHistory(room, scripts, false, 1, 'character')
+        expect(decision.route).toBe('summary-aware')
+        if (decision.route !== 'summary-aware') throw new Error('Expected an eligible fixture')
+        const regexPlan = getRegexExecutionPlan(scripts, 'editprocess')
+        const process = (skip: boolean) => room.message
+            .filter(message => !skip || !decision.plan.coveredMessageIds.has(message.chatId!))
+            .map(message => ({ role: 'user', content: executeRegexPlanSync(regexPlan, message.data, text => text).data, memo: message.chatId }))
+        const fullChats = process(false) as any[]
+        const preparedChats = process(true) as any[]
+        const owner = { type: 'character', chaId: 'character', name: 'Character' } as character
+        const complete = await hypaMemoryV3(fullChats, tokenTotal(fullChats), 4096, structuredClone(room), owner, tokenizer([]))
+        const completeRequests = structuredClone(requestCalls)
+        requestCalls.length = 0
+        const prepared = await hypaMemoryV3(preparedChats, tokenTotal(preparedChats), 4096, structuredClone(room), owner, tokenizer([]), {
+            boundaryMemo: decision.plan.boundaryMemo,
+            effectiveMessageMemos: decision.plan.effectiveMessageMemos,
+            historyStartIndex: 0,
+        })
+        expect(prepared.chats).toEqual(complete.chats)
+        expect(prepared.currentTokens).toEqual(complete.currentTokens)
+        expect(prepared.memory).toEqual(complete.memory)
+        expect(requestCalls).toEqual(completeRequests)
+        expect(room.message.map(message => message.data)).toEqual(['old a', 'old b', 'old c'])
+    })
+
     it('preserves memory selection, output, token budget, and stored metrics', async () => {
         const prefix = [
             { role: 'user', content: 'covered user', memo: 'a' },

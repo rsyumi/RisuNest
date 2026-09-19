@@ -958,6 +958,8 @@ fn conversation_metadata_windows_exclude_bodies_and_classify_parser_work() {
     let mut dynamic = message("{{history}}");
     dynamic["chatId"] = json!("dynamic");
     dynamic["disabled"] = json!("allBefore");
+    let mut disabled = message("disabled");
+    disabled["disabled"] = json!(true);
     commit(
         &mut store,
         1,
@@ -966,7 +968,7 @@ fn conversation_metadata_windows_exclude_bodies_and_classify_parser_work() {
             conversation_id: "conv-long".to_owned(),
             start: 1,
             delete_count: 1,
-            messages: vec![dynamic],
+            messages: vec![dynamic, disabled],
             conversation: None,
             configured_index: None,
         },
@@ -994,6 +996,7 @@ fn conversation_metadata_windows_exclude_bodies_and_classify_parser_work() {
     assert_eq!(result.value.messages[1].chat_id.as_deref(), Some("dynamic"));
     assert_eq!(result.value.messages[1].disabled, Some(json!("allBefore")));
     assert!(!result.value.messages[1].parser_inert);
+    assert_eq!(result.value.messages[2].disabled, Some(json!(true)));
 }
 
 #[test]

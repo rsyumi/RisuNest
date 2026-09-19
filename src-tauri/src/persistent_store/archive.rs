@@ -540,7 +540,7 @@ impl<'de> Visitor<'de> for ConversationsVisitor<'_> {
             }
             self.connection
                 .execute(
-                    "INSERT INTO temp.archive_restore_conversations (
+                    "INSERT INTO archive_restore.archive_restore_conversations (
                         ordinal, conversation_id, configured_index, recent_at, name,
                         message_count, detail
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -723,7 +723,7 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
             }
             self.connection
                 .execute(
-                    "INSERT INTO temp.archive_restore_messages (
+                    "INSERT INTO archive_restore.archive_restore_messages (
                         conversation_ordinal, message_index, message_id, value
                      ) VALUES (?1, ?2, ?3, ?4)",
                     params![
@@ -743,11 +743,15 @@ impl<'de> Visitor<'de> for MessagesVisitor<'_> {
     }
 }
 
-fn create_restore_staging(connection: &Connection) -> StoreResult<()> {
+fn create_restore_staging(connection: &Connection) -> StoreResult<tempfile::NamedTempFile> {
+    let staging = tempfile::NamedTempFile::new()?;
+    connection.execute("ATTACH DATABASE ?1 AS archive_restore", [staging.path().to_string_lossy().as_ref()])?;
+    let created = (|| -> StoreResult<()> {
+    connection.execute_batch("PRAGMA archive_restore.journal_mode=OFF; PRAGMA archive_restore.synchronous=OFF; PRAGMA archive_restore.cache_size=-2048;")?;
     connection.execute_batch(&format!(
-        "DROP TABLE IF EXISTS temp.{RESTORE_MESSAGES};
-         DROP TABLE IF EXISTS temp.{RESTORE_CONVERSATIONS};
-         CREATE TEMP TABLE {RESTORE_CONVERSATIONS} (
+        "DROP TABLE IF EXISTS archive_restore.{RESTORE_MESSAGES};
+         DROP TABLE IF EXISTS archive_restore.{RESTORE_CONVERSATIONS};
+         CREATE TABLE archive_restore.{RESTORE_CONVERSATIONS} (
             ordinal INTEGER PRIMARY KEY,
             conversation_id TEXT NOT NULL UNIQUE,
             configured_index INTEGER NOT NULL,
@@ -756,7 +760,7 @@ fn create_restore_staging(connection: &Connection) -> StoreResult<()> {
             message_count INTEGER NOT NULL,
             detail TEXT NOT NULL
          );
-         CREATE TEMP TABLE {RESTORE_MESSAGES} (
+         CREATE TABLE archive_restore.{RESTORE_MESSAGES} (
             conversation_ordinal INTEGER NOT NULL,
             message_index INTEGER NOT NULL,
             message_id TEXT,
@@ -765,13 +769,16 @@ fn create_restore_staging(connection: &Connection) -> StoreResult<()> {
          );"
     ))?;
     Ok(())
+    })();
+    if let Err(error) = created {
+        let _ = clear_restore_staging(connection);
+        return Err(error);
+    }
+    Ok(staging)
 }
 
 fn clear_restore_staging(connection: &Connection) -> StoreResult<()> {
-    connection.execute_batch(&format!(
-        "DROP TABLE IF EXISTS temp.{RESTORE_MESSAGES};
-         DROP TABLE IF EXISTS temp.{RESTORE_CONVERSATIONS};"
-    ))?;
+    connection.execute_batch("DETACH DATABASE archive_restore")?;
     Ok(())
 }
 
@@ -781,7 +788,7 @@ fn stage_payload(
     is_cancelled: &dyn Fn() -> bool,
 ) -> StoreResult<StagedArchivePayload> {
     ensure_not_cancelled(is_cancelled)?;
-    let decoder = GzDecoder::new(BufReader::new(file));
+    let decoder = GzDecoder::new(BufReader::new(CancellationAwareIo::new(file, is_cancelled)));
     let mut limited = decoder.take(MAX_DECODED_ARCHIVE_BYTES.saturating_add(1));
     let payload = {
         let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
@@ -1009,7 +1016,7 @@ pub(super) fn restore_character_with_cancellation(
             "Archived character {character_id} is missing its stored data"
         ));
     };
-    create_restore_staging(connection)?;
+    let _staging = create_restore_staging(connection)?;
     let result = (|| {
         let payload = stage_payload(connection, file, is_cancelled)?;
         ensure_not_cancelled(is_cancelled)?;
@@ -1054,8 +1061,8 @@ pub(super) fn restore_character_with_cancellation(
                      )
                      SELECT ?1, ?2, conversation_id, configured_index, recent_at,
                             name, message_count, detail
-                     FROM temp.archive_restore_conversations
-                     ORDER BY ordinal",
+                     FROM archive_restore.archive_restore_conversations
+                     ",
                     params![generation, character_id],
                 )?;
                 if inserted_conversations as i64 != payload.conversation_count {
@@ -1069,10 +1076,10 @@ pub(super) fn restore_character_with_cancellation(
                      )
                      SELECT ?1, ?2, conversations.conversation_id, messages.message_index,
                             messages.message_id, messages.value
-                     FROM temp.archive_restore_messages AS messages
-                     JOIN temp.archive_restore_conversations AS conversations
+                     FROM archive_restore.archive_restore_messages AS messages
+                     JOIN archive_restore.archive_restore_conversations AS conversations
                        ON conversations.ordinal = messages.conversation_ordinal
-                     ORDER BY conversations.ordinal, messages.message_index",
+                     ",
                     params![generation, character_id],
                 )?;
                 if inserted_messages as i64 != payload.message_count {
@@ -1095,15 +1102,16 @@ pub(super) fn restore_character_with_cancellation(
                     return validation(format!("Character {character_id} does not exist"));
                 }
                 transaction.execute_batch(
-                    "DROP TABLE temp.archive_restore_messages;
-                     DROP TABLE temp.archive_restore_conversations;",
+                    "DROP TABLE archive_restore.archive_restore_messages;
+                     DROP TABLE archive_restore.archive_restore_conversations;",
                 )?;
                 Ok(())
             },
         )
     })();
-    if result.is_err() {
-        clear_restore_staging(connection)?;
+    let cleanup = clear_restore_staging(connection);
+    match result {
+        Ok(value) => { cleanup?; Ok(value) }
+        Err(error) => { let _ = cleanup; Err(error) }
     }
-    result
 }

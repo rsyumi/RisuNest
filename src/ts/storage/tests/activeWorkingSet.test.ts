@@ -426,6 +426,23 @@ function makeWindowedHarness(input: {
 }
 
 describe('ActiveWorkingSet', () => {
+    it('fences a tail controller after another controller makes a same-length edit', async () => {
+        const full = makeChat('chat-a')
+        full.message = [
+            { role: 'user', data: 'covered', chatId: 'a' },
+            { role: 'user', data: 'tail', chatId: 'b' },
+        ] as Message[]
+        const harness = makeWindowedHarness({ characters: [makeCharacter('a', [full])] })
+        await harness.workingSet.activateCharacter('a')
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const local = { ...structuredClone(full), message: [structuredClone(full.message[1])] }
+        const first = harness.workingSet.captureWindowedConversationMutationController(target, local, 1)!
+        const other = harness.workingSet.captureWindowedConversationMutationController(target, structuredClone(local), 1)!
+        expect(other.applyRange(0, 1, [{ role: 'user', data: 'external edit', chatId: 'b' }], 'edit')).toBe(true)
+        expect(first.applyRange(0, 1, [{ role: 'user', data: 'stale edit', chatId: 'b' }], 'edit')).toBe(false)
+        expect(local.message[0].data).toBe('tail')
+    })
+
     it('records bounded generation tail mutations without promoting the conversation', async () => {
         const full = makeChat('chat-a')
         full.message = [

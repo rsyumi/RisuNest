@@ -1,5 +1,6 @@
-import type { Chat, Message } from '../storage/database.svelte'
+import type { Chat, Message, customscript } from '../storage/database.svelte'
 import type { ConversationMessageMetadata } from '../storage/persistentDataStore'
+import { getRegexExecutionPlan } from './regexExecutionPlan'
 
 interface StoredHypaSummary {
     chatMemos?: unknown
@@ -41,6 +42,14 @@ export function planSummaryAwarePromptMetadata(
     messages: readonly ConversationMessageMetadata[],
     preserveOrphanedMemory: boolean,
 ): SummaryAwarePromptHistoryDecision {
+    const ids = new Set<string>()
+    for (const message of messages) {
+        if (!message.chatId) return { route: 'complete', reason: 'missing-message-id' }
+        if (ids.has(message.chatId) || message.chatId === 'NewChat') {
+            return { route: 'complete', reason: 'duplicate-message-id' }
+        }
+        ids.add(message.chatId)
+    }
     const decision = planSummaryAwareMessages(chat, messages, preserveOrphanedMemory)
     if (decision.route === 'complete') return decision
     const boundaryAbsoluteIndex = messages.findIndex(
@@ -86,6 +95,34 @@ export function planSummaryAwarePromptHistory(
         route: 'summary-aware',
         plan: { ...decision.plan, bodyStartIndex: boundaryAbsoluteIndex + 1 },
     }
+}
+
+export function planSummaryAwareProcessedHistory(
+    chat: Chat,
+    scripts: customscript[],
+    preserveOrphanedMemory: boolean,
+    minimumTailMessages: number,
+    characterId: string,
+): SummaryAwarePromptHistoryDecision {
+    if (chat.message.some((message) => typeof message.data !== 'string'
+        || /[<{]/.test(message.data)
+        || (message.saying && message.saying !== characterId))) {
+        return { route: 'complete', reason: 'message-processing-dependency' }
+    }
+    const plan = getRegexExecutionPlan(scripts, 'editprocess')
+    if (!plan.workerEligible || plan.entries.some((entry) => entry.compileError !== undefined)) {
+        return { route: 'complete', reason: 'stateful-or-dynamic-regex' }
+    }
+    const decision = planSummaryAwarePromptHistory(chat, preserveOrphanedMemory)
+    if (decision.route === 'complete') return decision
+    if (decision.plan.effectiveMessageMemos.includes('NewChat')) {
+        return { route: 'complete', reason: 'ambiguous-preamble-id' }
+    }
+    const tailCount = effectiveMessages(chat.message.slice(decision.plan.bodyStartIndex)).length
+    if (tailCount < minimumTailMessages) {
+        return { route: 'complete', reason: 'memory-query-needs-covered-history' }
+    }
+    return decision
 }
 
 function planSummaryAwareMessages(

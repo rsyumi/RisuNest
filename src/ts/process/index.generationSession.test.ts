@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
     outputTriggerReturnsNull: false,
     tokenizeResult: null as Promise<number> | null,
     inlay: null as null | ((data: string) => { text: string, promise?: Promise<string> }),
+    moduleTriggers: [] as any[],
+    moduleRegex: [] as any[],
+    editHooks: new Set<unknown>(),
     listeners: new Set<(event: any) => Promise<void> | void>(),
     selectedTarget: null as any,
     selectedAuthority: null as any,
@@ -107,8 +110,12 @@ vi.mock('./inlayScreen', () => ({
     },
 }))
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
-vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
-vi.mock('./memory/hypav2', async () => (await import('./tests/sendChatTestHarness')).hypav2Module())
+vi.mock('./memory/hanuraiMemory', () => ({
+    hanuraiMemory: vi.fn(async (chats, { currentTokens }) => ({ chats, tokens: currentTokens })),
+}))
+vi.mock('./memory/hypav2', () => ({
+    hypaMemoryV2: vi.fn(async (chats, currentTokens) => ({ chats, currentTokens })),
+}))
 vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module({
     getCurrentHypaV3Preset: () => ({
         settings: {
@@ -126,9 +133,12 @@ vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarnes
 }))
 vi.mock('./scriptings', async () => (await import('./tests/sendChatTestHarness')).scriptingsModule())
 vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHarness')).modellistModule())
-vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule())
+vi.mock('./modules', async () => (await import('./tests/sendChatTestHarness')).modulesModule({
+    getModuleTriggers: () => mocks.moduleTriggers,
+    getModuleRegexScripts: () => mocks.moduleRegex,
+}))
 vi.mock('../globalApi.svelte', async () => (await import('./tests/sendChatTestHarness')).globalApiModule())
-vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChatTestHarness')).pluginsModule(mocks.listeners))
+vi.mock('../plugins/plugins.svelte', () => ({ pluginV2: { chatOutput: mocks.listeners, editprocess: mocks.editHooks } }))
 vi.mock('../plugins/pluginDatabaseAccess', async (importOriginal) => (await import('./tests/sendChatTestHarness')).pluginDatabaseAccessModule(importOriginal as () => Promise<Record<string, unknown>>))
 vi.mock('./presetChain', () => ({
     activatePresetChainForRequest: vi.fn(async () => {
@@ -326,6 +336,9 @@ describe('sendChat generation session integration', () => {
         mocks.tokenizeResult = null
         mocks.inlay = null
         mocks.listeners.clear()
+        mocks.editHooks.clear()
+        mocks.moduleTriggers = []
+        mocks.moduleRegex = []
         mocks.selectedTarget = null
         mocks.selectedAuthority = null
         mocks.windowedController = null
@@ -371,6 +384,53 @@ describe('sendChat generation session integration', () => {
         })
     })
 
+    it.each(['disabled', 'v2', 'hanurai'])('retains covered messages when the active memory route is %s', async (route) => {
+        const installed = installDatabase(makeChat([
+            { role: 'user', data: 'covered-a', chatId: 'a' },
+            { role: 'user', data: 'tail', chatId: 'b' },
+        ]))
+        installed.chat.hypaV3Data = {
+            summaries: [{ chatMemos: ['a'], text: 'covered' }],
+        } as any
+        DBState.db.hypaV3 = true
+        installed.currentCharacter.supaMemory = route !== 'disabled'
+        DBState.db.hypav2 = route === 'v2'
+        DBState.db.hanuraiEnable = route === 'hanurai'
+
+        await sendChat()
+
+        expect(mocks.processScriptFull.mock.calls.some((call) => call[1] === 'covered-a')).toBe(true)
+    })
+
+    it.each(['plugin-editprocess', 'plugin-output', 'character-trigger', 'module-trigger', 'character-regex', 'module-regex'])
+    ('preserves complete compatibility history with %s', async (consumer) => {
+        const installed = installDatabase(makeChat([
+            { role: 'user', data: 'covered-a', chatId: 'a' },
+            { role: 'user', data: 'tail', chatId: 'b' },
+        ]))
+        installed.chat.hypaV3Data = { summaries: [{ chatMemos: ['a'], text: 'summary' }] } as any
+        installed.currentCharacter.supaMemory = true
+        DBState.db.hypaV3 = true
+        mocks.selectedTarget = { characterId: installed.currentCharacter.chaId, conversationId: installed.chat.id, storeRevision: 1 }
+        mocks.selectedAuthority = { sessionVersion: 0, persistedSessionVersion: 0 }
+        const output = vi.fn(async () => undefined)
+        if (consumer === 'plugin-editprocess') mocks.editHooks.add(() => undefined)
+        if (consumer === 'plugin-output') mocks.listeners.add(output)
+        if (consumer === 'character-trigger') installed.currentCharacter.triggerscript = [{}] as any
+        if (consumer === 'module-trigger') mocks.moduleTriggers = [{}]
+        if (consumer === 'character-regex') installed.currentCharacter.customscript = [{ type: 'editprocess', in: 'a', out: '@@inject', flag: 'g' }] as any
+        if (consumer === 'module-regex') mocks.moduleRegex = [{ type: 'editprocess', in: 'a', out: '{{setvar::test::1}}', flag: 'g' }]
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        expect(mocks.acquireCompleteConversation).toHaveBeenCalledOnce()
+        const preservesEffects = ['plugin-editprocess', 'character-regex', 'module-regex'].includes(consumer)
+        expect(mocks.processScriptFull.mock.calls.some((call) => call[1] === 'covered-a')).toBe(preservesEffects)
+        expect(mocks.events).toContain('output-trigger')
+        expect(mocks.events).toContain('output-script')
+        if (consumer === 'plugin-output') expect(output).toHaveBeenCalledOnce()
+    })
+
     it('generates from a pinned unsummarized tail without complete promotion', async () => {
         const installed = installDatabase(makeChat([]))
         const storedMessages = [
@@ -382,6 +442,7 @@ describe('sendChat generation session integration', () => {
             summaries: [{ chatMemos: ['a', 'b'], summary: 'covered' }],
         } as any
         DBState.db.hypaV3 = true
+        installed.currentCharacter.supaMemory = true
         mocks.session = null
         mocks.outputTriggerReturnsNull = true
         mocks.selectedTarget = {

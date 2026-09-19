@@ -59,14 +59,62 @@ vi.mock('./plugins/plugins.svelte', () => ({
 }))
 
 import { ChatTokenizer, encode, strongBan } from './tokenizer'
+import { pluginV2 } from './plugins/plugins.svelte'
 
 describe('chat tokenizer native count batching', () => {
     beforeEach(() => {
+        pluginV2.providerOptions.clear()
         harness.nativeCountBatch.mockReset()
         harness.useTokenizerCaching = false
         harness.aiModel = 'gpt-4'
         harness.modelTokenizer = 1
         harness.transformersTokenizer.mockReset()
+    })
+
+    it('preserves arbitrary plugin tokenizer calls even with generation reuse enabled', async () => {
+        harness.aiModel = 'custom'
+        const tokenizerFunc = vi.fn(async () => [1, 2])
+        pluginV2.providerOptions.set('', { tokenizer: 'custom', tokenizerFunc })
+        const tokenizer = new ChatTokenizer(2, 'noName', true)
+        const chat = { role: 'user' as const, content: 'synthetic' }
+        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(4)
+        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(4)
+        expect(tokenizerFunc).toHaveBeenCalledTimes(2)
+    })
+
+    it('reuses generation-local text counts but invalidates changed content and tokenizer settings', async () => {
+        harness.aiModel = 'hf:::synthetic/model-a'
+        harness.modelTokenizer = 12
+        harness.transformersTokenizer.mockResolvedValue([1, 2, 3])
+        const tokenizer = new ChatTokenizer(2, 'noName', true)
+        const chat = { role: 'user' as const, content: 'synthetic' }
+        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(5)
+        await expect(tokenizer.tokenizeChat(chat)).resolves.toBe(5)
+        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(1)
+        chat.content = 'edited'
+        await tokenizer.tokenizeChat(chat)
+        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(2)
+        harness.aiModel = 'hf:::synthetic/model-b'
+        await tokenizer.tokenizeChat(chat)
+        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(3)
+        await new ChatTokenizer(2, 'noName', true).tokenizeChat(chat)
+        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(4)
+    })
+
+    it('keeps count reuse opt-in and never reuses a failed count', async () => {
+        harness.aiModel = 'hf:::synthetic/model'
+        harness.modelTokenizer = 12
+        harness.transformersTokenizer.mockResolvedValue([1])
+        const chat = { role: 'user' as const, content: 'synthetic' }
+        const ordinary = new ChatTokenizer(0, 'noName')
+        await ordinary.tokenizeChat(chat)
+        await ordinary.tokenizeChat(chat)
+        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(2)
+        const cached = new ChatTokenizer(0, 'noName', true)
+        harness.transformersTokenizer.mockRejectedValueOnce(new Error('synthetic tokenizer failure'))
+        await expect(cached.tokenizeChat(chat)).rejects.toThrow('synthetic tokenizer failure')
+        await expect(cached.tokenizeChat(chat)).resolves.toBe(1)
+        expect(harness.transformersTokenizer).toHaveBeenCalledTimes(4)
     })
 
     it.each([

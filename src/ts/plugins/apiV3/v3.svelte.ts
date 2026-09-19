@@ -766,7 +766,7 @@ const makeRisuaiAPIV3 = (
         signal: pluginLifetime.signal,
     })
     const getCompleteCurrentCharacter = () =>
-        getPluginDatabaseAccess(plugin.name).getCurrentCharacter(fullObjectContext())
+        getPluginDatabaseAccess(plugin.name).getFullObjectSnapshotStream({}, fullObjectContext())
     const setCompleteCurrentCharacter = (character: unknown) =>
         getPluginDatabaseAccess(plugin.name).setCurrentCharacter(
             character as any,
@@ -1021,7 +1021,9 @@ const makeRisuaiAPIV3 = (
             }
         },
         getCharacterFromIndex: (index:number) => {
-            return getPluginDatabaseAccess(plugin.name).getCharacterFromIndex(index, fullObjectContext())
+            return getPluginDatabaseAccess(plugin.name).getFullObjectSnapshotStream(
+                { characterIndex: index }, fullObjectContext(),
+            )
         },
         setCharacterToIndex: (index:number, char:any) => {
             return getPluginDatabaseAccess(plugin.name).setCharacterToIndex(
@@ -1031,9 +1033,8 @@ const makeRisuaiAPIV3 = (
             )
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
-            return getPluginDatabaseAccess(plugin.name).getChatFromIndex(
-                characterIndex,
-                chatIndex,
+            return getPluginDatabaseAccess(plugin.name).getFullObjectSnapshotStream(
+                { characterIndex, chatIndex },
                 fullObjectContext(),
             )
         },

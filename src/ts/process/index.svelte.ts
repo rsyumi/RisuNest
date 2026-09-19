@@ -72,8 +72,7 @@ import {
 } from './promptHistory'
 import { runCurrentChatParserPass } from './currentChatParserPass'
 import {
-    assertSummaryAwarePromptHistoryCurrent,
-    planSummaryAwarePromptHistory,
+    planSummaryAwareProcessedHistory,
     type SummaryAwarePromptHistoryPlan,
 } from './summaryAwarePromptHistory'
 import { applyGenerationErrorResponse } from './generationErrorResponse'
@@ -352,6 +351,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     let currentChar:character
     let boundedChat: Chat | null = null
     let summaryAwareHistoryPlan: SummaryAwarePromptHistoryPlan | null = null
+    const hasObservableHistoryTokenizer = () => DBState.db.googleClaudeTokenizing
+        || (DBState.db.aiModel === 'custom'
+            && pluginV2.providerOptions?.get(DBState.db.currentPluginProvider)?.tokenizer === 'custom')
     let generationInfo:MessageGenerationInfo|undefined = undefined
 
     const stageTimings = {
@@ -391,7 +393,6 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             parserCharacter: currentChar,
             session: controller ? null : getActiveConversationSession(),
             parser: risuChatParser,
-            skipMessageIds: summaryAwareHistoryPlan?.coveredMessageIds,
         })
         if (!controller) return parsed
         for (let index = 0; index < parsed.message.length; index++) {
@@ -511,7 +512,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         const ownerIndex = get(selectedCharID)
         const owner = DBState.db.characters[ownerIndex]
         const conversation = owner?.chats[owner.chatPage]
-        const hypaSettings = owner?.type !== 'group' && DBState.db.hypaV3
+        const hypaSettings = owner?.type !== 'group' && owner?.supaMemory
+            && DBState.db.hypaV3 && !DBState.db.hypav2 && !DBState.db.hanuraiEnable
             ? getCurrentHypaV3Preset().settings
             : null
         const authority = hypaSettings ? captureSelectedConversationAuthority() : null
@@ -535,6 +537,10 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                     owner.personality,
                     owner.scenario,
                     owner.replaceGlobalNote,
+                    owner.exampleMessage,
+                    owner.postHistoryInstructions,
+                    DBState.db.groupTemplate,
+                    DBState.db.promptSettings,
                     owner.firstMessage,
                     owner.alternateGreetings,
                     conversation,
@@ -551,11 +557,15 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                     ? 'standard-hypa-v3-disabled'
                     : !authority
                         ? 'selected-conversation-not-windowed'
-                        : hypaSettings.useExperimentalImpl
+                        : hasObservableHistoryTokenizer()
+                            ? 'custom-or-remote-tokenizer'
+                            : hypaSettings.useExperimentalImpl
                             ? 'experimental-hypa-v3'
                             : (pluginV2.editprocess?.size ?? 0) > 0
                                 ? 'plugin-editprocess'
-                                : pluginV2.chatOutput.size > 0
+                                : (pluginV2.editoutput?.size ?? 0) > 0
+                                    ? 'plugin-editoutput'
+                                    : pluginV2.chatOutput.size > 0
                                     ? 'plugin-chat-output'
                                     : owner.triggerscript.length > 0 || getModuleTriggers().length > 0
                                         ? 'generation-trigger'
@@ -601,6 +611,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 authority,
                 conversation,
                 preserveOrphanedMemory: hypaSettings.preserveOrphanedMemory,
+                minimumTailMessages: hypaSettings.queryChatCount,
                 signal: abortSignal,
                 isCurrent,
             })
@@ -749,40 +760,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         currentChar = nowChatroom
     }
 
-    if (!summaryAwareHistoryPlan && DBState.db.hypaV3 && nowChatroom.type !== 'group') {
-        const hypaSettings = getCurrentHypaV3Preset().settings
-        const decision = planSummaryAwarePromptHistory(
-            selectedConversation,
-            hypaSettings.preserveOrphanedMemory,
-        )
-        const editProcessScripts = [
-            ...(DBState.db.presetRegex ?? []),
-            ...(currentChar.customscript ?? []),
-            ...getModuleRegexScripts(),
-        ].some((script) => script.type === 'editprocess')
-        const fallbackReason = hypaSettings.useExperimentalImpl
-            ? 'experimental-hypa-v3'
-            : (pluginV2.editprocess?.size ?? 0) > 0
-                ? 'plugin-editprocess'
-                : currentChar.triggerscript.length > 0 || getModuleTriggers().length > 0
-                    ? 'generation-trigger'
-                    : editProcessScripts
-                        ? 'regex-editprocess'
-                        : null
-        if (decision.route === 'summary-aware' && !fallbackReason) {
-            summaryAwareHistoryPlan = decision.plan
-            console.debug('[Generation history] summary-aware', {
-                coveredMessages: decision.plan.coveredMessageIds.size,
-            })
-        } else {
-            console.debug('[Generation history] complete', {
-                reason: fallbackReason ?? (decision.route === 'complete' ? decision.reason : 'unknown'),
-            })
-        }
-    }
-
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
-    const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name')
+    const tokenizer = new ChatTokenizer(chatAdditonalTokens, DBState.db.aiModel.startsWith('gpt') ? 'noName' : 'name',
+        nowChatroom.supaMemory && DBState.db.hypaV3 && !DBState.db.hypav2 && !DBState.db.hanuraiEnable)
     let currentChat = runCurrentChatFunction(selectedConversation)
     if (!boundedChat) nowChatroom.chats[selectedChat] = currentChat
     let maxContextTokens = DBState.db.maxContext
@@ -1347,6 +1327,24 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     }
 
     const requiresLivePromptCompatibility = (pluginV2.editprocess?.size ?? 0) > 0
+    if (!summaryAwareHistoryPlan && nowChatroom.type !== 'group' && nowChatroom.supaMemory
+        && DBState.db.hypaV3 && !DBState.db.hypav2 && !DBState.db.hanuraiEnable) {
+        const settings = getCurrentHypaV3Preset().settings
+        if (!settings.useExperimentalImpl && !requiresLivePromptCompatibility && !hasObservableHistoryTokenizer()
+            && !(usingPromptTemplate && DBState.db.promptSettings.sendName)) {
+            const decision = planSummaryAwareProcessedHistory(currentChat, [
+                ...(DBState.db.presetRegex ?? []),
+                ...(currentChar.customscript ?? []),
+                ...getModuleRegexScripts(),
+            ], settings.preserveOrphanedMemory, settings.queryChatCount, nowChatroom.chaId)
+            if (decision.route === 'summary-aware') {
+                summaryAwareHistoryPlan = decision.plan
+                console.debug('[Generation history] complete view, summary-aware preprocessing', {
+                    coveredMessages: decision.plan.coveredMessageIds.size,
+                })
+            } else console.debug('[Generation history] complete preprocessing', { reason: decision.reason })
+        }
+    }
     const promptHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
     let promptHistoryCompatibilitySnapshot: PromptHistoryCompatibilitySnapshot | null = null
     let promptScriptOperationScope: PromptScriptOperationScope | null = null
@@ -1361,8 +1359,6 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             if (!conversationResources.windowedController.isCurrent()) {
                 throw new PersistentMutationFencedError()
             }
-        } else {
-            assertSummaryAwarePromptHistoryCurrent(currentChat, summaryAwareHistoryPlan)
         }
     }
     preparedHistoryStartIndex = chats.length

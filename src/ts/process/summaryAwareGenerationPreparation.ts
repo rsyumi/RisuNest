@@ -40,6 +40,7 @@ interface PreparationInput {
     authority: WindowedConversationPersistenceAuthority
     conversation: Omit<Chat, 'message'>
     preserveOrphanedMemory: boolean
+    minimumTailMessages?: number
     signal?: AbortSignal
     isCurrent(): boolean
     now?(): number
@@ -99,6 +100,12 @@ export async function prepareSummaryAwareGeneration(
         if (decision.route === 'complete') {
             await release()
             return decision
+        }
+        const tailCount = metadata.slice(decision.plan.bodyStartIndex)
+            .filter((message) => message.disabled !== true).length
+        if (tailCount < (input.minimumTailMessages ?? 0)) {
+            await release()
+            return { route: 'complete', reason: 'memory-query-needs-covered-history' }
         }
 
         const messages = []

@@ -397,6 +397,7 @@ export class ActiveWorkingSet {
             || absoluteStartIndex + chat.message.length !== initialState.authority.totalMessages
         ) return null
         let released = false
+        let expectedSessionVersion = initialState.authority.sessionVersion
         const requireState = (): WindowedSelectedConversationState | null => {
             const state = this.selectedConversationState
             return !released
@@ -405,6 +406,7 @@ export class ActiveWorkingSet {
                 && state.characterId === initialState.characterId
                 && state.conversationId === initialState.conversationId
                 && state.authority.sessionToken === initialState.authority.sessionToken
+                && state.authority.sessionVersion === expectedSessionVersion
                 && state.authority.totalMessages === absoluteStartIndex + chat.message.length
                 ? state
                 : null
@@ -446,7 +448,7 @@ export class ActiveWorkingSet {
                     || deleteCount < 0
                     || localStart + deleteCount > chat.message.length
                 ) return false
-                const chatSnapshot = safeStructuredClone(chat) as unknown as Record<string, unknown>
+                const replacedMessages = chat.message.slice(localStart, localStart + deleteCount)
                 const shellSnapshot = safeStructuredClone(
                     state.conversation,
                 ) as unknown as Record<string, unknown>
@@ -497,10 +499,11 @@ export class ActiveWorkingSet {
                         }],
                         conversation: metadata,
                     })
+                    expectedSessionVersion = sessionVersion
                     return true
                 } catch (error) {
                     rollbackViewport()
-                    restoreObject(chat as unknown as Record<string, unknown>, chatSnapshot)
+                    chat.message.splice(localStart, detachedMessages.length, ...replacedMessages)
                     restoreObject(
                         state.conversation as unknown as Record<string, unknown>,
                         shellSnapshot,

@@ -423,14 +423,26 @@ export class ChatTokenizer {
 
     private chatAdditionalTokens:number
     private useName:'name'|'noName'
+    private readonly chatCounts = new WeakMap<OpenAIChat, {
+        content: string, name: string | undefined, identity: string, count: number,
+    }>()
 
-    constructor(chatAdditionalTokens:number, useName:'name'|'noName'){
+    constructor(chatAdditionalTokens:number, useName:'name'|'noName', private reuseChatCounts = false){
         this.chatAdditionalTokens = chatAdditionalTokens
         this.useName = useName
     }
     async tokenizeChat(data:OpenAIChat, args:{
         countThoughts?:boolean,
     } = {}) {
+        const identity = this.reuseChatCounts && !data.multimodals?.length && !args.countThoughts
+            ? this.chatCountIdentity()
+            : null
+        const previous = identity === null ? undefined : this.chatCounts.get(data)
+        if (previous?.identity === identity && previous.content === data.content && previous.name === data.name) {
+            return previous.count
+        }
+        const content = data.content
+        const name = data.name
         let encoded = (await encode(data.content)).length + this.chatAdditionalTokens
         if(data.name && this.useName ==='name'){
             encoded += (await encode(data.name)).length + 1
@@ -445,7 +457,22 @@ export class ChatTokenizer {
                 encoded += (await encode(thought)).length + 1
             }
         }
+        if (identity !== null && identity === this.chatCountIdentity()
+            && content === data.content && name === data.name && !data.multimodals?.length) {
+            this.chatCounts.set(data, { content, name, identity, count: encoded })
+        }
         return encoded
+    }
+    private chatCountIdentity(): string | null {
+        const db = getDatabase()
+        const model = getModelInfo(db.aiModel)
+        const pluginTokenizer = pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer ?? 'none'
+        if ((db.aiModel === 'custom' && pluginTokenizer === 'custom')
+            || (model.tokenizer === LLMTokenizer.GoogleCloud && db.googleClaudeTokenizing)) return null
+        return JSON.stringify([
+            db.aiModel, db.customTokenizer, db.currentPluginProvider,
+            db.googleClaudeTokenizing, model.tokenizer, pluginTokenizer,
+        ])
     }
     async tokenizeChats(data:OpenAIChat[]){
         const db = getDatabase()
