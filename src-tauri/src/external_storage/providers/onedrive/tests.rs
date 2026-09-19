@@ -1691,7 +1691,19 @@ fn the_authorization_policy_requests_the_scopes_of_its_account_type() {
         authorization_policy(&config, "android").unwrap().client_id,
         "android-client"
     );
-    assert!(authorization_policy(&config, "ios").is_err());
+    config.location.insert(
+        "redirectUri".to_owned(),
+        IOS_REDIRECT_URI.to_owned(),
+    );
+    config
+        .oauth_profile
+        .as_mut()
+        .unwrap()
+        .platform_client_ids
+        .insert("ios".to_owned(), "ios-client".to_owned());
+    let ios = authorization_policy(&config, "ios").unwrap();
+    assert_eq!(ios.client_id, "ios-client");
+    assert_eq!(ios.redirect_url.as_str(), IOS_REDIRECT_URI);
 
     let mut business = config_at(graph, "business");
     business.location.insert(

@@ -1,9 +1,9 @@
 //! Native OAuth transport boundaries.
 //!
 //! Desktop authorization uses an external browser and a loopback callback
-//! bound before the authorization URL is created. Android OAuth returns through
-//! the application's registered custom URI while Rust retains the state, PKCE
-//! verifier and provider-registered redirect URI.
+//! bound before the authorization URL is created. Mobile OAuth returns through
+//! a platform-owned authentication session or registered custom URI while Rust
+//! retains the state, PKCE verifier and provider-registered redirect URI.
 use super::{
     auth::{AuthorizationCode, AuthorizationPolicy, PendingAuthorization},
     contract::{Cancellation, ErrorKind, ProviderError, Result},
@@ -13,6 +13,77 @@ use super::{
 pub(crate) const ANDROID_ONEDRIVE_REDIRECT_URI: &str = "risunestlocal://oauth/onedrive";
 #[cfg(target_os = "android")]
 pub(crate) const ANDROID_GOOGLE_DRIVE_REDIRECT_URI: &str = "risunestlocal://oauth/google-drive";
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) struct IosWebAuthenticationAuthorization {
+    pending: PendingAuthorization,
+    authorization_url: url::Url,
+    callback_scheme: String,
+}
+
+#[cfg(any(target_os = "ios", test))]
+impl IosWebAuthenticationAuthorization {
+    pub(crate) fn start(
+        policy: AuthorizationPolicy,
+        callback_scheme: String,
+        offline_access: bool,
+    ) -> Result<Self> {
+        if callback_scheme.is_empty()
+            || callback_scheme != policy.redirect_url.scheme()
+            || matches!(callback_scheme.as_str(), "http" | "https")
+        {
+            return Err(ProviderError::new(ErrorKind::Unsupported));
+        }
+        let (pending, mut authorization_url) = PendingAuthorization::start(policy)?;
+        if offline_access {
+            authorization_url
+                .query_pairs_mut()
+                .append_pair("access_type", "offline")
+                .append_pair("prompt", "consent");
+        }
+        Ok(Self {
+            pending,
+            authorization_url,
+            callback_scheme,
+        })
+    }
+
+    fn finish(self, raw_callback: &str) -> Result<AuthorizationCode> {
+        if raw_callback.is_empty() || raw_callback.len() > 16 * 1024 {
+            return Err(ProviderError::new(ErrorKind::ReauthRequired));
+        }
+        let callback = url::Url::parse(raw_callback)
+            .map_err(|_| ProviderError::new(ErrorKind::ReauthRequired))?;
+        self.pending.finish(&callback)
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl IosWebAuthenticationAuthorization {
+    pub(crate) async fn authenticate(self, app: &tauri::AppHandle) -> Result<AuthorizationCode> {
+        use tauri_plugin_ios_native::{IosNativeExt, WebAuthenticationOutcome};
+        let native = app.ios_native().clone();
+        let session = native.clone();
+        let authorization_url = self.authorization_url.to_string();
+        let callback_scheme = self.callback_scheme.clone();
+        let outcome = tokio::select! {
+            outcome = session.authenticate(&authorization_url, &callback_scheme, false) => outcome,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                native.cancel_authentication().await;
+                return Err(ProviderError::new(ErrorKind::ReauthRequired));
+            }
+        };
+        match outcome {
+            WebAuthenticationOutcome::Callback(callback) => self.finish(&callback),
+            WebAuthenticationOutcome::Cancelled => {
+                Err(ProviderError::new(ErrorKind::Cancelled))
+            }
+            WebAuthenticationOutcome::Failed => {
+                Err(ProviderError::new(ErrorKind::Transient))
+            }
+        }
+    }
+}
 
 #[cfg(not(target_os = "android"))]
 pub(crate) struct LoopbackAuthorization {
@@ -604,6 +675,44 @@ mod tests {
             AndroidCallback::OAuthError(kind) => assert_eq!(kind, ErrorKind::Cancelled),
             AndroidCallback::Grant(_) => panic!("expected denial"),
         }
+    }
+
+    #[test]
+    fn ios_authentication_session_binds_the_runtime_callback_scheme() {
+        let redirect =
+            url::Url::parse("com.googleusercontent.apps.123-client:/oauth2redirect").unwrap();
+        let flow = IosWebAuthenticationAuthorization::start(
+            policy(redirect.clone()).unwrap(),
+            "com.googleusercontent.apps.123-client".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            flow.callback_scheme,
+            "com.googleusercontent.apps.123-client"
+        );
+        assert!(flow
+            .authorization_url
+            .query_pairs()
+            .any(|(name, value)| name == "access_type" && value == "offline"));
+        let state = flow
+            .authorization_url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let callback = format!("{redirect}?code=synthetic-code&state={state}");
+        let grant = flow.finish(&callback).unwrap();
+        assert_eq!(grant.redirect_url, redirect);
+        assert_eq!(grant.code.0.as_slice(), b"synthetic-code");
+
+        assert!(IosWebAuthenticationAuthorization::start(
+            policy(url::Url::parse("risunestlocal://oauth/onedrive").unwrap()).unwrap(),
+            "another-scheme".into(),
+            false,
+        )
+        .is_err());
     }
 
     #[test]

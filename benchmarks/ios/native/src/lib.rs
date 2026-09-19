@@ -11,6 +11,38 @@ async fn ios_bench_network_probe() -> Result<serde_json::Value, &'static str> {
 }
 
 #[tauri::command]
+async fn ios_bench_authenticate(
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, &'static str> {
+    if ios_bench_phase() != "oauth" {
+        return Err("OAuth verification phase required");
+    }
+    #[cfg(target_os = "ios")]
+    {
+        use tauri_plugin_ios_native::{IosNativeExt, WebAuthenticationOutcome};
+
+        let callback = "risunestoauthtest://oauth?code=synthetic&state=device";
+        let authorization_url = "https://httpbin.org/redirect-to?url=risunestoauthtest%3A%2F%2Foauth%3Fcode%3Dsynthetic%26state%3Ddevice";
+        return Ok(match app
+            .ios_native()
+            .authenticate(authorization_url, "risunestoauthtest", true)
+            .await
+        {
+            WebAuthenticationOutcome::Callback(callback_url) => {
+                serde_json::json!({ "status": "succeeded", "callbackUrl": callback_url })
+            }
+            WebAuthenticationOutcome::Cancelled => serde_json::json!({ "status": "cancelled" }),
+            WebAuthenticationOutcome::Failed => serde_json::json!({ "status": "failed" }),
+        });
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = app;
+        Err("iOS runtime required")
+    }
+}
+
+#[tauri::command]
 fn ios_bench_phase() -> String {
     std::env::var("RISUNEST_IOS_PHASE").expect("verification phase")
 }
@@ -35,7 +67,8 @@ fn benchmark_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send
         ios_bench_report,
         ios_bench_stream_url,
         ios_bench_cloud_key,
-        ios_bench_network_probe
+        ios_bench_network_probe,
+        ios_bench_authenticate
     ]
 }
 

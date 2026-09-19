@@ -5,6 +5,7 @@ edition = "2021"
 links = "tauri-plugin-ios-native"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 tauri = "2.11.5"
 
 [build-dependencies]

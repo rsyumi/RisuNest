@@ -3980,6 +3980,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -4361,6 +4362,7 @@ dependencies = [
 name = "risunest"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.21.7",
  "cap-primitives",
@@ -4371,14 +4373,19 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hex",
+ "hmac",
+ "httpdate",
  "image",
  "jni 0.21.1",
  "keyring",
  "libc",
  "oauth2",
+ "percent-encoding",
+ "quick-xml",
  "regex",
  "reqwest 0.11.27",
  "risunest-external-storage-format",
+ "risunest-release-update",
  "risunest-sync-connect",
  "risunest-sync-wire",
  "rmpv",
@@ -4428,6 +4435,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hkdf",
+ "risunest-sync-wire",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4453,6 +4461,23 @@ dependencies = [
  "tauri-plugin-os",
  "tauri-plugin-process",
  "tauri-plugin-shell",
+]
+
+[[package]]
+name = "risunest-release-update"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "hex",
+ "minisign-verify",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "time",
+ "url",
 ]
 
 [[package]]
@@ -5768,6 +5793,7 @@ dependencies = [
 name = "tauri-plugin-ios-native"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tauri",
  "tauri-plugin",
 ]

@@ -3,7 +3,7 @@
 use super::{
     auth::{
         android_web_authorization_policy, authorization_policy, exchange_authorization_code,
-        verify_google_grant,
+        ios_authorization_policy, verify_google_grant,
     },
     config::AuthorizationSettings,
     create,
@@ -2038,6 +2038,27 @@ fn authorization_uses_the_platform_client_and_the_per_file_scope() {
         url::Url::parse("http://127.0.0.1:52001/oauth").unwrap()
     )
     .is_err());
+    let (ios, callback_scheme) = ios_authorization_policy(&config).unwrap();
+    assert_eq!(ios.client_id, client_id("ios"));
+    assert_eq!(
+        callback_scheme,
+        "com.googleusercontent.apps.123456789012-ios"
+    );
+    assert_eq!(
+        ios.redirect_url.as_str(),
+        "com.googleusercontent.apps.123456789012-ios:/oauth2redirect"
+    );
+    let mut malformed_ios = config.clone();
+    malformed_ios
+        .oauth_profile
+        .as_mut()
+        .unwrap()
+        .platform_client_ids
+        .insert(
+            "ios".into(),
+            "123-bad:scheme.apps.googleusercontent.com".into(),
+        );
+    assert!(ios_authorization_policy(&malformed_ios).is_err());
     assert!(authorization_policy(
         &config,
         "windows",
