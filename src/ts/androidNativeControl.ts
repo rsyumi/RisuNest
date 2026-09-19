@@ -86,7 +86,10 @@ function installAndroidNativeControl(): void {
         webViewVersion: () => control.request<string>('generation.webViewVersion'),
     }
     window.RisuGenerationKeepAlive = generation
-    if (!window.RisuNestSafControl) return
+    if (!window.RisuNestSafControl) {
+        control.notify('lifecycle.onFrontendReady')
+        return
+    }
     const saf = createAndroidControlClient(window.RisuNestSafControl)
     window.RisuSafBridge = {
         copyExport: (...args) => saf.notify('saf.copyExport', ...args),
@@ -102,6 +105,7 @@ function installAndroidNativeControl(): void {
         markExportPublicationReady: (id) => saf.request<boolean>('saf.markExportPublicationReady', id),
         acknowledgeExport: (id) => saf.request<boolean>('saf.acknowledgeExport', id),
     }
+    control.notify('lifecycle.onFrontendReady')
 }
 
 installAndroidNativeControl()

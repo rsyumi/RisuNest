@@ -135,10 +135,12 @@ class SafFileTaxonomyGoldenTest {
     val configured = Regex("\"ext\"\\s*:\\s*\\[([^\\]]*)\\]")
       .findAll(configuration).flatMap { quotedStrings(it.groupValues[1]) }.toSet()
     for (suffix in taxonomy.databaseSuffixes) {
-      assertTrue(suffix, registered.contains(".*\\\\$suffix"))
       if (suffix == ".bin") {
+        // Generic binary backups remain explicit picker inputs, not an OS-wide association.
+        assertFalse(registered.contains(".*\\\\$suffix"))
         assertFalse(configured.contains("bin"))
       } else {
+        assertTrue(suffix, registered.contains(".*\\\\$suffix"))
         assertTrue(suffix, configured.contains(suffix.removePrefix(".")))
       }
     }

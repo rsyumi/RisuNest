@@ -93,27 +93,7 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `disabled SAF jobs retain the legacy tauri opened files contract`() {
-    assertEquals(
-      "window.tauriOpenedFiles=[\"C:\\\\opened\\u000afile.risudat\"];",
-      openedFilesScript(listOf("C:\\opened\nfile.risudat")),
-    )
-  }
-
-  @Test
-  fun `legacy opened files are injected on a cold start and dispatched on a warm start`() {
-    assertEquals(
-      LegacyOpenedFileDelivery.DOCUMENT_START_INJECTION,
-      legacyOpenedFileDelivery(coldStart = true),
-    )
-    assertEquals(
-      LegacyOpenedFileDelivery.RUNTIME_EVENT,
-      legacyOpenedFileDelivery(coldStart = false),
-    )
-  }
-
-  @Test
-  fun `warm start delivery dispatches the opened files and falls back to the startup queue`() {
+  fun `ready document delivery dispatches opened files and falls back to its startup queue`() {
     val script = openedFilesEventScript(listOf("/data/cache/opened_files/1-0-preset.risup"))
 
     assertEquals(true, script.contains("new CustomEvent('risu-opened-files'"))
@@ -121,12 +101,12 @@ class MainActivityBehaviorTest {
     assertEquals(true, script.contains("\"/data/cache/opened_files/1-0-preset.risup\""))
     assertEquals(true, script.contains("if(window.dispatchEvent(event)){"))
     assertEquals(true, script.contains("window.tauriOpenedFiles="))
-    // The cold start contract stays a plain assignment, the warm start one never replaces it.
+    // Delivery never replaces an earlier undrained startup batch.
     assertEquals(false, script.startsWith("window.tauriOpenedFiles="))
   }
 
   @Test
-  fun `warm start delivery escapes opened file paths the same way the cold start does`() {
+  fun `ready document delivery escapes opened file paths`() {
     assertEquals(
       true,
       openedFilesEventScript(listOf("C:\\opened\nfile.risup"))

@@ -11,9 +11,30 @@ function fixture() {
     return { sent, port, client, reply }
 }
 
-afterEach(() => vi.useRealTimers())
+afterEach(() => {
+    vi.useRealTimers()
+    delete window.RisuNestControl
+    delete window.RisuNestSafControl
+    delete window.RisuLifecycleBridge
+    delete window.RisuGenerationKeepAlive
+    delete window.RisuSafBridge
+})
 
 describe('scoped Android control transport', () => {
+    it.each([false, true])('announces the real app document after installing controls (SAF %s)', async (safEnabled) => {
+        vi.resetModules()
+        const ready = vi.fn((text: string) => {
+            expect(window.RisuLifecycleBridge?.onFlushComplete).toBeTypeOf('function')
+            expect(window.RisuGenerationKeepAlive?.begin).toBeTypeOf('function')
+            expect(Boolean(window.RisuSafBridge)).toBe(safEnabled)
+            expect(JSON.parse(text)).toEqual({ method: 'lifecycle.onFrontendReady', args: [] })
+        })
+        window.RisuNestControl = { postMessage: ready }
+        if (safEnabled) window.RisuNestSafControl = { postMessage: vi.fn() }
+        await import('./androidNativeControl')
+        expect(ready).toHaveBeenCalledOnce()
+    })
+
     it('matches delayed responses without treating promises as successful booleans', async () => {
         const { client, sent, reply } = fixture()
         const first = client.request<boolean>('saf.acknowledgeExport', 'first')

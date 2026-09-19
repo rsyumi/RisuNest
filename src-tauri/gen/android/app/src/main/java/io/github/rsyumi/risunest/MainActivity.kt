@@ -1,6 +1,7 @@
 package io.github.rsyumi.risunest
 
 import android.content.ComponentCallbacks2
+import android.content.Context
 import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
@@ -225,29 +226,6 @@ internal fun escapeJsStringLiteral(value: String): String = buildString {
     }
   }
 }
-
-internal fun openedFilesScript(paths: List<String>): String {
-  val values = paths.joinToString(",") { "\"${escapeJsStringLiteral(it)}\"" }
-  return "window.tauriOpenedFiles=[$values];"
-}
-
-/**
- * How the files that the legacy opened file path handles reach the web app.
- *
- * A cold start injects them before the document runs, a warm start has to reach a page that is
- * already loaded.
- */
-internal enum class LegacyOpenedFileDelivery {
-  DOCUMENT_START_INJECTION,
-  RUNTIME_EVENT,
-}
-
-internal fun legacyOpenedFileDelivery(coldStart: Boolean): LegacyOpenedFileDelivery =
-  if (coldStart) {
-    LegacyOpenedFileDelivery.DOCUMENT_START_INJECTION
-  } else {
-    LegacyOpenedFileDelivery.RUNTIME_EVENT
-  }
 
 /**
  * Announces files opened while the app was already running.
@@ -530,6 +508,7 @@ private val postNotificationsRequestedInProcess = AtomicBoolean(false)
 class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
+  private var frontendReady = AndroidFrontendReady()
   private var commitBridge: AndroidCommitBridge? = null
   private var controlBridge: AndroidControlBridge? = null
   private var safControlBridge: AndroidControlBridge? = null
@@ -570,7 +549,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     )
   }
   private val safDestinationPicker = registerForActivityResult(
-    ActivityResultContracts.CreateDocument("application/octet-stream"),
+    object : ActivityResultContracts.CreateDocument("application/octet-stream") {
+      override fun createIntent(context: Context, input: String): Intent =
+        super.createIntent(context, input).setType(androidExportMimeType(input))
+    },
     ::onSafDestinationSelected,
   )
   private val backupSourcePicker = registerForActivityResult(
@@ -661,6 +643,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun recoverRenderer(webView: WebView, didCrash: Boolean): Boolean {
+    frontendReady.cancel()
     commitBridge?.close()
     commitBridge = null
     Log.e(TAG, "Android WebView renderer exited, didCrash=$didCrash")
@@ -686,6 +669,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    frontendReady.cancel()
+    frontendReady = AndroidFrontendReady()
     lifecycleWebView = webView
     commitBridge?.close()
     commitBridge = AndroidCommitBridge.attach(webView)
@@ -696,11 +681,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       safControlBridge = AndroidControlBridge.attach(webView, ::dispatchControl, "RisuNestSafControl")
       deliveredSpoolTokens.clear()
-      replayReadySpools(webView)
-      replaySafDestinationResult(webView)
       injectOpenedFiles(webView)
     } else {
-      injectLegacyOpenedFiles(webView)
+      stageLegacyOpenedFiles(webView, claimOpenedFileUris(intent))
     }
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
@@ -796,14 +779,16 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       setIntent(intent)
       return
     }
-    if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
-      setIntent(intent)
-      consumedOpenedFileFingerprint = null
-      lifecycleWebView?.let { injectOpenedFiles(it, intent, includeLegacyFiles = false) }
+    setIntent(intent)
+    consumedOpenedFileFingerprint = null
+    lifecycleWebView?.let {
+      if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) injectOpenedFiles(it, intent)
+      else stageLegacyOpenedFiles(it, claimOpenedFileUris(intent))
     }
   }
 
   override fun onDestroy() {
+    frontendReady.cancel()
     rendererRestartGate.close()
     commitBridge?.close()
     commitBridge = null
@@ -864,11 +849,21 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
+  private fun onFrontendReady() {
+    val webView = lifecycleWebView ?: return
+    if (!frontendReady.markReady()) return
+    if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      replayReadySpools(webView)
+      replaySafDestinationResult(webView)
+    }
+  }
+
   private suspend fun dispatchControl(method: String, args: List<String>): Any? {
     if (method.startsWith("saf.") && !BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       error("android-saf-unavailable")
     }
     return when (method) {
+      "lifecycle.onFrontendReady" -> onFrontendReady()
       "lifecycle.onFlushComplete" -> lifecycleCommands.onFlushComplete(args[0])
       "lifecycle.onFlushHold" -> lifecycleCommands.onFlushHold(args[0])
       "lifecycle.requestExit" -> lifecycleCommands.requestExit()
@@ -1836,16 +1831,20 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   private fun replaySafDestinationResult(webView: WebView) {
-    val record = loadSafDestinationState()
-      ?.takeIf(SafDestinationRecord::isTerminal)
-      ?: return
-    webView.evaluateJavascript(
-      androidSafDestinationScriptForRecord(record, destinationMessage(record)),
-      null,
-    )
+    safScope.launch {
+      val record = withContext(Dispatchers.IO) {
+        loadSafDestinationState()?.takeIf(SafDestinationRecord::isTerminal)
+      } ?: return@launch
+      if (lifecycleWebView !== webView || !frontendReady.isReady) return@launch
+      webView.evaluateJavascript(
+        androidSafDestinationScriptForRecord(record, destinationMessage(record)),
+        null,
+      )
+    }
   }
 
   private fun dispatchSafDestination(record: SafDestinationRecord, message: String?) {
+    if (!frontendReady.isReady) return
     lifecycleWebView?.evaluateJavascript(
       androidSafDestinationScriptForRecord(record, message),
       null,
@@ -1878,32 +1877,27 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private fun injectOpenedFiles(
     webView: WebView,
     openedIntent: Intent? = intent,
-    includeLegacyFiles: Boolean = true,
   ) {
     val uris = claimOpenedFileUris(openedIntent)
     if (uris.isEmpty()) return
-    val openedSources = uris.map { uri ->
-      val (displayName, totalBytes) = runCatching { resolveSourceMetadata(uri) }
-        .getOrElse {
-          safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
-        }
-      OpenedFileSource(uri, displayName, totalBytes)
-    }
-    val (nativeJobSources, legacySources) = openedSources.partition { source ->
-      shouldUseNativeFileJobSpool(source.displayName)
-    }
-    val legacyUris = legacySources.map { it.uri }
-    when (legacyOpenedFileDelivery(coldStart = includeLegacyFiles)) {
-      LegacyOpenedFileDelivery.DOCUMENT_START_INJECTION ->
-        injectLegacyOpenedFiles(webView, legacyUris)
-      LegacyOpenedFileDelivery.RUNTIME_EVENT -> dispatchLegacyOpenedFiles(webView, legacyUris)
-    }
-    if (nativeJobSources.isEmpty()) return
+    val ready = frontendReady
     val requestId = UUID.randomUUID().toString()
     val cancellation = AtomicBoolean(false)
     safSourceCancellations[requestId] = cancellation
     safScope.launch {
       try {
+        val openedSources = withContext(Dispatchers.IO) {
+          uris.map { uri ->
+            val (displayName, totalBytes) = runCatching { resolveSourceMetadata(uri) }
+              .getOrElse { safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null }
+            OpenedFileSource(uri, displayName, totalBytes)
+          }
+        }
+        val (nativeJobSources, legacySources) = openedSources.partition { source ->
+          shouldUseNativeFileJobSpool(source.displayName)
+        }
+        stageLegacyOpenedFiles(webView, legacySources.map { it.uri }, ready)
+        if (nativeJobSources.isEmpty()) return@launch
         val store = safSpoolStore()
         val sources = withContext(Dispatchers.IO) {
           store.cleanupStale()
@@ -1928,6 +1922,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             )
           },
         )
+        ready.await()
         if (!copyContext.isActive || lifecycleWebView !== webView) return@launch
         val newlyReady = batch.ready.filter { deliveredSpoolTokens.add(it.token) }
         webView.evaluateJavascript(
@@ -1946,13 +1941,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       val ready = withContext(Dispatchers.IO) {
         val store = safSpoolStore()
         store.cleanupStale()
-        store.listReady().filter {
-          shouldUseNativeFileJobSpool(it.displayName) && deliveredSpoolTokens.add(it.token)
-        }
+        store.listReady().filter { shouldUseNativeFileJobSpool(it.displayName) }
       }
-      if (ready.isEmpty() || lifecycleWebView !== webView) return@launch
+      if (ready.isEmpty() || lifecycleWebView !== webView || !frontendReady.isReady) return@launch
+      val newlyReady = ready.filter { deliveredSpoolTokens.add(it.token) }
+      if (newlyReady.isEmpty()) return@launch
       webView.evaluateJavascript(
-        androidSpoolBatchScript(UUID.randomUUID().toString(), SafSpoolBatch(ready, emptyList())),
+        androidSpoolBatchScript(UUID.randomUUID().toString(), SafSpoolBatch(newlyReady, emptyList())),
         null,
       )
     }
@@ -2010,24 +2005,20 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private fun injectLegacyOpenedFiles(
+  private fun stageLegacyOpenedFiles(
     webView: WebView,
-    uris: List<Uri> = launchOpenedFileUris(intent),
+    uris: List<Uri>,
+    ready: AndroidFrontendReady = frontendReady,
   ) {
-    val openedFiles = copyLegacyOpenedFiles(uris)
-    if (openedFiles.isEmpty()) return
-    val script = openedFilesScript(openedFiles)
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-      WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("*"))
-    } else {
-      webView.evaluateJavascript(script, null)
+    if (uris.isEmpty()) return
+    safScope.launch {
+      val openedFiles = withContext(Dispatchers.IO) { copyLegacyOpenedFiles(uris) }
+      if (openedFiles.isEmpty()) return@launch
+      ready.await()
+      if (lifecycleWebView === webView) {
+        webView.evaluateJavascript(openedFilesEventScript(openedFiles), null)
+      }
     }
-  }
-
-  private fun dispatchLegacyOpenedFiles(webView: WebView, uris: List<Uri>) {
-    val openedFiles = copyLegacyOpenedFiles(uris)
-    if (openedFiles.isEmpty()) return
-    webView.evaluateJavascript(openedFilesEventScript(openedFiles), null)
   }
 
   private fun copyLegacyOpenedFiles(uris: List<Uri>): List<String> {
@@ -2039,7 +2030,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     return uris.mapIndexedNotNull { index, uri ->
       var target: File? = null
       try {
-        val openedTarget = File(directory, "$stamp-$index-${resolveLegacyDisplayName(uri)}")
+        val openedTarget = File(directory, "${UUID.randomUUID()}-$index-${resolveLegacyDisplayName(uri)}")
         target = openedTarget
         contentResolver.openInputStream(uri)?.use { input ->
           openedTarget.outputStream().use { output -> input.copyTo(output) }
