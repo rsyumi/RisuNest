@@ -81,6 +81,14 @@ fn successful(status: Option<u16>) -> bool {
 }
 
 pub(super) fn parse(body: &[u8]) -> Result<Vec<Entry>> {
+    parse_impl(body, false)
+}
+
+pub(super) fn parse_complete(body: &[u8]) -> Result<Vec<Entry>> {
+    parse_impl(body, true)
+}
+
+fn parse_impl(body: &[u8], complete: bool) -> Result<Vec<Entry>> {
     let mut reader = NsReader::from_reader(body);
     reader.config_mut().expand_empty_elements = true;
     let mut stack: Vec<Element> = Vec::new();
@@ -100,8 +108,12 @@ pub(super) fn parse(body: &[u8]) -> Result<Vec<Entry>> {
                 }
                 let current = element(resolved, start.local_name().as_ref());
                 match (current, stack.last().copied()) {
-                    (Element::MultiStatus, None) => multistatus = true,
-                    (Element::Response, _) => {
+                    (Element::MultiStatus, None) => {
+                        if complete && multistatus { return Err(corrupt()); }
+                        multistatus = true;
+                    },
+                    (Element::Response, parent) => {
+                        if complete && (parent != Some(Element::MultiStatus) || entry.is_some()) { return Err(corrupt()); }
                         entry = Some(Entry::default());
                         response_status = None;
                         pending = Pending::default();
@@ -128,6 +140,7 @@ pub(super) fn parse(body: &[u8]) -> Result<Vec<Entry>> {
                     &mut response_status,
                     &mut pending,
                     &mut entries,
+                    complete,
                 )?;
             }
             Event::Text(chunk) => {
@@ -165,9 +178,11 @@ fn finish_element(
     response_status: &mut Option<u16>,
     pending: &mut Pending,
     entries: &mut Vec<Entry>,
+    complete: bool,
 ) -> Result<()> {
     if current == Element::Response {
         if let Some(finished) = entry.take() {
+            if complete && (!successful(*response_status) || finished.href.is_empty()) { return Err(corrupt()); }
             if successful(*response_status) && !finished.href.is_empty() {
                 entries.push(finished);
             }

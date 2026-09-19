@@ -17,8 +17,21 @@ pub(crate) async fn verify_remote_receipt(
     receipt: ObjectReceipt,
     cancel: &Cancellation,
 ) -> Result<Option<ObjectReceipt>> {
+    verify_remote_receipt_at(directory, intent, provider, repository, receipt, cancel, None, None).await
+}
+
+pub(super) async fn verify_remote_receipt_at(
+    directory: &std::path::Path,
+    intent: &ObjectIntent,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    receipt: ObjectReceipt,
+    cancel: &Cancellation,
+    unchanged: Option<&VersionToken>,
+    output: Option<&std::path::Path>,
+) -> Result<Option<ObjectReceipt>> {
     validate_receipt(intent, repository, &receipt)?;
-    if receipt.checksum.as_ref().is_some_and(|checksum| {
+    if output.is_none() && unchanged.is_none() && receipt.checksum.as_ref().is_some_and(|checksum| {
         checksum.provider_verified
             && checksum.algorithm.eq_ignore_ascii_case("sha256")
             && checksum.value == intent.sha256
@@ -27,12 +40,18 @@ pub(crate) async fn verify_remote_receipt(
     }
     let temporary = tempfile::tempdir_in(directory)
         .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
-    let path = temporary.path().join("object");
+    let path = output.map(std::path::Path::to_path_buf).unwrap_or_else(|| temporary.path().join("object"));
     let mut sink = SpoolSink::create(&path, intent.byte_length)?;
-    let current = match provider.read_object(repository, &receipt.locator, None, &mut sink, cancel).await {
+    let current = match provider.read_object(repository, &receipt.locator, unchanged, &mut sink, cancel).await {
         Ok(ReadReceipt::Body(current)) => current,
-        Ok(ReadReceipt::NotModified(_)) => return Err(ProviderError::new(ErrorKind::Corrupt)),
-        Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
+        Ok(ReadReceipt::NotModified(version)) => {
+            if unchanged == Some(&version) { return Ok(Some(receipt)); }
+            return Err(ProviderError::new(ErrorKind::Corrupt));
+        }
+        Err(error) if error.kind == ErrorKind::NotFound => {
+            std::fs::remove_file(&path).map_err(|_| ProviderError::new(ErrorKind::Transient))?;
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     validate_receipt(intent, repository, &current)?;

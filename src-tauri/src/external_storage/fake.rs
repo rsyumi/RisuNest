@@ -90,6 +90,8 @@ pub(super) struct FakeState {
     after_listing: Vec<(usize, String, ObjectRole, Vec<u8>)>,
     reads: BTreeMap<String, ProviderError>,
     read_attempts: Vec<String>,
+    pub(super) ignore_unchanged: bool,
+    pub(super) body_bytes: BTreeMap<String, usize>,
     cancel_after_reads: BTreeMap<String, (usize, Cancellation)>,
     upload_attempts: Vec<String>,
     upload_locators: BTreeMap<String, String>,
@@ -318,9 +320,10 @@ impl Provider for FakeProvider {
                 .cloned()
                 .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
             let token = VersionToken(version.to_string());
-            if unchanged == Some(&token) {
+            if unchanged == Some(&token) && !self.state.lock().unwrap().ignore_unchanged {
                 return Ok(ReadReceipt::NotModified(token));
             }
+            *self.state.lock().unwrap().body_bytes.entry(l.object.clone()).or_default() += bytes.len();
             let hash = risunest_sync_wire::hash(&bytes);
             let mut writer = sink.open(0, bytes.len() as u64, c).await?;
             writer

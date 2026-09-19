@@ -64,6 +64,7 @@ pub(crate) struct TransferJournal {
     db: Connection,
     directory: PathBuf,
     identity: JobIdentity,
+    pub(super) verification: super::packaging::AttemptVerification,
 }
 impl TransferJournal {
     /// Reopens an existing journal after its worker has exited, then removes
@@ -105,7 +106,7 @@ impl TransferJournal {
         if identity.job_id != job_id {
             return Err(corrupt());
         }
-        Self { db, directory: directory.into(), identity }
+        Self { db, directory: directory.into(), identity, verification: Default::default() }
             .cleanup_terminal_spools(store, format_repository_id)
     }
 
@@ -246,6 +247,7 @@ impl TransferJournal {
             db,
             directory: directory.into(),
             identity,
+            verification: Default::default(),
         })
     }
 
