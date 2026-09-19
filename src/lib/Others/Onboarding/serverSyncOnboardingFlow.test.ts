@@ -35,6 +35,7 @@ function finished(phase: 'idle' | 'pending' | 'conflict'): ServerSyncSnapshot {
             ...identity,
             head,
             dirtyRecords: 0,
+            pendingDeviceSections: false,
             fullScan: false,
             registrationRequired: false,
             operationPending: phase === 'pending',

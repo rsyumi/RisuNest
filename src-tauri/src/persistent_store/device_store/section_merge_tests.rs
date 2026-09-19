@@ -154,6 +154,35 @@ fn e2_server_apply_rechecks_the_local_version_and_rolls_back_conflicting_batches
 }
 
 #[test]
+fn server_completion_preserves_a_device_tail_until_its_exact_version_is_published() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut device = DeviceStore::open(directory.path()).unwrap();
+    device.set_section_participating(Section::LocalPlugins, false).unwrap();
+    device.write_plugin_device_values("plugin", &[PluginDeviceMutation::Set {
+        space: "string".into(), key: "key".into(), value: "first".into(),
+    }]).unwrap();
+    let first = device.read_section_rows(Section::LocalPlugins).unwrap().remove(0);
+    assert!(!server::has_pending(&device).unwrap());
+    device.set_section_participating(Section::LocalPlugins, true).unwrap();
+    assert!(server::has_pending(&device).unwrap());
+
+    device.write_plugin_device_values("plugin", &[PluginDeviceMutation::Set {
+        space: "string".into(), key: "key".into(), value: "newer".into(),
+    }]).unwrap();
+    let newer = device.read_section_rows(Section::LocalPlugins).unwrap().remove(0);
+    server::write_sections(&mut device, &[server::SectionWrite::MarkVersion {
+        domain: Domain::LocalPlugins, key: local_entry(&first).entry.key,
+        version: first.version(),
+    }]).unwrap();
+    assert!(server::has_pending(&device).unwrap());
+    server::write_sections(&mut device, &[server::SectionWrite::MarkVersion {
+        domain: Domain::LocalPlugins, key: local_entry(&newer).entry.key,
+        version: newer.version(),
+    }]).unwrap();
+    assert!(!server::has_pending(&device).unwrap());
+}
+
+#[test]
 fn e3_spools_deduplicate_vectors_are_read_only_and_clean_up_after_use() {
     use risunest_external_storage_format::{content_identity::hash, format::FingerprintBuilder};
     let mut spool = SectionSpoolBuilder::new(Section::Hypa).unwrap();

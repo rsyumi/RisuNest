@@ -35,6 +35,7 @@ function complete(): ServerSyncSnapshot {
       reconciling: false,
       head,
       dirtyRecords: 0,
+      pendingDeviceSections: false,
       fullScan: false,
       registrationRequired: false,
       operationPending: false,
@@ -79,6 +80,7 @@ describe("server completion presenter", () => {
   );
   it.each([
     { dirtyRecords: 1 },
+    { pendingDeviceSections: true },
     { registrationRequired: true },
     { operationPending: true },
     { reconciling: true },

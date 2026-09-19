@@ -96,6 +96,7 @@ const bound = (endpoint = "https://bound.test/", libraryId = "lib"): ServerSyncS
     deviceId: "device",
     head: null,
     dirtyRecords: 0,
+    pendingDeviceSections: false,
     fullScan: false,
     registrationRequired: false,
     operationPending: false,

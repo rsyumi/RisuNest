@@ -28,6 +28,7 @@ const bound = (): ServerSyncSnapshot => ({
     deviceId: "device",
     head: null,
     dirtyRecords: 37,
+    pendingDeviceSections: false,
     fullScan: false,
     registrationRequired: false,
     operationPending: false,

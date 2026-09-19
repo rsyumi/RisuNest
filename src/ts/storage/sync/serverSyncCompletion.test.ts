@@ -36,6 +36,7 @@ function fixture(): {
       reconciling: false,
       head,
       dirtyRecords: 0,
+      pendingDeviceSections: false,
       fullScan: false,
       registrationRequired: false,
       operationPending: false,
@@ -61,6 +62,7 @@ describe("matchesCompletedServerCycle", () => {
 
   it.each([
     ["dirty records", (status: ServerStatus) => ({ ...status, dirtyRecords: 1 })],
+    ["pending device sections", (status: ServerStatus) => ({ ...status, pendingDeviceSections: true })],
     ["full scan", (status: ServerStatus) => ({ ...status, fullScan: true })],
     ["reconciliation", (status: ServerStatus) => ({ ...status, reconciling: true })],
     ["pending operation", (status: ServerStatus) => ({ ...status, operationPending: true })],

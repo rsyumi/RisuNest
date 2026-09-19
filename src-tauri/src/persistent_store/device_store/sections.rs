@@ -1398,6 +1398,18 @@ impl DeviceStore {
         Ok(())
     }
 
+    pub(crate) fn has_pending_section_entries(&self, section: Section) -> StoreResult<bool> {
+        let table = match section {
+            Section::Hypa => "hypa_embeddings",
+            Section::LocalPlugins => "plugin_device_storage",
+        };
+        Ok(self.connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE published_clock IS NULL OR published_clock<>write_clock)"),
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn pending_section_entry_keys(&self, section: Section, after: &str, limit: usize) -> StoreResult<Vec<String>> {
         let limit = limit.min(256);
         match section {

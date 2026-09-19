@@ -38,6 +38,7 @@ export interface ServerStatus {
   deviceId: string | null;
   head: ServerHead | null;
   dirtyRecords: number;
+  pendingDeviceSections: boolean;
   fullScan: boolean;
   registrationRequired: boolean;
   operationPending: boolean;

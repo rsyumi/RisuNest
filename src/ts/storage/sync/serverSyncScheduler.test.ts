@@ -25,6 +25,7 @@ function fixture() {
     deviceId: "device",
     head,
     dirtyRecords: 0,
+    pendingDeviceSections: false,
     fullScan: false,
     registrationRequired: false,
     operationPending: false,

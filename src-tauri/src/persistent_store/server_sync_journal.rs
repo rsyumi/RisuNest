@@ -19,6 +19,7 @@ pub(crate) struct ReplicaStatus {
     pub device_id: Option<String>,
     pub head: Option<RemoteHead>,
     pub dirty_records: i64,
+    pub pending_device_sections: bool,
     pub full_scan: bool,
     pub registration_required: bool,
     pub operation_pending: bool,
@@ -242,6 +243,8 @@ impl PersistentStore {
                 [],
                 |r| r.get(0),
             )?,
+            pending_device_sections: config.is_some()
+                && super::server_sync_sections::has_pending(self.device_store()?)?,
             full_scan,
             registration_required,
             operation_pending: self.connection.query_row(

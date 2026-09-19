@@ -42,6 +42,15 @@ pub(crate) fn participation(device: &DeviceStore) -> StoreResult<Vec<(Domain, St
     Ok(chosen)
 }
 
+pub(crate) fn has_pending(device: &DeviceStore) -> StoreResult<bool> {
+    for (domain, _) in participation(device)? {
+        if device.has_pending_section_entries(require_section(domain)?)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn stamp_unpublished_removal(
     device: &DeviceStore,
     domain: Domain,

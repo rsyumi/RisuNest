@@ -23,6 +23,7 @@ function fixture() {
       },
     },
     dirtyRecords: 0,
+    pendingDeviceSections: false,
     fullScan: false,
     registrationRequired: false,
     operationPending: false,
@@ -322,6 +323,7 @@ describe("common completion and replacement contract", () => {
   });
   it.each([
     { dirtyRecords: 1 },
+    { pendingDeviceSections: true },
     { fullScan: true },
     { operationPending: true },
     { registrationRequired: true },

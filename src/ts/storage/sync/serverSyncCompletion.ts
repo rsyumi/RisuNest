@@ -16,6 +16,7 @@ export function matchesCompletedServerCycle(
     status.registrationRequired ||
     status.reconciling ||
     status.operationPending ||
+    status.pendingDeviceSections !== false ||
     status.fullScan ||
     status.dirtyRecords !== 0
   )
