@@ -8,7 +8,7 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 use tauri::{AppHandle, Manager};
 
@@ -386,9 +386,31 @@ impl TransferPool {
 pub(crate) struct NativeMediaIpcState {
     pool: Mutex<TransferPool>,
     spool_root: Mutex<Option<PathBuf>>,
+    processing: Mutex<()>,
 }
 
 impl NativeMediaIpcState {
+    fn admit_processing(&self, id: &str) -> Result<MutexGuard<'_, ()>, String> {
+        let result = (|| {
+            let guard = self.processing.lock()
+                .map_err(|error| format!("native media processing mutex poisoned: {error}"))?;
+            let pool = self.pool.lock()
+                .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?;
+            if !matches!(pool.transfers.get(id), Some(Transfer::Processing(processing))
+                if !processing.cancelled && processing.generation == pool.generation)
+            {
+                return Err("native media processing was cancelled".to_owned());
+            }
+            Ok(guard)
+        })();
+        if result.is_err() {
+            if let Ok(mut pool) = self.pool.lock() {
+                pool.finish_processing(id);
+            }
+        }
+        result
+    }
+
     pub(crate) fn configure(&self, root: PathBuf) -> Result<(), String> {
         fs::create_dir_all(&root)
             .map_err(|error| format!("failed to create native media IPC directory: {error}"))?;
@@ -600,6 +622,7 @@ pub(crate) async fn native_media_encode_inlay_finish(
             .lock()
             .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
             .begin_uploaded_processing(&upload_id)?;
+        let _admission = state.admit_processing(&upload_id)?;
         let (input, data) = match read_processing_input(input) {
             Ok(value) => value,
             Err(error) => {
@@ -669,6 +692,7 @@ pub(crate) async fn native_media_write_inlay_finish(
             .lock()
             .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
             .begin_uploaded_processing(&upload_id)?;
+        let _admission = state.admit_processing(&upload_id)?;
         let (input, data) = match read_processing_input(input) {
             Ok(value) => value,
             Err(error) => {
@@ -759,6 +783,7 @@ pub(super) fn encode_direct(
         .lock()
         .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
         .begin_direct_processing(data.len() as u64)?;
+    let _admission = state.admit_processing(&output_id)?;
     let encoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         encode_inlay_image(id, data, name, options)
     })) {
@@ -795,6 +820,7 @@ pub(super) fn write_direct(
         .lock()
         .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
         .begin_direct_processing(data.len() as u64)?;
+    let _admission = state.admit_processing(&processing_id)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         write_inlay_image_with_options(root, id, data, name, options)
     }))
@@ -807,6 +833,49 @@ pub(super) fn write_direct(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_direct_encoders_do_not_start_before_admission_and_cancel_without_leaking() {
+        let state = super::NativeMediaIpcState::default();
+        let admission = state.processing.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let send = send.clone();
+                let state = &state;
+                scope.spawn(move || {
+                    send.send(super::encode_direct(state, "synthetic", b"original", "file.bin", None)).unwrap();
+                });
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.pool.lock().unwrap().transfers.len() != 2 {
+                assert!(std::time::Instant::now() < deadline, "workers did not reserve their inputs");
+                std::thread::yield_now();
+            }
+            assert!(receive.try_recv().is_err());
+            state.reset_renderer_session().unwrap();
+            drop(admission);
+            for _ in 0..2 {
+                assert!(receive.recv().unwrap().err().expect("cancelled operation").contains("cancelled"));
+            }
+        });
+        assert!(state.pool.lock().unwrap().transfers.is_empty());
+        assert_eq!(state.pool.lock().unwrap().reserved_bytes, 0);
+        let result = super::encode_direct(&state, "next", b"original", "file.bin", None).unwrap();
+        assert_eq!(result.data.as_deref(), Some(b"original".as_slice()));
+    }
+
+    #[test]
+    fn poisoned_processing_admission_releases_the_reserved_slot() {
+        let state = super::NativeMediaIpcState::default();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = state.processing.lock().unwrap();
+            panic!("synthetic worker failure");
+        });
+        assert!(super::encode_direct(&state, "synthetic", b"original", "file.bin", None).is_err());
+        assert!(state.pool.lock().unwrap().transfers.is_empty());
+        assert_eq!(state.pool.lock().unwrap().reserved_bytes, 0);
+    }
+
     use super::*;
     use crate::native_media::InlayEncodeFormat;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
