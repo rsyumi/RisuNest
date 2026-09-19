@@ -460,10 +460,16 @@ impl ConnectedRepositoryView<'_> {
 impl RepositoryView for ConnectedRepositoryView<'_> {
     fn roots<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
         Box::pin(async move {
-            let head = leases::control_request(cancel, control::read_head(
-                self.connected.provider.as_ref(), &self.connected.handle,
-                &self.connected.stored.descriptor, &self.connected.root_key, None, cancel,
-            )).await?.map(|observed| observed.document.state);
+            let head = if self.connected.stored.descriptor.publication_strategy.is_some() {
+                leases::control_request(cancel, control::read_head(
+                    self.connected.provider.as_ref(), &self.connected.handle,
+                    &self.connected.stored.descriptor, &self.connected.root_key, None, cancel,
+                )).await?.map(|observed| observed.document.state)
+            } else {
+                // Backup-only repositories have authenticated points, not a
+                // mutable synchronization head. Do not probe a fictitious one.
+                None
+            };
             let points = self.read_points(cancel).await?;
             let sources = self.bundle_sources(&points, cancel).await?;
             let decided = points.iter().map(|point| {

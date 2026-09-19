@@ -200,9 +200,9 @@ impl GithubReleases {
         self.decode(response, cancel).await
     }
 
-    /// Release listing is page numbered, so one tag costs a bounded scan. A scan
-    /// that reaches the bound reports absence, which keeps every caller on the
-    /// side that never reuses or overwrites an unseen release.
+    /// A bounded lookup reports absence only after an exhausted page. Reaching
+    /// the request budget leaves the result unknown, never safe to overwrite or
+    /// count as an already-deleted object.
     async fn find_release(
         &self,
         context: &Context,
@@ -215,10 +215,10 @@ impl GithubReleases {
                 return Ok(Some(found.id));
             }
             if releases.len() < api::RELEASE_PAGE_SIZE {
-                break;
+                return Ok(None);
             }
         }
-        Ok(None)
+        Err(ProviderError::new(ErrorKind::Transient))
     }
 
     async fn find_asset(
@@ -235,10 +235,10 @@ impl GithubReleases {
                 return Ok(Some(found));
             }
             if exhausted {
-                break;
+                return Ok(None);
             }
         }
-        Ok(None)
+        Err(ProviderError::new(ErrorKind::Transient))
     }
 
     async fn find_asset_by_id(
@@ -255,10 +255,10 @@ impl GithubReleases {
                 return Ok(Some(found));
             }
             if exhausted {
-                break;
+                return Ok(None);
             }
         }
-        Ok(None)
+        Err(ProviderError::new(ErrorKind::Transient))
     }
 
     /// True when the root already holds releases of this adapter. A scan that
@@ -812,14 +812,16 @@ impl Provider for GithubReleases {
                 parse_cursor(cursor)?;
             let mut objects = Vec::new();
             let mut next_cursor = None;
+            let mut exhausted_releases = false;
             let mut releases: Option<Vec<ReleaseView>> = None;
-            for step in 0..api::MAX_LIST_STEPS {
+            for _ in 0..api::MAX_LIST_STEPS {
                 if releases.is_none() {
                     releases = Some(self.releases_page(context, release_page, cancel).await?);
                 }
                 let page_length = releases.as_ref().map_or(0, Vec::len);
                 if release_index >= page_length {
                     if page_length < api::RELEASE_PAGE_SIZE {
+                        exhausted_releases = true;
                         break;
                     }
                     release_page += 1;
@@ -872,9 +874,9 @@ impl Provider for GithubReleases {
                 } else {
                     asset_page += 1;
                 }
-                if step + 1 == api::MAX_LIST_STEPS {
-                    next_cursor = Some(format!("{release_page}:{release_index}:{asset_page}:0"));
-                }
+            }
+            if !exhausted_releases && next_cursor.is_none() {
+                next_cursor = Some(format!("{release_page}:{release_index}:{asset_page}:{asset_index}"));
             }
             Ok(ObjectPage {
                 objects,

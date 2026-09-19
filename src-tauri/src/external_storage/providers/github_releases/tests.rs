@@ -151,6 +151,136 @@ fn has_header(record: &crate::external_storage::wire_fixture::WireRequest, name:
         .any(|(header, _)| header.eq_ignore_ascii_case(name))
 }
 
+fn existing_repository_replies() -> Vec<Reply> {
+    vec![
+        repository_reply(true),
+        reply(200, json!([release(7, &format!("{PREFIX}-d-0"))])),
+        reply(200, json!([asset(1, "descriptor-root", 4, None)])),
+    ]
+}
+
+#[test]
+fn bounded_lookups_do_not_report_unscanned_objects_as_absent() {
+    runtime().block_on(async {
+        for kind in ["release", "asset-name", "asset-id"] {
+            let pages = if kind == "release" { api::MAX_RELEASE_SCAN_PAGES } else { api::MAX_ASSET_SCAN_PAGES };
+            let replies = (0..pages).map(|page| {
+                let entries: Vec<_> = if kind == "release" {
+                    (0..api::RELEASE_PAGE_SIZE).map(|index| {
+                        release(1 + u64::from(page) * 1000 + index as u64, &format!("unrelated-{page}-{index}"))
+                    }).collect()
+                } else {
+                    (0..api::ASSET_PAGE_SIZE).map(|index| {
+                        asset(1 + u64::from(page) * 1000 + index as u64, &format!("pack-unrelated-{page}-{index}"), 4, None)
+                    }).collect()
+                };
+                reply(200, json!(entries))
+            }).collect();
+            let server = github_server(replies);
+            let test = dependencies();
+            let provider = super::GithubReleases { dependencies: test.dependencies };
+            let context = api::Context::new(&config(&server), zeroize::Zeroizing::new("synthetic-token".into())).unwrap();
+            let cancel = Cancellation::default();
+            let result = match kind {
+                "release" => provider.find_release(&context, "unseen-release", &cancel).await.map(|value| value.is_some()),
+                "asset-name" => provider.find_asset(&context, 7, "unseen-asset", &cancel).await.map(|value| value.is_some()),
+                _ => provider.find_asset_by_id(&context, 7, u64::MAX, &cancel).await.map(|value| value.is_some()),
+            };
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Transient, "{kind}");
+            assert_eq!(server.requests.lock().unwrap().len(), pages as usize);
+        }
+    });
+}
+
+#[test]
+fn discovery_returns_a_cursor_when_its_budget_ends_on_a_skipped_release_or_page() {
+    runtime().block_on(async {
+        for start in [0usize, 29] {
+            let tag = job_tag("retained-job", 0);
+            let first: Vec<_> = (0..30).map(|id| release(id + 100, "unrelated")).collect();
+            let second: Vec<_> = (0..30).map(|id| release(id + 200, "unrelated")).collect();
+            let mut third: Vec<_> = (0..30).map(|id| release(id + 300, "unrelated")).collect();
+            if start == 0 { third[2] = release(777, &tag); }
+            let resumed = if start == 0 { third.clone() } else { vec![release(777, &tag)] };
+            let mut replies = existing_repository_replies();
+            for page in [first, second, third, resumed] { replies.push(reply(200, json!(page))); }
+            replies.push(reply(200, json!([asset(999, &api::asset_name(ObjectRole::BackupBundle, "snapshot-retained"), 4, None)])));
+            if start == 0 { replies.push(reply(200, json!([]))); }
+            let server = github_server(replies);
+            let test = dependencies();
+            let provider = adapter(test.dependencies);
+            let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+            let cancel = Cancellation::default();
+            let cursor = format!("1:{start}:1:0");
+            let first = provider.list_objects(&handle, Collection::Snapshots, Some(&cursor), 100, &cancel).await.unwrap();
+            assert!(first.objects.is_empty());
+            let next = first.next_cursor.expect("A bounded scan has not exhausted the repository");
+            assert_ne!(next, cursor);
+            let resumed = provider.list_objects(&handle, Collection::Snapshots, Some(&next), 100, &cancel).await.unwrap();
+            assert_eq!(resumed.objects.len(), 1);
+            assert!(resumed.objects[0].complete);
+            assert!(resumed.next_cursor.is_none());
+        }
+    });
+}
+
+#[test]
+fn an_exhausted_asset_search_does_not_claim_a_successful_deletion() {
+    runtime().block_on(async {
+        let tag = job_tag("retained-job", 0);
+        let mut replies = existing_repository_replies();
+        replies.push(reply(200, release(777, &tag)));
+        for page in 0..api::MAX_ASSET_SCAN_PAGES {
+            replies.push(reply(200, json!((0..api::ASSET_PAGE_SIZE).map(|index| {
+                asset(1 + u64::from(page) * 1000 + index as u64, "pack-unrelated", 4, None)
+            }).collect::<Vec<_>>())));
+        }
+        let server = github_server(replies);
+        let test = dependencies();
+        let provider = super::GithubReleases { dependencies: test.dependencies };
+        let handle = open(&provider, &server, OpenMode::Existing).await.unwrap();
+        let locator = provider.context(&handle).unwrap().locator(&tag, 777, u64::MAX);
+        assert_eq!(provider.delete_object(&handle, &locator, &Cancellation::default()).await.unwrap_err().kind,
+            ErrorKind::Transient);
+        assert!(server.requests.lock().unwrap().iter().all(|request| method_of(request) == "GET"));
+    });
+}
+
+#[test]
+fn backup_only_cleanup_reads_points_without_requesting_an_unsupported_head() {
+    runtime().block_on(async {
+        use crate::external_storage::{cleanup, connection::RetentionPolicy, connection_commands::ConnectedRepository, connection_store::StoredConnection};
+        let mut replies = existing_repository_replies();
+        replies.push(reply(200, json!([])));
+        let server = github_server(replies);
+        let test = dependencies();
+        let provider = std::sync::Arc::new(super::GithubReleases { dependencies: test.dependencies.clone() });
+        let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+        let locator = provider.context(&handle).unwrap().locator(&format!("{PREFIX}-d-0"), 7, 1);
+        let connected = ConnectedRepository {
+            stored: StoredConnection {
+                id: "connection".into(), config: config(&server),
+                descriptor: risunest_external_storage_format::format::Descriptor::new("repository".into(), None).unwrap(),
+                descriptor_locator: locator, provider_repository_id: handle.repository_id.clone(),
+                credential_ref: SECRET.into(), root_key_ref: "synthetic-root-key".into(),
+                capabilities: super::capabilities(), created_at_ms: NOW_MS,
+                last_sync_at_ms: None, last_backup_at_ms: None, capture_policy: None, retention_policy: None,
+            },
+            provider, handle, dependencies: test.dependencies,
+            root_key: zeroize::Zeroizing::new([7; 32]),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let view = cleanup::ConnectedRepositoryView {
+            connected: &connected, writer_id: "writer", policy: RetentionPolicy::DEFAULT,
+            now_ms: NOW_MS, unfinished: vec![], cache_root: directory.path(),
+        };
+        let roots = cleanup::RepositoryView::roots(&view, &Cancellation::default()).await.unwrap();
+        assert!(roots.head.is_none());
+        assert!(roots.points.is_empty());
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
+    });
+}
+
 #[test]
 fn configuration_and_missing_secrets_are_refused_before_any_request() {
     runtime().block_on(async {
