@@ -5,6 +5,7 @@ use super::{
     journal::{validate_receipt, TransferJournal},
     transfer::{SpoolSink, SpoolSource},
 };
+use risunest_external_storage_format::{content_identity::hash, format::Descriptor};
 
 /// Reconcile answers identify an object, but not every provider supplies a
 /// verified SHA-256. In that case authenticate the bytes through a bounded
@@ -73,6 +74,27 @@ pub(crate) async fn upload(
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<ObjectReceipt> {
+    upload_inner(journal, object, provider, repository, cancel, true).await
+}
+
+pub(crate) async fn upload_inventory(
+    journal: &mut TransferJournal,
+    object: &str,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<ObjectReceipt> {
+    upload_inner(journal, object, provider, repository, cancel, false).await
+}
+
+async fn upload_inner(
+    journal: &mut TransferJournal,
+    object: &str,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+    recreate_missing: bool,
+) -> Result<ObjectReceipt> {
     cancel.check()?;
     let mut record = journal
         .record(object)?
@@ -93,10 +115,20 @@ pub(crate) async fn upload(
                     journal.complete(&record.intent, repository, &receipt)?;
                     return Ok(receipt);
                 }
+                if !recreate_missing {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
                 record.resume = None;
             }
             UploadResolution::Resumable(resume) => record.resume = Some(resume),
-            UploadResolution::RestartRequired => record.resume = None,
+            UploadResolution::RestartRequired => {
+                // An attempted registration may have been retired even when its
+                // creation response was lost before a local receipt was saved.
+                if !recreate_missing {
+                    return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                }
+                record.resume = None;
+            }
             UploadResolution::Conflict => {
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed));
             }
@@ -175,6 +207,67 @@ pub(crate) async fn upload(
             Err(original)
         }
     }
+}
+
+pub(crate) async fn upload_registered(
+    journal: &mut TransferJournal,
+    object: &str,
+    format_repository_id: &str,
+    root_key: &[u8; 32],
+    plaintext_length: u64,
+    plaintext_sha256: &str,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<ObjectReceipt> {
+    let descriptor = Descriptor::new(format_repository_id.to_owned(), None)
+        .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+    let record = journal
+        .record(object)?
+        .ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
+    if !matches!(
+        record.intent.role,
+        ObjectRole::Pack
+            | ObjectRole::Catalog
+            | ObjectRole::SyncState
+            | ObjectRole::BackupBundle
+            | ObjectRole::BackupPoint
+    ) {
+        return upload(journal, object, provider, repository, cancel).await;
+    }
+    let page_id = inventory_page_id(journal.job_id(), object, &record.intent.sha256);
+    let document = super::control::inventory_page_document(
+        &descriptor,
+        repository,
+        journal.job_id(),
+        &page_id,
+        &[super::control::InventoryRegistration {
+            intent: &record.intent,
+            plaintext_length,
+            plaintext_sha256,
+        }],
+    )?;
+    Box::pin(super::control::upload_inventory_page(
+        &descriptor,
+        root_key,
+        document,
+        journal,
+        provider,
+        repository,
+        cancel,
+    ))
+    .await?;
+    upload(journal, object, provider, repository, cancel).await
+}
+
+fn inventory_page_id(job_id: &str, object: &str, sha256: &str) -> String {
+    let mut identity = Vec::with_capacity(job_id.len() + object.len() + 66);
+    identity.extend_from_slice(job_id.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(object.as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(sha256.as_bytes());
+    hex::encode(hash(&identity))
 }
 
 #[cfg(test)]
@@ -476,5 +569,222 @@ mod tests {
             .unwrap()
             .receipt
             .is_none());
+    }
+
+    #[test]
+    fn inventory_registration_failure_sends_no_payload() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, intent) = prepare(root.path());
+            let provider = FakeProvider::new(false);
+            provider.fail_inventory_upload(ErrorKind::Unauthorized);
+            let error = upload_registered(
+                &mut journal,
+                &intent.object_id,
+                "format-repository",
+                &[7; 32],
+                intent.byte_length,
+                &intent.sha256,
+                &provider,
+                &fake::repository(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Unauthorized);
+            assert_eq!(provider.upload_attempts(&intent.object_id), 0);
+            assert!(!provider.holds(&intent.object_id));
+        });
+    }
+
+    #[test]
+    fn lost_inventory_response_is_resolved_before_payload_upload() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, intent) = prepare(root.path());
+            let provider = FakeProvider::new(false);
+            provider.state.lock().unwrap().lose_response = true;
+            upload_registered(
+                &mut journal,
+                &intent.object_id,
+                "format-repository",
+                &[7; 32],
+                intent.byte_length,
+                &intent.sha256,
+                &provider,
+                &fake::repository(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let page = format!(
+                "inventory-page-{}",
+                inventory_page_id(&identity().job_id, &intent.object_id, &intent.sha256)
+            );
+            assert!(provider.holds(&page));
+            assert!(provider.holds(&intent.object_id));
+            assert_eq!(provider.upload_attempts(&page), 1);
+            assert_eq!(provider.upload_attempts(&intent.object_id), 1);
+        });
+    }
+
+    #[test]
+    fn retired_inventory_coverage_makes_an_old_operation_non_resumable() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, intent) = prepare(root.path());
+            let provider = FakeProvider::new(false);
+            upload_registered(
+                &mut journal,
+                &intent.object_id,
+                "format-repository",
+                &[7; 32],
+                intent.byte_length,
+                &intent.sha256,
+                &provider,
+                &fake::repository(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let page = format!(
+                "inventory-page-{}",
+                inventory_page_id(&identity().job_id, &intent.object_id, &intent.sha256)
+            );
+            provider.forget(&page);
+            drop(journal);
+            let mut journal = TransferJournal::open(root.path(), identity()).unwrap();
+            let error = upload_registered(
+                &mut journal,
+                &intent.object_id,
+                "format-repository",
+                &[7; 32],
+                intent.byte_length,
+                &intent.sha256,
+                &provider,
+                &fake::repository(),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+            assert_eq!(provider.upload_attempts(&intent.object_id), 1);
+        });
+    }
+
+    #[test]
+    fn missing_inventory_with_a_lost_confirmation_cannot_be_recreated() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, intent) = prepare(root.path());
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let page_id = inventory_page_id(journal.job_id(), &intent.object_id, &intent.sha256);
+            let document = super::super::control::inventory_page_document(
+                &Descriptor::new("format-repository".into(), None).unwrap(),
+                &repository, journal.job_id(), &page_id,
+                &[super::super::control::InventoryRegistration {
+                    intent: &intent, plaintext_length: intent.byte_length,
+                    plaintext_sha256: &intent.sha256,
+                }],
+            ).unwrap();
+            super::super::control::upload_inventory_page(
+                &Descriptor::new("format-repository".into(), None).unwrap(),
+                &[7; 32], document, &mut journal, &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap();
+            let page_object = format!("inventory-page-{page_id}");
+            // Model a crash after remote creation but before recording its response.
+            journal.reopen_object(&page_object).unwrap();
+            assert!(journal.record(&page_object).unwrap().unwrap().attempted);
+            provider.forget(&page_object);
+            drop(journal);
+            let mut journal = TransferJournal::open(root.path(), identity()).unwrap();
+            let error = upload_registered(
+                &mut journal, &intent.object_id, "format-repository", &[7; 32],
+                intent.byte_length, &intent.sha256, &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+            assert_eq!(provider.upload_attempts(&page_object), 1);
+            assert_eq!(provider.upload_attempts(&intent.object_id), 0);
+        });
+    }
+
+    #[test]
+    fn inventory_growth_across_upload_cycles_and_retries_is_measured() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let cancel = Cancellation::default();
+            let mut payload_requests = 0;
+            let mut inventory_requests = 0;
+            for cycle in 0..3 {
+                let mut job = identity();
+                job.job_id = format!("cycle-{cycle}");
+                let directory = root.path().join(&job.job_id);
+                let mut journal = TransferJournal::open(&directory, job.clone()).unwrap();
+                for index in 0..32 {
+                    let bytes = format!("synthetic-{cycle}-{index}").into_bytes();
+                    let intent = ObjectIntent {
+                        repository_id: repository.repository_id.clone(),
+                        job_id: job.job_id.clone(),
+                        object_id: format!("pack-{cycle}-{index}"),
+                        role: ObjectRole::Pack,
+                        byte_length: bytes.len() as u64,
+                        sha256: risunest_sync_wire::hash(&bytes),
+                    };
+                    std::fs::write(journal.spool_path(&intent.object_id), &bytes).unwrap();
+                    journal.register(&intent).unwrap();
+                    for _ in 0..2 {
+                        upload_registered(
+                            &mut journal, &intent.object_id, "format-repository", &[7; 32],
+                            intent.byte_length, &intent.sha256, &provider, &repository, &cancel,
+                        ).await.unwrap();
+                    }
+                    payload_requests += provider.upload_attempts(&intent.object_id);
+                    inventory_requests += provider.upload_attempts(&format!("inventory-page-{}",
+                        inventory_page_id(&job.job_id, &intent.object_id, &intent.sha256)));
+                }
+            }
+            let state = provider.state.lock().unwrap();
+            let pages = state.objects.iter().filter(|(id, _)| id.starts_with("inventory-page-"))
+                .map(|(_, (bytes, _))| bytes.len()).collect::<Vec<_>>();
+            assert_eq!(pages.len(), 96);
+            assert_eq!(payload_requests, 96);
+            assert_eq!(inventory_requests, 96);
+            let metadata_bytes: usize = pages.iter().sum();
+            assert!(metadata_bytes < 96 * 2048);
+            eprintln!("3 cycles, 96 payloads, 96 retries: {} inventory pages, {metadata_bytes} encrypted metadata bytes, {payload_requests} payload creates, {inventory_requests} inventory creates", pages.len());
+        });
+    }
+
+    #[test]
+    fn one_object_registration_cost_is_explicit_for_a_representative_cycle() {
+        let representative_objects = 10_000usize;
+        let root = tempfile::tempdir().unwrap();
+        let (_, intent) = prepare(root.path());
+        let descriptor = Descriptor::new("format-repository".into(), None).unwrap();
+        let document = super::super::control::inventory_page_document(
+            &descriptor,
+            &fake::repository(),
+            &identity().job_id,
+            "representative-page",
+            &[super::super::control::InventoryRegistration {
+                intent: &intent,
+                plaintext_length: intent.byte_length,
+                plaintext_sha256: &intent.sha256,
+            }],
+        )
+        .unwrap();
+        let page_bytes = document
+            .encode(risunest_external_storage_format::control::MAX_CONTROL_BYTES)
+            .unwrap()
+            .len();
+
+        assert_eq!(representative_objects, 10_000);
+        assert_eq!(representative_objects * 2, 20_000);
+        assert!(page_bytes * representative_objects < 16 * 1024 * 1024);
     }
 }

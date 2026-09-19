@@ -135,6 +135,19 @@ describe('external storage connection request', () => {
         ).map(item => item.id)).toEqual(['zzz', 'mmm', 'aaa'])
     })
 
+    it('keeps separate point rows and hides their weaker raw recovery candidate', () => {
+        const base = {
+            createdAtMs: '1' as const, logicalRevision: '1' as const,
+            pinned: false, complete: true, verified: true,
+            includedSections: [], sameDevice: false,
+        }
+        const first = { ...base, id: 'point-a', snapshotId: 'snapshot', kind: 'backup-point' as const }
+        const second = { ...base, id: 'point-b', snapshotId: 'snapshot', kind: 'backup-point' as const }
+        const recovery = { ...base, id: 'snapshot', snapshotId: 'snapshot', kind: 'recovery-candidate' as const }
+        expect(mergeExternalHistoryItems([first], [second, recovery]).map(item => item.id))
+            .toEqual(['point-a', 'point-b'])
+    })
+
     it('keeps only the entries a restore can read back', () => {
         const base = {
             kind: 'recovery-candidate' as const, createdAtMs: '1' as const,

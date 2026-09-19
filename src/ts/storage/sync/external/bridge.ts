@@ -6,6 +6,7 @@ import type {
     ExternalConnectionResult,
     ExternalAuthorizationPending,
     ExternalHistoryPage,
+    ExternalHistoryDeletePreparation,
     ExternalJobSummary,
     ExternalReceivedApplicationResult,
     ExternalProviderDescriptor,
@@ -185,6 +186,16 @@ export class ExternalStorageBridge {
     listHistory(connectionId: string, cursor?: string): Promise<ExternalHistoryPage> {
         return this.native('external_storage_list_history', {
             request: { connectionId, ...(cursor ? { cursor } : {}) },
+        })
+    }
+
+    prepareHistoryDelete(
+        connectionId: string,
+        pointId: string,
+        pointObservation: string,
+    ): Promise<ExternalHistoryDeletePreparation> {
+        return this.native('external_storage_prepare_history_delete', {
+            request: { connectionId, pointId, pointObservation },
         })
     }
 

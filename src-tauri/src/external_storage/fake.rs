@@ -97,6 +97,7 @@ pub(super) struct FakeState {
     upload_locators: BTreeMap<String, String>,
     reconcile_attempts: Vec<String>,
     scripted_pages: Vec<(Collection, Result<ObjectPage>)>,
+    inventory_upload_failure: Option<ErrorKind>,
 }
 pub(crate) struct FakeProvider {
     pub(super) state: Mutex<FakeState>,
@@ -186,6 +187,9 @@ impl FakeProvider {
     }
     pub(crate) fn upload_attempts(&self, object: &str) -> usize {
         self.state.lock().unwrap().upload_attempts.iter().filter(|id| id.as_str() == object).count()
+    }
+    pub(crate) fn fail_inventory_upload(&self, kind: ErrorKind) {
+        self.state.lock().unwrap().inventory_upload_failure = Some(kind);
     }
     pub(crate) fn set_upload_locator(&self, object_id: &str, locator: &str) {
         self.state.lock().unwrap().upload_locators.insert(object_id.into(), locator.into());
@@ -370,6 +374,11 @@ impl Provider for FakeProvider {
             c.check()?;
             intent.validate(r)?;
             self.state.lock().unwrap().upload_attempts.push(intent.object_id.clone());
+            if intent.role == ObjectRole::InventoryPage {
+                if let Some(kind) = self.state.lock().unwrap().inventory_upload_failure.take() {
+                    return Err(ProviderError::new(kind));
+                }
+            }
             if intent.byte_length > 1024 * 1024 || source.byte_length() != intent.byte_length {
                 return Err(ProviderError::new(ErrorKind::FileTooLarge));
             }
@@ -524,6 +533,7 @@ impl Provider for FakeProvider {
             let roles: &[ObjectRole] = match collection {
                 Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
                 Collection::BackupPoints => &[ObjectRole::BackupPoint],
+                Collection::InventoryPages => &[ObjectRole::InventoryPage],
                 Collection::Descriptors => &[ObjectRole::Descriptor],
                 Collection::Leases => &[ObjectRole::Lease],
             };

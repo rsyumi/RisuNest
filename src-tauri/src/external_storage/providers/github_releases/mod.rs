@@ -970,6 +970,44 @@ impl Provider for GithubReleases {
         })
     }
 
+    fn lookup_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        intent: &'a ObjectIntent,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = self.context(repository)?;
+            intent.validate(repository)?;
+            if !api::is_safe_name(&intent.object_id, 180) {
+                return Err(corrupt());
+            }
+            let batch = api::batch_key(intent.role, &intent.job_id);
+            let name = api::asset_name(intent.role, &intent.object_id);
+            let first_tag = context.tag(&batch, 0);
+            let prefix = first_tag.strip_suffix('0').ok_or_else(corrupt)?;
+            let mut found = None;
+            for page in 1..=api::MAX_RELEASE_SCAN_PAGES {
+                let releases = self.releases_page(context, page, cancel).await?;
+                let complete = releases.len() < api::RELEASE_PAGE_SIZE;
+                for release in releases {
+                    let Some(sequence) = release.tag_name.strip_prefix(prefix) else { continue; };
+                    if sequence.parse::<u32>().is_err() { continue; }
+                    let Some(asset) = self.find_asset(context, release.id, &name, cancel).await? else {
+                        continue;
+                    };
+                    if !asset.uploaded() || !asset.matches(intent) || found.is_some() {
+                        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+                    }
+                    found = Some(Self::receipt(context, &release.tag_name, release.id, &asset, intent));
+                }
+                if complete { return Ok(found); }
+            }
+            Err(ProviderError::new(ErrorKind::Transient))
+        })
+    }
+
     fn reconcile_upload<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

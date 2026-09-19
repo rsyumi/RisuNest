@@ -130,6 +130,28 @@ function succeeded(connectionId: string, revision: string): ExternalJobSummary {
 }
 
 describe('external storage production integration', () => {
+    it('reports deferred history deletion without polling a stopped manual job forever', async () => {
+        const { installExternalStorageProduction, requestExternalStorageDeleteHistory } = await import('./production')
+        const dispose = await installExternalStorageProduction()
+        mocks.bridge.startJob.mockResolvedValue({
+            ...succeeded('old-sync', '1'), kind: 'delete-history', state: 'waiting',
+            error: { code: 'Transient', message: 'Deletion deferred' },
+        })
+        await expect(requestExternalStorageDeleteHistory('old-sync', {
+            id: 'point', pointId: 'point', pointObservation: 'authenticated-observation',
+            deletable: true, snapshotId: 'snapshot', kind: 'backup-point',
+            createdAtMs: '1', logicalRevision: '1', pinned: false,
+            complete: true, verified: true, includedSections: [], sameDevice: true,
+        }, false, false)).rejects.toThrow('Deletion deferred')
+        expect(mocks.bridge.startJob).toHaveBeenCalledWith(expect.objectContaining({
+            kind: 'delete-history', pointId: 'point',
+            pointObservation: 'authenticated-observation',
+            confirmOtherDevice: false, confirmLastRetained: false,
+        }))
+        expect(mocks.bridge.getJob).not.toHaveBeenCalled()
+        dispose()
+    })
+
     beforeEach(() => {
         vi.resetModules()
         vi.clearAllMocks()

@@ -13,6 +13,7 @@ pub(crate) enum JobKind {
     Sync,
     Restore,
     PinHistory,
+    DeleteHistory,
     ResolveConflict,
     Cleanup,
 }
@@ -22,6 +23,10 @@ pub(crate) struct StartJobRequest {
     pub connection_id: String,
     pub kind: JobKind,
     pub snapshot_id: Option<String>,
+    pub point_id: Option<String>,
+    pub point_observation: Option<String>,
+    pub confirm_other_device: Option<bool>,
+    pub confirm_last_retained: Option<bool>,
     pub conflict_id: Option<String>,
     pub choice: Option<String>,
     pub restore_areas: Option<Vec<String>>,
@@ -43,6 +48,10 @@ impl StartJobRequest {
         // A removal is described entirely by the connection it runs on.
         if self.kind == JobKind::Cleanup
             && (self.snapshot_id.is_some()
+                || self.point_id.is_some()
+                || self.point_observation.is_some()
+                || self.confirm_other_device.is_some()
+                || self.confirm_last_retained.is_some()
                 || self.conflict_id.is_some()
                 || self.choice.is_some()
                 || self.restore_areas.is_some()
@@ -50,11 +59,29 @@ impl StartJobRequest {
         {
             return Err(ProviderError::new(ErrorKind::Corrupt));
         }
-        if !valid(&self.connection_id)
-            || [&self.snapshot_id, &self.conflict_id, &self.session_id]
+        let delete_history = self.kind == JobKind::DeleteHistory;
+        if delete_history
+            != (self.point_id.is_some()
+                && self.point_observation.is_some()
+                && self.confirm_other_device.is_some()
+                && self.confirm_last_retained.is_some())
+            || (!delete_history
+                && (self.point_id.is_some()
+                    || self.point_observation.is_some()
+                    || self.confirm_other_device.is_some()
+                    || self.confirm_last_retained.is_some()))
+            || (delete_history
+                && (self.snapshot_id.is_some()
+                    || self.conflict_id.is_some()
+                    || self.choice.is_some()
+                    || self.restore_areas.is_some()
+                    || self.target_revision.is_some()))
+            || !valid(&self.connection_id)
+            || [&self.snapshot_id, &self.point_id, &self.conflict_id, &self.session_id]
                 .into_iter()
                 .flatten()
                 .any(|s| !valid(s))
+            || self.point_observation.as_ref().is_some_and(|s| s.is_empty() || s.len() > 256 * 1024 || s.contains('\0'))
             || self
                 .target_revision
                 .as_ref()
@@ -480,6 +507,41 @@ mod tests {
         input.session_id = Some("session".into());
         input.reason = Some("automatic".into());
         assert!(input.validate().is_ok());
+    }
+
+    #[test]
+    fn selected_history_deletion_requires_one_exact_durable_observation_and_confirmations() {
+        let observation = serde_json::to_string(&risunest_external_storage_format::snapshot::StoredObject {
+            header: risunest_external_storage_format::snapshot::PublicObjectHeader::new(
+                "repository".into(),
+                "backup-point-point".into(),
+                risunest_external_storage_format::snapshot::ObjectRole::BackupPoint,
+                1,
+            ).unwrap(),
+            locator: risunest_external_storage_format::snapshot::WireLocator {
+                connection_identity: "account/root".into(),
+                collection: Some("points".into()),
+                object: "opaque".into(),
+            },
+            ciphertext_length: 0,
+            ciphertext_sha256: [1; 32],
+            plaintext_length: 1,
+            plaintext_sha256: [2; 32],
+        }).unwrap();
+        let mut input: StartJobRequest = serde_json::from_value(json!({
+            "connectionId":"synthetic",
+            "kind":"delete-history",
+            "pointId":"point",
+            "pointObservation":observation,
+            "confirmOtherDevice":false,
+            "confirmLastRetained":true
+        })).unwrap();
+        assert!(input.validate().is_ok());
+        input.point_observation = None;
+        assert!(input.validate().is_err());
+        input.point_observation = Some("{}".into());
+        input.snapshot_id = Some("snapshot".into());
+        assert!(input.validate().is_err());
     }
 
     #[test]

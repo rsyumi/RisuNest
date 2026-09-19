@@ -495,6 +495,12 @@ fn same_requested_operation(existing: &StartJobRequest, incoming: &StartJobReque
                 && existing.target_revision == incoming.target_revision
         }
         JobKind::PinHistory => existing.snapshot_id == incoming.snapshot_id,
+        JobKind::DeleteHistory => {
+            existing.point_id == incoming.point_id
+                && existing.point_observation == incoming.point_observation
+                && existing.confirm_other_device == incoming.confirm_other_device
+                && existing.confirm_last_retained == incoming.confirm_last_retained
+        }
         JobKind::ResolveConflict => {
             existing.conflict_id == incoming.conflict_id && existing.choice == incoming.choice
         }
@@ -1203,6 +1209,9 @@ async fn run_job(app: &AppHandle, id: &str, cancel: &Cancellation) -> Result<Val
         }
         JobKind::PinHistory => {
             super::history_jobs::run_pin_history(app, &connected, &job, cancel).await
+        }
+        JobKind::DeleteHistory => {
+            super::history_deletion::run_delete_history(app, &connected, &job, cancel).await
         }
         JobKind::Cleanup => run_cleanup(app, &connected, &job, cancel).await,
     }

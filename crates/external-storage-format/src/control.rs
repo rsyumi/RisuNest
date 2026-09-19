@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 const HEAD_SCHEMA: &str = "risunest.external-head/v2";
 const POINT_SCHEMA: &str = "risunest.external-backup-point/v1";
 const BUNDLE_SCHEMA: &str = "risunest.external-backup-bundle/v1";
+const INVENTORY_SCHEMA: &str = "risunest.external-inventory-page/v1";
 const LEASE_SCHEMA: &str = "risunest.external-lease/v1";
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
+pub const MAX_INVENTORY_OBJECTS: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -291,6 +293,131 @@ impl BackupBundleDocument {
         value.validate()?;
         if value.encode(max_bytes)? != bytes {
             return Err(FormatError("non-canonical-backup-bundle"));
+        }
+        Ok(value)
+    }
+}
+
+/// The immutable intent for one payload that may exist remotely. It contains
+/// no upload credential or resumable-session secret.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InventoryEntry {
+    pub object_id: String,
+    pub role: ObjectRole,
+    pub ciphertext_length: u64,
+    pub ciphertext_sha256: [u8; 32],
+    pub plaintext_length: u64,
+    pub plaintext_sha256: [u8; 32],
+}
+
+impl InventoryEntry {
+    pub fn new(
+        object_id: String,
+        role: ObjectRole,
+        ciphertext_length: u64,
+        ciphertext_sha256: [u8; 32],
+        plaintext_length: u64,
+        plaintext_sha256: [u8; 32],
+    ) -> Result<Self> {
+        let value = Self {
+            object_id,
+            role,
+            ciphertext_length,
+            ciphertext_sha256,
+            plaintext_length,
+            plaintext_sha256,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.object_id.is_empty()
+            || self.object_id.len() > 8192
+            || self.object_id.contains('\0')
+            || self.ciphertext_length == 0
+            || !matches!(
+                self.role,
+                ObjectRole::Pack
+                    | ObjectRole::Catalog
+                    | ObjectRole::SyncState
+                    | ObjectRole::BackupBundle
+                    | ObjectRole::BackupPoint
+            )
+        {
+            return Err(FormatError("invalid-inventory-entry"));
+        }
+        Ok(())
+    }
+}
+
+/// An independently enumerable registration for one operation batch. Entries
+/// are sorted by object identity so the encrypted body has one canonical form.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InventoryPageDocument {
+    pub schema: String,
+    pub repository_id: String,
+    pub operation_id: String,
+    pub page_id: String,
+    pub objects: Vec<InventoryEntry>,
+}
+
+impl InventoryPageDocument {
+    pub fn new(
+        repository_id: String,
+        operation_id: String,
+        page_id: String,
+        objects: Vec<InventoryEntry>,
+    ) -> Result<Self> {
+        let value = Self {
+            schema: INVENTORY_SCHEMA.into(),
+            repository_id,
+            operation_id,
+            page_id,
+            objects,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != INVENTORY_SCHEMA
+            || self.repository_id.is_empty()
+            || self.repository_id.len() > 128
+            || self.operation_id.is_empty()
+            || self.operation_id.len() > 1024
+            || self.operation_id.contains('\0')
+            || self.page_id.is_empty()
+            || self.page_id.len() > 1024
+            || self.page_id.contains('\0')
+            || self.objects.is_empty()
+            || self.objects.len() > MAX_INVENTORY_OBJECTS
+        {
+            return Err(FormatError("invalid-inventory-page"));
+        }
+        let mut previous: Option<&str> = None;
+        for object in &self.objects {
+            object.validate()?;
+            if previous.is_some_and(|value| value >= object.object_id.as_str()) {
+                return Err(FormatError("invalid-inventory-order"));
+            }
+            previous = Some(&object.object_id);
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        self.validate()?;
+        encode(self, max_bytes, "invalid-inventory-page")
+    }
+
+    pub fn decode(bytes: &[u8], max_bytes: usize) -> Result<Self> {
+        let value: Self = decode(bytes, max_bytes, "invalid-inventory-page")?;
+        value.validate()?;
+        if value.encode(max_bytes)? != bytes {
+            return Err(FormatError("non-canonical-inventory-page"));
         }
         Ok(value)
     }
@@ -866,5 +993,81 @@ mod tests {
             MAX_CONTROL_BYTES
         )
         .is_err());
+    }
+
+    #[test]
+    fn inventory_pages_are_bounded_canonical_operation_records() {
+        let entries = vec![
+            InventoryEntry::new(
+                "catalog-a".into(), ObjectRole::Catalog, 41, [1; 32], 21, [3; 32],
+            )
+            .unwrap(),
+            InventoryEntry::new(
+                "pack-b".into(), ObjectRole::Pack, 42, [2; 32], 22, [4; 32],
+            )
+            .unwrap(),
+        ];
+        let page = InventoryPageDocument::new(
+            "repository".into(),
+            "operation".into(),
+            "page-0".into(),
+            entries,
+        )
+        .unwrap();
+        let encoded = page.encode(MAX_CONTROL_BYTES).unwrap();
+        assert_eq!(
+            InventoryPageDocument::decode(&encoded, MAX_CONTROL_BYTES).unwrap(),
+            page
+        );
+
+        let mut duplicate = page.clone();
+        duplicate.objects.push(duplicate.objects[0].clone());
+        assert!(duplicate.validate().is_err());
+        assert!(InventoryEntry::new(
+            "lease".into(),
+            ObjectRole::Lease,
+            1,
+            [3; 32],
+            1,
+            [4; 32],
+        )
+        .is_err());
+        assert!(InventoryPageDocument::new(
+            "repository".into(),
+            "operation".into(),
+            "page-0".into(),
+            (0..=MAX_INVENTORY_OBJECTS)
+                .map(|index| {
+                    InventoryEntry::new(
+                        format!("pack-{index:04}"),
+                        ObjectRole::Pack,
+                        1,
+                        [4; 32],
+                        1,
+                        [5; 32],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        )
+        .is_err());
+
+        let maximum = InventoryPageDocument::new(
+            "repository".into(),
+            "operation".into(),
+            "page-maximum".into(),
+            (0..MAX_INVENTORY_OBJECTS)
+                .map(|index| InventoryEntry::new(
+                    format!("pack-{index:04}"), ObjectRole::Pack,
+                    64 * 1024 * 1024, [4; 32], 64 * 1024 * 1024, [5; 32],
+                ).unwrap())
+                .collect(),
+        ).unwrap();
+        let maximum_bytes = maximum.encode(MAX_CONTROL_BYTES).unwrap().len();
+        assert!(maximum_bytes <= MAX_CONTROL_BYTES);
+        let wire_capacity_objects = 10_000usize;
+        let full_pages = wire_capacity_objects.div_ceil(MAX_INVENTORY_OBJECTS);
+        assert_eq!(full_pages, 79);
+        assert!(maximum_bytes * full_pages < 5 * 1024 * 1024);
     }
 }

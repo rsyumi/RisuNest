@@ -26,6 +26,7 @@ import {
 import type {
     DecimalString,
     ExternalJobSummary,
+    ExternalHistoryItem,
     ExternalRestoreArea,
     ExternalStorageState,
 } from './types'
@@ -305,6 +306,43 @@ export async function requestExternalStorageNow(
         kind,
         String(token.revision) as DecimalString,
     )
+}
+
+export async function requestExternalStorageDeleteHistory(
+    connectionId: string,
+    item: ExternalHistoryItem,
+    confirmOtherDevice: boolean,
+    confirmLastRetained: boolean,
+): Promise<ExternalJobSummary> {
+    assertNoPendingApplication()
+    if (!item.pointId || !item.pointObservation || !item.deletable) {
+        throw new Error('The selected history item cannot be deleted')
+    }
+    const current = runtime
+    if (!current) throw new Error('External storage production is not installed')
+    let job = await getExternalStorageBridge().startJob({
+        connectionId,
+        kind: 'delete-history',
+        pointId: item.pointId,
+        pointObservation: item.pointObservation,
+        confirmOtherDevice,
+        confirmLastRetained,
+        reason: 'manual',
+        session: current.session.kind,
+        sessionId: current.session.id,
+    })
+    while (true) {
+        if (job.state === 'succeeded') break
+        if (['failed', 'cancelled', 'uncertain', 'conflict', 'waiting'].includes(job.state)) {
+            throw restoreFailure(job)
+        }
+        await new Promise(resolve => setTimeout(resolve, 500))
+        job = await getExternalStorageBridge().getJob(job.id)
+    }
+    const state = await getExternalStorageBridge().getState()
+    current.state = state
+    current.controller.replaceState(state)
+    return job
 }
 
 /**

@@ -14,6 +14,7 @@
         requestExternalConflictRestore,
         requestExternalStorageResolveConflict,
         requestExternalStorageRestore,
+        requestExternalStorageDeleteHistory,
     } from 'src/ts/storage/sync/external/production'
     import type {
         ExternalConflictSummary,
@@ -80,7 +81,7 @@
         const sections = externalRestorableSections(item)
         if (sections.length === 0) {
             void runJob(connection, 'restore', {
-                snapshotId: item.id,
+                snapshotId: item.snapshotId ?? item.id,
                 restoreAreas: externalRestoreAreas(item, []),
             })
             return
@@ -193,6 +194,42 @@
                     ...details,
                 })
             }
+            await refresh(true)
+            schedulePoll()
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
+        } finally {
+            busy = false
+        }
+    }
+
+    async function deleteHistory(
+        connection: ExternalConnectionSummary,
+        item: ExternalHistoryItem,
+    ): Promise<void> {
+        if (!item.pointId || !item.pointObservation || !item.deletable) return
+        busy = true
+        try {
+            const preparation = await bridge.prepareHistoryDelete(
+                connection.id,
+                item.pointId,
+                item.pointObservation,
+            )
+            if (!preparation.sameDevice
+                && !(await alertConfirm(strings.deleteOtherDeviceConfirm))) return
+            if (preparation.lastRetained
+                && !(await alertConfirm(strings.deleteLastRetainedConfirm))) return
+            if (preparation.sameDevice && !preparation.lastRetained
+                && !(await alertConfirm(strings.deleteHistoryConfirm))) return
+            const operation = requestExternalStorageDeleteHistory(
+                connection.id,
+                item,
+                !preparation.sameDevice,
+                preparation.lastRetained,
+            )
+            schedulePoll(true)
+            await operation
+            await loadHistory(connection, false)
             await refresh(true)
             schedulePoll()
         } catch (reason) {
@@ -602,7 +639,7 @@
 
                 <div class="actions">
                     {#if job && job.state === 'waiting' && job.error?.action === 'retry' && (job.kind === 'backup' || job.kind === 'sync')}
-                        <SettingButton disabled={busy} onclick={() => runJob(connection, job.kind)}>{strings.retryAction}</SettingButton>
+                        <SettingButton disabled={busy} onclick={() => runJob(connection, job.kind === 'backup' ? 'backup' : 'sync')}>{strings.retryAction}</SettingButton>
                     {/if}
                     <SettingButton disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'backup')}>{strings.runBackup}</SettingButton>
                     {#if connection.purpose === 'sync'}<SettingButton disabled={busy || (job && externalJobIsActive(job))} onclick={() => runJob(connection, 'sync')}>{strings.runSync}</SettingButton>{/if}
@@ -624,9 +661,10 @@
                                     <span>{historyLine(item)}</span>
                                     <span class="item-actions">
                                         <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => beginRestore(connection, item)}>{strings.restore}</SettingButton>
-                                        <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => exportSnapshot(connection.id, item.id)}>{strings.download}</SettingButton>
+                                        <SettingButton variant="secondary" disabled={!item.complete || !item.verified} onclick={() => exportSnapshot(connection.id, item.snapshotId ?? item.id)}>{strings.download}</SettingButton>
                                         {#if item.pinned}<SettingButton variant="secondary" disabled>{strings.pinned}</SettingButton>
-                                        {:else}<SettingButton variant="secondary" onclick={() => runJob(connection, 'pin-history', { snapshotId: item.id })}>{strings.pin}</SettingButton>{/if}
+                                        {:else}<SettingButton variant="secondary" onclick={() => runJob(connection, 'pin-history', { snapshotId: item.snapshotId ?? item.id })}>{strings.pin}</SettingButton>{/if}
+                                        {#if item.deletable}<SettingButton variant="secondary" disabled={busy} onclick={() => deleteHistory(connection, item)}>{strings.deleteHistory}</SettingButton>{/if}
                                     </span>
                                 </div>
                                 {#if restoreScope && restoreScope.id === item.id}
@@ -639,7 +677,7 @@
                                             <p class="policy-note">{strings[sectionHelp[section]]}</p>
                                         {/each}
                                         <div class="actions">
-                                            <SettingButton disabled={busy} onclick={() => runJob(connection, 'restore', { snapshotId: item.id, restoreAreas: externalRestoreAreas(item, chosen) })}>{strings.restore}</SettingButton>
+                                            <SettingButton disabled={busy} onclick={() => runJob(connection, 'restore', { snapshotId: item.snapshotId ?? item.id, restoreAreas: externalRestoreAreas(item, chosen) })}>{strings.restore}</SettingButton>
                                             <SettingButton variant="secondary" disabled={busy} onclick={() => { restoreScope = null }}>{strings.cancel}</SettingButton>
                                         </div>
                                     </div>

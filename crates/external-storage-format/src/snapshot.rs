@@ -31,6 +31,7 @@ pub enum ObjectRole {
     SyncState,
     BackupBundle,
     BackupPoint,
+    InventoryPage,
     Lease,
     Head,
 }

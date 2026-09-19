@@ -162,6 +162,7 @@ export type ExternalJobKind =
     | 'sync'
     | 'restore'
     | 'pin-history'
+    | 'delete-history'
     | 'cleanup'
     | 'resolve-conflict'
 
@@ -177,6 +178,10 @@ export interface StartExternalJobRequest {
     connectionId: string
     kind: ExternalJobKind
     snapshotId?: string
+    pointId?: string
+    pointObservation?: string
+    confirmOtherDevice?: boolean
+    confirmLastRetained?: boolean
     conflictId?: string
     choice?: 'local' | 'remote'
     restoreAreas?: ExternalRestoreArea[]
@@ -241,6 +246,10 @@ export interface ExternalStorageState {
 
 export interface ExternalHistoryItem {
     id: string
+    snapshotId?: string
+    pointId?: string
+    pointObservation?: string
+    deletable?: boolean
     kind: 'snapshot' | 'backup-point' | 'conflict' | 'recovery-candidate'
     createdAtMs: DecimalString
     logicalRevision: DecimalString
@@ -254,6 +263,11 @@ export interface ExternalHistoryItem {
     sameDevice: boolean
     deviceName?: string
     warning?: string
+}
+
+export interface ExternalHistoryDeletePreparation {
+    sameDevice: boolean
+    lastRetained: boolean
 }
 
 export interface ExternalHistoryPage {

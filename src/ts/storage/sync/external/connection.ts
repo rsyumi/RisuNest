@@ -100,10 +100,16 @@ export function mergeExternalHistoryItems(
                 : item.kind,
         })
     }
-    return [...merged.values()].sort((left, right) => {
+    const retainedSnapshots = new Set([...merged.values()]
+        .filter(item => item.kind === 'backup-point' || item.kind === 'conflict')
+        .map(item => item.snapshotId ?? item.id))
+    return [...merged.values()]
+        .filter(item => item.kind !== 'recovery-candidate'
+            || !retainedSnapshots.has(item.snapshotId ?? item.id))
+        .sort((left, right) => {
         const difference = Number(right.createdAtMs) - Number(left.createdAtMs)
         return Number.isFinite(difference) ? difference : 0
-    })
+        })
 }
 
 /** History entries a restore can actually read back. */

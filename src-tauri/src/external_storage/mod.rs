@@ -18,6 +18,7 @@ pub(crate) mod durable_quota;
 pub(crate) mod fake;
 pub(crate) mod gc_store;
 pub(crate) mod history;
+pub(crate) mod history_deletion;
 pub(crate) mod history_jobs;
 pub(crate) mod http;
 #[cfg(test)]

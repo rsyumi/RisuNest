@@ -244,7 +244,7 @@ pub(crate) async fn verify_publication(
         }
     }
     let Some(root) = revalidate_cached_object(
-        &completed.reference, &mut cache, journal, provider, repository, cancel,
+        &completed.reference, &mut cache, journal, root_key, provider, repository, cancel,
     ).await? else {
         return Ok(PublicationReadiness::Repackage);
     };
@@ -262,6 +262,7 @@ pub(crate) fn wire_role(role: ObjectRole) -> Result<wire::ObjectRole> {
         ObjectRole::SyncState => Ok(wire::ObjectRole::SyncState),
         ObjectRole::BackupBundle => Ok(wire::ObjectRole::BackupBundle),
         ObjectRole::BackupPoint => Ok(wire::ObjectRole::BackupPoint),
+        ObjectRole::InventoryPage => Ok(wire::ObjectRole::InventoryPage),
         ObjectRole::Descriptor => Ok(wire::ObjectRole::Descriptor),
         ObjectRole::Lease => Ok(wire::ObjectRole::Lease),
     }
@@ -273,6 +274,7 @@ pub(crate) fn native_role(role: wire::ObjectRole) -> Result<ObjectRole> {
         wire::ObjectRole::SyncState => Ok(ObjectRole::SyncState),
         wire::ObjectRole::BackupBundle => Ok(ObjectRole::BackupBundle),
         wire::ObjectRole::BackupPoint => Ok(ObjectRole::BackupPoint),
+        wire::ObjectRole::InventoryPage => Ok(ObjectRole::InventoryPage),
         wire::ObjectRole::Descriptor => Ok(ObjectRole::Descriptor),
         wire::ObjectRole::Lease => Ok(ObjectRole::Lease),
         wire::ObjectRole::Head => Err(corrupt("head is not an immutable snapshot object")),
@@ -534,17 +536,22 @@ async fn revalidate_cached_object(
     value: &RemoteObject,
     cache: &mut PackageCache,
     journal: &mut TransferJournal,
+    root_key: &[u8; 32],
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
 ) -> Result<Option<RemoteObject>> {
-    revalidate_cached_object_at(value, cache, journal, provider, repository, cancel, None).await
+    revalidate_cached_object_at(
+        value, cache, journal, root_key, provider, repository, cancel, None,
+    )
+    .await
 }
 
 async fn revalidate_cached_object_at(
     value: &RemoteObject,
     cache: &mut PackageCache,
     journal: &mut TransferJournal,
+    root_key: &[u8; 32],
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
@@ -602,7 +609,18 @@ async fn revalidate_cached_object_at(
                 cache.forget_object(&value.repository_id, repository, &value.object_id)?;
                 return Ok(None);
             }
-            let mut receipt = transfer_job::upload(journal, &value.object_id, provider, repository, cancel).await?;
+            let mut receipt = transfer_job::upload_registered(
+                journal,
+                &value.object_id,
+                &value.repository_id,
+                root_key,
+                value.plaintext_length,
+                &value.plaintext_sha256,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?;
             if output.is_some() {
                 receipt.checksum = None;
                 receipt = transfer_job::verify_remote_receipt_at(
@@ -662,7 +680,7 @@ async fn revalidate_cached_catalog(
         let decoded = journal.verification.catalogs.get(&key).cloned();
         let output = (object.role == ObjectRole::Catalog && decoded.is_none()).then_some(path.as_path());
         let Some(object) = revalidate_cached_object_at(
-            &object, cache, journal, provider, repository, cancel, output,
+            &object, cache, journal, root_key, provider, repository, cancel, output,
         ).await? else {
             return Ok(None);
         };
@@ -986,7 +1004,17 @@ async fn build_entries(
         )? {
             let mut exists = true;
             for pack in &mut cached.packs {
-                match revalidate_cached_object(pack, cache, journal, provider, repository, cancel).await? {
+                match revalidate_cached_object(
+                    pack,
+                    cache,
+                    journal,
+                    root_key,
+                    provider,
+                    repository,
+                    cancel,
+                )
+                .await?
+                {
                     Some(current) => *pack = current,
                     None => { exists = false; break; }
                 }
@@ -1037,6 +1065,7 @@ async fn build_entries(
             id,
             ObjectRole::Pack,
             format_repository_id,
+            root_key,
             &data_key,
             limits,
             cache,
@@ -1216,6 +1245,7 @@ async fn upload_plain_object(
     object_id: String,
     role: ObjectRole,
     format_repository_id: &str,
+    root_key: &[u8; 32],
     key: &[u8; 32],
     limits: PackageLimits,
     cache: &mut PackageCache,
@@ -1238,7 +1268,7 @@ async fn upload_plain_object(
             return Err(corrupt("cached plaintext identity differs"));
         }
         if let Some(current) = revalidate_cached_object(
-            &value, cache, journal, provider, repository, cancel,
+            &value, cache, journal, root_key, provider, repository, cancel,
         ).await? {
             return Ok(current);
         }
@@ -1333,8 +1363,18 @@ async fn upload_plain_object(
         .await
         .map_err(transient)??;
         drop(cpu);
-        let receipt =
-            transfer_job::upload(journal, &object_id, provider, repository, cancel).await?;
+        let receipt = transfer_job::upload_registered(
+            journal,
+            &object_id,
+            format_repository_id,
+            root_key,
+            plaintext_length,
+            &plaintext_sha256,
+            provider,
+            repository,
+            cancel,
+        )
+        .await?;
         let value = RemoteObject {
             repository_id: format_repository_id.into(),
             object_id,
@@ -1390,7 +1430,18 @@ async fn upload_plain_object(
         sha256: ciphertext_sha256.clone(),
     };
     journal.register(&intent)?;
-    let receipt = transfer_job::upload(journal, &object_id, provider, repository, cancel).await?;
+    let receipt = transfer_job::upload_registered(
+        journal,
+        &object_id,
+        format_repository_id,
+        root_key,
+        plaintext_length,
+        &plaintext_sha256,
+        provider,
+        repository,
+        cancel,
+    )
+    .await?;
     let value = RemoteObject {
         repository_id: format_repository_id.into(),
         object_id,
@@ -1542,6 +1593,7 @@ async fn build_catalog(
             "catalog",
             ObjectRole::Catalog,
             format_repository_id,
+            root_key,
             &metadata_key,
             limits,
             build_root,
@@ -1572,6 +1624,7 @@ async fn build_catalog(
                 "catalog",
                 ObjectRole::Catalog,
                 format_repository_id,
+                root_key,
                 &metadata_key,
                 limits,
                 build_root,
@@ -1614,6 +1667,7 @@ async fn upload_metadata_bytes(
     _prefix: &str,
     role: ObjectRole,
     format_repository_id: &str,
+    root_key: &[u8; 32],
     key: &[u8; 32],
     limits: PackageLimits,
     build_root: &Path,
@@ -1636,6 +1690,7 @@ async fn upload_metadata_bytes(
         object_id,
         role,
         format_repository_id,
+        root_key,
         key,
         limits,
         cache,
@@ -1931,6 +1986,7 @@ pub(crate) async fn package_and_upload(
         format!("snapshot-{}", metadata.snapshot_id),
         role,
         &metadata.repository_id,
+        root_key,
         &metadata_key,
         limits,
         &mut cache,
@@ -2499,7 +2555,9 @@ mod tests {
             .await
             .unwrap();
             let first_count = provider.state.lock().unwrap().objects.len();
-            assert_eq!(first_count, 5);
+            assert_eq!(first_count, 10);
+            assert_eq!(provider.state.lock().unwrap().objects.keys()
+                .filter(|id| id.starts_with("inventory-page-")).count(), 5);
             assert_ne!(first.repository_id, repository.repository_id);
             assert!(provider
                 .state
@@ -2543,7 +2601,7 @@ mod tests {
             );
             assert_eq!(
                 provider.state.lock().unwrap().objects.len() - first_count,
-                3
+                6
             );
 
             let staging = root.path().join("restore");
@@ -2860,6 +2918,7 @@ mod tests {
                 "snapshot-stable".into(),
                 ObjectRole::SyncState,
                 "format-repository",
+                &[31; 32],
                 &key,
                 limits(128 * 1024),
                 &mut cache,
@@ -2879,6 +2938,7 @@ mod tests {
                 "snapshot-stable".into(),
                 ObjectRole::SyncState,
                 "format-repository",
+                &[31; 32],
                 &key,
                 limits(128 * 1024),
                 &mut cache,
