@@ -1849,7 +1849,6 @@ export const languageKorean = {
             enableBodyPlugin:
                 '개별 플러그인 데이터를 직접 관리하려면 RisuNest 설정의 플러그인 데이터에서 확인할 수 있습니다.',
             enableConfirm: '켜기',
-            cancel: '취소',
         },
         plugins: {
             unsupportedApiVersionInstall:
