@@ -1441,30 +1441,26 @@ impl DeviceStore {
         Ok(())
     }
 
-    pub(crate) fn write_section_entries(&mut self, writes: &[SectionWriteInput<'_>]) -> StoreResult<()> {
-        let tx = self.transaction()?;
-        for write in writes {
-            match write {
-                SectionWriteInput::Apply { section, entry, object } => {
-                    if entry.kind != kind_of_section(*section) { return Err(invalid("Section entry belongs to another section")); }
-                    let row = SectionRow::from_entry((*entry).clone(), true, |_| {
-                        object.map(|bytes| bytes.to_vec()).ok_or_else(|| invalid("Section vector object is missing"))
-                    })?;
-                    merge_row(&tx, *section, &row)?;
-                    observe_remote_clock(&tx, *section, &row.write_clock)?;
-                }
-                SectionWriteInput::Mark { section, key } => {
-                    let key = decode_entry_key(kind_of_section(*section), key)?;
-                    if let Some((row, _)) = read_row(&tx, *section, &key)? {
-                        mark_row_version(&tx, *section, &key, &row.version(), true)?;
-                    }
-                }
-                SectionWriteInput::MarkVersion { section, key, version } => {
-                    mark_row_version(&tx, *section, &decode_entry_key(kind_of_section(*section), key)?, version, true)?;
+    pub(crate) fn write_section_entry(tx: &Transaction<'_>, write: &SectionWriteInput<'_>) -> StoreResult<()> {
+        match write {
+            SectionWriteInput::Apply { section, entry, object } => {
+                if entry.kind != kind_of_section(*section) { return Err(invalid("Section entry belongs to another section")); }
+                let row = SectionRow::from_entry((*entry).clone(), true, |_| {
+                    object.map(|bytes| bytes.to_vec()).ok_or_else(|| invalid("Section vector object is missing"))
+                })?;
+                merge_row(tx, *section, &row)?;
+                observe_remote_clock(tx, *section, &row.write_clock)?;
+            }
+            SectionWriteInput::Mark { section, key } => {
+                let key = decode_entry_key(kind_of_section(*section), key)?;
+                if let Some((row, _)) = read_row(tx, *section, &key)? {
+                    mark_row_version(tx, *section, &key, &row.version(), true)?;
                 }
             }
+            SectionWriteInput::MarkVersion { section, key, version } => {
+                mark_row_version(tx, *section, &decode_entry_key(kind_of_section(*section), key)?, version, true)?;
+            }
         }
-        tx.commit()?;
         Ok(())
     }
 

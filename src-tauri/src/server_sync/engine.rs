@@ -1414,39 +1414,17 @@ impl PersistentStore {
         let mut applied_sections = vec![Domain::Library];
         if honored {
             let cache = self.server_cache()?;
-            let mut writes = Vec::new();
-            let mut after = (String::new(), String::new());
-            loop {
-                let page = self.section_page(&after)?;
-                if page.is_empty() {
-                    break;
-                }
-                for (name, key, action, remote, version) in page {
-                    after = (name.clone(), key.clone());
-                    let domain = Domain::try_from(name.as_str())
-                        .map_err(|_| SyncError::new("invalid-local-section", 409))?;
-                    match action.as_str() {
-                        "apply" => writes.push(self.section_apply_write(
-                            &cache,
-                            domain,
-                            &parse::<RecordVersion>(&version)?,
-                        )?),
-                        "mark" => {
-                            if let Some(write) = self.section_mark_write(
-                                &cache,
-                                domain,
-                                &key,
-                                &parse::<RecordVersion>(&version)?,
-                            )? {
-                                writes.push(write);
-                            }
-                        }
-                        _ => (),
-                    }
-                    bases.push((domain, key, parse::<RecordVersion>(&remote)?, None));
-                }
-            }
-            sections::write_sections(self.device_store_mut()?, &writes)?;
+            self.write_prepared_server_sections(|name, key, action, remote, version| {
+                let domain = Domain::try_from(name)
+                    .map_err(|_| SyncError::new("invalid-local-section", 409))?;
+                let write = match action {
+                    "apply" => Some(Self::section_apply_write(&cache, domain, &parse::<RecordVersion>(version)?)?),
+                    "mark" => Self::section_mark_write(&cache, domain, key, &parse::<RecordVersion>(version)?)?,
+                    _ => None,
+                };
+                bases.push((domain, key.to_owned(), parse::<RecordVersion>(remote)?, None));
+                Ok(write)
+            })?;
             applied_sections.extend(ready.section_participation.iter().map(|(domain, _)| *domain));
             applied_sections.sort();
         }
@@ -1754,7 +1732,6 @@ impl PersistentStore {
     /// Reads back the entry this cycle decided to take, with the vector body
     /// when the value was too large to ride inside the entry.
     fn section_apply_write(
-        &self,
         cache: &Cache,
         domain: Domain,
         version: &RecordVersion,
@@ -1781,7 +1758,6 @@ impl PersistentStore {
     /// Marks only the section row carried by the cursor this cycle prepared.
     /// A newer local write under the same key must remain unpublished.
     fn section_mark_write(
-        &self,
         cache: &Cache,
         domain: Domain,
         key: &str,

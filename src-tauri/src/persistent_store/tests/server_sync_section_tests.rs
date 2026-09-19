@@ -1076,3 +1076,47 @@ fn leaving_a_section_keeps_the_mirror_and_taking_one_on_rebuilds_it() {
     assert_eq!(read_vector(&reader, 21), read_vector(&author, 21));
     fleet.task.abort();
 }
+
+#[test]
+fn prepared_section_values_apply_before_loading_the_next_and_roll_back_on_late_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    store.connection.execute_batch("CREATE TEMP TABLE server_section_records(domain TEXT,key TEXT,action TEXT,remote TEXT,version TEXT,PRIMARY KEY(domain,key));").unwrap();
+    for index in 0..514 {
+        store.connection.execute("INSERT INTO server_section_records VALUES(?1,?2,'apply','remote','version')", params![Domain::LocalPlugins.as_str(), format!("key-{index:04}")]).unwrap();
+    }
+    let before = store.device_store().unwrap().section_state(Section::LocalPlugins).unwrap();
+    let payload = "v".repeat(8192);
+    let mut loaded = 0;
+    let result = store.write_prepared_server_sections(|_, key, _, _, _| {
+        loaded += 1;
+        if loaded == 514 { return Err(crate::server_sync::SyncError::new("synthetic-read-failure", 500)); }
+        Ok(Some(sections::SectionWrite::Apply {
+            domain: Domain::LocalPlugins, entry: plugin_entry(key, 10, "remote", Some(&payload)), object: None,
+        }))
+    });
+    assert!(result.is_err());
+    assert_eq!(loaded, 514);
+    assert!(plugin_rows(&store).is_empty());
+    assert_eq!(store.device_store().unwrap().section_state(Section::LocalPlugins).unwrap(), before);
+
+    let first = plugin_entry("key-0000", 10, "remote", Some("original"));
+    apply_over_the_ledger(&mut store, &first).unwrap();
+    loaded = 0;
+    let result = store.write_prepared_server_sections(|_, key, _, _, _| {
+        loaded += 1;
+        Ok(Some(sections::SectionWrite::Apply {
+            domain: Domain::LocalPlugins, entry: plugin_entry(key, 10, "remote", Some(&payload)), object: None,
+        }))
+    });
+    assert!(result.is_err());
+    assert_eq!(loaded, 1, "a conflicting value must stop before loading later bodies");
+    assert_eq!(plugin_rows(&store)[0].value.as_deref(), Some("original"));
+
+    store.write_prepared_server_sections(|_, key, _, _, _| Ok(Some(sections::SectionWrite::Apply {
+        domain: Domain::LocalPlugins, entry: plugin_entry(key, 11, "remote", Some(&payload)), object: None,
+    }))).unwrap();
+    let rows = plugin_rows(&store);
+    assert_eq!(rows.len(), 514);
+    assert!(rows.iter().all(|row| row.value.as_deref() == Some(payload.as_str())));
+}
