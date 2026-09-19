@@ -1,23 +1,7 @@
 name: Release pipeline check
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/release*.yml
-      - .github/workflows/stable-release.yml
-      - scripts/release/**
-      - tests/release/**
-      - package.json
-      - pnpm-lock.yaml
-      - version.json
-      - server/version.json
-      - release-notes/**
-      - crates/release-update/**
-      - crates/tauri-plugin-updater/**
-      - crates/sync-wire/**
-      - server/sync/**
-      - server/manager/**
-      - src-tauri/**
+  workflow_dispatch:
 
 permissions:
   contents: read
