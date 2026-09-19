@@ -288,6 +288,87 @@ fn archiving_moves_conversations_into_one_object_and_restoring_puts_them_back() 
 }
 
 #[test]
+fn malformed_streamed_restore_keeps_the_archive_and_cleans_partial_staging() {
+    let (_directory, mut store, cas) = archive_store();
+    let revision = store.revision().expect("read revision");
+    store
+        .archive_character("middle-archived", revision, 10)
+        .expect("archive the character");
+    let original = archived_object(&store, "middle-archived");
+    let original_bytes = cas
+        .read_object(&original.object_hash)
+        .expect("read original archive")
+        .expect("archive object exists");
+    let mut decoder = flate2::read::GzDecoder::new(original_bytes.as_slice());
+    let mut json_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut json_bytes).expect("decode archive");
+    let mut payload: Value = serde_json::from_slice(&json_bytes).expect("parse archive");
+    payload["conversations"]
+        .as_array_mut()
+        .expect("conversation array")
+        .push(json!({ "unexpected": true }));
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    serde_json::to_writer(&mut encoder, &payload).expect("encode malformed payload");
+    let malformed = cas
+        .prepare_bytes(&encoder.finish().expect("finish malformed archive"))
+        .expect("prepare malformed archive");
+    let mut redirected = original.clone();
+    redirected.object_hash = malformed.content_hash;
+    let generation = active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "UPDATE characters SET archived_object = ?3
+             WHERE generation = ?1 AND character_id = ?2",
+            params![
+                generation,
+                "middle-archived",
+                serde_json::to_string(&redirected).expect("encode archive metadata")
+            ],
+        )
+        .expect("point fixture at malformed archive");
+
+    let before_revision = store.revision().expect("read revision before restore");
+    assert!(store
+        .restore_character("middle-archived", before_revision)
+        .is_err());
+    assert_eq!(
+        store.revision().expect("read revision after failed restore"),
+        before_revision
+    );
+    let retained = archived_object(&store, "middle-archived");
+    assert_eq!(retained.object_hash, redirected.object_hash);
+    assert!(cas
+        .stat_object(&original.object_hash)
+        .expect("stat original archive")
+        .is_some());
+    let active_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM conversations
+                 WHERE generation = ?1 AND character_id = ?2) +
+                (SELECT COUNT(*) FROM messages
+                 WHERE generation = ?1 AND character_id = ?2)",
+            params![generation, "middle-archived"],
+            |row| row.get(0),
+        )
+        .expect("count active rows");
+    assert_eq!(active_rows, 0);
+    let staging_tables: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_temp_master
+             WHERE name IN ('archive_restore_conversations', 'archive_restore_messages')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count restore staging tables");
+    assert_eq!(staging_tables, 0);
+}
+
+#[test]
 fn an_archived_character_rejects_every_mutation_except_deleting_it() {
     let (_directory, mut store, _cas) = archive_store();
     let revision = store.revision().expect("read revision");
