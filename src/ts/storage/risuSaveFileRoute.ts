@@ -71,8 +71,8 @@ export interface RisuSaveFileRouteDependencies {
     copyAndroidExport(
         request: AndroidSafDestinationRequest,
     ): Promise<AndroidSafDestinationResult>
-    markAndroidExportReady(requestId: string): boolean
-    acknowledgeAndroidExport(requestId: string): boolean
+    markAndroidExportReady(requestId: string): boolean | Promise<boolean>
+    acknowledgeAndroidExport(requestId: string): boolean | Promise<boolean>
     reloadPlugins(): void | Promise<void>
     reloadPluginsAfterNativeRestore(): void | Promise<void>
     /** Name and size of a picked desktop file for the progress dialog; defaults to the basename. */
@@ -208,7 +208,7 @@ async function exportThroughAndroidSaf(
             )
         },
     )
-    if (!dependencies.markAndroidExportReady(terminal.requestId)) {
+    if (!await dependencies.markAndroidExportReady(terminal.requestId)) {
         throw new AndroidSafDestinationError(
             terminal.requestId,
             'prerequisite-proof-failed',
@@ -216,7 +216,7 @@ async function exportThroughAndroidSaf(
             'Android SAF publication prerequisites could not be persisted',
         )
     }
-    if (!dependencies.acknowledgeAndroidExport(terminal.requestId)) {
+    if (!await dependencies.acknowledgeAndroidExport(terminal.requestId)) {
         throw new AndroidSafDestinationError(
             terminal.requestId,
             'acknowledgement-failed',
@@ -257,13 +257,13 @@ function recoveredAndroidRisuSaveTerminal(
     return event as AndroidSafDestinationEvent
 }
 
-export function recoverAndroidRisuSavePublication(
+export async function recoverAndroidRisuSavePublication(
     encoded: string | null,
-    acknowledge: (requestId: string) => boolean,
-): AndroidSafDestinationEvent | null {
+    acknowledge: (requestId: string) => boolean | Promise<boolean>,
+): Promise<AndroidSafDestinationEvent | null> {
     const terminal = recoveredAndroidRisuSaveTerminal(encoded)
     if (!terminal) return null
-    if (!acknowledge(terminal.requestId)) {
+    if (!await acknowledge(terminal.requestId)) {
         throw new AndroidSafDestinationError(
             terminal.requestId,
             'acknowledgement-failed',
@@ -275,8 +275,8 @@ export function recoverAndroidRisuSavePublication(
 }
 
 export interface AndroidRisuSaveRecoveryDependencies {
-    getStatus(): string | null
-    acknowledge(requestId: string): boolean
+    getStatus(): string | null | Promise<string | null>
+    acknowledge(requestId: string): boolean | Promise<boolean>
     listen(listener: (event: AndroidSafDestinationEvent) => void): () => void
     isActive(requestId: string): boolean
 }
@@ -286,8 +286,6 @@ export function listenRecoveredAndroidRisuSavePublications(
     onError: (error: unknown) => void,
     dependencies: AndroidRisuSaveRecoveryDependencies,
 ): () => void {
-    const encoded = dependencies.getStatus()
-    const initialTerminal = recoveredAndroidRisuSaveTerminal(encoded)
     return listenRecoveredPublications({
         sourceKind: 'risuSave',
         onTerminal,
@@ -298,15 +296,14 @@ export function listenRecoveredAndroidRisuSavePublications(
             JSON.stringify(event),
             dependencies.acknowledge,
         ),
-        initial: encoded && initialTerminal && !dependencies.isActive(initialTerminal.requestId)
-            ? {
-                requestId: initialTerminal.requestId,
-                recover: () => recoverAndroidRisuSavePublication(
-                    encoded,
-                    dependencies.acknowledge,
-                ),
-            }
-            : null,
+        initial: {
+            recover: async () => {
+                const encoded = await dependencies.getStatus()
+                const terminal = recoveredAndroidRisuSaveTerminal(encoded)
+                if (!terminal || dependencies.isActive(terminal.requestId)) return null
+                return recoverAndroidRisuSavePublication(encoded, dependencies.acknowledge)
+            },
+        },
     })
 }
 

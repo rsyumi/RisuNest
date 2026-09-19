@@ -1,3 +1,4 @@
+import '../androidNativeControl'
 import { invoke } from '@tauri-apps/api/core'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { isTauriIOS, isTauriMobile } from '../platform'

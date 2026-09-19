@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => {
             listener = nextListener
             return () => { listener = undefined }
         }),
-        androidGenerationNotificationsEnabled: vi.fn(() => mocks.notificationStatus),
+        androidGenerationNotificationsEnabled: vi.fn(async () => mocks.notificationStatus),
     }
 })
 
@@ -46,23 +46,24 @@ describe('RisuNest Android platform settings', () => {
         delete window.RisuGenerationKeepAlive
     })
 
-    function mountPlatform(status: boolean | null): HTMLDivElement {
+    async function mountPlatform(status: boolean | null): Promise<HTMLDivElement> {
         mocks.notificationStatus = status
         window.RisuGenerationKeepAlive = {
             begin: () => false,
             end: () => undefined,
             notificationsEnabled: () => status === true,
             openNotificationSettings: mocks.openNotificationSettings,
-            webViewVersion: () => '140.0.1',
+            webViewVersion: async () => '140.0.1',
         }
         const target = document.createElement('div')
         document.body.append(target)
         mounted = mount(RisuNestAndroidPlatform, { target })
+        await vi.waitFor(() => expect(target.textContent).toContain('140.0.1'))
         return target
     }
 
     it('keeps platform controls and diagnostics visible when notification status is unavailable', async () => {
-        const target = mountPlatform(null)
+        const target = await mountPlatform(null)
         await tick()
         await Promise.resolve()
         await tick()
@@ -77,7 +78,7 @@ describe('RisuNest Android platform settings', () => {
     })
 
     it('renders notification state, diagnostics, settings action, and persisted keep-alive toggle', async () => {
-        const target = mountPlatform(true)
+        const target = await mountPlatform(true)
         await tick()
         await Promise.resolve()
         await tick()
@@ -106,7 +107,7 @@ describe('RisuNest Android platform settings', () => {
     })
 
     it('warns while notifications are off and refreshes when focus returns from settings', async () => {
-        const target = mountPlatform(false)
+        const target = await mountPlatform(false)
         await tick()
         expect(target.textContent).toContain("This feature doesn't work while notifications are off.")
         expect(target.querySelector('[role="alert"]')).not.toBeNull()
@@ -118,29 +119,26 @@ describe('RisuNest Android platform settings', () => {
 
         mocks.notificationStatus = true
         window.dispatchEvent(new Event('focus'))
-        await tick()
-        expect(target.textContent).toContain('Allowed')
+        await vi.waitFor(() => expect(target.textContent).toContain('Allowed'))
         expect(notificationBadge?.classList.contains('border-success-500')).toBe(true)
         expect(notificationBadge?.classList.contains('border-draculared')).toBe(false)
         expect(target.textContent).not.toContain("This feature doesn't work while notifications are off.")
     })
 
     it('refreshes permission on native resume without browser focus or visibility events', async () => {
-        const target = mountPlatform(false)
+        const target = await mountPlatform(false)
         await tick()
         expect(target.querySelector('[role="alert"]')).not.toBeNull()
         target.querySelector('button')?.click()
 
         mocks.notificationStatus = true
         window.dispatchEvent(new Event('risunest-android-notifications-changed'))
-        await tick()
-        expect(target.querySelector('[role="status"]')?.textContent).toBe('Allowed')
+        await vi.waitFor(() => expect(target.querySelector('[role="status"]')?.textContent).toBe('Allowed'))
         expect(target.querySelector('[role="alert"]')).toBeNull()
 
         mocks.notificationStatus = false
         window.dispatchEvent(new Event('risunest-android-notifications-changed'))
-        await tick()
-        expect(target.querySelector('[role="status"]')?.textContent).toBe('Off')
+        await vi.waitFor(() => expect(target.querySelector('[role="status"]')?.textContent).toBe('Off'))
         expect(target.querySelector('[role="alert"]')).not.toBeNull()
 
         await unmount(mounted!)

@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.net.URI
 
 plugins {
     id("com.android.application")
@@ -12,6 +13,18 @@ val tauriProperties = Properties().apply {
         propFile.inputStream().use { load(it) }
     }
 }
+val controlDevOrigin = providers.gradleProperty("risunestControlDevOrigin")
+    .orElse(providers.environmentVariable("TAURI_DEV_HOST").map { "http://$it:5174" })
+    .orElse("http://localhost:5174")
+    .map { origin ->
+        val uri = URI(origin)
+        require(uri.scheme in listOf("http", "https") && uri.host != null &&
+            uri.userInfo == null && uri.rawPath.isNullOrEmpty() &&
+            uri.rawQuery == null && uri.rawFragment == null && uri.port in -1..65535) {
+            "risunestControlDevOrigin must be one exact HTTP(S) origin"
+        }
+        "\"$origin\""
+    }
 val enableExperimentalSafFileJobs = providers
     .gradleProperty("risuEnableExperimentalSafFileJobs")
     .map { it.equals("true", ignoreCase = true) }
@@ -50,6 +63,7 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        buildConfigField("String", "CONTROL_DEV_ORIGIN", "\"\"")
         buildConfigField(
             "boolean",
             "ENABLE_EXPERIMENTAL_SAF_FILE_JOBS",
@@ -71,6 +85,7 @@ android {
             manifestPlaceholders["usesCleartextTraffic"] = "true"
             isDebuggable = true
             isJniDebuggable = true
+            buildConfigField("String", "CONTROL_DEV_ORIGIN", controlDevOrigin.get())
             isMinifyEnabled = false
             // The Tauri template kept the full DWARF debug info of the Rust
             // cdylib in the APK. The dev-profile librisunest_lib.so is ~470 MB,

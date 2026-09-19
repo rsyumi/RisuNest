@@ -273,8 +273,8 @@ export function registerAndroidRisuSaveRoute(): void {
 
     const route = createAndroidRisuSaveSpoolRoute({
         confirmRestore: async () => true,
-        discard: (source) => {
-            if (!discardAndroidSafSource(source.token)) {
+        discard: async (source) => {
+            if (!await discardAndroidSafSource(source.token)) {
                 alertError(`${source.displayName}: discard-failed`)
             }
         },

@@ -13,7 +13,6 @@ import android.provider.Settings
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.ViewGroup
-import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -46,9 +45,6 @@ private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
 private const val EXIT_FLUSH_TIMEOUT_MILLIS = 1_500L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val OPENED_FILES_EVENT = "risu-opened-files"
-private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
-private const val SAF_BRIDGE_NAME = "RisuSafBridge"
-private const val GENERATION_KEEP_ALIVE_BRIDGE_NAME = "RisuGenerationKeepAlive"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
@@ -534,6 +530,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
   private var commitBridge: AndroidCommitBridge? = null
+  private var controlBridge: AndroidControlBridge? = null
+  private var safControlBridge: AndroidControlBridge? = null
+  private val lifecycleCommands = LifecycleFlushBridge()
+  private val generationCommands = GenerationKeepAliveBridge()
+  private val safCommands = SafBridge()
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
   private val exitFlushGate = ExitFlushGate()
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
@@ -659,9 +660,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     return rendererRecoveryCoordinator.recover(
       removeFromParent = { (webView.parent as? ViewGroup)?.removeView(webView) },
       removeJavascriptBridge = {
-        webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME)
-        webView.removeJavascriptInterface(SAF_BRIDGE_NAME)
-        webView.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
+        controlBridge?.close()
+        controlBridge = null
+        safControlBridge?.close()
+        safControlBridge = null
       },
       destroyView = webView::destroy,
       clearReference = {
@@ -679,11 +681,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     lifecycleWebView = webView
     commitBridge?.close()
     commitBridge = AndroidCommitBridge.attach(webView)
-    webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
-    webView.addJavascriptInterface(GenerationKeepAliveBridge(), GENERATION_KEEP_ALIVE_BRIDGE_NAME)
+    controlBridge?.close()
+    controlBridge = AndroidControlBridge.attach(webView, ::dispatchControl)
+    safControlBridge?.close()
+    safControlBridge = null
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      safControlBridge = AndroidControlBridge.attach(webView, ::dispatchControl, "RisuNestSafControl")
       deliveredSpoolTokens.clear()
-      webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
       replayReadySpools(webView)
       replaySafDestinationResult(webView)
       injectOpenedFiles(webView)
@@ -797,10 +801,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     safSourceCancellations.clear()
     safDestinationCancellations.clear()
     safProgressThrottle.clearAll()
-    lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
     generationKeepAliveOwner.teardown(
       removeJavascriptBridge = {
-        lifecycleWebView?.removeJavascriptInterface(GENERATION_KEEP_ALIVE_BRIDGE_NAME)
+        controlBridge?.close()
+        controlBridge = null
+        safControlBridge?.close()
+        safControlBridge = null
       },
       stopGeneration = { GenerationForegroundService.stopAll(this) },
     )
@@ -842,32 +848,61 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
+  private suspend fun dispatchControl(method: String, args: List<String>): Any? {
+    if (method.startsWith("saf.") && !BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      error("android-saf-unavailable")
+    }
+    return when (method) {
+      "lifecycle.onFlushComplete" -> lifecycleCommands.onFlushComplete(args[0])
+      "lifecycle.onFlushHold" -> lifecycleCommands.onFlushHold(args[0])
+      "lifecycle.requestExit" -> lifecycleCommands.requestExit()
+      "lifecycle.requestRestart" -> lifecycleCommands.requestRestart()
+      "generation.begin" -> generationCommands.begin()
+      "generation.end" -> generationCommands.end()
+      "generation.notificationsEnabled" -> generationCommands.notificationsEnabled()
+      "generation.openNotificationSettings" -> generationCommands.openNotificationSettings()
+      "generation.webViewVersion" -> generationCommands.webViewVersion()
+      "saf.pickBackupSource" -> safCommands.pickBackupSource(args[0])
+      "saf.pickLegacyBackupSource" -> safCommands.pickLegacyBackupSource(args[0])
+      "saf.pickContentSource" -> safCommands.pickContentSource(args[0], args[1])
+      "saf.copyExport" -> safCommands.copyExport(args[0], args[1], args[2])
+      "saf.cancelSource" -> safCommands.cancelSource(args[0])
+      else -> withContext(Dispatchers.IO) {
+        when (method) {
+          "saf.cancelExport" -> safCommands.cancelExport(args[0])
+          "saf.discardSource" -> safCommands.discardSource(args[0])
+          "saf.getActiveSourceRequestIds" -> safCommands.getActiveSourceRequestIds()
+          "saf.getExportStatus" -> safCommands.getExportStatus()
+          "saf.getExportSourceId" -> safCommands.getExportSourceId()
+          "saf.markExportPublicationReady" -> safCommands.markExportPublicationReady(args[0])
+          "saf.acknowledgeExport" -> safCommands.acknowledgeExport(args[0])
+          else -> error("android-control-unavailable")
+        }
+      }
+    }
+  }
+
   private inner class LifecycleFlushBridge {
-    @JavascriptInterface
     fun onFlushComplete(token: String?) {
       token ?: return
       mainHandler.post { finishForExitFlush(token) }
     }
 
-    @JavascriptInterface
     fun onFlushHold(token: String?) {
       token ?: return
       mainHandler.post { exitFlushGate.cancel(token) }
     }
 
-    @JavascriptInterface
     fun requestExit() {
       mainHandler.post { finishAndRemoveTask() }
     }
 
-    @JavascriptInterface
     fun requestRestart() {
       mainHandler.post { coldRestartDispatcher.restart() }
     }
   }
 
   private inner class GenerationKeepAliveBridge {
-    @JavascriptInterface
     fun begin(): Boolean = generationKeepAliveOwner.begin {
       beginGenerationKeepAlive(
         requestNotifications = ::requestPostNotificationsForForegroundService,
@@ -876,15 +911,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       )
     }
 
-    @JavascriptInterface
     fun end(): Boolean = generationKeepAliveOwner.end {
       GenerationForegroundService.stop(this@MainActivity)
     }
 
-    @JavascriptInterface
     fun notificationsEnabled(): Boolean = GenerationForegroundService.notificationsEnabled(this@MainActivity)
 
-    @JavascriptInterface
     fun openNotificationSettings(): Boolean = runCatching {
       val settingsIntent = if (Build.VERSION.SDK_INT >= 26) {
         Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
@@ -899,7 +931,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       true
     }.getOrDefault(false)
 
-    @JavascriptInterface
     fun webViewVersion(): String = WebViewCompat.getCurrentWebViewPackage(this@MainActivity)?.versionName ?: ""
 
   }
@@ -927,7 +958,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   private inner class SafBridge {
-    @JavascriptInterface
     fun pickBackupSource(requestId: String) {
       if (!isCanonicalUuidV4(requestId)) return
       val cancellation = AtomicBoolean(false)
@@ -965,10 +995,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       )
     }
 
-    @JavascriptInterface
     fun pickLegacyBackupSource(requestId: String) = pickDocumentSource(requestId, false, null)
 
-    @JavascriptInterface
     fun pickContentSource(requestId: String, destination: String) {
       if (!isCanonicalUuidV4(requestId)) return
       val importDestination = SafContentImportDestination.fromWireName(destination)
@@ -1031,7 +1059,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       )
     }
 
-    @JavascriptInterface
     fun copyExport(
       requestId: String,
       sourcePath: String,
@@ -1141,7 +1168,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       }
     }
 
-    @JavascriptInterface
     fun cancelExport(requestId: String): Boolean {
       val cancellation = safDestinationCancellations[requestId] ?: return false
       cancellation.set(true)
@@ -1160,22 +1186,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       }
     }
 
-    @JavascriptInterface
     fun cancelSource(requestId: String) {
       safSourceCancellations[requestId]?.set(true)
     }
 
-    @JavascriptInterface
     fun discardSource(token: String): Boolean = safSpoolStore().discardReady(token)
 
-    @JavascriptInterface
     fun getActiveSourceRequestIds(): String = safSourceCancellations.keys
       .filter(::isCanonicalUuidV4)
       .sorted()
       .take(16)
       .joinToString(prefix = "[", separator = ",", postfix = "]") { "\"$it\"" }
 
-    @JavascriptInterface
     fun getExportStatus(): String? {
       val record = loadSafDestinationState()
         ?.takeIf(SafDestinationRecord::isTerminal)
@@ -1183,10 +1205,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       return destinationJson(record, destinationMessage(record))
     }
 
-    @JavascriptInterface
     fun getExportSourceId(): String? = loadSafDestinationState()?.exportId
 
-    @JavascriptInterface
     fun markExportPublicationReady(requestId: String): Boolean {
       if (!isCanonicalUuidV4(requestId)) return false
       return synchronized(safDestinationStateLock) {
@@ -1203,7 +1223,6 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       }
     }
 
-    @JavascriptInterface
     fun acknowledgeExport(requestId: String): Boolean = acknowledgeSafDestinationExport(
       requestId,
       ::loadSafDestinationState,

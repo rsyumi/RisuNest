@@ -7,7 +7,7 @@ import { isTerminalJob as isTerminal, type NativeFileJobStatus } from './nativeF
 export interface NativeFileJobRecoveryDependencies {
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     wait(milliseconds: number): Promise<void>
-    androidSafExportId?(): string | null
+    androidSafExportId?(): string | null | Promise<string | null>
 }
 
 export interface NativeFileJobRecoveryResult {
@@ -105,7 +105,7 @@ async function reconcileExportInBackground(
     }
     try {
         const handoffId = androidSafHandoffId(status)
-        if (handoffId && dependencies.androidSafExportId?.() === handoffId) {
+        if (handoffId && await dependencies.androidSafExportId?.() === handoffId) {
             retainNativeJob = true
             return
         }

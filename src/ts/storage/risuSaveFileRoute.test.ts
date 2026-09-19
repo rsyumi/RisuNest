@@ -107,7 +107,7 @@ describe('RisuSave picker route', () => {
             withFlushedExport: (...args: any[]) => Promise<unknown>
             copyAndroidExport: (...args: any[]) => Promise<unknown>
             markAndroidExportReady?: (requestId: string) => boolean
-            acknowledgeAndroidExport?: (requestId: string) => boolean
+            acknowledgeAndroidExport?: (requestId: string) => boolean | Promise<boolean>
         },
     ): void {
         deps.platform = () => 'native-android' as never
@@ -249,7 +249,7 @@ describe('RisuSave picker route', () => {
         expect(acknowledgeAndroidExport).not.toHaveBeenCalled()
 
         const replayAck = vi.fn(() => true)
-        expect(risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify({
+        expect(await risuSaveFileRoute.recoverAndroidRisuSavePublication(JSON.stringify({
             requestId: '77777777-7777-4777-8777-777777777777',
             exportId: '88888888-8888-4888-8888-888888888888',
             sourceKind: 'risuSave',
@@ -263,7 +263,7 @@ describe('RisuSave picker route', () => {
     it('propagates acknowledgement failure while retaining a renderer recovery retry', async () => {
         const deps = dependencies('native-desktop')
         const markAndroidExportReady = vi.fn(() => true)
-        const acknowledgeAndroidExport = vi.fn(() => false)
+        const acknowledgeAndroidExport = vi.fn(async () => false)
         installAndroidExport(deps, {
             withFlushedExport: async (_runtime, _reason, callback) => await callback({
                 withNativeFile: async (_options: unknown, nativeCallback: Function) =>
@@ -289,15 +289,9 @@ describe('RisuSave picker route', () => {
             '11111111-1111-4111-8111-111111111111',
         )
 
-        const recover = (risuSaveFileRoute as unknown as {
-            recoverAndroidRisuSavePublication(
-                encoded: string | null,
-                acknowledge: (requestId: string) => boolean,
-            ): unknown
-        }).recoverAndroidRisuSavePublication
-        expect(recover).toBeTypeOf('function')
-        const retry = vi.fn(() => true)
-        expect(recover(JSON.stringify({
+        const recover = risuSaveFileRoute.recoverAndroidRisuSavePublication
+        const retry = vi.fn(async () => true)
+        expect(await recover(JSON.stringify({
             requestId: '11111111-1111-4111-8111-111111111111',
             exportId: '22222222-2222-4222-8222-222222222222',
             sourceKind: 'risuSave',

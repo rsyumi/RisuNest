@@ -159,8 +159,8 @@ export interface PortableExportResumeDependencies {
     intent: PendingPortableExport,
     result: NativeFileJobResult,
   ): Promise<AndroidSafDestinationEvent>;
-  acknowledgeAndroid(requestId: string): boolean;
-  androidAcknowledgementPending?(requestId: string): boolean;
+  acknowledgeAndroid(requestId: string): boolean | Promise<boolean>;
+  androidAcknowledgementPending?(requestId: string): boolean | Promise<boolean>;
   cleanupHandoff(path: string): Promise<void>;
   onStatus?(status: PortableJobStatus): void;
   onResult?(result: NativeFileJobResult): void | Promise<void>;
@@ -294,8 +294,8 @@ export async function resumePendingPortableExport(
     };
     dependencies.store.write(intent);
     if (
-      !dependencies.acknowledgeAndroid(intent.requestId) &&
-      dependencies.androidAcknowledgementPending?.(intent.requestId) !== false
+      !await dependencies.acknowledgeAndroid(intent.requestId) &&
+      await dependencies.androidAcknowledgementPending?.(intent.requestId) !== false
     )
       throw new PortableExportNeedsAttention(
         "destination-acknowledgement-pending",
@@ -306,8 +306,8 @@ export async function resumePendingPortableExport(
     // A previous acknowledgement can have succeeded before the WebView disappeared.
     // The native job keeps the verified handoff until its final forget operation.
     if (
-      !dependencies.acknowledgeAndroid(intent.requestId) &&
-      dependencies.androidAcknowledgementPending?.(intent.requestId) !== false
+      !await dependencies.acknowledgeAndroid(intent.requestId) &&
+      await dependencies.androidAcknowledgementPending?.(intent.requestId) !== false
     )
       throw new PortableExportNeedsAttention(
         "destination-acknowledgement-pending",
@@ -347,8 +347,8 @@ async function resumeAndroidPortablePublication(
   result: NativeFileJobResult,
 ): Promise<AndroidSafDestinationEvent> {
   const bridge = productionAndroidBridge();
-  const read = () => {
-    const text = getAndroidSafExportStatus(bridge);
+  const read = async () => {
+    const text = await getAndroidSafExportStatus(bridge);
     if (!text) return null;
     const event: AndroidSafDestinationEvent = JSON.parse(text);
     if (event.requestId !== intent.requestId)
@@ -358,31 +358,39 @@ async function resumeAndroidPortablePublication(
       );
     return event;
   };
-  const terminal = read();
-  if (terminal) return terminal;
-  const active = getAndroidSafExportSourceId(bridge);
-  if (!active || !result.handoffPath?.includes(active))
-    throw new PortableExportNeedsAttention(
-      "android-publication-retry-required",
-      intent.jobId,
-    );
   return new Promise((resolve, reject) => {
-    const dispose = listenAndroidSafDestinationEvents((event) => {
-      if (event.requestId === intent.requestId) {
-        dispose();
-        resolve(event);
-      }
-    });
-    try {
-      const completed = read();
-      if (completed) {
-        dispose();
-        resolve(completed);
-      }
-    } catch (error) {
+    let settled = false;
+    let dispose = () => {};
+    const finish = (event: AndroidSafDestinationEvent) => {
+      if (settled || event.requestId !== intent.requestId) return;
+      settled = true;
+      dispose();
+      resolve(event);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
       dispose();
       reject(error);
-    }
+    };
+    // Subscribe before asynchronous receipt reads so completion cannot fall between them.
+    dispose = listenAndroidSafDestinationEvents(finish);
+    void (async () => {
+      const terminal = await read();
+      if (settled) return;
+      if (terminal) return finish(terminal);
+      const active = await getAndroidSafExportSourceId(bridge);
+      if (settled) return;
+      if (!active || !result.handoffPath?.includes(active)) {
+        const completed = await read();
+        if (settled) return;
+        if (completed) return finish(completed);
+        throw new PortableExportNeedsAttention(
+          "android-publication-retry-required",
+          intent.jobId,
+        );
+      }
+    })().catch(fail);
   });
 }
 
@@ -419,11 +427,11 @@ export function portableAndroidPublicationDependencies(): Pick<
     },
     resumeAndroid: resumeAndroidPortablePublication,
     acknowledgeAndroid: acknowledgeAndroidSafExport,
-    androidAcknowledgementPending() {
+    async androidAcknowledgementPending() {
       const bridge = productionAndroidBridge();
       return (
-        getAndroidSafExportStatus(bridge) !== null ||
-        getAndroidSafExportSourceId(bridge) !== null
+        await getAndroidSafExportStatus(bridge) !== null ||
+        await getAndroidSafExportSourceId(bridge) !== null
       );
     },
   };

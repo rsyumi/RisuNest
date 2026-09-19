@@ -25,7 +25,7 @@ interface NativeScreenshotArchiveDependencies {
 interface AndroidScreenshotArchiveDependencies {
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     copyToAndroidSaf(request: AndroidSafDestinationRequest): Promise<AndroidSafDestinationResult>
-    acknowledgeAndroidSafExport(requestId: string): boolean
+    acknowledgeAndroidSafExport(requestId: string): boolean | Promise<boolean>
     warn(warningCode: string): void
 }
 
@@ -36,7 +36,7 @@ interface MobileScreenshotArchiveDependencies {
         suggestedName: string
         signal?: AbortSignal
     }): Promise<{ bytes: number; requestId?: string; warningCodes?: string[] }>
-    acknowledgePublication?(requestId: string): boolean
+    acknowledgePublication?(requestId: string): boolean | Promise<boolean>
     warn(warningCode: string): void
 }
 
@@ -273,7 +273,7 @@ class MobileScreenshotArchiveWriter implements ScreenshotArchiveWriter {
             if (
                 this.destinationRequestId
                 && this.dependencies.acknowledgePublication
-                && !this.dependencies.acknowledgePublication(this.destinationRequestId)
+                && !await this.dependencies.acknowledgePublication(this.destinationRequestId)
             ) {
                 this.dependencies.warn('cleanup-failed')
             }
@@ -372,9 +372,9 @@ function recoveredScreenshotTerminal(encoded: string | null): AndroidSafDestinat
 }
 
 interface AndroidScreenshotRecoveryDependencies {
-    getStatus(): string | null
+    getStatus(): string | null | Promise<string | null>
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
-    acknowledgeAndroidSafExport(requestId: string): boolean
+    acknowledgeAndroidSafExport(requestId: string): boolean | Promise<boolean>
 }
 
 const productionAndroidRecoveryDependencies: AndroidScreenshotRecoveryDependencies = {
@@ -386,12 +386,12 @@ const productionAndroidRecoveryDependencies: AndroidScreenshotRecoveryDependenci
 export async function recoverAndroidScreenshotPublication(
     dependencies: AndroidScreenshotRecoveryDependencies = productionAndroidRecoveryDependencies,
 ): Promise<AndroidSafDestinationEvent | null> {
-    const terminal = recoveredScreenshotTerminal(dependencies.getStatus())
+    const terminal = recoveredScreenshotTerminal(await dependencies.getStatus())
     if (!terminal || !terminal.exportId) return null
     await dependencies.invoke('native_file_job_screenshot_output_release', {
         jobId: terminal.exportId,
     })
-    if (!dependencies.acknowledgeAndroidSafExport(terminal.requestId)) {
+    if (!await dependencies.acknowledgeAndroidSafExport(terminal.requestId)) {
         throw new Error('Android screenshot destination journal could not be acknowledged')
     }
     return terminal
@@ -426,7 +426,7 @@ export function listenRecoveredAndroidScreenshotPublications(
         }),
         initial: {
             recover: async () => {
-                const encoded = dependencies.getStatus()
+                const encoded = await dependencies.getStatus()
                 const terminal = recoveredScreenshotTerminal(encoded)
                 if (!terminal || dependencies.isActive(terminal.requestId)) return null
                 return recoverAndroidScreenshotPublication({

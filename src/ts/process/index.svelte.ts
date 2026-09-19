@@ -251,7 +251,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         if (!lifecycle.isTargetCurrent()) return false
         enteredGeneration = true
-        generationKeepAliveAcquired = beginAndroidGenerationKeepAlive()
+        generationKeepAliveAcquired = await beginAndroidGenerationKeepAlive()
         iosGeneration = await beginIOSGeneration(arg.signal)
         lifecycle.onProgress = iosGeneration.progress;
         const result = await sendChatInternal(
@@ -284,7 +284,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
         }
         completeLease?.release()
-        endAndroidGenerationKeepAlive(generationKeepAliveAcquired)
+        await endAndroidGenerationKeepAlive(generationKeepAliveAcquired)
         await iosGeneration
           ?.dispose(generationReturned && lifecycle.responseCompleted && !iosGeneration.signal?.aborted)
           .catch((error) =>

@@ -130,7 +130,7 @@ async function consumeAndroidContentSpool(
                     RisuSafBridge?: AndroidSafJavascriptBridge
                 }
             ).RisuSafBridge
-            bridge?.discardSource?.(source.token)
+            await bridge?.discardSource?.(source.token)
         }
     }
 }

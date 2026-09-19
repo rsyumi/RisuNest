@@ -17,20 +17,25 @@
         keepAlive = settings.androidKeepAliveDuringGeneration
     })
 
-    function refresh(): void {
-        notificationStatus = androidGenerationNotificationsEnabled()
+    let refreshVersion = 0
+    async function refresh(): Promise<void> {
+        const version = ++refreshVersion
+        const status = await androidGenerationNotificationsEnabled()
+        if (version !== refreshVersion) return
+        notificationStatus = status
         const bridge = window.RisuGenerationKeepAlive
         if (!bridge) return
         try {
-            webView = bridge.webViewVersion()
+            const value = await bridge.webViewVersion()
+            if (version === refreshVersion) webView = value
         } catch {
-            notificationStatus = null
+            if (version === refreshVersion) webView = ''
         }
     }
 
-    function openNotificationSettings(): void {
+    async function openNotificationSettings(): Promise<void> {
         try {
-            window.RisuGenerationKeepAlive?.openNotificationSettings()
+            await window.RisuGenerationKeepAlive?.openNotificationSettings()
         } catch {
             // The visible state stays unchanged until Android resumes this WebView.
         }
@@ -50,6 +55,7 @@
         // Android resume does not always produce browser focus/visibility events.
         window.addEventListener('risunest-android-notifications-changed', refresh)
         return () => {
+            refreshVersion++
             window.removeEventListener('focus', refresh)
             document.removeEventListener('visibilitychange', refreshOnVisible)
             window.removeEventListener('risunest-android-notifications-changed', refresh)

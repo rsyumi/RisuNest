@@ -554,7 +554,7 @@ export interface NativeFileJobDependencies {
     isTauri(): boolean
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     wait(milliseconds: number): Promise<void>
-    discardAndroidSource?(token: string): boolean
+    discardAndroidSource?(token: string): boolean | Promise<boolean>
 }
 
 export interface NativeBackupExportDependencies extends NativeFileJobDependencies {
@@ -1140,16 +1140,16 @@ async function pollNativeFileJobUntilTerminal(
     }
 }
 
-function abortBeforeNativeRestoreStart(
+async function abortBeforeNativeRestoreStart(
     source: NativeFileJobSource | NativeOfficialAccountSnapshotRestoreRequest,
     dependencies: NativeFileJobDependencies,
-): never {
+): Promise<never> {
     if (!('type' in source)) throw abortError()
     let discarded = source.type !== 'androidSpool'
     if (source.type === 'androidSpool') {
         try {
             discarded =
-                dependencies.discardAndroidSource?.(source.token) === true
+                await dependencies.discardAndroidSource?.(source.token) === true
         } catch {}
     }
     if (!discarded) {
@@ -1187,14 +1187,14 @@ async function runNativeReplacementRestore(
         throw new Error(`${operation} requires Tauri`)
     }
     if (options.signal?.aborted) {
-        abortBeforeNativeRestoreStart(source, dependencies)
+        await abortBeforeNativeRestoreStart(source, dependencies)
     }
 
     const mutationToken = await runtime.capturePersistentMutationToken(
         mutationReason, { publishOfficial: false },
     )
     if (options.signal?.aborted) {
-        abortBeforeNativeRestoreStart(source, dependencies)
+        await abortBeforeNativeRestoreStart(source, dependencies)
     }
     const request =
         kind === 'restore-official-account-snapshot'
