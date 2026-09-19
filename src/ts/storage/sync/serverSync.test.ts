@@ -91,6 +91,38 @@ function fixture(
   return { facade, native, runtime, fence, trace, progress };
 }
 describe("server sync activation boundary", () => {
+  it.each(['flush', 'token', 'fence'] as const)(
+    'releases an unactivated preparation when %s fails and permits another cycle',
+    async (failure) => {
+      const { facade, native, runtime, fence } = fixture();
+      const original = native.getMockImplementation()!;
+      let prepared = false;
+      native.mockImplementation(async (command) => {
+        if (command === 'server_sync_prepare') {
+          if (prepared) throw { code: 'preparation-pending' };
+          prepared = true;
+        }
+        if (command === 'server_sync_cancel' || command === 'server_sync_publish') {
+          prepared = false;
+        }
+        return original(command);
+      });
+      const error = new Error('synthetic local failure');
+      if (failure === 'flush') {
+        runtime.flushPendingData.mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+      } else if (failure === 'token') {
+        runtime.capturePersistentMutationToken.mockRejectedValueOnce(error);
+      } else {
+        runtime.acquireDestructiveReplacementFence.mockRejectedValueOnce(error);
+      }
+      await expect(facade.cycle()).rejects.toMatchObject({ code: 'server-sync-failed' });
+      expect(native).toHaveBeenCalledWith('server_sync_cancel');
+      expect(prepared).toBe(false);
+      expect(facade.needsRefresh()).toBe(false);
+      expect(fence.release).not.toHaveBeenCalled();
+      await expect(facade.cycle()).resolves.toEqual(result);
+    },
+  );
   it("does not let a stalled progress reply hold completion or update a later cycle", async () => {
     vi.useFakeTimers();
     try {

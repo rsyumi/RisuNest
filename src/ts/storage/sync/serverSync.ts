@@ -286,6 +286,7 @@ export function createServerSyncFacade(options: {
     });
     if (prepared.kind === "report") return prepared.result;
     let fence: PersistentDestructiveReplacementFence | undefined;
+    let ownsPreparation = true;
     try {
       if (cancelled) throw new ServerSyncError("cancelled");
       await options.runtime.flushPendingData("server-sync-activate");
@@ -295,11 +296,12 @@ export function createServerSyncFacade(options: {
       fence = await options.runtime.acquireDestructiveReplacementFence(token);
       if (cancelled) throw new ServerSyncError("cancelled");
       pendingActivation = { prepared, fence };
+      ownsPreparation = false;
       fence = undefined;
       await activate();
     } catch (cause) {
-      if (fence) {
-        fence.release();
+      if (ownsPreparation) {
+        fence?.release();
         await native("server_sync_cancel").catch(() => undefined);
       }
       throw serverSyncError(cause);
