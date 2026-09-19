@@ -123,6 +123,8 @@ fn create_schema(connection: &mut Connection) -> StoreResult<()> {
             PRIMARY KEY (generation, character_id)
         );
         CREATE INDEX characters_configured ON characters (generation, configured_index);
+        CREATE INDEX characters_catalog
+            ON characters (generation, trashed, configured_index, character_id);
         CREATE INDEX characters_recent ON characters (generation, recent_at DESC, configured_index);
         CREATE TABLE conversations (
             generation TEXT NOT NULL,

@@ -537,14 +537,17 @@ pub(super) fn query_characters(
     query: &CharacterQuery,
     target: &ReadTarget,
 ) -> StoreResult<CharacterPage> {
-    let (limit, offset) = page_input(query.limit, query.cursor.as_deref())?;
-    let order = order_sql(query.order);
     let search = query
         .search
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
+    if search.is_none() && matches!(query.order, QueryOrder::Configured) {
+        return query_configured_characters(connection, query, target);
+    }
+    let (limit, offset) = page_input(query.limit, query.cursor.as_deref())?;
+    let order = order_sql(query.order);
     let mut statement = connection.prepare(&format!(
         "SELECT {CHARACTER_SUMMARY_COLUMNS}
          FROM characters
@@ -579,6 +582,44 @@ pub(super) fn query_characters(
         next_cursor: has_more.then(|| (offset + items.len() as i64).to_string()),
         items,
     })
+}
+
+fn query_configured_characters(
+    connection: &Connection,
+    query: &CharacterQuery,
+    target: &ReadTarget,
+) -> StoreResult<CharacterPage> {
+    let (limit, _) = page_input(query.limit, None)?;
+    let after: (i64, String) = match query.cursor.as_deref() {
+        Some(cursor) => serde_json::from_str(cursor).map_err(|_| StoreError::Validation {
+            message: "Invalid configured character cursor".to_owned(),
+        })?,
+        None => (i64::MIN, String::new()),
+    };
+    let mut statement = connection.prepare(&format!(
+        "SELECT {CHARACTER_SUMMARY_COLUMNS} FROM characters
+         WHERE generation = ?1 AND trashed = ?2
+           AND (configured_index, character_id) > (?3, ?4)
+         ORDER BY configured_index ASC, character_id ASC LIMIT ?5"
+    ))?;
+    let mut rows = statement.query(params![target.generation, query.trash as i64,
+        after.0, after.1, limit.saturating_add(1)])?;
+    let mut items = Vec::new();
+    let mut has_more = false;
+    while let Some(row) = rows.next()? {
+        if items.len() as i64 == limit {
+            has_more = true;
+            break;
+        }
+        items.push(character_summary_from_row(row)?);
+    }
+    let next_cursor = if has_more {
+        let last = items.last().expect("positive page limit");
+        Some(serde_json::to_string(&(last.configured_index, &last.id))?)
+    } else {
+        None
+    };
+    Ok(CharacterPage { revision: target.revision, next_cursor, items })
 }
 
 /// One summary by identity. Targeted invalidation reprojects a single changed
@@ -634,7 +675,14 @@ pub(super) fn query_conversations(
     let (limit, offset) = page_input(query.limit, query.cursor.as_deref())?;
     let order = order_sql(query.order);
     let mut statement = connection.prepare(&format!(
-        "SELECT conversation_id, character_id, name, configured_index, recent_at, message_count, detail
+        "SELECT conversation_id, character_id, name, configured_index, recent_at, message_count,
+             CASE WHEN json_type(detail, '$.folderId') = 'text'
+                 THEN json_extract(detail, '$.folderId') END,
+             CASE WHEN json_type(detail, '$.bindedPersona') = 'text'
+                 THEN json_extract(detail, '$.bindedPersona') END,
+             CASE WHEN json_type(detail, '$.fmIndex') = 'integer'
+                       AND typeof(json_extract(detail, '$.fmIndex')) = 'integer'
+                 THEN json_extract(detail, '$.fmIndex') END
          FROM conversations WHERE generation = ?1 AND character_id = ?2
          ORDER BY {order} LIMIT ?3 OFFSET ?4"
     ))?;
@@ -646,23 +694,16 @@ pub(super) fn query_conversations(
     ])?;
     let mut items = Vec::new();
     while let Some(row) = rows.next()? {
-        let detail: Value = serde_json::from_str(&row.get::<_, String>(6)?)?;
         items.push(ConversationSummary {
             id: row.get(0)?,
             character_id: row.get(1)?,
             name: row.get(2)?,
-            folder_id: detail
-                .get("folderId")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            binded_persona: detail
-                .get("bindedPersona")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            folder_id: row.get(6)?,
+            binded_persona: row.get(7)?,
             configured_index: row.get(3)?,
             recent_at: row.get(4)?,
             message_count: row.get(5)?,
-            fm_index: detail.get("fmIndex").and_then(Value::as_i64),
+            fm_index: row.get(8)?,
         });
     }
     let has_more = items.len() as i64 > limit;

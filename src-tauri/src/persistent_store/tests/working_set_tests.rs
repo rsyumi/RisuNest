@@ -508,7 +508,7 @@ fn character_catalog_honors_order_search_trash_and_cursor() {
         .query_characters(&configured(None, false, None), None)
         .expect("first configured page");
     assert_eq!(first.items[0].id, "char-b");
-    assert_eq!(first.next_cursor.as_deref(), Some("1"));
+    assert!(first.next_cursor.is_some());
     assert_eq!(
         store
             .query_characters(&configured(None, false, first.next_cursor.as_deref()), None)
@@ -567,6 +567,32 @@ fn character_catalog_honors_order_search_trash_and_cursor() {
         .expect("character exists");
     assert_eq!(detail.value["chaId"], "char-a");
     assert!(detail.value.get("chats").is_none());
+}
+
+#[test]
+fn configured_catalog_cursor_handles_ties_and_does_not_parse_the_previous_prefix() {
+    let (_directory, store, _) = open_fixture();
+    store.connection.execute("UPDATE characters SET configured_index = 5", []).unwrap();
+    let mut query = CharacterQuery {
+        search: None, order: QueryOrder::Configured, trash: false, limit: 1, cursor: None,
+    };
+    let first = store.query_characters(&query, None).unwrap();
+    assert_eq!(first.items[0].id, "char-a");
+    query.cursor = first.next_cursor;
+    // The next page must neither parse nor return a previously emitted row.
+    store.connection.execute("UPDATE characters SET archived_object = 'invalid' WHERE character_id = 'char-a'", []).unwrap();
+    let second = store.query_characters(&query, None).unwrap();
+    assert_eq!(second.items[0].id, "char-b");
+    assert!(second.next_cursor.is_none());
+    query.trash = true;
+    query.cursor = None;
+    let trash = store.query_characters(&query, None).unwrap();
+    assert_eq!(trash.items[0].id, "char-c");
+    assert!(trash.next_cursor.is_none());
+    for cursor in ["invalid", "1", "[]", "[5, null]"] {
+        query.cursor = Some(cursor.to_owned());
+        assert!(matches!(store.query_characters(&query, None), Err(StoreError::Validation { .. })));
+    }
 }
 
 #[test]
@@ -652,6 +678,35 @@ fn conversation_catalog_honors_configured_recent_and_cursor() {
         .expect("serialize empty conversation page"),
         json!({ "revision": 1, "items": [] })
     );
+}
+
+#[test]
+fn conversation_catalog_extracts_only_typed_summary_fields_from_large_details() {
+    let (_directory, store, _) = open_fixture();
+    for mut detail in [
+        json!({}),
+        json!({"folderId": null, "bindedPersona": null, "fmIndex": null}),
+        json!({"folderId": "", "bindedPersona": "persona", "fmIndex": -1}),
+        json!({"folderId": [], "bindedPersona": {}, "fmIndex": 1.0}),
+        json!({"folderId": true, "bindedPersona": 1, "fmIndex": true}),
+        json!({"fmIndex": i64::MIN}),
+        json!({"fmIndex": i64::MAX}),
+        json!({"fmIndex": u64::MAX}),
+    ] {
+        detail["scriptState"] = json!({"large": "x".repeat(128 * 1024)});
+        store.connection.execute(
+            "UPDATE conversations SET detail = ?1 WHERE character_id = 'char-a' AND conversation_id = 'conv-short'",
+            [serde_json::to_string(&detail).unwrap()],
+        ).unwrap();
+        let page = store.query_conversations(&ConversationQuery {
+            character_id: "char-a".to_owned(), order: QueryOrder::Configured, limit: 10, cursor: None,
+        }, None).unwrap();
+        let summary = page.items.iter().find(|item| item.id == "conv-short").unwrap();
+        assert_eq!(summary.folder_id.as_deref(), detail.get("folderId").and_then(Value::as_str));
+        assert_eq!(summary.binded_persona.as_deref(), detail.get("bindedPersona").and_then(Value::as_str));
+        assert_eq!(summary.fm_index, detail.get("fmIndex").and_then(Value::as_i64));
+        assert!(serde_json::to_vec(summary).unwrap().len() < 512);
+    }
 }
 
 #[test]
