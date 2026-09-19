@@ -1,4 +1,4 @@
-use super::resolve_android_root;
+use super::resolve_platform_root;
 use crate::asset_repository::{ExactObjectUnlink, PayloadCas};
 use std::{fs, io::ErrorKind, path::Path};
 
@@ -35,7 +35,8 @@ fn platform_parent_alias_supports_cas_write_read_and_delete() {
         .to_string()
         .starts_with("linked path component is forbidden:"));
 
-    let root = resolve_android_root(&platform_root).unwrap();
+    let root = resolve_platform_root(&platform_root, false).unwrap();
+    assert_eq!(root, resolve_platform_root(&platform_root, true).unwrap());
     assert_eq!(root, fs::canonicalize(&real_root).unwrap());
     let cas = PayloadCas::new(&root).expect("open CAS through resolved platform root");
     let payload = cas.prepare_bytes(b"synthetic Android asset").unwrap();
@@ -61,7 +62,7 @@ fn platform_root_does_not_assume_primary_user_or_package_name() {
     let root = fixture.path().join("user/10/another.synthetic.app");
     fs::create_dir_all(&root).unwrap();
     assert_eq!(
-        resolve_android_root(&root).unwrap(),
+        resolve_platform_root(&root, false).unwrap(),
         fs::canonicalize(root).unwrap()
     );
 }
@@ -73,7 +74,7 @@ fn platform_root_itself_cannot_be_a_link() {
     let root = fixture.path().join("linked-app");
     link_directory(outside.path(), &root);
     assert_eq!(
-        resolve_android_root(&root).unwrap_err().kind(),
+        resolve_platform_root(&root, false).unwrap_err().kind(),
         ErrorKind::InvalidData
     );
 }
@@ -84,17 +85,17 @@ fn platform_root_must_be_an_existing_absolute_directory() {
     let file = fixture.path().join("file");
     fs::write(&file, b"synthetic").unwrap();
     assert_eq!(
-        resolve_android_root(&file).unwrap_err().kind(),
+        resolve_platform_root(&file, false).unwrap_err().kind(),
         ErrorKind::InvalidData
     );
     assert_eq!(
-        resolve_android_root(&fixture.path().join("missing"))
+        resolve_platform_root(&fixture.path().join("missing"), false)
             .unwrap_err()
             .kind(),
         ErrorKind::NotFound
     );
     assert_eq!(
-        resolve_android_root(Path::new("relative-app"))
+        resolve_platform_root(Path::new("relative-app"), false)
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput
@@ -102,10 +103,35 @@ fn platform_root_must_be_an_existing_absolute_directory() {
 }
 
 #[test]
+fn first_run_creates_a_real_root_beneath_a_trusted_parent_alias() {
+    let fixture = tempfile::tempdir().unwrap();
+    let parent = fixture.path().join("real-parent");
+    fs::create_dir(&parent).unwrap();
+    let alias = fixture.path().join("home-alias");
+    link_directory(&parent, &alias);
+    let root = resolve_platform_root(&alias.join("RisuNest"), true).unwrap();
+    assert_eq!(root, parent.join("RisuNest").canonicalize().unwrap());
+    let cas = PayloadCas::new(&root).unwrap();
+    let payload = cas.prepare_bytes(b"first-run asset").unwrap();
+    assert_eq!(cas.read_object(&payload.content_hash).unwrap().unwrap(), b"first-run asset");
+}
+
+#[test]
+fn first_run_does_not_accept_a_linked_or_nonabsolute_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("linked-app");
+    link_directory(outside.path(), &root);
+    assert_eq!(resolve_platform_root(&root, true).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(resolve_platform_root(Path::new("relative-app"), true).unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn resolved_root_does_not_allow_asset_directory_redirection() {
     let fixture = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let root = resolve_android_root(fixture.path()).unwrap();
+    let root = resolve_platform_root(fixture.path(), false).unwrap();
     let cas = PayloadCas::new(&root).unwrap();
     let sentinel = outside.path().join("sentinel");
     fs::write(&sentinel, b"untouched").unwrap();
@@ -128,7 +154,7 @@ fn resolved_root_replaced_by_link_is_rejected_by_cas() {
     let outside = tempfile::tempdir().unwrap();
     let platform_root = fixture.path().join("app");
     fs::create_dir(&platform_root).unwrap();
-    let root = resolve_android_root(&platform_root).unwrap();
+    let root = resolve_platform_root(&platform_root, false).unwrap();
     let cas = PayloadCas::new(&root).unwrap();
     fs::remove_dir(&platform_root).unwrap();
     link_directory(outside.path(), &platform_root);

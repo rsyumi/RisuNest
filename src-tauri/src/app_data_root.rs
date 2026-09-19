@@ -3,33 +3,38 @@ use std::path::PathBuf;
 /// Resolve native storage only from the platform-owned application directory.
 pub(crate) fn resolve<R: tauri::Runtime>(app: &impl tauri::Manager<R>) -> tauri::Result<PathBuf> {
     let root = app.path().app_data_dir()?;
-    #[cfg(target_os = "android")]
-    return resolve_android_root(&root).map_err(Into::into);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    return resolve_platform_root(&root, cfg!(target_os = "linux")).map_err(Into::into);
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
     Ok(root)
 }
 
-#[cfg(any(test, target_os = "android"))]
-fn resolve_android_root(root: &std::path::Path) -> std::io::Result<PathBuf> {
+#[cfg(any(test, target_os = "android", target_os = "linux"))]
+fn resolve_platform_root(root: &std::path::Path, create_missing: bool) -> std::io::Result<PathBuf> {
     use std::{fs, io};
 
     if !root.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Android application data root must be absolute",
+            "Application data root must be absolute",
         ));
     }
-    let metadata = fs::symlink_metadata(root)?;
+    let metadata = match fs::symlink_metadata(root) {
+        Err(error) if create_missing && error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(root)?;
+            fs::symlink_metadata(root)?
+        }
+        result => result?,
+    };
     if crate::trust_boundary::is_link_like(&metadata) || !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Android application data root must be a real directory",
+            "Application data root must be a real directory",
         ));
     }
 
-    // Android's app mount namespace can alias /data/user/0 to /data/data.
-    // Only the OS-provided root may cross such parents. CAS still rejects
-    // links in every path it receives, including all app-owned descendants.
+    // Android mount aliases and Linux data/home aliases are trusted only
+    // above the OS-provided root. CAS still rejects all app-owned links.
     fs::canonicalize(root)
 }
 

@@ -32,6 +32,21 @@ pub struct UpdateScheduleStatus {
     pub action_matches: bool,
 }
 
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn user_service_directory(xdg: Option<PathBuf>, home: impl FnOnce() -> Result<PathBuf>) -> Result<PathBuf> {
+    let config = match xdg.filter(|path| path.is_absolute()) {
+        Some(path) => path,
+        None => {
+            let home = home()?;
+            if !home.is_absolute() {
+                return Err("absolute-config-path-required".into());
+            }
+            home.join(".config")
+        }
+    };
+    Ok(config.join("systemd/user"))
+}
+
 pub fn default_data_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     let root = std::env::var_os("LOCALAPPDATA")
@@ -486,10 +501,30 @@ pub fn xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn absolute_xdg_config_does_not_require_home() {
+        let root = tempfile::tempdir().unwrap();
+        let xdg = root.path().join("config");
+        let resolved = user_service_directory(Some(xdg.clone()), || panic!("HOME must stay lazy")).unwrap();
+        assert_eq!(resolved, xdg.join("systemd/user"));
+    }
+
+    #[test]
+    fn absent_empty_or_relative_xdg_uses_an_absolute_home() {
+        let root = tempfile::tempdir().unwrap();
+        for xdg in [None, Some(PathBuf::new()), Some(PathBuf::from("relative/config"))] {
+            let resolved = user_service_directory(xdg.clone(), || Ok(root.path().to_owned())).unwrap();
+            assert_eq!(resolved, root.path().join(".config/systemd/user"));
+            assert!(user_service_directory(xdg.clone(), || Err("home-unavailable".into())).is_err());
+            assert!(user_service_directory(xdg, || Ok(PathBuf::from("relative/home"))).is_err());
+        }
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn background_children_are_reaped_after_exit() {
         let mut command = Command::new("sh");
