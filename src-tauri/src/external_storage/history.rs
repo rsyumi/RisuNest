@@ -136,7 +136,7 @@ fn item(
 ) -> Value {
     let same_device =
         !store_id.is_empty() && document.captured_by_device.as_deref() == Some(store_id);
-    json!({"id":document.snapshot_id,"kind":kind,"createdAtMs":document.created_at_ms.to_string(),"logicalRevision":document.revision,"storedBytes":reference.receipt.byte_length.to_string(),"pinned":pinned,"complete":true,"verified":true,
+    json!({"id":document.snapshot_id,"snapshotId":document.snapshot_id,"kind":kind,"createdAtMs":document.created_at_ms.to_string(),"logicalRevision":document.revision,"storedBytes":reference.receipt.byte_length.to_string(),"pinned":pinned,"complete":true,"verified":true,
         "includedSections":document.sections.keys().collect::<Vec<_>>(),"sameDevice":same_device,
         "warning":"Snapshot metadata is authenticated. All referenced data is verified before restore."})
 }
@@ -193,11 +193,17 @@ pub(crate) async fn external_storage_list_history(
                     &document.snapshot_id,
                     &reference,
                 )?;
-                remember_item(
-                    &mut items,
-                    document.snapshot_id.clone(),
-                    item(&document, &reference, kind, pinned, &store_id),
-                );
+                let mut value = item(&document, &reference, kind, pinned, &store_id);
+                value["id"] = json!(point.document.point_id.clone());
+                value["pointId"] = json!(point.document.point_id.clone());
+                value["pointObservation"] = json!(serde_json::to_string(
+                    &point.reference.stored(&connected.handle)?,
+                ).map_err(runtime::local_error)?);
+                value["deletable"] = json!(matches!(
+                    point.document.kind,
+                    control::BackupPointKind::Automatic | control::BackupPointKind::Manual
+                ));
+                items.insert(point.document.point_id.clone(), value);
             }
         }
         match page.next_cursor {

@@ -28,6 +28,7 @@ mod wasm {
             "state" => Ok(ObjectRole::SyncState),
             "bundle" => Ok(ObjectRole::BackupBundle),
             "backupPoint" => Ok(ObjectRole::BackupPoint),
+            "inventoryPage" => Ok(ObjectRole::InventoryPage),
             "head" => Ok(ObjectRole::Head),
             _ => Err(JsValue::from_str("invalid-object-role")),
         }
@@ -44,6 +45,13 @@ mod wasm {
             ObjectRole::Head => HeadDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ()),
             ObjectRole::BackupPoint => {
                 BackupPointDocument::decode(bytes, MAX_CONTROL_BYTES).map(|_| ())
+            }
+            ObjectRole::InventoryPage => {
+                risunest_external_storage_format::control::InventoryPageDocument::decode(
+                    bytes,
+                    MAX_CONTROL_BYTES,
+                )
+                .map(|_| ())
             }
             _ => Ok(()),
         }

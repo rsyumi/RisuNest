@@ -289,10 +289,77 @@ pub(crate) struct BackupPointPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListedInventoryPage {
+    pub document: wire_control::InventoryPageDocument,
+    pub reference: RemoteObject,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InventoryPagePage {
+    pub pages: Vec<ListedInventoryPage>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoteConflictPointDeleteOutcome {
     Deleted,
     NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteBackupPointDeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteInventoryPageDeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
+pub(crate) struct InventoryRegistration<'a> {
+    pub intent: &'a ObjectIntent,
+    pub plaintext_length: u64,
+    pub plaintext_sha256: &'a str,
+}
+
+pub(crate) fn inventory_page_document(
+    descriptor: &Descriptor,
+    repository: &RepositoryHandle,
+    operation_id: &str,
+    page_id: &str,
+    registrations: &[InventoryRegistration<'_>],
+) -> Result<wire_control::InventoryPageDocument> {
+    descriptor.validate().map_err(corrupt)?;
+    let mut objects = registrations
+        .iter()
+        .map(|registration| {
+            let intent = registration.intent;
+            if intent.job_id != operation_id {
+                return Err(corrupt("inventory operation differs"));
+            }
+            intent.validate(repository)?;
+            wire_control::InventoryEntry::new(
+                intent.object_id.clone(),
+                wire_role(intent.role)?,
+                intent.byte_length,
+                decode_hash(&intent.sha256)?,
+                registration.plaintext_length,
+                decode_hash(registration.plaintext_sha256)?,
+            )
+            .map_err(corrupt)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    objects.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+    wire_control::InventoryPageDocument::new(
+        descriptor.repository_id.clone(),
+        operation_id.to_owned(),
+        page_id.to_owned(),
+        objects,
+    )
+    .map_err(corrupt)
 }
 
 fn seal(
@@ -589,6 +656,35 @@ pub(crate) async fn upload_backup_point(
     .await
 }
 
+pub(crate) async fn upload_inventory_page(
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    document: wire_control::InventoryPageDocument,
+    journal: &mut TransferJournal,
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<RemoteObject> {
+    if document.repository_id != descriptor.repository_id {
+        return Err(corrupt("inventory repository differs"));
+    }
+    let plaintext = document
+        .encode(MAX_POINT_PLAINTEXT)
+        .map_err(corrupt)?;
+    upload_control_object(
+        descriptor,
+        root_key,
+        format!("inventory-page-{}", document.page_id),
+        ObjectRole::InventoryPage,
+        &plaintext,
+        journal,
+        provider,
+        repository,
+        cancel,
+    )
+    .await
+}
+
 pub(crate) async fn ensure_remote_conflict_point(
     descriptor: &Descriptor,
     conflict_id: &str,
@@ -827,7 +923,22 @@ async fn upload_control_object(
     if recorded_plaintext != plaintext {
         return Err(corrupt("control journal content differs"));
     }
-    let receipt = transfer_job::upload(journal, &object_id, provider, repository, cancel).await?;
+    let receipt = if role == ObjectRole::InventoryPage {
+        transfer_job::upload_inventory(journal, &object_id, provider, repository, cancel).await?
+    } else {
+        transfer_job::upload_registered(
+            journal,
+            &object_id,
+            &descriptor.repository_id,
+            root_key,
+            plaintext.len() as u64,
+            &plaintext_sha256,
+            provider,
+            repository,
+            cancel,
+        )
+        .await?
+    };
     Ok(RemoteObject {
         repository_id: descriptor.repository_id.clone(),
         object_id,
@@ -887,6 +998,93 @@ async fn open_listed_point(
         },
         document,
     })
+}
+
+async fn open_listed_inventory_page(
+    receipt: ObjectReceipt,
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cancel: &Cancellation,
+) -> Result<ListedInventoryPage> {
+    receipt.locator.validate_for(repository)?;
+    if !receipt.complete || receipt.byte_length == 0 || receipt.byte_length > MAX_POINT_CIPHERTEXT {
+        return Err(corrupt("invalid listed inventory page"));
+    }
+    let (_, bytes) = download_control(
+        provider,
+        repository,
+        &receipt.locator,
+        None,
+        MAX_POINT_CIPHERTEXT,
+        cancel,
+    )
+    .await?;
+    let bytes = bytes.ok_or_else(|| corrupt("listed inventory page was not downloaded"))?;
+    let (plaintext, header, plaintext_sha256, ciphertext_sha256) = open(
+        descriptor,
+        root_key,
+        None,
+        wire::ObjectRole::InventoryPage,
+        &bytes,
+        MAX_POINT_PLAINTEXT,
+    )?;
+    let document = wire_control::InventoryPageDocument::decode(&plaintext, MAX_POINT_PLAINTEXT)
+        .map_err(corrupt)?;
+    if document.repository_id != descriptor.repository_id
+        || header.object_id != format!("inventory-page-{}", document.page_id)
+    {
+        return Err(corrupt("inventory page identity differs"));
+    }
+    Ok(ListedInventoryPage {
+        reference: RemoteObject {
+            repository_id: descriptor.repository_id.clone(),
+            object_id: header.object_id,
+            role: ObjectRole::InventoryPage,
+            receipt,
+            ciphertext_sha256,
+            plaintext_length: header.plaintext_length,
+            plaintext_sha256,
+        },
+        document,
+    })
+}
+
+pub(crate) async fn delete_authenticated_inventory_page(
+    connected: &super::connection_commands::ConnectedRepository,
+    expected: &wire::StoredObject,
+    cancel: &Cancellation,
+) -> Result<RemoteInventoryPageDeleteOutcome> {
+    if expected.header.role != wire::ObjectRole::InventoryPage
+        || !expected.header.object_id.starts_with("inventory-page-")
+    {
+        return Err(corrupt("inventory page reference differs"));
+    }
+    let expected = RemoteObject::from_stored(expected, &connected.handle)?;
+    let listed = match open_listed_inventory_page(
+        expected.receipt.clone(),
+        &connected.stored.descriptor,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await
+    {
+        Err(error) if error.kind == ErrorKind::NotFound => {
+            return Ok(RemoteInventoryPageDeleteOutcome::NotFound)
+        }
+        other => other?,
+    };
+    if listed.reference.stored(&connected.handle)? != expected.stored(&connected.handle)? {
+        return Err(corrupt("inventory page bytes differ"));
+    }
+    connected
+        .provider
+        .delete_object(&connected.handle, &expected.receipt.locator, cancel)
+        .await?;
+    Ok(RemoteInventoryPageDeleteOutcome::Deleted)
 }
 
 pub(crate) async fn delete_authenticated_conflict_point(
@@ -953,6 +1151,93 @@ pub(crate) async fn list_backup_points_page(
     }
     Ok(BackupPointPage {
         points,
+        next_cursor: page.next_cursor,
+    })
+}
+
+pub(crate) async fn delete_authenticated_backup_point(
+    connected: &super::connection_commands::ConnectedRepository,
+    point_id: &str,
+    expected_kind: BackupPointKind,
+    point: &wire::StoredObject,
+    cancel: &Cancellation,
+) -> Result<RemoteBackupPointDeleteOutcome> {
+    if point_id.is_empty()
+        || point_id.len() > 1024
+        || point_id.contains('\0')
+        || !matches!(expected_kind, BackupPointKind::Automatic | BackupPointKind::Manual)
+        || point.header.role != wire::ObjectRole::BackupPoint
+        || point.header.object_id != format!("backup-point-{point_id}")
+    {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    let expected = RemoteObject::from_stored(point, &connected.handle)?;
+    let listed = match open_listed_point(
+        expected.receipt.clone(),
+        &connected.stored.descriptor,
+        &connected.root_key,
+        connected.provider.as_ref(),
+        &connected.handle,
+        cancel,
+    )
+    .await
+    {
+        Err(error) if error.kind == ErrorKind::NotFound => {
+            return Ok(RemoteBackupPointDeleteOutcome::NotFound)
+        }
+        other => other?,
+    };
+    if listed.document.point_id != point_id
+        || listed.document.kind != expected_kind
+        || listed.reference.stored(&connected.handle)? != *point
+    {
+        return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+    }
+    connected
+        .provider
+        .delete_object(&connected.handle, &expected.receipt.locator, cancel)
+        .await?;
+    Ok(RemoteBackupPointDeleteOutcome::Deleted)
+}
+
+pub(crate) async fn list_inventory_pages_page(
+    descriptor: &Descriptor,
+    root_key: &[u8; 32],
+    provider: &dyn Provider,
+    repository: &RepositoryHandle,
+    cursor: Option<&str>,
+    limit: u16,
+    cancel: &Cancellation,
+) -> Result<InventoryPagePage> {
+    if limit == 0 || limit > 100 {
+        return Err(corrupt("invalid inventory page limit"));
+    }
+    let page = provider
+        .list_objects(
+            repository,
+            Collection::InventoryPages,
+            cursor,
+            limit,
+            cancel,
+        )
+        .await?;
+    let mut pages = Vec::with_capacity(page.objects.len());
+    for receipt in page.objects {
+        cancel.check()?;
+        pages.push(
+            open_listed_inventory_page(
+                receipt,
+                descriptor,
+                root_key,
+                provider,
+                repository,
+                cancel,
+            )
+            .await?,
+        );
+    }
+    Ok(InventoryPagePage {
+        pages,
         next_cursor: page.next_cursor,
     })
 }
@@ -1948,7 +2233,9 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(repeated.object_id, uploaded.object_id);
-            assert_eq!(provider.state.lock().unwrap().objects.len(), 1);
+            assert_eq!(provider.state.lock().unwrap().objects.len(), 2);
+            assert_eq!(provider.state.lock().unwrap().objects.keys()
+                .filter(|id| id.starts_with("inventory-page-")).count(), 1);
             assert_eq!(provider.upload_attempts("backup-point-conflict-1"), 1);
         });
     }
@@ -2008,6 +2295,168 @@ mod tests {
                 .unwrap(),
                 RemoteConflictPointDeleteOutcome::NotFound
             );
+        });
+    }
+
+    #[test]
+    fn ordinary_point_delete_requires_the_exact_authenticated_kind_and_observation() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider);
+            let root = tempfile::tempdir().unwrap();
+            let identity = JobIdentity {
+                job_id: "ordinary-operation".into(),
+                connection_id: "connection".into(),
+                repository_id: connected.handle.repository_id.clone(),
+                capture_id: "capture".into(),
+                capture: CaptureIdentity {
+                    store_id: "store".into(),
+                    library_epoch: "epoch".into(),
+                    generation: "generation".into(),
+                    selection_epoch: "selection".into(),
+                    revision: 1,
+                },
+            };
+            let mut journal = TransferJournal::open(root.path(), identity).unwrap();
+            let point = BackupPointDocument::single(
+                &connected.stored.descriptor,
+                "ordinary".into(),
+                BackupPointKind::Manual,
+                1,
+                bundle(&connected.handle, "bundle"),
+            ).unwrap();
+            let uploaded = upload_backup_point(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                point,
+                &mut journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                &Cancellation::default(),
+            ).await.unwrap();
+            let stored = uploaded.stored(&connected.handle).unwrap();
+
+            let error = delete_authenticated_backup_point(
+                &connected,
+                "ordinary",
+                BackupPointKind::Automatic,
+                &stored,
+                &Cancellation::default(),
+            ).await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+            let mut changed = stored.clone();
+            changed.plaintext_sha256[0] ^= 1;
+            let error = delete_authenticated_backup_point(
+                &connected,
+                "ordinary",
+                BackupPointKind::Manual,
+                &changed,
+                &Cancellation::default(),
+            ).await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+            assert_eq!(delete_authenticated_backup_point(
+                &connected,
+                "ordinary",
+                BackupPointKind::Manual,
+                &stored,
+                &Cancellation::default(),
+            ).await.unwrap(), RemoteBackupPointDeleteOutcome::Deleted);
+        });
+    }
+
+    #[test]
+    fn inventory_page_is_confirmed_listed_and_authenticated_before_delete() {
+        runtime().block_on(async {
+            let provider = Arc::new(fake::FakeProvider::new(false));
+            let connected = connected(provider.clone());
+            let root = tempfile::tempdir().unwrap();
+            let identity = JobIdentity {
+                job_id: "operation".into(),
+                connection_id: "connection".into(),
+                repository_id: connected.handle.repository_id.clone(),
+                capture_id: "capture".into(),
+                capture: CaptureIdentity {
+                    store_id: "store".into(),
+                    library_epoch: "epoch".into(),
+                    generation: "generation".into(),
+                    selection_epoch: "selection".into(),
+                    revision: 1,
+                },
+            };
+            let mut journal = TransferJournal::open(root.path(), identity).unwrap();
+            let intent = ObjectIntent {
+                repository_id: connected.handle.repository_id.clone(),
+                job_id: "operation".into(),
+                object_id: "pack-a".into(),
+                role: ObjectRole::Pack,
+                byte_length: 12,
+                sha256: "11".repeat(32),
+            };
+            let document = inventory_page_document(
+                &connected.stored.descriptor,
+                &connected.handle,
+                "operation",
+                "operation-0",
+                &[InventoryRegistration {
+                    intent: &intent,
+                    plaintext_length: 6,
+                    plaintext_sha256: &"22".repeat(32),
+                }],
+            )
+            .unwrap();
+            let uploaded = upload_inventory_page(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                document.clone(),
+                &mut journal,
+                connected.provider.as_ref(),
+                &connected.handle,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+
+            let listed = list_inventory_pages_page(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                connected.provider.as_ref(),
+                &connected.handle,
+                None,
+                10,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(listed.next_cursor, None);
+            assert_eq!(listed.pages.len(), 1);
+            assert_eq!(listed.pages[0].document, document);
+            assert_eq!(listed.pages[0].reference, uploaded);
+
+            let stored = uploaded.stored(&connected.handle).unwrap();
+            assert_eq!(
+                delete_authenticated_inventory_page(
+                    &connected,
+                    &stored,
+                    &Cancellation::default(),
+                )
+                .await
+                .unwrap(),
+                RemoteInventoryPageDeleteOutcome::Deleted
+            );
+            assert_eq!(provider.delete_attempts("inventory-page-operation-0"), 1);
+            assert!(list_inventory_pages_page(
+                &connected.stored.descriptor,
+                &connected.root_key,
+                connected.provider.as_ref(),
+                &connected.handle,
+                None,
+                10,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap()
+            .pages
+            .is_empty());
         });
     }
 
@@ -2072,7 +2521,9 @@ mod tests {
             assert_eq!(bundle.object_id, "snapshot-conflict-remote");
             assert_eq!(provider.upload_attempts("snapshot-remote-state"), 1);
             assert_eq!(provider.upload_attempts("snapshot-conflict-remote"), 1);
-            assert_eq!(provider.state.lock().unwrap().objects.len(), 2);
+            assert_eq!(provider.state.lock().unwrap().objects.len(), 4);
+            assert_eq!(provider.state.lock().unwrap().objects.keys()
+                .filter(|id| id.starts_with("inventory-page-")).count(), 2);
 
             let repeated = ensure_remote_conflict_bundle(
                 &connected,

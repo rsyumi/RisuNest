@@ -21,7 +21,7 @@
 //! credentials from `account_id` and those bytes.
 //!
 //! Below the root, each object role owns a collection (`descriptors`, `packs`,
-//! `catalogs`, `snapshots`, `points`, `leases`) and the head is the root member
+//! `catalogs`, `snapshots`, `points`, `inventory`, `leases`) and the head is the root member
 //! `head`.
 //! A `RemoteLocator.object` is the slash-joined raw path of an object relative
 //! to the root, which any device can resolve on its own.
@@ -58,9 +58,10 @@ const KOOFR_HOST: &str = "app.koofr.net";
 const KOOFR_DAV_PREFIX: &str = "/dav/";
 const ROOT_KEY: &str = "root";
 const DESCRIPTOR_FOLDER: &str = "descriptors";
-const ROLE_FOLDERS: [&str; 6] = [
+const ROLE_FOLDERS: [&str; 7] = [
     "catalogs",
     DESCRIPTOR_FOLDER,
+    "inventory",
     "leases",
     "packs",
     "points",
@@ -85,6 +86,7 @@ fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "points",
+        ObjectRole::InventoryPage => "inventory",
         ObjectRole::Lease => "leases",
     }
 }
@@ -92,6 +94,7 @@ fn collection_folder(collection: Collection) -> &'static str {
     match collection {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
+        Collection::InventoryPages => role_folder(ObjectRole::InventoryPage),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
         Collection::Leases => role_folder(ObjectRole::Lease),
     }

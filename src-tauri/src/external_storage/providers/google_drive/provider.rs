@@ -53,6 +53,7 @@ fn role_token(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "backupPoint",
+        ObjectRole::InventoryPage => "inventoryPage",
         ObjectRole::Lease => "lease",
     }
 }
@@ -63,6 +64,7 @@ fn collection_role(collection: Collection) -> ObjectRole {
     match collection {
         Collection::Snapshots => ObjectRole::SyncState,
         Collection::BackupPoints => ObjectRole::BackupPoint,
+        Collection::InventoryPages => ObjectRole::InventoryPage,
         Collection::Descriptors => ObjectRole::Descriptor,
         Collection::Leases => ObjectRole::Lease,
     }
@@ -71,6 +73,7 @@ fn collection_token(role: ObjectRole) -> Option<&'static str> {
     match role {
         ObjectRole::SyncState | ObjectRole::BackupBundle => Some("snapshots"),
         ObjectRole::BackupPoint => Some("backupPoints"),
+        ObjectRole::InventoryPage => Some("inventory"),
         ObjectRole::Descriptor => Some("descriptors"),
         ObjectRole::Lease => Some("leases"),
         ObjectRole::Pack | ObjectRole::Catalog => None,

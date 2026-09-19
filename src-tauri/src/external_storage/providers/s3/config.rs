@@ -90,6 +90,7 @@ pub(crate) fn role_folder(role: ObjectRole) -> &'static str {
         // authenticated envelope header, not the path, tells them apart.
         ObjectRole::SyncState | ObjectRole::BackupBundle => "snapshots",
         ObjectRole::BackupPoint => "backup-points",
+        ObjectRole::InventoryPage => "inventory",
         ObjectRole::Lease => "leases",
     }
 }
@@ -102,6 +103,7 @@ pub(crate) fn removable_folder(folder: &str) -> bool {
         ObjectRole::Catalog,
         ObjectRole::SyncState,
         ObjectRole::BackupPoint,
+        ObjectRole::InventoryPage,
         ObjectRole::Lease,
     ]
     .iter()
@@ -112,6 +114,7 @@ pub(crate) fn collection_folder(collection: Collection) -> &'static str {
     match collection {
         Collection::Snapshots => role_folder(ObjectRole::SyncState),
         Collection::BackupPoints => role_folder(ObjectRole::BackupPoint),
+        Collection::InventoryPages => role_folder(ObjectRole::InventoryPage),
         Collection::Descriptors => role_folder(ObjectRole::Descriptor),
         Collection::Leases => role_folder(ObjectRole::Lease),
     }

@@ -54,7 +54,14 @@ impl GcStore {
                stopped_reason TEXT,
                last_reachable_bytes INTEGER,
                last_removed_count INTEGER,
-               last_removed_bytes INTEGER);",
+               last_removed_bytes INTEGER);
+             CREATE TABLE IF NOT EXISTS inventory_page_observations(
+               connection_id TEXT NOT NULL,
+               target_id TEXT NOT NULL,
+               identity TEXT NOT NULL,
+               first_absent_ms INTEGER NOT NULL CHECK(first_absent_ms>=0),
+               last_observed_ms INTEGER NOT NULL CHECK(last_observed_ms>=first_absent_ms),
+               PRIMARY KEY(connection_id,target_id));",
         ).map_err(storage)?;
         for (table, expected) in [
             ("observations", &[
@@ -63,6 +70,9 @@ impl GcStore {
             ("cleanup_state", &[
                 "connection_id", "observation_valid", "last_run_ms", "stopped_reason",
                 "last_reachable_bytes", "last_removed_count", "last_removed_bytes",
+            ][..]),
+            ("inventory_page_observations", &[
+                "connection_id", "target_id", "identity", "first_absent_ms", "last_observed_ms",
             ][..]),
         ] {
             let mut query = db.prepare(&format!("PRAGMA table_info({table})")).map_err(storage)?;
@@ -86,6 +96,10 @@ impl GcStore {
         if !valid {
             transaction.execute("DELETE FROM observations WHERE connection_id=?1", [connection_id])
                 .map_err(storage)?;
+            transaction.execute(
+                "DELETE FROM inventory_page_observations WHERE connection_id=?1",
+                [connection_id],
+            ).map_err(storage)?;
         }
         transaction.execute(
             "INSERT INTO cleanup_state(connection_id,observation_valid) VALUES(?1,0)
@@ -110,6 +124,10 @@ impl GcStore {
         let transaction = self.0.unchecked_transaction().map_err(storage)?;
         transaction.execute("DELETE FROM observations WHERE connection_id=?1", [connection_id])
             .map_err(storage)?;
+        transaction.execute(
+            "DELETE FROM inventory_page_observations WHERE connection_id=?1",
+            [connection_id],
+        ).map_err(storage)?;
         transaction.execute(
             "INSERT INTO cleanup_state(connection_id,observation_valid) VALUES(?1,0)
              ON CONFLICT(connection_id) DO UPDATE SET observation_valid=0",
@@ -172,6 +190,67 @@ impl GcStore {
         Ok(())
     }
 
+    pub(crate) fn record_inventory_page_observations(
+        &self,
+        connection_id: &str,
+        absent: &BTreeMap<String, String>,
+        now_ms: u64,
+    ) -> Result<BTreeMap<String, u64>> {
+        let now = count(now_ms)?;
+        let transaction = self.0.unchecked_transaction().map_err(storage)?;
+        let previous = {
+            let mut query = transaction.prepare(
+                "SELECT target_id,identity,first_absent_ms,last_observed_ms
+                 FROM inventory_page_observations WHERE connection_id=?1",
+            ).map_err(storage)?;
+            let rows = query.query_map([connection_id], |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?, row.get::<_, i64>(3)?,
+            )))
+            .map_err(storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage)?;
+            rows
+        };
+        let mut ages = BTreeMap::new();
+        for (target, identity, first, last) in previous {
+            if first < 0 || last < first {
+                return Err(corrupt());
+            }
+            if absent.get(&target) == Some(&identity) && now >= last {
+                ages.insert(target, amount(first)?);
+            }
+        }
+        transaction.execute(
+            "DELETE FROM inventory_page_observations WHERE connection_id=?1",
+            [connection_id],
+        ).map_err(storage)?;
+        for (target, identity) in absent {
+            if target.is_empty() || !crate::trust_boundary::is_lower_hex_256(identity) {
+                return Err(corrupt());
+            }
+            let first = *ages.entry(target.clone()).or_insert(now_ms);
+            transaction.execute(
+                "INSERT INTO inventory_page_observations VALUES(?1,?2,?3,?4,?5)",
+                params![connection_id, target, identity, count(first)?, now],
+            ).map_err(storage)?;
+        }
+        transaction.commit().map_err(storage)?;
+        Ok(ages)
+    }
+
+    pub(crate) fn forget_inventory_page_observation(
+        &self,
+        connection_id: &str,
+        target: &str,
+    ) -> Result<()> {
+        self.0.execute(
+            "DELETE FROM inventory_page_observations WHERE connection_id=?1 AND target_id=?2",
+            params![connection_id, target],
+        ).map_err(storage)?;
+        Ok(())
+    }
+
     pub(crate) fn last_reachable_bytes(&self, connection_id: &str) -> Result<Option<u64>> {
         let value = self.0.query_row(
             "SELECT last_reachable_bytes FROM cleanup_state WHERE connection_id=?1",
@@ -212,6 +291,10 @@ impl GcStore {
         let transaction = self.0.unchecked_transaction().map_err(storage)?;
         transaction.execute("DELETE FROM observations WHERE connection_id=?1", [connection_id])
             .map_err(storage)?;
+        transaction.execute(
+            "DELETE FROM inventory_page_observations WHERE connection_id=?1",
+            [connection_id],
+        ).map_err(storage)?;
         transaction.execute("DELETE FROM cleanup_state WHERE connection_id=?1", [connection_id])
             .map_err(storage)?;
         transaction.commit().map_err(storage)
@@ -285,7 +368,7 @@ mod tests {
         let mut query = store.0.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
         let tables = query.query_map([], |row| row.get::<_, String>(0)).unwrap()
             .collect::<std::result::Result<Vec<_>, _>>().unwrap();
-        assert_eq!(tables, ["cleanup_state", "observations"]);
+        assert_eq!(tables, ["cleanup_state", "inventory_page_observations", "observations"]);
         assert_eq!(store.last_reachable_bytes("connection").unwrap(), None);
         store.set_last_reachable_bytes("connection", 512).unwrap();
         store.record_cleanup_run("connection", 1000, "complete", 1, 256).unwrap();
@@ -301,5 +384,24 @@ mod tests {
         db.execute_batch("CREATE TABLE observations(connection_id TEXT,target_id TEXT,first_seen_ms INTEGER);").unwrap();
         drop(db);
         assert!(matches!(GcStore::open(root.path()), Err(error) if error.kind == ErrorKind::Corrupt));
+    }
+
+    #[test]
+    fn inventory_page_age_survives_only_complete_unchanged_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let page = targets(&[("page", "identity")]);
+        let changed = targets(&[("page", "changed")]);
+        let store = GcStore::open(root.path()).unwrap();
+        store.begin_observation("connection").unwrap();
+        assert_eq!(store.record_inventory_page_observations("connection", &page, 1000).unwrap()["page"], 1000);
+        store.finish_observation("connection").unwrap();
+        drop(store);
+
+        let store = GcStore::open(root.path()).unwrap();
+        store.begin_observation("connection").unwrap();
+        assert_eq!(store.record_inventory_page_observations("connection", &page, 2000).unwrap()["page"], 1000);
+        assert_eq!(store.record_inventory_page_observations("connection", &changed, 3000).unwrap()["page"], 3000);
+        store.invalidate_observations("connection").unwrap();
+        assert_eq!(store.record_inventory_page_observations("connection", &page, 4000).unwrap()["page"], 4000);
     }
 }

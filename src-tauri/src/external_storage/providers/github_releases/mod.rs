@@ -970,6 +970,38 @@ impl Provider for GithubReleases {
         })
     }
 
+    fn lookup_object<'a>(
+        &'a self,
+        repository: &'a RepositoryHandle,
+        intent: &'a ObjectIntent,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, Option<ObjectReceipt>> {
+        Box::pin(async move {
+            cancel.check()?;
+            let context = self.context(repository)?;
+            intent.validate(repository)?;
+            if !api::is_safe_name(&intent.object_id, 180) {
+                return Err(corrupt());
+            }
+            let batch = api::batch_key(intent.role, &intent.job_id);
+            let name = api::asset_name(intent.role, &intent.object_id);
+            for seq in 0..RECONCILE_SEQ_SCAN {
+                let tag = context.tag(&batch, seq);
+                let Some(release) = self.find_release(context, &tag, cancel).await? else {
+                    break;
+                };
+                let Some(asset) = self.find_asset(context, release, &name, cancel).await? else {
+                    continue;
+                };
+                if asset.uploaded() && asset.matches(intent) {
+                    return Ok(Some(Self::receipt(context, &tag, release, &asset, intent)));
+                }
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+            Ok(None)
+        })
+    }
+
     fn reconcile_upload<'a>(
         &'a self,
         repository: &'a RepositoryHandle,

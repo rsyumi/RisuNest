@@ -173,7 +173,9 @@ async fn walk(
             }
             ObjectRole::Catalog => source.catalog(&object).await,
             ObjectRole::Pack | ObjectRole::BackupPoint => Ok(Vec::new()),
-            ObjectRole::Descriptor | ObjectRole::Lease => return Err(corrupt()),
+            ObjectRole::Descriptor | ObjectRole::InventoryPage | ObjectRole::Lease => {
+                return Err(corrupt())
+            }
         };
         // A disappearing metadata object changes the survey even when an earlier
         // direct probe found it. Do not hide a partially walked closure.

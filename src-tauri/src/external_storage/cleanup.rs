@@ -125,11 +125,34 @@ pub(crate) struct JobRoots {
     pub snapshot_ids: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InventorySurvey {
+    pub pages: Vec<InventoryPageState>,
+    pub objects: Vec<RemoteObject>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InventoryPageState {
+    pub reference: RemoteObject,
+    pub operation_id: String,
+    pub all_objects_absent: bool,
+}
+
 pub(crate) trait RepositoryView: Sync {
     fn roots<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots>;
     fn snapshots<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, Vec<ObjectReceipt>>;
     fn job_roots(&self) -> Result<JobRoots>;
     fn known_objects(&self) -> Result<Vec<RemoteObject>>;
+    fn inventory<'a>(&'a self, _cancel: &'a Cancellation) -> ProviderFuture<'a, InventorySurvey> {
+        Box::pin(async { Ok(InventorySurvey::default()) })
+    }
+    fn delete_inventory_page<'a>(
+        &'a self,
+        _expected: &'a risunest_external_storage_format::snapshot::StoredObject,
+        _cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, control::RemoteInventoryPageDeleteOutcome> {
+        Box::pin(async { Err(ProviderError::new(ErrorKind::Unsupported)) })
+    }
     fn confirmed_removed(&self, _object: &RemoteObject) -> Result<()> { Ok(()) }
     fn protected_jobs(&self) -> Vec<String> { Vec::new() }
 }
@@ -265,7 +288,10 @@ async fn run_owned(
     }
     let mut before = view.roots(cancel).await?;
     let listed = view.snapshots(cancel).await?;
+    let inventory = view.inventory(cancel).await?;
     let jobs = view.job_roots()?;
+    let mut known_objects = view.known_objects()?;
+    known_objects.extend(inventory.objects);
     let marked = reachability::mark(context.root, source, MarkRequest {
         connection_id: context.connection_id, repository: context.repository,
         format_repository_id: &context.descriptor.repository_id,
@@ -275,7 +301,7 @@ async fn run_owned(
             kept_bundles: before.kept_bundles.clone(), job_objects: jobs.objects.clone(),
             job_references: jobs.references.clone(), job_snapshot_ids: jobs.snapshot_ids.clone(),
         },
-        listed, known_objects: view.known_objects()?, retired_points: before.retired_points.clone(),
+        listed, known_objects, retired_points: before.retired_points.clone(),
     }, cancel).await?;
     if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
         outcome.stop_reason = reason;
@@ -387,6 +413,88 @@ async fn run_owned(
         owner.set_delete_in_flight(false);
     }
     if matches!(outcome.stop_reason, StopReason::Complete | StopReason::Limit) {
+        let protected = view.protected_jobs().into_iter().collect::<BTreeSet<_>>();
+        let fresh = view.inventory(cancel).await?;
+        let mut absent = BTreeMap::new();
+        let mut pages = BTreeMap::new();
+        for page in fresh.pages {
+            let key = locator_key(&page.reference.receipt.locator)?;
+            let identity = reachability::object_identity(&page.reference, context.repository)?;
+            if page.all_objects_absent && !protected.contains(&page.operation_id) {
+                absent.insert(key.clone(), identity.clone());
+            }
+            if pages.insert(key, (identity, page)).is_some() {
+                return Err(ProviderError::new(ErrorKind::Corrupt));
+            }
+        }
+        let observed_at = context.clock.reading().wall_ms;
+        let ages = GcStore::open(context.root)?.record_inventory_page_observations(
+            context.connection_id,
+            &absent,
+            observed_at,
+        )?;
+        for (key, first_absent) in ages {
+            if sent >= request.limits.per_run {
+                outcome.stop_reason = StopReason::Limit;
+                break;
+            }
+            if observed_at.saturating_sub(first_absent) < leases::UNREACHABLE_GRACE_MS {
+                continue;
+            }
+            let Some((expected_identity, expected)) = pages.get(&key) else {
+                continue;
+            };
+            if let Some(reason) = current_limit(
+                context,
+                request,
+                time_not_before,
+                owner,
+                started,
+                cancel,
+            )? {
+                outcome.stop_reason = reason;
+                break;
+            }
+            if let Some(reason) = recheck(context, owner, view, &before, &jobs, cancel).await? {
+                outcome.stop_reason = reason;
+                break;
+            }
+            let confirmation = view.inventory(cancel).await?;
+            let Some(current) = confirmation.pages.into_iter().find(|page| {
+                locator_key(&page.reference.receipt.locator).ok().as_deref() == Some(key.as_str())
+            }) else {
+                GcStore::open(context.root)?
+                    .forget_inventory_page_observation(context.connection_id, &key)?;
+                continue;
+            };
+            if !current.all_objects_absent
+                || protected.contains(&current.operation_id)
+                || reachability::object_identity(&current.reference, context.repository)?
+                    != *expected_identity
+            {
+                GcStore::open(context.root)?
+                    .forget_inventory_page_observation(context.connection_id, &key)?;
+                continue;
+            }
+            owner.set_delete_in_flight(true);
+            let stored = current.reference.stored(context.repository)?;
+            let removed = view.delete_inventory_page(&stored, cancel).await;
+            owner.set_delete_in_flight(false);
+            match removed? {
+                control::RemoteInventoryPageDeleteOutcome::Deleted
+                | control::RemoteInventoryPageDeleteOutcome::NotFound => {
+                    sent += 1;
+                    GcStore::open(context.root)?
+                        .forget_inventory_page_observation(context.connection_id, &key)?;
+                    outcome.deleted_objects = outcome.deleted_objects.saturating_add(1);
+                    outcome.deleted_bytes = outcome
+                        .deleted_bytes
+                        .saturating_add(expected.reference.receipt.byte_length);
+                }
+            }
+        }
+    }
+    if matches!(outcome.stop_reason, StopReason::Complete | StopReason::Limit) {
         if let Some(reason) = current_limit(context, request, time_not_before, owner, started, cancel)? {
             outcome.stop_reason = reason;
         } else if let Some(reason) = recheck(context, owner, view, &before, &jobs, cancel).await? {
@@ -484,6 +592,91 @@ impl ConnectedRepositoryView<'_> {
         }
         Ok(sources)
     }
+
+    async fn read_inventory(&self, cancel: &Cancellation) -> Result<InventorySurvey> {
+        let mut survey = InventorySurvey::default();
+        let mut cursor: Option<String> = None;
+        let mut tracker = PageTracker::default();
+        let mut page_ids = BTreeSet::new();
+        loop {
+            let page = leases::control_request(
+                cancel,
+                control::list_inventory_pages_page(
+                    &self.connected.stored.descriptor,
+                    &self.connected.root_key,
+                    self.connected.provider.as_ref(),
+                    &self.connected.handle,
+                    cursor.as_deref(),
+                    100,
+                    cancel,
+                ),
+            )
+            .await?;
+            let receipts = page
+                .pages
+                .iter()
+                .map(|page| page.reference.receipt.clone())
+                .collect::<Vec<_>>();
+            tracker.accept(
+                &self.connected.handle,
+                &receipts,
+                page.next_cursor.as_deref(),
+            )?;
+            for listed in page.pages {
+                if !page_ids.insert(listed.document.page_id.clone()) {
+                    return Err(ProviderError::new(ErrorKind::Corrupt));
+                }
+                let mut present = 0usize;
+                for entry in &listed.document.objects {
+                    let role = packaging::native_role(entry.role)?;
+                    let intent = ObjectIntent {
+                        repository_id: self.connected.handle.repository_id.clone(),
+                        job_id: listed.document.operation_id.clone(),
+                        object_id: entry.object_id.clone(),
+                        role,
+                        byte_length: entry.ciphertext_length,
+                        sha256: hex::encode(entry.ciphertext_sha256),
+                    };
+                    let Some(receipt) = leases::control_request(
+                        cancel,
+                        self.connected.provider.lookup_object(
+                            &self.connected.handle,
+                            &intent,
+                            cancel,
+                        ),
+                    )
+                    .await?
+                    else {
+                        continue;
+                    };
+                    super::journal::validate_receipt(
+                        &intent,
+                        &self.connected.handle,
+                        &receipt,
+                    )?;
+                    present += 1;
+                    survey.objects.push(RemoteObject {
+                        repository_id: listed.document.repository_id.clone(),
+                        object_id: entry.object_id.clone(),
+                        role,
+                        receipt,
+                        ciphertext_sha256: intent.sha256,
+                        plaintext_length: entry.plaintext_length,
+                        plaintext_sha256: hex::encode(entry.plaintext_sha256),
+                    });
+                }
+                survey.pages.push(InventoryPageState {
+                    reference: listed.reference,
+                    operation_id: listed.document.operation_id,
+                    all_objects_absent: present == 0,
+                });
+            }
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(survey),
+            }
+        }
+    }
 }
 impl RepositoryView for ConnectedRepositoryView<'_> {
     fn roots<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
@@ -559,6 +752,20 @@ impl RepositoryView for ConnectedRepositoryView<'_> {
             self.cache_root, &self.connected.stored.descriptor.repository_id, &self.connected.handle,
         )
     }
+    fn inventory<'a>(&'a self, cancel: &'a Cancellation) -> ProviderFuture<'a, InventorySurvey> {
+        Box::pin(self.read_inventory(cancel))
+    }
+    fn delete_inventory_page<'a>(
+        &'a self,
+        expected: &'a risunest_external_storage_format::snapshot::StoredObject,
+        cancel: &'a Cancellation,
+    ) -> ProviderFuture<'a, control::RemoteInventoryPageDeleteOutcome> {
+        Box::pin(control::delete_authenticated_inventory_page(
+            self.connected,
+            expected,
+            cancel,
+        ))
+    }
 }
 
 pub(crate) struct ConnectedDocuments<'a> {
@@ -626,10 +833,13 @@ mod tests {
     use super::*;
     use crate::external_storage::{
         fake::{self, DeleteFault, FakeLeaseClock, FakeProvider},
+        journal::JobIdentity,
         reachability::tests::{object, source, Source},
+        transfer_job,
     };
+    use crate::persistent_store::sync_selection::CaptureIdentity;
     use risunest_external_storage_format::format::{Descriptor, Strategy};
-    use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex};
+    use std::{io::Write, sync::{atomic::{AtomicUsize, Ordering}, Arc, Mutex}};
 
     const NOW: u64 = 1000 * 24 * 60 * leases::MINUTE_MS;
     fn available_time(_: Instant) -> Result<bool> { Ok(true) }
@@ -645,6 +855,9 @@ mod tests {
         change_at: AtomicUsize,
         listing_error: Mutex<Option<ErrorKind>>,
         removed: Mutex<Vec<String>>,
+        inventory: Mutex<InventorySurvey>,
+        retired_inventory: Mutex<Vec<String>>,
+        protected: Mutex<Vec<String>>,
     }
     impl RepositoryView for View {
         fn roots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
@@ -669,10 +882,24 @@ mod tests {
         }
         fn job_roots(&self) -> Result<JobRoots> { Ok(self.jobs.lock().unwrap().clone()) }
         fn known_objects(&self) -> Result<Vec<RemoteObject>> { Ok(self.known.clone()) }
+        fn inventory<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, InventorySurvey> {
+            Box::pin(async move { Ok(self.inventory.lock().unwrap().clone()) })
+        }
+        fn delete_inventory_page<'a>(
+            &'a self,
+            expected: &'a risunest_external_storage_format::snapshot::StoredObject,
+            _: &'a Cancellation,
+        ) -> ProviderFuture<'a, control::RemoteInventoryPageDeleteOutcome> {
+            Box::pin(async move {
+                self.retired_inventory.lock().unwrap().push(expected.header.object_id.clone());
+                Ok(control::RemoteInventoryPageDeleteOutcome::Deleted)
+            })
+        }
         fn confirmed_removed(&self, object: &RemoteObject) -> Result<()> {
             self.removed.lock().unwrap().push(object.object_id.clone());
             Ok(())
         }
+        fn protected_jobs(&self) -> Vec<String> { self.protected.lock().unwrap().clone() }
     }
     struct Probes<'a> {
         source: &'a Source,
@@ -725,6 +952,9 @@ mod tests {
                     roots: Mutex::new(ObservedRoots::default()), jobs: Mutex::new(JobRoots::default()), known,
                     reads: AtomicUsize::new(0), change_at: AtomicUsize::new(usize::MAX),
                     listing_error: Mutex::new(None), removed: Mutex::new(Vec::new()),
+                    inventory: Mutex::new(InventorySurvey::default()),
+                    retired_inventory: Mutex::new(Vec::new()),
+                    protected: Mutex::new(Vec::new()),
                 },
             }
         }
@@ -762,6 +992,160 @@ mod tests {
             assert_eq!(result.stop_reason, StopReason::Complete);
             assert_eq!(result.deleted_objects, 2);
             assert_eq!(h.payload_deletes(), ["parent-catalog", "child-pack"]);
+        });
+    }
+    #[test]
+    fn c_empty_inventory_pages_wait_seven_days_and_are_rechecked_before_retirement() {
+        runtime().block_on(async {
+            let h = Harness::new();
+            let page = object("inventory-page-old", ObjectRole::InventoryPage);
+            *h.view.inventory.lock().unwrap() = InventorySurvey {
+                pages: vec![InventoryPageState {
+                    reference: page,
+                    operation_id: "finished-operation".into(),
+                    all_objects_absent: true,
+                }],
+                objects: Vec::new(),
+            };
+            assert_eq!(h.run().await.unwrap().deleted_objects, 0);
+            h.clock.advance(leases::UNREACHABLE_GRACE_MS);
+            let result = h.run().await.unwrap();
+            assert_eq!(result.stop_reason, StopReason::Complete);
+            assert_eq!(h.view.retired_inventory.lock().unwrap().as_slice(), ["inventory-page-old"]);
+            assert_eq!(result.deleted_objects, 3);
+        });
+    }
+
+    #[test]
+    fn c_live_or_newly_protected_inventory_pages_do_not_retire() {
+        runtime().block_on(async {
+            let h = Harness::new();
+            let page = object("inventory-page-protected", ObjectRole::InventoryPage);
+            *h.view.inventory.lock().unwrap() = InventorySurvey {
+                pages: vec![InventoryPageState {
+                    reference: page,
+                    operation_id: "resumed-operation".into(),
+                    all_objects_absent: true,
+                }],
+                objects: Vec::new(),
+            };
+            assert_eq!(h.run().await.unwrap().deleted_objects, 0);
+            h.clock.advance(leases::UNREACHABLE_GRACE_MS);
+            h.view.protected.lock().unwrap().push("resumed-operation".into());
+            assert_eq!(h.run().await.unwrap().deleted_objects, 2);
+            assert!(h.view.retired_inventory.lock().unwrap().is_empty());
+
+            h.view.protected.lock().unwrap().clear();
+            assert_eq!(h.run().await.unwrap().deleted_objects, 0);
+            assert!(h.view.retired_inventory.lock().unwrap().is_empty());
+            h.view.inventory.lock().unwrap().pages[0].all_objects_absent = false;
+            h.clock.advance(leases::UNREACHABLE_GRACE_MS);
+            assert_eq!(h.run().await.unwrap().deleted_objects, 0);
+            assert!(h.view.retired_inventory.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn c_fresh_device_discovers_registered_payload_without_a_local_package_cache() {
+        runtime().block_on(async {
+            let upload_root = tempfile::tempdir().unwrap();
+            let empty_cache = tempfile::tempdir().unwrap();
+            let provider = Arc::new(FakeProvider::new(false));
+            let repository = fake::repository();
+            let descriptor = Descriptor::new("format-repository".into(), None).unwrap();
+            let identity = JobIdentity {
+                job_id: "interrupted-upload".into(),
+                connection_id: "connection".into(),
+                repository_id: repository.repository_id.clone(),
+                capture_id: "capture".into(),
+                capture: CaptureIdentity {
+                    store_id: "store".into(),
+                    library_epoch: "epoch".into(),
+                    generation: "generation".into(),
+                    selection_epoch: "selection".into(),
+                    revision: 1,
+                },
+            };
+            let mut journal = TransferJournal::open(upload_root.path(), identity.clone()).unwrap();
+            let bytes = b"synthetic interrupted payload";
+            let intent = ObjectIntent {
+                repository_id: repository.repository_id.clone(),
+                job_id: identity.job_id.clone(),
+                object_id: "pack-interrupted".into(),
+                role: ObjectRole::Pack,
+                byte_length: bytes.len() as u64,
+                sha256: risunest_sync_wire::hash(bytes),
+            };
+            let mut spool = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(journal.spool_path(&intent.object_id))
+                .unwrap();
+            spool.write_all(bytes).unwrap();
+            spool.sync_all().unwrap();
+            journal.register(&intent).unwrap();
+            transfer_job::upload_registered(
+                &mut journal,
+                &intent.object_id,
+                &descriptor.repository_id,
+                &[7; 32],
+                intent.byte_length,
+                &intent.sha256,
+                provider.as_ref(),
+                &repository,
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            drop(journal);
+
+            let test = fake::loopback_dependencies(fake::MemoryVault::default(), 1_000);
+            let connected = ConnectedRepository {
+                stored: super::super::connection_store::StoredConnection {
+                    id: "connection".into(),
+                    config: super::super::contract::ConnectionConfig {
+                        provider: "synthetic".into(),
+                        profile: None,
+                        endpoint: "https://synthetic.invalid".into(),
+                        account_id: "account".into(),
+                        location: BTreeMap::new(),
+                        oauth_profile: None,
+                    },
+                    descriptor,
+                    descriptor_locator: super::super::contract::RemoteLocator {
+                        connection_identity: repository.connection_identity.clone(),
+                        collection: None,
+                        object: "descriptor".into(),
+                    },
+                    provider_repository_id: repository.repository_id.clone(),
+                    credential_ref: "credential".into(),
+                    root_key_ref: "key".into(),
+                    capture_policy: None,
+                    retention_policy: None,
+                    capabilities: fake::capabilities(true),
+                    created_at_ms: 1_000,
+                    last_sync_at_ms: None,
+                    last_backup_at_ms: None,
+                },
+                provider,
+                handle: repository,
+                dependencies: test.dependencies,
+                root_key: zeroize::Zeroizing::new([7; 32]),
+            };
+            let view = ConnectedRepositoryView {
+                connected: &connected,
+                writer_id: "other-device",
+                policy: RetentionPolicy::DEFAULT,
+                now_ms: NOW,
+                unfinished: Vec::new(),
+                cache_root: empty_cache.path(),
+            };
+
+            let survey = view.read_inventory(&Cancellation::default()).await.unwrap();
+            assert_eq!(survey.objects.len(), 1);
+            assert_eq!(survey.objects[0].object_id, intent.object_id);
+            assert_eq!(survey.pages.len(), 1);
+            assert!(!survey.pages[0].all_objects_absent);
         });
     }
     #[test]

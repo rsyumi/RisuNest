@@ -194,7 +194,13 @@ pub(crate) async fn resume_existing(
 ) -> Result<Option<RemoteLocator>> {
     expected.validate().map_err(|_| corrupt())?;
     let mut descriptor = None;
-    for collection in [Collection::Snapshots, Collection::BackupPoints, Collection::Leases, Collection::Descriptors] {
+    for collection in [
+        Collection::Snapshots,
+        Collection::BackupPoints,
+        Collection::InventoryPages,
+        Collection::Leases,
+        Collection::Descriptors,
+    ] {
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
         let mut complete = false;

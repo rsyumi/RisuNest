@@ -181,7 +181,7 @@ impl Context {
     pub(super) fn holds_collection(&self, tag: &str, collection: Collection) -> bool {
         match collection {
             Collection::Descriptors => tag == self.descriptor_tag(),
-            Collection::Snapshots | Collection::BackupPoints => {
+            Collection::Snapshots | Collection::BackupPoints | Collection::InventoryPages => {
                 tag.starts_with(&format!("{}-{JOB_BATCH_PREFIX}", self.tag_prefix))
             }
             Collection::Leases => tag.starts_with(&format!("{}-{LEASE_BATCH}-", self.tag_prefix)),
@@ -253,6 +253,7 @@ pub(super) fn role_prefix(role: ObjectRole) -> &'static str {
         ObjectRole::SyncState => "state",
         ObjectRole::BackupBundle => "bundle",
         ObjectRole::BackupPoint => "point",
+        ObjectRole::InventoryPage => "inventory",
         ObjectRole::Lease => "lease",
     }
 }
@@ -263,6 +264,7 @@ pub(super) fn collection_roles(collection: Collection) -> &'static [ObjectRole] 
     match collection {
         Collection::Snapshots => &[ObjectRole::SyncState, ObjectRole::BackupBundle],
         Collection::BackupPoints => &[ObjectRole::BackupPoint],
+        Collection::InventoryPages => &[ObjectRole::InventoryPage],
         Collection::Descriptors => &[ObjectRole::Descriptor],
         Collection::Leases => &[ObjectRole::Lease],
     }
@@ -284,6 +286,7 @@ pub(super) fn removable_asset(name: &str) -> bool {
         ObjectRole::SyncState,
         ObjectRole::BackupBundle,
         ObjectRole::BackupPoint,
+        ObjectRole::InventoryPage,
         ObjectRole::Lease,
     ]
     .iter()

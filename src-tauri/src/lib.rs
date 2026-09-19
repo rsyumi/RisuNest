@@ -670,6 +670,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         external_storage::runtime::external_storage_cancel_job,
         external_storage::runtime::external_storage_get_quota,
         external_storage::history::external_storage_list_history,
+        external_storage::history_deletion::external_storage_prepare_history_delete,
         external_storage::sync_engine::external_storage_list_conflicts,
         external_storage::sync_engine::external_storage_delete_conflict,
         external_storage::sync_engine::external_storage_recheck_conflict,
