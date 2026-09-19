@@ -12,6 +12,7 @@ import {
     type AndroidSafDestinationResult,
 } from './storage/androidSafBridge'
 import { listenRecoveredPublications } from './storage/recoveredPublicationListener'
+import { exportIOSFile } from './storage/iosFiles'
 
 export const SCREENSHOT_OUTPUT_CHUNK_BYTES = 64 * 1024
 
@@ -26,6 +27,23 @@ interface AndroidScreenshotArchiveDependencies {
     copyToAndroidSaf(request: AndroidSafDestinationRequest): Promise<AndroidSafDestinationResult>
     acknowledgeAndroidSafExport(requestId: string): boolean
     warn(warningCode: string): void
+}
+
+interface MobileScreenshotArchiveDependencies {
+    invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
+    exportFile(request: {
+        sourcePath: string
+        suggestedName: string
+        signal?: AbortSignal
+    }): Promise<{ bytes: number; requestId?: string; warningCodes?: string[] }>
+    acknowledgePublication?(requestId: string): boolean
+    warn(warningCode: string): void
+}
+
+const productionIOSDependencies: MobileScreenshotArchiveDependencies = {
+    invoke: (command, args) => invoke(command, args),
+    exportFile: exportIOSFile,
+    warn: (warningCode) => console.warn(`iOS screenshot output warning: ${warningCode}`),
 }
 
 const productionDependencies: NativeScreenshotArchiveDependencies = {
@@ -51,9 +69,9 @@ function warningCodes(result: unknown): string[] {
     return [...new Set(warnings.filter((warning): warning is string => typeof warning === 'string'))]
 }
 
-function readAndroidHandoff(result: unknown): { bytes: number; sourcePath: string } {
+function readMobileHandoff(result: unknown): { bytes: number; sourcePath: string } {
     if (!result || typeof result !== 'object') {
-        throw new Error('Native screenshot output returned an invalid Android handoff')
+        throw new Error('Native screenshot output returned an invalid mobile handoff')
     }
     const value = result as { bytes?: unknown; sourcePath?: unknown }
     if (
@@ -63,12 +81,12 @@ function readAndroidHandoff(result: unknown): { bytes: number; sourcePath: strin
         || typeof value.sourcePath !== 'string'
         || !value.sourcePath
     ) {
-        throw new Error('Native screenshot output returned an invalid Android handoff')
+        throw new Error('Native screenshot output returned an invalid mobile handoff')
     }
     return { bytes: value.bytes, sourcePath: value.sourcePath }
 }
 
-function androidPublicationError(code: string, message: string, warningCodes: string[] = []) {
+function screenshotPublicationError(code: string, message: string, warningCodes: string[] = []) {
     return Object.assign(new Error(message), { code, warningCodes })
 }
 
@@ -168,7 +186,7 @@ class NativeScreenshotArchiveWriter implements ScreenshotArchiveWriter {
     }
 }
 
-class AndroidScreenshotArchiveWriter implements ScreenshotArchiveWriter {
+class MobileScreenshotArchiveWriter implements ScreenshotArchiveWriter {
     private state: 'open' | 'publishing' | 'closed' | 'aborted' = 'open'
     private publication: Promise<void> | null = null
     private aborting: Promise<boolean> | null = null
@@ -182,19 +200,19 @@ class AndroidScreenshotArchiveWriter implements ScreenshotArchiveWriter {
     constructor(
         private readonly jobId: string,
         private readonly suggestedName: string,
-        private readonly dependencies: AndroidScreenshotArchiveDependencies,
+        private readonly dependencies: MobileScreenshotArchiveDependencies,
     ) {}
 
     async write(chunk: Uint8Array): Promise<void> {
-        if (this.state === 'aborted') throw new Error('Android screenshot output was aborted')
-        if (this.state !== 'open') throw new Error('Android screenshot output is finalized')
+        if (this.state === 'aborted') throw new Error('Mobile screenshot output was aborted')
+        if (this.state !== 'open') throw new Error('Mobile screenshot output is finalized')
         await appendNativeChunk(this.jobId, chunk, this.dependencies.invoke)
     }
 
     async close(): Promise<void> {
-        if (this.state === 'aborted') throw new Error('Android screenshot output was aborted')
+        if (this.state === 'aborted') throw new Error('Mobile screenshot output was aborted')
         if (this.state === 'closed') return
-        if (this.state !== 'open') throw new Error('Android screenshot output is being published')
+        if (this.state !== 'open') throw new Error('Mobile screenshot output is being published')
         this.state = 'publishing'
         this.publication = this.publish().catch((error) => {
             this.publicationError = error
@@ -222,22 +240,21 @@ class AndroidScreenshotArchiveWriter implements ScreenshotArchiveWriter {
                 'native_file_job_screenshot_output_publish',
                 { jobId: this.jobId },
             )
-            const handoff = readAndroidHandoff(prepared)
+            const handoff = readMobileHandoff(prepared)
             this.handoffReady = true
             for (const warningCode of warningCodes(prepared)) this.dependencies.warn(warningCode)
-            const published = await this.dependencies.copyToAndroidSaf({
+            const published = await this.dependencies.exportFile({
                 sourcePath: handoff.sourcePath,
                 suggestedName: this.suggestedName,
                 signal: this.publicationController.signal,
-                deferAcknowledgement: true,
             })
             this.destinationRequestId = published.requestId ?? null
             this.destinationCommitted = true
             for (const warningCode of warningCodes(published)) this.dependencies.warn(warningCode)
             if (published.bytes !== handoff.bytes) {
-                throw androidPublicationError(
+                throw screenshotPublicationError(
                     'length-mismatch',
-                    'Android screenshot output length does not match its native handoff',
+                    'Mobile screenshot output length does not match its native handoff',
                     ['partial-destination-may-remain'],
                 )
             }
@@ -255,7 +272,8 @@ class AndroidScreenshotArchiveWriter implements ScreenshotArchiveWriter {
             }
             if (
                 this.destinationRequestId
-                && !this.dependencies.acknowledgeAndroidSafExport(this.destinationRequestId)
+                && this.dependencies.acknowledgePublication
+                && !this.dependencies.acknowledgePublication(this.destinationRequestId)
             ) {
                 this.dependencies.warn('cleanup-failed')
             }
@@ -437,9 +455,28 @@ export async function createNativeScreenshotArchiveWriter(
     return new NativeScreenshotArchiveWriter(started.jobId, dependencies)
 }
 
-export async function createAndroidScreenshotArchiveWriter(
+export function createAndroidScreenshotArchiveWriter(
     suggestedName: string,
     dependencies: AndroidScreenshotArchiveDependencies = productionAndroidDependencies,
+): Promise<ScreenshotArchiveWriter> {
+    return createMobileScreenshotArchiveWriter(suggestedName, {
+        invoke: dependencies.invoke,
+        exportFile: (request) => dependencies.copyToAndroidSaf({ ...request, deferAcknowledgement: true }),
+        acknowledgePublication: dependencies.acknowledgeAndroidSafExport,
+        warn: dependencies.warn,
+    })
+}
+
+export function createIOSScreenshotArchiveWriter(
+    suggestedName: string,
+    dependencies: MobileScreenshotArchiveDependencies = productionIOSDependencies,
+): Promise<ScreenshotArchiveWriter> {
+    return createMobileScreenshotArchiveWriter(suggestedName, dependencies)
+}
+
+async function createMobileScreenshotArchiveWriter(
+    suggestedName: string,
+    dependencies: MobileScreenshotArchiveDependencies,
 ): Promise<ScreenshotArchiveWriter> {
     const started = await dependencies.invoke('native_file_job_screenshot_output_start', {
         destination: null,
@@ -447,7 +484,7 @@ export async function createAndroidScreenshotArchiveWriter(
     if (typeof started.jobId !== 'string' || !started.jobId) {
         throw new Error('Native screenshot output returned an invalid job ID')
     }
-    return new AndroidScreenshotArchiveWriter(started.jobId, suggestedName, dependencies)
+    return new MobileScreenshotArchiveWriter(started.jobId, suggestedName, dependencies)
 }
 
 export function describeScreenshotPublicationError(error: unknown, partialWarning: string) {

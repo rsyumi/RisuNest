@@ -60,8 +60,8 @@
     } from 'src/ts/chatScreenshotSourceLease';
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
-    import { createAndroidScreenshotArchiveWriter, createNativeScreenshotArchiveWriter, describeScreenshotPublicationError } from 'src/ts/nativeScreenshotArchiveWriter';
-    import { isTauri, isTauriAndroid, isTauriDesktop } from 'src/ts/platform';
+    import { createAndroidScreenshotArchiveWriter, createIOSScreenshotArchiveWriter, createNativeScreenshotArchiveWriter, describeScreenshotPublicationError } from 'src/ts/nativeScreenshotArchiveWriter';
+    import { isTauri, isTauriAndroid, isTauriDesktop, isTauriIOS } from 'src/ts/platform';
     import { isAndroidSafFileJobsEnabled } from 'src/ts/storage/androidSafBridge';
     import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules, getModuleTriggers } from 'src/ts/process/modules';
     import { ColorSchemeTypeStore } from 'src/ts/gui/colorscheme';
@@ -994,12 +994,16 @@
                         if (!canExportLongScreenshotArchive(
                             isTauri,
                             isTauriDesktop,
-                            androidSafReady,
+                            androidSafReady || isTauriIOS,
                         )) {
                             throw new Error(language.screenshotLongNativeUnavailable)
                         }
                         if (isTauriDesktop) {
                             const writer = await createNativeScreenshotArchiveWriter(`${fileBase}.zip`)
+                            return createStreamingScreenshotArchive(writer)
+                        }
+                        if (isTauriIOS) {
+                            const writer = await createIOSScreenshotArchiveWriter(`${fileBase}.zip`)
                             return createStreamingScreenshotArchive(writer)
                         }
                         if (androidSafReady) {

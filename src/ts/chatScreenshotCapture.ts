@@ -52,9 +52,9 @@ function throwIfAborted(signal: AbortSignal) {
 export function canExportLongScreenshotArchive(
     isNative: boolean,
     isNativeDesktop: boolean,
-    isAndroidSafReady = false,
+    isNativeMobileExportReady = false,
 ) {
-    return !isNative || isNativeDesktop || isAndroidSafReady
+    return !isNative || isNativeDesktop || isNativeMobileExportReady
 }
 
 export async function captureChatScreenshot(
