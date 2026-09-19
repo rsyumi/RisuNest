@@ -2,9 +2,23 @@ import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
+    platform: 'web' as 'web' | 'desktop' | 'ios' | 'android',
+    importIOS: vi.fn(), importAndroid: vi.fn(), importDesktop: vi.fn(),
+    open: vi.fn(),
     readImage: vi.fn(),
     saveAsset: vi.fn(async (_data: Uint8Array) => ''),
 }))
+
+vi.mock('../platform', () => ({
+    get isTauri() { return mocks.platform !== 'web' },
+    get isTauriDesktop() { return mocks.platform === 'desktop' },
+    get isTauriIOS() { return mocks.platform === 'ios' },
+    get isTauriAndroid() { return mocks.platform === 'android' },
+}))
+vi.mock('../storage/iosContentPicker', () => ({ importIOSContentFromPicker: mocks.importIOS }))
+vi.mock('../storage/androidContentPicker', () => ({ importAndroidContentFromPicker: mocks.importAndroid }))
+vi.mock('../storage/nativeModuleFileRoute', () => ({ importDesktopNativeModulePath: mocks.importDesktop }))
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: mocks.open }))
 
 vi.mock('src/lang', () => ({
     language: {
@@ -62,11 +76,12 @@ vi.mock('../characterCards', () => ({
     importCharacterProcess: vi.fn(),
 }))
 
-import { exportModuleLegacy, readModule, type RisuModule } from './modules'
+import { exportModuleLegacy, importModule, readModule, type RisuModule } from './modules'
 
 describe('legacy module export', () => {
     beforeEach(() => {
         vi.clearAllMocks()
+        mocks.platform = 'web'
         const rpackMap = readFileSync('src/ts/rpack/rpack_map.bin')
         vi.stubGlobal('fetch', vi.fn(async () => ({
             arrayBuffer: async () => rpackMap.buffer.slice(
@@ -74,6 +89,19 @@ describe('legacy module export', () => {
                 rpackMap.byteOffset + rpackMap.byteLength,
             ),
         })))
+    })
+
+    it.each(['ios', 'android', 'desktop'] as const)('routes the public module picker only to %s', async platform => {
+        mocks.platform = platform
+        mocks.open.mockResolvedValue('C:/synthetic/module.risum')
+        mocks.importIOS.mockResolvedValue('ios-module')
+        mocks.importAndroid.mockResolvedValue('android-module')
+        await importModule()
+        expect(mocks.importIOS).toHaveBeenCalledTimes(platform === 'ios' ? 1 : 0)
+        expect(mocks.importAndroid).toHaveBeenCalledTimes(platform === 'android' ? 1 : 0)
+        expect(mocks.importDesktop).toHaveBeenCalledTimes(platform === 'desktop' ? 1 : 0)
+        if (platform === 'ios') expect(mocks.importIOS).toHaveBeenCalledWith('module')
+        if (platform === 'android') expect(mocks.importAndroid).toHaveBeenCalledWith('module')
     })
 
     it('roundtrips ordinary asset bytes and preserves asset metadata exactly', async () => {

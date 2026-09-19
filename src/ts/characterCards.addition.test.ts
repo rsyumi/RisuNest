@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
     charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
     pngWrites: [] as Array<{ key: string; data: Uint8Array }>,
     downloads: [] as Array<{ name: string; data: Uint8Array }>,
+    platform: 'desktop' as 'desktop' | 'android' | 'ios',
+    importAndroid: vi.fn(),
+    importIOS: vi.fn(),
     nativeDesktopResult: { kind: 'cancelled' } as unknown,
     importDesktopNativeCharacterFromPicker: vi.fn(),
     importDesktopNativeCharacterPath: vi.fn(),
@@ -77,10 +80,14 @@ vi.mock('./globalApi.svelte', () => ({
     VirtualWriter: class {},
 }))
 vi.mock('src/ts/platform', () => ({
-    isTauri: false,
-    isTauriDesktop: true,
+    get isTauri() { return mocks.platform !== 'desktop' },
+    get isTauriDesktop() { return mocks.platform === 'desktop' },
+    get isTauriAndroid() { return mocks.platform === 'android' },
+    get isTauriIOS() { return mocks.platform === 'ios' },
     isNodeServer: false,
 }))
+vi.mock('./storage/androidContentPicker', () => ({ importAndroidContentFromPicker: mocks.importAndroid }))
+vi.mock('./storage/iosContentPicker', () => ({ importIOSContentFromPicker: mocks.importIOS }))
 vi.mock('./storage/nativeCharacterFileRoute', () => ({
     importDesktopNativeCharacterFromPicker: mocks.importDesktopNativeCharacterFromPicker,
     importDesktopNativeCharacterPath: mocks.importDesktopNativeCharacterPath,
@@ -156,6 +163,7 @@ import {
 
 describe('character card additions', () => {
     beforeEach(() => {
+        mocks.platform = 'desktop'
         mocks.database.characters = []
         mocks.database.statics.imports = 0
         mocks.nextId = 0
@@ -173,6 +181,16 @@ describe('character card additions', () => {
             mocks.database.characters.push(character)
             return character.chaId
         })
+    })
+
+    it.each(['ios', 'android'] as const)('routes the public character picker only to %s', async platform => {
+        mocks.platform = platform
+        mocks.importIOS.mockResolvedValue('ios-character')
+        mocks.importAndroid.mockResolvedValue('android-character')
+        await expect(importCharacter()).resolves.toBe(`${platform}-character`)
+        expect(platform === 'ios' ? mocks.importIOS : mocks.importAndroid).toHaveBeenCalledWith('character')
+        expect(platform === 'ios' ? mocks.importAndroid : mocks.importIOS).not.toHaveBeenCalled()
+        expect(mocks.openDesktopPicker).not.toHaveBeenCalled()
     })
 
     it('enables the verified native character content route', () => {

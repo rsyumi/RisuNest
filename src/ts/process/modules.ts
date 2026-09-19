@@ -12,7 +12,7 @@ import { DBState, HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } f
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
-import { isTauri, isTauriDesktop } from '../platform'
+import { isTauri, isTauriDesktop, isTauriAndroid, isTauriIOS } from '../platform'
 import { open } from '@tauri-apps/plugin-dialog'
 import { readFile } from '@tauri-apps/plugin-fs'
 import type { NativeFileJobOptions, NativeFileJobSource } from '../storage/nativeFileJobs'
@@ -309,7 +309,11 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
 }
 
 export async function importModule() {
-    if (isTauri && !isTauriDesktop) {
+    if (isTauriIOS) {
+        const { importIOSContentFromPicker } = await import('../storage/iosContentPicker')
+        return await importIOSContentFromPicker('module')
+    }
+    if (isTauriAndroid) {
         const { importAndroidContentFromPicker } = await import(
             '../storage/androidContentPicker'
         )

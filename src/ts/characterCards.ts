@@ -7,7 +7,7 @@ import { language } from "src/lang"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { changeChar, characterFormatUpdate, commitDetachedCharacter } from "./characters"
 import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, loadAsset, LocalWriter, openURL, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
-import { isTauri, isNodeServer, isTauriDesktop } from "src/ts/platform"
+import { isTauri, isNodeServer, isTauriDesktop, isTauriAndroid, isTauriIOS } from "src/ts/platform"
 import { getImageType } from "./media"
 import { DBState, SettingsMenuIndex, ShowRealmFrameStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { hasher } from "./parser/parser.svelte"
@@ -108,7 +108,11 @@ export async function importPreparedNativeCharacterContent(
 export async function importCharacter() {
     let lastImportedCharacterId: string | null = null
     try {
-        if (isTauri && !isTauriDesktop) {
+        if (isTauriIOS) {
+            const { importIOSContentFromPicker } = await import('./storage/iosContentPicker')
+            return await importIOSContentFromPicker('character')
+        }
+        if (isTauriAndroid) {
             const { importAndroidContentFromPicker } = await import(
                 './storage/androidContentPicker'
             )
