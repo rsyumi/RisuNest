@@ -8,6 +8,7 @@ import BackgroundTasks
 
 private struct EndArgs: Decodable { let id: String; let success: Bool? }
 private struct ProgressArgs: Decodable { let id: String; let completed: Int64 }
+private struct OpenedArgs: Decodable { let urls: [String] }
 private struct PathArgs: Decodable { let path: String }
 private struct ExportArgs: Decodable { let sourcePath: String; let suggestedName: String; let requestId: String }
 private struct NotificationArgs: Decodable { let body: String }
@@ -22,6 +23,9 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
     private var tasks: [String: UIBackgroundTaskIdentifier] = [:]
     private var expired = Set<String>()
     private var observers: [NSObjectProtocol] = []
+    private let fileQueue = DispatchQueue(label: "io.github.rsyumi.risunest.files", qos: .userInitiated)
+    private var stagingSweepStarted = false
+    private var openedFiles: [[String: String]] = []
     private var pickerCall: Invoke?
     private var exportCopy: URL?
     private var exporting = false
@@ -42,6 +46,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
 
     override func load(webview: WKWebView) {
         webView = webview
+        fileQueue.async { self.sweepStaging() }
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             continuedRegistered = BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: .main) { [weak self] task in
@@ -303,10 +308,99 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
             .first { $0.isKeyWindow }
     }
 
+    private func sweepStaging() {
+        guard !stagingSweepStarted else { return }
+        stagingSweepStarted = true
+        let manager = FileManager.default
+        let receipts = staging.appendingPathComponent("receipts", isDirectory: true)
+        var protected = Set<String>()
+        let receiptFiles: [URL]
+        if manager.fileExists(atPath: receipts.path) {
+            guard let files = try? manager.contentsOfDirectory(at: receipts, includingPropertiesForKeys: nil) else { return }
+            receiptFiles = files
+        } else { receiptFiles = [] }
+        for receipt in receiptFiles {
+            guard let data = try? Data(contentsOf: receipt),
+                  let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if value["state"] as? String == "pending" {
+                guard let folder = value["folder"] as? String, UUID(uuidString: folder) != nil else { return }
+                protected.insert(folder)
+            }
+        }
+        for folder in (try? manager.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil)) ?? [] {
+            if UUID(uuidString: folder.lastPathComponent) != nil && !protected.contains(folder.lastPathComponent) {
+                try? manager.removeItem(at: folder)
+            }
+        }
+    }
+
+    private func stageFile(_ url: URL) throws -> [String: Any] {
+        sweepStaging()
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        let folder = staging.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let destination = folder.appendingPathComponent(url.lastPathComponent)
+            var coordinationError: NSError?
+            var copyError: Error?
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { source in
+                do { try FileManager.default.copyItem(at: source, to: destination) }
+                catch { copyError = error }
+            }
+            if let error = coordinationError { throw error }
+            if let error = copyError { throw error }
+            let values = try destination.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true else { throw CocoaError(.fileReadUnsupportedScheme) }
+            return ["cancelled": false, "path": destination.path, "name": url.lastPathComponent, "bytes": values.fileSize ?? 0]
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            throw error
+        }
+    }
+
+    @objc func receiveOpenedFiles(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(OpenedArgs.self)
+        fileQueue.async {
+            for text in args.urls {
+                guard let url = URL(string: text), url.isFileURL,
+                      ["risum", "risup", "charx", "risunest", "risudat"].contains(url.pathExtension.lowercased()) else { continue }
+                let entry: [String: String]
+                do {
+                    let staged = try self.stageFile(url)
+                    entry = ["path": staged["path"] as! String]
+                } catch { entry = ["error": "The selected file could not be prepared for import"] }
+                DispatchQueue.main.async {
+                    self.openedFiles.append(entry)
+                    self.webView?.evaluateJavaScript("window.dispatchEvent(new Event('risunest-ios-opened-files'))")
+                }
+            }
+            invoke.resolve()
+        }
+    }
+
+    @objc func takeOpenedFiles(_ invoke: Invoke) {
+        DispatchQueue.main.async {
+            let files = self.openedFiles
+            self.openedFiles.removeAll()
+            invoke.resolve(["files": files])
+        }
+    }
+
+    private func failPreparation(_ invoke: Invoke, folder: URL?, error: Error) {
+        if let folder = folder { try? FileManager.default.removeItem(at: folder) }
+        if let id = publicationId { try? FileManager.default.removeItem(at: staging.appendingPathComponent("receipts/\(id).json")) }
+        pickerCall = nil
+        publicationId = nil
+        exportCopy = nil
+        exporting = false
+        invoke.reject(error.localizedDescription)
+    }
+
     private func present(_ picker: UIDocumentPickerViewController, invoke: Invoke) {
         guard pickerCall == nil else { invoke.reject("A file picker is already open"); return }
         guard let controller = webView?.window?.rootViewController else {
-            invoke.reject("The app window is unavailable"); return
+            failPreparation(invoke, folder: exportCopy?.deletingLastPathComponent(), error: CocoaError(.featureUnsupported)); return
         }
         var presenter = controller
         while let child = presenter.presentedViewController { presenter = child }
@@ -350,13 +444,14 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
                 let receipt = self.staging.appendingPathComponent("receipts/\(args.requestId).json")
                 guard !FileManager.default.fileExists(atPath: receipt.path) else { invoke.reject("Publication identifier already used"); return }
                 try FileManager.default.createDirectory(at: receipt.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try JSONSerialization.data(withJSONObject: ["state": "pending"]).write(to: receipt, options: .atomic)
+                let folder = self.staging.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try JSONSerialization.data(withJSONObject: ["state": "pending", "folder": folder.lastPathComponent]).write(to: receipt, options: .atomic)
                 self.publicationId = args.requestId
                 // Reserve the picker before copying so overlapping requests cannot race.
                 self.pickerCall = invoke
-                DispatchQueue.global(qos: .userInitiated).async {
+                self.fileQueue.async {
+                    self.sweepStaging()
                     do {
-                        let folder = self.staging.appendingPathComponent(UUID().uuidString, isDirectory: true)
                         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                         let copy = folder.appendingPathComponent(args.suggestedName)
                         try FileManager.default.copyItem(at: source, to: copy)
@@ -367,7 +462,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
                             self.present(UIDocumentPickerViewController(forExporting: [copy], asCopy: true), invoke: invoke)
                         }
                     } catch {
-                        DispatchQueue.main.async { self.pickerCall = nil; invoke.reject(error.localizedDescription) }
+                        DispatchQueue.main.async { self.failPreparation(invoke, folder: folder, error: error) }
                     }
                 }
             } catch { invoke.reject(error.localizedDescription) }
@@ -382,7 +477,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
                   file.deletingLastPathComponent().deletingLastPathComponent() == staging.resolvingSymlinksInPath() else {
                 invoke.reject("Expected a staged import or export file"); return
             }
-            try FileManager.default.removeItem(at: file)
+            try FileManager.default.removeItem(at: file.deletingLastPathComponent())
             invoke.resolve()
         } catch { invoke.reject(error.localizedDescription) }
     }
@@ -409,31 +504,27 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
             finishPicker(["cancelled": false, "bytes": size])
             return
         }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let access = url.startAccessingSecurityScopedResource()
-            defer { if access { url.stopAccessingSecurityScopedResource() } }
-            let folder = self.staging.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        fileQueue.async {
             do {
-                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                let destination = folder.appendingPathComponent(url.lastPathComponent)
-                var coordinationError: NSError?
-                var copyError: Error?
-                NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { source in
-                    do { try FileManager.default.copyItem(at: source, to: destination) }
-                    catch { copyError = error }
-                }
-                if let error = coordinationError { throw error }
-                if let error = copyError { throw error }
-                let values = try destination.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-                guard values.isRegularFile == true else { throw CocoaError(.fileReadUnsupportedScheme) }
-                DispatchQueue.main.async {
-                    self.finishPicker(["cancelled": false, "path": destination.path, "name": url.lastPathComponent, "bytes": values.fileSize ?? 0])
-                }
+                let result = try self.stageFile(url)
+                DispatchQueue.main.async { self.finishPicker(result) }
             } catch {
-                try? FileManager.default.removeItem(at: folder)
                 DispatchQueue.main.async { self.pickerCall = nil; call.reject(error.localizedDescription) }
             }
         }
+    }
+
+    @objc func acknowledgePublication(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(EndArgs.self)
+        guard UUID(uuidString: args.id) != nil else { invoke.reject("Invalid publication identifier"); return }
+        let receipt = staging.appendingPathComponent("receipts/\(args.id).json")
+        guard FileManager.default.fileExists(atPath: receipt.path) else { invoke.resolve(); return }
+        guard let value = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as? [String: Any],
+              ["succeeded", "cancelled"].contains(value["state"] as? String ?? "") else {
+            invoke.reject("Publication has not completed"); return
+        }
+        try FileManager.default.removeItem(at: receipt)
+        invoke.resolve()
     }
 
     private func finishPicker(_ result: [String: Any]) {
@@ -447,6 +538,9 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
                 try JSONSerialization.data(withJSONObject: terminal).write(to: receipt, options: .atomic)
             } catch {
                 // Keep both the native handoff and pending receipt for explicit recovery.
+                publicationId = nil
+                exportCopy = nil
+                exporting = false
                 call?.reject("File publication receipt could not be saved")
                 return
             }
@@ -454,6 +548,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
         publicationId = nil
         if let copy = exportCopy { try? FileManager.default.removeItem(at: copy.deletingLastPathComponent()) }
         exportCopy = nil
+        exporting = false
         call?.resolve(result)
     }
 

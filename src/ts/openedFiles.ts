@@ -2,7 +2,8 @@ import { readFile } from '@tauri-apps/plugin-fs'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { alertError } from './alert'
-import { isTauriDesktop } from 'src/ts/platform'
+import { isTauriDesktop, isTauriIOS } from 'src/ts/platform'
+import { discardIOSFile } from './storage/iosFiles'
 
 /**
  * Name shared by the DOM event Android dispatches on a warm start and by the Tauri event the
@@ -43,6 +44,10 @@ export async function consumeOpenedFiles(files: string[]): Promise<void> {
                 alertError(
                     `Failed to open the selected file: ${file}\n${error}`,
                 )
+            } finally {
+                if (isTauriIOS) await discardIOSFile(file).catch(() => {
+                    alertError('The imported temporary file could not be removed.')
+                })
             }
         }
     })
@@ -81,6 +86,11 @@ export function registerOpenedFileListeners(
     }
     window.addEventListener(OPENED_FILES_EVENT, domListener)
 
+    if (isTauriIOS) {
+        window.addEventListener('risunest-ios-opened-files', () => void drainIOSOpenedFiles())
+        void drainIOSOpenedFiles()
+    }
+
     if (isTauriDesktop) {
         void listen(OPENED_FILES_EVENT, () => {
             void drainDesktopOpenedFiles()
@@ -93,6 +103,21 @@ export function registerOpenedFileListeners(
                 console.warn('Failed to subscribe to opened files:', error)
                 void drainDesktopOpenedFiles()
             })
+    }
+}
+
+async function drainIOSOpenedFiles(): Promise<void> {
+    try {
+        const { files } = await invoke<{ files: Array<{ path?: string; error?: string }> }>(
+            'plugin:ios-native|take_opened_files',
+        )
+        for (const file of files) {
+            if (file.error) alertError(file.error)
+
+        }
+        await consumeOpenedFiles(files.flatMap(file => file.path ? [file.path] : []))
+    } catch (error) {
+        alertError(`Failed to receive the selected file: ${error}`)
     }
 }
 

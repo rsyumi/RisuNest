@@ -64,9 +64,13 @@ export function validateIosArchiveEntries(entries) {
 function expectedIosDocuments(tauriConfig) {
   return tauriConfig.bundle.fileAssociations.map((association) => ({
     CFBundleTypeExtensions: association.ext,
-    CFBundleTypeName: association.ext[0],
-    CFBundleTypeRole: "Editor",
-    LSHandlerRank: "Default",
+    CFBundleTypeName: association.name ?? association.ext[0],
+    CFBundleTypeRole: association.role ?? "Editor",
+    LSHandlerRank: association.rank ?? "Default",
+    ...((association.exportedType || association.contentTypes) ? {
+      LSItemContentTypes: association.exportedType
+        ? [association.exportedType.identifier] : association.contentTypes,
+    } : {}),
   }));
 }
 
@@ -100,6 +104,20 @@ export function assertIosBundleMetadata(info, releaseInput, tauriConfig, iosConf
   };
   if (!isDeepStrictEqual(actual, expected))
     throw new Error(`IPA bundle metadata does not match the release configuration: ${JSON.stringify(actual)}`);
+  for (const association of tauriConfig.bundle.fileAssociations) {
+    const exported = association.exportedType;
+    const identifiers = exported ? [exported.identifier] : association.contentTypes ?? [];
+    const declarations = exported ? info.UTExportedTypeDeclarations : info.UTImportedTypeDeclarations;
+    for (const identifier of identifiers) {
+      const declaration = declarations?.find(value => value.UTTypeIdentifier === identifier);
+      if (!declaration
+          || !isDeepStrictEqual(declaration.UTTypeTagSpecification?.["public.filename-extension"], association.ext)
+          || !isDeepStrictEqual(declaration.UTTypeConformsTo, exported?.conformsTo ?? ["public.data"]))
+        throw new Error(`IPA custom document type declaration does not match: ${identifier}`);
+      if (exported && declaration.UTTypeTagSpecification?.["public.mime-type"] !== association.mimeType)
+        throw new Error(`IPA custom document MIME type does not match: ${identifier}`);
+    }
+  }
   if (typeof info.CFBundleExecutable !== "string" || !info.CFBundleExecutable)
     throw new Error("IPA bundle metadata does not name an executable.");
   return { ...actual, executable: info.CFBundleExecutable };

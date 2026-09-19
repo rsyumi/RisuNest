@@ -50,6 +50,14 @@ describe('iOS file publication', () => {
             }),
         ).resolves.toEqual({ bytes: 42 })
     })
+    it('retains recoverable receipts until the caller has stored its publication result', async () => {
+        invoke.mockResolvedValue({ cancelled: false, bytes: 42 })
+        await exportIOSFile({ sourcePath: '/owned/file', suggestedName: 'backup.risunest', requestId: 'caller-owned' })
+        expect(invoke).toHaveBeenCalledOnce()
+        invoke.mockClear()
+        await exportIOSFile({ sourcePath: '/owned/file', suggestedName: 'backup.risunest' })
+        expect(invoke).toHaveBeenLastCalledWith('plugin:ios-native|acknowledge_publication', { id: expect.any(String) })
+    })
     it('never treats a pending publication receipt as success', async () => {
         invoke.mockResolvedValue({ state: 'pending' })
         await expect(getIOSPublication('receipt')).resolves.toBeNull()

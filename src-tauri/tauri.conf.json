@@ -24,8 +24,55 @@
     },
     "fileAssociations": [
       {
-        "ext": ["risum", "risup", "charx", "risunest", "risudat"],
-        "mimeType": "application/x-risunest"
+        "ext": [
+          "risum"
+        ],
+        "mimeType": "application/x-risunest",
+        "contentTypes": [
+          "io.github.rsyumi.risunest.risum"
+        ]
+      },
+      {
+        "ext": [
+          "risup"
+        ],
+        "mimeType": "application/x-risunest",
+        "contentTypes": [
+          "io.github.rsyumi.risunest.risup"
+        ]
+      },
+      {
+        "ext": [
+          "charx"
+        ],
+        "mimeType": "application/x-risunest",
+        "contentTypes": [
+          "io.github.rsyumi.risunest.charx"
+        ]
+      },
+      {
+        "ext": [
+          "risunest"
+        ],
+        "mimeType": "application/x-risunest",
+        "contentTypes": [
+          "io.github.rsyumi.risunest.risunest"
+        ],
+        "exportedType": {
+          "identifier": "io.github.rsyumi.risunest.risunest",
+          "conformsTo": [
+            "public.data"
+          ]
+        }
+      },
+      {
+        "ext": [
+          "risudat"
+        ],
+        "mimeType": "application/x-risunest",
+        "contentTypes": [
+          "io.github.rsyumi.risunest.risudat"
+        ]
       }
     ]
   },

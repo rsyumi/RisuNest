@@ -53,7 +53,17 @@ struct WebAuthenticationResponse {
 }
 
 #[cfg(target_os = "ios")]
+#[derive(Serialize)]
+struct OpenedFilesRequest { urls: Vec<String> }
+
+#[cfg(target_os = "ios")]
 impl<R: Runtime> IosNative<R> {
+    pub async fn receive_opened_files(&self, urls: Vec<String>) {
+        let _ = self.0.run_mobile_plugin_async::<()>(
+            "receiveOpenedFiles", OpenedFilesRequest { urls },
+        ).await;
+    }
+
     pub async fn authenticate(
         &self,
         authorization_url: &str,

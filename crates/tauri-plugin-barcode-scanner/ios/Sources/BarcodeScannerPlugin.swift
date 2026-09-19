@@ -79,6 +79,9 @@ class BarcodeScannerPlugin: Plugin, AVCaptureMetadataOutputObjectsDelegate {
   var captureVideoPreviewLayer: AVCaptureVideoPreviewLayer?
   var metaOutput: AVCaptureMetadataOutput?
 
+  private let sessionQueue = DispatchQueue(label: "io.github.rsyumi.risunest.scanner")
+  private var scanGeneration = 0
+
   var currentCamera = 0
   var frontCamera: AVCaptureDevice?
   var backCamera: AVCaptureDevice?
@@ -98,9 +101,7 @@ class BarcodeScannerPlugin: Plugin, AVCaptureMetadataOutputObjectsDelegate {
   }
 
   private func loadCamera() {
-    cameraView = CameraView(
-      frame: CGRect(
-        x: 0, y: 0, width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height))
+    cameraView = CameraView(frame: webView.superview?.bounds ?? webView.bounds)
     cameraView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
   }
 
@@ -108,12 +109,12 @@ class BarcodeScannerPlugin: Plugin, AVCaptureMetadataOutputObjectsDelegate {
     _ captureOutput: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject],
     from connection: AVCaptureConnection
   ) {
-    if metadataObjects.count == 0 || !self.isScanning {
+    if metadataObjects.count == 0 || !self.isScanning || captureOutput !== self.metaOutput {
       // while nothing is detected, or if scanning is false, do nothing.
       return
     }
 
-    let found = metadataObjects[0] as! AVMetadataMachineReadableCodeObject
+    guard let found = metadataObjects.first as? AVMetadataMachineReadableCodeObject else { return }
     if scanFormats.contains(found.type) {
       var jsObject: JsonObject = [:]
 
@@ -128,82 +129,16 @@ class BarcodeScannerPlugin: Plugin, AVCaptureMetadataOutputObjectsDelegate {
     }
   }
 
-  private func setupCamera(direction: String, windowed: Bool) {
-    do {
-      var cameraDirection = direction
-      cameraView.backgroundColor = UIColor.clear
-      if windowed {
-        webView.superview?.insertSubview(cameraView, belowSubview: webView)
-      } else {
-        webView.superview?.insertSubview(cameraView, aboveSubview: webView)
-      }
-
-      let availableVideoDevices = discoverCaptureDevices()
-      for device in availableVideoDevices {
-        if device.position == AVCaptureDevice.Position.back {
-          backCamera = device
-        } else if device.position == AVCaptureDevice.Position.front {
-          frontCamera = device
-        }
-      }
-
-      // older iPods have no back camera
-      if cameraDirection == "back" {
-        if backCamera == nil {
-          cameraDirection = "front"
-        }
-      } else {
-        if frontCamera == nil {
-          cameraDirection = "back"
-        }
-      }
-
-      let input: AVCaptureDeviceInput
-      input = try createCaptureDeviceInput(
-        cameraDirection: cameraDirection, backCamera: backCamera, frontCamera: frontCamera)
-      captureSession = AVCaptureSession()
-      captureSession!.addInput(input)
-      metaOutput = AVCaptureMetadataOutput()
-      captureSession!.addOutput(metaOutput!)
-      metaOutput!.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
-      captureVideoPreviewLayer = AVCaptureVideoPreviewLayer(session: captureSession!)
-      cameraView.addPreviewLayer(captureVideoPreviewLayer)
-
-      self.windowed = windowed
-      if windowed {
-        self.previousBackgroundColor = self.webView.backgroundColor
-        self.webView.isOpaque = false
-        self.webView.backgroundColor = UIColor.clear
-        self.webView.scrollView.backgroundColor = UIColor.clear
-      }
-    } catch CaptureError.backCameraUnavailable {
-      //
-    } catch CaptureError.frontCameraUnavailable {
-      //
-    } catch CaptureError.couldNotCaptureInput {
-      //
-    } catch {
-      //
-    }
-  }
-
-  private func dismantleCamera() {
-    if self.captureSession != nil {
-      self.captureSession!.stopRunning()
-      self.cameraView.removePreviewLayer()
-      self.cameraView.removeFromSuperview()
-      self.captureVideoPreviewLayer = nil
-      self.metaOutput = nil
-      self.captureSession = nil
-      self.frontCamera = nil
-      self.backCamera = nil
-    }
-
-    self.isScanning = false
-  }
-
   private func destroy() {
-    dismantleCamera()
+    scanGeneration += 1
+    let session = captureSession
+    captureSession = nil
+    sessionQueue.async { session?.stopRunning() }
+    cameraView?.removePreviewLayer()
+    cameraView?.removeFromSuperview()
+    captureVideoPreviewLayer = nil
+    metaOutput = nil
+    isScanning = false
     invoke = nil
     if windowed {
       let backgroundColor = previousBackgroundColor ?? UIColor.white
@@ -211,6 +146,7 @@ class BarcodeScannerPlugin: Plugin, AVCaptureMetadataOutputObjectsDelegate {
       webView.backgroundColor = backgroundColor
       webView.scrollView.backgroundColor = backgroundColor
     }
+    windowed = false
   }
 
   private func getPermissionState() -> String {
@@ -260,79 +196,79 @@ class BarcodeScannerPlugin: Plugin, AVCaptureMetadataOutputObjectsDelegate {
     }
   }
 
-  private func runScanner(_ invoke: Invoke, args: ScanOptions) {
-    if getPermissionState() != "granted" {
-      invoke.reject("Camera permission denied or not yet requested")
-      return
-    }
-
-    scanFormats = [AVMetadataObject.ObjectType]()
-
-    (args.formats ?? []).forEach { format in
-      if let formatValue = format.value {
-        scanFormats.append(formatValue)
-      } else {
-        invoke.reject("Unsupported barcode format on this iOS version: \(format)")
-        return
-      }
-    }
-
-    if scanFormats.isEmpty {
-      for supportedFormat in SupportedFormat.allCases {
-        if let formatValue = supportedFormat.value {
-          scanFormats.append(formatValue)
-        }
-      }
-    }
-
-    self.metaOutput!.metadataObjectTypes = self.scanFormats
-    DispatchQueue.main.async {
-      self.captureSession!.startRunning()
-    }
-
-    self.isScanning = true
-  }
-
   @objc private func scan(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(ScanOptions.self)
-
-    self.invoke = invoke
-
-    let entry = Bundle.main.infoDictionary?["NSCameraUsageDescription"] as? String
-
-    if entry == nil || entry?.count == 0 {
-      invoke.reject("NSCameraUsageDescription is not in the app Info.plist")
-      return
-    }
-
-    // Check if camera is available on this platform (iOS simulator doesn't have cameras)
-    let availableVideoDevices = discoverCaptureDevices()
-    if availableVideoDevices.isEmpty {
-      invoke.reject("No camera available on this device (e.g., iOS Simulator)")
-      return
-    }
-
-    var iOS14min: Bool = false
-    if #available(iOS 14.0, *) { iOS14min = true }
-    if !iOS14min && self.getPermissionState() != "granted" {
-      var authorized = false
-      AVCaptureDevice.requestAccess(for: .video) { (isAuthorized) in
-        authorized = isAuthorized
+    DispatchQueue.main.async {
+      guard self.invoke == nil else { invoke.reject("A scan is already running"); return }
+      guard let description = Bundle.main.infoDictionary?["NSCameraUsageDescription"] as? String,
+            !description.isEmpty else { invoke.reject("NSCameraUsageDescription is not in the app Info.plist"); return }
+      guard self.getPermissionState() == "granted" else { invoke.reject("Camera permission denied or not yet requested"); return }
+      var formats = [AVMetadataObject.ObjectType]()
+      for format in args.formats ?? [] {
+        guard let value = format.value else { invoke.reject("Unsupported barcode format on this iOS version"); return }
+        formats.append(value)
       }
-      if !authorized {
-        invoke.reject("denied by the user")
-        return
+      let explicitFormats = !formats.isEmpty
+      if formats.isEmpty { formats = SupportedFormat.allCases.compactMap { $0.value } }
+      self.invoke = invoke
+      self.scanGeneration += 1
+      let generation = self.scanGeneration
+      let requestedFormats = formats
+      self.sessionQueue.async {
+        do {
+          let devices = discoverCaptureDevices()
+          let direction: AVCaptureDevice.Position = args.cameraDirection == "front" ? .front : .back
+          guard let device = devices.first(where: { $0.position == direction }) ?? devices.first else {
+            throw CocoaError(.featureUnsupported)
+          }
+          let input = try AVCaptureDeviceInput(device: device)
+          let session = AVCaptureSession()
+          let output = AVCaptureMetadataOutput()
+          guard session.canAddInput(input) else { throw CocoaError(.featureUnsupported) }
+          session.addInput(input)
+          guard session.canAddOutput(output) else { throw CocoaError(.featureUnsupported) }
+          session.addOutput(output)
+          let supported = requestedFormats.filter { output.availableMetadataObjectTypes.contains($0) }
+          guard !supported.isEmpty, !explicitFormats || supported.count == requestedFormats.count else {
+            throw CocoaError(.featureUnsupported)
+          }
+          output.setMetadataObjectsDelegate(self, queue: .main)
+          output.metadataObjectTypes = supported
+          DispatchQueue.main.async {
+            guard self.scanGeneration == generation, self.invoke != nil else { return }
+            guard let parent = self.webView.superview else {
+              invoke.reject("The app window is unavailable")
+              self.destroy()
+              return
+            }
+            self.loadCamera()
+            self.cameraView.frame = parent.bounds
+            self.cameraView.backgroundColor = .clear
+            self.windowed = args.windowed ?? false
+            if self.windowed {
+              parent.insertSubview(self.cameraView, belowSubview: self.webView)
+              self.previousBackgroundColor = self.webView.backgroundColor
+              self.webView.isOpaque = false
+              self.webView.backgroundColor = .clear
+              self.webView.scrollView.backgroundColor = .clear
+            } else { parent.insertSubview(self.cameraView, aboveSubview: self.webView) }
+            self.captureSession = session
+            self.metaOutput = output
+            self.scanFormats = supported
+            let preview = AVCaptureVideoPreviewLayer(session: session)
+            self.captureVideoPreviewLayer = preview
+            self.cameraView.addPreviewLayer(preview)
+            self.isScanning = true
+            self.sessionQueue.async { session.startRunning() }
+          }
+        } catch {
+          DispatchQueue.main.async {
+            guard self.scanGeneration == generation else { return }
+            invoke.reject("The camera could not be started")
+            self.destroy()
+          }
+        }
       }
-    }
-
-    DispatchQueue.main.async { [self] in
-      self.loadCamera()
-      self.dismantleCamera()
-      self.setupCamera(
-        direction: args.cameraDirection ?? "back",
-        windowed: args.windowed ?? false
-      )
-      self.runScanner(invoke, args: args)
     }
   }
 

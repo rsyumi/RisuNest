@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
+    ios: false,
     readFile: vi.fn(async (_path: string) => new Uint8Array([1])),
-    invoke: vi.fn(async (_command: string) => [] as string[]),
+    invoke: vi.fn<(command: string, args?: unknown) => Promise<unknown>>(async () => []),
     listen: vi.fn(async (_event: string, _handler: (payload: unknown) => void) => () => {}),
     alertError: vi.fn(),
     listeners: [] as Array<(payload: unknown) => void>,
@@ -20,7 +21,8 @@ vi.mock('./alert', () => ({ alertError: mocks.alertError }))
 vi.mock('src/ts/platform', () => ({
     isTauri: true,
     isTauriAndroid: false,
-    isTauriDesktop: true,
+    get isTauriDesktop() { return !mocks.ios },
+    get isTauriIOS() { return mocks.ios },
 }))
 
 let api: typeof import('./openedFiles')
@@ -46,12 +48,13 @@ async function flush() {
 
 describe('opened file delivery', () => {
     beforeEach(async () => {
+        mocks.ios = false
         vi.resetModules()
         api = await import('./openedFiles')
         ;({ consumeOpenedFiles, registerOpenedFileListeners, OPENED_FILES_EVENT, OPENED_FILES_TAKE_COMMAND } = api)
         const addEventListener = window.addEventListener.bind(window)
         vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
-            if (type === OPENED_FILES_EVENT) domListeners.push([type, listener])
+            if ([OPENED_FILES_EVENT, 'risunest-ios-opened-files'].includes(type)) domListeners.push([type, listener])
             addEventListener(type, listener, options)
         })
         mocks.readFile.mockClear()
@@ -68,6 +71,32 @@ describe('opened file delivery', () => {
         await flush()
         for (const [type, listener] of domListeners.splice(0)) window.removeEventListener(type, listener)
         vi.restoreAllMocks()
+    })
+
+    it('drains iOS cold and warm opens in order and discards staged sources after import', async () => {
+        mocks.ios = true
+        let take = 0
+        mocks.invoke.mockImplementation(async command => {
+            if (command.endsWith('take_opened_files')) return { files: ++take === 1
+                ? [{ path: '/staged/first.charx' }, { path: '/staged/broken.risum' }]
+                : [{ path: '/staged/last.charx' }] }
+        })
+        const order: string[] = []
+        const importPath = vi.fn(async (path: string) => {
+            order.push(path)
+            if (path.includes('broken')) throw new Error('synthetic failure')
+            return true
+        })
+        registerOpenedFileListeners(vi.fn(), importPath)
+        window.dispatchEvent(new Event('risunest-ios-opened-files'))
+        await vi.waitFor(() => expect(order).toHaveLength(3))
+        await flush()
+        expect(order).toEqual(['/staged/first.charx', '/staged/broken.risum', '/staged/last.charx'])
+        expect(mocks.readFile).not.toHaveBeenCalled()
+        expect(mocks.listen).not.toHaveBeenCalled()
+        expect(mocks.invoke.mock.calls.filter(([command]) => command.endsWith('discard_file'))
+            .map(([, args]) => args)).toEqual(order.map(path => ({ path })))
+        expect(mocks.alertError).toHaveBeenCalledOnce()
     })
 
     it('reads and imports every file in order', async () => {

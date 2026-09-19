@@ -251,3 +251,30 @@ test("committed iOS shell carries the configured custom URL scheme", () => {
   const project = readFileSync(join(repository, "src-tauri/gen/apple/project.yml"), "utf8");
   assert.match(project, /CFBundleURLSchemes: \[risunestlocal\]\s+CFBundleURLName: risunestlocal/);
 });
+
+
+test("iOS package proof requires imported and exported custom document types", () => {
+  const imported = "io.github.rsyumi.risunest.risum";
+  const exported = "io.github.rsyumi.risunest.risunest";
+  const associations = [
+    { ext: ["risum"], contentTypes: [imported] },
+    { ext: ["risunest"], mimeType: "application/x-risunest", exportedType: { identifier: exported, conformsTo: ["public.data"] } },
+  ];
+  const config = { ...tauriConfig, bundle: { fileAssociations: associations } };
+  const info = { ...iosInfo(), CFBundleDocumentTypes: associations.map(a => ({
+    CFBundleTypeExtensions: a.ext, CFBundleTypeName: a.ext[0], CFBundleTypeRole: "Editor", LSHandlerRank: "Default",
+    LSItemContentTypes: a.contentTypes ?? [a.exportedType.identifier],
+  })),
+    UTImportedTypeDeclarations: [{ UTTypeIdentifier: imported, UTTypeConformsTo: ["public.data"], UTTypeTagSpecification: { "public.filename-extension": ["risum"] } }],
+    UTExportedTypeDeclarations: [{ UTTypeIdentifier: exported, UTTypeConformsTo: ["public.data"], UTTypeTagSpecification: { "public.filename-extension": ["risunest"], "public.mime-type": "application/x-risunest" } }],
+  };
+  assert.equal(assertIosBundleMetadata(info, releaseInput, config, iosConfig).executable, "RisuNest");
+  for (const key of ["UTImportedTypeDeclarations", "UTExportedTypeDeclarations"]) {
+    const invalid = structuredClone(info);
+    delete invalid[key];
+    assert.throws(() => assertIosBundleMetadata(invalid, releaseInput, config, iosConfig), /custom document type/);
+  }
+  const invalid = structuredClone(info);
+  delete invalid.CFBundleDocumentTypes[0].LSItemContentTypes;
+  assert.throws(() => assertIosBundleMetadata(invalid, releaseInput, config, iosConfig), /bundle metadata/);
+});

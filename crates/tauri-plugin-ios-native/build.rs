@@ -10,6 +10,8 @@ fn main() {
         "export_file",
         "discard_file",
         "publication",
+        "acknowledge_publication",
+        "take_opened_files",
         "generation_progress",
         "reset_generation",
         "authenticate",

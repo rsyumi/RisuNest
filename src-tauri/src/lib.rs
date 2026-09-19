@@ -903,6 +903,16 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
 }
 
 pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {
+    #[cfg(target_os = "ios")]
+    if let tauri::RunEvent::Opened { urls } = &_event {
+        use tauri_plugin_ios_native::IosNativeExt;
+        let plugin = _app.ios_native().clone();
+        let files = urls.iter().filter(|url| url.scheme() == "file")
+            .map(ToString::to_string).collect::<Vec<_>>();
+        if !files.is_empty() {
+            tauri::async_runtime::spawn(async move { plugin.receive_opened_files(files).await; });
+        }
+    }
     #[cfg(target_os = "macos")]
     macos_lifecycle::handle_run_event(_app, _event);
 }

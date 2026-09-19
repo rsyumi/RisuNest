@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { language } from "src/lang";
-  import { isTauriAndroid } from "src/ts/platform";
+  import { isTauriAndroid, isTauriIOS } from "src/ts/platform";
   import { modalNavigation } from "src/ts/ui/modalNavigation";
   import type { ServerConfig } from "src/ts/storage/sync/serverSync";
   import {
@@ -134,7 +134,7 @@
         class="rounded border border-darkborderc bg-darkbutton px-4 py-2 hover:bg-selected"
         >{text.readRegistration}</button
       >
-      {#if isTauriAndroid}<button
+      {#if isTauriAndroid || isTauriIOS}<button
           type="button"
           disabled={busy || scanning}
           onclick={() => void scan()}

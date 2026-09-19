@@ -715,12 +715,12 @@ export async function characterURLImport() {
     }
 
     registerOpenedFileListeners(importFile, async (path) => {
-        if (isTauriDesktop && /\.(risunest|risudat|bin)$/i.test(path)) {
+        if ((isTauriDesktop || isTauriIOS) && /\.(risunest|risudat|bin)$/i.test(path)) {
             const { restoreBackupFromNativeSource } = await import('./storage/portableBackupFileRouteProduction.svelte')
             await restoreBackupFromNativeSource({type:'desktopPath',path})
             return true
         }
-        if (!isTauriDesktop || !/\.(json|png|charx|jpe?g|risum)$/i.test(path))
+        if (!(isTauriDesktop || isTauriIOS) || !/\.(json|png|charx|jpe?g|risum)$/i.test(path))
             return false
         if (/\.risum$/i.test(path)) {
             const { importPreparedNativeModuleContent } = await import(

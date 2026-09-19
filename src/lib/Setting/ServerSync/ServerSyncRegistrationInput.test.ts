@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mount, tick, unmount } from "svelte";
-vi.mock("src/ts/platform", () => ({ isTauriAndroid: false }));
+vi.mock("src/ts/platform", () => ({ isTauriAndroid: false, isTauriIOS: true }));
 import Input from "./ServerSyncRegistrationInput.svelte";
 import { serverRegistrationInbox } from "src/ts/storage/sync/serverSyncRegistrationInbox";
 import vector from "../../../../crates/sync-connect/tests/registration-vector.json";
@@ -13,6 +13,13 @@ afterEach(async () => {
   document.body.replaceChildren();
 });
 describe("registration form input", () => {
+  it("offers the existing scanner on iOS", async () => {
+    const target = document.createElement("div");
+    document.body.append(target);
+    component = mount(Input, { target, props: { onRegistration: vi.fn() } });
+    await tick();
+    expect(target.querySelectorAll("button")).toHaveLength(2);
+  });
   it("prefills only through explicit Read code and clears the raw secret", async () => {
     const target = document.createElement("div");
     document.body.append(target);

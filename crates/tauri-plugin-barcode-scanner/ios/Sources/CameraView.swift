@@ -33,7 +33,7 @@ class CameraView: UIView {
       }
     }
 
-    if let interfaceOrientation = UIApplication.shared.windows.first(where: { $0.isKeyWindow })?
+    if let interfaceOrientation = self.window?
       .windowScene?.interfaceOrientation
     {
       self.videoPreviewLayer?.connection?.videoOrientation = interfaceOrientationToVideoOrientation(
@@ -42,9 +42,10 @@ class CameraView: UIView {
   }
 
   func addPreviewLayer(_ previewLayer: AVCaptureVideoPreviewLayer?) {
-    previewLayer!.videoGravity = AVLayerVideoGravity.resizeAspectFill
-    previewLayer!.frame = self.bounds
-    self.layer.addSublayer(previewLayer!)
+    guard let previewLayer = previewLayer else { return }
+    previewLayer.videoGravity = AVLayerVideoGravity.resizeAspectFill
+    previewLayer.frame = self.bounds
+    self.layer.addSublayer(previewLayer)
     self.videoPreviewLayer = previewLayer
   }
 

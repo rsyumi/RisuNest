@@ -35,18 +35,25 @@ export async function exportIOSFile(request: {
     requestId?: string
 }): Promise<{ bytes: number; warningCodes?: string[] }> {
     if (request.signal?.aborted) throw cancelled()
+    const requestId = request.requestId ?? crypto.randomUUID()
     const result = await invoke<{ cancelled: boolean; bytes: number }>(
         'plugin:ios-native|export_file',
         {
             sourcePath: request.sourcePath,
             suggestedName: request.suggestedName,
-            requestId: request.requestId ?? crypto.randomUUID(),
+            requestId,
         },
     )
+    if (result.cancelled || !request.requestId) {
+        await acknowledgeIOSPublication(requestId).catch(() => {})
+    }
     if (result.cancelled) throw cancelled()
     // Publication has completed. A late abort must not turn a published file into a reported failure.
     return { bytes: result.bytes }
 }
+
+export const acknowledgeIOSPublication = (id: string) =>
+    invoke<void>('plugin:ios-native|acknowledge_publication', { id })
 
 export async function getIOSPublication(
     requestId: string,

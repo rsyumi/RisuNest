@@ -1,4 +1,4 @@
-import { exportIOSFile, getIOSPublication } from "../iosFiles";
+import { exportIOSFile, getIOSPublication, acknowledgeIOSPublication } from "../iosFiles";
 import {
   AndroidSafDestinationError,
   acknowledgeAndroidSafExport,
@@ -316,6 +316,8 @@ export async function resumePendingPortableExport(
       );
   }
   try {
+    if (intent.publication === "ios-files" && intent.requestId)
+      await acknowledgeIOSPublication(intent.requestId);
     if (result.handoffPath)
       await dependencies.cleanupHandoff(result.handoffPath);
     await dependencies.invoke("native_file_job_forget", {

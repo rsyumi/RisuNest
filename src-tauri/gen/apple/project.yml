@@ -39,6 +39,27 @@ targets:
     info:
       path: risunest_iOS/Info.plist
       properties:
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: io.github.rsyumi.risunest.risum
+            UTTypeConformsTo: [public.data]
+            UTTypeDescription: risum
+            UTTypeTagSpecification:
+              public.filename-extension: [risum]
+          - UTTypeIdentifier: io.github.rsyumi.risunest.risup
+            UTTypeConformsTo: [public.data]
+            UTTypeDescription: risup
+            UTTypeTagSpecification:
+              public.filename-extension: [risup]
+          - UTTypeIdentifier: io.github.rsyumi.risunest.charx
+            UTTypeConformsTo: [public.data]
+            UTTypeDescription: charx
+            UTTypeTagSpecification:
+              public.filename-extension: [charx]
+          - UTTypeIdentifier: io.github.rsyumi.risunest.risudat
+            UTTypeConformsTo: [public.data]
+            UTTypeDescription: risudat
+            UTTypeTagSpecification:
+              public.filename-extension: [risudat]
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
         NSCameraUsageDescription: Scan a QR code you choose to connect RisuNest.
