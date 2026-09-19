@@ -7889,6 +7889,15 @@ mod tests {
         type Cleanup = fn(&Path, &Path) -> Result<bool, NativeJobError>;
         let cleanup_for = |kind: &str| -> Cleanup {
             match kind {
+                "raw-recovery" => |root, path| {
+                    cleanup_handoff_path(
+                        root,
+                        path,
+                        "risunest-rescue-",
+                        ".risunest-rescue.zip",
+                        "raw recovery",
+                    )
+                },
                 "portable-backup" => |root, path| {
                     cleanup_handoff_path(
                         root,
@@ -7906,7 +7915,7 @@ mod tests {
             }
         };
         let grammars = fixture["managedHandoffs"].as_array().unwrap();
-        assert_eq!(grammars.len(), 5, "grammar count drifted from the fixture");
+        assert_eq!(grammars.len(), 6, "grammar count drifted from the fixture");
 
         for grammar in grammars {
             let kind = grammar["kind"].as_str().unwrap();
