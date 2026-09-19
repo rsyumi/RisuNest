@@ -29,8 +29,8 @@ import { hanuraiMemory } from "./memory/hanuraiMemory";
 import { hypaMemoryV2 } from "./memory/hypav2";
 import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
-import { hypaMemoryV3 } from "./memory/hypav3";
-import { getModuleAssets, getModuleToggles } from "./modules";
+import { getCurrentHypaV3Preset, hypaMemoryV3 } from "./memory/hypav3";
+import { getModuleAssets, getModuleRegexScripts, getModuleToggles, getModuleTriggers } from "./modules";
 import { readImage } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { dispatchChatOutputListeners } from '../plugins/pluginChatOutputListeners'
@@ -68,6 +68,11 @@ import {
     type PromptHistoryCompatibilitySnapshot,
 } from './promptHistory'
 import { runCurrentChatParserPass } from './currentChatParserPass'
+import {
+    assertSummaryAwarePromptHistoryCurrent,
+    planSummaryAwarePromptHistory,
+    type SummaryAwarePromptHistoryPlan,
+} from './summaryAwarePromptHistory'
 import { applyGenerationErrorResponse } from './generationErrorResponse'
 import { applyGenerationResponse } from './generationResponseApplication'
 import {
@@ -314,6 +319,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     let selectedChar = -1
     let selectedChat = -1
     let currentChar:character
+    let summaryAwareHistoryPlan: SummaryAwarePromptHistoryPlan | null = null
     let generationInfo:MessageGenerationInfo|undefined = undefined
 
     const stageTimings = {
@@ -351,6 +357,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             parserCharacter: currentChar,
             session: getActiveConversationSession(),
             parser: risuChatParser,
+            skipMessageIds: summaryAwareHistoryPlan?.coveredMessageIds,
         })
     }
 
@@ -548,6 +555,38 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     }
     else{
         currentChar = nowChatroom
+    }
+
+    if (DBState.db.hypaV3 && nowChatroom.type !== 'group') {
+        const hypaSettings = getCurrentHypaV3Preset().settings
+        const decision = planSummaryAwarePromptHistory(
+            selectedConversation,
+            hypaSettings.preserveOrphanedMemory,
+        )
+        const editProcessScripts = [
+            ...(DBState.db.presetRegex ?? []),
+            ...(currentChar.customscript ?? []),
+            ...getModuleRegexScripts(),
+        ].some((script) => script.type === 'editprocess')
+        const fallbackReason = hypaSettings.useExperimentalImpl
+            ? 'experimental-hypa-v3'
+            : (pluginV2.editprocess?.size ?? 0) > 0
+                ? 'plugin-editprocess'
+                : currentChar.triggerscript.length > 0 || getModuleTriggers().length > 0
+                    ? 'generation-trigger'
+                    : editProcessScripts
+                        ? 'regex-editprocess'
+                        : null
+        if (decision.route === 'summary-aware' && !fallbackReason) {
+            summaryAwareHistoryPlan = decision.plan
+            console.debug('[Generation history] summary-aware', {
+                coveredMessages: decision.plan.coveredMessageIds.size,
+            })
+        } else {
+            console.debug('[Generation history] complete', {
+                reason: fallbackReason ?? (decision.route === 'complete' ? decision.reason : 'unknown'),
+            })
+        }
     }
 
     let chatAdditonalTokens = arg.chatAdditonalTokens ?? caculatedChatTokens
@@ -1119,11 +1158,16 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const promptHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
     let promptHistoryCompatibilitySnapshot: PromptHistoryCompatibilitySnapshot | null = null
     let promptScriptOperationScope: PromptScriptOperationScope | null = null
+    let preparedHistoryStartIndex = 0
     try {
     promptScriptOperationScope = createPromptScriptOperationScope(nowChatroom, {
         pluginCompatibility: requiresLivePromptCompatibility,
     })
     const promptHistorySelection = selectPromptHistory(promptHistory)
+    if (summaryAwareHistoryPlan) {
+        assertSummaryAwarePromptHistoryCurrent(currentChat, summaryAwareHistoryPlan)
+    }
+    preparedHistoryStartIndex = chats.length
     const promptHistoryEntries = requiresLivePromptCompatibility
         ? (promptHistoryCompatibilitySnapshot = createLivePromptHistoryCompatibilitySnapshot(
             currentChat.message,
@@ -1140,6 +1184,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         } else {
             msg = ensurePromptHistoryEntryId(promptHistory, entry, v4)
         }
+        if (msg.chatId && summaryAwareHistoryPlan?.coveredMessageIds.has(msg.chatId)) continue
         promptScriptOperationScope?.adoptMessageId(entry.locator, msg.chatId)
         const parsedMessage = promptScriptOperationScope
             ? promptScriptOperationScope.parse(nowChatroom, msg.data, {
@@ -1368,7 +1413,19 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         }
         else if(DBState.db.hypaV3){
             console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
-            const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer)
+            const sp = await hypaMemoryV3(
+                chats,
+                currentTokens,
+                maxContextTokens,
+                currentChat,
+                nowChatroom,
+                tokenizer,
+                summaryAwareHistoryPlan ? {
+                    boundaryMemo: summaryAwareHistoryPlan.boundaryMemo,
+                    effectiveMessageMemos: summaryAwareHistoryPlan.effectiveMessageMemos,
+                    historyStartIndex: preparedHistoryStartIndex,
+                } : undefined,
+            )
             if(sp.error){
                 // Save new summary
                 if (sp.memory) {

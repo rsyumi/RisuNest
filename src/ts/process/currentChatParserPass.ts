@@ -38,6 +38,7 @@ export interface RunCurrentChatParserPassOptions {
     parserCharacter: character | groupChat
     session: ActiveConversationSession | null
     parser: CurrentChatParser
+    skipMessageIds?: ReadonlySet<string>
 }
 
 export function runCurrentChatParserPass(
@@ -46,6 +47,7 @@ export function runCurrentChatParserPass(
     const { chat, session } = options
     if (!session) {
         chat.message = chat.message.map((message) => {
+            if (message.chatId && options.skipMessageIds?.has(message.chatId)) return message
             message.data = options.parser(message.data, {
                 chara: options.parserCharacter,
                 runVar: true,
@@ -102,6 +104,7 @@ export function runCurrentChatParserPass(
             for (let offset = 0; offset < window.messages.length; offset++) {
                 const absoluteIndex = window.startIndex + offset
                 const original = window.messages[offset]
+                if (original.chatId && options.skipMessageIds?.has(original.chatId)) continue
                 const parsedData = options.parser(original.data, {
                     chara: parserCharacter,
                     runVar: true,
