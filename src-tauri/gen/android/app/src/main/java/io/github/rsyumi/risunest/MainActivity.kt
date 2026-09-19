@@ -131,6 +131,7 @@ internal class RendererRecoveryCoordinator(
   ): Boolean {
     if (recovering) return true
     recovering = true
+    var cleanedUp = true
     listOf(
       "remove-from-parent" to removeFromParent,
       "remove-javascript-bridge" to removeJavascriptBridge,
@@ -141,11 +142,13 @@ internal class RendererRecoveryCoordinator(
       try {
         step()
       } catch (error: Throwable) {
+        if (name != "mark-recovery") cleanedUp = false
         logFailure(name, error)
       }
     }
     return try {
-      restart()
+      val restarting = restart()
+      cleanedUp && restarting
     } catch (error: Throwable) {
       logFailure("restart", error)
       false
@@ -538,6 +541,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
   private val exitFlushGate = ExitFlushGate()
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
+  private val rendererRestartGate by lazy {
+    RendererRestartGate(
+      post = { work -> mainHandler.post { work() } },
+      restart = { if (!coldRestartDispatcher.restart()) finishAndRemoveTask() },
+    )
+  }
   private val generationKeepAliveOwner = GenerationKeepAliveOwner()
   private val mainHandler = Handler(Looper.getMainLooper())
   private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -670,9 +679,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         if (lifecycleWebView === webView) {
           lifecycleWebView = null
         }
+        releaseFailedWebView(webView)
       },
       markRecovery = rendererRecoveryMarker::mark,
-      restart = coldRestartDispatcher::restart,
+      restart = rendererRestartGate::request,
     )
   }
 
@@ -724,6 +734,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       this,
       object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
+          if (lifecycleWebView !== webView) return
           when (backNavigationPolicy.decide(webView.canGoBack(), SystemClock.elapsedRealtime())) {
             BackNavigationAction.GO_BACK -> webView.goBack()
             BackNavigationAction.SHOW_EXIT_HINT -> {
@@ -749,7 +760,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onResume() {
     super.onResume()
+    rendererRestartGate.onResume()
     dispatchNotificationStateRefresh()
+  }
+
+  override fun onPause() {
+    rendererRestartGate.onPause()
+    super.onPause()
   }
 
   private fun dispatchNotificationStateRefresh() {
@@ -789,6 +806,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun onDestroy() {
+    rendererRestartGate.close()
     commitBridge?.close()
     commitBridge = null
     safSourceCancellations.values.forEach { it.set(true) }
