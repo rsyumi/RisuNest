@@ -5,6 +5,7 @@ import { selectSingleFile, asBuffer  } from 'src/ts/util';
 import { v4 } from 'uuid';
 import type { PreTrainedTokenizer } from '@huggingface/transformers';
 import { Mutex } from '../mutex';
+import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile';
 
 const initializationMutex = new Mutex()
 const embeddingMutex = new Mutex()
@@ -122,12 +123,16 @@ export const runEmbedding = async (texts: string[], model: EmbeddingModel = 'Xen
             });
             lastEmbeddingModelQuery = embeddingModelQuery
         }
-        const result = await extractor(texts, { pooling: 'mean', normalize: true });
-        const data = result.data as Float32Array
-        const lenPerText = data.length / texts.length
         const vectors: Float32Array[] = []
-        for (let i = 0; i < texts.length; i++) {
-            vectors.push(data.subarray(i * lenPerText, (i + 1) * lenPerText))
+        const batchSize = Math.min(texts.length, getRuntimePerformanceBudgets().localEmbeddingBatchEntries)
+        for (let offset = 0; offset < texts.length; offset += batchSize) {
+            const batch = texts.slice(offset, offset + batchSize)
+            const result = await extractor(batch, { pooling: 'mean', normalize: true });
+            const data = result.data as Float32Array
+            const lenPerText = data.length / batch.length
+            for (let i = 0; i < batch.length; i++) {
+                vectors.push(data.subarray(i * lenPerText, (i + 1) * lenPerText))
+            }
         }
         return vectors
     })

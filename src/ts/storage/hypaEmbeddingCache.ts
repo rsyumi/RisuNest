@@ -1,6 +1,7 @@
 import localforage from 'localforage'
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri, isTauriAndroid } from '../platform'
+import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
 
 /** Vectors travel as Float32 little endian, never as JSON number arrays. */
 export const HYPA_VECTOR_ELEMENT_BYTES = 4
@@ -140,7 +141,7 @@ export function createNativeHypaEmbeddingCache(
     return {
         async read(keys: string[]): Promise<Map<string, HypaCachedEmbedding>> {
             const results = new Map<string, HypaCachedEmbedding>()
-            for (const batch of chunk(keys, HYPA_CACHE_BATCH_SIZE)) {
+            for (const batch of chunk(keys, Math.min(HYPA_CACHE_BATCH_SIZE, getRuntimePerformanceBudgets().hypaCacheBatchEntries))) {
                 const response = await invokeCommand<unknown>('pds_read_hypa_embeddings', {
                     keys: batch,
                 })
@@ -151,7 +152,7 @@ export function createNativeHypaEmbeddingCache(
             return results
         },
         async write(entries: HypaEmbeddingEntry[]): Promise<void> {
-            for (const batch of chunk(entries, HYPA_CACHE_BATCH_SIZE)) {
+            for (const batch of chunk(entries, Math.min(HYPA_CACHE_BATCH_SIZE, getRuntimePerformanceBudgets().hypaCacheBatchEntries))) {
                 const frame = encodeHypaWriteFrame(batch)
                 // Android cannot deliver a raw request body, so it carries the
                 // same frame as base64 instead of a JSON number array.

@@ -1,5 +1,7 @@
 import { getDatabase, type Database } from "../../storage/database.svelte";
 import { normalizeInlayEncodeOptions } from "../../storage/blobStore";
+import { ByteBudgetLru } from "../../util/byteBudgetLru";
+import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../../runtimePerformanceProfile";
 import {
     decodeInlayImageBitmap,
     encodeInlayImageWithCanvas,
@@ -15,7 +17,15 @@ export interface InlayProviderImage {
 /** What every image provider reads. Anything else travels as a still WebP. */
 const providerReadableMimes = new Set(['image/png', 'image/jpeg', 'image/webp'])
 const maxRememberedStillFrames = 16
-const stillFrames = new Map<string, InlayProviderImage>()
+function createStillFrameCache() {
+    return new ByteBudgetLru<string, InlayProviderImage>(
+        getRuntimePerformanceBudgets().providerImageCacheBytes,
+        (id, image) => (id.length + image.data.length) * 2 + 32,
+        maxRememberedStillFrames,
+    )
+}
+let stillFrames = createStillFrameCache()
+subscribeRuntimePerformanceProfile(forgetInlayProviderImages)
 
 function dataUriParts(dataUri: string): { mime: string, base64: string } | null {
     const match = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(dataUri)
@@ -43,18 +53,14 @@ function providerImageSettings(): ProviderImageSettings {
     return (getDatabase() ?? {}) as ProviderImageSettings
 }
 
-function remember(id: string, image: InlayProviderImage): InlayProviderImage {
-    stillFrames.set(id, image)
-    while (stillFrames.size > maxRememberedStillFrames) {
-        const oldest = stillFrames.keys().next()
-        if (oldest.done) break
-        stillFrames.delete(oldest.value)
-    }
+function remember(id: string, image: InlayProviderImage, cache: typeof stillFrames): InlayProviderImage {
+    cache.set(id, image)
     return image
 }
 
 export function forgetInlayProviderImages(): void {
     stillFrames.clear()
+    stillFrames = createStillFrameCache()
 }
 
 /**
@@ -68,7 +74,8 @@ export async function inlayImageForProvider(
 ): Promise<InlayProviderImage> {
     const settings = providerImageSettings()
     if (settings.risunestInlayAnimationStillFrame === false) return asset
-    const remembered = stillFrames.get(id)
+    const cache = stillFrames
+    const remembered = cache.get(id)
     if (remembered) return remembered
     const parts = dataUriParts(asset.data)
     if (!parts) return asset
@@ -91,7 +98,7 @@ export async function inlayImageForProvider(
                 data: `data:${encoded.mime};base64,${encodeBase64(encoded.data)}`,
                 width: encoded.width,
                 height: encoded.height,
-            })
+            }, cache)
         } finally {
             bitmap.close?.()
         }

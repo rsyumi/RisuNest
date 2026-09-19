@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import {
     consistentEmbeddings,
     createLocalHypaEmbeddingCache,
@@ -81,6 +82,33 @@ describe('hypa embedding frames', () => {
 })
 
 describe('native hypa embedding cache', () => {
+    it.each([false, true])('preserves every vector in smaller low-spec batches (Android: %s)', async (android) => {
+        setRuntimePerformanceProfile('low-spec')
+        try {
+            const stored = new Map<string, HypaCachedEmbedding>()
+            const sizes: number[] = []
+            const invoke = vi.fn(async (command: string, args: any) => {
+                if (command === 'pds_write_hypa_embeddings') {
+                    const decoded = decodeHypaReadFrame(android ? Buffer.from(args.payload, 'base64') : args)
+                    sizes.push(decoded.size)
+                    for (const [key, value] of decoded) stored.set(key, value)
+                    return
+                }
+                sizes.push(args.keys.length)
+                return readFrame(args.keys.map((key: string) => ({ key, values: Array.from(stored.get(key)!.vector) })))
+            })
+            const cache = createNativeHypaEmbeddingCache(invoke as never, android)
+            const entries = Array.from({ length: 137 }, (_, i) => entry(`key-${i}`, [i, -i]))
+            await cache.write(entries)
+            const hits = await cache.read(entries.map((item) => item.key))
+            expect(sizes).toEqual([64, 64, 9, 64, 64, 9])
+            expect([...hits.keys()]).toEqual(entries.map((item) => item.key))
+            for (let i = 0; i < entries.length; i++) expect(hits.get(`key-${i}`)!.vector).toEqual(new Float32Array([i, -i]))
+        } finally {
+            setRuntimePerformanceProfile('normal')
+        }
+    })
+
     it('reads a whole batch in one call', async () => {
         const invoke = vi.fn(async (_command: string, _args: unknown) => readFrame([
             { key: 'a', values: [1, 2] },

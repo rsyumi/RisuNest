@@ -9,6 +9,7 @@ vi.mock('src/ts/storage/database.svelte', () => mocks)
 vi.mock('src/ts/util', () => ({ asBuffer: (bytes: Uint8Array) => bytes }))
 
 import { forgetInlayProviderImages, inlayImageForProvider } from '../inlayProviderImage'
+import * as performanceProfile from '../../../runtimePerformanceProfile'
 
 const drawImage = vi.fn()
 let createBitmap = vi.fn()
@@ -51,6 +52,45 @@ describe('inlayImageForProvider', () => {
         encodedBytes = Uint8Array.of(9, 9, 9)
         createBitmap = vi.fn(async () => ({ width: 40, height: 20, close: vi.fn() }))
         vi.stubGlobal('createImageBitmap', createBitmap)
+    })
+
+    test('evicts by bytes in access order and returns oversized images without retaining them', async () => {
+        const budget = vi.spyOn(performanceProfile, 'getRuntimePerformanceBudgets').mockReturnValue({
+            ...performanceProfile.getRuntimePerformanceBudgets(), providerImageCacheBytes: 180,
+        })
+        try {
+            forgetInlayProviderImages()
+            const asset = { data: dataUri('image/gif', gifBytes) }
+            await inlayImageForProvider('a', asset)
+            await inlayImageForProvider('b', asset)
+            await inlayImageForProvider('a', asset)
+            await inlayImageForProvider('c', asset)
+            expect(createBitmap).toHaveBeenCalledTimes(3)
+            await inlayImageForProvider('b', asset)
+            expect(createBitmap).toHaveBeenCalledTimes(4)
+            encodedBytes = new Uint8Array(100)
+            const first = await inlayImageForProvider('large', asset)
+            const second = await inlayImageForProvider('large', asset)
+            expect(first.data).toBe(dataUri('image/webp', encodedBytes))
+            expect(second).toEqual(first)
+            expect(createBitmap).toHaveBeenCalledTimes(6)
+        } finally {
+            budget.mockRestore()
+            forgetInlayProviderImages()
+        }
+    })
+
+    test('an in-flight conversion cannot repopulate an invalidated cache', async () => {
+        let resume!: (value: { width: number, height: number, close: () => void }) => void
+        createBitmap.mockImplementationOnce(() => new Promise((resolve) => { resume = resolve }))
+        const asset = { data: dataUri('image/gif', gifBytes) }
+        const pending = inlayImageForProvider('a', asset)
+        await vi.waitFor(() => expect(createBitmap).toHaveBeenCalledTimes(1))
+        forgetInlayProviderImages()
+        resume({ width: 40, height: 20, close: vi.fn() })
+        await pending
+        await inlayImageForProvider('a', asset)
+        expect(createBitmap).toHaveBeenCalledTimes(2)
     })
 
     test('sends an image every provider reads without touching it', async () => {

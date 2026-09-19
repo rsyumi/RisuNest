@@ -117,6 +117,25 @@ it('retries a failed replacement without retaining a disposed embedding model', 
     expect(first).toHaveBeenCalledTimes(1)
 })
 
+it('keeps embedding order and values across low-spec batches without replacing the model', async () => {
+    const { setRuntimePerformanceProfile } = await import('../runtimePerformanceProfile')
+    setRuntimePerformanceProfile('low-spec')
+    try {
+        const instance = model(null)
+        instance.mockImplementation(async (batch: string[]) => ({ data: Float32Array.from(batch.flatMap((text) => [Number(text), -Number(text)])) }))
+        harness.pipeline.mockResolvedValue(instance)
+        const { runEmbedding } = await import('./transformers')
+        const input = Array.from({ length: 19 }, (_, i) => String(i))
+        const output = await runEmbedding(input, undefined, 'wasm')
+        expect(instance.mock.calls.map(([batch]) => batch.length)).toEqual([8, 8, 3])
+        expect(output).toEqual(input.map((text) => new Float32Array([Number(text), -Number(text)])))
+        expect(harness.pipeline).toHaveBeenCalledTimes(1)
+        expect(instance.dispose).not.toHaveBeenCalled()
+    } finally {
+        setRuntimePerformanceProfile('normal')
+    }
+})
+
 it('does not initialize models for empty embeddings or absent speech', async () => {
     const { runEmbedding, runVITS } = await import('./transformers')
     expect(await runEmbedding([], undefined, 'wasm')).toEqual([])
