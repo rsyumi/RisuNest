@@ -397,6 +397,33 @@ describe('external storage production integration', () => {
         expect(mocks.releaseFence).toHaveBeenCalledOnce()
     })
 
+    it('retries a failed receive with the original job and fence instead of starting another operation', async () => {
+        const { installExternalStorageProduction, requestExternalStorageResolveConflict } = await import('./production')
+        const recovery = await import('./applicationRecovery')
+        await installExternalStorageProduction()
+        const ready = {
+            ...succeeded('old-sync', '8'), kind: 'resolve-conflict', state: 'waiting', phase: 'remote-apply',
+            result: { receiveReady: true, expectedRevision: '8' },
+        }
+        mocks.bridge.startJob.mockResolvedValue(ready)
+        mocks.bridge.getJob.mockResolvedValue(ready)
+        mocks.bridge.applyReceived.mockRejectedValueOnce(new Error('synthetic local activation failure'))
+        await expect(requestExternalStorageResolveConflict('old-sync', 'synthetic-conflict', 'remote'))
+            .rejects.toThrow('synthetic local activation failure')
+        expect(recovery.hasPendingExternalApplication()).toBe(true)
+        expect(mocks.releaseFence).not.toHaveBeenCalled()
+        expect(mocks.refreshWorkingSet).not.toHaveBeenCalled()
+        mocks.bridge.applyReceived.mockResolvedValue({ snapshotId: 'snapshot', receivedRevision: '9' })
+        await recovery.retryExternalApplication()
+        expect(mocks.bridge.startJob).toHaveBeenCalledOnce()
+        expect(mocks.bridge.applyReceived.mock.calls).toEqual([
+            ['job-old-sync', '8'], ['job-old-sync', '8'],
+        ])
+        expect(mocks.refreshWorkingSet).toHaveBeenCalledWith(9)
+        expect(mocks.releaseFence).toHaveBeenCalledOnce()
+        expect(recovery.hasPendingExternalApplication()).toBe(false)
+    })
+
     it('releases the replacement fence before authoritative restore plugin reload', async () => {
         const {
             installExternalStorageProduction,

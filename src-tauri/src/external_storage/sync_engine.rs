@@ -192,32 +192,46 @@ fn prepare_receive_input(
     })
 }
 
-// No transport or credentials enter the activation boundary.
+fn receive_validation_error(error: crate::persistent_store::StoreError) -> ProviderError {
+    match error {
+        crate::persistent_store::StoreError::Store { .. } => local_error(error),
+        _ => ProviderError::new(ErrorKind::PreconditionFailed),
+    }
+}
+
+// No transport or credentials enter the activation boundary. A failed attempt
+// retains the original staged generation and section inputs for the same job.
 fn activate_prepared_receive(
     store: &mut PersistentStore,
-    prepared: PreparedReceive,
+    prepared: &PreparedReceive,
     current: &CaptureIdentity,
 ) -> Result<i64> {
-    let staging_id = prepared.commit.external_staging_id().to_owned();
+    let staging_id = prepared.commit.external_staging_id();
     let result = (|| {
         require_exact_receive_identity(&prepared.expected, current)?;
         store.external_validate_receive(&prepared.job_id, &prepared.connection_id,
             &prepared.expected, &prepared.authenticated_head)
-            .map_err(|_| ProviderError::new(ErrorKind::PreconditionFailed))?;
+            .map_err(receive_validation_error)?;
         require_receive_participation(store, &prepared.participation)?;
+        // This only revalidates the existing SQL stage; it neither downloads
+        // nor materializes the library and never rebases the expected revision.
+        let commit = store.prepare_replace_commit(staging_id, Some(prepared.expected.revision))
+            .map_err(receive_validation_error)?;
         for section in &prepared.sections {
             super::sections::apply_prepared_section(store, section)?;
         }
-        store.finish_external_receive(prepared.commit, &prepared.job_id)
+        store.finish_external_receive(commit, &prepared.job_id)
             .map(|result| result.revision).map_err(local_error)
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
         if let Some(completed) = store.external_receive_completion(&prepared.job_id, &prepared.connection_id)
             .map_err(local_error)?
         {
             return Ok(completed.revision);
         }
-        if store.replace_abort(&staging_id).is_err() {
+        if matches!(error.kind, ErrorKind::PreconditionFailed | ErrorKind::Corrupt)
+            && store.replace_abort(staging_id).is_err()
+        {
             crate::nlog!("error", "Rejected external receive stage could not be removed");
         }
     }
@@ -974,8 +988,18 @@ fn commit_prepared_receive(
 ) -> Result<(String, i64)> {
     let prepared = take_prepared_receive(state, claim, job, expected)?;
     let snapshot_id = prepared.snapshot_id.clone();
-    let revision = activate_prepared_receive(store, prepared, current)?;
-    Ok((snapshot_id, revision))
+    match activate_prepared_receive(store, &prepared, current) {
+        Ok(revision) => Ok((snapshot_id, revision)),
+        Err(error) => {
+            if !matches!(error.kind, ErrorKind::PreconditionFailed | ErrorKind::Corrupt) {
+                // The claim excludes another preparation, cancellation, or
+                // apply until this original input has been restored.
+                state.prepared_receives.lock().map_err(local_error)?
+                    .insert(job.id.clone(), prepared);
+            }
+            Err(error)
+        }
+    }
 }
 
 fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Value> {
@@ -1004,11 +1028,16 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
     let outcome = commit_prepared_receive(&mut store, &state, &claim, &job, expected, &current);
     drop(store);
     drop(permit);
-    job.receive_staging_id = None;
+    let retained = state.prepared_receives.lock().map_err(local_error)?;
+    job.receive_staging_id = retained.get(&job.id)
+        .map(|prepared| prepared.commit.external_staging_id().to_owned());
+    let ready_result = retained.get(&job.id).map(PreparedReceive::ready_result);
+    drop(retained);
     let (snapshot_id, revision) = match outcome {
         Ok(result) => result,
         Err(error) => {
-            let permanent = matches!(error.kind, ErrorKind::PreconditionFailed | ErrorKind::Corrupt);
+            let permanent = ready_result.is_none()
+                && matches!(error.kind, ErrorKind::PreconditionFailed | ErrorKind::Corrupt);
             let mut preserving = false;
             if permanent {
                 let mut store = pds(app)?;
@@ -1022,7 +1051,10 @@ fn apply_received(app: &AppHandle, request: &ApplyReceivedRequest) -> Result<Val
             job.summary["state"] = json!(if preserving { "conflict" } else if permanent { "failed" } else { "waiting" });
             job.summary["phase"] = json!(if preserving { "conflict-choice" } else { "paused" });
             job.summary.as_object_mut().unwrap().remove("result");
-            if preserving {
+            if let Some(ready) = ready_result {
+                job.summary["phase"] = json!("remote-apply");
+                job.summary["result"] = ready;
+            } else if preserving {
                 job.summary["result"] = json!({"conflictId":job.id});
             }
             job.summary["error"] = super::runtime::error_dto(&error);
@@ -2313,12 +2345,82 @@ mod receive_tests {
     }
 
     #[test]
+    fn failed_receive_reuses_the_original_stage_and_sections_without_downloads() {
+        let (directory, mut store, job, downloaded) = fixture();
+        let source = downloaded.staging_root.clone();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let stage = prepared.commit.external_staging_id().to_owned();
+        fs::remove_dir_all(&source).unwrap();
+        let injector = rusqlite::Connection::open(directory.path().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+        injector.execute_batch("CREATE TRIGGER synthetic_receive_failure BEFORE INSERT ON external_storage_bases BEGIN SELECT RAISE(ABORT,'synthetic'); END").unwrap();
+        let state = super::super::job_store::JobCommandState::default();
+        state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
+        let mut first_rows = None;
+        for _ in 0..2 {
+            let mut native = store.open_native_job_store().unwrap();
+            let (_, claim) = state.claim(&job).unwrap();
+            let error = commit_prepared_receive(&mut native, &state, &claim, &job, 0, &job.admission_identity).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Transient);
+            assert_eq!(native.external_identity().unwrap(), job.admission_identity);
+            assert!(completed_receive_result(&native, &job, 0).unwrap().is_none());
+            assert_eq!(native.materialize_staging(&stage).unwrap()["marker"], "remote");
+            let partial = rows(&mut native);
+            assert_eq!(partial.len(), 1);
+            if let Some(first) = &first_rows { assert_eq!(&partial, first); }
+            else { first_rows = Some(partial); }
+            let retained = state.prepared_receives.lock().unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[&job.id].commit.external_staging_id(), stage);
+            assert_eq!(retained[&job.id].expected, job.admission_identity);
+            assert_eq!(retained[&job.id].snapshot_id, "snapshot");
+        }
+        injector.execute_batch("DROP TRIGGER synthetic_receive_failure").unwrap();
+        let mut native = store.open_native_job_store().unwrap();
+        let (_, claim) = state.claim(&job).unwrap();
+        assert_eq!(commit_prepared_receive(&mut native, &state, &claim, &job, 0, &job.admission_identity).unwrap(),
+            ("snapshot".into(), 1));
+        assert!(state.prepared_receives.lock().unwrap().is_empty());
+        assert!(!source.exists());
+        assert_eq!(rows(&mut native), first_rows.unwrap());
+        assert_eq!(native.materialize(None).unwrap()["marker"], "remote");
+        assert!(native.prepare_replace_commit(&stage, Some(1)).is_err());
+        assert_eq!(completed_receive_result(&native, &job, 0).unwrap().unwrap()["receivedRevision"], "1");
+    }
+
+    #[test]
+    fn retry_after_a_failed_receive_still_rejects_a_changed_library() {
+        let (directory, mut store, job, downloaded) = fixture();
+        let prepared = prepare(&mut store, &job, downloaded);
+        let stage = prepared.commit.external_staging_id().to_owned();
+        let injector = rusqlite::Connection::open(directory.path().join("persistent").join(crate::persistent_store::DATABASE_FILE)).unwrap();
+        injector.execute_batch("CREATE TRIGGER synthetic_receive_failure BEFORE INSERT ON external_storage_bases BEGIN SELECT RAISE(ABORT,'synthetic'); END").unwrap();
+        let state = super::super::job_store::JobCommandState::default();
+        state.prepared_receives.lock().unwrap().insert(job.id.clone(), prepared);
+        let (_, claim) = state.claim(&job).unwrap();
+        assert_eq!(commit_prepared_receive(&mut store, &state, &claim, &job, 0, &job.admission_identity).unwrap_err().kind,
+            ErrorKind::Transient);
+        let partial = rows(&mut store);
+        assert_eq!(partial.len(), 1);
+        injector.execute_batch("DROP TRIGGER synthetic_receive_failure").unwrap();
+        local_edit(&mut store, 0);
+        let current = store.external_identity().unwrap();
+        assert_eq!(commit_prepared_receive(&mut store, &state, &claim, &job, 0, &current).unwrap_err().kind,
+            ErrorKind::PreconditionFailed);
+        assert!(state.prepared_receives.lock().unwrap().is_empty());
+        assert!(store.prepare_replace_commit(&stage, Some(1)).is_err());
+        assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
+        assert!(completed_receive_result(&store, &job, 0).unwrap().is_none());
+        // Device-section progress is preserved honestly; this is not rollback.
+        assert_eq!(rows(&mut store), partial);
+    }
+
+    #[test]
     fn completed_receive_is_stable_after_later_local_writes_and_another_receive() {
         let (_directory, mut store, job, downloaded) = fixture();
         let second_input = downloaded.clone();
         let prepared = prepare(&mut store, &job, downloaded);
         let expected = job.admission_identity.clone();
-        activate_prepared_receive(&mut store, prepared, &expected).unwrap();
+        activate_prepared_receive(&mut store, &prepared, &expected).unwrap();
         // The auxiliary summary deliberately remains queued, as after a failed cache write.
         assert_eq!(job.summary["state"], "queued");
         local_edit(&mut store, 1);
@@ -2326,7 +2428,7 @@ mod receive_tests {
         let mut second_input = second_input;
         second_input.snapshot_id = "second-snapshot".into();
         let prepared = prepare(&mut store, &second, second_input);
-        activate_prepared_receive(&mut store, prepared, &second.admission_identity).unwrap();
+        activate_prepared_receive(&mut store, &prepared, &second.admission_identity).unwrap();
         assert_eq!(store.external_base("connection").unwrap().unwrap().snapshot_id, "second-snapshot");
         let result = completed_receive_result(&store, &job, 0).unwrap().unwrap();
         assert_eq!(result["receivedRevision"], "1");
@@ -2347,7 +2449,7 @@ mod receive_tests {
             "CREATE TRIGGER synthetic_summary_failure BEFORE UPDATE ON external_requests
              BEGIN SELECT RAISE(ABORT,'synthetic summary failure'); END;"
         ).unwrap();
-        activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
+        activate_prepared_receive(&mut store, &prepared, &job.admission_identity).unwrap();
         job.summary["state"] = json!("succeeded");
         job.receive_staging_id = None;
         assert!(cache.put(&job).is_err());
@@ -2369,7 +2471,7 @@ mod receive_tests {
         store.external_select(&epoch, &crate::persistent_store::sync_selection::SyncTarget::None).unwrap();
         assert_eq!(store.external_job(&job.id).unwrap().unwrap().phase, "stale");
         let current = store.external_identity().unwrap();
-        assert!(activate_prepared_receive(&mut store, prepared, &current).is_err());
+        assert!(activate_prepared_receive(&mut store, &prepared, &current).is_err());
         assert_eq!(store.revision().unwrap(), 0);
         assert!(rows(&mut store).is_empty());
     }
@@ -2388,7 +2490,7 @@ mod receive_tests {
         assert_eq!(state.prepared_receives.lock().unwrap().len(), 1);
         let prepared = take_prepared_receive(&state, &claim, &job, 0).unwrap();
         assert!(take_prepared_receive(&state, &claim, &job, 0).is_err());
-        activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
+        activate_prepared_receive(&mut store, &prepared, &job.admission_identity).unwrap();
         drop(claim);
         assert_eq!(completed_receive_result(&store, &job, 0).unwrap().unwrap()["receivedRevision"], "1");
         assert_eq!(store.revision().unwrap(), 1);
@@ -2425,7 +2527,7 @@ mod receive_tests {
                 "revision" => current.revision += 1,
                 _ => unreachable!(),
             }
-            assert_eq!(activate_prepared_receive(&mut store, prepared, &current).err().unwrap().kind,
+            assert_eq!(activate_prepared_receive(&mut store, &prepared, &current).err().unwrap().kind,
                 ErrorKind::PreconditionFailed, "{field}");
             assert!(rows(&mut store).is_empty(), "{field}");
             assert_eq!(store.revision().unwrap(), 0, "{field}");
@@ -2448,7 +2550,7 @@ mod receive_tests {
                 let prepared = prepare(&mut store, &job, downloaded);
                 local_edit(&mut store, 0);
                 let current = store.external_identity().unwrap();
-                assert!(activate_prepared_receive(&mut store, prepared, &current).is_err());
+                assert!(activate_prepared_receive(&mut store, &prepared, &current).is_err());
             }
             assert_eq!(store.revision().unwrap(), 1);
             assert_eq!(store.materialize(None).unwrap()["marker"], "newer-local");
@@ -2464,7 +2566,7 @@ mod receive_tests {
         let device = store.device_store_mut().unwrap();
         device.set_section_participating(PdsSection::LocalPlugins, false).unwrap();
         device.set_section_participating(PdsSection::LocalPlugins, true).unwrap();
-        assert!(activate_prepared_receive(&mut store, prepared, &job.admission_identity).is_err());
+        assert!(activate_prepared_receive(&mut store, &prepared, &job.admission_identity).is_err());
         assert!(rows(&mut store).is_empty());
         assert_eq!(store.revision().unwrap(), 0);
     }
@@ -2522,7 +2624,7 @@ mod receive_tests {
         let (_, claim) = state.claim(&job).unwrap();
         assert!(take_prepared_receive(&state, &claim, &job, 0).is_err());
         let prepared = prepare(&mut store, &job, downloaded);
-        activate_prepared_receive(&mut store, prepared, &job.admission_identity).unwrap();
+        activate_prepared_receive(&mut store, &prepared, &job.admission_identity).unwrap();
         assert_eq!(rows(&mut store), first);
         assert_eq!(store.revision().unwrap(), 1);
     }
