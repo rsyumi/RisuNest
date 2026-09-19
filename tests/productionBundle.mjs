@@ -39,11 +39,11 @@ const forbiddenMarkers = [
 export function isVerificationModule(id) {
   const normalized = id.replaceAll("\\", "/").split("?")[0];
   if (normalized.includes("/node_modules/")) {
-    return /\/(?:@vitest|vitest|happy-dom|fake-indexeddb|fast-check)\//.test(
+    return /\/(?:@vitest|vitest|happy-dom|jsdom|fake-indexeddb|fast-check)\//.test(
       normalized,
     );
   }
-  return /(?:^|\/)(?:benchmarks|tests|__tests__|__fixtures__)(?:\/|$)|\.(?:test|spec|bench|testSupport)\.(?:[cm]?[jt]sx?|svelte)$/.test(
+  return /(?:^|\/)(?:benchmarks|tests|test-fixtures|__tests__|__fixtures__)(?:\/|$)|\.(?:test|spec|bench|testSupport|testUtils)\.(?:[cm]?[jt]sx?|svelte(?:\.[jt]s)?)$/.test(
     normalized,
   );
 }
