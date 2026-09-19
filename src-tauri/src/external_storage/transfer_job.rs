@@ -93,7 +93,7 @@ async fn upload_inner(
     provider: &dyn Provider,
     repository: &RepositoryHandle,
     cancel: &Cancellation,
-    recreate_completed_missing: bool,
+    recreate_missing: bool,
 ) -> Result<ObjectReceipt> {
     cancel.check()?;
     let mut record = journal
@@ -115,14 +115,16 @@ async fn upload_inner(
                     journal.complete(&record.intent, repository, &receipt)?;
                     return Ok(receipt);
                 }
-                if !recreate_completed_missing && record.receipt.is_some() {
+                if !recreate_missing {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
                 record.resume = None;
             }
             UploadResolution::Resumable(resume) => record.resume = Some(resume),
             UploadResolution::RestartRequired => {
-                if !recreate_completed_missing && record.receipt.is_some() {
+                // An attempted registration may have been retired even when its
+                // creation response was lost before a local receipt was saved.
+                if !recreate_missing {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
                 record.resume = None;
@@ -667,6 +669,94 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind, ErrorKind::PreconditionFailed);
             assert_eq!(provider.upload_attempts(&intent.object_id), 1);
+        });
+    }
+
+    #[test]
+    fn missing_inventory_with_a_lost_confirmation_cannot_be_recreated() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (mut journal, intent) = prepare(root.path());
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let page_id = inventory_page_id(journal.job_id(), &intent.object_id, &intent.sha256);
+            let document = super::super::control::inventory_page_document(
+                &Descriptor::new("format-repository".into(), None).unwrap(),
+                &repository, journal.job_id(), &page_id,
+                &[super::super::control::InventoryRegistration {
+                    intent: &intent, plaintext_length: intent.byte_length,
+                    plaintext_sha256: &intent.sha256,
+                }],
+            ).unwrap();
+            super::super::control::upload_inventory_page(
+                &Descriptor::new("format-repository".into(), None).unwrap(),
+                &[7; 32], document, &mut journal, &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap();
+            let page_object = format!("inventory-page-{page_id}");
+            // Model a crash after remote creation but before recording its response.
+            journal.reopen_object(&page_object).unwrap();
+            assert!(journal.record(&page_object).unwrap().unwrap().attempted);
+            provider.forget(&page_object);
+            drop(journal);
+            let mut journal = TransferJournal::open(root.path(), identity()).unwrap();
+            let error = upload_registered(
+                &mut journal, &intent.object_id, "format-repository", &[7; 32],
+                intent.byte_length, &intent.sha256, &provider, &repository,
+                &Cancellation::default(),
+            ).await.unwrap_err();
+            assert_eq!(error.kind, ErrorKind::PreconditionFailed);
+            assert_eq!(provider.upload_attempts(&page_object), 1);
+            assert_eq!(provider.upload_attempts(&intent.object_id), 0);
+        });
+    }
+
+    #[test]
+    fn inventory_growth_across_upload_cycles_and_retries_is_measured() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let provider = FakeProvider::new(false);
+            let repository = fake::repository();
+            let cancel = Cancellation::default();
+            let mut payload_requests = 0;
+            let mut inventory_requests = 0;
+            for cycle in 0..3 {
+                let mut job = identity();
+                job.job_id = format!("cycle-{cycle}");
+                let directory = root.path().join(&job.job_id);
+                let mut journal = TransferJournal::open(&directory, job.clone()).unwrap();
+                for index in 0..32 {
+                    let bytes = format!("synthetic-{cycle}-{index}").into_bytes();
+                    let intent = ObjectIntent {
+                        repository_id: repository.repository_id.clone(),
+                        job_id: job.job_id.clone(),
+                        object_id: format!("pack-{cycle}-{index}"),
+                        role: ObjectRole::Pack,
+                        byte_length: bytes.len() as u64,
+                        sha256: risunest_sync_wire::hash(&bytes),
+                    };
+                    std::fs::write(journal.spool_path(&intent.object_id), &bytes).unwrap();
+                    journal.register(&intent).unwrap();
+                    for _ in 0..2 {
+                        upload_registered(
+                            &mut journal, &intent.object_id, "format-repository", &[7; 32],
+                            intent.byte_length, &intent.sha256, &provider, &repository, &cancel,
+                        ).await.unwrap();
+                    }
+                    payload_requests += provider.upload_attempts(&intent.object_id);
+                    inventory_requests += provider.upload_attempts(&format!("inventory-page-{}",
+                        inventory_page_id(&job.job_id, &intent.object_id, &intent.sha256)));
+                }
+            }
+            let state = provider.state.lock().unwrap();
+            let pages = state.objects.iter().filter(|(id, _)| id.starts_with("inventory-page-"))
+                .map(|(_, (bytes, _))| bytes.len()).collect::<Vec<_>>();
+            assert_eq!(pages.len(), 96);
+            assert_eq!(payload_requests, 96);
+            assert_eq!(inventory_requests, 96);
+            let metadata_bytes: usize = pages.iter().sum();
+            assert!(metadata_bytes < 96 * 2048);
+            eprintln!("3 cycles, 96 payloads, 96 retries: {} inventory pages, {metadata_bytes} encrypted metadata bytes, {payload_requests} payload creates, {inventory_requests} inventory creates", pages.len());
         });
     }
 

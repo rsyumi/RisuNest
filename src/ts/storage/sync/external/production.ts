@@ -333,10 +333,10 @@ export async function requestExternalStorageDeleteHistory(
     })
     while (true) {
         if (job.state === 'succeeded') break
-        if (['failed', 'cancelled', 'uncertain', 'conflict'].includes(job.state)) {
+        if (['failed', 'cancelled', 'uncertain', 'conflict', 'waiting'].includes(job.state)) {
             throw restoreFailure(job)
         }
-        await new Promise(resolve => setTimeout(resolve, job.state === 'waiting' ? 5_000 : 500))
+        await new Promise(resolve => setTimeout(resolve, 500))
         job = await getExternalStorageBridge().getJob(job.id)
     }
     const state = await getExternalStorageBridge().getState()

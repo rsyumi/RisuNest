@@ -160,6 +160,57 @@ fn existing_repository_replies() -> Vec<Reply> {
 }
 
 #[test]
+fn inventory_lookup_finds_later_releases_after_gaps_and_rejects_duplicates() {
+    runtime().block_on(async {
+        for duplicate in [false, true] {
+            let bytes = b"inventory-payload";
+            let mut replies = existing_repository_replies();
+            replies.push(reply(200, json!([
+                release(40, &job_tag("job-1", 9)),
+                release(41, &job_tag("job-1", 12)),
+                release(42, &job_tag("other-job", 0)),
+            ])));
+            replies.push(reply(200, json!([asset(90, "pack-object", bytes.len() as u64, Some(digest_of(bytes)))])));
+            replies.push(reply(200, if duplicate {
+                json!([asset(91, "pack-object", bytes.len() as u64, Some(digest_of(bytes)))])
+            } else { json!([]) }));
+            let server = github_server(replies);
+            let provider = adapter(dependencies().dependencies);
+            let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+            let intent = object_intent(&handle, ObjectRole::Pack, "object", bytes);
+            let result = provider.lookup_object(&handle, &intent, &Cancellation::default()).await;
+            if duplicate {
+                assert_eq!(result.unwrap_err().kind, ErrorKind::PreconditionFailed);
+            } else {
+                assert_eq!(result.unwrap().unwrap().locator.object, "40/90");
+            }
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 6);
+            assert!(requests.iter().all(|request| method_of(request) == "GET"));
+        }
+    });
+}
+
+#[test]
+fn inventory_collection_lists_only_inventory_assets() {
+    runtime().block_on(async {
+        let mut replies = existing_repository_replies();
+        replies.push(reply(200, json!([release(40, &job_tag("job-1", 9))])));
+        replies.push(reply(200, json!([
+            asset(90, "inventory-inventory-page-one", 100, None),
+            asset(91, "pack-object", 100, None),
+        ])));
+        let server = github_server(replies);
+        let provider = adapter(dependencies().dependencies);
+        let handle = open(provider.as_ref(), &server, OpenMode::Existing).await.unwrap();
+        let page = provider.list_objects(&handle, Collection::InventoryPages, None, 10, &Cancellation::default()).await.unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].locator.object, "40/90");
+        assert!(page.next_cursor.is_none());
+    });
+}
+
+#[test]
 fn bounded_lookups_do_not_report_unscanned_objects_as_absent() {
     runtime().block_on(async {
         for kind in ["release", "asset-name", "asset-id"] {

@@ -133,7 +133,7 @@ pub(crate) async fn run_delete_history(
         clock: leases::system_clock(),
         protection_supported: connected.stored.capabilities.lease_operations,
     };
-    let owner = match leases::admit(&context, &job.id, LeaseKind::Deleting, cancel).await? {
+    let owner = match leases::admit(&context, &job.id, LeaseKind::Cleanup, cancel).await? {
         Admission::Admitted(owner) => owner,
         Admission::Yield { .. } => return Err(ProviderError::new(ErrorKind::Transient)),
         Admission::UnsupportedProtection => return Err(ProviderError::new(ErrorKind::Unsupported)),
@@ -147,14 +147,17 @@ pub(crate) async fn run_delete_history(
         {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        owner.check_control(&context, false)?;
+        owner.place_marker(&context, cancel).await?;
         if owner.recheck(&context, cancel).await?.is_some() {
             return Err(ProviderError::new(ErrorKind::Transient));
         }
         let stored = inspected.point.reference.stored(&connected.handle)?;
-        let outcome = control::delete_authenticated_backup_point(
+        owner.check_control(&context, true)?;
+        owner.set_delete_in_flight(true);
+        let outcome = leases::control_request(cancel, control::delete_authenticated_backup_point(
             connected, point_id, inspected.point.document.kind, &stored, cancel,
-        ).await?;
+        )).await?;
+        owner.set_delete_in_flight(false);
         Ok(json!({
             "pointId": point_id,
             "deleteOutcome": match outcome {

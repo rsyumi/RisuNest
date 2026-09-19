@@ -307,7 +307,8 @@ async fn run_owned(
         outcome.stop_reason = reason;
         return Ok(());
     }
-    if !marked.candidates.is_empty() {
+    let mut marker_placed = !marked.candidates.is_empty();
+    if marker_placed {
         owner.renew_if_due(context, cancel).await?;
         owner.place_marker(context, cancel).await?;
     }
@@ -441,6 +442,11 @@ async fn run_owned(
             if observed_at.saturating_sub(first_absent) < leases::UNREACHABLE_GRACE_MS {
                 continue;
             }
+            if !marker_placed {
+                owner.renew_if_due(context, cancel).await?;
+                owner.place_marker(context, cancel).await?;
+                marker_placed = true;
+            }
             let Some((expected_identity, expected)) = pages.get(&key) else {
                 continue;
             };
@@ -476,11 +482,19 @@ async fn run_owned(
                     .forget_inventory_page_observation(context.connection_id, &key)?;
                 continue;
             }
-            owner.set_delete_in_flight(true);
             let stored = current.reference.stored(context.repository)?;
-            let removed = view.delete_inventory_page(&stored, cancel).await;
+            if let Some(reason) = current_limit(
+                context, request, time_not_before, owner, started, cancel,
+            )? {
+                outcome.stop_reason = reason;
+                break;
+            }
+            owner.set_delete_in_flight(true);
+            let removed = leases::control_request(
+                cancel, view.delete_inventory_page(&stored, cancel),
+            ).await?;
             owner.set_delete_in_flight(false);
-            match removed? {
+            match removed {
                 control::RemoteInventoryPageDeleteOutcome::Deleted
                 | control::RemoteInventoryPageDeleteOutcome::NotFound => {
                     sent += 1;
@@ -858,6 +872,7 @@ mod tests {
         inventory: Mutex<InventorySurvey>,
         retired_inventory: Mutex<Vec<String>>,
         protected: Mutex<Vec<String>>,
+        inventory_delete_error: Mutex<Option<ErrorKind>>,
     }
     impl RepositoryView for View {
         fn roots<'a>(&'a self, _: &'a Cancellation) -> ProviderFuture<'a, ObservedRoots> {
@@ -892,6 +907,9 @@ mod tests {
         ) -> ProviderFuture<'a, control::RemoteInventoryPageDeleteOutcome> {
             Box::pin(async move {
                 self.retired_inventory.lock().unwrap().push(expected.header.object_id.clone());
+                if let Some(kind) = *self.inventory_delete_error.lock().unwrap() {
+                    return Err(ProviderError::new(kind));
+                }
                 Ok(control::RemoteInventoryPageDeleteOutcome::Deleted)
             })
         }
@@ -955,6 +973,7 @@ mod tests {
                     inventory: Mutex::new(InventorySurvey::default()),
                     retired_inventory: Mutex::new(Vec::new()),
                     protected: Mutex::new(Vec::new()),
+                    inventory_delete_error: Mutex::new(None),
                 },
             }
         }
@@ -1013,6 +1032,29 @@ mod tests {
             assert_eq!(result.stop_reason, StopReason::Complete);
             assert_eq!(h.view.retired_inventory.lock().unwrap().as_slice(), ["inventory-page-old"]);
             assert_eq!(result.deleted_objects, 3);
+        });
+    }
+
+    #[test]
+    fn inventory_only_response_loss_keeps_the_deletion_marker() {
+        runtime().block_on(async {
+            let h = Harness::new();
+            h.view.jobs.lock().unwrap().references.push(h.view.known[0].clone());
+            *h.view.inventory.lock().unwrap() = InventorySurvey {
+                pages: vec![InventoryPageState {
+                    reference: object("inventory-page-empty", ObjectRole::InventoryPage),
+                    operation_id: "finished".into(),
+                    all_objects_absent: true,
+                }],
+                objects: Vec::new(),
+            };
+            assert_eq!(h.run().await.unwrap().deleted_objects, 0);
+            h.clock.advance(leases::UNREACHABLE_GRACE_MS);
+            *h.view.inventory_delete_error.lock().unwrap() = Some(ErrorKind::Transient);
+            assert_eq!(h.run().await.unwrap_err().kind, ErrorKind::Transient);
+            assert!(h.payload_deletes().is_empty());
+            assert_eq!(h.run().await.unwrap().stop_reason, StopReason::Lease);
+            assert_eq!(h.view.retired_inventory.lock().unwrap().len(), 1);
         });
     }
 

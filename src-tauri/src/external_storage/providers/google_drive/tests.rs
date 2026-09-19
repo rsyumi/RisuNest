@@ -2248,6 +2248,8 @@ fn deleting_checks_the_parent_and_role_of_the_file_before_removing_it() {
         replies.push(error_reply(404, "notFound"));
         replies.push(json_reply(200, member("descriptor", FOLDER)));
         replies.push(json_reply(200, member("pack", "another-folder")));
+        replies.push(json_reply(200, member("inventoryPage", FOLDER)));
+        replies.push(Reply::Http { status: 204, headers: vec![], body: Vec::new() });
         let server = WireServer::start(replies);
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let cancel = Cancellation::default();
@@ -2292,8 +2294,10 @@ fn deleting_checks_the_parent_and_role_of_the_file_before_removing_it() {
             );
         }
 
+        provider.delete_object(&repository, &locator("inventory-file"), &cancel).await.unwrap();
         let lines = request_lines(&server);
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[9], "DELETE /synthetic/drive/v3/files/inventory-file HTTP/1.1");
         assert!(lines[3].contains("fields=id%2Cparents%2CappProperties"));
         assert_eq!(
             lines[4],

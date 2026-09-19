@@ -733,6 +733,7 @@ fn removable(settings: &Settings, file: &DriveFile) -> bool {
                 ObjectRole::SyncState,
                 ObjectRole::BackupBundle,
                 ObjectRole::BackupPoint,
+                ObjectRole::InventoryPage,
                 ObjectRole::Lease,
             ]
             .iter()

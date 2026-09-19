@@ -154,6 +154,14 @@ fn remember_item(items: &mut BTreeMap<String, Value>, id: String, mut next: Valu
     }
     items.insert(id, next);
 }
+fn point_row_id(kind: control::BackupPointKind, point_id: &str, snapshot_id: &str) -> Result<String> {
+    if kind == control::BackupPointKind::Conflict {
+        serde_json::to_string(&(point_id, snapshot_id)).map_err(runtime::local_error)
+    } else {
+        Ok(point_id.to_owned())
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn external_storage_list_history(
     app: AppHandle,
@@ -194,7 +202,10 @@ pub(crate) async fn external_storage_list_history(
                     &reference,
                 )?;
                 let mut value = item(&document, &reference, kind, pinned, &store_id);
-                value["id"] = json!(point.document.point_id.clone());
+                let row_id = point_row_id(
+                    point.document.kind, &point.document.point_id, &document.snapshot_id,
+                )?;
+                value["id"] = json!(row_id);
                 value["pointId"] = json!(point.document.point_id.clone());
                 value["pointObservation"] = json!(serde_json::to_string(
                     &point.reference.stored(&connected.handle)?,
@@ -203,7 +214,7 @@ pub(crate) async fn external_storage_list_history(
                     point.document.kind,
                     control::BackupPointKind::Automatic | control::BackupPointKind::Manual
                 ));
-                items.insert(point.document.point_id.clone(), value);
+                items.insert(row_id, value);
             }
         }
         match page.next_cursor {
@@ -253,6 +264,20 @@ pub(crate) async fn external_storage_list_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_rows_preserve_both_conflict_bundles_and_separate_retention_points() {
+        use control::BackupPointKind::{Automatic, Conflict, Manual};
+        let mut rows = BTreeMap::new();
+        for (kind, point, snapshot) in [
+            (Conflict, "conflict", "local"), (Conflict, "conflict", "remote"),
+            (Automatic, "automatic", "local"), (Manual, "manual", "local"),
+        ] {
+            rows.insert(point_row_id(kind, point, snapshot).unwrap(), snapshot);
+        }
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.values().filter(|id| **id == "local").count(), 3);
+        assert_eq!(rows.values().filter(|id| **id == "remote").count(), 1);
+    }
     #[test]
     fn duplicate_snapshot_keeps_pinning_and_conflict_evidence() {
         let mut items = BTreeMap::new();
