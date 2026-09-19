@@ -1074,6 +1074,10 @@ fn pds_asset_gc_execute_all(
     operation_guard: &RendererOperationGuard,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
     let now = current_time_ms()?;
+    // This fresh command-local mark only filters candidates; deletion rechecks current roots.
+    let marks = with_store_mutex_admitted(state, operation_guard, |store| {
+        store.prepare_asset_gc_delete_marks()
+    })?;
     let mut cursor = None;
     let mut result = AssetGcMaintenanceResult {
         candidate_count: 0,
@@ -1085,7 +1089,7 @@ fn pds_asset_gc_execute_all(
         omitted: 0,
     };
     loop {
-        let page = pds_asset_gc_execute_page(state, operation_guard, cursor.as_deref(), now)?;
+        let page = pds_asset_gc_execute_page(state, operation_guard, &marks, cursor.as_deref(), now)?;
         let page_result = asset_gc_result(page.report);
         result.candidate_count += page_result.candidate_count;
         result.candidate_bytes += page_result.candidate_bytes;
@@ -1103,11 +1107,12 @@ fn pds_asset_gc_execute_all(
 fn pds_asset_gc_execute_page(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
+    marks: &crate::asset_repository::migration_gc::AssetGcMarks,
     cursor: Option<&str>,
     now: i64,
 ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
     with_store_mutex_mut_admitted(state, operation_guard, |store| {
-        store.asset_gc_delete_page_with_hook(128, cursor, now, 7 * 24 * 60 * 60 * 1_000, |_| Ok(()))
+        store.asset_gc_delete_marked_page_with_hook(marks, 128, cursor, now, 7 * 24 * 60 * 60 * 1_000, |_| Ok(()))
     })
 }
 
@@ -2120,41 +2125,14 @@ mod tests {
             ..PersistentStoreState::default()
         };
         let operation_guard = state.admit_renderer_operation().unwrap();
-        let observed_pages = std::cell::Cell::new(0);
-        let now = current_time_ms().unwrap();
-        let mut cursor = None;
-        let mut result = AssetGcMaintenanceResult {
-            candidate_count: 0,
-            candidate_bytes: 0,
-            deleted_count: 0,
-            deleted_bytes: 0,
-            blockers: Vec::new(),
-            candidates: Vec::new(),
-            omitted: 0,
-        };
-        loop {
-            let page = pds_asset_gc_execute_page(&state, &operation_guard, cursor.as_deref(), now)
-                .expect("execute command page");
-            assert!(
-                state.store.try_lock().is_ok(),
-                "store lock must be released between GC pages"
-            );
-            observed_pages.set(observed_pages.get() + 1);
-            let page_result = asset_gc_result(page.report);
-            result.candidate_count += page_result.candidate_count;
-            result.candidate_bytes += page_result.candidate_bytes;
-            result.deleted_count += page_result.deleted_count;
-            result.deleted_bytes += page_result.deleted_bytes;
-            result.blockers.extend(page_result.blockers);
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
+        super::super::ASSET_GC_ROOT_COLLECTIONS.with(|count| count.set((0, 0)));
+        let result = pds_asset_gc_execute_all(&state, &operation_guard).expect("execute complete cleanup");
+        super::super::ASSET_GC_ROOT_COLLECTIONS.with(|count| {
+            assert_eq!(count.get(), (1, 2), "one preliminary scan and one final check per deleting page");
+        });
+        assert!(state.store.try_lock().is_ok());
         drop(operation_guard);
         let store = state.store.into_inner().unwrap().unwrap();
-
-        assert!(observed_pages.get() >= 2);
         assert_eq!(result.candidate_count, total);
         assert_eq!(result.candidate_bytes, expected_bytes);
         assert_eq!(result.deleted_count, total);

@@ -965,6 +965,11 @@ fn scan_failure(error: crate::portable_backup::Error) -> StoreError {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static ASSET_GC_ROOT_COLLECTIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 pub(crate) struct AssetGcPreview {
     cas: crate::asset_repository::PayloadCas,
     residency: crate::server_sync::residency::Residency,
@@ -2634,8 +2639,34 @@ impl PersistentStore {
         Ok(())
     }
 
+    pub(crate) fn prepare_asset_gc_delete_marks(
+        &self,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcMarks> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
+            .map_err(|error| std::io::Error::other(error.code))?;
+        Ok(crate::asset_repository::migration_gc::mark_asset_roots_with_remote(
+            &cas, self.collect_asset_gc_roots(false, false)?, |hash| residency.gc_size(hash),
+        )?)
+    }
+
     pub(crate) fn asset_gc_delete_page_with_hook(
         &mut self,
+        limit: i64,
+        cursor: Option<&str>,
+        now_ms: i64,
+        minimum_grace_ms: i64,
+        hook: impl FnMut(
+            crate::asset_repository::migration_gc::AssetGcDeleteHookPoint,
+        ) -> StoreResult<()>,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
+        let marks = self.prepare_asset_gc_delete_marks()?;
+        self.asset_gc_delete_marked_page_with_hook(&marks, limit, cursor, now_ms, minimum_grace_ms, hook)
+    }
+
+    pub(crate) fn asset_gc_delete_marked_page_with_hook(
+        &mut self,
+        initial_marks: &crate::asset_repository::migration_gc::AssetGcMarks,
         limit: i64,
         cursor: Option<&str>,
         now_ms: i64,
@@ -2645,17 +2676,18 @@ impl PersistentStore {
         ) -> StoreResult<()>,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
         use crate::asset_repository::migration_gc::{
-            dry_run_mark_and_sweep_with_remote, AssetGcDeleteHookPoint, AssetGcDryRunPage,
+            dry_run_mark_and_sweep_with_remote, sweep_asset_candidates_with_remote,
+            AssetGcDeleteHookPoint, AssetGcDryRunPage,
         };
 
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         let initial_candidates = self.query_asset_object_catalog(limit, cursor)?;
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
-        let initial_report = dry_run_mark_and_sweep_with_remote(
+        let initial_report = sweep_asset_candidates_with_remote(
             &cas,
             initial_candidates.items.clone(),
-            self.collect_asset_gc_roots(false, false)?,
+            initial_marks,
             now_ms,
             minimum_grace_ms,
             |hash| residency.gc_size(hash),
@@ -2809,6 +2841,12 @@ impl PersistentStore {
         };
         use crate::asset_repository::migration_gc::collect_staged_migration_roots;
 
+        #[cfg(test)]
+        ASSET_GC_ROOT_COLLECTIONS.with(|count| {
+            let (preliminary, final_checks) = count.get();
+            count.set((preliminary + usize::from(!repository_guard_held),
+                final_checks + usize::from(repository_guard_held)));
+        });
         let mut roots = vec![("library", snapshot::collect_asset_roots(&self.connection)?)];
         for reader in self.revision_leases.values() {
             roots.push((
