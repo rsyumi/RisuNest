@@ -342,10 +342,6 @@ fn create_controlled_inner(
     let flattened = flattened_plugin_storage(connection, &target.generation)?;
     let excluded_colliding_plugin_value_count = flattened.collisions.len() as u64;
     let plugin_storage_meta = plugin_storage_meta_value(&flattened.owners);
-    let mut plugin_storage = Value::Object(flattened.values);
-    if let Some(replacements) = replacements {
-        project_plugin_storage_resources(&mut plugin_storage, replacements);
-    }
     if omit_account {
         root.shift_remove("account");
     }
@@ -435,13 +431,11 @@ fn create_controlled_inner(
         &mut on_progress,
     )?;
     check_export_cancelled(&is_cancelled)?;
-    write_optional_value_block(
-        &mut file,
-        PLUGIN_STORAGE,
-        "pluginStorage",
-        Some(&plugin_storage),
-        &is_cancelled,
-    )?;
+    write_block(&mut file, PLUGIN_STORAGE, "pluginStorage", &is_cancelled, |writer| {
+        write_plugin_storage(
+            connection, &target.generation, &flattened.rows, replacements, writer, &is_cancelled,
+        )
+    })?;
     report_export_progress(
         &mut file,
         &mut completed_items,
@@ -550,17 +544,16 @@ fn preset_count(connection: &Connection, generation: &str) -> StoreResult<u64> {
     })
 }
 
-/// One `plugin_storage` row with the ownership the table records.
+/// Ordered ownership metadata; values are read only when they are consumed.
 pub(crate) struct PluginStorageRow {
     pub(crate) owner: String,
     pub(crate) key: String,
-    pub(crate) value: Value,
     pub(crate) assigned_at: Option<i64>,
 }
 
 /// Flattened plugin storage plus the keys that could not be flattened.
 pub(crate) struct FlattenedPluginStorage {
-    pub(crate) values: Map<String, Value>,
+    pub(crate) rows: Vec<PluginStorageRow>,
     /// Keys held by more than one plugin, with every owner that holds them.
     pub(crate) collisions: Vec<(String, Vec<String>)>,
     /// Owner of each exported key, for the ownership sidecar.
@@ -573,7 +566,7 @@ pub(crate) fn plugin_storage_rows(
     generation: &str,
 ) -> StoreResult<Vec<PluginStorageRow>> {
     let mut statement = connection.prepare(
-        "SELECT owner, storage_key, value, ordinal, assigned_at FROM plugin_storage
+        "SELECT owner, storage_key, ordinal, assigned_at FROM plugin_storage
          WHERE generation = ?1",
     )?;
     let mut values = statement
@@ -581,34 +574,22 @@ pub(crate) fn plugin_storage_rows(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?
-        .map(|row| {
-            let (owner, key, value, ordinal, assigned_at) = row?;
-            Ok((
-                owner,
-                key,
-                serde_json::from_str(&value)?,
-                ordinal,
-                assigned_at,
-            ))
-        })
-        .collect::<StoreResult<Vec<(String, String, Value, i64, Option<i64>)>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     values.sort_by(
-        |(left_owner, left, _, left_ordinal, _), (right_owner, right, _, right_ordinal, _)| {
+        |(left_owner, left, left_ordinal, _), (right_owner, right, right_ordinal, _)| {
             compare_plugin_storage_keys(left, *left_ordinal, right, *right_ordinal)
                 .then_with(|| left_owner.cmp(right_owner))
         },
     );
     Ok(values
         .into_iter()
-        .map(|(owner, key, value, _, assigned_at)| PluginStorageRow {
+        .map(|(owner, key, _, assigned_at)| PluginStorageRow {
             owner,
             key,
-            value,
             assigned_at,
         })
         .collect())
@@ -639,7 +620,7 @@ pub(crate) fn flattened_plugin_storage(
         })
         .collect();
     collisions.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut values = Map::new();
+    let mut selected = Vec::new();
     let mut owners = Vec::new();
     for row in rows {
         if owners_by_key
@@ -648,11 +629,11 @@ pub(crate) fn flattened_plugin_storage(
         {
             continue;
         }
-        owners.push((row.key.clone(), row.owner, row.assigned_at));
-        values.insert(row.key, row.value);
+        owners.push((row.key.clone(), row.owner.clone(), row.assigned_at));
+        selected.push(row);
     }
     Ok(FlattenedPluginStorage {
-        values,
+        rows: selected,
         collisions,
         owners,
     })
@@ -666,9 +647,45 @@ pub(crate) fn materialized_plugin_storage(
 ) -> StoreResult<Map<String, Value>> {
     let mut values = Map::new();
     for row in plugin_storage_rows(connection, generation)? {
-        values.insert(row.key, row.value);
+        let value = read_plugin_storage_value(connection, generation, &row)?;
+        values.insert(row.key, value);
     }
     Ok(values)
+}
+
+fn read_plugin_storage_value(
+    connection: &Connection,
+    generation: &str,
+    row: &PluginStorageRow,
+) -> StoreResult<Value> {
+    let value: String = connection.prepare_cached(
+        "SELECT value FROM plugin_storage WHERE generation = ?1 AND owner = ?2 AND storage_key = ?3",
+    )?.query_row(params![generation, row.owner, row.key], |row| row.get(0))?;
+    Ok(serde_json::from_str(&value)?)
+}
+
+fn write_plugin_storage(
+    connection: &Connection,
+    generation: &str,
+    rows: &[PluginStorageRow],
+    replacements: Option<&HashMap<String, String>>,
+    writer: &mut dyn Write,
+    is_cancelled: &impl Fn() -> bool,
+) -> StoreResult<()> {
+    writer.write_all(b"{")?;
+    for (index, row) in rows.iter().enumerate() {
+        check_export_cancelled(is_cancelled)?;
+        if index != 0 { writer.write_all(b",")?; }
+        serde_json::to_writer(&mut *writer, &row.key)?;
+        writer.write_all(b":")?;
+        let mut value = read_plugin_storage_value(connection, generation, row)?;
+        if let Some(replacements) = replacements {
+            project_plugin_storage_resources(&mut value, replacements);
+        }
+        serde_json::to_writer(&mut *writer, &value)?;
+    }
+    writer.write_all(b"}")?;
+    Ok(())
 }
 
 /// The ownership sidecar upstream RisuAI ignores and RisuNest reads back.
@@ -1330,6 +1347,37 @@ fn take_root_block_value(root: &mut Map<String, Value>, key: &str) -> Option<Val
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_export_selects_metadata_before_reading_values_and_preserves_legacy_order() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE plugin_storage (generation TEXT, owner TEXT, storage_key TEXT, value TEXT, ordinal INTEGER, assigned_at INTEGER);
+             CREATE UNIQUE INDEX plugin_key ON plugin_storage (generation, owner, storage_key);",
+        ).unwrap();
+        for (owner, key, value, ordinal) in [
+            ("a", "z", r#"{"nested":"assets/old.bin"}"#, 0),
+            ("a", "10", "10", 1),
+            ("a", "2", "2", 2),
+            ("a", "shared", "not parsed because it is excluded", 3),
+            ("b", "shared", "also excluded", 4),
+        ] {
+            connection.execute(
+                "INSERT INTO plugin_storage VALUES ('g', ?1, ?2, ?3, ?4, 1234)",
+                rusqlite::params![owner, key, value, ordinal],
+            ).unwrap();
+        }
+        let selected = super::flattened_plugin_storage(&connection, "g").unwrap();
+        assert_eq!(selected.collisions.len(), 1);
+        assert_eq!(selected.rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(), ["2", "10", "z"]);
+        let replacements = std::collections::HashMap::from([("assets/old.bin".to_owned(), "assets/new.bin".to_owned())]);
+        let mut output = Vec::new();
+        super::write_plugin_storage(&connection, "g", &selected.rows, Some(&replacements), &mut output, &|| false).unwrap();
+        assert_eq!(output, br#"{"2":2,"10":10,"z":{"nested":"assets/new.bin"}}"#);
+        assert!(super::write_plugin_storage(&connection, "g", &selected.rows, None, &mut Vec::new(), &|| true).is_err());
+        connection.execute("UPDATE plugin_storage SET value = 'invalid' WHERE storage_key = 'z'", []).unwrap();
+        assert!(super::write_plugin_storage(&connection, "g", &selected.rows, None, &mut Vec::new(), &|| false).is_err());
+    }
+
     use super::super::plugin_owner::UNOWNED_OWNER;
     use super::*;
     use crate::asset_repository::{owner_manifest_codec, PayloadCas};

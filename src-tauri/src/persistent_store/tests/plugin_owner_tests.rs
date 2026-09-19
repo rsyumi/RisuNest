@@ -203,7 +203,7 @@ fn exporting_drops_only_the_keys_two_plugins_both_hold() {
     let flattened = super::super::export::flattened_plugin_storage(&store.connection, &generation)
         .expect("flatten plugin storage");
     assert_eq!(
-        flattened.values.keys().collect::<Vec<_>>(),
+        flattened.rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
         vec!["unique-a", "unique-b"]
     );
     assert_eq!(
