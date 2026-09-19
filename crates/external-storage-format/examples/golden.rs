@@ -21,7 +21,6 @@ use std::collections::BTreeMap;
 
 const REPOSITORY: &str = "synthetic-repository";
 const LIBRARY: &str = "synthetic-library";
-const METADATA: &str = "https://synthetic.invalid/folder";
 const OBJECT_NAMESPACE: &str = "synthetic-capture-job";
 const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 
@@ -266,14 +265,6 @@ fn verify_wasm_vector(value: serde_json::Value) {
         .unwrap(),
         plaintext
     );
-    let code = crypto::RecoveryCode::parse(value["code"].as_str().unwrap()).unwrap();
-    let recovery_bytes = bytes(&value, "recovery");
-    let recovery = crypto::RecoveryEnvelope::decode(&recovery_bytes).unwrap();
-    assert_eq!(recovery.encode().unwrap(), recovery_bytes);
-    let recovered = recovery.recover(REPOSITORY, &code).unwrap();
-    assert_eq!(*recovered.root, [7; 32]);
-    assert_eq!(&*recovered.connection_metadata, METADATA);
-
     let (state, head, bundle, point) = documents();
     let key = [7; 32];
     let opened_state = open(
@@ -325,7 +316,7 @@ fn verify_wasm_vector(value: serde_json::Value) {
         value["keyedCatalogId"].as_str().unwrap(),
         keyed_object_id(&key, OBJECT_NAMESPACE, ObjectRole::Catalog, &document_hash).unwrap()
     );
-    println!("WASM-to-native RNX1, control, naming and recovery vectors passed.");
+    println!("WASM-to-native RNX1, control and naming vectors passed.");
 }
 
 fn main() {
@@ -342,12 +333,6 @@ fn main() {
     let key = [7; 32];
     let binding = "synthetic-repository/synthetic-object/data/v1";
     let mut ciphertext = Vec::new();
-    let code = crypto::RecoveryCode::generate().unwrap();
-    let recovery =
-        crypto::RecoveryEnvelope::protect(REPOSITORY.into(), METADATA.into(), &key, &code)
-            .unwrap()
-            .encode()
-            .unwrap();
     let compressed = pack::compress(&plaintext).unwrap();
     crypto::encrypt(
         &mut std::io::Cursor::new(&plaintext),
@@ -368,8 +353,6 @@ fn main() {
             "ciphertext": ciphertext,
             "hash": hash(&plaintext),
             "compressed": compressed,
-            "code": &*code.expose(),
-            "recovery": recovery,
             "state": state,
             "head": head,
             "bundle": bundle,

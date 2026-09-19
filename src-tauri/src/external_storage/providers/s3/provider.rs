@@ -382,7 +382,7 @@ impl S3Provider {
                 Call::bucket(reqwest::Method::GET, ProviderOperation::List)
                     .query("list-type", "2")
                     .query("prefix", prefix.as_str())
-                    .query("max-keys", "2"),
+                    .query("max-keys", "3"),
                 cancel,
             )
             .await?;
@@ -396,10 +396,10 @@ impl S3Provider {
             }
             return Ok(());
         }
-        if page.next_continuation_token.is_some() || page.objects.len() > 1 {
+        if page.next_continuation_token.is_some() || page.objects.len() > 2 {
             return Err(precondition(None));
         }
-        if let Some(object) = page.objects.first() {
+        for object in page.objects {
             if context
                 .object_of(collection_folder(Collection::Descriptors), &object.key)
                 .is_none()

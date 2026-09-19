@@ -630,10 +630,10 @@ impl WebdavProvider {
                 }
                 continue;
             }
-            if contents.len() > 1 {
+            if contents.len() > 2 {
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed));
             }
-            if let Some(descriptor) = contents.into_iter().next() {
+            for descriptor in contents {
                 if descriptor.collection
                     || descriptor.content_length.is_none_or(|length| length == 0)
                     || !paths::valid_segment(&descriptor.name)

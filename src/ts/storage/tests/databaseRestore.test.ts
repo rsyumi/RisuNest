@@ -3,7 +3,6 @@ import type { Database } from '../database.svelte'
 import {
     completeAccountUnmigration,
     installAccountBackup,
-    installDriveRestore,
     installLocalBackup,
     installRisuKeiBackup,
     materializeAccountUnmigrationResources,
@@ -80,47 +79,6 @@ describe('local backup restore', () => {
 
         const onPostCommitError = vi.fn()
         await expect(installLocalBackup(database, {
-            replaceDatabase: async () => committed,
-            publishAcceptedRevision: async () => { throw new Error('official offline') },
-            relaunch,
-            onPostCommitError,
-        })).resolves.toEqual(committed)
-
-        expect(onPostCommitError).toHaveBeenCalledWith(new Error('official offline'))
-        expect(relaunch).not.toHaveBeenCalled()
-    })
-})
-
-describe('Drive restore', () => {
-    it('relaunches only after replacement succeeds', async () => {
-        const events: string[] = []
-
-        await installDriveRestore(database, {
-            replaceDatabase: async () => { events.push('replace'); return committed },
-            publishAcceptedRevision: async () => { events.push('publish') },
-            relaunch: async () => { events.push('relaunch') },
-        })
-
-        expect(events).toEqual(['replace', 'publish', 'relaunch'])
-    })
-
-    it('does not relaunch when replacement fails', async () => {
-        const relaunch = vi.fn()
-
-        await expect(installDriveRestore(database, {
-            replaceDatabase: async () => { throw new Error('replacement failed') },
-            publishAcceptedRevision: vi.fn(),
-            relaunch,
-        })).rejects.toThrow('replacement failed')
-
-        expect(relaunch).not.toHaveBeenCalled()
-    })
-
-    it('does not relaunch when accepted-revision publication fails', async () => {
-        const relaunch = vi.fn()
-
-        const onPostCommitError = vi.fn()
-        await expect(installDriveRestore(database, {
             replaceDatabase: async () => committed,
             publishAcceptedRevision: async () => { throw new Error('official offline') },
             relaunch,
@@ -209,7 +167,6 @@ describe.each([
 
 describe.each([
     ['local', installLocalBackup, 'local-backup'],
-    ['Drive', installDriveRestore, 'drive-restore'],
 ] as const)('%s committed restore follow-ups', (_name, install, reason) => {
     it('queues publication without immediately publishing or restarting a stale projection', async () => {
         const replaceDatabase = vi.fn(async () => refreshRequired)

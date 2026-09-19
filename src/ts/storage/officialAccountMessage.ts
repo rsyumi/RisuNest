@@ -3,44 +3,12 @@ interface HubMessageEvent {
     source: MessageEventSource | null
 }
 
-export interface HubPopupController {
-    readonly source: Window | null
-    open(url: string): Window | null
-    close(): void
-}
-
-const productionDriveCallbackUrl = 'https://sv.risuai.xyz/drive'
-
 export function resolveExpectedOfficialAccountMessageUrl(
-    messageType: unknown,
+    _messageType: unknown,
     hubUrl: string,
     accountIframeUrl: string,
 ): string {
-    return messageType === 'drive'
-        ? productionDriveCallbackUrl
-        : (accountIframeUrl || `${hubUrl}/hub/login`)
-}
-
-export function createHubPopupController(
-    openWindow: (url: string) => Window | null = (url) => window.open(url),
-): HubPopupController {
-    let popup: Window | null = null
-    return {
-        get source() {
-            if (popup?.closed) popup = null
-            return popup
-        },
-        open(url) {
-            if (this.source) return popup
-            popup = openWindow(url)
-            return popup
-        },
-        close() {
-            const current = popup
-            popup = null
-            if (current && !current.closed) current.close()
-        },
-    }
+    return accountIframeUrl || `${hubUrl}/hub/login`
 }
 
 export function isExpectedHubMessage(

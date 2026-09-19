@@ -550,7 +550,7 @@ fn create_mode_reserves_a_head_identifier_in_an_empty_location() {
 }
 
 #[test]
-fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
+fn resume_create_accepts_only_an_empty_or_bootstrap_descriptor_control_layout() {
     runtime().block_on(async {
         let test = deps_with(Some(stored_secret(NOW_MS + 3_600_000)));
         let provider = provider_of(&test.dependencies);
@@ -628,15 +628,19 @@ fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
             ErrorKind::PreconditionFailed
         );
 
-        let duplicate = WireServer::start(vec![
+        let too_many = WireServer::start(vec![
             about_reply(),
             folder_reply(),
-            control_reply(vec![descriptor_file("desc-1"), descriptor_file("desc-2")]),
+            control_reply(vec![
+                descriptor_file("desc-1"),
+                descriptor_file("desc-2"),
+                descriptor_file("desc-3"),
+            ]),
         ]);
         assert_eq!(
             provider
                 .open_repository(
-                    &connection(duplicate.url.as_str()),
+                    &connection(too_many.url.as_str()),
                     &secret_ref(),
                     OpenMode::ResumeCreate,
                     &cancel,

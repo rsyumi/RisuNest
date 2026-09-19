@@ -81,6 +81,7 @@ export interface PrepareExternalConnectionRequest {
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
     capturePolicy?: ExternalCapturePolicy
+    recoveryKey?: string
     acknowledgements: string[]
 }
 
@@ -262,7 +263,6 @@ export interface ExternalHistoryItem {
     /** Whether these values are the ones this device wrote. */
     sameDevice: boolean
     deviceName?: string
-    warning?: string
 }
 
 export interface ExternalHistoryDeletePreparation {
@@ -342,10 +342,13 @@ export interface PendingExternalAuthorization {
     state: 'browser-required' | 'native-pending' | 'complete'
 }
 
-export interface ExternalRecoveryMaterial {
-    recoveryId: string
+export interface ExternalRecoveryKeyMaterial {
+    key: string
+}
+
+export interface ExternalConnectionSettingsMaterial {
+    transferId: string
     expiresAtMs: DecimalString
-    code: string
     qrPayload?: string
 }
 
@@ -357,7 +360,7 @@ export interface ExternalSnapshotExportResult {
 
 export interface ExternalConnectionResult {
     connection: ExternalConnectionSummary
-    recovery?: ExternalRecoveryMaterial
+    recovery?: ExternalRecoveryKeyMaterial
 }
 
 export interface ExternalAuthorizationPending {

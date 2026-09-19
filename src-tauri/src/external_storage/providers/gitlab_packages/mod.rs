@@ -362,6 +362,7 @@ impl GitlabPackages {
         let owned_prefix = format!("{}.", settings.package_base);
         let mut marker_count = 0usize;
         let mut descriptor_count = 0usize;
+        let mut descriptor_versions = BTreeSet::new();
         let mut page = None;
         let mut seen = BTreeSet::new();
         loop {
@@ -431,7 +432,7 @@ impl GitlabPackages {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
                 descriptor_count += 1;
-                if descriptor_count > 1 {
+                if descriptor_count > 2 || !descriptor_versions.insert(package.version.clone()) {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
                 let placement = settings

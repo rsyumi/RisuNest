@@ -844,7 +844,7 @@ impl Provider for GoogleDrive {
                     settings.folder_id
                 )
             };
-            let control = self.list_control_files(session, &query, 2, cancel).await?;
+            let control = self.list_control_files(session, &query, 3, cancel).await?;
             let heads: Vec<&DriveFile> = control
                 .iter()
                 .filter(|file| file.property(ROLE_KEY) == Some(HEAD_ROLE))
@@ -864,13 +864,13 @@ impl Provider for GoogleDrive {
                 }
                 OpenMode::ResumeCreate
                     if !heads.is_empty()
-                        || descriptors.len() > 1
+                        || descriptors.len() > 2
                         || heads.len() + descriptors.len() != control.len() =>
                 {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
                 OpenMode::ResumeCreate => {
-                    if let Some(descriptor) = descriptors.first() {
+                    for descriptor in descriptors {
                         validate_resumable_descriptor(descriptor)?;
                     }
                 }

@@ -25,7 +25,7 @@
         ExternalHistoryItem,
         ExternalJobSummary,
         ExternalQuotaSummary,
-        ExternalRecoveryMaterial,
+        ExternalConnectionSettingsMaterial,
         ExternalRetentionPolicy,
         ExternalRestoreArea,
         ExternalRestoreSection,
@@ -52,8 +52,9 @@
     let conflicts = $state<Record<string, ExternalConflictSummary[]>>({})
     let conflictCursor = $state<Record<string, ExternalConflictCursor | undefined>>({})
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
-    let recovery = $state<ExternalRecoveryMaterial | null>(null)
-    let recoveryQr = $state('')
+    let recoveryKey = $state('')
+    let connectionSettings = $state<ExternalConnectionSettingsMaterial | null>(null)
+    let connectionSettingsQr = $state('')
     /** The history entry whose restore scope is open, and what is ticked in it. */
     let restoreScope = $state<{ id: string; sections: ExternalRestoreSection[] } | null>(null)
     let pollTimer: ReturnType<typeof setTimeout> | undefined
@@ -135,7 +136,7 @@
     async function onConnected(result: ExternalConnectionResult): Promise<void> {
         busy = false
         adding = false
-        if (result.recovery) await displayRecovery(result.recovery)
+        if (result.recovery) recoveryKey = result.recovery.key
         await refreshExternalStorageProductionState()
         await refresh()
         schedulePoll()
@@ -435,23 +436,23 @@
         }
     }
 
-    async function displayRecovery(material: ExternalRecoveryMaterial): Promise<void> {
-        recovery = material
+    async function displayConnectionSettings(material: ExternalConnectionSettingsMaterial): Promise<void> {
+        connectionSettings = material
         if (!material.qrPayload) {
-            recoveryQr = ''
+            connectionSettingsQr = ''
             return
         }
         try {
-            recoveryQr = await QRCode.toDataURL(material.qrPayload, { margin: 2, width: 240 })
+            connectionSettingsQr = await QRCode.toDataURL(material.qrPayload, { margin: 2, width: 240 })
         } catch {
-            recoveryQr = ''
+            connectionSettingsQr = ''
         }
     }
 
-    async function createRecovery(connection: ExternalConnectionSummary): Promise<void> {
+    async function createConnectionSettings(connection: ExternalConnectionSummary): Promise<void> {
         busy = true
         try {
-            await displayRecovery(await bridge.beginRecoveryExport(connection.id))
+            await displayConnectionSettings(await bridge.beginConnectionSettingsExport(connection.id))
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
         } finally {
@@ -459,18 +460,22 @@
         }
     }
 
-    async function saveRecoveryFile(): Promise<void> {
-        if (!recovery) return
+    async function saveConnectionSettingsFile(): Promise<void> {
+        if (!connectionSettings) return
         try {
-            await bridge.saveRecoveryFile(recovery.recoveryId)
+            await bridge.saveConnectionSettingsFile(connectionSettings.transferId)
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
         }
     }
 
-    function closeRecovery(): void {
-        recovery = null
-        recoveryQr = ''
+    function closeRecoveryKey(): void {
+        recoveryKey = ''
+    }
+
+    function closeConnectionSettings(): void {
+        connectionSettings = null
+        connectionSettingsQr = ''
     }
 
     async function exportSnapshot(connectionId: string, snapshotId: string): Promise<void> {
@@ -580,7 +585,7 @@
 </script>
 
 
-<svelte:window onkeydown={event => { if (event.key === 'Escape' && recovery) closeRecovery() }} />
+<svelte:window onkeydown={event => { if (event.key === 'Escape') { closeRecoveryKey(); closeConnectionSettings() } }} />
 
 <SettingGroup id="risunest-external-storage" title={strings.title} description={strings.help}>
     {#snippet actions()}
@@ -682,7 +687,6 @@
                                         </div>
                                     </div>
                                 {/if}
-                                {#if item.warning}<p class="text-xs text-danger-400">{item.warning}</p>{/if}
                             </div>
                         {/each}
                         {#if historyCursor[connection.id]}<div><SettingButton variant="secondary" busy={historyLoading[connection.id]} onclick={() => loadHistory(connection, true)}>{strings.loadMore}</SettingButton></div>{/if}
@@ -767,7 +771,7 @@
                 {/if}
 
                 <div class="foot">
-                    <SettingButton variant="secondary" onclick={() => createRecovery(connection)}>{strings.recovery}</SettingButton>
+                    <SettingButton variant="secondary" onclick={() => createConnectionSettings(connection)}>{strings.connectionSettings}</SettingButton>
                     <SettingButton variant="danger" disabled={busy} onclick={() => removeConnection(connection)}>{strings.remove}</SettingButton>
                 </div>
             </article>
@@ -776,19 +780,29 @@
     {#if error}<p class="px-4 pb-4 text-sm text-danger-400" role="alert">{error}</p>{/if}
 </SettingGroup>
 
-{#if recovery}
+{#if recoveryKey}
     <div class="fixed inset-0 z-60 flex items-center justify-center bg-black/65 p-4" role="dialog" aria-modal="true" aria-label={strings.recovery}>
         <div class="dialog">
             <h3 class="text-lg font-bold">{strings.recovery}</h3>
             <p class="text-sm text-textcolor2">{strings.recoveryNotice}</p>
-            {#if recoveryQr}<img class="mx-auto rounded bg-white p-2" src={recoveryQr} alt={strings.showRecovery} />
-            {:else}<p class="rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.recoveryFileOnly}</p>{/if}
             <label class="block text-sm">
                 <span class="font-medium">{strings.recoveryCode}</span>
-                <input readonly class="mt-1 w-full select-all rounded border border-darkborderc bg-darkbg p-2 font-mono" value={recovery.code} />
+                <input readonly class="mt-1 w-full select-all rounded border border-darkborderc bg-darkbg p-2 font-mono" value={recoveryKey} />
                 <span class="mt-1 block text-[13px] text-textcolor2">{strings.recoveryCodeHelp}</span>
             </label>
-            <div class="actions"><SettingButton onclick={saveRecoveryFile}>{strings.saveRecovery}</SettingButton><SettingButton variant="secondary" onclick={closeRecovery}>{strings.closeRecovery}</SettingButton></div>
+            <div class="actions"><SettingButton onclick={closeRecoveryKey}>{strings.closeRecovery}</SettingButton></div>
+        </div>
+    </div>
+{/if}
+
+{#if connectionSettings}
+    <div class="fixed inset-0 z-60 flex items-center justify-center bg-black/65 p-4" role="dialog" aria-modal="true" aria-label={strings.connectionSettings}>
+        <div class="dialog">
+            <h3 class="text-lg font-bold">{strings.connectionSettings}</h3>
+            <p class="text-sm text-textcolor2">{strings.connectionSettingsNotice}</p>
+            {#if connectionSettingsQr}<img class="mx-auto rounded bg-white p-2" src={connectionSettingsQr} alt={strings.connectionSettingsQr} />
+            {:else}<p class="rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.connectionSettingsFileOnly}</p>{/if}
+            <div class="actions"><SettingButton onclick={saveConnectionSettingsFile}>{strings.saveConnectionSettings}</SettingButton><SettingButton variant="secondary" onclick={closeConnectionSettings}>{strings.closeRecovery}</SettingButton></div>
         </div>
     </div>
 {/if}

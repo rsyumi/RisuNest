@@ -769,6 +769,7 @@ fn resume_create_rejects_foreign_folder_contents_duplicate_descriptors_and_token
                 &children_page(&[
                     file_item("descriptor-a", 64, "etag-a"),
                     file_item("descriptor-b", 64, "etag-b"),
+                    file_item("descriptor-c", 64, "etag-c"),
                 ]),
             ),
         ]);

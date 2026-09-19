@@ -28,7 +28,6 @@ describe('isRealmUrl', () => {
         `${REALM_HUB_URL}/hub/login`,
         `${REALM_HUB_URL}/hub/account/save`,
         `${REALM_HUB_URL}/cryptokey?key=1`,
-        `${REALM_HUB_URL}/drive/token?code=x`,
         `${REALM_HUB_URL}/transformers/model.onnx`,
         `${REALM_HUB_URL}/proxy2`,
         `${REALM_HUB_URL}/kei`,

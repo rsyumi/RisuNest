@@ -16,7 +16,6 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, LoadingStatusState, bootFailure, type BootFailure } from "./stores.svelte";
 import { loadPlugins, loadPluginsAfterAuthoritativeRestore } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
-import { checkDriverInit } from "./drive/drive";
 import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
@@ -761,8 +760,6 @@ export async function loadData() {
         if (isTauriDesktop) await changeFullscreen()
 
         if (!isTauri && !excluded('sync')) {
-            await transition('drive-sync', language.risuNest.startup.account)
-            if (await checkDriverInit()) return
             await transition('service-worker', language.risuNest.startup.serviceWorker)
             if (navigator.serviceWorker) {
                 setUsingSw(true)

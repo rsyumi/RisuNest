@@ -5,7 +5,6 @@ mod wasm {
         control::{
             BackupBundleDocument, BackupPointDocument, HeadDocument, MAX_CONTROL_BYTES,
         },
-        crypto::{RecoveryCode, RecoveryEnvelope},
         pack,
         snapshot::{
             keyed_object_id as format_keyed_object_id, open_envelope, seal_envelope, ObjectRole,
@@ -82,57 +81,6 @@ mod wasm {
             .map_err(|_| JsValue::from_str("invalid-hash"))?;
         pack::decompress(bytes, length, &hash).map_err(|e| JsValue::from_str(e.0))
     }
-    #[wasm_bindgen]
-    pub fn protect_recovery(
-        repository: &str,
-        metadata: &str,
-        root: &[u8],
-        code: &str,
-    ) -> std::result::Result<Vec<u8>, JsValue> {
-        if repository.len() > 128 || metadata.len() > 8192 {
-            return Err(JsValue::from_str("invalid-recovery-envelope"));
-        }
-        let root: [u8; 32] = root
-            .try_into()
-            .map_err(|_| JsValue::from_str("invalid-key"))?;
-        let code = RecoveryCode::parse(code).map_err(|e| JsValue::from_str(e.0))?;
-        RecoveryEnvelope::protect(repository.into(), metadata.into(), &root, &code)
-            .and_then(|envelope| envelope.encode())
-            .map_err(|e| JsValue::from_str(e.0))
-    }
-    #[wasm_bindgen]
-    pub fn recover_key(
-        bytes: &[u8],
-        repository: &str,
-        code: &str,
-    ) -> std::result::Result<Vec<u8>, JsValue> {
-        let code = RecoveryCode::parse(code).map_err(|e| JsValue::from_str(e.0))?;
-        RecoveryEnvelope::decode(bytes)
-            .and_then(|envelope| envelope.recover(repository, &code))
-            .map(|value| value.root.to_vec())
-            .map_err(|e| JsValue::from_str(e.0))
-    }
-
-    #[wasm_bindgen]
-    pub fn recover_connection_metadata(
-        bytes: &[u8],
-        repository: &str,
-        code: &str,
-    ) -> std::result::Result<String, JsValue> {
-        let code = RecoveryCode::parse(code).map_err(|e| JsValue::from_str(e.0))?;
-        RecoveryEnvelope::decode(bytes)
-            .and_then(|envelope| envelope.recover(repository, &code))
-            .map(|value| value.connection_metadata.to_string())
-            .map_err(|e| JsValue::from_str(e.0))
-    }
-
-    #[wasm_bindgen]
-    pub fn canonical_recovery_envelope(bytes: &[u8]) -> std::result::Result<Vec<u8>, JsValue> {
-        RecoveryEnvelope::decode(bytes)
-            .and_then(|envelope| envelope.encode())
-            .map_err(|e| JsValue::from_str(e.0))
-    }
-
     #[wasm_bindgen]
     pub fn seal_object_envelope(
         plaintext: &[u8],

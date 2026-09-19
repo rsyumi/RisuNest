@@ -107,7 +107,6 @@ vi.mock('./process/coldstorageData', () => ({
 }))
 vi.mock('./plugins/plugins.svelte', () => ({ loadPlugins: vi.fn() }))
 vi.mock('./parser/parser.svelte', () => ({ hasher: vi.fn(async () => 'hashed') }))
-vi.mock('./drive/drive', () => ({ checkDriverInit: vi.fn() }))
 vi.mock('./drive/accounter', () => ({ loadRisuAccountData: vi.fn() }))
 vi.mock('./update', () => ({ checkRisuUpdate: vi.fn() }))
 vi.mock('./observer.svelte', () => ({ startObserveDom: vi.fn() }))

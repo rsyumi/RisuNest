@@ -198,6 +198,8 @@ pub(crate) struct PrepareConnectionRequest {
     /// Backup connections only.
     #[serde(default)]
     pub capture_policy: Option<CapturePolicy>,
+    #[serde(default)]
+    pub recovery_key: Option<String>,
     pub acknowledgements: Vec<String>,
 }
 
@@ -419,6 +421,9 @@ fn provider(
 pub(crate) fn validate_preparation(
     request: &PrepareConnectionRequest,
 ) -> Result<EndpointConfirmation> {
+    if (request.mode == ConnectionOpenMode::Existing) != request.recovery_key.is_some() {
+        return Err(ProviderError::new(ErrorKind::Unsupported));
+    }
     // A synchronization connection carries no capture policy: what it
     // exchanges is chosen per device.
     if request.purpose == ConnectionPurpose::Sync && request.capture_policy.is_some() {
@@ -898,6 +903,7 @@ mod tests {
             purpose,
             capture_policy: (purpose == ConnectionPurpose::Backup)
                 .then(CapturePolicy::default),
+            recovery_key: None,
             acknowledgements: Vec::new(),
         }
     }
@@ -1248,6 +1254,7 @@ mod tests {
             provider_repository_id: "synthetic-root".into(),
             credential_ref: "synthetic-credential-ref".into(),
             root_key_ref: "synthetic-key-ref".into(),
+            recovery_key_ref: "synthetic-recovery-key-ref".into(),
             capabilities: Capabilities::default(),
             created_at_ms: 1,
             last_sync_at_ms: None,

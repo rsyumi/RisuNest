@@ -137,8 +137,7 @@ fn item(
     let same_device =
         !store_id.is_empty() && document.captured_by_device.as_deref() == Some(store_id);
     json!({"id":document.snapshot_id,"snapshotId":document.snapshot_id,"kind":kind,"createdAtMs":document.created_at_ms.to_string(),"logicalRevision":document.revision,"storedBytes":reference.receipt.byte_length.to_string(),"pinned":pinned,"complete":true,"verified":true,
-        "includedSections":document.sections.keys().collect::<Vec<_>>(),"sameDevice":same_device,
-        "warning":"Snapshot metadata is authenticated. All referenced data is verified before restore."})
+        "includedSections":document.sections.keys().collect::<Vec<_>>(),"sameDevice":same_device})
 }
 fn remember_item(items: &mut BTreeMap<String, Value>, id: String, mut next: Value) {
     if let Some(previous) = items.get(&id) {

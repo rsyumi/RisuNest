@@ -1162,6 +1162,7 @@ mod tests {
                     provider_repository_id: repository.repository_id.clone(),
                     credential_ref: "credential".into(),
                     root_key_ref: "key".into(),
+                    recovery_key_ref: "recovery-key".into(),
                     capture_policy: None,
                     retention_policy: None,
                     capabilities: fake::capabilities(true),

@@ -77,10 +77,11 @@ describe('UserSettings local backup route', () => {
         )
     })
 
-    it('keeps upstream local backup, account, and Drive controls on this page', () => {
+    it('keeps local backup and official account controls but removes legacy Drive controls', () => {
         expect(source).toContain('SavePartialLocalBackup()')
-        expect(source).toContain('loadRisuAccountData')
-        expect(source).toContain('checkDriver')
+        expect(source).toContain('loadRisuAccountBackup')
+        expect(source).not.toContain('checkDriver')
+        expect(source).not.toContain('googleDriveConnection')
     })
 
     it('moves RisuNest backup and sync controls to the dedicated page', () => {

@@ -5,7 +5,7 @@ import { mount, tick, unmount } from 'svelte'
 const state = vi.hoisted(() => ({
     listProviders: vi.fn(),
     prepareConnection: vi.fn(),
-    prepareRecoveryImport: vi.fn(),
+    prepareConnectionSettingsImport: vi.fn(),
     commitConnection: vi.fn(),
     beginAuthorization: vi.fn(),
     completeAuthorization: vi.fn(),
@@ -23,7 +23,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
     getExternalStorageBridge: () => ({
         listProviders: state.listProviders,
         prepareConnection: state.prepareConnection,
-        prepareRecoveryImport: state.prepareRecoveryImport,
+        prepareConnectionSettingsImport: state.prepareConnectionSettingsImport,
         commitConnection: state.commitConnection,
         beginAuthorization: state.beginAuthorization,
         completeAuthorization: state.completeAuthorization,
@@ -140,8 +140,8 @@ afterEach(async () => {
 })
 
 describe('opening an existing repository', () => {
-    it('reads the repository settings from the recovery key instead of asking for them again', async () => {
-        state.prepareRecoveryImport.mockResolvedValue({
+    it('authenticates imported connection settings with the recovery key before review', async () => {
+        state.prepareConnectionSettingsImport.mockResolvedValue({
             ...prepared,
             endpoint: { ...prepared.endpoint, repositoryHint: 'recovered-folder' },
         })
@@ -153,26 +153,46 @@ describe('opening an existing repository', () => {
 
         expect(target.textContent).not.toContain(strings.create)
         expect([...target.querySelectorAll('label')]
-            .some(item => item.textContent?.includes(strings.provider))).toBe(false)
-        expect(target.textContent).toContain(strings.recoveryRequiredTitle)
+            .some(item => item.textContent?.includes(strings.provider))).toBe(true)
+        expect(target.textContent).toContain(strings.connectionSettingsImportHelp)
 
         const payload = target.querySelector('textarea')
-        if (!payload) throw new Error('Missing recovery payload field')
-        payload.value = 'recovery-payload'
+        if (!payload) throw new Error('Missing connection settings payload field')
+        payload.value = 'connection-settings-payload'
         payload.dispatchEvent(new Event('input', { bubbles: true }))
         const code = labelControl<HTMLInputElement>(strings.recoveryCode)
         code.value = 'recovery-code'
         code.dispatchEvent(new Event('input', { bubbles: true }))
         await settle()
-        button(strings.unlock).click()
+        button(strings.importConnectionSettings).click()
         await settle()
 
-        expect(state.prepareRecoveryImport)
-            .toHaveBeenCalledWith('recovery-payload', 'recovery-code')
+        expect(state.prepareConnectionSettingsImport)
+            .toHaveBeenCalledWith('connection-settings-payload', 'recovery-code')
         expect(state.prepareConnection).not.toHaveBeenCalled()
         expect(target.textContent).toContain('recovered-folder')
-        // The recovery key carries the purpose, which this form never asked for.
         expect(target.textContent).not.toContain(strings.purposeReview)
+    })
+
+    it('supports manual provider setup with only the fixed recovery key', async () => {
+        component = mount(ConnectionForm, {
+            target,
+            props: { strings, onconnected: vi.fn(), oncancel: vi.fn(), restoreOnly: true },
+        })
+        await settle()
+
+        const code = labelControl<HTMLInputElement>(strings.recoveryCode)
+        code.value = 'fixed-recovery-key'
+        code.dispatchEvent(new Event('input', { bubbles: true }))
+        await settle()
+        button(strings.prepare).click()
+        await settle()
+
+        expect(state.prepareConnection).toHaveBeenCalledWith(expect.objectContaining({
+            mode: 'existing',
+            recoveryKey: 'fixed-recovery-key',
+        }))
+        expect(state.prepareConnectionSettingsImport).not.toHaveBeenCalled()
     })
 })
 

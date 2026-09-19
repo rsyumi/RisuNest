@@ -169,7 +169,7 @@ pub fn decrypt(
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RecoveryEnvelope {
+pub struct RepositoryBootstrapEnvelope {
     pub schema: String,
     pub repository_id: String,
     pub salt: [u8; 16],
@@ -192,12 +192,14 @@ mod recovery_ciphertext {
         URL_SAFE_NO_PAD.decode(encoded).map_err(|_| serde::de::Error::custom("invalid-recovery-ciphertext"))
     }
 }
-const RECOVERY_SCHEMA: &str = "risunest.recovery/v1";
-pub const MAX_RECOVERY_BYTES: usize = 64 * 1024;
+const RECOVERY_SCHEMA: &str = "risunest.repository-bootstrap/v1";
+const CONNECTION_SETTINGS_SCHEMA: &str = "risunest.connection-settings/v1";
+pub const MAX_REPOSITORY_BOOTSTRAP_BYTES: usize = 64 * 1024;
+pub const MAX_CONNECTION_SETTINGS_BYTES: usize = 64 * 1024;
 
 /// An app-generated 128-bit secret. Never serialize or debug-print this value.
-pub struct RecoveryCode(Zeroizing<[u8; 16]>);
-impl RecoveryCode {
+pub struct RecoveryKey(Zeroizing<[u8; 16]>);
+impl RecoveryKey {
     pub fn generate() -> Result<Self> {
         let mut bytes = Zeroizing::new([0; 16]);
         getrandom::getrandom(bytes.as_mut()).map_err(|_| FormatError("randomness-unavailable"))?;
@@ -245,12 +247,110 @@ impl RecoveryCode {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConnectionSettingsEnvelope {
+    pub schema: String,
+    pub repository_id: String,
+    pub salt: [u8; 16],
+    #[serde(with = "recovery_ciphertext")]
+    pub ciphertext: Vec<u8>,
+}
+
+impl ConnectionSettingsEnvelope {
+    fn binding(&self) -> Result<Vec<u8>> {
+        if self.schema != CONNECTION_SETTINGS_SCHEMA
+            || self.repository_id.is_empty()
+            || self.repository_id.len() > 128
+        {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        serde_json::to_vec(&(&self.schema, &self.repository_id, self.salt))
+            .map_err(|_| FormatError("invalid-connection-settings"))
+    }
+
+    fn wrapping_key(&self, code: &RecoveryKey) -> Result<Zeroizing<[u8; 32]>> {
+        let mut key = Zeroizing::new([0; 32]);
+        hkdf::Hkdf::<sha2::Sha256>::new(Some(&self.salt), code.0.as_ref())
+            .expand(&self.binding()?, key.as_mut())
+            .map_err(|_| FormatError("key-derivation-failed"))?;
+        Ok(key)
+    }
+
+    pub fn protect(repository_id: String, plaintext: &[u8], code: &RecoveryKey) -> Result<Self> {
+        if plaintext.is_empty() || plaintext.len() > 32 * 1024 {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        let mut result = Self {
+            schema: CONNECTION_SETTINGS_SCHEMA.into(),
+            repository_id,
+            salt: [0; 16],
+            ciphertext: Vec::new(),
+        };
+        getrandom::getrandom(&mut result.salt)
+            .map_err(|_| FormatError("randomness-unavailable"))?;
+        let key = result.wrapping_key(code)?;
+        let binding = result.binding()?;
+        encrypt(
+            &mut std::io::Cursor::new(plaintext),
+            &mut result.ciphertext,
+            &key,
+            &binding,
+            plaintext.len() as u64,
+        )?;
+        Ok(result)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.binding()?;
+        let bytes = serde_json::to_vec(self)
+            .map_err(|_| FormatError("invalid-connection-settings"))?;
+        if bytes.len() > MAX_CONNECTION_SETTINGS_BYTES {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || bytes.len() > MAX_CONNECTION_SETTINGS_BYTES {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        let value: Self = serde_json::from_slice(bytes)
+            .map_err(|_| FormatError("invalid-connection-settings"))?;
+        value.binding()?;
+        if value.ciphertext.len() > 48 * 1024 {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        Ok(value)
+    }
+
+    pub fn open(&self, repository_id: &str, code: &RecoveryKey) -> Result<Zeroizing<Vec<u8>>> {
+        if self.repository_id != repository_id {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        let key = self.wrapping_key(code)?;
+        let binding = self.binding()?;
+        let mut plaintext = Zeroizing::new(Vec::new());
+        decrypt(
+            &mut std::io::Cursor::new(&self.ciphertext),
+            &mut *plaintext,
+            &key,
+            &binding,
+            32 * 1024,
+        )?;
+        if plaintext.is_empty() {
+            return Err(FormatError("invalid-connection-settings"));
+        }
+        Ok(plaintext)
+    }
+}
+
 /// Only returned after authenticating the entire independent recovery envelope.
-pub struct RecoveredConnection {
+pub struct RecoveredRepository {
     pub root: Zeroizing<[u8; 32]>,
     pub connection_metadata: Zeroizing<String>,
 }
-impl RecoveryEnvelope {
+impl RepositoryBootstrapEnvelope {
     fn binding(&self) -> Result<Vec<u8>> {
         if self.schema != RECOVERY_SCHEMA
             || self.repository_id.is_empty()
@@ -261,7 +361,7 @@ impl RecoveryEnvelope {
         serde_json::to_vec(&(&self.schema, &self.repository_id, self.salt))
             .map_err(|_| FormatError("invalid-recovery-envelope"))
     }
-    fn wrapping_key(&self, code: &RecoveryCode) -> Result<Zeroizing<[u8; 32]>> {
+    fn wrapping_key(&self, code: &RecoveryKey) -> Result<Zeroizing<[u8; 32]>> {
         self.binding()?;
         let mut key = Zeroizing::new([0; 32]);
         hkdf::Hkdf::<sha2::Sha256>::new(Some(&self.salt), code.0.as_ref())
@@ -273,7 +373,7 @@ impl RecoveryEnvelope {
         repository_id: String,
         connection_metadata: String,
         root: &[u8; 32],
-        code: &RecoveryCode,
+        code: &RecoveryKey,
     ) -> Result<Self> {
         let connection_metadata = Zeroizing::new(connection_metadata);
         if connection_metadata.len() > 8192 {
@@ -305,13 +405,13 @@ impl RecoveryEnvelope {
         self.binding()?;
         let bytes =
             serde_json::to_vec(self).map_err(|_| FormatError("invalid-recovery-envelope"))?;
-        if bytes.len() > MAX_RECOVERY_BYTES {
+        if bytes.len() > MAX_REPOSITORY_BOOTSTRAP_BYTES {
             return Err(FormatError("invalid-recovery-envelope"));
         }
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > MAX_RECOVERY_BYTES {
+        if bytes.len() > MAX_REPOSITORY_BOOTSTRAP_BYTES {
             return Err(FormatError("invalid-recovery-envelope"));
         }
         let value: Self =
@@ -319,7 +419,7 @@ impl RecoveryEnvelope {
         value.binding()?;
         Ok(value)
     }
-    pub fn recover(&self, repository_id: &str, code: &RecoveryCode) -> Result<RecoveredConnection> {
+    pub fn recover(&self, repository_id: &str, code: &RecoveryKey) -> Result<RecoveredRepository> {
         if self.repository_id != repository_id || self.wrapped_key.len() > 16 * 1024 {
             return Err(FormatError("invalid-recovery-envelope"));
         }
@@ -340,7 +440,7 @@ impl RecoveryEnvelope {
             .map_err(|_| FormatError("invalid-root-key"))?;
         let metadata = std::str::from_utf8(&root[32..])
             .map_err(|_| FormatError("invalid-recovery-envelope"))?;
-        Ok(RecoveredConnection {
+        Ok(RecoveredRepository {
             root: Zeroizing::new(bytes),
             connection_metadata: Zeroizing::new(metadata.into()),
         })
@@ -402,10 +502,10 @@ mod tests {
         );
     }
     #[test]
-    fn recovery_is_independent_of_original_os_and_authenticates_connection_metadata() {
-        let code = RecoveryCode::generate().unwrap();
-        let recovered_code = RecoveryCode::parse(&code.expose()).unwrap();
-        let envelope = RecoveryEnvelope::protect(
+    fn repository_bootstrap_authenticates_identity_root_and_descriptor_metadata() {
+        let code = RecoveryKey::generate().unwrap();
+        let recovered_code = RecoveryKey::parse(&code.expose()).unwrap();
+        let envelope = RepositoryBootstrapEnvelope::protect(
             "synthetic-repository".into(),
             "https://synthetic.invalid/folder".into(),
             &[9; 32],
@@ -414,7 +514,7 @@ mod tests {
         .unwrap();
         let encoded = envelope.encode().unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains("synthetic.invalid"));
-        let mut imported = RecoveryEnvelope::decode(&encoded).unwrap();
+        let mut imported = RepositoryBootstrapEnvelope::decode(&encoded).unwrap();
         assert_eq!(
             *imported
                 .recover("synthetic-repository", &recovered_code)
@@ -430,26 +530,54 @@ mod tests {
             "https://synthetic.invalid/folder"
         );
         assert!(imported
-            .recover("synthetic-repository", &RecoveryCode::generate().unwrap())
+            .recover("synthetic-repository", &RecoveryKey::generate().unwrap())
             .is_err());
         assert!(imported.recover("another-repository", &code).is_err());
         imported.salt[0] ^= 1;
         assert!(imported.recover("synthetic-repository", &code).is_err());
         let mut old: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         old["memoryKib"] = u32::MAX.into();
-        assert!(RecoveryEnvelope::decode(&serde_json::to_vec(&old).unwrap()).is_err());
-        assert!(RecoveryEnvelope::decode(&vec![b' '; MAX_RECOVERY_BYTES + 1]).is_err());
+        assert!(RepositoryBootstrapEnvelope::decode(&serde_json::to_vec(&old).unwrap()).is_err());
+        assert!(RepositoryBootstrapEnvelope::decode(&vec![b' '; MAX_REPOSITORY_BOOTSTRAP_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn connection_settings_use_the_same_key_but_a_distinct_authenticated_schema() {
+        let code = RecoveryKey::generate().unwrap();
+        let envelope = ConnectionSettingsEnvelope::protect(
+            "provider-repository".into(),
+            br#"{"provider":"webdav","password":"synthetic"}"#,
+            &code,
+        )
+        .unwrap();
+        let encoded = envelope.encode().unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("synthetic"));
+        let mut decoded = ConnectionSettingsEnvelope::decode(&encoded).unwrap();
+        assert_eq!(
+            &*decoded.open("provider-repository", &code).unwrap(),
+            br#"{"provider":"webdav","password":"synthetic"}"#,
+        );
+        assert!(decoded.open("another-repository", &code).is_err());
+        assert!(decoded
+            .open("provider-repository", &RecoveryKey::generate().unwrap())
+            .is_err());
+        decoded.salt[0] ^= 1;
+        assert!(decoded.open("provider-repository", &code).is_err());
+        assert!(ConnectionSettingsEnvelope::decode(
+            &vec![b' '; MAX_CONNECTION_SETTINGS_BYTES + 1]
+        )
+        .is_err());
     }
     #[test]
     fn recovery_code_rejects_passwords_typos_and_noncanonical_grouping() {
-        let code = RecoveryCode::generate().unwrap();
+        let code = RecoveryKey::generate().unwrap();
         let text = code.expose();
-        assert!(RecoveryCode::parse(&text.to_uppercase()).is_ok());
+        assert!(RecoveryKey::parse(&text.to_uppercase()).is_ok());
         for bad in ["password", "123456", &text.replace('-', "")] {
-            assert!(RecoveryCode::parse(bad).is_err());
+            assert!(RecoveryKey::parse(bad).is_err());
         }
         let mut typo = text.as_bytes().to_vec();
         typo[0] = if typo[0] == b'0' { b'1' } else { b'0' };
-        assert!(RecoveryCode::parse(std::str::from_utf8(&typo).unwrap()).is_err());
+        assert!(RecoveryKey::parse(std::str::from_utf8(&typo).unwrap()).is_err());
     }
 }

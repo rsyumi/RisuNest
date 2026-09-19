@@ -36,6 +36,7 @@ export function buildPrepareConnectionRequest(options: {
     mode: ExternalOpenMode
     purpose: ExternalConnectionPurpose
     capturePolicy?: ExternalCapturePolicy
+    recoveryKey?: string
     acknowledgements: string[]
 }): PrepareExternalConnectionRequest {
     const definition = getExternalProviderDefinition(options.providerId)
@@ -55,6 +56,7 @@ export function buildPrepareConnectionRequest(options: {
         mode: options.mode,
         purpose: options.purpose,
         ...(options.capturePolicy ? { capturePolicy: { ...options.capturePolicy } } : {}),
+        ...(options.recoveryKey ? { recoveryKey: options.recoveryKey } : {}),
         acknowledgements: [...options.acknowledgements],
     }
 }

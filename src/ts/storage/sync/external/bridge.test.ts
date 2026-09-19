@@ -101,13 +101,28 @@ describe('ExternalStorageBridge', () => {
         })
     })
 
-    it('never sends recovery key bytes through the import command', async () => {
+    it('authenticates connection settings with the recovery key in the native boundary', async () => {
         const invoke = vi.fn(async () => ({ preparationId: 'prepared' }))
         const bridge = new ExternalStorageBridge({ supported: () => true, invoke })
-        await bridge.prepareRecoveryImport('authenticated-envelope', 'word-word-word')
-        expect(invoke).toHaveBeenCalledWith('external_storage_prepare_recovery_import', {
-            request: { payload: 'authenticated-envelope', code: 'word-word-word' },
+        await bridge.prepareConnectionSettingsImport('authenticated-settings', 'word-word-word')
+        expect(invoke).toHaveBeenCalledWith('external_storage_prepare_connection_settings_import', {
+            request: { payload: 'authenticated-settings', recoveryKey: 'word-word-word' },
         })
+    })
+
+    it('exports connection settings through an opaque staged file transfer', async () => {
+        const invoke = vi.fn(async (command: string) => command.includes('begin')
+            ? { transferId: 'transfer', expiresAtMs: '1', qrPayload: null }
+            : undefined)
+        const bridge = new ExternalStorageBridge({ supported: () => true, invoke })
+
+        await bridge.beginConnectionSettingsExport('connection')
+        await bridge.saveConnectionSettingsFile('transfer')
+
+        expect(invoke.mock.calls).toEqual([
+            ['external_storage_begin_connection_settings_export', { connectionId: 'connection' }],
+            ['external_storage_save_connection_settings_file', { transferId: 'transfer' }],
+        ])
     })
 
     it('forwards the opaque execution session identity', async () => {

@@ -193,7 +193,7 @@ pub(crate) async fn resume_existing(
     cancel: &Cancellation,
 ) -> Result<Option<RemoteLocator>> {
     expected.validate().map_err(|_| corrupt())?;
-    let mut descriptor = None;
+    let mut descriptors = Vec::new();
     for collection in [
         Collection::Snapshots,
         Collection::BackupPoints,
@@ -215,13 +215,13 @@ pub(crate) async fn resume_existing(
                 if !object.complete {
                     return Err(corrupt());
                 }
-                if collection != Collection::Descriptors || descriptor.is_some() {
+                if collection != Collection::Descriptors || descriptors.len() >= 2 {
                     return Err(ProviderError::new(ErrorKind::PreconditionFailed));
                 }
                 if object.byte_length == 0 || object.byte_length > MAX_DESCRIPTOR_CIPHERTEXT {
                     return Err(corrupt());
                 }
-                descriptor = Some(object.locator);
+                descriptors.push(object.locator);
             }
             match page.next_cursor {
                 None => { complete = true; break; }
@@ -238,8 +238,20 @@ pub(crate) async fn resume_existing(
         }
     }
     cancel.check()?;
-    if let Some(locator) = descriptor.as_ref() {
-        read(root, provider, repository, locator, expected, root_key, cancel).await?;
+    let had_descriptors = !descriptors.is_empty();
+    let mut descriptor = None;
+    for locator in descriptors {
+        if read(root, provider, repository, &locator, expected, root_key, cancel)
+            .await
+            .is_ok()
+        {
+            if descriptor.replace(locator).is_some() {
+                return Err(ProviderError::new(ErrorKind::PreconditionFailed));
+            }
+        }
+    }
+    if descriptor.is_none() && had_descriptors {
+        return Err(corrupt());
     }
     cancel.check()?;
     Ok(descriptor)

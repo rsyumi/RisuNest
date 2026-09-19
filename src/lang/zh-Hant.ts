@@ -700,8 +700,6 @@ export const languageChineseTraditional = {
     "editInput": "修改輸入",
     "editOutput": "修改輸出",
     "editProcess": "修改發送資料",
-    "loadLatest": "讀取最新的備份",
-    "loadOthers": "讀取其他備份",
     "exampleMessage": "示範訊息",
     "creatorNotes": "創作者備註",
     "systemPrompt": "系統提示詞",

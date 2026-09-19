@@ -30,47 +30,6 @@ assert.throws(() =>
     asBytes(vector.hash),
   ),
 );
-assert.deepEqual(
-  asArray(
-    wasm.recover_key(
-      asBytes(vector.recovery),
-      "synthetic-repository",
-      vector.code,
-    ),
-  ),
-  vector.key,
-);
-assert.equal(
-  wasm.recover_connection_metadata(
-    asBytes(vector.recovery),
-    "synthetic-repository",
-    vector.code,
-  ),
-  "https://synthetic.invalid/folder",
-);
-assert.throws(() =>
-  wasm.recover_key(
-    asBytes(vector.recovery),
-    "wrong-repository",
-    vector.code,
-  ),
-);
-assert.deepEqual(
-  asArray(wasm.canonical_recovery_envelope(asBytes(vector.recovery))),
-  vector.recovery,
-);
-
-const recoveryDocument = JSON.parse(
-  new TextDecoder().decode(asBytes(vector.recovery)),
-);
-assert.equal(typeof recoveryDocument.wrappedKey, "string");
-assert.match(recoveryDocument.wrappedKey, /^[A-Za-z0-9_-]+$/u);
-assert.equal(recoveryDocument.wrappedKey.includes("="), false);
-assert.deepEqual(
-  asArray(new TextEncoder().encode(JSON.stringify(recoveryDocument))),
-  vector.recovery,
-);
-
 const documents = [
   {
     bytes: vector.state,
@@ -166,17 +125,6 @@ assert.throws(() =>
 
 const compressed = wasm.compress_chunk(plain, false);
 assert.equal(wasm.compress_chunk(plain, true)[0], 0);
-const recovery = wasm.protect_recovery(
-  "synthetic-repository",
-  "https://synthetic.invalid/folder",
-  key,
-  vector.code,
-);
-const wasmRecoveryDocument = JSON.parse(new TextDecoder().decode(recovery));
-assert.equal(typeof wasmRecoveryDocument.wrappedKey, "string");
-assert.match(wasmRecoveryDocument.wrappedKey, /^[A-Za-z0-9_-]+$/u);
-assert.equal(wasmRecoveryDocument.wrappedKey.includes("="), false);
-
 const wasmEnvelopes = documents.map((document) =>
   wasm.seal_object_envelope(
     asBytes(document.bytes),
@@ -224,8 +172,6 @@ writeFileSync(
   JSON.stringify({
     plaintext: vector.plaintext,
     compressed: asArray(compressed),
-    recovery: asArray(recovery),
-    code: vector.code,
     stateEnvelope: asArray(wasmEnvelopes[0]),
     headEnvelope: asArray(wasmEnvelopes[1]),
     bundleEnvelope: asArray(wasmEnvelopes[2]),

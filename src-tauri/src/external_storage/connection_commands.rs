@@ -9,7 +9,7 @@ use super::{
     },
     descriptor,
     providers::{self, Dependencies},
-    recovery::{self, ImportedRecovery},
+    recovery,
     runtime, secrets,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -37,7 +37,15 @@ pub(crate) struct ConnectedRepository {
 struct PendingPreparation {
     request: PrepareConnectionRequest,
     expires_at_ms: u64,
-    recovery: Option<ImportedRecovery>,
+    recovery_key: Option<Zeroizing<String>>,
+    expected_repository_id: Option<String>,
+    imported_credential: Option<ImportedCredential>,
+    transferred: bool,
+}
+
+struct ImportedCredential {
+    bytes: Zeroizing<Vec<u8>>,
+    account_id: Option<String>,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -72,11 +80,10 @@ enum PendingAuthorization {
     },
 }
 
-struct PendingRecovery {
+struct PendingConnectionSettings {
     connection_id: String,
     expires_at_ms: u64,
     bytes: Vec<u8>,
-    code: Zeroizing<String>,
 }
 
 #[derive(Default)]
@@ -84,14 +91,14 @@ pub(crate) struct ConnectionCommandState {
     preparations: Mutex<HashMap<String, PendingPreparation>>,
     authorizations: Mutex<HashMap<String, PendingAuthorization>>,
     authorization_cancellations: Mutex<HashMap<String, Cancellation>>,
-    recoveries: Mutex<HashMap<String, PendingRecovery>>,
+    connection_settings: Mutex<HashMap<String, PendingConnectionSettings>>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CommitConnectionRequest {
     preparation_id: String,
-    secret: ProviderSecretInput,
+    secret: Option<ProviderSecretInput>,
 }
 
 #[derive(Deserialize)]
@@ -169,9 +176,9 @@ fn cancel_authorization(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct PrepareRecoveryImportRequest {
+pub(crate) struct PrepareConnectionSettingsImportRequest {
     payload: String,
-    code: String,
+    recovery_key: String,
 }
 
 #[derive(Serialize)]
@@ -186,10 +193,15 @@ pub(crate) struct PendingAuthorizationSummary {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RecoveryMaterial {
-    recovery_id: String,
+pub(crate) struct RecoveryKeyMaterial {
+    key: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionSettingsMaterial {
+    transfer_id: String,
     expires_at_ms: String,
-    code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     qr_payload: Option<String>,
 }
@@ -199,7 +211,7 @@ pub(crate) struct RecoveryMaterial {
 pub(crate) struct ConnectionResult {
     connection: ConnectionSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
-    recovery: Option<RecoveryMaterial>,
+    recovery: Option<RecoveryKeyMaterial>,
 }
 
 fn now_ms() -> u64 {
@@ -232,19 +244,30 @@ fn restore_preparation(state: &ConnectionCommandState, id: String, pending: Pend
 
 fn insert_preparation(
     state: &ConnectionCommandState,
-    request: PrepareConnectionRequest,
-    recovery: Option<ImportedRecovery>,
+    mut request: PrepareConnectionRequest,
+    expected_repository_id: Option<String>,
+    imported_credential: Option<ImportedCredential>,
+    transferred: bool,
 ) -> Result<PreparedConnection> {
-    if recovery.is_some()
+    if transferred
         && request.config.oauth_profile.is_some()
         && request.config.account_id.is_empty()
     {
         return Err(ProviderError::new(ErrorKind::Corrupt));
     }
     let endpoint = connection::validate_preparation(&request)?;
+    let recovery_key = request
+        .recovery_key
+        .take()
+        .map(|value| {
+            risunest_external_storage_format::crypto::RecoveryKey::parse(&value)
+                .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
+            Ok(Zeroizing::new(value))
+        })
+        .transpose()?;
     let preparation_id = uuid::Uuid::new_v4().to_string();
     let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
-    let missing_platform_client = recovery.is_some()
+    let missing_platform_client = transferred
         && request
             .config
             .oauth_profile
@@ -256,7 +279,7 @@ fn insert_preparation(
         endpoint,
         capabilities: None,
         requires_o_auth: request.config.oauth_profile.is_some(),
-        requires_recovery_key: request.mode == ConnectionOpenMode::Existing && recovery.is_none(),
+        requires_recovery_key: false,
         requires_platform_o_auth_client: missing_platform_client,
         oauth_project_hint: missing_platform_client.then(|| {
             request
@@ -273,7 +296,10 @@ fn insert_preparation(
         PendingPreparation {
             request,
             expires_at_ms,
-            recovery,
+            recovery_key,
+            expected_repository_id,
+            imported_credential,
+            transferred,
         },
     );
     Ok(result)
@@ -294,7 +320,7 @@ fn apply_recovery_platform_client(
             Err(ProviderError::new(ErrorKind::Unsupported))
         };
     }
-    if preparation.recovery.is_none() {
+    if !preparation.transferred {
         return Err(ProviderError::new(ErrorKind::Unsupported));
     }
     let supplied = supplied.ok_or_else(|| ProviderError::new(ErrorKind::Unsupported))?;
@@ -376,7 +402,7 @@ pub(crate) fn external_storage_prepare_connection(
     state: State<'_, ConnectionCommandState>,
     request: PrepareConnectionRequest,
 ) -> Result<PreparedConnection> {
-    insert_preparation(&state, request, None)
+    insert_preparation(&state, request, None, None, false)
 }
 
 #[tauri::command]
@@ -387,15 +413,23 @@ pub(crate) async fn external_storage_commit_connection(
 ) -> ConnectResult<ConnectionResult> {
     let preparation_id = request.preparation_id;
     let pending = take_preparation(&state, &preparation_id)?;
-    if pending.request.mode == ConnectionOpenMode::Existing && pending.recovery.is_none() {
-        restore_preparation(&state, preparation_id, pending);
-        return Err(ProviderError::new(ErrorKind::ReauthRequired).into());
-    }
     if pending.request.config.oauth_profile.is_some() {
         restore_preparation(&state, preparation_id, pending);
         return Err(ProviderError::new(ErrorKind::Unsupported).into());
     }
-    let secret = connection::encode_secret(&pending.request.config.provider, request.secret)?;
+    let secret = match (&pending.imported_credential, request.secret) {
+        (Some(imported), None) => EncodedProviderSecret {
+            bytes: SecretBytes(Zeroizing::new(imported.bytes.to_vec())),
+            account_id: imported.account_id.clone(),
+        },
+        (None, Some(secret)) => {
+            connection::encode_secret(&pending.request.config.provider, secret)?
+        }
+        _ => {
+            restore_preparation(&state, preparation_id, pending);
+            return Err(ProviderError::new(ErrorKind::Unsupported).into());
+        }
+    };
     let cancel = Cancellation::default();
     match commit_preparation(
         &app,
@@ -433,7 +467,7 @@ pub(crate) async fn external_storage_begin_authorization(
             return Err(ProviderError::new(ErrorKind::Cancelled));
         }
         if preparation.request.mode == ConnectionOpenMode::Existing
-            && preparation.recovery.is_none()
+            && !preparation.transferred
         {
             return Err(ProviderError::new(ErrorKind::ReauthRequired));
         }
@@ -503,7 +537,7 @@ pub(crate) async fn external_storage_begin_authorization(
             return Err(ProviderError::new(ErrorKind::Cancelled));
         }
         if preparation.request.mode == ConnectionOpenMode::Existing
-            && preparation.recovery.is_none()
+            && !preparation.transferred
         {
             return Err(ProviderError::new(ErrorKind::ReauthRequired));
         }
@@ -578,7 +612,7 @@ pub(crate) async fn external_storage_begin_authorization(
             return Err(ProviderError::new(ErrorKind::Cancelled));
         }
         if preparation.request.mode == ConnectionOpenMode::Existing
-            && preparation.recovery.is_none()
+            && !preparation.transferred
         {
             return Err(ProviderError::new(ErrorKind::ReauthRequired));
         }
@@ -1070,6 +1104,7 @@ async fn commit_preparation(
             (pending, true)
         }
         Err(error) if error.kind == ErrorKind::NotFound => {
+            cancel.check()?;
             let (credential_ref, account_id) = match credential {
                 CredentialInput::Bytes(secret) => (
                     provider_vault.store(&secret.bytes).await?,
@@ -1077,30 +1112,85 @@ async fn commit_preparation(
                 ),
                 CredentialInput::Reference { reference, account_id } => (reference, account_id),
             };
-            cancel.check()?;
             if let Some(account_id) = account_id {
                 config.account_id = account_id;
             }
-            let (repository_id, descriptor, key, create) = match preparation.request.mode {
-                ConnectionOpenMode::Create => (
-                    uuid::Uuid::new_v4().to_string(),
-                    None,
-                    root_key().map_err(|_| ProviderError::new(ErrorKind::Transient))?,
-                    true,
-                ),
-                ConnectionOpenMode::Existing => {
-                    let recovery = preparation
-                        .recovery
-                        .as_ref()
-                        .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
-                    (
-                        recovery.metadata.descriptor.repository_id.clone(),
-                        Some(recovery.metadata.descriptor.clone()),
-                        recovery.key.clone(),
-                        false,
-                    )
-                }
-            };
+            let (repository_id, descriptor, key, recovery_key, provider_repository_id, create) =
+                match preparation.request.mode {
+                    ConnectionOpenMode::Create => (
+                        uuid::Uuid::new_v4().to_string(),
+                        None,
+                        root_key().map_err(|_| ProviderError::new(ErrorKind::Transient))?,
+                        recovery::generate_key()?,
+                        None,
+                        true,
+                    ),
+                    ConnectionOpenMode::Existing => {
+                        let recovery_key = preparation
+                            .recovery_key
+                            .as_deref()
+                            .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
+                        let discovered = async {
+                            let provider = connection::provider_for(&config, dependencies.clone())?;
+                            let (handle, capabilities) = provider
+                                .open_repository(
+                                    &config,
+                                    &credential_ref,
+                                    super::contract::OpenMode::Existing,
+                                    cancel,
+                                )
+                                .await?;
+                            let recovered = recovery::open_bootstrap(
+                                &root,
+                                provider.as_ref(),
+                                &handle,
+                                recovery_key,
+                                cancel,
+                            )
+                            .await?;
+                            if preparation
+                                .expected_repository_id
+                                .as_ref()
+                                .is_some_and(|expected| {
+                                    expected != &recovered.metadata.descriptor.repository_id
+                                })
+                            {
+                                return Err(ProviderError::new(ErrorKind::Corrupt).into());
+                            }
+                            require_repository_strategy(
+                                &capabilities,
+                                recovered.metadata.descriptor.publication_strategy,
+                            )?;
+                            descriptor::read(
+                                &root,
+                                provider.as_ref(),
+                                &handle,
+                                &recovered.metadata.descriptor_locator,
+                                &recovered.metadata.descriptor,
+                                &recovered.key,
+                                cancel,
+                            )
+                            .await?;
+                            Ok::<_, ConnectionFailure>((recovered, handle.repository_id))
+                        }
+                        .await;
+                        let (recovered, provider_repository_id) = match discovered {
+                            Ok(value) => value,
+                            Err(error) => {
+                                let _ = provider_vault.remove(&credential_ref).await;
+                                return Err(error);
+                            }
+                        };
+                        (
+                            recovered.metadata.descriptor.repository_id.clone(),
+                            Some(recovered.metadata.descriptor),
+                            recovered.key,
+                            Zeroizing::new(recovery_key.to_owned()),
+                            Some(provider_repository_id),
+                            false,
+                        )
+                    }
+                };
             let key_ref = match key_vault.store(&SecretBytes(Zeroizing::new(key.to_vec()))).await {
                 Ok(reference) => reference,
                 Err(error) => {
@@ -1108,20 +1198,42 @@ async fn commit_preparation(
                     return Err(error.into());
                 }
             };
+            let recovery_key_ref = match key_vault
+                .store(&SecretBytes(Zeroizing::new(recovery_key.as_bytes().to_vec())))
+                .await
+            {
+                Ok(reference) => reference,
+                Err(error) => {
+                    let _ = key_vault.remove(&key_ref).await;
+                    let _ = provider_vault.remove(&credential_ref).await;
+                    return Err(error.into());
+                }
+            };
+            let capture_policy = descriptor
+                .as_ref()
+                .map(|value| {
+                    value
+                        .publication_strategy
+                        .is_none()
+                        .then(CapturePolicy::default)
+                })
+                .unwrap_or(preparation.request.capture_policy);
             let pending = PendingStoredConnection {
                 id: connection_id.into(),
                 config,
                 repository_id,
                 descriptor,
                 create,
-                provider_repository_id: None,
+                provider_repository_id,
                 credential_ref: credential_ref.0.clone(),
                 root_key_ref: key_ref.0.clone(),
-                capture_policy: preparation.request.capture_policy,
+                recovery_key_ref: recovery_key_ref.0.clone(),
+                capture_policy,
                 created_at_ms: now_ms(),
             };
             if let Err(error) = store.put_pending(&pending) {
                 let _ = key_vault.remove(&key_ref).await;
+                let _ = key_vault.remove(&recovery_key_ref).await;
                 let _ = provider_vault.remove(&credential_ref).await;
                 return Err(error.into());
             }
@@ -1144,15 +1256,6 @@ async fn commit_preparation(
     let (handle, capabilities) = provider
         .open_repository(&config, &credential_ref, open_mode, cancel)
         .await?;
-    if !pending.create {
-        let recovery = preparation
-            .recovery
-            .as_ref()
-            .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
-        if recovery.metadata.provider_repository_id != handle.repository_id {
-            return Err(ProviderError::new(ErrorKind::Corrupt).into());
-        }
-    }
     if pending
         .provider_repository_id
         .as_ref()
@@ -1169,6 +1272,9 @@ async fn commit_preparation(
         let _ = store.remove_pending(connection_id);
         let _ = key_vault
             .remove(&SecretRef(pending.root_key_ref.clone()))
+            .await;
+        let _ = key_vault
+            .remove(&SecretRef(pending.recovery_key_ref.clone()))
             .await;
         let _ = provider_vault.remove(&credential_ref).await;
         return Err(ConnectionFailure::ALREADY_CONNECTED);
@@ -1187,9 +1293,10 @@ async fn commit_preparation(
     let descriptor = updated.descriptor.as_ref().ok_or_else(|| ProviderError::new(ErrorKind::Corrupt))?;
     require_repository_strategy(&capabilities, descriptor.publication_strategy)?;
     let root_key = read_root_key(key_vault.as_ref(), &updated.root_key_ref).await?;
+    let recovery_key = read_recovery_key(key_vault.as_ref(), &updated.recovery_key_ref).await?;
     let descriptor_locator = match preparation.request.mode {
         ConnectionOpenMode::Create => {
-            ensure_create_descriptor(
+            let locator = ensure_create_descriptor(
                 &root,
                 provider.as_ref(),
                 &handle,
@@ -1198,36 +1305,53 @@ async fn commit_preparation(
                 resuming,
                 cancel,
             )
-            .await?
+            .await?;
+            recovery::publish_bootstrap(
+                &root,
+                provider.as_ref(),
+                &handle,
+                &recovery::BootstrapMetadata {
+                    descriptor: descriptor.clone(),
+                    descriptor_locator: locator.clone(),
+                },
+                &root_key,
+                &recovery_key,
+                cancel,
+            )
+            .await?;
+            locator
         }
         ConnectionOpenMode::Existing => {
-            let recovery = preparation
-                .recovery
-                .as_ref()
-                .ok_or_else(|| ProviderError::new(ErrorKind::ReauthRequired))?;
+            let recovered = recovery::open_bootstrap(
+                &root,
+                provider.as_ref(),
+                &handle,
+                &recovery_key,
+                cancel,
+            )
+            .await?;
+            if recovered.metadata.descriptor != *descriptor || *recovered.key != *root_key {
+                return Err(ProviderError::new(ErrorKind::Corrupt).into());
+            }
             descriptor::read(
                 &root,
                 provider.as_ref(),
                 &handle,
-                &recovery.metadata.descriptor_locator,
+                &recovered.metadata.descriptor_locator,
                 descriptor,
                 &root_key,
                 cancel,
             )
             .await?;
-            recovery.metadata.descriptor_locator.clone()
+            recovered.metadata.descriptor_locator
         }
     };
     cancel.check()?;
     let stored = store.promote_pending(connection_id, descriptor_locator, capabilities)?;
     let recovery = if preparation.request.mode == ConnectionOpenMode::Create {
-        match create_recovery_material(app, &stored, &root_key) {
-            Ok(material) => Some(material),
-            Err(_) => {
-                crate::nlog!("warn", "External connection recovery material must be exported again");
-                None
-            }
-        }
+        Some(RecoveryKeyMaterial {
+            key: recovery_key.to_string(),
+        })
     } else {
         None
     };
@@ -1246,6 +1370,20 @@ async fn read_root_key(vault: &dyn SecretVault, reference: &str) -> Result<Zeroi
     key.copy_from_slice(&bytes.0);
     bytes.0.zeroize();
     Ok(key)
+}
+
+async fn read_recovery_key(
+    vault: &dyn SecretVault,
+    reference: &str,
+) -> Result<Zeroizing<String>> {
+    let mut bytes = vault.read(&SecretRef(reference.into())).await?;
+    let key = std::str::from_utf8(&bytes.0)
+        .map_err(|_| ProviderError::new(ErrorKind::ReauthRequired))?;
+    risunest_external_storage_format::crypto::RecoveryKey::parse(key)
+        .map_err(|_| ProviderError::new(ErrorKind::ReauthRequired))?;
+    let result = Zeroizing::new(key.to_owned());
+    bytes.0.zeroize();
+    Ok(result)
 }
 
 pub(crate) async fn open_connected(
@@ -1350,72 +1488,67 @@ pub(crate) async fn external_storage_remove_connection(
     secrets::repository_key_vault(&root)
         .remove(&SecretRef(stored.root_key_ref.clone()))
         .await?;
+    secrets::repository_key_vault(&root)
+        .remove(&SecretRef(stored.recovery_key_ref.clone()))
+        .await?;
     store.remove(&connection_id)?;
     Ok(())
 }
 
-fn create_recovery_material(
-    app: &AppHandle,
-    stored: &StoredConnection,
-    key: &[u8; 32],
-) -> Result<RecoveryMaterial> {
-    create_recovery_material_with_state(&app.state::<ConnectionCommandState>(), stored, key)
-}
-
-fn create_recovery_material_with_state(
-    state: &ConnectionCommandState,
-    stored: &StoredConnection,
-    key: &[u8; 32],
-) -> Result<RecoveryMaterial> {
-    let exported = recovery::export(stored, key)?;
-    let recovery_id = uuid::Uuid::new_v4().to_string();
-    let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
-    let encoded = URL_SAFE_NO_PAD.encode(&exported.bytes);
-    // Version 40 QR byte mode at the UI's default M correction level holds
-    // 2,331 bytes. Keep a little room for library framing differences.
-    let qr_payload = (encoded.len() <= 2_300).then_some(encoded);
-    let material = RecoveryMaterial {
-        recovery_id: recovery_id.clone(),
-        expires_at_ms: expires_at_ms.to_string(),
-        code: exported.code.to_string(),
-        qr_payload,
-    };
-    lock(&state.recoveries)?.insert(
-        recovery_id,
-        PendingRecovery {
-            connection_id: stored.id.clone(),
-            expires_at_ms,
-            bytes: exported.bytes,
-            code: exported.code,
-        },
-    );
-    Ok(material)
-}
-
 #[tauri::command]
-pub(crate) async fn external_storage_begin_recovery_export(
+pub(crate) async fn external_storage_begin_connection_settings_export(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
     connection_id: String,
-) -> Result<RecoveryMaterial> {
+) -> Result<ConnectionSettingsMaterial> {
     let root = connection_root(&app)?;
     let stored = ConnectionStore::open(&root)?.read(&connection_id)?;
-    let key = read_root_key(
+    let recovery_key = read_recovery_key(
         secrets::repository_key_vault(&root).as_ref(),
-        &stored.root_key_ref,
+        &stored.recovery_key_ref,
     )
     .await?;
-    create_recovery_material_with_state(&state, &stored, &key)
+    let credential = if stored.config.oauth_profile.is_some() {
+        None
+    } else {
+        Some(
+            secrets::provider_vault(&root)
+                .read(&SecretRef(stored.credential_ref.clone()))
+                .await?,
+        )
+    };
+    let bytes = recovery::export_connection_settings(
+        &stored,
+        &recovery_key,
+        credential.as_ref().map(|value| value.0.as_slice()),
+    )?;
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
+    let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+    let qr_payload = (encoded.len() <= 2_300).then_some(encoded);
+    lock(&state.connection_settings)?.insert(
+        transfer_id.clone(),
+        PendingConnectionSettings {
+            connection_id,
+            expires_at_ms,
+            bytes,
+        },
+    );
+    Ok(ConnectionSettingsMaterial {
+        transfer_id,
+        expires_at_ms: expires_at_ms.to_string(),
+        qr_payload,
+    })
 }
 
 #[tauri::command]
-pub(crate) async fn external_storage_save_recovery_file(
+pub(crate) async fn external_storage_save_connection_settings_file(
     app: AppHandle,
     state: State<'_, ConnectionCommandState>,
-    recovery_id: String,
+    transfer_id: String,
 ) -> Result<()> {
-    let pending = lock(&state.recoveries)?
-        .remove(&recovery_id)
+    let pending = lock(&state.connection_settings)?
+        .remove(&transfer_id)
         .ok_or_else(|| ProviderError::new(ErrorKind::NotFound))?;
     if pending.expires_at_ms <= now_ms() {
         return Err(ProviderError::new(ErrorKind::Cancelled));
@@ -1423,8 +1556,8 @@ pub(crate) async fn external_storage_save_recovery_file(
     let selected = app
         .dialog()
         .file()
-        .add_filter("RisuNest recovery", &["rnrecovery"])
-        .set_file_name("risunest-key-connection.rnrecovery")
+        .add_filter("RisuNest connection settings", &["rnconnection"])
+        .set_file_name("risunest-connection.rnconnection")
         .blocking_save_file()
         .ok_or_else(|| ProviderError::new(ErrorKind::Cancelled))?;
     let encoded = URL_SAFE_NO_PAD.encode(&pending.bytes);
@@ -1449,7 +1582,10 @@ pub(crate) async fn external_storage_save_recovery_file(
         .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
     let mut verified = Vec::new();
     let max_encoded =
-        risunest_external_storage_format::crypto::MAX_RECOVERY_BYTES.saturating_add(2) / 3 * 4;
+        risunest_external_storage_format::crypto::MAX_CONNECTION_SETTINGS_BYTES
+            .saturating_add(2)
+            / 3
+            * 4;
     file.take((max_encoded + 1) as u64)
         .read_to_end(&mut verified)
         .map_err(|_| ProviderError::new(ErrorKind::Transient))?;
@@ -1459,49 +1595,60 @@ pub(crate) async fn external_storage_save_recovery_file(
     let verified = URL_SAFE_NO_PAD
         .decode(&verified)
         .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
-    let imported = recovery::import(&verified, &pending.code)?;
     let stored = ConnectionStore::open(&connection_root(&app)?)?.read(&pending.connection_id)?;
-    if imported.metadata.descriptor != stored.descriptor
-        || imported.metadata.provider_repository_id != stored.provider_repository_id
-    {
+    let recovery_key = read_recovery_key(
+        secrets::repository_key_vault(&connection_root(&app)?).as_ref(),
+        &stored.recovery_key_ref,
+    )
+    .await?;
+    let imported = recovery::import_connection_settings(&verified, &recovery_key)?;
+    if imported.repository_id != stored.descriptor.repository_id || imported.config != stored.config {
         return Err(ProviderError::new(ErrorKind::Corrupt));
     }
     Ok(())
 }
 
 #[tauri::command]
-pub(crate) fn external_storage_prepare_recovery_import(
+pub(crate) fn external_storage_prepare_connection_settings_import(
     state: State<'_, ConnectionCommandState>,
-    request: PrepareRecoveryImportRequest,
+    request: PrepareConnectionSettingsImportRequest,
 ) -> Result<PreparedConnection> {
     let max_encoded =
-        risunest_external_storage_format::crypto::MAX_RECOVERY_BYTES.saturating_add(2) / 3 * 4;
+        risunest_external_storage_format::crypto::MAX_CONNECTION_SETTINGS_BYTES
+            .saturating_add(2)
+            / 3
+            * 4;
     if request.payload.is_empty() || request.payload.len() > max_encoded {
         return Err(ProviderError::new(ErrorKind::Corrupt));
     }
     let bytes = URL_SAFE_NO_PAD
         .decode(request.payload.as_bytes())
         .map_err(|_| ProviderError::new(ErrorKind::Corrupt))?;
-    let code = Zeroizing::new(request.code);
-    let imported = recovery::import(&bytes, &code)?;
-    let purpose = if imported.metadata.descriptor.publication_strategy.is_none() {
-        ConnectionPurpose::Backup
-    } else {
-        ConnectionPurpose::Sync
-    };
+    let recovery_key = Zeroizing::new(request.recovery_key);
+    let imported = recovery::import_connection_settings(&bytes, &recovery_key)?;
     let mut acknowledgements = Vec::new();
-    if imported.metadata.config.provider == "github_releases" {
+    if imported.config.provider == "github_releases" {
         acknowledgements.push(GITHUB_ACKNOWLEDGEMENT.into());
     }
     let prepare = PrepareConnectionRequest {
-        config: imported.metadata.config.clone(),
+        config: imported.config,
         mode: ConnectionOpenMode::Existing,
-        purpose,
-        capture_policy: (purpose == ConnectionPurpose::Backup)
-            .then(super::connection::CapturePolicy::default),
+        purpose: ConnectionPurpose::Backup,
+        capture_policy: Some(super::connection::CapturePolicy::default()),
+        recovery_key: Some(recovery_key.to_string()),
         acknowledgements,
     };
-    insert_preparation(&state, prepare, Some(imported))
+    let imported_credential = imported.credential.map(|bytes| ImportedCredential {
+        bytes,
+        account_id: imported.account_id,
+    });
+    insert_preparation(
+        &state,
+        prepare,
+        Some(imported.repository_id),
+        imported_credential,
+        true,
+    )
 }
 
 fn platform_key() -> &'static str {
@@ -1614,7 +1761,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn existing_prepare_never_claims_a_key_without_authenticated_recovery() {
+    fn existing_prepare_requires_a_well_formed_recovery_key() {
         let state = ConnectionCommandState::default();
         let request = PrepareConnectionRequest {
             config: super::super::contract::ConnectionConfig {
@@ -1628,15 +1775,28 @@ mod tests {
             mode: ConnectionOpenMode::Existing,
             purpose: ConnectionPurpose::Backup,
             capture_policy: Some(super::connection::CapturePolicy::default()),
+            recovery_key: Some(recovery::generate_key().unwrap().to_string()),
             acknowledgements: Vec::new(),
         };
-        let result = insert_preparation(&state, request, None).unwrap();
-        assert!(result.requires_recovery_key);
+        let result = insert_preparation(&state, request, None, None, false).unwrap();
+        assert!(!result.requires_recovery_key);
         assert!(result.capabilities.is_none());
+
+        let mut invalid = state
+            .preparations
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .request
+            .clone();
+        invalid.recovery_key = Some("not-a-recovery-key".into());
+        assert!(insert_preparation(&state, invalid, None, None, false).is_err());
     }
 
     #[test]
-    fn recovery_payload_is_authenticated_before_endpoint_review() {
+    fn connection_settings_are_authenticated_before_endpoint_review() {
         let descriptor = Descriptor::new("synthetic-repository".into(), None,
         )
         .unwrap();
@@ -1655,6 +1815,7 @@ mod tests {
             provider_repository_id: "synthetic-provider-root".into(),
             credential_ref: "not-exported".into(),
             root_key_ref: "not-exported".into(),
+            recovery_key_ref: "not-exported-recovery".into(),
             capture_policy: None,
             retention_policy: None,
             capabilities: super::super::fake::capabilities(false),
@@ -1662,28 +1823,19 @@ mod tests {
             last_sync_at_ms: None,
             last_backup_at_ms: None,
         };
-        let exported = recovery::export(&stored, &[7; 32]).unwrap();
-        let recovered = recovery::import(&exported.bytes, &exported.code).unwrap();
-        assert_eq!(
-            recovered.metadata.config.endpoint,
-            "https://synthetic.invalid"
-        );
-        let state = ConnectionCommandState::default();
-        let material = create_recovery_material_with_state(&state, &stored, &[7; 32]).unwrap();
-        let qr = material.qr_payload.expect("synthetic metadata fits a QR");
-        let qr_bytes = URL_SAFE_NO_PAD.decode(qr).unwrap();
-        assert!(recovery::import(&qr_bytes, &material.code).is_ok());
-        let mut damaged = exported.bytes;
+        let key = recovery::generate_key().unwrap();
+        let exported = recovery::export_connection_settings(&stored, &key, Some(b"secret")).unwrap();
+        let recovered = recovery::import_connection_settings(&exported, &key).unwrap();
+        assert_eq!(recovered.config.endpoint, "https://synthetic.invalid");
+        assert_eq!(recovered.credential.unwrap().as_slice(), b"secret");
+        let mut damaged = exported;
         let last = damaged.len() - 1;
         damaged[last] ^= 1;
-        assert!(recovery::import(&damaged, &exported.code).is_err());
+        assert!(recovery::import_connection_settings(&damaged, &key).is_err());
     }
 
     #[test]
     fn recovered_google_client_override_must_keep_the_authenticated_project() {
-        let descriptor = Descriptor::new("synthetic-repository".into(), Some(super::super::contract::PublicationStrategy::Sequential),
-        )
-        .unwrap();
         let config = super::super::contract::ConnectionConfig {
             provider: "google_drive".into(),
             profile: Some("drive".into()),
@@ -1701,25 +1853,20 @@ mod tests {
                 )]),
             }),
         };
-        let imported = ImportedRecovery {
-            metadata: recovery::RecoveryMetadata {
-                config: config.clone(),
-                descriptor: descriptor.clone(),
-                descriptor_locator: super::super::fake::locator(),
-                provider_repository_id: "synthetic-provider-root".into(),
-            },
-            key: Zeroizing::new([7; 32]),
-        };
         let mut pending = PendingPreparation {
             request: PrepareConnectionRequest {
                 config,
                 mode: ConnectionOpenMode::Existing,
                 purpose: ConnectionPurpose::Sync,
                 capture_policy: None,
+                recovery_key: Some(recovery::generate_key().unwrap().to_string()),
                 acknowledgements: Vec::new(),
             },
             expires_at_ms: u64::MAX,
-            recovery: Some(imported),
+            recovery_key: Some(recovery::generate_key().unwrap()),
+            expected_repository_id: Some("synthetic-repository".into()),
+            imported_credential: None,
+            transferred: true,
         };
 
         assert!(apply_recovery_platform_client(

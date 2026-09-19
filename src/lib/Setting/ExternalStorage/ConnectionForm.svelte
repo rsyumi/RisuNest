@@ -65,9 +65,7 @@
     let providerId = $state<ExternalProviderId>('google_drive')
     let chosenMode = $state<ExternalOpenMode>('create')
     const mode = $derived<ExternalOpenMode>(restoreOnly ? 'existing' : chosenMode)
-    // The recovery file carries the repository settings, so the review must not
-    // show the purpose this form never asked for.
-    let fromRecovery = $state(false)
+    let fromTransfer = $state(false)
     let purpose = $state<ExternalConnectionPurpose>('backup')
     let values = $state<Record<string, string>>({
         space: 'drive', accountType: 'personal', tenant: 'common',
@@ -81,8 +79,8 @@
     let accepted = $state<string[]>([])
     let prepared = $state<PreparedExternalConnection | null>(null)
     let endpointConfirmed = $state(false)
-    let recoveryPayload = $state('')
-    let recoveryCode = $state('')
+    let connectionSettingsPayload = $state('')
+    let recoveryKey = $state('')
     let pendingAuthorizationId = $state<string | null>(null)
     let currentPlatformClientId = $state('')
     let oauthClientSecret = $state('')
@@ -184,7 +182,7 @@
             return
         }
         prepared = null
-        fromRecovery = false
+        fromTransfer = false
         endpointConfirmed = false
         currentPlatformClientId = ''
         oauthClientSecret = ''
@@ -212,18 +210,18 @@
 
     function selectMode(value: ExternalOpenMode): void {
         chosenMode = value
-        recoveryPayload = ''
-        recoveryCode = ''
+        connectionSettingsPayload = ''
+        recoveryKey = ''
         resetPrepared()
     }
 
-    function readRecoveryFile(): Promise<string | null> {
+    function readConnectionSettingsFile(): Promise<string | null> {
         return new Promise(resolve => {
             const input = document.createElement('input')
             input.type = 'file'
             // The Android picker hides extensions it does not know, so it stays
             // open there and the contents are checked when the key is read.
-            if (!isTauriAndroid) input.accept = '.rnrecovery,text/plain'
+            if (!isTauriAndroid) input.accept = '.rnconnection,text/plain'
             input.style.display = 'none'
             const finish = async (file?: File) => {
                 input.remove()
@@ -236,11 +234,26 @@
         })
     }
 
-    async function loadRecoveryFile(): Promise<void> {
-        const contents = await readRecoveryFile()
+    async function loadConnectionSettingsFile(): Promise<void> {
+        const contents = await readConnectionSettingsFile()
         if (contents === null) return
-        recoveryPayload = contents.replace(/^﻿/, '').trim()
+        connectionSettingsPayload = contents.replace(/^﻿/, '').trim()
         error = ''
+    }
+
+    async function scanConnectionSettings(): Promise<void> {
+        try {
+            const { checkPermissions, requestPermissions, scan, Format } = await import('@tauri-apps/plugin-barcode-scanner')
+            let permission = await checkPermissions()
+            if (permission === 'prompt') permission = await requestPermissions()
+            if (permission !== 'granted') throw new Error('qr-camera-permission-denied')
+            const result = await scan({ formats: [Format.QRCode], windowed: true, cameraDirection: 'back' })
+            if (result.format !== Format.QRCode) throw new Error('invalid-connection-settings')
+            connectionSettingsPayload = result.content.trim()
+            error = ''
+        } catch (reason) {
+            error = externalErrorMessage(strings, reason)
+        }
     }
 
     function selectPurpose(value: ExternalConnectionPurpose): void {
@@ -272,6 +285,7 @@
         try {
             request = buildPrepareConnectionRequest({
                 providerId, values, platform, mode, purpose,
+                recoveryKey: mode === 'existing' ? recoveryKey.trim() : undefined,
                 capturePolicy: purpose === 'backup'
                     ? { hypa, localPlugins, localSettings }
                     : defaultExternalCapturePolicy(purpose),
@@ -291,12 +305,12 @@
         }
     }
 
-    async function authenticateRecovery(): Promise<void> {
+    async function importConnectionSettings(): Promise<void> {
         busy = true
         error = ''
         try {
-            prepared = await bridge.prepareRecoveryImport(recoveryPayload.trim(), recoveryCode.trim())
-            fromRecovery = true
+            prepared = await bridge.prepareConnectionSettingsImport(connectionSettingsPayload.trim(), recoveryKey.trim())
+            fromTransfer = true
             providerId = prepared.endpoint.providerId
         } catch (reason) {
             error = externalErrorMessage(strings, reason)
@@ -355,8 +369,8 @@
                 await onconnected(result)
                 return
             }
-            const secret = buildProviderSecret(providerId, values)
-            if (!secret) throw new Error('This provider requires OAuth authorization.')
+            const secret = fromTransfer ? undefined : buildProviderSecret(providerId, values)
+            if (!fromTransfer && !secret) throw new Error('This provider requires OAuth authorization.')
             await onconnected(await bridge.commitConnection(prepared.preparationId, secret))
             for (const field of definition.secretFields) values[field.key] = ''
         } catch (reason) {
@@ -370,34 +384,28 @@
 
 <fieldset disabled={busy} class="form" data-external-storage-connection-form data-tone={tone}>
     <fieldset disabled={prepared !== null} class="contents">
-    {#if !restoreOnly}
     <section class="sub">
-        <h4 class="sub-title">{mode === 'create' ? strings.provider : strings.mode}</h4>
+        <h4 class="sub-title">{strings.provider}</h4>
         <div class="fields two">
-            {#if mode === 'create'}
-                <label class="field">
-                    <span>{strings.provider}</span>
-                    <SelectInput value={providerId} className="w-full" onchange={event => selectProvider(event.currentTarget.value)}>
-                        {#each providerOptions as option (option.value)}<OptionInput value={option.value} disabled={option.disabled}>{option.label}</OptionInput>{/each}
-                    </SelectInput>
-                    <small>{providerStrings.description}</small>
-                </label>
-            {/if}
-            <div class="field">
+            <label class="field">
+                <span>{strings.provider}</span>
+                <SelectInput value={providerId} className="w-full" onchange={event => selectProvider(event.currentTarget.value)}>
+                    {#each providerOptions as option (option.value)}<OptionInput value={option.value} disabled={option.disabled}>{option.label}</OptionInput>{/each}
+                </SelectInput>
+                <small>{providerStrings.description}</small>
+            </label>
+            {#if !restoreOnly}<div class="field">
                 <span>{strings.mode}</span>
                 <SegmentedButtons value={mode} label={strings.mode} role="radiogroup" onchange={selectMode} options={[{ value: 'create', label: strings.create }, { value: 'existing', label: strings.existing }]} />
                 {#if mode === 'existing'}<small>{strings.existingHelp}</small>{/if}
-            </div>
+            </div>{/if}
         </div>
-        {#if mode === 'create'}
-            {#if !authorizationAvailable}<p class="note danger"><span>{strings.authorizationUnavailable}</span></p>{/if}
-            {#if googleAndroid}<p class="note"><span>{strings.googleAndroidSetup}</span></p>{/if}
-            {#if isTauriAndroid && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveAndroidSetup}</span></p>{/if}
-            {#if isTauriIOS && providerId === 'google_drive'}<p class="note"><span>{strings.googleIOSSetup}</span></p>{/if}
-            {#if isTauriIOS && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveIOSSetup}</span></p>{/if}
-        {/if}
+        {#if !authorizationAvailable}<p class="note danger"><span>{strings.authorizationUnavailable}</span></p>{/if}
+        {#if googleAndroid}<p class="note"><span>{strings.googleAndroidSetup}</span></p>{/if}
+        {#if isTauriAndroid && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveAndroidSetup}</span></p>{/if}
+        {#if isTauriIOS && providerId === 'google_drive'}<p class="note"><span>{strings.googleIOSSetup}</span></p>{/if}
+        {#if isTauriIOS && providerId === 'onedrive'}<p class="note"><span>{strings.oneDriveIOSSetup}</span></p>{/if}
     </section>
-    {/if}
 
     {#if mode === 'create'}
     <section class="sub">
@@ -412,24 +420,43 @@
                 <small>{strings.sequentialWarning}</small>
             </div>
         {/if}
-        {#if providerWarning}
-            <div class="warning">
-                <strong>{providerWarning.title}</strong>
-                <p>{providerWarning.body}</p>
-            </div>
-        {/if}
-        {#each requiredAcks as acknowledgement (acknowledgement)}
-            <div class="warning">
-                <strong>{strings.githubWarningTitle}</strong>
-                <p>{strings.githubWarning}</p>
-                <label class="check">
-                    <input type="checkbox" checked={accepted.includes(acknowledgement)} onchange={event => toggleAcknowledgement(acknowledgement, event.currentTarget.checked)} />
-                    <span>{strings.acknowledge}</span>
-                    <span class="sr-only">{strings.githubWarning}</span>
-                </label>
-            </div>
-        {/each}
     </section>
+    {/if}
+
+    {#if providerWarning}
+        <div class="warning">
+            <strong>{providerWarning.title}</strong>
+            <p>{providerWarning.body}</p>
+        </div>
+    {/if}
+    {#each requiredAcks as acknowledgement (acknowledgement)}
+        <div class="warning">
+            <strong>{strings.githubWarningTitle}</strong>
+            <p>{strings.githubWarning}</p>
+            <label class="check">
+                <input type="checkbox" checked={accepted.includes(acknowledgement)} onchange={event => toggleAcknowledgement(acknowledgement, event.currentTarget.checked)} />
+                <span>{strings.acknowledge}</span>
+                <span class="sr-only">{strings.githubWarning}</span>
+            </label>
+        </div>
+    {/each}
+
+    {#if mode === 'existing'}
+    <section class="sub">
+        <h4 class="sub-title">{strings.connectionSettings}</h4>
+        <p class="sub-help">{strings.connectionSettingsImportHelp}</p>
+        <div class="actions">
+            <SettingButton variant="secondary" disabled={busy} onclick={loadConnectionSettingsFile}>{strings.openConnectionSettingsFile}</SettingButton>
+            {#if isTauriAndroid || isTauriIOS}<SettingButton variant="secondary" disabled={busy} onclick={scanConnectionSettings}>{strings.scanConnectionSettings}</SettingButton>{/if}
+        </div>
+        <label class="field"><span>{strings.connectionSettingsPayload}</span><textarea class="textarea" placeholder={strings.connectionSettingsPayloadPlaceholder} bind:value={connectionSettingsPayload}></textarea></label>
+        <label class="field"><span>{strings.recoveryCode}</span><TextInput fullwidth hideText bind:value={recoveryKey} /></label>
+        <div class="actions">
+            <SettingButton disabled={busy || !connectionSettingsPayload.trim() || !recoveryKey.trim()} onclick={importConnectionSettings}>{strings.importConnectionSettings}</SettingButton>
+        </div>
+        <p class="sub-help">{strings.manualConnectionHelp}</p>
+    </section>
+    {/if}
 
     <section class="sub">
         <h4 class="sub-title">{strings.connectionInfo}</h4>
@@ -461,7 +488,7 @@
         </div>
     </section>
 
-    {#if purpose === 'backup'}
+    {#if mode === 'create' && purpose === 'backup'}
     <fieldset class="sub">
         <legend class="sub-title">{strings.scope}</legend>
         <p class="note"><span>{strings.scopeHelp}</span></p>
@@ -475,7 +502,6 @@
         <p class="note"><span>{strings.deviceSettingsHelp}</span></p>
     </fieldset>
     {/if}
-    {/if}
     </fieldset>
 
     {#if prepared}
@@ -485,13 +511,13 @@
                 <dt>{strings.authority}</dt><dd>{prepared.endpoint.authority}</dd>
                 {#if prepared.endpoint.accountHint}<dt>{strings.account}</dt><dd>{prepared.endpoint.accountHint}</dd>{/if}
                 <dt>{strings.repository}</dt><dd>{prepared.endpoint.repositoryHint}</dd>
-                {#if !fromRecovery}
+                {#if mode === 'create'}
                     <dt>{strings.purposeReview}</dt>
                     <dd>{purpose === 'backup' ? `${strings.backup} · ${strings.includes.replace('{0}', scopeSummary)}` : strings.sync}</dd>
                 {/if}
                 {#if prepared.requiresPlatformOAuthClient && prepared.oauthProjectHint}<dt>{strings.oauthProjectHint}</dt><dd>{prepared.oauthProjectHint}</dd>{/if}
             </dl>
-            {#if purpose === 'sync' && !fromRecovery}
+            {#if mode === 'create' && purpose === 'sync'}
                 <p class="note"><span>{strings.syncPurposeLocalDataNotice}</span></p>
             {/if}
             {#each prepared.endpoint.warnings as warning (warning)}<p class="note"><span>{externalEndpointWarning(strings, warning)}</span></p>{/each}
@@ -506,7 +532,7 @@
                     {#if pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
                 </div>
             {/if}
-            {#if endpointConfirmed && !prepared.requiresOAuth}
+            {#if endpointConfirmed && !prepared.requiresOAuth && !fromTransfer}
                 <div class="fields two">
                     {#each definition.secretFields as field (field.key)}
                         {@const help = externalFieldHelp(strings, providerId, field.key)}
@@ -533,24 +559,10 @@
             </div>
             {#if !prepared.requiresOAuth && mode === 'create'}<p class="sub-help">{strings.connectHint}</p>{/if}
         </section>
-    {:else if mode === 'existing'}
-        <section class="sub">
-            <h4 class="sub-title">{strings.recoveryRequiredTitle}</h4>
-            <p class="sub-help">{strings.recoveryRequired}</p>
-            <div class="actions">
-                <SettingButton variant="secondary" disabled={busy} onclick={loadRecoveryFile}>{strings.openRecoveryFile}</SettingButton>
-            </div>
-            <label class="field"><span>{strings.recoveryPayload}</span><textarea class="textarea" placeholder={strings.recoveryPayloadPlaceholder} bind:value={recoveryPayload}></textarea></label>
-            <label class="field"><span>{strings.recoveryCode}</span><TextInput fullwidth hideText bind:value={recoveryCode} /></label>
-            <div class="actions">
-                <SettingButton disabled={busy || !recoveryPayload.trim() || !recoveryCode.trim()} onclick={authenticateRecovery}>{strings.unlock}</SettingButton>
-                <SettingButton variant="secondary" onclick={oncancel}>{strings.cancel}</SettingButton>
-            </div>
-        </section>
     {:else}
         <section class="sub">
             <div class="actions">
-                <SettingButton disabled={busy || !authorizationAvailable || requiredAcks.some(item => !accepted.includes(item))} onclick={prepare}>{strings.prepare}</SettingButton>
+                <SettingButton disabled={busy || !authorizationAvailable || (mode === 'existing' && !recoveryKey.trim()) || requiredAcks.some(item => !accepted.includes(item))} onclick={prepare}>{strings.prepare}</SettingButton>
                 <SettingButton variant="secondary" onclick={oncancel}>{strings.cancel}</SettingButton>
             </div>
             <p class="sub-help">{strings.pendingVerification}</p>

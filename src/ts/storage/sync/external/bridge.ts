@@ -12,7 +12,7 @@ import type {
     ExternalProviderDescriptor,
     ExternalProviderSecretInput,
     ExternalQuotaSummary,
-    ExternalRecoveryMaterial,
+    ExternalConnectionSettingsMaterial,
     ExternalRetentionPolicy,
     ExternalStorageState,
     ExternalSnapshotExportResult,
@@ -93,7 +93,7 @@ export class ExternalStorageBridge {
 
     commitConnection(
         preparationId: string,
-        secret: ExternalProviderSecretInput,
+        secret?: ExternalProviderSecretInput,
     ): Promise<ExternalConnectionResult> {
         return this.native('external_storage_commit_connection', {
             request: { preparationId, secret },
@@ -238,12 +238,12 @@ export class ExternalStorageBridge {
         return this.native('external_storage_get_quota', { connectionId })
     }
 
-    beginRecoveryExport(connectionId: string): Promise<ExternalRecoveryMaterial> {
-        return this.native('external_storage_begin_recovery_export', { connectionId })
+    beginConnectionSettingsExport(connectionId: string): Promise<ExternalConnectionSettingsMaterial> {
+        return this.native('external_storage_begin_connection_settings_export', { connectionId })
     }
 
-    saveRecoveryFile(recoveryId: string): Promise<void> {
-        return this.native('external_storage_save_recovery_file', { recoveryId })
+    saveConnectionSettingsFile(transferId: string): Promise<void> {
+        return this.native('external_storage_save_connection_settings_file', { transferId })
     }
 
     exportSnapshot(connectionId: string, snapshotId: string): Promise<ExternalSnapshotExportResult> {
@@ -252,9 +252,9 @@ export class ExternalStorageBridge {
         })
     }
 
-    prepareRecoveryImport(payload: string, code: string): Promise<PreparedExternalConnection> {
-        return this.native('external_storage_prepare_recovery_import', {
-            request: { payload, code },
+    prepareConnectionSettingsImport(payload: string, recoveryKey: string): Promise<PreparedExternalConnection> {
+        return this.native('external_storage_prepare_connection_settings_import', {
+            request: { payload, recoveryKey },
         })
     }
 }

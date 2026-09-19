@@ -274,10 +274,10 @@ impl OneDrive {
                 }
                 continue;
             }
-            if items.len() > 1 {
+            if items.len() > 2 {
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed));
             }
-            if let Some(item) = items.into_iter().next() {
+            for item in items {
                 let name = item.name.ok_or_else(corrupt)?;
                 let path = format!("{descriptors}/{name}");
                 if item.file.is_none()

@@ -637,10 +637,10 @@ impl Mybox {
                 }
                 continue;
             }
-            if resources.len() > 1 {
+            if resources.len() > 2 {
                 return Err(ProviderError::new(ErrorKind::PreconditionFailed));
             }
-            if let Some(resource) = resources.into_iter().next() {
+            for resource in resources {
                 if resource.kind != "file"
                     || resource.size == 0
                     || !config::valid_name(&resource.name)

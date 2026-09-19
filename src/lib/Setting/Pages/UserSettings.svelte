@@ -2,23 +2,18 @@
     import { language } from "src/lang";
     import { hubURL } from "src/ts/characterCards";
     import { getDeviceMarkers } from "src/ts/storage/deviceMarkers";
-    import {
-        loadRisuAccountBackup,
-        loadRisuAccountData,
-        saveRisuAccountData,
-    } from "src/ts/drive/accounter";
+    import { loadRisuAccountBackup } from "src/ts/drive/accounter";
 
     import { DBState } from "src/ts/stores.svelte";
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
-    import { isTauri, isNodeServer } from "src/ts/platform";
+    import { isTauri } from "src/ts/platform";
     import { openDataHealthScreen } from "src/ts/storage/dataHealthNavigation";
     import {
         unMigrationAccount,
         accountUnmigrationBusy,
     } from "src/ts/storage/accountStorage";
-    import { checkDriver } from "src/ts/drive/drive";
     import {
         SavePartialLocalBackup,
         SaveLocalBackup,
@@ -29,7 +24,6 @@
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
     import { getNativeOfficialAccountFlow } from "src/ts/storage/sync/nativeOfficialAccountFlow";
     import {
-        createHubPopupController,
         isExpectedHubMessage,
         resolveExpectedOfficialAccountMessageUrl,
     } from "src/ts/storage/officialAccountMessage";
@@ -37,7 +31,6 @@
         exportPortableBackupFromSystemPicker,
         restoreBackupFromSystemPicker,
     } from "src/ts/storage/portableBackupFileRouteProduction.svelte";
-    import { onDestroy } from "svelte";
     import {
         nativeFileOperation,
         exportRisuSaveFromSystemPicker,
@@ -57,10 +50,8 @@
     import { exportCompatibilityBackupFromSystemPicker } from "src/ts/storage/compatibleBackupFileRouteProduction.svelte";
     import { formatCompatibilityBackupReport } from "src/ts/storage/compatibleBackupReport";
     import type { NativeCompatibilityTarget } from "src/ts/storage/nativeFileJobs";
-    import { externalStorageStrings } from "../ExternalStorage/strings";
     let openIframe = $state(false);
     let openIframeURL = $state("");
-    const drivePopup = createHubPopupController();
     let accountIframe = $state<HTMLIFrameElement>();
     let nativeAccountBusy = $state(false);
     let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null);
@@ -205,9 +196,6 @@
         }
     }
 
-    onDestroy(() => {
-        drivePopup.close();
-    });
 </script>
 
 {#if risuSaveOperation !== null}
@@ -222,20 +210,9 @@
             hubURL,
             openIframeURL,
         );
-        const expectedSource =
-            message?.type === "drive"
-                ? drivePopup.source
-                : accountIframe?.contentWindow;
+        const expectedSource = accountIframe?.contentWindow;
         if (!isExpectedHubMessage(e, expectedUrl, expectedSource)) return;
-        if (message?.type === "drive") {
-            if (!isTauri) await loadRisuAccountData();
-            DBState.db.account.data.refresh_token = message.data.refresh_token;
-            DBState.db.account.data.access_token = message.data.access_token;
-            DBState.db.account.data.expires_in =
-                message.data.expires_in * 700 + Date.now();
-            if (!isTauri) await saveRisuAccountData();
-            drivePopup.close();
-        } else if (message?.data.vaild) {
+        if (message?.data.vaild) {
             const credential = {
                 id: message.id,
                 token: message.token,
@@ -346,40 +323,6 @@
     </Button>
 {/if}
 
-<Button
-    onclick={async () => {
-        if (await alertConfirm(language.backupConfirm)) {
-
-            if (isTauri || isNodeServer) {
-                checkDriver("savetauri");
-            } else {
-                checkDriver("save");
-            }
-        }
-    }}
-    className="mt-2"
->
-    {language.savebackup}
-</Button>
-
-<Button
-    onclick={async () => {
-        if (
-            (await alertConfirm(language.backupLoadConfirm)) &&
-            (await alertConfirm(language.backupLoadConfirm2))
-        ) {
-            if (isTauri || isNodeServer) {
-                checkDriver("loadtauri");
-            } else {
-                checkDriver("load");
-            }
-        }
-    }}
-    className="mt-2"
->
-    {language.loadbackup}
-</Button>
-
 <Button onclick={exportAsDataset} className="mt-2">
     {language.exportAsDataset}
 </Button>
@@ -440,31 +383,6 @@
     {#if DBState.db.account}
         <span class="mb-4 text-textcolor2">ID: {DBState.db.account.id}</span>
         {#if !isTauri}
-            <h1 class="text-xl font-bold mt-2">
-                {language.googleDriveConnection}
-            </h1>
-            <p class="mb-2 text-sm text-textcolor2">
-                {externalStorageStrings(DBState.db.language).oldDriveNote}
-            </p>
-            {#if !DBState.db.account.data.refresh_token}
-                <span class="text-sm font-light mb-2 text-textcolor2"
-                    >{language.googleDriveInfo}</span
-                >
-                <button
-                    class="bg-selected p-2 rounded-md hover:bg-blue-500 transition-colors"
-                    onclick={async () => {
-                        const authorizationUrl = await checkDriver("reftoken");
-                        if (typeof authorizationUrl === "string")
-                            drivePopup.open(authorizationUrl);
-                    }}
-                >
-                    Connect to Google Drive
-                </button>
-            {:else}
-                <span class="text-sm font-light mb-2 text-textcolor2"
-                    >{language.googleDriveConnected}</span
-                >
-            {/if}
             <fieldset
                 disabled={$accountUnmigrationBusy}
                 class="flex items-center mt-2"

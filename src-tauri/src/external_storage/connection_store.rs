@@ -16,6 +16,7 @@ pub(crate) struct StoredConnection {
     pub provider_repository_id: String,
     pub credential_ref: String,
     pub root_key_ref: String,
+    pub recovery_key_ref: String,
     pub capabilities: Capabilities,
     pub created_at_ms: u64,
     pub last_sync_at_ms: Option<u64>,
@@ -44,6 +45,7 @@ pub(crate) struct PendingStoredConnection {
     pub provider_repository_id: Option<String>,
     pub credential_ref: String,
     pub root_key_ref: String,
+    pub recovery_key_ref: String,
     pub created_at_ms: u64,
 }
 #[derive(Clone, Copy)]
@@ -197,6 +199,7 @@ impl ConnectionStore {
                 || pinned.repository_id != connection.repository_id
                 || pinned.create != connection.create
                 || pinned.root_key_ref != connection.root_key_ref
+                || pinned.recovery_key_ref != connection.recovery_key_ref
                 || pinned.capture_policy != connection.capture_policy
                 || pinned.created_at_ms != connection.created_at_ms;
             let descriptor_changed = match (&pinned.descriptor, &connection.descriptor) {
@@ -286,6 +289,7 @@ impl ConnectionStore {
             capture_policy: pending.capture_policy,
             retention_policy: None,
             root_key_ref: pending.root_key_ref,
+            recovery_key_ref: pending.recovery_key_ref,
             capabilities,
             created_at_ms: pending.created_at_ms,
             last_sync_at_ms: None,
@@ -451,6 +455,7 @@ fn decode(encoded: &str) -> Result<StoredConnection> {
         &value.provider_repository_id,
         &value.credential_ref,
         &value.root_key_ref,
+        &value.recovery_key_ref,
     ]
     .iter()
     .any(|s| s.is_empty())
@@ -468,7 +473,13 @@ fn validate_pending(value: &PendingStoredConnection) -> Result<()> {
     } else if !value.create {
         return Err(corrupt());
     }
-    if [&value.id, &value.repository_id, &value.credential_ref, &value.root_key_ref]
+    if [
+        &value.id,
+        &value.repository_id,
+        &value.credential_ref,
+        &value.root_key_ref,
+        &value.recovery_key_ref,
+    ]
         .iter()
         .any(|value| value.is_empty())
         || value.provider_repository_id.as_ref().is_some_and(String::is_empty)
@@ -508,6 +519,7 @@ mod tests {
             provider_repository_id: Some("synthetic-provider-repository".into()),
             credential_ref: "provider-v1:00000000-0000-4000-8000-000000000001".into(),
             root_key_ref: "repository-key-v1:00000000-0000-4000-8000-000000000002".into(),
+            recovery_key_ref: "repository-key-v1:00000000-0000-4000-8000-000000000003".into(),
             capture_policy: None,
             created_at_ms: 1,
         }

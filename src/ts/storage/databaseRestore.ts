@@ -114,22 +114,6 @@ export async function installLocalBackup(
     }, dependencies)
 }
 
-export async function installDriveRestore(
-    database: Database,
-    dependencies: RestoreFollowupDependencies & {
-        replaceDatabase: PersistentDataRuntime['replacePersistentDatabase']
-        publishAcceptedRevision: () => Promise<void>
-        relaunch: () => void | Promise<void>
-    },
-): Promise<CommittedApplyOutcome> {
-    const outcome = await dependencies.replaceDatabase(database, 'drive-restore', { publishOfficial: true })
-    if (outcome.projection === 'refresh-required') return outcome
-    return finishCommittedRestore(outcome, async () => {
-        await dependencies.publishAcceptedRevision()
-        await dependencies.relaunch()
-    }, dependencies)
-}
-
 export async function completeAccountUnmigration(
     database: Database,
     dependencies: RestoreFollowupDependencies & {

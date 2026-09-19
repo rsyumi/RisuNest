@@ -937,6 +937,7 @@ fn resume_create_rejects_foreign_folder_contents_duplicate_descriptors_and_unsaf
                     &[
                         resource("descriptor-a.bin", "descriptor-a", "file", 64),
                         resource("descriptor-b.bin", "descriptor-b", "file", 64),
+                        resource("descriptor-c.bin", "descriptor-c", "file", 64),
                     ],
                     None,
                 ),

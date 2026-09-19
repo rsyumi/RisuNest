@@ -317,10 +317,10 @@ impl GithubReleases {
             return Ok(());
         };
         let assets = self.assets_page(context, release, 1, cancel).await?;
-        if assets.len() > 1 {
+        if assets.len() > 2 {
             return Err(ProviderError::new(ErrorKind::PreconditionFailed));
         }
-        if let Some(asset) = assets.first() {
+        for asset in &assets {
             let prefix = format!("{}-", api::role_prefix(ObjectRole::Descriptor));
             let valid_name = asset
                 .name

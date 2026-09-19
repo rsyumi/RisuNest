@@ -26,7 +26,7 @@ use crate::{
     },
 };
 use risunest_external_storage_format::{
-    crypto::RecoveryCode,
+    crypto::RecoveryKey,
     format::{library_fingerprint_domain, Descriptor},
 };
 use serde_json::json;
@@ -34,7 +34,7 @@ use std::{collections::BTreeMap, io::Read};
 use zeroize::Zeroizing;
 
 #[test]
-fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault() {
+fn repository_bootstrap_opens_and_applies_a_real_snapshot_without_the_source_vault() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -44,7 +44,6 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             let destination = tempfile::tempdir().unwrap();
             let provider = FakeProvider::new(false);
             let repository = fake::repository();
-            let scope = library_fingerprint_domain();
             let descriptor =
                 Descriptor::new("synthetic-recovery-repository".into(), None)
                     .unwrap();
@@ -161,6 +160,7 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                 provider_repository_id: repository.repository_id.clone(),
                 credential_ref: "unavailable-source-credential".into(),
                 root_key_ref: "unavailable-source-root-key".into(),
+                recovery_key_ref: "unavailable-source-recovery-key".into(),
                 capture_policy: None,
                 retention_policy: None,
                 capabilities: Capabilities::default(),
@@ -168,7 +168,21 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
                 last_sync_at_ms: None,
                 last_backup_at_ms: None,
             };
-            let exported = recovery::export(&stored, &root_key).unwrap();
+            let recovery_key = recovery::generate_key().unwrap();
+            recovery::publish_bootstrap(
+                destination.path(),
+                &provider,
+                &repository,
+                &recovery::BootstrapMetadata {
+                    descriptor: descriptor.clone(),
+                    descriptor_locator: stored.descriptor_locator.clone(),
+                },
+                &root_key,
+                &recovery_key,
+                &cancel,
+            )
+            .await
+            .unwrap();
             let unavailable_source_vault = MemoryVault::default();
             assert!(unavailable_source_vault
                 .read(&SecretRef(stored.root_key_ref.clone()))
@@ -179,23 +193,35 @@ fn recovery_package_opens_and_applies_a_real_snapshot_without_the_source_vault()
             let mut destination_store = PersistentStore::open(destination.path()).unwrap();
             let revision_before_import = destination_store.revision().unwrap();
             let wrong_code = loop {
-                let candidate = RecoveryCode::generate().unwrap().expose();
-                if candidate.as_str() != exported.code.as_str() {
+                let candidate = RecoveryKey::generate().unwrap().expose();
+                if candidate.as_str() != recovery_key.as_str() {
                     break candidate;
                 }
             };
-            assert!(recovery::import(&exported.bytes, &wrong_code).is_err());
+            assert!(recovery::open_bootstrap(
+                destination.path(),
+                &provider,
+                &repository,
+                &wrong_code,
+                &cancel,
+            )
+            .await
+            .is_err());
             assert_eq!(
                 destination_store.revision().unwrap(),
                 revision_before_import
             );
 
-            let imported = recovery::import(&exported.bytes, &exported.code).unwrap();
+            let imported = recovery::open_bootstrap(
+                destination.path(),
+                &provider,
+                &repository,
+                &recovery_key,
+                &cancel,
+            )
+            .await
+            .unwrap();
             assert_eq!(imported.metadata.descriptor, descriptor);
-            assert_eq!(
-                imported.metadata.provider_repository_id,
-                repository.repository_id
-            );
             let destination_vault = MemoryVault::default();
             let destination_key_ref = destination_vault
                 .store(&SecretBytes(Zeroizing::new(imported.key.to_vec())))

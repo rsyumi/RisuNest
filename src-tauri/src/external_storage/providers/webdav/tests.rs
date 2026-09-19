@@ -949,6 +949,11 @@ fn resume_create_rejects_foreign_role_contents_duplicate_descriptors_and_incompl
                         64,
                         None,
                     ),
+                    object_response(
+                        &format!("{}/{DESCRIPTOR_FOLDER}/descriptor-c", encoded_root()),
+                        64,
+                        None,
+                    ),
                 ],
             ),
         ]);

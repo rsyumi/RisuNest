@@ -314,6 +314,7 @@ fn backup_only_cleanup_reads_points_without_requesting_an_unsupported_head() {
                 descriptor: risunest_external_storage_format::format::Descriptor::new("repository".into(), None).unwrap(),
                 descriptor_locator: locator, provider_repository_id: handle.repository_id.clone(),
                 credential_ref: SECRET.into(), root_key_ref: "synthetic-root-key".into(),
+                recovery_key_ref: "synthetic-recovery-key".into(),
                 capabilities: super::capabilities(), created_at_ms: NOW_MS,
                 last_sync_at_ms: None, last_backup_at_ms: None, capture_policy: None, retention_policy: None,
             },
@@ -662,7 +663,7 @@ fn resume_create_rejects_head_duplicate_malformed_and_foreign_owned_layouts() {
                 ],
             ),
             (
-                "duplicate descriptor assets",
+                "too many descriptor assets",
                 vec![
                     repository_reply(true),
                     reply(200, json!([release(7, &descriptor_tag)])),
@@ -670,7 +671,8 @@ fn resume_create_rejects_head_duplicate_malformed_and_foreign_owned_layouts() {
                         200,
                         json!([
                             asset(1, "descriptor-one", 4, None),
-                            asset(2, "descriptor-two", 4, None)
+                            asset(2, "descriptor-two", 4, None),
+                            asset(3, "descriptor-three", 4, None)
                         ]),
                     ),
                 ],

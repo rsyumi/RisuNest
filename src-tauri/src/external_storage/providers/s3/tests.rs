@@ -524,7 +524,7 @@ fn create_refuses_an_occupied_root_and_existing_requires_a_descriptor() {
         assert_eq!(
             line(&records[0]),
             "GET /synthetic/synthetic-bucket\
-             ?list-type=2&max-keys=2&prefix=risunest%2F HTTP/1.1"
+             ?list-type=2&max-keys=3&prefix=risunest%2F HTTP/1.1"
         );
         assert_eq!(
             header(&records[0], "x-amz-content-sha256").unwrap(),
@@ -621,7 +621,7 @@ fn root_listing(objects: &[(&str, u64)], next: Option<&str>) -> Vec<u8> {
 }
 
 #[test]
-fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
+fn resume_create_accepts_only_an_empty_or_bootstrap_descriptor_control_layout() {
     runtime().block_on(async {
         let empty = || reply(200, &[], root_listing(&[], None));
 
@@ -651,7 +651,7 @@ fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
         .unwrap();
         let records = server.requests.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert!(line(&records[0]).contains("max-keys=2"));
+        assert!(line(&records[0]).contains("max-keys=3"));
         drop(records);
 
         for key in ["head", "packs/pack-1", "foreign/object"] {
@@ -682,6 +682,7 @@ fn resume_create_accepts_only_an_empty_or_single_descriptor_control_layout() {
                 &[
                     ("descriptors/descriptor-1", 64),
                     ("descriptors/descriptor-2", 64),
+                    ("descriptors/descriptor-3", 64),
                 ],
                 None,
             ),
