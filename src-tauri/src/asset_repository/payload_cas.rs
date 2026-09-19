@@ -1,6 +1,7 @@
 use crate::trust_boundary::{is_link_like, is_lower_hex_256, sync_directory};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -12,6 +13,23 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+std::thread_local! {
+    static ROOT_PATH_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn reset_root_path_validations() {
+    ROOT_PATH_VALIDATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn root_path_validations() -> usize {
+    ROOT_PATH_VALIDATIONS.with(std::cell::Cell::get)
+}
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +44,12 @@ pub struct PreparedPayload {
 #[derive(Debug)]
 pub struct PayloadCas {
     repository_root: PathBuf,
+}
+
+/// Read-only batching for GC preview. Every batch revalidates its fixed ancestry and touched
+/// shards before and after checking each object, while deletion continues to use `PayloadCas`.
+pub(crate) struct PayloadCasReadScan {
+    cas: PayloadCas,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +101,10 @@ impl PayloadCas {
         let cas = Self { repository_root };
         cas.ensure_repository_root()?;
         Ok(cas)
+    }
+
+    pub(crate) fn into_read_scan(self) -> PayloadCasReadScan {
+        PayloadCasReadScan { cas: self }
     }
 
     pub fn prepare_bytes(&self, data: &[u8]) -> Result<PreparedPayload, io::Error> {
@@ -437,6 +465,8 @@ impl PayloadCas {
     }
 
     fn ensure_repository_root(&self) -> io::Result<()> {
+        #[cfg(test)]
+        ROOT_PATH_VALIDATIONS.with(|count| count.set(count.get() + 1));
         reject_link_components(&self.repository_root)?;
         let metadata = fs::symlink_metadata(&self.repository_root)?;
         ensure_real_directory(&self.repository_root, &metadata)?;
@@ -582,6 +612,86 @@ impl PayloadCas {
     }
 }
 
+impl PayloadCasReadScan {
+    #[allow(dead_code)]
+    pub(crate) fn read_object(&self, content_hash: &str) -> io::Result<Option<Vec<u8>>> {
+        self.cas.read_object(content_hash)
+    }
+
+    pub(crate) fn stat_objects<'a>(
+        &self,
+        content_hashes: impl IntoIterator<Item = &'a str>,
+    ) -> io::Result<Vec<Option<u64>>> {
+        let content_hashes = content_hashes.into_iter().collect::<Vec<_>>();
+        for content_hash in &content_hashes {
+            validate_content_hash(content_hash)?;
+        }
+
+        let objects_directory = self.checked_objects_directory()?;
+        let Some(objects_directory) = objects_directory else {
+            if self.checked_objects_directory()?.is_some() {
+                return exact_scan_hierarchy_changed();
+            }
+            return Ok(vec![None; content_hashes.len()]);
+        };
+        let shards = content_hashes
+            .iter()
+            .map(|hash| &hash[..2])
+            .collect::<BTreeSet<_>>();
+        let mut shard_presence = BTreeMap::new();
+        for shard in shards {
+            let shard_directory = objects_directory.join(shard);
+            shard_presence.insert(
+                shard,
+                self.cas.existing_owned_directory(&shard_directory)?,
+            );
+        }
+
+        let mut sizes = Vec::with_capacity(content_hashes.len());
+        for content_hash in &content_hashes {
+            if !shard_presence[&content_hash[..2]] {
+                sizes.push(None);
+                continue;
+            }
+            let object_path = objects_directory
+                .join(&content_hash[..2])
+                .join(&content_hash[2..]);
+            match fs::symlink_metadata(&object_path) {
+                Ok(metadata) => {
+                    self.cas.validate_owned_file(&object_path, &metadata)?;
+                    sizes.push(Some(fs::symlink_metadata(&object_path)?.len()));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => sizes.push(None),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if self.checked_objects_directory()?.as_ref() != Some(&objects_directory) {
+            return exact_scan_hierarchy_changed();
+        }
+        for (shard, present) in shard_presence {
+            let shard_directory = objects_directory.join(shard);
+            if self.cas.existing_owned_directory(&shard_directory)? != present {
+                return exact_scan_hierarchy_changed();
+            }
+        }
+        Ok(sizes)
+    }
+
+    fn checked_objects_directory(&self) -> io::Result<Option<PathBuf>> {
+        self.cas.ensure_repository_root()?;
+        let assets_directory = self.cas.repository_root.join("assets-v2");
+        if !self.cas.existing_owned_directory(&assets_directory)? {
+            return Ok(None);
+        }
+        let objects_directory = assets_directory.join("objects");
+        if !self.cas.existing_owned_directory(&objects_directory)? {
+            return Ok(None);
+        }
+        Ok(Some(objects_directory))
+    }
+}
+
 fn create_staging_file(path: &Path, parent: &Path) -> io::Result<(File, StagingFile)> {
     let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     let staging = StagingFile {
@@ -632,6 +742,13 @@ fn invalid_owned_path<T>(path: &Path, reason: &str) -> io::Result<T> {
     Err(io::Error::new(
         ErrorKind::InvalidData,
         format!("{reason}: {}", path.display()),
+    ))
+}
+
+fn exact_scan_hierarchy_changed<T>() -> io::Result<T> {
+    Err(io::Error::new(
+        ErrorKind::InvalidData,
+        "content-addressed object hierarchy changed during scan",
     ))
 }
 
@@ -791,6 +908,62 @@ mod tests {
     use super::{create_staging_file, ExactObjectUnlink, PayloadCas};
     use sha2::Digest;
     use std::io::Cursor;
+
+    #[test]
+    fn read_scan_rejects_a_linked_object() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::NamedTempFile::new().expect("outside object");
+        std::fs::write(outside.path(), b"outside bytes").unwrap();
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let prepared = cas.prepare_bytes(b"scan candidate").unwrap();
+        let object_path = directory.path().join(&prepared.physical_key);
+        std::fs::remove_file(&object_path).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &object_path).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_file(outside.path(), &object_path) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create reparse fixture: {error}");
+        }
+
+        let scan = cas.into_read_scan();
+        let error = scan
+            .stat_objects([prepared.content_hash.as_str()])
+            .expect_err("linked scan object must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside bytes");
+    }
+
+    #[test]
+    fn read_scan_rejects_a_repository_root_replaced_after_creation() {
+        let parent = tempfile::tempdir().expect("temporary parent");
+        let external = tempfile::tempdir().expect("external repository");
+        let repository_root = parent.path().join("repository");
+        let original_root = parent.path().join("original-repository");
+        std::fs::create_dir(&repository_root).expect("create repository root");
+        let scan = PayloadCas::new(&repository_root)
+            .expect("open repository")
+            .into_read_scan();
+        std::fs::rename(&repository_root, &original_root).expect("move repository root");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(external.path(), &repository_root).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(external.path(), &repository_root) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create reparse fixture: {error}");
+        }
+
+        let error = scan
+            .stat_objects(["00a89e1d795e102f7b58e92f5448fba1f6f74d79b5b7da0aaac5c45c7e695916"])
+            .expect_err("replaced scan root must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn duplicate_publication_verifies_existing_bytes_and_cleans_staging() {

@@ -971,7 +971,7 @@ std::thread_local! {
 }
 
 pub(crate) struct AssetGcPreview {
-    cas: crate::asset_repository::PayloadCas,
+    scan: crate::asset_repository::PayloadCasReadScan,
     residency: crate::server_sync::residency::Residency,
     marks: crate::asset_repository::migration_gc::AssetGcMarks,
     /// What holds an object besides the library, so a retained candidate can say why.
@@ -2413,6 +2413,7 @@ impl PersistentStore {
 
     pub(crate) fn prepare_asset_gc_preview(&self) -> StoreResult<AssetGcPreview> {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let scan = cas.into_read_scan();
         let labelled = self.collect_labelled_asset_gc_roots(false, true)?;
         // Only the holders that are small and explainable are kept for attribution; the library
         // itself is the default answer and copying its root set would cost as much as it holds.
@@ -2423,13 +2424,13 @@ impl PersistentStore {
             .collect();
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
-        let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote(
-            &cas,
+        let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote_scan(
+            &scan,
             labelled.into_iter().map(|(_, roots)| roots),
             |hash| residency.gc_size(hash),
         )?;
         Ok(AssetGcPreview {
-            cas,
+            scan,
             residency,
             marks,
             holders,
@@ -2461,8 +2462,8 @@ impl PersistentStore {
                 )
             })
             .collect();
-        let report = crate::asset_repository::migration_gc::sweep_asset_candidates_with_remote(
-            &preview.cas,
+        let report = crate::asset_repository::migration_gc::sweep_asset_candidates_with_remote_scan(
+            &preview.scan,
             candidates.items,
             &preview.marks,
             now_ms,
@@ -2524,12 +2525,12 @@ impl PersistentStore {
         minimum_grace_ms: i64,
     ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunPage> {
         use crate::asset_repository::migration_gc::{
-            sweep_asset_candidates_with_remote, AssetGcDryRunPage,
+            sweep_asset_candidates_with_remote_scan, AssetGcDryRunPage,
         };
 
         let candidates = self.query_asset_object_catalog(limit, cursor)?;
-        let report = sweep_asset_candidates_with_remote(
-            &preview.cas,
+        let report = sweep_asset_candidates_with_remote_scan(
+            &preview.scan,
             candidates.items,
             &preview.marks,
             now_ms,

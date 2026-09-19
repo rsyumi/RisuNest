@@ -8,7 +8,10 @@ pub(crate) mod owner_manifest_codec;
 mod payload_cas;
 
 pub(crate) use payload_cas::exact_file_identity;
+#[cfg(test)]
+pub(crate) use payload_cas::{reset_root_path_validations, root_path_validations};
 pub use payload_cas::PayloadCas;
+pub(crate) use payload_cas::PayloadCasReadScan;
 #[allow(unused_imports)]
 pub use payload_cas::PreparedPayload;
 pub(crate) use payload_cas::{object_physical_key, ExactObjectUnlink};
