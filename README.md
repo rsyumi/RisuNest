@@ -52,16 +52,3 @@ RisuNest has not published a release yet. Build it from source:
 pnpm install
 pnpm tauri dev
 ```
-
-### Docker Installation
-
-You can also run RisuNest using Docker. This method is particularly useful for web hosting.
-
-1. Clone the repository and build the container:
-   ```
-   git clone https://github.com/rsyumi/RisuNest.git
-   cd RisuNest
-   docker compose up -d
-   ```
-
-2. Access RisuNest at `http://localhost:6001` in your web browser.
