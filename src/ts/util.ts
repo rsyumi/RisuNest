@@ -50,6 +50,7 @@ export async function selectSingleFile(ext:string[]){
     if(domSelect){
         const v = await selectFileByDom(ext, 'single')
         const file = v[0]
+        if (!file) return null
         return {name: file.name,data:await readFileAsUint8Array(file)}
     }
 
@@ -166,39 +167,42 @@ export function getUserIconProtrait(){
 }
 
 export function selectFileByDom(allowedExtensions:string[], multiple:'multiple'|'single' = 'single') {
-    return new Promise<null|File[]>((resolve) => {
+    return new Promise<File[]>((resolve, reject) => {
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
         fileInput.multiple = multiple === 'multiple';
         const acceptAll = (getDatabase().allowAllExtentionFiles || isIOS() || allowedExtensions[0] === '*')
-        if(!acceptAll){
-            if (allowedExtensions && allowedExtensions.length) {
-                fileInput.accept = allowedExtensions.map(ext => `.${ext}`).join(',');
-            }
-        }
-        else{
-            fileInput.accept = '*'
-        }
-
-    
-        fileInput.addEventListener('change', (event) => {
-            if (fileInput.files.length === 0) {
-                resolve([]);
-                return;
-            }
-    
-            const files = acceptAll ? Array.from(fileInput.files) :(Array.from(fileInput.files).filter(file => {
-                const fileExtension = file.name.split('.').pop().toLowerCase();
-                return !allowedExtensions || allowedExtensions.includes(fileExtension);
-            })) 
-    
-            fileInput.remove()
+        fileInput.accept = acceptAll ? '*' : allowedExtensions.map(ext => `.${ext}`).join(',');
+        let settled = false;
+        const cleanup = () => {
+            fileInput.removeEventListener('change', change);
+            fileInput.removeEventListener('cancel', cancel);
+            fileInput.remove();
+        };
+        const finish = (files: File[]) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
             resolve(files);
-        });
-    
+        };
+        const change = () => {
+            const files = Array.from(fileInput.files ?? []);
+            finish(acceptAll ? files : files.filter(file =>
+                allowedExtensions.includes(file.name.split('.').pop().toLowerCase()),
+            ));
+        };
+        const cancel = () => finish([]);
+        fileInput.addEventListener('change', change);
+        fileInput.addEventListener('cancel', cancel);
         document.body.appendChild(fileInput);
-        fileInput.click();
-        fileInput.style.display = 'none'; // Hide the file input element
+        try {
+            fileInput.click();
+            fileInput.style.display = 'none';
+        } catch (error) {
+            settled = true;
+            cleanup();
+            reject(error);
+        }
     });
 }
 
