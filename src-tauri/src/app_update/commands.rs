@@ -363,24 +363,33 @@ pub(crate) async fn app_update_stage_deb(
             .and_then(|url| url.path_segments()?.next_back().map(str::to_owned))
             .filter(|name| !name.is_empty() && !name.contains('/') && !name.contains('\\'))
             .ok_or("signed DEB filename is invalid")?;
-        let destination = directory.join(file_name);
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(&directory).map_err(|error| error.to_string())?;
-        std::io::Write::write_all(&mut temporary, &bytes).map_err(|error| error.to_string())?;
-        temporary
-            .as_file()
-            .sync_all()
-            .map_err(|error| error.to_string())?;
-        temporary
-            .persist_noclobber(&destination)
-            .map_err(|error| error.error.to_string())?;
-        let path = destination.to_string_lossy().into_owned();
-        let quoted = format!("'{}'", path.replace('\'', "'\\''"));
-        Ok(StagedDeb {
-            path,
-            install_command: format!("sudo apt install {quoted}"),
-        })
+        stage_verified_deb(&directory, &file_name, &bytes)
     }
+}
+
+#[cfg(desktop)]
+fn stage_verified_deb(directory: &std::path::Path, file_name: &str, bytes: &[u8]) -> Result<StagedDeb, String> {
+    let stem = file_name.strip_suffix(".deb")
+        .filter(|name| !name.is_empty() && !name.contains('/') && !name.contains('\\'))
+        .ok_or("signed DEB filename is invalid")?;
+    if !directory.is_absolute() {
+        return Err("Downloads directory must be absolute".to_owned());
+    }
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!("{stem}-"))
+        .suffix(".deb")
+        .tempfile_in(directory)
+        .map_err(|error| error.to_string())?;
+    std::io::Write::write_all(&mut temporary, bytes).map_err(|error| error.to_string())?;
+    temporary.as_file().sync_all().map_err(|error| error.to_string())?;
+    let (_file, destination) = temporary.keep().map_err(|error| error.error.to_string())?;
+    let path = destination.to_string_lossy().into_owned();
+    let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+    Ok(StagedDeb {
+        path,
+        install_command: format!("sudo apt install {quoted}"),
+    })
 }
 
 #[cfg(desktop)]
@@ -491,6 +500,39 @@ impl Drop for HandleOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(desktop)]
+    #[test]
+    fn deb_staging_creates_downloads_and_keeps_unique_verified_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("User's Downloads");
+        let first = stage_verified_deb(&directory, "RisuNest_2.0.0.deb", b"first verified package").unwrap();
+        let unrelated = directory.join("RisuNest_2.0.0.deb");
+        std::fs::write(&unrelated, b"user file").unwrap();
+        let second = stage_verified_deb(&directory, "RisuNest_2.0.0.deb", b"second verified package").unwrap();
+        assert_ne!(first.path, second.path);
+        assert!(first.path.ends_with(".deb"));
+        assert!(second.path.ends_with(".deb"));
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"first verified package");
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"second verified package");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"user file");
+        assert!(first.install_command.contains("User'\\''s Downloads"));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn deb_staging_rejects_invalid_paths_without_creating_files() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["", "../package.deb", "sub\\package.deb", "package.exe", ".deb"] {
+            assert!(stage_verified_deb(root.path(), name, b"verified").is_err());
+        }
+        assert!(stage_verified_deb(std::path::Path::new("relative"), "package.deb", b"verified").is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let file = root.path().join("not-a-directory");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(stage_verified_deb(&file, "package.deb", b"verified").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+    }
 
     #[test]
     fn native_operation_guard_rejects_concurrent_checks_or_installs() {

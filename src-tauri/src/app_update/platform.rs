@@ -20,6 +20,14 @@ pub(crate) struct PlatformSelection {
 }
 
 pub(crate) fn current_selection() -> PlatformSelection {
+    #[cfg(target_os = "macos")]
+    if std::env::current_exe()
+        .ok()
+        .and_then(|path| tauri_plugin_updater::extract_path_from_executable(&path).ok())
+        .is_none()
+    {
+        return disabled();
+    }
     selection(
         std::env::consts::OS,
         std::env::consts::ARCH,

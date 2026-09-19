@@ -20,9 +20,20 @@ use tauri::{
     Manager, Runtime,
 };
 
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+mod appimage;
 mod commands;
 mod config;
 mod error;
+#[cfg(any(target_os = "macos", test))]
+mod macos_bundle;
 mod updater;
 
 pub use config::Config;
