@@ -12,17 +12,24 @@ new absolute data directory, then initialize, register each device and start:
 
 ```powershell
 # Windows, PowerShell
-$data = Join-Path $env:LOCALAPPDATA 'RisuNestSync'
+$data = Join-Path $env:LOCALAPPDATA 'RisuNestSyncData'
 ./risunest-sync-server.exe init --data-dir $data
 ./risunest-sync-server.exe device add --data-dir $data
 ./risunest-sync-server.exe serve --data-dir $data
 ```
 
 ```sh
-# Linux or macOS
-./risunest-sync-server init --data-dir "$HOME/RisuNestSync"
-./risunest-sync-server device add --data-dir "$HOME/RisuNestSync"
-./risunest-sync-server serve --data-dir "$HOME/RisuNestSync"
+# Linux
+data="${XDG_DATA_HOME:-$HOME/.local/share}/risunest-sync"
+./risunest-sync-server init --data-dir "$data"
+./risunest-sync-server device add --data-dir "$data"
+./risunest-sync-server serve --data-dir "$data"
+
+# macOS
+data="$HOME/Library/Application Support/io.github.rsyumi.risunest.sync-manager"
+./risunest-sync-server init --data-dir "$data"
+./risunest-sync-server device add --data-dir "$data"
+./risunest-sync-server serve --data-dir "$data"
 ```
 
 In RisuNest's server synchronization settings, register the endpoint, library ID,

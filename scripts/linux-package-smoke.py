@@ -81,7 +81,7 @@ try:
     wait('return !!window.__TAURI_INTERNALS__')
     identifier = native('plugin:app|identifier')
     app_data = native('plugin:path|resolve_directory', {'directory':14})
-    if identifier != 'RisuNest' or Path(app_data).resolve() != (profile / 'data' / identifier).resolve():
+    if identifier != 'risunest' or Path(app_data).resolve() != (profile / 'data' / identifier).resolve():
         raise RuntimeError('Native identity/path gate failed; no DOM or data inspected')
     current = native('plugin:deep-link|get_current')
     if current != [uri]:

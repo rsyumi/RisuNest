@@ -16,10 +16,20 @@ export function mergeTauriConfig(base, ...overrides) {
 }
 
 export function assertAppIdentifier(config, os) {
-  const expected = ["windows", "linux", "macos"].includes(os) ? "RisuNest"
-    : ["android", "ios"].includes(os) ? "io.github.rsyumi.risunest" : null;
+  const expected = os === "windows" ? "RisuNest"
+    : os === "linux" ? "risunest"
+    : ["macos", "android", "ios"].includes(os) ? "io.github.rsyumi.risunest" : null;
   if (!expected || config.identifier !== expected)
     throw new Error(`Unexpected effective ${os} app identifier: ${config.identifier}`);
+  return expected;
+}
+
+export function assertSyncIdentifier(config, os) {
+  const expected = os === "windows" ? "RisuNestSync"
+    : os === "linux" ? "risunest-sync"
+    : os === "macos" ? "io.github.rsyumi.risunest.sync-manager" : null;
+  if (!expected || config.identifier !== expected)
+    throw new Error(`Unexpected effective ${os} Sync identifier: ${config.identifier}`);
   return expected;
 }
 

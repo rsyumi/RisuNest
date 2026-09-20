@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "identifier": "RisuNest",
+  "identifier": "io.github.rsyumi.risunest",
   "bundle": {
     "macOS": {
       "minimumSystemVersion": "14.0",

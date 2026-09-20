@@ -1,4 +1,7 @@
 !macro NSIS_HOOK_PREINSTALL
+  StrCmp $INSTDIR "$LOCALAPPDATA\RisuNest Sync" 0 sync_install_dir_ready
+  StrCpy $INSTDIR "$LOCALAPPDATA\RisuNestSync"
+  sync_install_dir_ready:
   StrCpy $R7 ""
   IfFileExists "$INSTDIR\risunest-sync-manager.exe" 0 sync_prepare_done
   nsExec::ExecToStack '"$INSTDIR\risunest-sync-manager.exe" installer prepare'
@@ -57,8 +60,8 @@
   SetErrorLevel 1
   Goto sync_install_done
   sync_cancel_guard:
-  CreateDirectory "$LOCALAPPDATA\RisuNestSync\manager-update"
-  FileOpen $0 "$LOCALAPPDATA\RisuNestSync\manager-update\installer-$R7.cancel" w
+  CreateDirectory "$LOCALAPPDATA\RisuNestSyncData\manager-update"
+  FileOpen $0 "$LOCALAPPDATA\RisuNestSyncData\manager-update\installer-$R7.cancel" w
   IfErrors sync_cancel_guard_failed
   FileWrite $0 '{"cancel":true}'
   FileClose $0
@@ -84,8 +87,8 @@
   StrCmp $0 "0" sync_uninstall_done
   sync_uninstall_failed:
   StrCmp $R7 "" sync_uninstall_cancel_done
-  CreateDirectory "$LOCALAPPDATA\RisuNestSync\manager-update"
-  FileOpen $0 "$LOCALAPPDATA\RisuNestSync\manager-update\installer-$R7.cancel" w
+  CreateDirectory "$LOCALAPPDATA\RisuNestSyncData\manager-update"
+  FileOpen $0 "$LOCALAPPDATA\RisuNestSyncData\manager-update\installer-$R7.cancel" w
   IfErrors sync_uninstall_cancel_done
   FileWrite $0 '{"cancel":true}'
   FileClose $0
@@ -102,8 +105,8 @@
 
 !macro NSIS_HOOK_POSTUNINSTALL
   StrCmp $R7 "" sync_uninstall_guard_done
-  CreateDirectory "$LOCALAPPDATA\RisuNestSync\manager-update"
-  FileOpen $0 "$LOCALAPPDATA\RisuNestSync\manager-update\installer-$R7.release" w
+  CreateDirectory "$LOCALAPPDATA\RisuNestSyncData\manager-update"
+  FileOpen $0 "$LOCALAPPDATA\RisuNestSyncData\manager-update\installer-$R7.release" w
   IfErrors sync_uninstall_guard_failed
   FileWrite $0 '{"release":true}'
   FileClose $0

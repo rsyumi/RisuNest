@@ -2,6 +2,35 @@ use super::resolve_platform_root;
 use crate::asset_repository::{ExactObjectUnlink, PayloadCas};
 use std::{fs, io::ErrorKind, path::Path};
 
+#[test]
+fn linux_data_home_uses_only_absolute_xdg_or_home_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let xdg = root.path().join("xdg");
+    assert_eq!(
+        super::linux_data_home(Some(xdg.clone()), None).unwrap(),
+        xdg
+    );
+    assert_eq!(
+        super::linux_data_home(Some("relative".into()), Some(root.path().to_owned())).unwrap(),
+        root.path().join(".local/share")
+    );
+    assert!(super::linux_data_home(None, Some("relative".into())).is_err());
+}
+
+#[test]
+fn windows_data_roots_use_dedicated_pascal_case_leaf_names() {
+    let base = tempfile::tempdir().unwrap().path().to_owned();
+    assert_eq!(
+        super::windows_data_root(base.clone(), "RisuNestData").unwrap(),
+        base.join("RisuNestData")
+    );
+    assert_eq!(
+        super::windows_data_root(base.clone(), "RisuNestWebViewData").unwrap(),
+        base.join("RisuNestWebViewData")
+    );
+    assert!(super::windows_data_root("relative".into(), "RisuNestData").is_err());
+}
+
 #[cfg(unix)]
 fn link_directory(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).expect("create synthetic directory link");

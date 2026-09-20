@@ -330,6 +330,21 @@ pub fn run() {
     let executable = platform::server_executable().expect("server path unavailable");
     let client = Client::new(root.clone()).expect("management client unavailable");
     let updates = UpdateCoordination::new(&root).expect("update activity unavailable");
+    let mut tauri_context = tauri::generate_context!();
+    let main_window = if let Some(data_directory) =
+        platform::webview_data_dir().expect("WebView data directory unavailable")
+    {
+        let index = tauri_context
+            .config_mut()
+            .app
+            .windows
+            .iter()
+            .position(|window| window.label == "main")
+            .expect("main window missing");
+        Some((tauri_context.config_mut().app.windows.remove(index), data_directory))
+    } else {
+        None
+    };
     tauri::Builder::default()
         .manage(Context {
             root,
@@ -351,6 +366,11 @@ pub fn run() {
             manager_qr
         ])
         .setup(move |app| {
+            if let Some((config, data_directory)) = &main_window {
+                tauri::WebviewWindowBuilder::from_config(app, config)?
+                    .data_directory(data_directory.clone())
+                    .build()?;
+            }
             use tauri::{
                 menu::{Menu, MenuItem},
                 tray::TrayIconBuilder,
@@ -393,7 +413,7 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
+        .run(tauri_context)
         .expect("sync manager runtime failed");
 }
 

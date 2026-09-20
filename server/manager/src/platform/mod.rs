@@ -49,20 +49,64 @@ fn user_service_directory(xdg: Option<PathBuf>, home: impl FnOnce() -> Result<Pa
 
 pub fn default_data_dir() -> Result<PathBuf> {
     #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|p| p.join("RisuNestSync"));
+    let root = windows_data_root(
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        "RisuNestSyncData",
+    );
     #[cfg(target_os = "macos")]
-    let root = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|p| p.join("Library/Application Support/RisuNestSync"));
+    let root = macos_data_root(std::env::var_os("HOME").map(PathBuf::from));
     #[cfg(all(unix, not(target_os = "macos")))]
-    let root = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-        .map(|p| p.join("risunest-sync"));
-    root.filter(|p| p.is_absolute())
+    let root = linux_data_root(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        "risunest-sync",
+    );
+    root
         .ok_or("user-data-directory-unavailable".into())
+}
+
+pub fn webview_data_dir() -> Result<Option<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    return Ok(None);
+    #[cfg(windows)]
+    let root = windows_data_root(
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        "RisuNestSyncWebViewData",
+    );
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let root = linux_data_root(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        "risunest-sync-webview",
+    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        root.map(Some)
+            .ok_or("user-data-directory-unavailable".into())
+    }
+}
+
+#[cfg(any(test, windows))]
+fn windows_data_root(base: Option<PathBuf>, leaf: &str) -> Option<PathBuf> {
+    base.filter(|path| path.is_absolute())
+        .map(|path| path.join(leaf))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_data_root(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.filter(|path| path.is_absolute()).map(|path| {
+        path.join("Library/Application Support/io.github.rsyumi.risunest.sync-manager")
+    })
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn linux_data_root(xdg: Option<PathBuf>, home: Option<PathBuf>, leaf: &str) -> Option<PathBuf> {
+    xdg.filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".local/share"))
+        })
+        .map(|path| path.join(leaf))
 }
 
 pub fn server_executable() -> Result<PathBuf> {
@@ -523,6 +567,45 @@ mod tests {
             assert!(user_service_directory(xdg.clone(), || Err("home-unavailable".into())).is_err());
             assert!(user_service_directory(xdg, || Ok(PathBuf::from("relative/home"))).is_err());
         }
+    }
+
+    #[test]
+    fn platform_data_leaf_names_follow_native_conventions() {
+        let windows_base = tempfile::tempdir().unwrap();
+        let linux_home = tempfile::tempdir().unwrap();
+        let macos_home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            windows_data_root(Some(windows_base.path().to_owned()), "RisuNestSyncData"),
+            Some(windows_base.path().join("RisuNestSyncData"))
+        );
+        assert_eq!(
+            windows_data_root(
+                Some(windows_base.path().to_owned()),
+                "RisuNestSyncWebViewData"
+            ),
+            Some(windows_base.path().join("RisuNestSyncWebViewData"))
+        );
+        assert_eq!(
+            linux_data_root(None, Some(linux_home.path().to_owned()), "risunest-sync"),
+            Some(linux_home.path().join(".local/share/risunest-sync"))
+        );
+        assert_eq!(
+            linux_data_root(
+                None,
+                Some(linux_home.path().to_owned()),
+                "risunest-sync-webview"
+            ),
+            Some(linux_home.path().join(".local/share/risunest-sync-webview"))
+        );
+        assert_eq!(
+            macos_data_root(Some(macos_home.path().to_owned())),
+            Some(macos_home.path().join(
+                "Library/Application Support/io.github.rsyumi.risunest.sync-manager"
+            ))
+        );
+        assert!(
+            windows_data_root(Some(PathBuf::from("relative")), "RisuNestSyncData").is_none()
+        );
     }
 
     #[cfg(not(windows))]
