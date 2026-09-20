@@ -46,7 +46,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
 
     override func load(webview: WKWebView) {
         webView = webview
-        fileQueue.async { self.sweepStaging() }
+        sweepStaging()
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             continuedRegistered = BGTaskScheduler.shared.register(forTaskWithIdentifier: taskIdentifier, using: .main) { [weak self] task in
