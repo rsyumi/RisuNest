@@ -836,7 +836,7 @@ fn a_settings_batch_answers_in_request_order() {
 
 #[test]
 fn plugin_permissions_and_their_reconfirmation_times_stay_in_their_own_tables() {
-    let (_directory, store) = open();
+    let (_directory, mut store) = open();
     assert!(store.read_plugin_permissions().unwrap().is_empty());
     assert!(store.read_plugin_permission_grants().unwrap().is_empty());
 
@@ -873,6 +873,10 @@ fn plugin_permissions_and_their_reconfirmation_times_stay_in_their_own_tables() 
     assert!(store
         .write_plugin_permission_grant("Plugin A", "db", -1)
         .is_err());
+
+    store.clear_plugin_permissions().unwrap();
+    assert!(store.read_plugin_permissions().unwrap().is_empty());
+    assert!(store.read_plugin_permission_grants().unwrap().is_empty());
 }
 
 #[test]

@@ -652,6 +652,12 @@ const permissionCacheKey = (pluginName: string, permissionDesc: PluginPermission
 const permissionGivenPlugins: Set<string> = new Set();
 const permissionDeniedPlugins: Set<string> = new Set();
 
+export async function resetAllPluginPermissions() {
+    await getPluginPermissionStore().clearAll()
+    permissionGivenPlugins.clear()
+    permissionDeniedPlugins.clear()
+}
+
 type PluginV3ProviderOptions = PluginV2ProviderOptions & {
     model?: LLMModel
 }

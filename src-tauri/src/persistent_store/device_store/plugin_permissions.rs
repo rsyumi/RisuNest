@@ -109,4 +109,12 @@ impl DeviceStore {
         )?;
         Ok(())
     }
+
+    pub(crate) fn clear_plugin_permissions(&mut self) -> StoreResult<()> {
+        let transaction = self.transaction()?;
+        transaction.execute("DELETE FROM plugin_permissions", [])?;
+        transaction.execute("DELETE FROM plugin_permission_grants", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
 }

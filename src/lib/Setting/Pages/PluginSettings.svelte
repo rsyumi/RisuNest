@@ -1,7 +1,7 @@
 <script lang="ts">
-    import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon } from "@lucide/svelte";
+    import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon, ShieldIcon } from "@lucide/svelte";
     import { language } from "src/lang";
-    import { alertConfirm, alertMd, alertSelect } from "src/ts/alert";
+    import { alertConfirm, alertMd, alertSelect, alertToast } from "src/ts/alert";
     import { TriangleAlert } from '@lucide/svelte';
 
     import { DBState, hotReloading, SettingsMenuIndex } from "src/ts/stores.svelte";
@@ -13,8 +13,15 @@
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import { hotReloadPluginFiles } from "src/ts/plugins/apiV3/developMode";
+    import { resetAllPluginPermissions } from "src/ts/plugins/apiV3/v3.svelte";
 
     let showParams = $state([])
+
+    async function resetPluginPermissions() {
+        if (!await alertConfirm(language.resetAllPluginPermissionsConfirm)) return
+        await resetAllPluginPermissions()
+        alertToast(language.resetAllPluginPermissionsDone)
+    }
 </script>
 
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.plugin}</h2>
@@ -251,6 +258,15 @@
         class="hover:text-textcolor cursor-pointer"
     >
         <PlusIcon />
+    </button>
+
+    <button
+        onclick={resetPluginPermissions}
+        class="hover:text-textcolor cursor-pointer"
+        title={language.resetAllPluginPermissions}
+        aria-label={language.resetAllPluginPermissions}
+    >
+        <ShieldIcon />
     </button>
 
     <button

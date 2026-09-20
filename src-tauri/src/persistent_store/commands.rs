@@ -1485,6 +1485,15 @@ pub(crate) fn pds_write_plugin_permission_grant(
     })
 }
 
+#[tauri::command(async)]
+pub(crate) fn pds_clear_plugin_permissions(
+    state: State<'_, PersistentStoreState>,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store.device_store_mut()?.clear_plugin_permissions()
+    })
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SectionParticipationRow {
