@@ -85,11 +85,11 @@ test("rejects missing update inputs and malformed registry URLs with bounded err
       environment: syntheticEnvironment({ RISUNEST_UPDATE_PUBLIC_KEY: "" }),
       signer: async () => {},
     }), { message: "update-signing-preflight-failed" });
-    await assert.rejects(preflightUpdateSigning({
+    await assert.doesNotReject(preflightUpdateSigning({
       directory: root,
       environment: syntheticEnvironment({ TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "" }),
       signer: async () => {},
-    }), { message: "update-signing-preflight-failed" });
+    }));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -138,6 +138,7 @@ test("uses the real Tauri signer to validate a synthetic update key pair", async
   const root = temporaryRoot();
   const first = join(root, "first.key");
   const second = join(root, "second.key");
+  const unencrypted = join(root, "unencrypted.key");
   const password = "synthetic-update-password";
   try {
     for (const key of [first, second]) {
@@ -150,6 +151,14 @@ test("uses the real Tauri signer to validate a synthetic update key pair", async
       ], { cwd: repository, stdio: "pipe", windowsHide: true });
       assert.equal(generated.status, 0, "Synthetic Tauri key generation failed");
     }
+    const generatedUnencrypted = spawnSync(process.execPath, [
+      tauriCli,
+      "signer", "generate",
+      "--write-keys", unencrypted,
+      "--password", "",
+      "--ci",
+    ], { cwd: repository, stdio: "pipe", windowsHide: true });
+    assert.equal(generatedUnencrypted.status, 0, "Synthetic unencrypted Tauri key generation failed");
     const environment = syntheticEnvironment({
       TAURI_SIGNING_PRIVATE_KEY: readFileSync(first, "utf8"),
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: password,
@@ -171,6 +180,15 @@ test("uses the real Tauri signer to validate a synthetic update key pair", async
       directory: root,
       environment: { ...environment, RISUNEST_UPDATE_PUBLIC_KEY: "malformed-public-key" },
     }), { message: "update-signing-preflight-failed" });
+    await assert.doesNotReject(preflightUpdateSigning({
+      directory: root,
+      environment: {
+        ...environment,
+        TAURI_SIGNING_PRIVATE_KEY: readFileSync(unencrypted, "utf8"),
+        TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "",
+        RISUNEST_UPDATE_PUBLIC_KEY: readFileSync(`${unencrypted}.pub`, "utf8"),
+      },
+    }));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

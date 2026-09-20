@@ -3,13 +3,13 @@ description: Check out approved reference source without starting or installing 
 runs:
   using: composite
   steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         repository: kwaroran/Risuai
         ref: c454df882aaf32e02a22da26d3718c8cadc97814
         path: .tmp/test-references/risuai
         persist-credentials: false
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         repository: PocketRisu/PocketRisu
         ref: b315d898abd543fffaf5346d8eb3246b20da92cd

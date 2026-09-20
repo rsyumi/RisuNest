@@ -18,4 +18,12 @@ jobs:
       source_ref: ${{ github.sha }}
       publish: true
       bootstrap: ${{ vars.RISUNEST_RELEASE_BOOTSTRAP == 'true' }}
-    secrets: inherit
+    secrets:
+      TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+      TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}

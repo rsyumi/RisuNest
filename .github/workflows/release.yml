@@ -8,6 +8,15 @@ on:
       source_ref: { type: string, required: true }
       publish: { type: boolean, required: true }
       bootstrap: { type: boolean, default: false }
+    secrets:
+      TAURI_PRIVATE_KEY: { required: true }
+      TAURI_KEY_PASSWORD: { required: false }
+      RISUNEST_UPDATE_PUBLIC_KEY: { required: true }
+      ANDROID_KEYSTORE_BASE64: { required: false }
+      ANDROID_KEYSTORE_PASSWORD: { required: false }
+      ANDROID_KEY_ALIAS: { required: false }
+      ANDROID_KEY_PASSWORD: { required: false }
+      RISUNEST_DEFAULT_REGISTRY_URL: { required: false }
   workflow_dispatch:
     inputs:
       product:
@@ -57,7 +66,7 @@ jobs:
       publish: ${{ inputs.publish }}
       bootstrap: ${{ inputs.bootstrap }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.source_ref }}
           fetch-depth: 0
@@ -76,10 +85,10 @@ jobs:
           printf 'source_commit=%s\n' "$source_commit" >> "$GITHUB_OUTPUT"
         env:
           TAG: ${{ inputs.tag }}
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
           version: ${{ env.PNPM_VERSION }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
@@ -96,7 +105,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           SOURCE_COMMIT: ${{ steps.identity.outputs.source_commit }}
           RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-input
           path: release-input.json
@@ -107,25 +116,29 @@ jobs:
     needs: source
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
-      - uses: actions/setup-java@v5
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         if: inputs.product == 'app'
         with: { distribution: temurin, java-version: "21" }
       - id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/test-references
+      - run: pnpm test:node
+      - run: pnpm test --project harness
+      - run: pnpm test:protocol
       - name: Preflight app signing inputs
         if: inputs.product == 'app'
         run: node scripts/release/signing-preflight.mjs --product "${{ inputs.product }}"
@@ -149,29 +162,26 @@ jobs:
           RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
       - name: Clean signing preflight files
         if: always()
-        run: node -e "require('node:fs').rmSync(process.env.SIGNING_PREFLIGHT_ROOT, { recursive: true, force: true })"
+        run: >-
+          node -e "require('node:fs').rmSync(process.env.SIGNING_PREFLIGHT_ROOT, { recursive: true, force: true })"
         env:
           SIGNING_PREFLIGHT_ROOT: ${{ runner.temp }}/risunest-signing-preflight
-      - uses: ./.github/actions/test-references
-      - run: pnpm test:node
-      - run: pnpm test --project harness
-      - run: pnpm test:protocol
 
   app-web-tests:
     if: inputs.product == 'app'
     needs: source
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
       - id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
@@ -198,11 +208,11 @@ jobs:
           - { runner: macos-15, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: "${{ matrix.target }}" }
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/cache
@@ -221,17 +231,17 @@ jobs:
     needs: source
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with: { distribution: temurin, java-version: "21" }
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
       - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: aarch64-linux-android,x86_64-linux-android }
       - run: pnpm install --frozen-lockfile
       - name: Verify the committed Android shell
@@ -263,13 +273,13 @@ jobs:
     needs: source
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: aarch64-apple-ios-sim }
       - name: Select the verified iOS toolchain
         shell: bash
@@ -313,13 +323,13 @@ jobs:
           - { runner: macos-15, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: "${{ matrix.target }}", components: clippy,rustfmt }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/cache
@@ -398,13 +408,13 @@ jobs:
     needs: source
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
       - name: Install native GUI test dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
       - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
@@ -416,11 +426,11 @@ jobs:
     needs: source
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
       - run: pnpm --dir server/endpoint-registry --ignore-workspace install --frozen-lockfile
       - run: pnpm --dir server/endpoint-registry --ignore-workspace check
@@ -433,13 +443,13 @@ jobs:
       CC_wasm32_unknown_unknown: clang
       AR_wasm32_unknown_unknown: llvm-ar
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: wasm32-unknown-unknown }
       - name: Install native and WASM build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
@@ -470,17 +480,17 @@ jobs:
       release_id: ${{ steps.draft.outputs.release_id }}
       already_published: ${{ steps.mode.outputs.already_published || steps.draft.outputs.already_published }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: release-input }
       - id: mode
         if: inputs.publish != true
         run: echo "already_published=false" >> "$GITHUB_OUTPUT"
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         if: inputs.publish == true
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         if: inputs.publish == true
         with: { node-version: "24", package-manager-cache: false }
       - run: pnpm install --frozen-lockfile
@@ -512,25 +522,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: release-input }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: "${{ matrix.target }}" }
       - id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/cache
@@ -542,24 +552,45 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64
       - run: pnpm install --frozen-lockfile
-      - name: Build once and package from the product binary
+      - name: Compile app desktop binary without signing key
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-work
+          node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
+          pnpm exec -- tauri build --target "$TARGET" --no-bundle --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+          cp "$CARGO_TARGET_DIR/$TARGET/release/$EXECUTABLE" release-work/app-binary
+      - name: Bundle app desktop assets
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           TARGET: ${{ matrix.target }}
-          EXECUTABLE: ${{ matrix.executable }}
           BUNDLES: ${{ matrix.bundles }}
+        run: |
+          set -euo pipefail
+          pnpm exec -- tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
+      - name: Package app desktop assets
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
           OS: ${{ matrix.os }}
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p release-work release-out
-          node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
-          pnpm exec -- tauri build --target "$TARGET" --no-bundle --config "$RUNNER_TEMP/release-tauri.json" -- --locked
-          cp "$CARGO_TARGET_DIR/$TARGET/release/$EXECUTABLE" release-work/app-binary
-          pnpm exec -- tauri build --target "$TARGET" --bundles "$BUNDLES" --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           node scripts/release/package-app.mjs --kind desktop --os "$OS" --arch "$ARCH" --bundle-dir "$CARGO_TARGET_DIR/$TARGET/release/bundle" --binary release-work/app-binary --release-input release-input.json --output release-work/packages
+      - name: Sign final app desktop assets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
           node scripts/release/build.mjs --release-input release-input.json --leg "desktop_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Verify the produced macOS archive with the production updater
         if: matrix.os == 'darwin'
@@ -578,7 +609,7 @@ jobs:
           --draft-id "${{ needs.prepare-draft.outputs.release_id }}"
           --directory release-out
           --inventory "release-out/inventory-desktop_${{ matrix.os }}_${{ matrix.arch }}.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs.publish && format('inventory-app-desktop-{0}-{1}', matrix.os, matrix.arch) || format('rehearsal-app-desktop-{0}-{1}', matrix.os, matrix.arch) }}
           path: ${{ inputs.publish && format('release-out/inventory-desktop_{0}_{1}.json', matrix.os, matrix.arch) || 'release-out/*' }}
@@ -592,18 +623,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: release-input }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with: { distribution: temurin, java-version: "21" }
-      - uses: android-actions/setup-android@v3
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: aarch64-linux-android }
       - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
       - run: pnpm install --frozen-lockfile
@@ -630,14 +661,11 @@ jobs:
           node scripts/release/android-signing.mjs
           --keystore "$RUNNER_TEMP/risunest-release.jks"
           --properties src-tauri/gen/android/keystore.properties
-      - name: Build and verify signed ARM64 APK
+      - name: Build and package signed ARM64 APK
         shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          mkdir -p release-work release-out
+          mkdir -p release-work
           export NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
           export PATH="$ANDROID_HOME/build-tools/36.0.0:$PATH"
           node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
@@ -647,6 +675,13 @@ jobs:
           test "$apk_count" -eq 1
           apk=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print -quit)
           node scripts/release/package-app.mjs --kind android --arch aarch64 --package "$apk" --binary "$CARGO_TARGET_DIR/aarch64-linux-android/release/librisunest_lib.so" --release-input release-input.json --output release-work/packages
+      - name: Sign final ARM64 APK
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
           node scripts/release/build.mjs --release-input release-input.json --leg mobile_android_aarch64 --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Remove runner signing material
         if: always()
@@ -656,7 +691,7 @@ jobs:
         if: inputs.publish == true
         env: { GITHUB_TOKEN: "${{ github.token }}" }
         run: node scripts/release/upload-build.mjs --draft-id "${{ needs.prepare-draft.outputs.release_id }}" --directory release-out --inventory release-out/inventory-mobile_android_aarch64.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs.publish && 'inventory-app-android-aarch64' || 'rehearsal-app-android-aarch64' }}
           path: ${{ inputs.publish && 'release-out/inventory-mobile_android_aarch64.json' || 'release-out/*' }}
@@ -670,15 +705,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: release-input }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: aarch64-apple-ios }
       - name: Select the verified iPhoneOS toolchain
         shell: bash
@@ -691,26 +726,30 @@ jobs:
           printf '%s\n' "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin" >> "$GITHUB_PATH"
           xcodebuild -version
       - run: pnpm install --frozen-lockfile
-      - name: Build unsigned iPhoneOS ARM64 IPA
+      - name: Build and package unsigned iPhoneOS ARM64 IPA
         shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          mkdir -p release-work release-out
+          mkdir -p release-work
           node scripts/release/tauri-config.mjs --release-input release-input.json --output "$RUNNER_TEMP/release-tauri.json"
           pnpm exec -- tauri ios build --ci --target aarch64 --no-sign --config "$RUNNER_TEMP/release-tauri.json" -- --locked
           ipa_count=$(find src-tauri/gen/apple -type f -name '*.ipa' | wc -l | tr -d ' ')
           test "$ipa_count" -eq 1
           ipa=$(find src-tauri/gen/apple -type f -name '*.ipa' -print -quit)
           node scripts/release/package-app.mjs --kind ios --arch aarch64 --package "$ipa" --release-input release-input.json --output release-work/packages
+      - name: Sign final iPhoneOS ARM64 IPA
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-out
           node scripts/release/build.mjs --release-input release-input.json --leg mobile_ios_aarch64 --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Upload final assets to draft
         if: inputs.publish == true
         env: { GITHUB_TOKEN: "${{ github.token }}" }
         run: node scripts/release/upload-build.mjs --draft-id "${{ needs.prepare-draft.outputs.release_id }}" --directory release-out --inventory release-out/inventory-mobile_ios_aarch64.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs.publish && 'inventory-app-ios-aarch64' || 'rehearsal-app-ios-aarch64' }}
           path: ${{ inputs.publish && 'release-out/inventory-mobile_ios_aarch64.json' || 'release-out/*' }}
@@ -736,27 +775,27 @@ jobs:
     env:
       RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: release-input }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with: { python-version: "3.12" }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: "${{ matrix.target }}" }
       - id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/cache
@@ -780,12 +819,10 @@ jobs:
       - name: Prove Windows cloudflared start, tunnel, stop and restart
         if: matrix.os == 'windows'
         run: node scripts/release/verify-cloudflared.mjs --binary "$env:RISUNEST_CLOUDFLARED"
-      - name: Build console, background and GUI executables once
+      - name: Build and package Sync distributions
         shell: bash
         env:
           RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           TARGET: ${{ matrix.target }}
           OS: ${{ matrix.os }}
           ARCH: ${{ matrix.arch }}
@@ -802,6 +839,16 @@ jobs:
           raw=$(find release-work/raw -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print -quit)
           vendor_sha=$(node -p "require('./vendor/vendor.json').executableSha256")
           node server/manager/install/package.mjs --native-build release-work/native/native-build.json --raw-archive "$raw" --release-input release-input.json --output release-work/packages --cloudflared-sha256 "$vendor_sha"
+      - name: Sign final Sync distributions
+        shell: bash
+        env:
+          RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
           node scripts/release/build.mjs --release-input release-input.json --leg "sync_${OS}_${ARCH}" --assets-json release-work/packages/assets.json --output release-out --public-key "$RISUNEST_UPDATE_PUBLIC_KEY"
       - name: Install, reinstall and roll back the produced Linux managed package
         if: matrix.os == 'linux'
@@ -836,7 +883,7 @@ jobs:
           --draft-id "${{ needs.prepare-draft.outputs.release_id }}"
           --directory release-out
           --inventory "release-out/inventory-sync_${{ matrix.os }}_${{ matrix.arch }}.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ inputs.publish && format('inventory-sync-{0}-{1}', matrix.os, matrix.arch) || format('rehearsal-sync-{0}-{1}', matrix.os, matrix.arch) }}
           path: ${{ inputs.publish && format('release-out/inventory-sync_{0}_{1}.json', matrix.os, matrix.arch) || 'release-out/*' }}
@@ -857,17 +904,17 @@ jobs:
       queue: max
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: release-input }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         if: inputs.product == 'sync'
-      - uses: actions/cache/restore@v5
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         if: inputs.product == 'sync'
         with:
           path: |
@@ -878,7 +925,7 @@ jobs:
           restore-keys: release-cargo-1.97.1-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
       - name: Download build inventories
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ${{ inputs.publish && format('inventory-{0}-*', inputs.product) || format('rehearsal-{0}-*', inputs.product) }}
           path: collected
@@ -923,7 +970,7 @@ jobs:
           args=(--publish --product "$PRODUCT" --tag "$TAG" --source-commit "$SOURCE_COMMIT" --release-input release-input.json --product-manifest release-manifest/product-manifest.json --assets collected/assets --draft-id "$DRAFT_ID")
           if test "$BOOTSTRAP" = true; then args+=(--bootstrap); fi
           node scripts/release/publish.mjs "${args[@]}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: inputs.publish != true
         with:
           name: release-validation-${{ inputs.product }}
@@ -944,11 +991,11 @@ jobs:
       queue: max
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with: { ref: "${{ needs.source.outputs.source_commit }}", persist-credentials: false }
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with: { version: "10.34.1" }
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
       - run: pnpm install --frozen-lockfile
       - name: Download immutable published assets

@@ -46,7 +46,6 @@ export async function preflightUpdateSigning({
   try {
     const publicKey = requiredEnvironment("RISUNEST_UPDATE_PUBLIC_KEY", environment);
     requiredEnvironment("TAURI_SIGNING_PRIVATE_KEY", environment);
-    requiredEnvironment("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", environment);
     const payload = join(directory, "synthetic-update.bin");
     writeFileSync(payload, "RisuNest signing preflight\n", { mode: 0o600 });
     restoreEnvironment = applyEnvironment([

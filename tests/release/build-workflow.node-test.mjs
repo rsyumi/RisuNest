@@ -7,16 +7,17 @@ const workflow = readFileSync(new URL("../../.github/workflows/release.yml", imp
 const stableWorkflow = readFileSync(new URL("../../.github/workflows/stable-release.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const cacheWorkflow = readFileSync(new URL("../../.github/workflows/release-cache.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const checkWorkflow = readFileSync(new URL("../../.github/workflows/release-check.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const referenceAction = readFileSync(new URL("../../.github/actions/test-references/action.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 
 test("both products and pull requests run shared native signature and catalog tests", () => {
   const commonTests = workflow.slice(workflow.indexOf("\n  release-tooling-tests:\n"), workflow.indexOf("\n  app-web-tests:\n"));
   assert.doesNotMatch(commonTests, /\n    if: inputs\.product/);
-  for (const contents of [commonTests, checkWorkflow]) {
-    assert.match(contents, /uses: dtolnay\/rust-toolchain@1\.97\.1/);
-  }
+  assert.match(commonTests, /uses: dtolnay\/rust-toolchain@[a-f0-9]{40} # 1\.97\.1/);
+  assert.match(checkWorkflow, /uses: dtolnay\/rust-toolchain@1\.97\.1/);
   assert.match(commonTests, /pnpm test:protocol/);
   assert.match(commonTests, /pnpm test:node/);
   assert.match(commonTests, /pnpm test --project harness/);
+  assert(commonTests.indexOf("pnpm test:protocol") < commonTests.indexOf("Preflight app signing inputs"));
   assert.doesNotMatch(commonTests, /pnpm test:release/);
   assert.match(checkWorkflow, /cargo test --manifest-path crates\/release-update\/Cargo\.toml --release --locked/);
   assert.match(workflow, /needs: \[source, release-tooling-tests,/);
@@ -128,8 +129,83 @@ test("private signing material is scoped to signing steps", () => {
   }
   assert.doesNotMatch(appPreflight, /secrets\.RISUNEST_DEFAULT_REGISTRY_URL/);
   assert.match(syncPreflight, /secrets\.RISUNEST_DEFAULT_REGISTRY_URL/);
-  assert.match(tooling, /uses: actions\/setup-java@v5\n\s+if: inputs\.product == 'app'/);
-  assert.match(tooling, /name: Clean signing preflight files\n\s+if: always\(\)/);
+  assert.match(tooling, /uses: actions\/setup-java@[a-f0-9]{40} # v5\n\s+if: inputs\.product == 'app'/);
+  assert.match(tooling, /name: Clean signing preflight files\n\s+if: always\(\)\n\s+run: >-/);
+
+  const keyFreeSteps = [
+    "Compile app desktop binary without signing key",
+    "Package app desktop assets",
+    "Build and package signed ARM64 APK",
+    "Build and package unsigned iPhoneOS ARM64 IPA",
+    "Build and package Sync distributions",
+  ];
+  for (const name of keyFreeSteps) {
+    const start = workflow.indexOf(`      - name: ${name}\n`);
+    assert.notEqual(start, -1, `Missing key-free step: ${name}`);
+    const end = workflow.indexOf("\n      - name:", start + 1);
+    const step = workflow.slice(start, end === -1 ? workflow.length : end);
+    assert.doesNotMatch(step, /TAURI_SIGNING_PRIVATE_KEY/);
+  }
+  for (const name of [
+    "Bundle app desktop assets",
+    "Sign final app desktop assets",
+    "Sign final ARM64 APK",
+    "Sign final iPhoneOS ARM64 IPA",
+    "Sign final Sync distributions",
+  ]) {
+    const start = workflow.indexOf(`      - name: ${name}\n`);
+    assert.notEqual(start, -1, `Missing signing step: ${name}`);
+    const end = workflow.indexOf("\n      - name:", start + 1);
+    assert.match(workflow.slice(start, end === -1 ? workflow.length : end), /TAURI_SIGNING_PRIVATE_KEY/);
+  }
+});
+
+test("the reusable release forwards only its eight declared secrets", () => {
+  const names = [
+    "TAURI_PRIVATE_KEY",
+    "TAURI_KEY_PASSWORD",
+    "RISUNEST_UPDATE_PUBLIC_KEY",
+    "ANDROID_KEYSTORE_BASE64",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_ALIAS",
+    "ANDROID_KEY_PASSWORD",
+    "RISUNEST_DEFAULT_REGISTRY_URL",
+  ];
+  assert.doesNotMatch(stableWorkflow, /secrets: inherit/);
+  const callContract = workflow.slice(workflow.indexOf("  workflow_call:\n"), workflow.indexOf("  workflow_dispatch:\n"));
+  const forwarding = stableWorkflow.slice(stableWorkflow.indexOf("    secrets:\n"));
+  for (const name of names) {
+    assert.match(callContract, new RegExp(`\\n      ${name}:`));
+    assert.match(forwarding, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
+  }
+  assert.equal((forwarding.match(/^      [A-Z][A-Z0-9_]+:/gm) ?? []).length, names.length);
+});
+
+test("remote actions inside the release signing boundary use verified commit SHAs", () => {
+  const verified = new Map([
+    ["actions/checkout#v6", "d23441a48e516b6c34aea4fa41551a30e30af803"],
+    ["actions/checkout#v4", "11d5960a326750d5838078e36cf38b85af677262"],
+    ["actions/setup-node#v6", "249970729cb0ef3589644e2896645e5dc5ba9c38"],
+    ["actions/setup-java#v5", "b6effb05e454b25005698d916606bdc6ffcbf961"],
+    ["actions/setup-python#v6", "ece7cb06caefa5fff74198d8649806c4678c61a1"],
+    ["actions/cache/restore#v5", "caa296126883cff596d87d8935842f9db880ef25"],
+    ["actions/download-artifact#v4", "d3f86a106a0bac45b974a628896c90dbdf5c8093"],
+    ["actions/upload-artifact#v4", "ea165f8d65b6e75b540449e92b4886f43607fa02"],
+    ["pnpm/action-setup#v5", "fc06bc1257f339d1d5d8b3a19a8cae5388b55320"],
+    ["dtolnay/rust-toolchain#1.97.1", "4716b85f2fac3e324e64fa2810f6b5c3905760a5"],
+    ["android-actions/setup-android#v3", "9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407"],
+  ]);
+  for (const contents of [workflow, referenceAction]) {
+    const remoteUses = [...contents.matchAll(/^\s*-?\s*uses:\s+([^\s#]+)(?:\s+#\s*(\S+))?/gm)]
+      .filter(match => !match[1].startsWith("./"));
+    assert(remoteUses.length > 0);
+    for (const match of remoteUses) {
+      const [action, reference] = match[1].split("@");
+      assert.match(reference ?? "", /^[a-f0-9]{40}$/, `${action} is not pinned`);
+      assert(match[2], `${action} is missing its readable version comment`);
+      assert.equal(reference, verified.get(`${action}#${match[2]}`), `${action} is not a verified pin`);
+    }
+  }
 });
 
 test("release caches retain downloads without unpacked dependency trees", () => {
@@ -241,7 +317,7 @@ test("both macOS Sync legs verify whole-app apply and rollback before upload", (
 
 test("raw Sync release binaries require the embedded update public key", () => {
   const syncBuild = workflow.slice(
-    workflow.indexOf("Build console, background and GUI executables once"),
+    workflow.indexOf("Build and package Sync distributions"),
     workflow.indexOf("Run synthetic Windows NSIS install failure and rollback checks"),
   );
   assert.match(syncBuild, /RISUNEST_UPDATE_PUBLIC_KEY: \$\{\{ secrets\.RISUNEST_UPDATE_PUBLIC_KEY \}\}/);
