@@ -228,6 +228,12 @@ fn drop_references(
 /// derived from a record the table already holds, so the change adds nothing and loses nothing.
 fn normalize(transaction: &Connection, staging: &str, table: &str) -> StoreResult<()> {
     match table {
+        "root" => {
+            transaction.execute(
+                "UPDATE root SET value=json_remove(value, '$.characters', '$.botPresets', '$.pluginCustomStorage', '$.pluginStorageMeta') WHERE generation=?1 AND json_valid(value)",
+                [staging],
+            )?;
+        }
         "characters" => {
             transaction.execute(
                 "UPDATE characters SET conversation_count=(SELECT count(*) FROM conversations c WHERE c.generation=characters.generation AND c.character_id=characters.character_id) WHERE generation=?1",

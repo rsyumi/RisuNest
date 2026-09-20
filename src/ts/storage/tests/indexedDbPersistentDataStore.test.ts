@@ -148,6 +148,24 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    it('stores plugin ownership metadata outside the root record', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            `plugin-meta-root-${databaseSequence++}`, new IDBFactory(), IDBKeyRange,
+        )
+        const database = structuredClone(fixtureDatabase)
+        database.pluginCustomStorage = { synthetic: { enabled: true } }
+        database.pluginStorageMeta = {
+            synthetic: { plugin: 'synthetic-plugin', updatedAt: 1 },
+        }
+        await store.open()
+        await store.replaceFromDatabase(database)
+
+        expect((await store.readRoot()).value).not.toHaveProperty('pluginStorageMeta')
+        expect(await store.readPluginStorage('synthetic-plugin', 'synthetic')).toMatchObject({
+            value: database.pluginCustomStorage.synthetic,
+        })
+    })
+
     it('preserves conversation order when appending and inserting after a deletion', async () => {
         const store = new IndexedDbPersistentDataStore(
             `conversation-order-${databaseSequence++}`, new IDBFactory(), IDBKeyRange,

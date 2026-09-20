@@ -96,6 +96,26 @@ fn a_derived_value_rule_offers_recomputing_the_table_without_losing_anything() {
 }
 
 #[test]
+fn separated_root_material_offers_removing_the_duplicate_fields() {
+    let plan = plan(&result(vec![Finding::new(
+        codes::RECORD_INVALID,
+        "root",
+        "",
+        "portable root contains separated field: pluginStorageMeta",
+    )]));
+    let [candidate] = plan.as_slice() else {
+        panic!("one candidate: {plan:?}");
+    };
+    assert!(candidate.preferred && !candidate.discards);
+    assert_eq!(
+        candidate.action,
+        RepairAction::NormalizeRecords {
+            table: "root".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn an_orphan_offers_restoring_its_owner_rather_than_deleting_it() {
     let plan = plan(&result(vec![Finding::new(
         codes::RECORD_ORPHAN,

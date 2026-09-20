@@ -28,6 +28,11 @@
         type DataHealthSeverity,
         type RepairCandidate,
     } from 'src/ts/storage/dataHealth'
+    import {
+        dataHealthOwnerKey,
+        describeDataHealthFinding,
+        type DataHealthResolvedNames,
+    } from 'src/ts/storage/dataHealthPresentation'
     import { createDataHealthModel } from 'src/ts/storage/dataHealthModel'
     import { formatRisuNestStorageBytes } from 'src/ts/storage/risuNestStorageDashboard'
     import { downloadFile } from 'src/ts/globalApi.svelte'
@@ -40,9 +45,16 @@
          * library that is already open; the recovery shell is the one place that is not true.
          */
         prepare?: () => Promise<void>
+        resolveNames?: (
+            items: readonly DataHealthFinding[],
+        ) => Promise<Map<string, DataHealthResolvedNames>>
     }
 
-    let { onOpenUnusedImages, prepare }: Props = $props()
+    let {
+        onOpenUnusedImages,
+        prepare,
+        resolveNames,
+    }: Props = $props()
 
     const strings = language.risuNest.dataHealth
     const model = createDataHealthModel({
@@ -57,8 +69,10 @@
         undoRepair: undoNativeDataHealthRepair,
     })
     let view = $state(model.snapshot())
+    let resolvedNames = $state(new Map<string, DataHealthResolvedNames>())
     let includeNames = $state(false)
     let keepSnapshot = $state(false)
+    let namesGeneration = 0
 
     const severityLabels: Record<DataHealthSeverity, string> = {
         blocking: strings.severityBlocking,
@@ -95,6 +109,51 @@
             .join(' · ')
     const itemTarget = (item: DataHealthFinding): string =>
         item.target ? `${item.target.kind}: ${item.target.key}` : ''
+    const separatedFieldLabel = (field: string): string => ({
+        characters: strings.rootFieldCharacters,
+        botPresets: strings.rootFieldPresets,
+        pluginCustomStorage: strings.rootFieldPluginStorage,
+        pluginStorageMeta: strings.rootFieldPluginStorageMeta,
+    })[field] ?? field
+    const presentationStrings = {
+        rootSeparatedField: (field: string) =>
+            strings.rootSeparatedField.replace('{0}', separatedFieldLabel(field)),
+        moduleAssetMissing: (module: string, ordinal: number) =>
+            strings.moduleAssetMissing
+                .replace('{0}', module)
+                .replace('{1}', count(ordinal)),
+        conversationModuleMissing: (character: string, conversation: string) =>
+            strings.conversationModuleMissing
+                .replace('{0}', character)
+                .replace('{1}', conversation),
+        conversationMessageInlayMissing: (
+            character: string,
+            conversation: string,
+            ordinal: number,
+        ) => strings.conversationMessageInlayMissing
+            .replace('{0}', character)
+            .replace('{1}', conversation)
+            .replace('{2}', count(ordinal)),
+    }
+    const itemDescription = (item: DataHealthFinding): string | null =>
+        describeDataHealthFinding(
+            item,
+            resolvedNames.get(dataHealthOwnerKey(item.owner.kind, item.owner.id)) ?? null,
+            presentationStrings,
+        )
+
+    async function refreshNames(items: readonly DataHealthFinding[]): Promise<void> {
+        const generation = ++namesGeneration
+        try {
+            const resolver = resolveNames ?? (
+                await import('src/ts/storage/dataHealthNames')
+            ).resolveDataHealthFindingNames
+            const names = await resolver(items)
+            if (generation === namesGeneration) resolvedNames = names
+        } catch {
+            if (generation === namesGeneration) resolvedNames = new Map()
+        }
+    }
 
     let deepProgress = $derived.by(() => {
         const deep = view.result?.deep
@@ -137,7 +196,13 @@
 
     function reportText(): string {
         const result = view.result
-        return result ? formatDataHealthReport(result, { includeNames }) : ''
+        return result
+            ? formatDataHealthReport(result, {
+                  includeNames,
+                  resolveOwnerName: (kind, id) =>
+                      resolvedNames.get(dataHealthOwnerKey(kind, id))?.ownerName ?? null,
+              })
+            : ''
     }
 
     async function copyReport(): Promise<void> {
@@ -206,8 +271,13 @@
         await run(() => model.undo(id))
     }
 
+    let resolvedResult: typeof view.result = null
     const unsubscribe = model.subscribe((next) => {
         view = next
+        if (next.result !== resolvedResult) {
+            resolvedResult = next.result
+            void refreshNames(next.result?.items ?? [])
+        }
     })
     onMount(() => {
         void (prepare ? prepare() : Promise.resolve())
@@ -215,7 +285,10 @@
             .then(() => model.loadRepairs())
             .catch(() => alertError(strings.scanFailed))
     })
-    onDestroy(unsubscribe)
+    onDestroy(() => {
+        namesGeneration++
+        unsubscribe()
+    })
 </script>
 
 <SettingGroup
@@ -302,8 +375,8 @@
             <p class="border-t border-darkborderc/55 px-4 py-2 pl-10 text-sm text-textcolor2">{severityHelp[group.severity]}</p>
             {#each group.shown as item, index (index)}
                 <div data-data-health-item class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 border-t border-darkborderc/55 py-1.5 pr-4 pl-10 text-sm">
-                    <span class="min-w-0 flex-1 break-all">{itemLocation(item)}</span>
-                    {#if itemTarget(item)}
+                    <span class="min-w-0 flex-1 break-all">{itemDescription(item) ?? itemLocation(item)}</span>
+                    {#if !itemDescription(item) && itemTarget(item)}
                         <span class="min-w-0 break-all text-textcolor2">{itemTarget(item)}</span>
                     {/if}
                 </div>

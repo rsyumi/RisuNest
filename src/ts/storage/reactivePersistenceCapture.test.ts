@@ -27,11 +27,26 @@ function capture(state: ReturnType<typeof fixture>, root = () => state.database)
     })
 }
 function root(state: ReturnType<typeof fixture>) {
-    const { characters: _, pluginCustomStorage: __, botPresets: ___, ...value } = state.database
+    const {
+        characters: _,
+        pluginCustomStorage: __,
+        pluginStorageMeta: ___,
+        botPresets: ____,
+        ...value
+    } = state.database
     return value
 }
 
 describe('production reactive persistence captures', () => {
+    it('keeps plugin storage ownership metadata out of the persistent root', () => {
+        const state = fixture()
+        state.database.pluginStorageMeta = {
+            nested: { plugin: 'plugin-a', updatedAt: 1 },
+        }
+        const cached = capture(state)
+        expect(JSON.parse(cached.root())).not.toHaveProperty('pluginStorageMeta')
+    })
+
     it('reuses initialized strings on first reactive capture and defers whole-object encoding', () => {
         const value = 'x'.repeat(16 * 1024 * 1024)
         const state = fixture()

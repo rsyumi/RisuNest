@@ -45,7 +45,7 @@ describe('persistent root mutations', () => {
         ])
     })
 
-    it.each(['characters', 'botPresets', 'pluginCustomStorage'])(
+    it.each(['characters', 'botPresets', 'pluginCustomStorage', 'pluginStorageMeta'])(
         'rejects the separately owned %s area',
         (key) => {
             expect(() => applyRootMutations(root({}), [{ type: 'delete', key }])).toThrow(

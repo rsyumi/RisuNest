@@ -12,12 +12,12 @@ use rusqlite::{
 };
 use serde_json::Value;
 
-fn invalid(message: &'static str) -> StoreError {
+fn invalid(message: impl Into<String>) -> StoreError {
     StoreError::Validation {
         message: message.into(),
     }
 }
-fn require(condition: bool, message: &'static str) -> StoreResult<()> {
+fn require(condition: bool, message: impl Into<String>) -> StoreResult<()> {
     if condition {
         Ok(())
     } else {
@@ -140,13 +140,13 @@ fn validate_row(table: &PortableTable, row: &Row<'_>) -> StoreResult<()> {
     match table.name {
         "root" => {
             let value = json(row, 0)?;
-            require(
-                value.is_object()
-                    && ["characters", "botPresets", "pluginCustomStorage", "pluginStorageMeta"]
-                        .iter()
-                        .all(|k| value.get(k).is_none()),
-                "portable root contains separated records",
-            )?;
+            require(value.is_object(), "portable root is not an object")?;
+            for key in ["characters", "botPresets", "pluginCustomStorage", "pluginStorageMeta"] {
+                require(
+                    value.get(key).is_none(),
+                    format!("portable root contains separated field: {key}"),
+                )?;
+            }
         }
         "bot_presets" => {
             let value = json(row, 4)?;
@@ -589,6 +589,26 @@ mod tests {
         let bounded = collect(&db, 1);
         assert_eq!(bounded.items.len(), 1);
         assert_eq!(bounded.omitted as usize, damaged - 1);
+    }
+
+    #[test]
+    fn separated_root_field_is_named_without_exposing_its_value() {
+        let (_directory, db) = fixture();
+        db.execute(
+            "UPDATE root SET value=json_set(value, '$.pluginStorageMeta', json('{\"private\":true}'))",
+            [],
+        )
+        .unwrap();
+        let findings = collect(&db, 64);
+        let [finding] = findings.items.as_slice() else {
+            panic!("one finding: {:?}", findings.items);
+        };
+        assert_eq!(finding.owner.kind, "root");
+        assert_eq!(
+            finding.detail,
+            "portable root contains separated field: pluginStorageMeta"
+        );
+        assert!(!finding.detail.contains("private"));
     }
 
     #[test]

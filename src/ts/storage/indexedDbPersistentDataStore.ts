@@ -3189,6 +3189,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             characters: _characters,
             botPresets: _botPresets,
             pluginCustomStorage: _pluginCustomStorage,
+            pluginStorageMeta: _pluginStorageMeta,
             ...value
         } = root as Database
         transaction.objectStore('root').put({ key: generation, generation, value })

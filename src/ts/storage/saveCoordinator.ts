@@ -3677,11 +3677,13 @@ export class SaveCoordinator {
             characters?: Database['characters']
             botPresets?: botPreset[]
             pluginCustomStorage?: Database['pluginCustomStorage']
+            pluginStorageMeta?: Database['pluginStorageMeta']
         }
         const {
             characters: _characters,
             botPresets: legacyPresets,
             pluginCustomStorage: legacyPluginStorage,
+            pluginStorageMeta: _pluginStorageMeta,
             ...rootValue
         } = capturedRoot
         const rootCanonical = optimized ? optimized.root() : canonicalJson(rootValue)

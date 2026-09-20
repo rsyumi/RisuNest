@@ -43,6 +43,7 @@ fn invalid_root_mutations_do_not_change_state() {
         json!({"rootMutations": [{"type":"delete", "key":"characters"}]}),
         json!({"rootMutations": [{"type":"delete", "key":"botPresets"}]}),
         json!({"rootMutations": [{"type":"delete", "key":"pluginCustomStorage"}]}),
+        json!({"rootMutations": [{"type":"delete", "key":"pluginStorageMeta"}]}),
         json!({"rootMutations": [
             {"type":"set", "key":"username", "value":"Temporary"},
             {"type":"delete", "key":"username"}

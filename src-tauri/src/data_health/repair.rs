@@ -99,6 +99,20 @@ const ORPHANABLE: &[&str] = &["conversations", "messages"];
 
 fn record_candidates(index: usize, finding: &Finding) -> Vec<RepairCandidate> {
     let table = finding.owner.kind.as_str();
+    if table == "root"
+        && finding
+            .detail
+            .starts_with("portable root contains separated field: ")
+    {
+        return vec![candidate(
+            index,
+            RepairAction::NormalizeRecords {
+                table: table.to_owned(),
+            },
+            true,
+            false,
+        )];
+    }
     if NORMALIZABLE.contains(&table) {
         return vec![candidate(
             index,

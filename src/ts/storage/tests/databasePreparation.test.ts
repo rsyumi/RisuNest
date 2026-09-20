@@ -146,6 +146,9 @@ describe('prepareDatabaseForPersistence', () => {
             'char-b',
         ]
         const { characters: _characters, botPresets: _botPresets, ...root } = database
+        root.pluginStorageMeta = {
+            synthetic: { plugin: 'synthetic-plugin', updatedAt: 1 },
+        }
         delete (root as Partial<PersistentRoot>).language
         const original = structuredClone(root)
 
@@ -156,6 +159,7 @@ describe('prepareDatabaseForPersistence', () => {
         expect(root).toEqual(original)
         expect(prepared).not.toHaveProperty('characters')
         expect(prepared).not.toHaveProperty('botPresets')
+        expect(prepared).not.toHaveProperty('pluginStorageMeta')
         expect(prepared.formatversion).toBe(5)
         expect(prepared.loreBookToken).toBe(8000)
         expect(prepared.language).toBe('en')

@@ -279,6 +279,7 @@ export async function preparePersistentRootForWorkingSet(
         characters: _characters,
         botPresets: _botPresets,
         pluginCustomStorage: _pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
         ...root
     } = candidate
     return root

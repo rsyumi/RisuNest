@@ -95,6 +95,7 @@ export function capturePersistentRoot(database: Database): RootDatabase {
         characters: _characters,
         botPresets: _botPresets,
         pluginCustomStorage: _pluginCustomStorage,
+        pluginStorageMeta: _pluginStorageMeta,
         ...root
     } = database
     return root

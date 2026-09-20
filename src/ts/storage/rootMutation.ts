@@ -2,7 +2,12 @@ import type { PersistentRoot, RootMutation } from './persistentDataStore'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { canonicalClone, canonicalJson } from './saveCoordinatorHelpers'
 
-const separateAreas = new Set(['characters', 'botPresets', 'pluginCustomStorage'])
+const separateAreas = new Set([
+    'characters',
+    'botPresets',
+    'pluginCustomStorage',
+    'pluginStorageMeta',
+])
 
 export function diffRootMutations(before: PersistentRoot, after: PersistentRoot): RootMutation[] {
     const mutations: RootMutation[] = []

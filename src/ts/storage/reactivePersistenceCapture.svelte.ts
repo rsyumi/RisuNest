@@ -181,7 +181,7 @@ export function createPersistenceCanonicalCapture(read: {
 }): PersistenceCanonicalCapture {
     const captureRoot = objectCapture(
         () => read.root() as Record<string, unknown>,
-        new Set(['characters', 'botPresets', 'pluginCustomStorage']),
+        new Set(['characters', 'botPresets', 'pluginCustomStorage', 'pluginStorageMeta']),
         false,
     )
     const storageStringSeeds = new Map<string, readonly [string, string]>()

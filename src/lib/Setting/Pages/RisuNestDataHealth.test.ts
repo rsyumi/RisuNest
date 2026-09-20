@@ -28,6 +28,7 @@ vi.mock('src/lang', async () => ({
 }))
 
 import RisuNestDataHealth from './RisuNestDataHealth.svelte'
+import { dataHealthOwnerKey } from 'src/ts/storage/dataHealthPresentation'
 import { languageKorean } from 'src/lang/ko'
 import { languageEnglish } from 'src/lang/en'
 import type { DataHealthResult } from 'src/ts/storage/dataHealth'
@@ -134,7 +135,13 @@ describe('RisuNestDataHealth', () => {
         })
         const target = document.createElement('div')
         document.body.append(target)
-        mounted = mount(RisuNestDataHealth, { target, props })
+        mounted = mount(RisuNestDataHealth, {
+            target,
+            props: {
+                resolveNames: async () => new Map(),
+                ...props,
+            },
+        })
         await settle()
         return target
     }
@@ -154,6 +161,62 @@ describe('RisuNestDataHealth', () => {
         )
         expect(groups[0]).toContain(strings.severityBlockingHelp)
         expect(groups[1]).toContain(strings.severityDegradedHelp)
+    })
+
+    it('shows module, chat and message names instead of storage locators', async () => {
+        const named: DataHealthResult = {
+            ...damaged,
+            counts: { blocking: 0, degraded: 3, informational: 0 },
+            omitted: 0,
+            items: [
+                {
+                    code: 'reference-invalid',
+                    severity: 'degraded',
+                    owner: { kind: 'module', id: 'module-1' },
+                    locator: { sourcePath: '$.assets[0][1]', occurrence: 0 },
+                    target: { kind: 'asset', key: '' },
+                    detail: 'reference value cannot be resolved',
+                },
+                {
+                    code: 'reference-missing',
+                    severity: 'degraded',
+                    owner: { kind: 'conversation', id: 'character-1/chat-1' },
+                    locator: { sourcePath: '$.modules[0]', occurrence: 0 },
+                    target: { kind: 'module', key: 'missing-module' },
+                    detail: 'reference has no target in this library',
+                },
+                {
+                    code: 'reference-missing',
+                    severity: 'degraded',
+                    owner: { kind: 'conversation', id: 'character-1/chat-1' },
+                    locator: { sourcePath: '$.message[7].data', occurrence: 1 },
+                    target: { kind: 'inlay', key: 'missing-inlay' },
+                    detail: 'reference has no target in this library',
+                },
+            ],
+        }
+        const target = await setup(named, {
+            resolveNames: async () => new Map([
+                [dataHealthOwnerKey('module', 'module-1'), { ownerName: 'Weather' }],
+                [dataHealthOwnerKey('conversation', 'character-1/chat-1'), {
+                    ownerName: 'Mari / First chat',
+                    characterName: 'Mari',
+                    conversationName: 'First chat',
+                }],
+            ]),
+        })
+        await settle()
+        const text = [...target.querySelectorAll('[data-data-health-item]')]
+            .map((item) => item.textContent ?? '')
+            .join('\n')
+        expect(text).toContain('Module “Weather” has no link for asset 1.')
+        expect(text).toContain(
+            'The module assigned to character “Mari”, chat “First chat”, does not exist.',
+        )
+        expect(text).toContain(
+            'Character “Mari”, chat “First chat”, has broken inlay data in message 8.',
+        )
+        expect(text).not.toContain('character-1/chat-1')
     })
 
     it('says nothing has been checked before the first scan', async () => {

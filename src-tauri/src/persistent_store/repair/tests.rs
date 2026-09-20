@@ -78,6 +78,34 @@ fn a_reference_removal_rewrites_only_the_field_it_names() {
 }
 
 #[test]
+fn root_normalization_removes_only_separately_stored_fields() {
+    let (_directory, mut store) = fixture();
+    let generation = active_generation(&store.connection).unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE root SET value=json_set(value, '$.pluginStorageMeta', json('{\"owned\":true}')) WHERE generation=?1",
+            [&generation],
+        )
+        .unwrap();
+    store
+        .apply_repair(
+            1,
+            &[candidate(RepairAction::NormalizeRecords {
+                table: "root".to_owned(),
+            })],
+            10,
+        )
+        .unwrap();
+    let root = root_of(&store);
+    assert!(root.get("pluginStorageMeta").is_none());
+    assert_eq!(
+        root.get("customBackground").and_then(Value::as_str),
+        Some("assets/kept.png")
+    );
+}
+
+#[test]
 fn several_removals_in_one_record_keep_naming_the_same_elements() {
     let (_directory, mut store) = fixture();
     let owner = crate::data_health::Owner {

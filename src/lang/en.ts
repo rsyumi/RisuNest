@@ -2518,6 +2518,17 @@ export const languageEnglish = {
             codeAuthorityIncomplete: 'Storage setup left unfinished',
             codeObjectUnreferenced: 'Files nothing uses',
             codeUnclassified: 'Problems that could not be sorted',
+            rootFieldCharacters: 'characters',
+            rootFieldPresets: 'presets',
+            rootFieldPluginStorage: 'plugin storage',
+            rootFieldPluginStorageMeta: 'plugin storage ownership metadata',
+            rootSeparatedField:
+                'The database root contains a duplicate {0} record that belongs in separate storage.',
+            moduleAssetMissing: 'Module “{0}” has no link for asset {1}.',
+            conversationModuleMissing:
+                'The module assigned to character “{0}”, chat “{1}”, does not exist.',
+            conversationMessageInlayMissing:
+                'Character “{0}”, chat “{1}”, has broken inlay data in message {2}.',
         },
         backup: {
             generationBusy:

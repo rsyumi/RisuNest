@@ -12,6 +12,7 @@ import {
     type DataHealthFinding,
     type DataHealthResult,
 } from './dataHealth'
+import { describeDataHealthFinding } from './dataHealthPresentation'
 
 function finding(
     overrides: Partial<DataHealthFinding> = {},
@@ -26,6 +27,80 @@ function finding(
         ...overrides,
     }
 }
+
+const presentation = {
+    rootSeparatedField: (field: string) => `root:${field}`,
+    moduleAssetMissing: (module: string, ordinal: number) => `${module}:${ordinal}:asset`,
+    conversationModuleMissing: (character: string, conversation: string) =>
+        `${character}:${conversation}:module`,
+    conversationMessageInlayMissing: (
+        character: string,
+        conversation: string,
+        ordinal: number,
+    ) => `${character}:${conversation}:${ordinal}:inlay`,
+}
+
+describe('describeDataHealthFinding', () => {
+    it('describes a module asset by module name and human ordinal', () => {
+        const item = finding({
+            code: 'reference-invalid',
+            owner: { kind: 'module', id: 'module-1' },
+            locator: { sourcePath: '$.assets[0][1]', occurrence: 0 },
+            target: { kind: 'asset', key: '' },
+        })
+        expect(
+            describeDataHealthFinding(
+                item,
+                { ownerName: 'Weather' },
+                presentation,
+            ),
+        ).toBe('Weather:1:asset')
+    })
+
+    it('describes a missing conversation module by character and chat names', () => {
+        const item = finding({
+            owner: { kind: 'conversation', id: 'character-1/chat-1' },
+            locator: { sourcePath: '$.modules[0]', occurrence: 0 },
+            target: { kind: 'module', key: 'missing-module' },
+        })
+        expect(
+            describeDataHealthFinding(
+                item,
+                { characterName: 'Mari', conversationName: 'First chat' },
+                presentation,
+            ),
+        ).toBe('Mari:First chat:module')
+    })
+
+    it('describes a broken message inlay by character, chat and message ordinal', () => {
+        const item = finding({
+            owner: { kind: 'conversation', id: 'character-1/chat-1' },
+            locator: { sourcePath: '$.message[7].data', occurrence: 0 },
+            target: { kind: 'inlay', key: 'missing-inlay' },
+        })
+        expect(
+            describeDataHealthFinding(
+                item,
+                { characterName: 'Mari', conversationName: 'First chat' },
+                presentation,
+            ),
+        ).toBe('Mari:First chat:8:inlay')
+    })
+
+    it('names the separated root field without exposing its value', () => {
+        const item = finding({
+            code: 'record-invalid',
+            severity: 'blocking',
+            owner: { kind: 'root', id: '' },
+            locator: null,
+            target: null,
+            detail: 'portable root contains separated field: pluginStorageMeta',
+        })
+        expect(describeDataHealthFinding(item, null, presentation)).toBe(
+            'root:pluginStorageMeta',
+        )
+    })
+})
 
 function result(overrides: Partial<DataHealthResult> = {}): DataHealthResult {
     const items = overrides.items ?? [finding()]

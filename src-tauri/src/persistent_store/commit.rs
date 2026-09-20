@@ -90,7 +90,7 @@ pub(super) fn apply_root_mutations(
         };
         if matches!(
             key.as_str(),
-            "characters" | "botPresets" | "pluginCustomStorage"
+            "characters" | "botPresets" | "pluginCustomStorage" | "pluginStorageMeta"
         ) {
             return Err(validation("Invalid persistent root mutation key"));
         }
@@ -1561,6 +1561,7 @@ fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> St
     root.shift_remove("characters");
     root.shift_remove("botPresets");
     root.shift_remove("pluginCustomStorage");
+    root.shift_remove("pluginStorageMeta");
     transaction.execute(
         "INSERT INTO root (generation, value) VALUES (?1, ?2) ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
         params![generation, serde_json::to_string(&root)?],

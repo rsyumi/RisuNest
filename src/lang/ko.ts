@@ -2327,6 +2327,17 @@ export const languageKorean = {
             codeAuthorityIncomplete: '끝나지 않은 저장소 준비',
             codeObjectUnreferenced: '아무 데서도 쓰지 않는 파일',
             codeUnclassified: '분류하지 못한 문제',
+            rootFieldCharacters: '캐릭터',
+            rootFieldPresets: '프리셋',
+            rootFieldPluginStorage: '플러그인 저장소',
+            rootFieldPluginStorageMeta: '플러그인 저장소 메타데이터',
+            rootSeparatedField:
+                'DB 루트에 별도 저장되어야 하는 {0} 기록이 중복되어 있습니다.',
+            moduleAssetMissing: '모듈 “{0}”의 {1}번째 에셋 연결이 없습니다.',
+            conversationModuleMissing:
+                '캐릭터 “{0}”의 채팅 “{1}”에 할당된 모듈이 존재하지 않습니다.',
+            conversationMessageInlayMissing:
+                '캐릭터 “{0}”의 채팅 “{1}”에 {2}번째 메시지에 연결이 끊긴 인레이 데이터가 있습니다.',
         },
         backup: {
             generationBusy:

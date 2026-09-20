@@ -66,6 +66,7 @@ export async function bootstrapPersistentDatabase(
                 characters: _characters,
                 botPresets: _botPresets,
                 pluginCustomStorage: _pluginCustomStorage,
+                pluginStorageMeta: _pluginStorageMeta,
                 ...storedRoot
             } = database
             const root = await canonicalizePresetSelection(
@@ -113,6 +114,7 @@ export async function bootstrapPersistentDatabase(
                 characters: _characters,
                 botPresets: _botPresets,
                 pluginCustomStorage: _pluginCustomStorage,
+                pluginStorageMeta: _pluginStorageMeta,
                 ...storedRoot
             } = database
             const root = await canonicalizePresetSelection(
