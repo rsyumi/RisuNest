@@ -20,6 +20,11 @@ function nativeBackend() {
             grants.push(args as never)
             return undefined
         }
+        if (command === 'pds_clear_plugin_permissions') {
+            permissions.splice(0)
+            grants.splice(0)
+            return undefined
+        }
         throw new Error(`unexpected command ${command}`)
     })
     return { permissions, grants, invoked, invokeCommand }
@@ -71,6 +76,25 @@ describe('native plugin permissions', () => {
         await expect(store.isGranted('hash-a', 'db')).resolves.toBe(false)
     })
 
+    it('clears persisted permissions and the already loaded native cache', async () => {
+        const backend = nativeBackend()
+        backend.permissions.push({ codeHash: 'hash-a', permission: 'db', granted: true })
+        backend.grants.push({ pluginName: 'Plugin A', permission: 'db', lastGrantAt: 17 })
+        const store = createNativePluginPermissionStore(backend.invokeCommand)
+
+        await expect(store.isGranted('hash-a', 'db')).resolves.toBe(true)
+        await expect(store.lastGrantAt('Plugin A', 'db')).resolves.toBe(17)
+
+        await store.clearAll()
+
+        expect(backend.permissions).toEqual([])
+        expect(backend.grants).toEqual([])
+        await expect(store.isGranted('hash-a', 'db')).resolves.toBe(false)
+        await expect(store.lastGrantAt('Plugin A', 'db')).resolves.toBeNull()
+        expect(backend.invoked.filter((command) => command === 'pds_read_plugin_permissions'))
+            .toHaveLength(1)
+    })
+
     it('opens the browser store only when the web build first uses it', async () => {
         const values = new Map<string, unknown>()
         const createInstance = vi.fn(() => ({
@@ -78,6 +102,9 @@ describe('native plugin permissions', () => {
             setItem: async (key: string, value: unknown) => {
                 values.set(key, value)
                 return value
+            },
+            clear: async () => {
+                values.clear()
             },
         }) as unknown as LocalForage)
         const store = createLocalPluginPermissionStore(createInstance)
@@ -91,5 +118,27 @@ describe('native plugin permissions', () => {
         expect(values.get('Plugin A_db_lastGrantTime')).toBe(9)
         await expect(store.isGranted('hash-a', 'db')).resolves.toBe(true)
         await expect(store.lastGrantAt('Plugin A', 'db')).resolves.toBe(9)
+    })
+
+    it('clears the browser permission store', async () => {
+        const values = new Map<string, unknown>()
+        const store = createLocalPluginPermissionStore(() => ({
+            getItem: async (key: string) => values.get(key) ?? null,
+            setItem: async (key: string, value: unknown) => {
+                values.set(key, value)
+                return value
+            },
+            clear: async () => {
+                values.clear()
+            },
+        }) as unknown as LocalForage)
+
+        await store.grant('hash-a', 'db')
+        await store.recordGrant('Plugin A', 'db', 9)
+
+        await store.clearAll()
+
+        await expect(store.isGranted('hash-a', 'db')).resolves.toBe(false)
+        await expect(store.lastGrantAt('Plugin A', 'db')).resolves.toBeNull()
     })
 })

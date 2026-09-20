@@ -14,6 +14,7 @@ export interface PluginPermissionStore {
     grant(codeHash: string, permission: string): Promise<void>
     lastGrantAt(pluginName: string, permission: string): Promise<number | null>
     recordGrant(pluginName: string, permission: string, at: number): Promise<void>
+    clearAll(): Promise<void>
 }
 
 interface NativePermissionState {
@@ -70,6 +71,14 @@ export function createNativePluginPermissionStore(
             })
             ;(await load()).grants.set(pairKey(pluginName, permission), at)
         },
+        async clearAll() {
+            await invokeCommand('pds_clear_plugin_permissions')
+            if (loaded) {
+                const state = await loaded
+                state.granted.clear()
+                state.grants.clear()
+            }
+        },
     }
 }
 
@@ -94,6 +103,9 @@ export function createLocalPluginPermissionStore(
         },
         async recordGrant(pluginName, permission, at) {
             await store().setItem(`${pluginName}_${permission}_lastGrantTime`, at)
+        },
+        async clearAll() {
+            await store().clear()
         },
     }
 }

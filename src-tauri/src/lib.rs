@@ -871,6 +871,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         persistent_store::commands::pds_read_plugin_permissions,
         persistent_store::commands::pds_write_plugin_permission,
         persistent_store::commands::pds_write_plugin_permission_grant,
+        persistent_store::commands::pds_clear_plugin_permissions,
         persistent_store::commands::pds_hydrate_plugin_device_storage,
         persistent_store::commands::pds_read_plugin_device_value,
         persistent_store::commands::pds_list_plugin_device_keys,
