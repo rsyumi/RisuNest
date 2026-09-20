@@ -1,6 +1,13 @@
 import XCTest
 
 final class NativeUITests: XCTestCase {
+    private func attachScreenshot(_ app: XCUIApplication, name: String) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testNetworkReachability() throws {
         continueAfterFailure = false
         // Independent URLSession control in the XCTest runner, without a key/body.
@@ -213,6 +220,75 @@ final class NativeUITests: XCTestCase {
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.lifetime = .keepAlways
         add(screenshot)
+    }
+
+    func testProductOnboardingScreenshots() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "onboarding"
+        app.launch()
+
+        let webView = app.webViews.firstMatch
+        let home = webView.staticTexts["Choose how to start."]
+        XCTAssertTrue(home.waitForExistence(timeout: 90))
+        attachScreenshot(app, name: "01-onboarding-start")
+
+        let importOption = webView.staticTexts["Import from a backup file"]
+        XCTAssertTrue(importOption.waitForExistence(timeout: 15))
+        importOption.tap()
+        XCTAssertTrue(webView.staticTexts["Import a backup file"].waitForExistence(timeout: 15))
+        attachScreenshot(app, name: "02-onboarding-import")
+
+        let backToStart = webView.buttons["Back to start"]
+        XCTAssertTrue(backToStart.waitForExistence(timeout: 15))
+        backToStart.tap()
+        XCTAssertTrue(home.waitForExistence(timeout: 15))
+
+        let syncOption = webView.staticTexts["Connect to a sync server"]
+        XCTAssertTrue(syncOption.waitForExistence(timeout: 15))
+        syncOption.tap()
+        XCTAssertTrue(webView.staticTexts["Choose how to sync."].waitForExistence(timeout: 15))
+        attachScreenshot(app, name: "03-onboarding-sync")
+
+        XCTAssertTrue(backToStart.waitForExistence(timeout: 15))
+        backToStart.tap()
+        XCTAssertTrue(home.waitForExistence(timeout: 15))
+        let fresh = webView.staticTexts["Start right away"]
+        XCTAssertTrue(fresh.waitForExistence(timeout: 15))
+        fresh.tap()
+        XCTAssertTrue(webView.staticTexts["Ready"].waitForExistence(timeout: 15))
+        attachScreenshot(app, name: "04-onboarding-ready")
+
+        let start = webView.buttons["Start RisuNest"]
+        XCTAssertTrue(start.waitForExistence(timeout: 15))
+        start.tap()
+        XCTAssertTrue(webView.staticTexts["Ready"].waitForNonExistence(timeout: 30))
+        let settled = expectation(description: "Product chat settles after onboarding")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { settled.fulfill() }
+        wait(for: [settled], timeout: 10)
+        attachScreenshot(app, name: "05-product-after-onboarding")
+    }
+
+    func testProductSettingsScreenshots() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "settings"
+        app.launch()
+
+        let webView = app.webViews.firstMatch
+        XCTAssertTrue(webView.staticTexts["Performance"].waitForExistence(timeout: 90))
+        attachScreenshot(app, name: "06-risunest-settings")
+
+        let platform = webView.staticTexts["Platform"]
+        for _ in 0..<8 where !platform.isHittable {
+            webView.swipeUp()
+        }
+        XCTAssertTrue(platform.waitForExistence(timeout: 15))
+        let notifications = webView.staticTexts["Notifications"]
+        XCTAssertTrue(notifications.waitForExistence(timeout: 15))
+        attachScreenshot(app, name: "07-risunest-ios-platform")
     }
 
     func testNativePickersAndNotifications() throws {

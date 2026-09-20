@@ -54,7 +54,12 @@ async function main() {
   await guard();
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
   const phase = await invoke<string>("ios_bench_phase");
-  if (phase !== "app" && phase !== "app-restart") {
+  if (
+    phase !== "app" &&
+    phase !== "app-restart" &&
+    phase !== "onboarding" &&
+    phase !== "settings"
+  ) {
     // Product CSS gives the empty app root a full viewport of height.
     // Keep native-contract status/results visible to older WebKit accessibility.
     document.getElementById("app")!.style.display = "none";
@@ -65,6 +70,16 @@ async function main() {
     const { productApp } = await import("./productContracts");
     await report(phase, await productApp(phase === "app-restart"));
     await report("complete", { passed: true });
+    return;
+  }
+  if (phase === "onboarding") {
+    const { productOnboarding } = await import("./productContracts");
+    await report(phase, await productOnboarding());
+    return;
+  }
+  if (phase === "settings") {
+    const { productSettings } = await import("./productContracts");
+    await report(phase, await productSettings());
     return;
   }
   if (phase === "ui") {

@@ -112,3 +112,58 @@ export async function productApp(restart: boolean) {
     renderedTextLength: document.getElementById("app")!.textContent!.length,
   };
 }
+
+/** Product onboarding, mounted with a reset synthetic working set. */
+export async function productOnboarding() {
+  await initialize();
+  const opened = await invoke<{ revision: number }>("pds_open");
+  await invoke("pds_commit", {
+    commit: {
+      expectedRevision: opened.revision,
+      rootMutations: [
+        { type: "set", key: "didFirstSetup", value: false },
+        { type: "set", key: "language", value: "en" },
+      ],
+    },
+    assetAliases: [],
+  });
+  localStorage.setItem("risunest_tos_v1", "true");
+  document.getElementById("benchmark")!.remove();
+  const app = await import("../../src/main");
+  await app.default;
+  await until(
+    () => document.getElementById("app")!.textContent!.includes("Choose how to start."),
+    "product onboarding did not initialize",
+  );
+  return { passed: true };
+}
+
+/** RisuNest settings, mounted directly for physical-device visual checks. */
+export async function productSettings() {
+  await initialize();
+  const opened = await invoke<{ revision: number }>("pds_open");
+  await invoke("pds_commit", {
+    commit: {
+      expectedRevision: opened.revision,
+      rootMutations: [
+        { type: "set", key: "didFirstSetup", value: true },
+        { type: "set", key: "language", value: "en" },
+      ],
+    },
+    assetAliases: [],
+  });
+  localStorage.setItem("risunest_tos_v1", "true");
+  document.getElementById("benchmark")!.remove();
+  const app = await import("../../src/main");
+  await app.default;
+  const { SettingsMenuIndex, settingsOpen } = await import(
+    "../../src/ts/stores.svelte"
+  );
+  SettingsMenuIndex.set(17);
+  settingsOpen.set(true);
+  await until(
+    () => document.getElementById("app")!.textContent!.includes("Performance"),
+    "RisuNest settings did not initialize",
+  );
+  return { passed: true };
+}
