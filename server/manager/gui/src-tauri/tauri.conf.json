@@ -33,6 +33,7 @@
   },
   "bundle": {
     "active": false,
+    "publisher": "Yumi",
     "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
     "windows": { "nsis": { "installMode": "currentUser" } },
     "macOS": { "minimumSystemVersion": "13.0" }

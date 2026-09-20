@@ -289,10 +289,20 @@ test("effective configuration preserves the approved desktop and mobile identiti
     const overlay = JSON.parse(readFileSync(`src-tauri/tauri.${os}.conf.json`, "utf8"));
     const config = mergeTauriConfig(base, overlay, releaseTauriConfig({ product: "app", version: "1.2.3" }, "synthetic"));
     assert.equal(assertAppIdentifier(config, os), ["android", "ios"].includes(os) ? "io.github.rsyumi.risunest" : "RisuNest");
+    assert.equal(config.bundle.publisher, "Yumi");
     assert.equal(config.version, "1.2.3");
     if (os === "macos") assert.equal(config.bundle.macOS.signingIdentity, "-");
     assert.throws(() => assertAppIdentifier({ ...config, identifier: "wrong" }, os), /effective/);
   }
+});
+
+test("application bundles identify Yumi as the publisher", () => {
+  const app = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+  const sync = JSON.parse(readFileSync("server/manager/gui/src-tauri/tauri.conf.json", "utf8"));
+  assert.equal(app.productName, "RisuNest");
+  assert.equal(app.bundle.publisher, "Yumi");
+  assert.equal(sync.productName, "RisuNest Sync");
+  assert.equal(sync.bundle.publisher, "Yumi");
 });
 
 test("macOS package metadata and intentional ad-hoc signatures are checked", () => {
