@@ -27,8 +27,8 @@ GUI에는 고정 주소, 임시 주소(Cloudflare Tunnel), 레지스트리 주�
 
 | 플랫폼  | 데이터 기본 경로                                 | 서버 자동 실행                                       |
 | ------- | ------------------------------------------------ | ---------------------------------------------------- |
-| Windows | `%LOCALAPPDATA%/RisuNestSync`                    | 현재 사용자 Task Scheduler, 로그인 트리거, 일반 권한 |
-| macOS   | `~/Library/Application Support/RisuNestSync`     | `~/Library/LaunchAgents`의 사용자 LaunchAgent        |
+| Windows | `%LOCALAPPDATA%/RisuNestSyncData`                | 현재 사용자 Task Scheduler, 로그인 트리거, 일반 권한 |
+| macOS   | `~/Library/Application Support/io.github.rsyumi.risunest.sync-manager` | `~/Library/LaunchAgents`의 사용자 LaunchAgent |
 | Linux   | `${XDG_DATA_HOME:-~/.local/share}/risunest-sync` | `systemd --user`                                     |
 
 Windows에서는 자동 실행을 등록한 뒤 시작합니다. 등록된 작업을 통해 실행하며 별도 직접 실행으로 우회하지 않습니다. 설치 위치가 바뀌면 소유한 기존 작업을 상태에 표시하고 다시 등록하거나 제거할 수 있지만, 이전 실행 경로의 작업을 시작하지는 않습니다. 자동 실행 해제는 현재 프로세스의 중지와 별개입니다. GUI 트레이 자동 실행도 서버 자동 실행과 독립적입니다. macOS는 LaunchAgent plist를 제거해 다음 로그인 실행을 해제하며, 현재 로그인 세션에 로드된 작업은 로그아웃까지 남습니다. GUI 앱 이동 후에는 실행 등록을 다시 확인하세요.

@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertSyncIdentifier, mergeTauriConfig } from "../../../scripts/release/tauri-config.mjs";
 
 const manager = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const gui = join(manager, "gui");
@@ -238,6 +239,13 @@ export function packageNativeSuite({ nativeBuild, rawArchive, output, releaseInp
     throw new Error("Cloudflared executable checksum mismatch.");
   const architecture = target.startsWith("aarch64") ? "aarch64" : "x86_64";
   const os = target.includes("windows") ? "windows" : target.includes("linux") ? "linux" : "darwin";
+  const tauriPlatform = os === "darwin" ? "macos" : os;
+  const tauriRoot = join(gui, "src-tauri");
+  const tauriConfig = mergeTauriConfig(
+    JSON.parse(readFileSync(join(tauriRoot, "tauri.conf.json"), "utf8")),
+    JSON.parse(readFileSync(join(tauriRoot, `tauri.${tauriPlatform}.conf.json`), "utf8")),
+  );
+  assertSyncIdentifier(tauriConfig, tauriPlatform);
   const rawFormat = os === "windows" ? "zip" : "tar.gz";
   const result = [{
     download: { product: "sync", variant: "raw", os, arch: architecture, format: rawFormat },

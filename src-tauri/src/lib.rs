@@ -352,6 +352,12 @@ fn check_auth(fpath: String, auth: String) -> bool {
 
 /// Product initialization shared by native entry points.
 pub fn builder() -> tauri::Builder<tauri::Wry> {
+    builder_with_main_window(None)
+}
+
+fn builder_with_main_window(
+    main_window: Option<(tauri::utils::config::WindowConfig, std::path::PathBuf)>,
+) -> tauri::Builder<tauri::Wry> {
     native_log::install_panic_hook();
     let native_log_state = native_log::global_state();
     let setup_native_log_state = native_log_state.clone();
@@ -529,6 +535,11 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
 
     builder
         .setup(move |app| {
+            if let Some((config, data_directory)) = &main_window {
+                tauri::WebviewWindowBuilder::from_config(app, config)?
+                    .data_directory(data_directory.clone())
+                    .build()?;
+            }
             let setup_result = (|| -> Result<(), String> {
                 #[cfg(target_os = "macos")]
                 macos_lifecycle::install_native_quit(app.handle())?;
@@ -930,8 +941,14 @@ pub fn handle_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    builder()
-        .build(tauri::generate_context!())
+    let mut context = tauri::generate_context!();
+    #[cfg(desktop)]
+    let main_window = app_data_root::take_main_window_with_webview_root(&mut context)
+        .expect("desktop WebView data directory unavailable");
+    #[cfg(not(desktop))]
+    let main_window = None;
+    builder_with_main_window(main_window)
+        .build(context)
         .expect("error while building tauri application")
         .run(handle_run_event);
 }
