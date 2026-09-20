@@ -83,9 +83,6 @@
   onDestroy(() => activity(false));
 </script>
 
-<p class="page-description">
-  고정 주소와 임시 주소, 주소 레지스트리를 설정합니다.
-</p>
 <form aria-label="연결 설정"
   onsubmit={(e) => {
     e.preventDefault();

@@ -98,6 +98,24 @@ export function formatBytes(n: number | null): string {
   if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MiB`;
   return `${n.toLocaleString()} B`;
 }
+export function updatePhase(value: string): string {
+  return (
+    (
+      {
+        idle: "대기 중",
+        checking: "확인 중",
+        downloading: "다운로드 중",
+        "waiting-idle": "적용 대기 중",
+        draining: "서버 종료 중",
+        installing: "설치 중",
+        restarting: "다시 시작 중",
+        completed: "완료",
+        deferred: "연기됨",
+        failed: "실패",
+      } as Record<string, string>
+    )[value] ?? value
+  );
+}
 export function phase(value: string): string {
   return (
     (

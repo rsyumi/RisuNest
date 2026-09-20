@@ -26,7 +26,10 @@
 <form onsubmit={(event) => { event.preventDefault(); void apply(); }}>
   <fieldset class="card settings-group" disabled={busy}>
     <div class="setting">
-      <h2>네트워크 설정</h2>
+      <div class="setting-heading">
+        <h2>네트워크 설정</h2>
+        {#if listener}<span class="pill">수신 중</span>{/if}
+      </div>
       {#if listener}<p>현재 수신 주소: <code>{listener}</code></p>{/if}
       <label>바인딩 주소<input aria-label="바인딩 주소" required bind:value={address} placeholder="127.0.0.1" /></label>
       <label>포트<input aria-label="포트" type="number" min="1" max="65535" step="1" required bind:value={port} /></label>

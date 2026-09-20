@@ -12,11 +12,16 @@
   --textcolor: #223247;
   --subtextcolor: #607287;
   --darkborderc: rgba(103, 125, 154, 0.2);
-  --bgcolor: rgba(252, 254, 255, 0.76);
+  --shell: rgba(236, 243, 251, 0.22);
+  --side: rgba(238, 245, 253, 0.74);
+  --bgcolor: rgba(252, 254, 255, 0.78);
+  --hairline: rgba(255, 255, 255, 0.5);
   --panel: rgba(255, 255, 255, 0.7);
-  --input: rgba(237, 243, 251, 0.65);
+  --input: rgba(240, 245, 252, 0.6);
+  --navactive: rgba(255, 255, 255, 0.6);
+  --captionhover: rgba(0, 0, 0, 0.06);
   --accent: #337fd5;
-  --side: rgba(232, 240, 250, 0.66);
+  --ok: #478e77;
   color: var(--textcolor);
   background: transparent;
   font-synthesis: none;
@@ -38,12 +43,14 @@ button {
   cursor: pointer;
   border: 1px solid var(--darkborderc);
   background: var(--input);
-  border-radius: 7px;
-  padding: 8px 12px;
+  border-radius: 6px;
+  padding: 7px 12px;
+  font-size: 13px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
+  white-space: nowrap;
 }
 button:hover:not(:disabled) {
   filter: brightness(0.97);
@@ -68,7 +75,8 @@ p {
 h1 {
   font-size: 28px;
   font-weight: 600;
-  letter-spacing: -0.5px;
+  letter-spacing: -0.6px;
+  line-height: 1.2;
 }
 h2 {
   font-size: 14px;
@@ -85,18 +93,23 @@ p {
 small {
   font-size: 11px;
 }
+code {
+  font-size: 11px;
+}
 input,
 select,
 textarea {
   background: var(--input);
   border: 1px solid var(--darkborderc);
   border-radius: 6px;
-  padding: 9px;
+  padding: 8px 9px;
   width: 100%;
   min-width: 0;
+  font-size: 13px;
 }
 input[readonly] {
   font-size: 12px;
+  color: var(--subtextcolor);
 }
 input,
 textarea {
@@ -113,120 +126,205 @@ label {
   font-weight: 500;
 }
 label > input,
-label > select {
-  margin-top: 8px;
-}
+label > select,
 label > .copy-field {
   margin-top: 8px;
 }
+
+/* Window shell: the sidebar and content pane sit as tinted layers over the native material. */
 .app-shell {
   display: flex;
+  flex-direction: column;
   height: 100dvh;
   min-height: 420px;
-  background: rgba(230, 241, 252, 0.18);
+  background: var(--shell);
+}
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding-left: 12px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--subtextcolor);
+  background: var(--side);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.titlebar img {
+  width: 16px;
+  height: 16px;
+}
+.titlebar-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.caption-controls {
+  display: flex;
+  margin-left: auto;
+  align-self: stretch;
+}
+.caption-controls button {
+  width: 46px;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--textcolor);
+}
+.caption-controls button:hover:not(:disabled) {
+  filter: none;
+  background: var(--captionhover);
+}
+.caption-controls button.close:hover:not(:disabled) {
+  background: #c42b1c;
+  color: #fff;
+}
+.caption-controls button:focus-visible {
+  outline-offset: -3px;
+}
+.titlebar.mac {
+  height: 38px;
+  padding-left: 80px;
+  padding-right: 80px;
+  justify-content: center;
+  font-weight: 600;
 }
 aside {
-  width: 204px;
+  width: 200px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  padding: 30px 14px 20px;
+  padding: 26px 12px 18px;
   background: var(--side);
 }
 .identity {
   display: flex;
   gap: 10px;
   align-items: center;
-  padding: 0 10px 28px;
+  padding: 0 8px 26px;
 }
 .identity img {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
 }
 .identity strong {
-  font-size: 15px;
+  display: block;
+  font-size: 14px;
+  letter-spacing: -0.3px;
 }
 .identity small {
   display: block;
   font-size: 10px;
   margin-top: 3px;
+  line-height: 1.4;
 }
 .nav-label {
-  padding: 0 12px 10px;
+  padding: 0 10px 9px;
   font-size: 10px;
-  letter-spacing: 0.7px;
+  font-weight: 600;
+  letter-spacing: 1px;
 }
 nav {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
 }
 nav button {
   justify-content: flex-start;
   border: 0;
   background: transparent;
-  padding: 12px;
-  gap: 12px;
+  padding: 10px 11px;
+  gap: 11px;
+  font-size: 13px;
   color: var(--subtextcolor);
   position: relative;
 }
 nav button.active {
   color: var(--textcolor);
-  background: var(--panel);
+  background: var(--navactive);
+  box-shadow: 0 1px 3px rgba(87, 109, 135, 0.06);
 }
 nav button.active:before {
   content: "";
   position: absolute;
   left: 0;
+  top: 11px;
+  bottom: 11px;
   width: 3px;
-  height: 17px;
-  border-radius: 4px;
+  border-radius: 3px;
   background: var(--accent);
 }
 .sidebar-bottom {
   margin-top: auto;
-  padding: 24px 10px 0;
+  padding: 20px 8px 0;
   font-size: 11px;
+  color: var(--subtextcolor);
 }
 .sidebar-bottom span {
-  color: #478e77;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--textcolor);
+}
+.sidebar-bottom span:before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  flex-shrink: 0;
 }
 .sidebar-bottom span.offline {
   color: var(--subtextcolor);
 }
+.sidebar-bottom span.offline:before {
+  background: var(--subtextcolor);
+}
 .sidebar-bottom small {
   display: block;
   font-size: 10px;
-  margin-top: 5px;
+  margin-top: 6px;
+  padding-left: 13px;
 }
 main {
-  background: var(--bgcolor);
-  border-top-left-radius: 10px;
-  box-shadow: inset 1px 1px 0 #ffffff40;
   flex: 1;
   min-width: 0;
   overflow: auto;
-  padding: 32px;
+  padding: 30px 32px;
+  background: var(--bgcolor);
+  border-left: 1px solid var(--hairline);
+  border-top: 1px solid var(--hairline);
   scrollbar-width: thin;
 }
+
+/* Page header */
 .page-heading {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 15px;
-  margin-bottom: 25px;
+  margin-bottom: 22px;
 }
-.page-description {
-  margin: -12px 0 22px;
+.page-heading p {
+  margin-top: 6px;
+  line-height: 1.5;
 }
 .primary {
   background: var(--accent);
   color: white;
   border-color: transparent;
-  box-shadow: 0 2px 4px #1e426d16;
+  box-shadow: 0 1px 2px rgba(39, 105, 188, 0.19);
 }
 .icon-button {
-  padding: 7px;
+  padding: 6px;
   border: 0;
   background: transparent;
   color: var(--subtextcolor);
@@ -237,27 +335,76 @@ main {
   align-items: center;
   flex-wrap: wrap;
 }
+.text-button {
+  background: transparent;
+  border: 0;
+  color: var(--subtextcolor);
+  padding: 4px 5px;
+  font-size: 12px;
+}
+.danger {
+  color: #b55858;
+}
+
+/* Cards */
 .card {
   background: var(--panel);
   border: 1px solid var(--darkborderc);
-  border-radius: 10px;
+  border-radius: 9px;
   overflow: hidden;
-  box-shadow: 0 2px 5px #1e325007;
+  box-shadow:
+    0 2px 5px rgba(30, 50, 80, 0.035),
+    inset 0 1px 0 var(--hairline);
 }
+.notice-banner {
+  font-size: 12px;
+  border: 1px solid var(--darkborderc);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px 14px;
+  margin-bottom: 18px;
+}
+.notice {
+  font-size: 11px;
+  margin-top: 16px;
+  line-height: 1.8;
+}
+.warning {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  color: #aa772b !important;
+  margin-top: 12px !important;
+}
+.warning code {
+  overflow-wrap: anywhere;
+}
+.empty {
+  padding: 22px 20px;
+}
+.disconnected {
+  padding: 22px;
+  margin-bottom: 20px;
+}
+.disconnected p {
+  margin: 6px 0 16px;
+}
+
+/* Overview */
 .health {
   padding: 22px;
 }
 .health-heading {
   display: flex;
-  gap: 13px;
+  gap: 12px;
   align-items: center;
 }
 .health-icon {
   display: grid;
   place-items: center;
   border-radius: 50%;
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   background: #e5f5ec;
   color: #529881;
   flex-shrink: 0;
@@ -274,6 +421,7 @@ main {
   text-align: right;
   font-size: 10px;
   white-space: nowrap;
+  align-self: flex-start;
 }
 .copy-field {
   display: flex;
@@ -289,26 +437,42 @@ main {
 }
 .services {
   display: flex;
-  gap: 16px;
+  gap: 18px;
   flex-wrap: wrap;
-  font-size: 10px;
+  font-size: 11px;
   color: var(--subtextcolor);
   border-top: 1px solid var(--darkborderc);
-  padding-top: 15px;
-  margin-top: 18px;
+  padding-top: 14px;
+  margin-top: 16px;
+}
+.services span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.services span:before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--darkborderc);
+  flex-shrink: 0;
+}
+.services span.on:before {
+  background: var(--ok);
 }
 .storage-summary {
-  margin-top: 20px;
+  margin-top: 18px;
 }
 .storage-metrics {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  padding: 22px;
-  gap: 22px;
+  padding: 18px 20px;
+  gap: 20px;
 }
 .storage-metrics > div + div {
   border-left: 1px solid var(--darkborderc);
-  padding-left: 22px;
+  padding-left: 20px;
 }
 .storage-metrics span {
   font-size: 11px;
@@ -316,9 +480,9 @@ main {
 }
 .storage-metrics strong {
   display: block;
-  font-size: 25px;
+  font-size: 24px;
   font-weight: 600;
-  margin-top: 9px;
+  margin-top: 7px;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.5px;
 }
@@ -335,42 +499,45 @@ summary small {
 }
 .storage-summary details {
   border-top: 1px solid var(--darkborderc);
-  padding: 12px 22px;
+  padding: 11px 20px;
 }
 .storage-summary details p {
-  font-size: 10px;
-  margin: 12px 0 3px;
+  font-size: 11px;
+  margin: 10px 0 3px;
+}
+dl {
+  margin: 10px 0 0;
 }
 dl div {
   display: flex;
   justify-content: space-between;
   color: var(--subtextcolor);
-  padding: 5px 0;
+  padding: 4px 0;
 }
 dd {
   margin: 0;
+  font-variant-numeric: tabular-nums;
 }
 .section-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 22px 0 12px;
+  margin: 22px 0 10px;
+}
+.section-heading h2 {
+  font-size: 13px;
 }
 .section-heading h2 small {
-  margin-left: 8px;
+  margin-left: 6px;
+  font-weight: 400;
 }
-.text-button {
-  background: transparent;
-  border: 0;
-  color: var(--subtextcolor);
-  padding: 5px;
-  font-size: 12px;
-}
+
+/* Device rows */
 .device-row {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 16px 18px;
+  padding: 14px 16px;
   border-bottom: 1px solid var(--darkborderc);
 }
 .device-row:last-child {
@@ -379,6 +546,16 @@ dd {
 .device-row > div {
   min-width: 0;
   flex: 1;
+}
+.device-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: var(--input);
+  color: var(--subtextcolor);
+  flex-shrink: 0;
 }
 .device-row strong {
   font-size: 13px;
@@ -403,44 +580,16 @@ dd {
   background: var(--input);
   color: var(--subtextcolor);
 }
-.danger {
-  color: #b55858;
-}
-.empty {
-  padding: 24px;
-}
-.notice {
-  font-size: 11px;
-  margin-top: 17px;
-}
-.notice-banner {
-  font-size: 12px;
-  border: 1px solid var(--darkborderc);
-  border-radius: 8px;
-  background: var(--panel);
-  padding: 12px;
-  margin-bottom: 18px;
-}
-.warning {
-  display: flex;
-  gap: 6px;
-  color: #aa772b !important;
-  margin-top: 12px !important;
-}
-.disconnected {
-  padding: 22px;
-  margin-bottom: 20px;
-}
-.disconnected p {
-  margin: 8px 0 18px;
-}
+
+/* Settings groups */
 .settings-group {
   padding: 0;
   min-width: 0;
-  margin: 0 0 18px;
+  margin: 0 0 16px;
+  border: 1px solid var(--darkborderc);
 }
 .setting {
-  padding: 20px;
+  padding: 18px 20px;
   border-bottom: 1px solid var(--darkborderc);
 }
 .setting:last-child {
@@ -451,30 +600,43 @@ dd {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  min-height: 24px;
 }
 .setting p {
-  margin-top: 7px;
+  margin-top: 6px;
 }
 .setting > .actions {
   margin-top: 12px;
 }
 .setting > label {
-  margin-top: 13px;
+  margin-top: 12px;
 }
-.setting details {
-  margin-top: 18px;
-  padding-top: 14px;
+.setting-heading + label {
+  margin-top: 8px;
+}
+.setting > details {
+  margin-top: 16px;
+  padding-top: 12px;
   border-top: 1px solid var(--darkborderc);
 }
 .setting details label {
-  margin-top: 16px;
+  margin-top: 14px;
 }
 .setting details .text-button {
-  margin-top: 8px;
+  margin-top: 6px;
 }
-.setting details label + label {
-  margin-top: 18px;
+.tunnel-output {
+  max-height: 260px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 10px;
+  border: 1px solid var(--darkborderc);
+  border-radius: 6px;
+  background: var(--input);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.6;
 }
 .switch {
   position: relative;
@@ -531,28 +693,27 @@ dd {
 .form-footer p {
   font-size: 11px;
 }
-.form-footer .primary {
-  white-space: nowrap;
-}
+
+/* Dialogs */
 dialog {
   border: 1px solid var(--darkborderc);
-  border-radius: 14px;
+  border-radius: 12px;
   background: #f8fbff;
   color: var(--textcolor);
-  width: min(440px, calc(100vw - 40px));
-  padding: 28px;
-  box-shadow: 0 25px 80px #18283d50;
+  width: min(420px, calc(100vw - 40px));
+  padding: 26px;
+  box-shadow: 0 22px 60px rgba(23, 40, 64, 0.3);
 }
 dialog::backdrop {
-  background: #25324755;
+  background: rgba(48, 61, 80, 0.3);
   backdrop-filter: blur(5px);
 }
 dialog h2 {
-  font-size: 20px;
+  font-size: 18px;
   margin-right: 24px;
 }
 dialog p {
-  margin: 12px 0 18px;
+  margin: 10px 0 16px;
 }
 .dialog-close {
   position: absolute;
@@ -563,14 +724,14 @@ dialog p {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 22px;
+  margin-top: 20px;
 }
 .qr {
   background: white;
   border-radius: 8px;
   padding: 12px;
-  margin: 18px auto;
-  width: 260px;
+  margin: 16px auto;
+  width: 240px;
   max-width: 100%;
 }
 .qr svg {
@@ -578,28 +739,43 @@ dialog p {
   width: 100%;
   height: auto;
 }
+
+/* macOS keeps the vibrancy sidebar without the Windows selection bar. */
 .mac aside {
   background: rgba(228, 235, 246, 0.6);
 }
+.mac main {
+  border-left-color: rgba(167, 172, 186, 0.25);
+}
 .mac nav button.active {
-  background: #426eab25;
+  background: rgba(53, 103, 160, 0.14);
+  box-shadow: none;
 }
 .mac nav button.active:before {
   display: none;
 }
+
 @media (prefers-color-scheme: dark) {
   :root {
     --textcolor: #eef4ff;
     --subtextcolor: #b7c8dc;
     --darkborderc: rgba(189, 210, 240, 0.16);
-    --bgcolor: rgba(20, 29, 44, 0.8);
-    --panel: rgba(32, 46, 67, 0.75);
+    --shell: rgba(17, 25, 40, 0.32);
+    --side: rgba(17, 29, 47, 0.78);
+    --bgcolor: rgba(20, 29, 44, 0.82);
+    --hairline: rgba(199, 219, 244, 0.1);
+    --panel: rgba(32, 46, 67, 0.72);
     --input: rgba(16, 29, 47, 0.45);
-    --side: rgba(17, 29, 47, 0.68);
+    --navactive: rgba(132, 175, 229, 0.2);
+    --captionhover: rgba(255, 255, 255, 0.09);
     --accent: #579be7;
+    --ok: #78ceb1;
   }
   .mac aside {
     background: var(--side);
+  }
+  .mac nav button.active {
+    background: var(--navactive);
   }
   .health-icon {
     background: #284e43;
@@ -609,8 +785,14 @@ dialog p {
     background: #314d43;
     color: #92d5ba;
   }
+  .primary {
+    box-shadow: none;
+  }
   dialog {
     background: #1d2b3d;
+  }
+  dialog::backdrop {
+    background: rgba(8, 15, 28, 0.45);
   }
   option {
     background: #1d2b3d;
@@ -618,24 +800,31 @@ dialog p {
   .danger {
     color: #ef9a9a;
   }
+  .warning {
+    color: #e2b461 !important;
+  }
+  .switch span {
+    background: #4d5b6e;
+  }
 }
 @media (prefers-reduced-transparency: reduce) {
   :root {
+    --shell: #eaf0f7;
+    --side: #eaf0f7;
     --bgcolor: #f8fafc;
     --panel: #fff;
-    --side: #eaf0f7;
-  }
-  .app-shell {
-    background: #eaf0f7;
+    --hairline: rgba(103, 125, 154, 0.16);
   }
   dialog::backdrop {
     backdrop-filter: none;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bgcolor: #182436;
-      --panel: #24344a;
+      --shell: #172436;
       --side: #172436;
+      --bgcolor: #1e2c3e;
+      --panel: #24344a;
+      --hairline: rgba(189, 210, 240, 0.12);
     }
   }
 }
@@ -643,18 +832,24 @@ dialog p {
   :root {
     --textcolor: CanvasText;
     --subtextcolor: CanvasText;
+    --shell: Canvas;
+    --side: Canvas;
     --bgcolor: Canvas;
     --panel: Canvas;
-    --side: Canvas;
     --darkborderc: CanvasText;
+    --hairline: CanvasText;
     --input: Canvas;
+    --navactive: Canvas;
+    --captionhover: Highlight;
     --accent: Highlight;
+    --ok: CanvasText;
   }
   .primary {
     color: HighlightText;
   }
   .pill,
-  .health-icon {
+  .health-icon,
+  .device-icon {
     background: Canvas;
     color: CanvasText;
   }
@@ -664,18 +859,18 @@ dialog p {
 }
 @media (max-width: 760px) {
   aside {
-    width: 165px;
-    padding: 25px 10px 18px;
+    width: 164px;
+    padding: 22px 8px 16px;
   }
   main {
-    padding: 25px 20px;
+    padding: 24px 20px;
   }
   .storage-metrics {
-    padding: 18px;
-    gap: 16px;
+    padding: 16px;
+    gap: 14px;
   }
   .storage-metrics > div + div {
-    padding-left: 16px;
+    padding-left: 14px;
   }
   .storage-metrics strong {
     font-size: 21px;
@@ -684,11 +879,12 @@ dialog p {
     padding-left: 5px;
   }
   .identity img {
-    width: 30px;
+    width: 28px;
+    height: 28px;
   }
   nav button {
     gap: 8px;
-    padding: 11px 9px;
+    padding: 10px 9px;
   }
   .uptime {
     display: none;
@@ -699,5 +895,3 @@ dialog p {
     transition: none !important;
   }
 }
-
-.tunnel-output { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8rem; }

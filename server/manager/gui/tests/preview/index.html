@@ -4,6 +4,29 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>RisuNest Sync · 구현 화면 검증</title>
+    <style>
+      /* Synthetic desktop approximating the native acrylic backdrop. */
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        background: linear-gradient(130deg, #e2eaf5, #b8cde8 50%, #92b8db);
+      }
+      #app {
+        height: 100dvh;
+        backdrop-filter: blur(32px) saturate(125%);
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: linear-gradient(135deg, #233047, #273f61, #254b67);
+        }
+      }
+      body[data-wallpaper="bright"] {
+        background: linear-gradient(135deg, #fff 10%, #f8e5cd 50%, #eff5ff);
+      }
+      body[data-wallpaper="dark"] {
+        background: linear-gradient(135deg, #050b15, #151626 45%, #122338);
+      }
+    </style>
   </head>
   <body>
     <div id="app"></div>

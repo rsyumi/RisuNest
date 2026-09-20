@@ -373,8 +373,11 @@ pub fn run() {
                     _ => (),
                 })
                 .build(app)?;
-            if !tray {
-                if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window("main") {
+                // The frontend draws the title bar over the acrylic backdrop on Windows.
+                #[cfg(windows)]
+                window.set_decorations(false)?;
+                if !tray {
                     window.show()?;
                 }
             }

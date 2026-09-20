@@ -13,6 +13,7 @@
   import {
     native,
     message,
+    updatePhase,
     type Backend,
     type Status,
     type Environment,
@@ -21,6 +22,7 @@
   import Overview from "./Overview.svelte";
   import Connections from "./Connections.svelte";
   import Network from "./Network.svelte";
+  import Titlebar from "./Titlebar.svelte";
   import type { NetworkSettings } from "./api";
   import logo from "./logo.svg";
   let { backend = native }: { backend?: Backend } = $props();
@@ -41,12 +43,33 @@
   let pendingPage = "";
   let updating = $state(false);
   let dialogElement: HTMLDialogElement;
+  // The webview draws the title bar where the OS frame is hidden (Windows) or overlaid (macOS).
+  const titlebar: "windows" | "macos" | null = /Windows/.test(navigator.userAgent)
+    ? "windows"
+    : /Mac/.test(navigator.userAgent)
+      ? "macos"
+      : null;
   let automaticUpdateRetryAfter = 0;
   const navigation = [
-    { id: "overview", label: "개요", icon: LayoutDashboard },
-    { id: "devices", label: "기기", icon: MonitorSmartphone },
-    { id: "connection", label: "연결", icon: Link },
-    { id: "settings", label: "실행 설정", icon: SlidersHorizontal },
+    { id: "overview", label: "개요", icon: LayoutDashboard, description: "" },
+    {
+      id: "devices",
+      label: "기기",
+      icon: MonitorSmartphone,
+      description: "이 라이브러리에 등록된 기기를 관리합니다.",
+    },
+    {
+      id: "connection",
+      label: "연결",
+      icon: Link,
+      description: "고정 주소와 임시 주소, 주소 레지스트리를 설정합니다.",
+    },
+    {
+      id: "settings",
+      label: "실행 설정",
+      icon: SlidersHorizontal,
+      description: "서버 실행 상태와 로그인 시 자동 실행 여부를 관리합니다.",
+    },
   ];
   const current = $derived(navigation.find((n) => n.id === page)!);
   let refreshSequence = 0;
@@ -321,7 +344,9 @@
   }
 </script>
 
-<div class="app-shell" class:mac={environment?.platform === "macos"}>
+<div class="app-shell" class:mac={titlebar === "macos"}>
+  {#if titlebar}<Titlebar platform={titlebar} />{/if}
+  <div class="body">
   <aside>
     <div class="identity">
       <img src={logo} alt="RisuNest" />
@@ -333,18 +358,21 @@
           class:active={page === item.id}
           aria-current={page === item.id ? "page" : undefined}
           onclick={() => navigate(item.id)}
-          ><item.icon size={19} />{item.label}</button
+          ><item.icon size={17} />{item.label}</button
         >{/each}
     </nav>
     <div class="sidebar-bottom">
       <span class:offline={!connected}
-        >● {connected ? "로컬 서버 연결됨" : "서버 연결 안 됨"}</span
+        >{connected ? "로컬 서버 연결됨" : "서버 연결 안 됨"}</span
       ><small>RisuNest Sync · 0.1</small>
     </div>
   </aside>
   <main>
     <header class="page-heading">
-      <h1>{current.label}</h1>
+      <div>
+        <h1>{current.label}</h1>
+        {#if current.description}<p>{current.description}</p>{/if}
+      </div>
       <div class="actions">
         <button
           class="icon-button"
@@ -382,12 +410,9 @@
           showDevices={() => (page = "devices")}
         />
       {:else if page === "devices"}
-        <p class="page-description">
-          이 라이브러리에 등록된 기기를 관리합니다.
-        </p>
         <div class="card device-list">
           {#each status.devices as device}<div class="device-row">
-              <MonitorSmartphone size={21} />
+              <span class="device-icon"><MonitorSmartphone size={18} /></span>
               <div>
                 <strong>{device.name || device.id.slice(0, 12)}</strong><small
                   >{device.id}</small
@@ -416,14 +441,11 @@
         />{/if}
     {/if}
     {#if page === "settings"}
-      <p class="page-description">
-        서버 실행 상태와 로그인 시 자동 실행 여부를 관리합니다.
-      </p>
       <section class="card settings-group">
         <div class="setting">
           <div class="setting-heading">
             <h2>Sync 업데이트</h2>
-            <span class="pill">{environment?.updateStatus.phase ?? "idle"}</span>
+            <span class="pill">{updatePhase(environment?.updateStatus.phase ?? "idle")}</span>
           </div>
           <label
             >업데이트 정책<select
@@ -520,6 +542,7 @@
       </p>
     {/if}
   </main>
+  </div>
 </div>
 <dialog
   bind:this={dialogElement}
