@@ -149,6 +149,11 @@ describe('RisuNestDataHealth', () => {
         )
         expect(target.querySelectorAll('[data-data-health-group]')).toHaveLength(2)
         expect(target.querySelectorAll('[data-data-health-item]')).toHaveLength(2)
+        const groups = [...target.querySelectorAll('[data-data-health-group]')].map(
+            (group) => group.textContent ?? '',
+        )
+        expect(groups[0]).toContain(strings.severityBlockingHelp)
+        expect(groups[1]).toContain(strings.severityDegradedHelp)
     })
 
     it('says nothing has been checked before the first scan', async () => {
@@ -169,6 +174,28 @@ describe('RisuNestDataHealth', () => {
         await settle()
         expect(maintenance.scanNativeDataHealth).toHaveBeenCalledOnce()
         expect(target.querySelectorAll('[data-data-health-group]')).toHaveLength(2)
+        // The repair choices follow the new diagnosis without leaving the screen.
+        expect(maintenance.planNativeDataHealthRepair).toHaveBeenCalled()
+        expect(target.querySelectorAll('[data-data-health-choice]')).toHaveLength(1)
+    })
+
+    it('shows the running check beside the summary instead of only on the button', async () => {
+        let release: (result: DataHealthResult) => void = () => {}
+        maintenance.scanNativeDataHealth.mockImplementation(
+            () => new Promise<DataHealthResult>((resolve) => { release = resolve }),
+        )
+        const target = await setup(null)
+        const button = [...target.querySelectorAll('button')].find(
+            (candidate) => candidate.textContent?.trim() === strings.quickScan,
+        )
+        button?.click()
+        await settle()
+        const progress = target.querySelector('[data-data-health-progress]')
+        expect(progress?.textContent).toContain(strings.quickScanRunning)
+        expect(progress?.querySelector('[role="progressbar"]')).not.toBeNull()
+        release(damaged)
+        await settle()
+        expect(target.querySelector('[data-data-health-progress]')).toBeNull()
     })
 
     it('offers to continue a full check that stopped before it finished', async () => {
@@ -237,19 +264,41 @@ describe('RisuNestDataHealth', () => {
     })
 
 
-    it('offers one answer per problem and previews what it will do', async () => {
+    it('offers one answer per problem and counts what is selected', async () => {
         const target = await setup(damaged)
         const choices = target.querySelectorAll('[data-data-health-choice]')
         expect(choices).toHaveLength(1)
         expect(choices[0].textContent).toContain(strings.actionDropReference)
-        const preview = target.querySelector('[data-data-health-preview]')
-        expect(preview?.textContent).toContain(strings.previewTitle)
-        expect(preview?.textContent).toContain(
-            strings.previewAnswered.replace('{0}', '1').replace('{1}', '2'),
+        expect(target.querySelector('[data-data-health-preview]')).toBeNull()
+        expect(
+            target.querySelector('[data-data-health-apply]')?.textContent,
+        ).toContain(strings.repairSelected.replace('{0}', '1'))
+        expect(
+            target.querySelector('[data-data-health-apply]')?.textContent,
+        ).toContain(strings.repairSnapshotHelp.replace('{0}', '1'))
+    })
+
+    it('clears and restores every answer from the select-all box', async () => {
+        const target = await setup(damaged)
+        const selectAll = target.querySelector<HTMLInputElement>(
+            '[data-data-health-select-all] input[type="checkbox"]',
         )
-        expect(preview?.textContent).toContain(
-            strings.previewDiscards.replace('{0}', '1'),
+        expect(selectAll?.checked).toBe(true)
+        selectAll?.click()
+        await settle()
+        expect(
+            target.querySelector('[data-data-health-select-all]')?.textContent,
+        ).toContain(strings.repairSelected.replace('{0}', '0'))
+        const apply = [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+            (button) => button.textContent?.trim() === strings.repairApply,
         )
+        expect(apply?.disabled).toBe(true)
+        selectAll?.click()
+        await settle()
+        expect(
+            target.querySelector('[data-data-health-select-all]')?.textContent,
+        ).toContain(strings.repairSelected.replace('{0}', '1'))
+        expect(apply?.disabled).toBe(false)
     })
 
     it('applies the selection and shows the diagnosis of the repaired library', async () => {

@@ -45,6 +45,8 @@ vi.mock('src/ts/storage/risuSaveFileRoute', () => ({
 }))
 vi.mock('src/ts/storage/nativeFileJobManager', () => ({
     cancelActiveNativeFileOperation: vi.fn(),
+    dismissNativeFileOperationOutcome: vi.fn(),
+    nativeFileOperationOutcomeShown: vi.fn(() => false),
 }))
 vi.mock('src/ts/gui/nativeFileJobProgress', () => ({
     nativeFileJobProgressText: vi.fn(() => 'Writing backup'),

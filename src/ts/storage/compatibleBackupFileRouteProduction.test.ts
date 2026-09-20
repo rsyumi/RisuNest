@@ -121,7 +121,7 @@ describe('compatibility backup production picker', () => {
                 'export',
                 `compatibility-backup-export:${target}`,
                 expect.any(Function),
-                { format: 'library-backup' },
+                { presentation: 'dialog', format: 'library-backup' },
             )
             expect(mocks.runExport).toHaveBeenCalledWith(
                 mocks.runtime,

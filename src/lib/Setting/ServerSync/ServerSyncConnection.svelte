@@ -89,7 +89,7 @@
   const storageHelp = $derived(
     cacheUsage
       ? `${text.management.cache} ${bytes(cacheUsage.totalBytes)} · ${text.management.reclaimable} ${bytes(cacheUsage.reclaimableBytes)}`
-      : text.management.scope,
+      : undefined,
   );
   $effect(() => {
     if (!initialNavigation || appliedNavigation === initialNavigation) return;

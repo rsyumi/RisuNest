@@ -182,4 +182,5 @@ export const exportRisuSaveFromSystemPicker = (
                 },
                 productionDependencies,
             ),
+        { presentation: 'dialog', format: 'risu-save' },
     )

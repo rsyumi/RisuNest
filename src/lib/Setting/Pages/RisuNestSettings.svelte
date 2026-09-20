@@ -1,6 +1,12 @@
 <script lang="ts">
+    import { get } from 'svelte/store'
     import { language } from 'src/lang'
     import { risuNestInlaySettingsItems, risuNestStreamingSettingsItems } from 'src/ts/setting/risuNestSettingsData'
+    import {
+        RISUNEST_SETTINGS_TABS,
+        risuNestSettingsTabRequest,
+        type RisuNestSettingsTab,
+    } from 'src/ts/setting/risuNestSettingsTabs'
     import { isTauri, isTauriAndroid, isTauriIOS } from 'src/ts/platform'
     import RisuNestSettingRows from '../RisuNest/RisuNestSettingRows.svelte'
     import RisuNestPerformanceSettings from './RisuNestPerformanceSettings.svelte'
@@ -16,63 +22,107 @@
     import RisuNestLogViewer from './RisuNestLogViewer.svelte'
     import ServerSyncSettings from './ServerSyncSettings.svelte'
     import RisuNestUpdateSettings from './RisuNestUpdateSettings.svelte'
+    import ExternalStorageSettings from '../ExternalStorage/ExternalStorageSettings.svelte'
 
-    const sections: { id: string; label: string }[] = [
-        { id: 'risunest-perf', label: language.risuNest.perf.title },
-        { id: 'risunest-streaming', label: language.risuNest.streaming.title },
-        { id: 'risunest-inlay', label: language.risuNest.inlay.title },
-        { id: 'risunest-plugin-data', label: language.risuNest.pluginData.title },
-        ...(isTauri ? [{ id: 'risunest-local-data', label: language.risuNest.localData.title }] : []),
-        ...(isTauri ? [{ id: 'risunest-update', label: language.risuNest.update.title }] : []),
-        ...(isTauri ? [{ id: 'risunest-server-sync', label: language.risuNest.serverSync.title }] : []),
-        ...(isTauri ? [{ id: 'risunest-storage', label: language.risuNest.storage.title }] : []),
-        ...(isTauri ? [{ id: 'risunest-data-health', label: language.risuNest.dataHealth.title }] : []),
-        { id: 'risunest-backup', label: language.risuNest.backup.title },
-        ...(isTauriAndroid || isTauriIOS ? [{ id: 'risunest-platform', label: language.risuNest.platform.title }] : []),
-        ...(isTauri ? [{ id: 'risunest-diag', label: language.risuNest.diag.title }] : []),
-    ]
+    const tabLabels: Record<RisuNestSettingsTab, string> = {
+        settings: language.risuNest.tabs.settings,
+        storage: language.risuNest.tabs.storage,
+        sync: language.risuNest.tabs.sync,
+        'plugin-data': language.risuNest.tabs.pluginData,
+    }
+
+    // A screen that sends the reader here names the tab; otherwise the page opens on the first one.
+    let activeTab: RisuNestSettingsTab = $state(get(risuNestSettingsTabRequest) ?? 'settings')
+    let tabButtons: HTMLButtonElement[] = $state([])
+
+    $effect(() => {
+        const requested = $risuNestSettingsTabRequest
+        if (!requested) return
+        activeTab = requested
+        risuNestSettingsTabRequest.set(null)
+    })
 
     function jumpTo(id: string): void {
         document.getElementById(id)?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    }
+
+    function moveTab(event: KeyboardEvent, index: number): void {
+        const last = RISUNEST_SETTINGS_TABS.length - 1
+        let next: number
+        if (event.key === 'ArrowRight') next = index === last ? 0 : index + 1
+        else if (event.key === 'ArrowLeft') next = index === 0 ? last : index - 1
+        else if (event.key === 'Home') next = 0
+        else if (event.key === 'End') next = last
+        else return
+        event.preventDefault()
+        activeTab = RISUNEST_SETTINGS_TABS[next]
+        tabButtons[next]?.focus()
     }
 </script>
 
 <div class="@container w-full max-w-3xl">
     <h1 class="text-2xl font-bold">{language.risuNest.menuTitle}</h1>
-    <nav class="-mx-4 mt-3 flex gap-1.5 overflow-x-auto px-4 pb-1 [scrollbar-width:none] @xl:mx-0 @xl:flex-wrap @xl:px-0" aria-label={language.risuNest.sectionNav}>
-        {#each sections as section (section.id)}
-            <button type="button" class="shrink-0 rounded-full border border-darkborderc px-2.5 py-0.5 text-xs text-textcolor2 transition-colors duration-200 hover:bg-selected hover:text-textcolor focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected" onclick={() => jumpTo(section.id)}>{section.label}</button>
+    <div
+        role="tablist"
+        aria-label={language.risuNest.tabList}
+        class="-mx-4 mt-3 flex overflow-x-auto border-b border-darkborderc px-4 [scrollbar-width:none] @xl:mx-0 @xl:px-0"
+    >
+        {#each RISUNEST_SETTINGS_TABS as tab, index (tab)}
+            {@const active = activeTab === tab}
+            <button
+                bind:this={tabButtons[index]}
+                type="button"
+                role="tab"
+                id="risunest-tab-{tab}"
+                data-risunest-tab={tab}
+                aria-selected={active}
+                aria-controls="risunest-panel-{tab}"
+                tabindex={active ? 0 : -1}
+                class="-mb-px shrink-0 border-b-2 px-3 py-2 text-sm whitespace-nowrap transition-colors duration-200 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected {active ? 'border-textcolor font-semibold text-textcolor' : 'border-transparent text-textcolor2 hover:text-textcolor'}"
+                onclick={() => { activeTab = tab }}
+                onkeydown={(event) => moveTab(event, index)}
+            >{tabLabels[tab]}</button>
         {/each}
-    </nav>
-    <RisuNestPerformanceSettings />
-    <RisuNestSettingRows items={risuNestStreamingSettingsItems} />
-    <RisuNestSettingRows items={risuNestInlaySettingsItems} />
-    <RisuNestInlayInventory />
-    <RisuNestPluginData />
-    {#if isTauri}
-        <RisuNestLocalData />
-    {/if}
-    {#if isTauri}
-        <RisuNestUpdateSettings />
-    {/if}
-    {#if isTauri}
-        <section id="risunest-server-sync" class="scroll-mt-4"><ServerSyncSettings /></section>
-    {/if}
-    {#if isTauri}
-        <RisuNestStorageDashboard />
-        <RisuNestDataHealth onOpenUnusedImages={() => jumpTo('risunest-storage')} />
-    {/if}
-    <RisuNestBackupRestore />
-    {#if isTauri && !isTauriAndroid && !isTauriIOS}
-        <RisuNestAppImage />
-    {/if}
-    {#if isTauriIOS}
-        <RisuNestIOSPlatform />
-    {/if}
-    {#if isTauriAndroid}
-        <RisuNestAndroidPlatform />
-    {/if}
-    {#if isTauri}
-        <RisuNestLogViewer />
-    {/if}
+    </div>
+    <div role="tabpanel" id="risunest-panel-{activeTab}" aria-labelledby="risunest-tab-{activeTab}" data-risunest-panel={activeTab}>
+        {#if activeTab === 'settings'}
+            <RisuNestPerformanceSettings />
+            <RisuNestSettingRows items={risuNestStreamingSettingsItems} />
+            <RisuNestSettingRows items={risuNestInlaySettingsItems} />
+            {#if isTauri}
+                <RisuNestUpdateSettings />
+            {/if}
+            {#if isTauri && !isTauriAndroid && !isTauriIOS}
+                <RisuNestAppImage />
+            {/if}
+            {#if isTauriIOS}
+                <RisuNestIOSPlatform />
+            {/if}
+            {#if isTauriAndroid}
+                <RisuNestAndroidPlatform />
+            {/if}
+            {#if isTauri}
+                <RisuNestLogViewer />
+            {/if}
+        {:else if activeTab === 'storage'}
+            {#if isTauri}
+                <RisuNestStorageDashboard />
+            {/if}
+            <RisuNestInlayInventory />
+            {#if isTauri}
+                <RisuNestDataHealth onOpenUnusedImages={() => jumpTo('risunest-storage')} />
+            {/if}
+            <RisuNestBackupRestore />
+        {:else if activeTab === 'sync'}
+            {#if isTauri}
+                <section id="risunest-server-sync" class="scroll-mt-4"><ServerSyncSettings /></section>
+            {/if}
+            <ExternalStorageSettings />
+            {#if isTauri}
+                <RisuNestLocalData />
+            {/if}
+        {:else}
+            <RisuNestPluginData />
+        {/if}
+    </div>
 </div>

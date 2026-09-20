@@ -266,15 +266,46 @@ describe('RisuNestStorageDashboard', () => {
         await vi.waitFor(() =>
             expect(target.querySelectorAll('[data-storage-gc-row]')).toHaveLength(4),
         )
-        const rows = [...target.querySelectorAll('[data-storage-gc-row]')].map(
+        // The files to delete are listed first; the kept ones sit behind their own fold.
+        const deletable = [...target.querySelectorAll('[data-storage-gc-list] [data-storage-gc-row]')].map(
             (row) => row.textContent ?? '',
         )
-        expect(rows[0]).toContain('Can be deleted')
-        expect(rows[1]).toContain('kept so a fix can be undone')
-        expect(rows[2]).toContain('in use')
-        expect(rows[3]).toContain('Too new to delete yet')
+        expect(deletable).toHaveLength(1)
+        expect(deletable[0]).toContain('Can be deleted')
         expect(target.querySelector('[data-storage-gc-list]')?.textContent).toContain(
             'and 7 more',
+        )
+        const kept = target.querySelector('[data-storage-gc-kept]')
+        expect(kept?.textContent).toContain('3 files kept')
+        expect(kept?.hasAttribute('open')).toBe(false)
+        const keptRows = [...kept!.querySelectorAll('[data-storage-gc-row]')].map(
+            (row) => row.textContent ?? '',
+        )
+        expect(keptRows[0]).toContain('kept so a fix can be undone')
+        expect(keptRows[1]).toContain('in use')
+        expect(keptRows[2]).toContain('Too new to delete yet')
+    })
+
+    it('shows the search as a progress panel while the cleanup preview runs', async () => {
+        const target = setup()
+        let release: (value: unknown) => void = () => {}
+        maintenance.previewNativePersistentAssetGc.mockImplementation(
+            () => new Promise((resolve) => { release = resolve }),
+        )
+        const find = () =>
+            [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+                (candidate) => candidate.textContent?.trim() === 'Find',
+            )
+        await vi.waitFor(() => expect(find()).toBeDefined())
+        find()!.click()
+        await vi.waitFor(() =>
+            expect(target.querySelector('[data-storage-gc-progress]')?.textContent).toContain(
+                'Looking for unused images',
+            ),
+        )
+        release({ candidateCount: 0, candidateBytes: 0, deletedCount: 0, deletedBytes: 0, blockers: [], candidates: [] })
+        await vi.waitFor(() =>
+            expect(target.querySelector('[data-storage-gc-progress]')).toBeNull(),
         )
     })
 
@@ -282,7 +313,7 @@ describe('RisuNestStorageDashboard', () => {
         const target = setup()
         await vi.waitFor(() => expect(target.textContent).toContain('Unused images'))
         expect(target.textContent).toContain(
-            'This is the only place a file is actually deleted.',
+            'Clearing a broken link in the data check does not delete the file.',
         )
     })
 

@@ -3,18 +3,36 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 const settingsRawSource = readFileSync('src/lib/Setting/Settings.svelte', 'utf8')
 const pageRawSource = readFileSync('src/lib/Setting/Pages/RisuNestSettings.svelte', 'utf8')
+const appRawSource = readFileSync('src/App.svelte', 'utf8')
 const backupRestoreRawSource = readFileSync('src/lib/Setting/Pages/RisuNestBackupRestore.svelte', 'utf8')
 const storageRawSource = readFileSync('src/lib/Setting/Pages/RisuNestStorageDashboard.svelte', 'utf8')
 const tauriLibRawSource = readFileSync('src-tauri/src/lib.rs', 'utf8')
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
+import { RISUNEST_SETTINGS_TABS } from 'src/ts/setting/risuNestSettingsTabs'
 
 const normalizeNewlines = (source: string) => source.replace(/\r\n?/g, '\n')
 const settingsSource = normalizeNewlines(settingsRawSource)
 const pageSource = normalizeNewlines(pageRawSource)
+const appSource = normalizeNewlines(appRawSource)
 const backupRestoreSource = normalizeNewlines(backupRestoreRawSource)
 const storageSource = normalizeNewlines(storageRawSource)
 const tauriLibSource = normalizeNewlines(tauriLibRawSource)
+
+/** The source between two markers, so ordering can be asserted within one tab panel. */
+function between(source: string, start: string, end: string): string {
+    const from = source.indexOf(start)
+    const to = source.indexOf(end, from)
+    expect(from).toBeGreaterThanOrEqual(0)
+    expect(to).toBeGreaterThan(from)
+    return source.slice(from, to)
+}
+
+function inOrder(source: string, markers: string[]): void {
+    const positions = markers.map((marker) => source.indexOf(marker))
+    expect(positions.every((position) => position >= 0), markers.join(', ')).toBe(true)
+    expect(positions).toEqual([...positions].sort((left, right) => left - right))
+}
 
 describe('RisuNest settings navigation', () => {
     it('places RisuNest before plugin-added entries', () => {
@@ -38,47 +56,71 @@ describe('RisuNest settings navigation', () => {
         expect(settingsSource).not.toContain('$SettingsMenuIndex === 18')
     })
 
-    it('renders final RisuNest groups in order with platform gates', () => {
-        const groups = [
-            'RisuNestPerformanceSettings',
-            'RisuNestSettingRows',
-            'RisuNestStorageDashboard',
-            'RisuNestBackupRestore',
-            'RisuNestAndroidPlatform',
-            'RisuNestLogViewer',
-        ]
-        const positions = groups.map((group) =>
-            pageSource.lastIndexOf(`<${group}`),
-        )
-
-        expect(positions.every((position) => position >= 0)).toBe(true)
-        expect(positions).toEqual(
-            [...positions].sort((left, right) => left - right),
-        )
-        expect(pageSource).toContain(
-            '{#if isTauri}\n        <RisuNestStorageDashboard />',
-        )
-        expect(pageSource).toContain(
-            '{#if isTauriAndroid}\n        <RisuNestAndroidPlatform />',
-        )
-        expect(pageSource).toContain(
-            '{#if isTauri}\n        <RisuNestLogViewer />',
-        )
+    it('offers four tabs in order, each named in both shipped languages', () => {
+        expect(RISUNEST_SETTINGS_TABS).toEqual(['settings', 'storage', 'sync', 'plugin-data'])
+        expect(pageSource).toContain('role="tablist"')
+        expect(pageSource).toContain('role="tab"')
+        expect(pageSource).toContain('aria-selected={active}')
+        expect(pageSource).toContain('role="tabpanel"')
+        for (const translation of [languageEnglish, languageKorean]) {
+            for (const key of ['settings', 'storage', 'sync', 'pluginData'] as const) {
+                expect(translation.risuNest.tabs[key]).toEqual(expect.any(String))
+            }
+            expect(translation.risuNest.tabList).toEqual(expect.any(String))
+        }
     })
 
-    it('offers a section shortcut for every group on the page', () => {
-        for (const id of [
-            'risunest-perf',
-            'risunest-streaming',
-            'risunest-inlay',
-            'risunest-storage',
-            'risunest-backup',
-            'risunest-platform',
-            'risunest-diag',
-        ]) {
-            expect(pageSource).toContain(`'${id}'`)
-        }
-        expect(pageSource).toContain('scrollIntoView')
+    it('groups the settings tab as performance, streaming, attachments, update, platform, diagnostics', () => {
+        const panel = between(pageSource, "{#if activeTab === 'settings'}", "{:else if activeTab === 'storage'}")
+        inOrder(panel, [
+            '<RisuNestPerformanceSettings />',
+            'items={risuNestStreamingSettingsItems}',
+            'items={risuNestInlaySettingsItems}',
+            '<RisuNestUpdateSettings />',
+            '<RisuNestAppImage />',
+            '<RisuNestIOSPlatform />',
+            '<RisuNestAndroidPlatform />',
+            '<RisuNestLogViewer />',
+        ])
+        expect(panel).toContain('{#if isTauri}\n                <RisuNestUpdateSettings />')
+        expect(panel).toContain('{#if isTauriAndroid}\n                <RisuNestAndroidPlatform />')
+        expect(panel).toContain('{#if isTauri}\n                <RisuNestLogViewer />')
+    })
+
+    it('groups the storage tab as storage, stored attachments, data check, backup and restore', () => {
+        const panel = between(pageSource, "{:else if activeTab === 'storage'}", "{:else if activeTab === 'sync'}")
+        inOrder(panel, [
+            '<RisuNestStorageDashboard />',
+            '<RisuNestInlayInventory />',
+            '<RisuNestDataHealth',
+            '<RisuNestBackupRestore />',
+        ])
+        expect(panel).toContain('{#if isTauri}\n                <RisuNestStorageDashboard />')
+        expect(panel).toContain("jumpTo('risunest-storage')")
+    })
+
+    it('groups the sync tab as sync server, external storage, local data', () => {
+        const panel = between(pageSource, "{:else if activeTab === 'sync'}", '{:else}')
+        inOrder(panel, [
+            'id="risunest-server-sync"',
+            '<ExternalStorageSettings />',
+            '<RisuNestLocalData />',
+        ])
+        expect(backupRestoreSource).not.toContain('ExternalStorageSettings')
+    })
+
+    it('keeps plugin data on its own tab', () => {
+        const panel = between(pageSource, '{:else}\n            <RisuNestPluginData />', '{/if}')
+        expect(panel).toContain('<RisuNestPluginData />')
+    })
+
+    it('opens the tab a navigation request names', () => {
+        expect(pageSource).toContain('risuNestSettingsTabRequest')
+        expect(appSource).toContain("openRisuNestSettingsTab('storage')")
+        expect(appSource).toContain("openRisuNestSettingsTab('sync')")
+        expect(appSource.indexOf("openRisuNestSettingsTab('storage')")).toBeLessThan(
+            appSource.indexOf('getElementById(DATA_HEALTH_SECTION_ID)'),
+        )
     })
 })
 
@@ -130,6 +172,11 @@ describe('RisuNest backup and restore layout', () => {
         const remove = storageSource.indexOf('{language.remove}')
         expect(restore).toBeGreaterThanOrEqual(0)
         expect(restore).toBeLessThan(remove)
+    })
+
+    it('lets the shared progress dialog report the RisuSave export', () => {
+        expect(backupRestoreSource).toContain('dismissNativeFileOperationOutcome()')
+        expect(backupRestoreSource).toContain("nativeFileOperationOutcomeShown('export')")
     })
 })
 

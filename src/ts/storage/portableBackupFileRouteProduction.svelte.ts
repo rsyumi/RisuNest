@@ -131,7 +131,7 @@ export async function exportPortableBackupFromSystemPicker(
                 joined.dispose()
             }
         },
-        { format: 'library-backup' },
+        { presentation: 'dialog', format: 'library-backup' },
     ).finally(resumeServerSyncAfterBackup)
 }
 
@@ -183,7 +183,7 @@ export async function exportPortableBackupFromReferenceSource(
                 joined.dispose()
             }
         },
-        { format: 'library-backup' },
+        { presentation: 'dialog', format: 'library-backup' },
     ).finally(resumeServerSyncAfterBackup)
 }
 

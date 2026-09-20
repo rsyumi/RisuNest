@@ -109,6 +109,6 @@ export async function exportCompatibilityBackupFromSystemPicker(
             }
         },
         // Full-library admission prevents sync while the snapshot is captured.
-        { format: 'library-backup' },
+        { presentation: 'dialog', format: 'library-backup' },
     ).finally(resumeServerSyncAfterBackup)
 }

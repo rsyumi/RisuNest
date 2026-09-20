@@ -214,6 +214,10 @@ export type NativeFileJobStage =
     | 'reloading-plugins'
     | 'restarting-app'
     | 'awaiting-reselect'
+    | 'preparing-export'
+    | 'writing-export'
+    | 'publishing-destination'
+    | 'finalizing-export'
 
 export interface NativeImportCounts {
     entriesRead: number
@@ -264,6 +268,23 @@ export function resolveNativeFileJobStage(
         return 'assign-plugin-values'
     }
     if (status.detail) return status.detail.stage
+    // Exports report phases only. The rescue archive keeps the archive wording it always had.
+    if (status.kind.startsWith('export-') && status.kind !== 'export-raw-recovery') {
+        switch (status.phase) {
+            case 'queued':
+            case 'reading-source':
+                return 'preparing-export'
+            case 'writing-export':
+                return 'writing-export'
+            case 'publishing-destination':
+                return 'publishing-destination'
+            case 'finalizing-export':
+            case 'complete':
+                return 'finalizing-export'
+            default:
+                return null
+        }
+    }
     switch (status.phase) {
         case 'reading-source':
             // The common picker admits every backup as a library backup, so the

@@ -315,3 +315,11 @@ export function cancelActiveNativeFileOperation(): void {
 export function dismissNativeFileOperationOutcome(): void {
     nativeFileOperationOutcome.set(null)
 }
+
+/**
+ * Whether the shared dialog is showing how the last operation of this kind ended. Callers that
+ * report outcomes themselves skip their message while it is, so the user reads one account.
+ */
+export function nativeFileOperationOutcomeShown(kind: NativeFileOperationKind): boolean {
+    return get(nativeFileOperationOutcome)?.kind === kind
+}

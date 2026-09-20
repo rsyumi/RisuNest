@@ -1,4 +1,5 @@
 import {
+    allRepairSelection,
     dataHealthDeepFraction,
     groupDataHealthFindings,
     isDataHealthCancellation,
@@ -90,6 +91,16 @@ export function createDataHealthModel(deps: DataHealthDependencies) {
     const finish = (result: DataHealthResult | null) =>
         update({ ...derive(result), candidates: [], selection: [], preview: null })
 
+    /** A scan replaces the diagnosis, so the repair choices are read again for the new one. */
+    const finishScan = async (result: DataHealthResult): Promise<void> => {
+        finish(result)
+        try {
+            await loadPlan()
+        } catch {
+            update({ failed: true })
+        }
+    }
+
     /** Reads what the current diagnosis can be answered with, and preselects the fixed choices. */
     const loadPlan = async (): Promise<void> => {
         if (!state.result || state.result.items.length === 0) return
@@ -110,8 +121,11 @@ export function createDataHealthModel(deps: DataHealthDependencies) {
         let next = resume
         for (;;) {
             const result = await deps.deepScan(next)
+            if (result.deep?.complete || cancelRequested) {
+                await finishScan(result)
+                return
+            }
             finish(result)
-            if (result.deep?.complete || cancelRequested) return
             next = true
         }
     }
@@ -155,7 +169,7 @@ export function createDataHealthModel(deps: DataHealthDependencies) {
             }
         },
         quickScan(): Promise<void> {
-            return start('quick', async () => finish(await deps.scan()))
+            return start('quick', async () => finishScan(await deps.scan()))
         },
         deepScan(resume: boolean): Promise<void> {
             return start('deep', () => runDeep(resume))
@@ -182,6 +196,16 @@ export function createDataHealthModel(deps: DataHealthDependencies) {
                 state.selection,
                 id,
             )
+            update({ selection })
+            try {
+                await refreshPreview(selection)
+            } catch {
+                update({ failed: true })
+            }
+        },
+        /** Chooses one answer for every finding, or clears the selection. */
+        async setAll(on: boolean): Promise<void> {
+            const selection = on ? allRepairSelection(state.candidates) : []
             update({ selection })
             try {
                 await refreshPreview(selection)

@@ -229,8 +229,41 @@
         openValue = (await readPluginDataValue(item)) ?? ''
     }
 
-    async function remove(targets: readonly PluginDataItem[]): Promise<void> {
+    /**
+     * Every deletion is confirmed. Deleting the whole list or everything shown asks a second
+     * time, since one filter change away it is the plugin's entire store.
+     */
+    async function confirmRemoval(
+        targets: readonly PluginDataItem[],
+        bulk: 'all' | 'visible' | null,
+    ): Promise<boolean> {
+        const { alertConfirm } = await import('src/ts/alert')
+        const count = String(targets.length)
+        if (bulk === 'all') {
+            return (
+                (await alertConfirm(strings.deleteAllConfirm.replace('{0}', count))) &&
+                (await alertConfirm(strings.deleteAllConfirmFinal))
+            )
+        }
+        if (bulk === 'visible') {
+            return (
+                (await alertConfirm(strings.deleteVisibleConfirm.replace('{0}', count))) &&
+                (await alertConfirm(strings.deleteVisibleConfirmFinal))
+            )
+        }
+        return alertConfirm(
+            targets.length === 1
+                ? strings.deleteConfirmOne
+                : strings.deleteConfirmSelected.replace('{0}', count),
+        )
+    }
+
+    async function remove(
+        targets: readonly PluginDataItem[],
+        bulk: 'all' | 'visible' | null = null,
+    ): Promise<void> {
         if (targets.length === 0 || busy) return
+        if (!(await confirmRemoval(targets, bulk))) return
         busy = true
         try {
             await deletePluginDataItems(targets)
@@ -500,7 +533,7 @@
                 {#if automaticOnly}
                     <SettingButton variant="secondary" disabled={visible.length === 0 || installedPlugins.length === 0} busy={busy} onclick={reassignVisible}>{strings.reassign}</SettingButton>
                 {/if}
-                <SettingButton variant="danger" disabled={visible.length === 0} busy={busy} onclick={() => remove(visible)}>
+                <SettingButton variant="danger" disabled={visible.length === 0} busy={busy} onclick={() => remove(visible, visible.length === items.length ? 'all' : 'visible')}>
                     {visible.length === items.length
                         ? strings.deleteAll.replace('{0}', String(items.length))
                         : strings.deleteVisible.replace('{0}', String(visible.length))}
@@ -511,7 +544,7 @@
         {#if visible.length === 0}
             <p class="py-8 text-center text-sm text-textcolor2">{strings.empty}</p>
         {:else}
-            <ul class="divide-y divide-darkborderc/55 rounded-md border border-darkborderc">
+            <ul data-plugin-data-list class="max-h-[clamp(24rem,65dvh,52rem)] divide-y divide-darkborderc/55 overflow-y-auto rounded-md border border-darkborderc">
                 {#each visible as item (pluginDataItemId(item))}
                     <li class="flex items-center gap-2 px-3 py-1.5 text-sm" data-plugin-data-row={item.key}>
                         <button type="button" class="min-w-0 flex-1 truncate text-left font-mono hover:text-textcolor" title={strings.openValue} onclick={() => open(item)}>{item.key}</button>

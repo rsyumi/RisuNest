@@ -29,9 +29,10 @@
     } from 'src/ts/storage/nativeFileJobs'
     import {
         cancelActiveNativeFileOperation,
+        dismissNativeFileOperationOutcome,
+        nativeFileOperationOutcomeShown,
     } from 'src/ts/storage/nativeFileJobManager'
     import { nativeFileJobProgressText } from 'src/ts/gui/nativeFileJobProgress'
-    import ExternalStorageSettings from '../ExternalStorage/ExternalStorageSettings.svelte'
 
     let nativeAccountBusy = $state(false)
     let nativePublishController = $state<AbortController | null>(null)
@@ -91,13 +92,16 @@
             }
             return
         }
+        // The export runs behind the shared progress dialog, which reports how it ended.
+        dismissNativeFileOperationOutcome()
         try {
-
             const result = await exportRisuSaveFromSystemPicker()
             if (!result) return
+            // The exclusion report replaces the dialog's plain completion message.
+            dismissNativeFileOperationOutcome()
             alertNormal(formatRisuSaveExportResult(result))
         } catch (error) {
-            showRisuSaveError(error)
+            if (!nativeFileOperationOutcomeShown('export')) showRisuSaveError(error)
         }
     }
 
@@ -255,4 +259,3 @@
         </SettingRow>
     {/if}
 </SettingGroup>
-<ExternalStorageSettings />

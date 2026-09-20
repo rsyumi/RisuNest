@@ -5,6 +5,7 @@
     import SettingButton from '../RisuNest/SettingButton.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
+    import SettingProgress from '../RisuNest/SettingProgress.svelte'
     import { getInlayEncodeOptions, listInlayAssetMetadata } from 'src/ts/process/files/inlays'
     import {
         summarizeInlayAssets,
@@ -157,7 +158,13 @@
                 <SettingRow label={strings.optimize} help={strings.optimizeHelp}>
                     {#snippet below()}
                         {#if optimizing}
-                            <p data-inlay-optimize-progress class="mt-1 text-sm tabular-nums text-textcolor2" role="status" aria-live="polite">{progressText}</p>
+                            <div data-inlay-optimize-progress class="mt-2">
+                                <SettingProgress
+                                    label={strings.optimize}
+                                    detail={progressText}
+                                    fraction={progress.total > 0 ? progress.scanned / progress.total : null}
+                                />
+                            </div>
                         {:else if resultText}
                             <p data-inlay-optimize-result class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{resultText}</p>
                         {/if}

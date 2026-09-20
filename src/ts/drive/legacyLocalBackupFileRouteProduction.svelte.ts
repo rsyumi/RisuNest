@@ -122,4 +122,5 @@ export const exportLegacyLocalBackupFromSystemPicker = (
             onStatus(status)
             options.onStatus?.(status)
         },
-    }, productionDependencies))
+    }, productionDependencies),
+    { presentation: 'dialog', format: 'local-backup' })

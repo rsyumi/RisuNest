@@ -46,7 +46,11 @@
         NativeFileJobActivationCommittedError,
         NativeFileJobError,
     } from "src/ts/storage/nativeFileJobs";
-    import { NativeFileOperationBusyError } from "src/ts/storage/nativeFileJobManager";
+    import {
+        NativeFileOperationBusyError,
+        dismissNativeFileOperationOutcome,
+        nativeFileOperationOutcomeShown,
+    } from "src/ts/storage/nativeFileJobManager";
     import { exportCompatibilityBackupFromSystemPicker } from "src/ts/storage/compatibleBackupFileRouteProduction.svelte";
     import { formatCompatibilityBackupReport } from "src/ts/storage/compatibleBackupReport";
     import type { NativeCompatibilityTarget } from "src/ts/storage/nativeFileJobs";
@@ -140,9 +144,15 @@
             openDataHealthScreen();
     }
 
+    // Exports run behind the shared progress dialog, which reports how they ended.
+    function showExportError(error: unknown): void {
+        if (!nativeFileOperationOutcomeShown("export")) showRisuSaveError(error);
+    }
+
     async function runLocalBackupOperation(
         kind: "import" | "export",
     ): Promise<void> {
+        if (kind === "export") dismissNativeFileOperationOutcome();
         try {
             const result = isTauri
                 ? kind === "import"
@@ -153,6 +163,7 @@
                   : await SaveLocalBackup();
             if (!result || ("mode" in result && result.mode === "legacy"))
                 return;
+            if (isTauri && kind === "export") return;
             const message = result.warningCodes.includes(
                 "source-preserved-repair-required",
             )
@@ -166,17 +177,20 @@
                     : message,
             );
         } catch (error) {
-            showRisuSaveError(error);
+            if (kind === "export") showExportError(error);
+            else showRisuSaveError(error);
         }
     }
 
     async function runCompatibleExport(
         target: NativeCompatibilityTarget,
     ): Promise<void> {
+        dismissNativeFileOperationOutcome();
         try {
             const result =
                 await exportCompatibilityBackupFromSystemPicker(target);
             if (!result) return;
+            dismissNativeFileOperationOutcome();
             const report = result.compatibilityReport
                 ? formatCompatibilityBackupReport(result.compatibilityReport, {
                       ...language.portableBackup,
@@ -192,7 +206,7 @@
                     : message,
             );
         } catch (error) {
-            showRisuSaveError(error);
+            showExportError(error);
         }
     }
 
@@ -257,13 +271,15 @@
     <Button
         disabled={risuSaveOperation !== null}
         onclick={async () => {
+            dismissNativeFileOperationOutcome();
             try {
-
                 const result = await exportRisuSaveFromSystemPicker();
-                if (result)
-                    alertNormal(formatRisuSaveExportResult(result));
+                if (!result) return;
+                // The exclusion report replaces the dialog's plain completion message.
+                dismissNativeFileOperationOutcome();
+                alertNormal(formatRisuSaveExportResult(result));
             } catch (error) {
-                showRisuSaveError(error);
+                showExportError(error);
             }
         }}
         className="mt-2"

@@ -267,6 +267,41 @@ describe('repairing from the model', () => {
         expect(model.snapshot().skipped).toEqual(['characters:char-2'])
     })
 
+    it('reads the repair choices for the diagnosis a scan just produced', async () => {
+        const { deps, model } = harness({
+            scan: vi.fn().mockResolvedValue(damaged),
+        })
+        await model.quickScan()
+        expect(deps.planRepair).toHaveBeenCalledOnce()
+        expect(model.snapshot().selection).toEqual(['0:drop-reference'])
+        expect(model.snapshot().preview?.answered).toBe(1)
+    })
+
+    it('reads the repair choices once a deep scan has finished its last page', async () => {
+        const deepScan = vi
+            .fn()
+            .mockResolvedValueOnce({ ...damaged, depth: 'deep', deep: { cursor: 'a', completedObjects: 1, totalObjects: 2, completedBytes: 1, totalBytes: 2, complete: false } })
+            .mockResolvedValueOnce({ ...damaged, depth: 'deep', deep: { cursor: 'b', completedObjects: 2, totalObjects: 2, completedBytes: 2, totalBytes: 2, complete: true } })
+        const { deps, model } = harness({ deepScan })
+        await model.deepScan(false)
+        expect(deps.planRepair).toHaveBeenCalledOnce()
+        expect(model.snapshot().candidates).toHaveLength(2)
+    })
+
+    it('selects one answer per finding for select all and clears it again', async () => {
+        const { deps, model } = harness({ getResult: vi.fn().mockResolvedValue(damaged) })
+        await model.load()
+        await model.loadRepairs()
+        await model.toggle('0:drop-reference')
+        expect(model.snapshot().selection).toEqual([])
+        await model.setAll(true)
+        expect(model.snapshot().selection).toEqual(['0:drop-reference'])
+        expect(deps.previewRepair).toHaveBeenLastCalledWith(['0:drop-reference'])
+        await model.setAll(false)
+        expect(model.snapshot().selection).toEqual([])
+        expect(model.snapshot().preview).toBeNull()
+    })
+
     it('never asks for a repair while a scan is running', async () => {
         let release = () => {}
         const { deps, model } = harness({

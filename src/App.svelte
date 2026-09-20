@@ -60,12 +60,14 @@
         dataHealthNavigation,
         DATA_HEALTH_SECTION_ID,
     } from './ts/storage/dataHealthNavigation'
+    import { openRisuNestSettingsTab } from './ts/setting/risuNestSettingsTabs'
 
     $effect(() => {
         if (!isTauri || !$loadedStore) return
         return serverSyncNavigation.subscribe((request) => {
             serverSyncScreenRequest.set(request)
             if (DBState.db.didFirstSetup && !$onboardingHold) {
+                openRisuNestSettingsTab('sync')
                 SettingsMenuIndex.set(17)
                 settingsOpen.set(true)
             }
@@ -75,6 +77,7 @@
     $effect(() => {
         if (!isTauri) return
         return dataHealthNavigation.subscribe(() => {
+            openRisuNestSettingsTab('storage')
             SettingsMenuIndex.set(17)
             settingsOpen.set(true)
             requestAnimationFrame(() => {

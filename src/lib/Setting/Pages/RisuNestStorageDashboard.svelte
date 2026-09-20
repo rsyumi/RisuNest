@@ -6,6 +6,7 @@
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
     import SettingButton from '../RisuNest/SettingButton.svelte'
+    import SettingProgress from '../RisuNest/SettingProgress.svelte'
     import {
         getServerSyncBackupInventory,
         getServerSyncCacheUsage,
@@ -178,6 +179,10 @@
                       : strings.gcHeldLibrary,
               ].join(' · ')
             : gcStates[candidate.state]
+
+    // Only the files the cleanup will delete are listed; the kept ones stay behind a fold.
+    let gcDeletable = $derived(view.gcPreview?.candidates?.filter((candidate) => candidate.state === 'deletable') ?? [])
+    let gcKept = $derived(view.gcPreview?.candidates?.filter((candidate) => candidate.state !== 'deletable') ?? [])
 
     async function previewGc(): Promise<void> {
         try { await dashboard.previewGc() } catch (error) { await showStorageFailure(error) }
@@ -352,12 +357,9 @@
         </details>
         <details data-storage-backup-list="sync-backups" class="group">
             {@render listHeader(strings.syncBackups, serverBackupCount > 0 ? listSummary(serverBackupCount, rollup.serverBackupBytes) : '')}
-            <p class={listNoteClass}>
-                {syncLabels.scope}
-                {#if view.serverBackups && view.serverBackups.incompleteCount > 0}
-                    {' '}<span class="tabular-nums">{syncLabels.incomplete} ({formatCount(view.serverBackups.incompleteCount)}) · {formatRisuNestStorageBytes(view.serverBackups.incompleteBytes)}</span>
-                {/if}
-            </p>
+            {#if view.serverBackups && view.serverBackups.incompleteCount > 0}
+                <p class="{listNoteClass} tabular-nums">{syncLabels.incomplete} ({formatCount(view.serverBackups.incompleteCount)}) · {formatRisuNestStorageBytes(view.serverBackups.incompleteBytes)}</p>
+            {/if}
             {#each view.serverBackups?.items ?? [] as backup (backup.id)}
                 {@const localBytes = backup.local.localRequiredBytes + backup.local.remoteDependentBytes}
                 {@const remoteBytes = backup.remote.localRequiredBytes + backup.remote.remoteDependentBytes}
@@ -407,25 +409,50 @@
                             <p class="mt-1 text-sm tabular-nums">{strings.gcDeletedResult.replace('{0}', formatCount(view.gcResult.deletedCount)).replace('{1}', formatRisuNestStorageBytes(view.gcResult.deletedBytes))}</p>
                         {/if}
                     </div>
+                    {#if isBusy('preview-gc') || isBusy('execute-gc')}
+                        <div data-storage-gc-progress class="mt-2">
+                            <SettingProgress label={isBusy('execute-gc') ? strings.gcDeleting : strings.gcSearching} />
+                        </div>
+                    {/if}
                     {#if view.gcPreview?.candidates?.length}
-                        <details data-storage-gc-list class="group mt-2">
-                            <summary class="flex cursor-pointer list-none items-center gap-2 text-sm select-none [&::-webkit-details-marker]:hidden">
-                                <ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
-                                <span>{strings.gcListTitle}</span>
-                            </summary>
-                            <div class="mt-1 divide-y divide-darkborderc/55 rounded-md border border-darkborderc/55">
-                                {#each view.gcPreview.candidates as candidate (candidate.objectHash)}
-                                    <div data-storage-gc-row class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-3 py-1.5 text-sm">
-                                        <span class="font-mono text-xs break-all">{candidate.objectHash.slice(0, 12)}</span>
-                                        <span class="tabular-nums text-textcolor2">{formatRisuNestStorageBytes(candidate.bytes)}</span>
-                                        <span class="min-w-0 flex-1 text-textcolor2">{gcReason(candidate)}</span>
-                                    </div>
-                                {/each}
-                                {#if view.gcPreview.omitted}
-                                    <p class="px-3 py-1.5 text-sm text-textcolor2">{strings.gcListMore.replace('{0}', formatCount(view.gcPreview.omitted))}</p>
-                                {/if}
+                        {#snippet gcRow(candidate: NativeAssetGcCandidate)}
+                            <div data-storage-gc-row class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-3 py-1.5 text-sm">
+                                <span class="font-mono text-xs break-all">{candidate.objectHash.slice(0, 12)}</span>
+                                <span class="tabular-nums text-textcolor2">{formatRisuNestStorageBytes(candidate.bytes)}</span>
+                                <span class="min-w-0 flex-1 text-textcolor2">{gcReason(candidate)}</span>
                             </div>
-                        </details>
+                        {/snippet}
+                        {#if gcDeletable.length > 0}
+                            <details data-storage-gc-list class="group mt-2" open>
+                                <summary class="flex cursor-pointer list-none items-center gap-2 text-sm select-none [&::-webkit-details-marker]:hidden">
+                                    <ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
+                                    <span>{strings.gcListTitle}</span>
+                                    <span class="text-textcolor2 tabular-nums">{formatCount(gcDeletable.length)}</span>
+                                </summary>
+                                <div class="mt-1 divide-y divide-darkborderc/55 rounded-md border border-darkborderc/55">
+                                    {#each gcDeletable as candidate (candidate.objectHash)}
+                                        {@render gcRow(candidate)}
+                                    {/each}
+                                    {#if view.gcPreview.omitted}
+                                        <p class="px-3 py-1.5 text-sm text-textcolor2">{strings.gcListMore.replace('{0}', formatCount(view.gcPreview.omitted))}</p>
+                                    {/if}
+                                </div>
+                            </details>
+                        {/if}
+                        {#if gcKept.length > 0}
+                            <details data-storage-gc-kept class="group mt-2">
+                                <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-textcolor2 select-none [&::-webkit-details-marker]:hidden">
+                                    <ChevronRight size={16} class="shrink-0 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
+                                    <span>{strings.gcListKept.replace('{0}', formatCount(gcKept.length))}</span>
+                                </summary>
+                                <p class="mt-1 text-[13px] leading-normal text-textcolor2">{strings.gcListKeptHelp}</p>
+                                <div class="mt-1 divide-y divide-darkborderc/55 rounded-md border border-darkborderc/55">
+                                    {#each gcKept as candidate (candidate.objectHash)}
+                                        {@render gcRow(candidate)}
+                                    {/each}
+                                </div>
+                            </details>
+                        {/if}
                     {/if}
                 {/snippet}
                 <SettingButton variant="secondary" busy={isBusy('preview-gc')} disabled={isBusy('execute-gc')} onclick={previewGc}>{strings.gcRun}</SettingButton>

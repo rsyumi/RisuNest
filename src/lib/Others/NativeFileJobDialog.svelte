@@ -95,7 +95,7 @@
             {/if}
 
             <div class="flex flex-col gap-1" aria-live="polite">
-                <div role="progressbar" aria-label={copy.titleImport} aria-valuemin={0} aria-valuemax={100} aria-valuenow={model.overallPercent ?? undefined} class="h-2 w-full overflow-hidden rounded-md border border-darkborderc bg-bgcolor">
+                <div role="progressbar" aria-label={model.title} aria-valuemin={0} aria-valuemax={100} aria-valuenow={model.overallPercent ?? undefined} class="h-2 w-full overflow-hidden rounded-md border border-darkborderc bg-bgcolor">
                     {#if model.indeterminate}
                         <div class="h-full w-full bg-borderc/60 motion-safe:animate-pulse"></div>
                     {:else}

@@ -122,7 +122,6 @@
     </dl>
   {/if}
   {#if inventory && section !== "cache"}
-    <p class="text-sm text-textcolor2">{labels.scope}</p>
     {#if inventory.items.length === 0}<p class="text-sm">
         {text.noBackups}
       </p>{/if}

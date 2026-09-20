@@ -7,6 +7,8 @@
     import Check from 'src/lib/UI/GUI/CheckInput.svelte'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
     import SettingRow from '../RisuNest/SettingRow.svelte'
+    import SettingToggle from '../RisuNest/SettingToggle.svelte'
+    import SettingProgress from '../RisuNest/SettingProgress.svelte'
     import {
         applyNativeDataHealthRepair,
         cancelNativeDataHealthScan,
@@ -63,6 +65,11 @@
         degraded: strings.severityDegraded,
         informational: strings.severityInformational,
     }
+    const severityHelp: Record<DataHealthSeverity, string> = {
+        blocking: strings.severityBlockingHelp,
+        degraded: strings.severityDegradedHelp,
+        informational: strings.severityInformationalHelp,
+    }
     const codeLabels: Record<string, string> = {
         'reference-missing': strings.codeReferenceMissing,
         'reference-invalid': strings.codeReferenceInvalid,
@@ -101,6 +108,14 @@
             .replace('{0}', formatRisuNestStorageBytes(deep.completedBytes))
             .replace('{1}', formatRisuNestStorageBytes(deep.totalBytes))
         return `${objects} · ${bytes}`
+    })
+    // While a deep scan runs its pages report the share done; a quick scan reports nothing until it ends.
+    let scanDetail = $derived.by(() => {
+        const deep = view.result?.deep
+        if (view.running !== 'deep' || !deep) return ''
+        return strings.deepBytes
+            .replace('{0}', formatRisuNestStorageBytes(deep.completedBytes))
+            .replace('{1}', formatRisuNestStorageBytes(deep.totalBytes))
     })
     let summaryLines = $derived.by(() => {
         const result = view.result
@@ -159,29 +174,24 @@
         'settle-authority': strings.actionSettleAuthority,
     }
     let choices = $derived(repairChoicesByFinding(view.candidates))
+    // Select all is checked once every finding has an answer chosen.
+    let answeredFindings = $derived(
+        new Set(
+            view.candidates
+                .filter((candidate) => view.selection.includes(candidate.id))
+                .map((candidate) => candidate.finding),
+        ).size,
+    )
+    let allSelected = $derived(choices.size > 0 && answeredFindings === choices.size)
+    let someSelected = $derived(answeredFindings > 0 && !allSelected)
     // The snapshot suggestion follows the selection, until the reader decides for themselves.
     let snapshotTouched = $state(false)
     $effect(() => {
         if (!snapshotTouched) keepSnapshot = view.preview?.proposesSnapshot ?? false
     })
-    let previewLines = $derived.by(() => {
-        const preview = view.preview
-        if (!preview) return []
-        const lines = [
-            strings.previewAnswered
-                .replace('{0}', count(preview.answered))
-                .replace('{1}', count(preview.answered + preview.remaining)),
-        ]
-        if (preview.droppedReferences > 0)
-            lines.push(strings.previewReferences.replace('{0}', count(preview.droppedReferences)))
-        if (preview.droppedAliases > 0)
-            lines.push(strings.previewAliases.replace('{0}', count(preview.droppedAliases)))
-        if (preview.discarding.length > 0)
-            lines.push(strings.previewDiscards.replace('{0}', count(preview.discarding.length)))
-        if (preview.tables.length > 0)
-            lines.push(strings.previewTables.replace('{0}', preview.tables.join(', ')))
-        return lines
-    })
+    let showRepair = $derived(
+        Boolean(view.result) && (view.groups.length > 0 || view.journals.length > 0),
+    )
 
     function findingLabel(index: number): string {
         const item = view.result?.items[index]
@@ -234,7 +244,7 @@
                 {#if view.result.omitted > 0}
                     <p class="mt-1 text-sm text-textcolor2">{strings.omitted.replace('{0}', count(view.result.omitted))}</p>
                 {/if}
-                {#if deepProgress}
+                {#if deepProgress && !view.running}
                     <p class="mt-1 text-sm text-textcolor2 tabular-nums">{deepProgress}</p>
                 {/if}
             {/if}
@@ -242,6 +252,21 @@
                 <p class="mt-1 text-sm text-textcolor2" role="alert">{strings.scanFailed}</p>
             {/if}
         </div>
+        {#if view.running}
+            <div data-data-health-progress class="mt-3">
+                <SettingProgress
+                    label={view.running === 'deep' ? strings.deepScanRunning : strings.quickScanRunning}
+                    detail={scanDetail}
+                    fraction={view.running === 'deep' ? view.deepFraction : null}
+                >
+                    {#snippet actions()}
+                        {#if view.running === 'deep'}
+                            <SettingButton variant="secondary" onclick={() => run(() => model.cancel())}>{strings.cancel}</SettingButton>
+                        {/if}
+                    {/snippet}
+                </SettingProgress>
+            </div>
+        {/if}
     </div>
 
     <SettingRow data-data-health-actions label={strings.quickScan} help={strings.quickScanHelp}>
@@ -266,103 +291,35 @@
         {/if}
     </SettingRow>
 
+    {#each view.groups as group (group.severity + group.code)}
+        <details data-data-health-group class="group">
+            <summary class="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-[15px] select-none [&::-webkit-details-marker]:hidden">
+                <ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
+                <span class="h-2.5 w-2.5 shrink-0 rounded-xs {severityColors[group.severity]}" aria-hidden="true"></span>
+                <span class="min-w-0 break-words">{codeLabel(group.code)}</span>
+                <span class="ml-auto shrink-0 text-sm text-textcolor2 tabular-nums">{count(group.total)}</span>
+            </summary>
+            <p class="border-t border-darkborderc/55 px-4 py-2 pl-10 text-sm text-textcolor2">{severityHelp[group.severity]}</p>
+            {#each group.shown as item, index (index)}
+                <div data-data-health-item class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 border-t border-darkborderc/55 py-1.5 pr-4 pl-10 text-sm">
+                    <span class="min-w-0 flex-1 break-all">{itemLocation(item)}</span>
+                    {#if itemTarget(item)}
+                        <span class="min-w-0 break-all text-textcolor2">{itemTarget(item)}</span>
+                    {/if}
+                </div>
+            {/each}
+            {#if group.hidden > 0}
+                <p class="border-t border-darkborderc/55 py-2 pr-4 pl-10 text-sm text-textcolor2">{strings.groupMore.replace('{0}', count(group.hidden))}</p>
+            {/if}
+            {#if group.code === 'object-unreferenced' && onOpenUnusedImages}
+                <div class="border-t border-darkborderc/55 py-2 pr-4 pl-10">
+                    <SettingButton variant="secondary" onclick={onOpenUnusedImages}>{strings.gcLink}</SettingButton>
+                </div>
+            {/if}
+        </details>
+    {/each}
+
     {#if view.groups.length > 0}
-        {#each view.groups as group (group.severity + group.code)}
-            <details data-data-health-group class="group">
-                <summary class="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-[15px] select-none [&::-webkit-details-marker]:hidden">
-                    <ChevronRight size={16} class="shrink-0 text-textcolor2 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
-                    <span class="h-2.5 w-2.5 shrink-0 rounded-xs {severityColors[group.severity]}" aria-hidden="true"></span>
-                    <span class="min-w-0 break-words">{codeLabel(group.code)}</span>
-                    <span class="ml-auto shrink-0 text-sm text-textcolor2 tabular-nums">{count(group.total)}</span>
-                </summary>
-                <p class="border-t border-darkborderc/55 px-4 py-2 pl-10 text-sm text-textcolor2">{severityLabels[group.severity]} · {strings.manual}</p>
-                {#each group.shown as item, index (index)}
-                    <div data-data-health-item class="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 border-t border-darkborderc/55 py-1.5 pr-4 pl-10 text-sm">
-                        <span class="min-w-0 flex-1 break-all">{itemLocation(item)}</span>
-                        {#if itemTarget(item)}
-                            <span class="min-w-0 break-all text-textcolor2">{itemTarget(item)}</span>
-                        {/if}
-                    </div>
-                {/each}
-                {#if group.hidden > 0}
-                    <p class="border-t border-darkborderc/55 py-2 pr-4 pl-10 text-sm text-textcolor2">{strings.groupMore.replace('{0}', count(group.hidden))}</p>
-                {/if}
-                {#if group.code === 'object-unreferenced' && onOpenUnusedImages}
-                    <div class="border-t border-darkborderc/55 py-2 pr-4 pl-10">
-                        <SettingButton variant="secondary" onclick={onOpenUnusedImages}>{strings.gcLink}</SettingButton>
-                    </div>
-                {/if}
-            </details>
-        {/each}
-
-        <SettingGroup id="risunest-data-health-repair" title={strings.repairTitle} description={strings.repairHelp} panelProps={{ 'data-data-health-repair': '' }}>
-            {#if view.candidates.length === 0}
-                <p class="px-4 py-3 text-sm text-textcolor2">{strings.repairNone}</p>
-            {:else}
-                {#each [...choices] as [finding, options] (finding)}
-                    <div data-data-health-choice class="px-4 py-3">
-                        <p class="text-sm break-words">{findingLabel(finding)}</p>
-                        <div class="mt-1.5 flex flex-col gap-1">
-                            {#each options as option (option.id)}
-                                <Check
-                                    check={view.selection.includes(option.id)}
-                                    margin={false}
-                                    name={actionLabels[option.action.action]}
-                                    onChange={() => { void model.toggle(option.id) }}
-                                />
-                                {#if option.discards && view.selection.includes(option.id)}
-                                    <p class="pl-6 text-xs text-textcolor2">{strings.actionDiscards}</p>
-                                {/if}
-                                {#if option.action.action === 'adopt-stored-payload' && view.selection.includes(option.id)}
-                                    <p class="pl-6 text-xs text-textcolor2">{strings.actionRisky}</p>
-                                {/if}
-                            {/each}
-                        </div>
-                    </div>
-                {/each}
-                {#if previewLines.length > 0}
-                    <div data-data-health-preview class="px-4 py-3" role="status" aria-live="polite">
-                        <p class="text-[15px]">{strings.previewTitle}</p>
-                        <ul class="mt-1 text-sm text-textcolor2">
-                            {#each previewLines as line (line)}
-                                <li>{line}</li>
-                            {/each}
-                        </ul>
-                    </div>
-                {/if}
-                <SettingRow data-data-health-apply label={strings.repairSelected.replace('{0}', count(view.selection.length))} help={strings.repairSnapshotHelp}>
-                    {#snippet below()}
-                        <div class="mt-1.5 text-sm">
-                            <Check
-                                check={keepSnapshot}
-                                margin={false}
-                                name={strings.repairSnapshot}
-                                onChange={(next) => { snapshotTouched = true; keepSnapshot = next }}
-                            />
-                        </div>
-                    {/snippet}
-                    <SettingButton busy={view.repairing} disabled={view.selection.length === 0} onclick={applyRepair}>{strings.repairApply}</SettingButton>
-                </SettingRow>
-            {/if}
-            {#if view.skipped.length > 0}
-                <p data-data-health-skipped class="px-4 py-3 text-sm text-textcolor2" role="status">{strings.undoSkipped.replace('{0}', view.skipped.join(', '))}</p>
-            {/if}
-            <div data-data-health-journals class="divide-y divide-darkborderc/55">
-                <p class="px-4 py-2 text-sm text-textcolor2">{strings.undoHelp}</p>
-                {#each view.journals as entry (entry.id)}
-                    <div class="flex flex-wrap items-center gap-3 px-4 py-2 text-sm">
-                        <span class="min-w-0 flex-1 break-words tabular-nums">{strings.undoEntry
-                            .replace('{0}', new Date(entry.createdAt).toLocaleString())
-                            .replace('{1}', count(entry.changes))
-                            .replace('{2}', count(entry.heldObjects))}</span>
-                        <SettingButton variant="secondary" disabled={view.repairing || !entry.current} onclick={() => undoRepair(entry.id)}>{strings.undoAction}</SettingButton>
-                    </div>
-                {:else}
-                    <p class="px-4 py-2 text-sm text-textcolor2">{strings.undoNone}</p>
-                {/each}
-            </div>
-        </SettingGroup>
-
         <SettingRow data-data-health-report label={strings.copyReport} help={includeNames ? strings.includeNamesWarning : ''}>
             {#snippet below()}
                 <div class="mt-1.5 text-sm">
@@ -374,3 +331,86 @@
         </SettingRow>
     {/if}
 </SettingGroup>
+
+{#if showRepair}
+    <SettingGroup id="risunest-data-health-repair" title={strings.repairTitle} description={strings.repairHelp} panelProps={{ 'data-data-health-repair': '' }}>
+        {#if view.candidates.length === 0}
+            <p class="px-4 py-3 text-sm text-textcolor2">{strings.repairNone}</p>
+        {:else}
+            <div data-data-health-select-all class="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-2.5">
+                <SettingToggle
+                    label={strings.selectAll}
+                    showLabel
+                    checked={allSelected}
+                    indeterminate={someSelected}
+                    disabled={view.repairing}
+                    onchange={(next) => { void model.setAll(next) }}
+                />
+                <span class="text-sm text-textcolor2 tabular-nums">{strings.repairSelected.replace('{0}', count(view.selection.length))}</span>
+            </div>
+            {#each [...choices] as [finding, options] (finding)}
+                <div data-data-health-choice class="px-4 py-3">
+                    <p class="text-sm break-words">{findingLabel(finding)}</p>
+                    <div class="mt-1.5 flex flex-col gap-1">
+                        {#each options as option (option.id)}
+                            <Check
+                                check={view.selection.includes(option.id)}
+                                margin={false}
+                                name={actionLabels[option.action.action]}
+                                onChange={() => { void model.toggle(option.id) }}
+                            />
+                            {#if option.discards && view.selection.includes(option.id)}
+                                <p class="pl-6 text-xs text-textcolor2">{strings.actionDiscards}</p>
+                            {/if}
+                            {#if option.action.action === 'adopt-stored-payload' && view.selection.includes(option.id)}
+                                <p class="pl-6 text-xs text-textcolor2">{strings.actionRisky}</p>
+                            {/if}
+                        {/each}
+                    </div>
+                </div>
+            {/each}
+            <SettingRow
+                data-data-health-apply
+                label={strings.repairSelected.replace('{0}', count(view.selection.length))}
+                help={strings.repairSnapshotHelp.replace('{0}', count(view.selection.length))}
+            >
+                {#snippet below()}
+                    <div class="mt-1.5 text-sm">
+                        <Check
+                            check={keepSnapshot}
+                            margin={false}
+                            name={strings.repairSnapshot}
+                            onChange={(next) => { snapshotTouched = true; keepSnapshot = next }}
+                        />
+                    </div>
+                    {#if view.repairing}
+                        <div data-data-health-repair-progress class="mt-3">
+                            <SettingProgress label={strings.repairRunning} />
+                        </div>
+                    {/if}
+                {/snippet}
+                <SettingButton busy={view.repairing} disabled={view.selection.length === 0} onclick={applyRepair}>{strings.repairApply}</SettingButton>
+            </SettingRow>
+        {/if}
+        {#if view.skipped.length > 0}
+            <p data-data-health-skipped class="px-4 py-3 text-sm text-textcolor2" role="status">{strings.undoSkipped.replace('{0}', view.skipped.join(', '))}</p>
+        {/if}
+        <div data-data-health-journals class="divide-y divide-darkborderc/55">
+            <div class="px-4 py-3">
+                <div class="text-[15px]">{strings.undoTitle}</div>
+                <p class="mt-0.5 max-w-[62ch] text-[13px] leading-normal text-textcolor2">{strings.undoHelp}</p>
+            </div>
+            {#each view.journals as entry (entry.id)}
+                <div class="flex flex-wrap items-center gap-3 px-4 py-2.5 text-sm">
+                    <span class="min-w-0 flex-1 break-words tabular-nums">{strings.undoEntry
+                        .replace('{0}', new Date(entry.createdAt).toLocaleString())
+                        .replace('{1}', count(entry.changes))
+                        .replace('{2}', count(entry.heldObjects))}</span>
+                    <SettingButton variant="secondary" disabled={view.repairing || !entry.current} onclick={() => undoRepair(entry.id)}>{strings.undoAction}</SettingButton>
+                </div>
+            {:else}
+                <p class="px-4 py-2.5 text-sm text-textcolor2">{strings.undoNone}</p>
+            {/each}
+        </div>
+    </SettingGroup>
+{/if}
