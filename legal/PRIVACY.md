@@ -29,7 +29,7 @@ The Provider keeps no application logs for the Registry. The Registry runs on Cl
 
 ## 5. Connections to Third-Party Services
 
-RisuNest communicates with third-party services only when you explicitly enable the relevant feature. These include AI providers, RisuAI accounts and RisuRealm, external backup and synchronization storage, model distribution hosts, and any other service you set up yourself. These connections run directly between your device and the service in question and do not pass through the Provider's servers. What is sent, and how it is handled, is governed by each service's own privacy policy; the Provider neither relays nor reads it.
+Except when communicating with GitHub to check for automatic updates, RisuNest communicates with third-party services only when you explicitly enable the relevant feature. These include AI providers, RisuAI accounts and RisuRealm, external backup and synchronization storage, model distribution hosts, and any other service you set up yourself. These connections run directly between your device and the service in question and do not pass through the Provider's servers. What is sent, and how it is handled, is governed by each service's own privacy policy; the Provider neither relays nor reads it.
 
 ## 6. Your Rights and Choices
 
