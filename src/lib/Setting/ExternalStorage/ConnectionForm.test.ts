@@ -213,7 +213,7 @@ describe('Android Google authorization lifecycle', () => {
         await beginGoogleAuthorization()
 
         const callback = labelControl<HTMLInputElement>(strings.manualOAuthCallback)
-        callback.value = 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html?code=one&state=wrong'
+        callback.value = 'https://update.rsyumi.workers.dev/oauth/google-drive-callback?code=one&state=wrong'
         callback.dispatchEvent(new Event('input', { bubbles: true }))
         state.completeAuthorization.mockResolvedValueOnce({
             authorizationPending: true,
@@ -242,7 +242,7 @@ describe('Android Google authorization lifecycle', () => {
         expect(onconnected).toHaveBeenCalledWith({ connection: { id: 'google-connection' } })
         expect(state.completeAuthorization).toHaveBeenLastCalledWith(
             'authorization-1',
-            'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html?code=one&state=wrong',
+            'https://update.rsyumi.workers.dev/oauth/google-drive-callback?code=one&state=wrong',
             undefined,
         )
         await vi.waitFor(() => expect(busyStates.at(-1)).toBe(false))

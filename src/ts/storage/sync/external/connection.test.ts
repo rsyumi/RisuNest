@@ -72,7 +72,7 @@ describe('external storage connection request', () => {
             values: {
                 folderId: 'folder', space: 'drive', projectId: 'project',
                 clientId: 'web-client.apps.googleusercontent.com',
-                oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
+                oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback',
                 clientSecret: 'must-stay-transient',
             },
             platform: 'android', mode: 'create', purpose: 'backup',
@@ -81,7 +81,7 @@ describe('external storage connection request', () => {
         })
 
         expect(request.config.location.oauthRedirectUri).toBe(
-            'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
+            'https://update.rsyumi.workers.dev/oauth/google-drive-callback',
         )
         expect(request.config.oauthProfile?.platformClientIds).toEqual({
             android: 'web-client.apps.googleusercontent.com',

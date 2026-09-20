@@ -9,7 +9,7 @@ const script = html.match(/<script>([\s\S]*?)<\/script>/)![1].replace(/\r\n/g, '
 const windows: Window[] = []
 
 function open(query: string, language = 'en-US') {
-    const window = new Window({ url: `https://update.rsyumi.workers.dev/oauth/google-drive-callback.html${query}` })
+    const window = new Window({ url: `https://update.rsyumi.workers.dev/oauth/google-drive-callback${query}` })
     windows.push(window)
     Object.defineProperty(window.navigator, 'language', { value: language })
     window.document.write(html.replace(/<script>[\s\S]*?<\/script>/, ''))
@@ -46,7 +46,7 @@ describe('standalone Google Drive callback', () => {
         const copyButton = document.getElementById('copy') as HTMLButtonElement
         copyButton.click()
         await Promise.resolve()
-        expect(copy).toHaveBeenCalledWith('https://update.rsyumi.workers.dev/oauth/google-drive-callback.html?state=synthetic-state&code=synthetic%2Bcode')
+        expect(copy).toHaveBeenCalledWith('https://update.rsyumi.workers.dev/oauth/google-drive-callback?state=synthetic-state&code=synthetic%2Bcode')
         expect(document.getElementById('notice')!.textContent).toContain('Copied')
     })
 

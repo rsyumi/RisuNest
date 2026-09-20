@@ -70,7 +70,7 @@
     let values = $state<Record<string, string>>({
         space: 'drive', accountType: 'personal', tenant: 'common',
         ...(isTauriAndroid ? {
-            oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
+            oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback',
         } : {}),
     })
     let hypa = $state(true)
@@ -199,7 +199,7 @@
         values = {
             space: 'drive', accountType: 'personal', tenant: 'common',
             ...(isTauriAndroid ? {
-                oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback.html',
+                oauthRedirectUri: 'https://update.rsyumi.workers.dev/oauth/google-drive-callback',
             } : {}),
             uploadEndpoint: 'https://uploads.github.com',
             profile: next.profiles[0]?.value ?? '',

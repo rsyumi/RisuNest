@@ -8,7 +8,7 @@ pub(super) const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 pub(super) const TOKEN_INFO_ENDPOINT: &str = "https://oauth2.googleapis.com/tokeninfo";
 pub(super) const AUTHORIZE_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(super) const DEFAULT_ANDROID_WEB_REDIRECT_URI: &str =
-    "https://update.rsyumi.workers.dev/oauth/google-drive-callback.html";
+    "https://update.rsyumi.workers.dev/oauth/google-drive-callback";
 pub(super) const DRIVE_FILE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 pub(super) const APPDATA_SCOPE: &str = "https://www.googleapis.com/auth/drive.appdata";
 /// Documented alias for the root of the application data space.

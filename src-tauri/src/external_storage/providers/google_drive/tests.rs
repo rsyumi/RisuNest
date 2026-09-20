@@ -2074,7 +2074,7 @@ fn authorization_uses_the_platform_client_and_the_per_file_scope() {
     assert_eq!(android.client_id, client_id("android"));
     assert_eq!(
         android.redirect_url.as_str(),
-        "https://update.rsyumi.workers.dev/oauth/google-drive-callback.html"
+        "https://update.rsyumi.workers.dev/oauth/google-drive-callback"
     );
     let mut custom = config.clone();
     custom.location.insert(
