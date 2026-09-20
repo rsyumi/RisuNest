@@ -114,6 +114,9 @@ jobs:
       - uses: actions/setup-node@v6
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/setup-java@v5
+        if: inputs.product == 'app'
+        with: { distribution: temurin, java-version: "21" }
       - id: pnpm-store
         shell: bash
         run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
@@ -123,6 +126,32 @@ jobs:
           key: release-pnpm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml', 'server/manager/gui/pnpm-lock.yaml') }}
           restore-keys: release-pnpm-${{ runner.os }}-${{ runner.arch }}-
       - run: pnpm install --frozen-lockfile
+      - name: Preflight app signing inputs
+        if: inputs.product == 'app'
+        run: node scripts/release/signing-preflight.mjs --product "${{ inputs.product }}"
+        env:
+          SIGNING_PREFLIGHT_ROOT: ${{ runner.temp }}/risunest-signing-preflight
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      - name: Preflight Sync signing inputs
+        if: inputs.product == 'sync'
+        run: node scripts/release/signing-preflight.mjs --product "${{ inputs.product }}"
+        env:
+          SIGNING_PREFLIGHT_ROOT: ${{ runner.temp }}/risunest-signing-preflight
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          RISUNEST_UPDATE_PUBLIC_KEY: ${{ secrets.RISUNEST_UPDATE_PUBLIC_KEY }}
+          RISUNEST_DEFAULT_REGISTRY_URL: ${{ secrets.RISUNEST_DEFAULT_REGISTRY_URL }}
+      - name: Clean signing preflight files
+        if: always()
+        run: node -e "require('node:fs').rmSync(process.env.SIGNING_PREFLIGHT_ROOT, { recursive: true, force: true })"
+        env:
+          SIGNING_PREFLIGHT_ROOT: ${{ runner.temp }}/risunest-signing-preflight
       - uses: ./.github/actions/test-references
       - run: pnpm test:node
       - run: pnpm test --project harness

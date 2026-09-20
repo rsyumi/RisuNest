@@ -10,7 +10,7 @@ const checkWorkflow = readFileSync(new URL("../../.github/workflows/release-chec
 
 test("both products and pull requests run shared native signature and catalog tests", () => {
   const commonTests = workflow.slice(workflow.indexOf("\n  release-tooling-tests:\n"), workflow.indexOf("\n  app-web-tests:\n"));
-  assert.doesNotMatch(commonTests, /if: inputs\.product/);
+  assert.doesNotMatch(commonTests, /\n    if: inputs\.product/);
   for (const contents of [commonTests, checkWorkflow]) {
     assert.match(contents, /uses: dtolnay\/rust-toolchain@1\.97\.1/);
   }
@@ -102,9 +102,34 @@ test("stable release runs serialize per tag while different tags can build toget
 test("private signing material is scoped to signing steps", () => {
   const globalEnvironment = workflow.slice(workflow.indexOf("\nenv:\n"), workflow.indexOf("\njobs:\n"));
   assert.doesNotMatch(globalEnvironment, /TAURI_SIGNING_PRIVATE_KEY|ANDROID_KEYSTORE/);
-  const sourceAndTests = workflow.slice(workflow.indexOf("\n  source:\n"), workflow.indexOf("\n  prepare-draft:\n"));
-  assert.doesNotMatch(sourceAndTests, /TAURI_PRIVATE_KEY|ANDROID_KEYSTORE_BASE64/);
-  assert.equal((workflow.match(/^\s+ANDROID_KEYSTORE_BASE64:/gm) ?? []).length, 1);
+  const source = workflow.slice(workflow.indexOf("\n  source:\n"), workflow.indexOf("\n  release-tooling-tests:\n"));
+  assert.doesNotMatch(source, /TAURI_PRIVATE_KEY|ANDROID_KEYSTORE_BASE64/);
+  const tooling = workflow.slice(workflow.indexOf("\n  release-tooling-tests:\n"), workflow.indexOf("\n  app-web-tests:\n"));
+  const appPreflight = tooling.slice(tooling.indexOf("      - name: Preflight app signing inputs\n"),
+    tooling.indexOf("      - name: Preflight Sync signing inputs\n"));
+  const syncPreflight = tooling.slice(tooling.indexOf("      - name: Preflight Sync signing inputs\n"),
+    tooling.indexOf("      - name: Clean signing preflight files\n"));
+  for (const secret of [
+    "TAURI_PRIVATE_KEY",
+    "TAURI_KEY_PASSWORD",
+    "RISUNEST_UPDATE_PUBLIC_KEY",
+  ]) {
+    assert.match(appPreflight, new RegExp(`secrets\\.${secret}`));
+    assert.match(syncPreflight, new RegExp(`secrets\\.${secret}`));
+  }
+  for (const secret of [
+    "ANDROID_KEYSTORE_BASE64",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_ALIAS",
+    "ANDROID_KEY_PASSWORD",
+  ]) {
+    assert.match(appPreflight, new RegExp(`secrets\\.${secret}`));
+    assert.doesNotMatch(syncPreflight, new RegExp(`secrets\\.${secret}`));
+  }
+  assert.doesNotMatch(appPreflight, /secrets\.RISUNEST_DEFAULT_REGISTRY_URL/);
+  assert.match(syncPreflight, /secrets\.RISUNEST_DEFAULT_REGISTRY_URL/);
+  assert.match(tooling, /uses: actions\/setup-java@v5\n\s+if: inputs\.product == 'app'/);
+  assert.match(tooling, /name: Clean signing preflight files\n\s+if: always\(\)/);
 });
 
 test("release caches retain downloads without unpacked dependency trees", () => {
