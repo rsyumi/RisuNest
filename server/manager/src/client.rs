@@ -264,9 +264,17 @@ mod tests {
                 ("POST /shutdown ", r#"{"stopping":true}"#),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 4096];
-                let count = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..count]);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0 && request.len() + count <= 8192);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8_lossy(&request);
                 assert!(request.starts_with(method));
                 assert!(request
                     .to_ascii_lowercase()

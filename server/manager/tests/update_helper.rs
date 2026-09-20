@@ -962,14 +962,14 @@ async fn run_live_replacement_case(was_running: bool) {
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires explicit synthetic server/manager binaries and exclusive port 4319"]
+#[ignore = "requires explicit synthetic server/manager binaries and exclusive port 14319"]
 async fn helper_replaces_and_restarts_an_isolated_live_server() {
     run_live_replacement_case(true).await;
 }
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires explicit synthetic server/manager binaries and exclusive port 4319"]
+#[ignore = "requires explicit synthetic server/manager binaries and exclusive port 14319"]
 async fn helper_verifies_a_stopped_replacement_then_restores_stopped_intent() {
     run_live_replacement_case(false).await;
 }
@@ -1124,7 +1124,7 @@ async fn live_installer_guard_restart_failure(
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires explicit synthetic binaries, exclusive port 4319, and the real 100 second health timeout"]
+#[ignore = "requires explicit synthetic binaries, exclusive port 14319, and the real 100 second health timeout"]
 async fn installer_guard_records_restart_failure_after_accepted_corrupt_server_start() {
     let (source_server, source_manager) = explicit_test_binaries();
     let expected_server = fs::read(&source_server).unwrap();
@@ -1243,7 +1243,7 @@ async fn live_corrupt_replacement_rollback(
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires explicit synthetic binaries, exclusive port 4319, and the real 100 second health timeout"]
+#[ignore = "requires explicit synthetic binaries, exclusive port 14319, and the real 100 second health timeout"]
 async fn helper_rolls_back_a_corrupt_live_replacement_and_restarts_the_old_server() {
     let (source_server, source_manager) = explicit_test_binaries();
     let temp = tempfile::tempdir().unwrap();
@@ -1544,7 +1544,7 @@ async fn live_recovery_from_installed_manager(
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires explicit synthetic binaries and exclusive port 4319"]
+#[ignore = "requires explicit synthetic binaries and exclusive port 14319"]
 async fn interrupted_files_recovery_outlives_the_active_installed_manager() {
     let (source_server, source_manager) = explicit_test_binaries();
     let temp = tempfile::tempdir().unwrap();
@@ -1687,7 +1687,7 @@ async fn live_parent_timeout_recovery(
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires explicit synthetic binaries, exclusive port 4319, and the real 30 second parent timeout"]
+#[ignore = "requires explicit synthetic binaries, exclusive port 14319, and the real 30 second parent timeout"]
 async fn helper_recovers_the_live_server_when_its_parent_does_not_exit() {
     let (source_server, source_manager) = explicit_test_binaries();
     let temp = tempfile::tempdir().unwrap();

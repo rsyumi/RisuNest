@@ -176,7 +176,13 @@ pub fn bytes(value: &Value) -> String {
 }
 pub fn error_message(code: &str) -> &str {
     match code {
-        "startup-registration-required" => "실행 설정에서 서버 자동 실행을 등록한 뒤 서버를 시작하세요.",
+        "invalid-network-settings" => "바인딩 IP 주소와 포트(1~65535)를 확인하세요.",
+        "listen-address-in-use" => "주소와 포트를 이미 사용 중입니다. 네트워크 설정에서 포트를 변경하세요.",
+        "listen-address-unavailable" => "이 컴퓨터에 없는 IP 주소입니다. 네트워크 설정을 확인하세요.",
+        "listen-permission-denied" => "설정한 주소와 포트에서 서버를 실행할 권한이 없습니다.",
+        "tunnel-exited" => "cloudflared가 종료되었습니다. 출력 내용을 확인하세요.",
+        "tunnel-start-failed" => "cloudflared를 실행하지 못했습니다. 실행 파일과 출력 내용을 확인하세요.",
+        "tunnel-readiness-timeout" => "90초 안에 임시 주소 연결을 완료하지 못했습니다.",
         "management-stale-state" => "서버 상태가 변경되었습니다. 새로 확인한 뒤 다시 시도하세요.",
         "registration-already-issued" => "이미 발급한 요청입니다. 기기 목록을 확인하세요. 등록 링크를 잃었다면 해당 기기를 해제한 뒤 다시 등록하세요.",
         "management-response-incomplete" => "응답을 끝까지 받지 못했습니다. 다시 등록하기 전에 기기 목록을 확인하세요.",
@@ -218,6 +224,23 @@ fn overview(value: &Value) {
         .map(|d| d.iter().filter(|d| d["revoked"] == false).count())
         .unwrap_or(0);
     println!("등록된 기기: {count}");
+    println!("현재 수신 주소: {}", text(&value["listener"]));
+    tunnel_diagnostics(value);
+}
+
+fn tunnel_diagnostics(value: &Value) {
+    if let Some(error) = value["tunnel"]["error"].as_str() {
+        println!(
+            "임시 주소 오류: {} ({})",
+            error_message(error),
+            safe_text(error)
+        );
+    }
+    if let Some(logs) = value["tunnel"]["logs"].as_array() {
+        for line in logs.iter().filter_map(Value::as_str) {
+            println!("{}", safe_text(line));
+        }
+    }
 }
 
 async fn register(client: &Client, status: &Value) -> Result<()> {
@@ -330,6 +353,7 @@ async fn connection(root: &Path, client: &Client, status: &Value, executable: &P
                     .map(safe_text)
                     .unwrap_or("아직 발급되지 않음".into())
             );
+            tunnel_diagnostics(status);
             pause()?;
         }
         Some(1) => {
@@ -412,6 +436,26 @@ async fn connection(root: &Path, client: &Client, status: &Value, executable: &P
     Ok(())
 }
 
+fn network_settings(root: &Path, status: Option<&Value>) -> Result<()> {
+    use risunest_sync_server::config::NetworkSettings;
+    let _activity = begin_management_activity(root)?;
+    let mut settings = NetworkSettings::load(root).map_err(|e| e.code.to_owned())?;
+    clear();
+    if let Some(status) = status {
+        println!("현재 수신 주소: {}", text(&status["listener"]));
+    }
+    println!("저장된 수신 주소: {}", settings.socket());
+    settings.address = input("바인딩 주소", &settings.address.to_string())?
+        .parse()
+        .map_err(|_| "invalid-network-settings")?;
+    settings.port = input("포트", &settings.port.to_string())?
+        .parse()
+        .map_err(|_| "invalid-network-settings")?;
+    settings.save(root).map_err(|e| e.code.to_owned())?;
+    println!("네트워크 설정을 저장했습니다. 다음 서버 시작부터 적용됩니다.");
+    pause()
+}
+
 pub async fn run(root: &Path, executable: &Path) -> Result<()> {
     let _screen = if capable() {
         execute!(io::stdout(), terminal::EnterAlternateScreen)
@@ -429,12 +473,14 @@ pub async fn run(root: &Path, executable: &Path) -> Result<()> {
             } else {
                 "RisuNest 동기화 서버 · 연결 안 됨"
             },
-            &["개요", "기기", "연결", "실행 설정"],
+            &["개요", "기기", "연결", "실행 설정", "네트워크 설정"],
         )?
         else {
             break;
         };
-        let result = if action == 3 {
+        let result = if action == 4 {
+            network_settings(root, status.as_ref().ok())
+        } else if action == 3 {
             match menu(
                 "실행 설정",
                 &[
@@ -451,7 +497,21 @@ pub async fn run(root: &Path, executable: &Path) -> Result<()> {
                     if status.is_ok() {
                         Ok(())
                     } else {
-                        platform::start(root, executable)
+                        platform::start(root, executable)?;
+                        let mut ready = false;
+                        for _ in 0..50 {
+                            if client.status().await.is_ok() {
+                                ready = true;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        if ready {
+                            Ok(())
+                        } else {
+                            Err(std::fs::read_to_string(root.join("startup-error.txt"))
+                                .unwrap_or_else(|_| "server-not-ready".into()))
+                        }
                     }
                 }
                 Some(1) => {

@@ -699,3 +699,5 @@ dialog p {
     transition: none !important;
   }
 }
+
+.tunnel-output { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.8rem; }

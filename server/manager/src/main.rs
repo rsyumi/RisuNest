@@ -275,5 +275,6 @@ async fn start_server(
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    Err("server-not-ready".into())
+    Err(std::fs::read_to_string(root.join("startup-error.txt"))
+        .unwrap_or_else(|_| "server-not-ready".into()))
 }

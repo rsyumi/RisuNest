@@ -20,6 +20,8 @@
   } from "./api";
   import Overview from "./Overview.svelte";
   import Connections from "./Connections.svelte";
+  import Network from "./Network.svelte";
+  import type { NetworkSettings } from "./api";
   import logo from "./logo.svg";
   let { backend = native }: { backend?: Backend } = $props();
   let page = $state("overview");
@@ -28,12 +30,15 @@
   let connected = $state(false);
   let busy = $state(false);
   let notice = $state("");
-  let dialog = $state<"register" | "issued" | "revoke" | "stop" | null>(null);
+  let dialog = $state<"register" | "issued" | "revoke" | "stop" | "leave" | null>(null);
   let name = $state("");
   let selected = $state<Device | null>(null);
   let uri = $state("");
   let svg = $state("");
-  let connectionDirty = $state(false);
+  let connectionDraftDirty = $state(false);
+  let networkDirty = $state(false);
+  let connectionDirty = $derived(connectionDraftDirty || networkDirty);
+  let pendingPage = "";
   let updating = $state(false);
   let dialogElement: HTMLDialogElement;
   let automaticUpdateRetryAfter = 0;
@@ -83,11 +88,32 @@
   }
   function navigate(id: string) {
     if (id !== page && connectionDirty) {
-      notice = "적용하지 않은 연결 설정을 적용하거나 다시 불러온 뒤 이동하세요.";
+      pendingPage = id;
+      open("leave");
       return;
     }
     page = id;
     if (id === "settings") void loadEnvironment();
+  }
+  function leavePage() {
+    const next = pendingPage;
+    close();
+    connectionDraftDirty = false;
+    networkDirty = false;
+    navigate(next);
+  }
+  async function saveNetwork(settings: NetworkSettings): Promise<boolean> {
+    busy = true;
+    notice = "";
+    try {
+      await backend.network(settings);
+      await loadEnvironment();
+      notice = "네트워크 설정을 저장했습니다. 다음 서버 시작부터 적용됩니다.";
+      return true;
+    } catch (error) {
+      notice = message(error);
+      return false;
+    } finally { busy = false; }
   }
   async function refreshAll() {
     await Promise.all([refresh(), loadEnvironment()]);
@@ -345,6 +371,9 @@
           >서버 시작</button
         >
       </section>{/if}
+    {#if page === "connection" && environment}
+      <Network settings={environment.network} listener={connected ? status?.listener ?? null : null} {busy} save={saveNetwork} activity={(dirty) => (networkDirty = dirty)} />
+    {/if}
     {#if status}
       {#if page === "overview"}<Overview
           {status}
@@ -383,7 +412,7 @@
           busy={busy || !connected}
           {mutate}
           {copy}
-          activity={(active) => (connectionDirty = active)}
+          activity={(active) => (connectionDraftDirty = active)}
         />{/if}
     {/if}
     {#if page === "settings"}
@@ -505,7 +534,10 @@
     onclick={close}
     disabled={busy}><X size={20} /></button
   >
-  {#if dialog === "register"}<h2>새 기기 등록</h2>
+  {#if dialog === "leave"}
+    <p>저장하지 않은 변경사항이 있습니다. 정말로 이동하시겠습니까? 변경한 내용이 초기화됩니다.</p>
+    <div class="actions"><button onclick={leavePage}>네</button><button onclick={close}>아니오</button></div>
+  {:else if dialog === "register"}<h2>새 기기 등록</h2>
     <p>등록할 기기의 이름을 입력하세요.</p>
     <form
       onsubmit={(e) => {

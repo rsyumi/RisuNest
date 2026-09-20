@@ -63,7 +63,7 @@ def keyboard_menu(args):
 
 # Both adapters currently use the default sync port. Refuse to disturb a listener.
 with socket.socket() as probe:
-    probe.bind(("127.0.0.1", 4319))
+    probe.bind(("127.0.0.1", 14319))
 
 with tempfile.TemporaryDirectory(prefix="risunest-manager-test-") as temporary:
     root = Path(temporary)

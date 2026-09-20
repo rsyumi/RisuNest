@@ -19,6 +19,7 @@ beforeEach(() => {
   target = document.createElement("div");
   document.body.append(target);
   snapshot = {
+    listener: "127.0.0.1:14319",
     revision: "synthetic:0",
     uptimeSeconds: 5,
     connection: {
@@ -29,7 +30,7 @@ beforeEach(() => {
       uuid: "synthetic-uuid",
     },
     connectionState: { mode: "fixed", publication: "published" },
-    tunnel: { phase: "external", endpoint: null, error: null },
+    tunnel: { phase: "external", endpoint: null, error: null, logs: [] },
     publication: { phase: "published", error: null },
     storage: {
       measuredAt: 1,
@@ -45,6 +46,7 @@ beforeEach(() => {
     defaultRegistryUrl: "https://registry.example.com",
   };
   environmentSnapshot = {
+    network: { schema: 1, address: "127.0.0.1", port: 14319 },
     platform: "windows",
     dataDir: "synthetic",
     cloudflared: "C:\\synthetic\\cloudflared.exe",
@@ -70,7 +72,8 @@ beforeEach(() => {
     environment: vi.fn(async () => structuredClone(environmentSnapshot)),
     mutate: vi.fn(async () => ({})),
     start: vi.fn(async () => {}),
-    startup: vi.fn(async () => ({ registered: true, enabled: true })),
+    network: vi.fn(async (settings) => { environmentSnapshot.network = settings; }),
+    startup: vi.fn(async () => ({ registered: true, enabled: true, actionMatches: true })),
     trayStartup: vi.fn(async () => {}),
     updatePolicy: vi.fn(async () => {}),
     updateCheck: vi.fn(async () => ({ result: "current" })),
@@ -121,7 +124,7 @@ it("keeps a dirty form tied to its original revision during status refresh", asy
   await settle();
   expect(input.value).toBe("https://changed.example.com");
   target
-    .querySelector("form")!
+    .querySelector('form[aria-label="연결 설정"]')!
     .dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
   await settle();
   expect(backend.mutate).toHaveBeenCalledWith(
@@ -158,7 +161,7 @@ it("rebases a dirty connection draft after an action from the same form", async 
   );
   await settle();
   target
-    .querySelector("form")!
+    .querySelector('form[aria-label="연결 설정"]')!
     .dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
   await settle();
   expect(backend.mutate).toHaveBeenLastCalledWith(
@@ -278,7 +281,18 @@ it("keeps a dirty connection draft on its page and away from update actions", as
   expect(target.querySelector<HTMLInputElement>("input[type=url]")?.value).toBe(
     "https://unsaved.example.com",
   );
-  expect(target.textContent).toContain("아직 적용하지 않은 변경");
+  expect(target.querySelector("dialog[open]")?.textContent).toContain("저장하지 않은 변경사항이 있습니다. 정말로 이동하시겠습니까? 변경한 내용이 초기화됩니다.");
+  button("아니오").click();
+  await settle();
+  expect(input.value).toBe("https://unsaved.example.com");
+  button("실행 설정").click();
+  await settle();
+  button("네").click();
+  await settle();
+  expect(target.querySelector('form[aria-label="연결 설정"]')).toBeNull();
+  button("연결").click();
+  await settle();
+  expect(target.querySelector<HTMLInputElement>("input[type=url]")?.value).toBe("https://sync.example.com");
   expect(backend.updateCheck).not.toHaveBeenCalled();
 });
 
@@ -339,4 +353,42 @@ it("does not hot-loop automatic handoff while another manager keeps replacement 
   await vi.advanceTimersByTimeAsync(45_000);
   await settle();
   expect(backend.updateCheck).toHaveBeenCalledTimes(1);
+});
+
+
+it("saves network settings while the server is stopped and discards only confirmed drafts", async () => {
+  vi.mocked(backend.status).mockRejectedValue("daemon-unavailable");
+  await open();
+  button("연결").click();
+  await settle();
+  const address = target.querySelector<HTMLInputElement>('input[aria-label="바인딩 주소"]')!;
+  const port = target.querySelector<HTMLInputElement>('input[aria-label="포트"]')!;
+  address.value = "0.0.0.0";
+  address.dispatchEvent(new Event("input", { bubbles: true }));
+  port.value = "24319";
+  port.dispatchEvent(new Event("input", { bubbles: true }));
+  await settle();
+  button("개요").click();
+  await settle();
+  target.querySelector("dialog")!.dispatchEvent(new Event("cancel", { cancelable: true }));
+  await settle();
+  expect(address.value).toBe("0.0.0.0");
+  address.closest("form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+  await vi.waitFor(() => expect(backend.network).toHaveBeenCalledWith({ schema: 1, address: "0.0.0.0", port: 24319 }));
+  await settle();
+  expect(target.textContent).toContain("다음 서버 시작부터 적용됩니다.");
+  button("개요").click();
+  await settle();
+  expect(target.querySelector("dialog[open]")).toBeNull();
+});
+
+it("shows the last tunnel failure and output while retrying, as text", async () => {
+  snapshot.tunnel = { phase: "starting", endpoint: null, error: "tunnel-exited", logs: ['<script>synthetic</script>', 'DNS lookup failed'] };
+  await open();
+  expect(target.textContent).toContain("cloudflared가 종료되었습니다.");
+  button("연결").click();
+  await settle();
+  expect(target.textContent).toContain("tunnel-exited");
+  expect(target.querySelector("pre")?.textContent).toContain("DNS lookup failed");
+  expect(target.querySelector("pre script")).toBeNull();
 });

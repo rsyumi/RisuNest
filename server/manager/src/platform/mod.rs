@@ -118,6 +118,7 @@ pub fn initialize(root: &Path, executable: &Path) -> Result<()> {
 
 pub fn start(root: &Path, executable: &Path) -> Result<()> {
     initialize(root, executable)?;
+    let _ = std::fs::remove_file(root.join("startup-error.txt"));
     let state = startup(root, executable, "status")?;
     #[cfg(target_os = "macos")]
     let state = if state.registered && !state.action_matches {
@@ -125,11 +126,11 @@ pub fn start(root: &Path, executable: &Path) -> Result<()> {
     } else {
         state
     };
-    if state.registered && state.action_matches {
+    if state.registered && state.enabled && state.action_matches {
         startup(root, executable, "start")?;
     } else {
         #[cfg(windows)]
-        return Err("startup-registration-required".into());
+        windows::startup(root, executable, "manual")?;
         #[cfg(not(windows))]
         {
             let mut command = process(executable);

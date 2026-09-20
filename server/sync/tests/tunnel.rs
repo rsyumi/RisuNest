@@ -57,12 +57,23 @@ async fn managed_child_restarts_and_shutdown_owns_its_lifetime() {
     let runtime =
         ConnectionRuntime::start(store.clone(), "127.0.0.1:4319".parse().unwrap()).unwrap();
     let mut view = runtime.tunnel.clone();
+    let mut saw_retry_diagnostic = false;
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut connected = 0;
+        let mut previous = "";
         loop {
             view.changed().await.unwrap();
-            if view.borrow().phase == "connected" {
+            let current = view.borrow().clone();
+            if current.phase == "connected" && previous != "connected" {
                 connected += 1;
+            }
+            previous = current.phase;
+            if current.phase == "starting" && current.error.is_some() {
+                saw_retry_diagnostic = true;
+                assert!(current
+                    .logs
+                    .iter()
+                    .any(|line| line.contains("synthetic.trycloudflare.com")));
             }
             if connected == 2 {
                 break;
@@ -71,6 +82,7 @@ async fn managed_child_restarts_and_shutdown_owns_its_lifetime() {
     })
     .await
     .unwrap();
+    assert!(saw_retry_diagnostic);
     assert_eq!(
         store.connection_status().unwrap().endpoint.as_deref(),
         Some("https://synthetic.trycloudflare.com")

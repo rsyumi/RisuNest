@@ -13,11 +13,11 @@ try {
     Invoke-Manager @('autostart','install') | Out-Null
     $registered=Invoke-Manager @('autostart','status') | ConvertFrom-Json
     if(!$registered.registered -or !$registered.enabled -or !$registered.actionMatches){throw 'Task was not registered'}
-    if(!(Get-NetTCPConnection -State Listen -LocalPort 4319 -ErrorAction SilentlyContinue)) {
+    if(!(Get-NetTCPConnection -State Listen -LocalPort 14319 -ErrorAction SilentlyContinue)) {
         Invoke-Manager @('start') | Out-Null
         $started=$true
         Invoke-Manager @('status') | Out-Null
-    } else { Write-Output 'SKIP: task start and running-task removal, port 4319 is occupied' }
+    } else { Write-Output 'SKIP: task start and running-task removal, port 14319 is occupied' }
     $relocatedServer=Join-Path $dataRoot 'relocated-server.exe'
     Copy-Item -LiteralPath $Server -Destination $relocatedServer
     $relocated=& $Manager --data-dir $dataRoot --server $relocatedServer autostart status | ConvertFrom-Json

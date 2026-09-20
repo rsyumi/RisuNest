@@ -1524,8 +1524,17 @@ mod tests {
             ];
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 8192];
-                let read = stream.read(&mut request).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 8192];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0 && request.len() + count <= 16384);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let read = request.len();
                 assert!(String::from_utf8_lossy(&request[..read])
                     .to_ascii_lowercase()
                     .contains("authorization: bearer"));
@@ -1569,8 +1578,17 @@ mod tests {
             let mut requests = Vec::new();
             for (code, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 8192];
-                let read = stream.read(&mut request).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 8192];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0 && request.len() + count <= 16384);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let read = request.len();
                 requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
                 write!(
                     stream,
