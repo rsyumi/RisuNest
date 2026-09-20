@@ -13,8 +13,8 @@
   --subtextcolor: #607287;
   --darkborderc: rgba(103, 125, 154, 0.2);
   --shell: rgba(236, 243, 251, 0.22);
-  --side: rgba(238, 245, 253, 0.74);
-  --bgcolor: rgba(252, 254, 255, 0.78);
+  --side: rgba(238, 245, 253, 0.68);
+  --bgcolor: rgba(252, 254, 255, 0.72);
   --hairline: rgba(255, 255, 255, 0.5);
   --panel: rgba(255, 255, 255, 0.7);
   --input: rgba(240, 245, 252, 0.6);
@@ -178,8 +178,11 @@ label > .copy-field {
   padding: 0;
   background: transparent;
   color: var(--textcolor);
+  cursor: default;
+  transition: background-color 0.12s ease;
 }
-.caption-controls button:hover:not(:disabled) {
+.caption-controls button:hover:not(:disabled),
+.caption-controls button.hover {
   filter: none;
   background: var(--captionhover);
 }
@@ -761,8 +764,8 @@ dialog p {
     --subtextcolor: #b7c8dc;
     --darkborderc: rgba(189, 210, 240, 0.16);
     --shell: rgba(17, 25, 40, 0.32);
-    --side: rgba(17, 29, 47, 0.78);
-    --bgcolor: rgba(20, 29, 44, 0.82);
+    --side: rgba(17, 29, 47, 0.72);
+    --bgcolor: rgba(20, 29, 44, 0.76);
     --hairline: rgba(199, 219, 244, 0.1);
     --panel: rgba(32, 46, 67, 0.72);
     --input: rgba(16, 29, 47, 0.45);

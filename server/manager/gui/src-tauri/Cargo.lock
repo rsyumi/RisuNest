@@ -2978,6 +2978,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
+ "windows",
 ]
 
 [[package]]

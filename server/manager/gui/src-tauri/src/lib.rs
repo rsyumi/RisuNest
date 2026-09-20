@@ -9,6 +9,21 @@ use std::{
 };
 use tauri::{Manager, State};
 
+#[cfg(windows)]
+mod snap;
+
+/// Opens the native window menu for the title bar drawn by the webview.
+#[tauri::command]
+fn window_system_menu(window: tauri::WebviewWindow, x: f64, y: f64) {
+    #[cfg(windows)]
+    {
+        let target = window.as_ref().window();
+        let _ = window.run_on_main_thread(move || snap::show_system_menu(&target, Some((x, y))));
+    }
+    #[cfg(not(windows))]
+    let _ = (window, x, y);
+}
+
 struct Context {
     root: PathBuf,
     executable: PathBuf,
@@ -348,7 +363,8 @@ pub fn run() {
             manager_update_check,
             manager_tray_startup,
             manager_request_id,
-            manager_qr
+            manager_qr,
+            window_system_menu
         ])
         .setup(move |app| {
             use tauri::{
@@ -376,15 +392,18 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 // The frontend draws the title bar over the acrylic backdrop on Windows.
                 #[cfg(windows)]
-                window.set_decorations(false)?;
+                {
+                    window.set_decorations(false)?;
+                    snap::attach(&window.as_ref().window());
+                }
                 if !tray {
                     window.show()?;
                 }
             }
             Ok(())
         })
-        .on_window_event(move |window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(move |window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 if tray {
                     api.prevent_close();
                     let _ = window.hide();
@@ -392,6 +411,11 @@ pub fn run() {
                     window.app_handle().exit(0);
                 }
             }
+            #[cfg(windows)]
+            tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                snap::layout(window)
+            }
+            _ => (),
         })
         .run(tauri::generate_context!())
         .expect("sync manager runtime failed");
