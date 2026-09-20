@@ -155,7 +155,8 @@ async fn manager_start(ctx: State<'_, Context>) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Err("server-not-ready".into())
+    Err(std::fs::read_to_string(ctx.root.join("startup-error.txt"))
+        .unwrap_or_else(|_| "server-not-ready".into()))
 }
 #[tauri::command]
 async fn manager_environment(ctx: State<'_, Context>) -> Result<Value> {
@@ -175,9 +176,25 @@ async fn manager_environment(ctx: State<'_, Context>) -> Result<Value> {
             ),
             Err(error)=>(None,Some(error)),
         };
-        Ok(json!({"platform":std::env::consts::OS,"dataDir":path_text(&root),"cloudflared":path_text(&cloudflared),"startup":startup,"startupError":error,"trayStartup":gui_startup::setting(&root,None)?,"updateSettings":update_settings,"updateStatus":update_status,"updateSchedule":update_schedule,"updateScheduleError":update_schedule_error}))
+        Ok(json!({"network":risunest_sync_server::config::NetworkSettings::load(&root).map_err(|e| e.code.to_owned())?,"platform":std::env::consts::OS,"dataDir":path_text(&root),"cloudflared":path_text(&cloudflared),"startup":startup,"startupError":error,"trayStartup":gui_startup::setting(&root,None)?,"updateSettings":update_settings,"updateStatus":update_status,"updateSchedule":update_schedule,"updateScheduleError":update_schedule_error}))
     }).await.map_err(|_|"environment-unavailable")?
 }
+#[tauri::command]
+async fn manager_network(ctx: State<'_, Context>, settings: Value) -> Result<()> {
+    let settings: risunest_sync_server::config::NetworkSettings =
+        serde_json::from_value(settings).map_err(|_| "invalid-network-settings")?;
+    let root = ctx.root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = update::try_lock(&root)?;
+        if root.join("manager-update/transaction.json").exists() {
+            return Err("update-recovery-required".into());
+        }
+        settings.save(&root).map_err(|e| e.code.to_owned())
+    })
+    .await
+    .map_err(|_| "network-settings-save-failed")?
+}
+
 #[tauri::command]
 async fn manager_startup(
     ctx: State<'_, Context>,
@@ -325,6 +342,7 @@ pub fn run() {
             manager_mutate,
             manager_start,
             manager_environment,
+            manager_network,
             manager_startup,
             manager_update_policy,
             manager_update_check,

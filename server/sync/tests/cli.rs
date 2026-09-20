@@ -38,15 +38,85 @@ fn independent_binary_initializes_registers_reports_and_revokes() {
     );
 }
 #[test]
-fn binary_rejects_public_cleartext_before_creating_storage() {
+fn binary_rejects_multicast_before_creating_storage() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("not-created");
     let output = cli(
         &target,
-        &["init", "--listen", "0.0.0.0:4319", "--https-proxy"],
+        &["init", "--listen", "224.0.0.1:14319", "--https-proxy"],
     );
     assert!(!output.status.success());
     assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn saved_wildcard_listener_is_used_and_management_remains_local() {
+    use risunest_sync_server::management::discovery::Discovery;
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    let address = format!("0.0.0.0:{port}");
+    assert!(
+        cli(dir.path(), &["network", "configure", "--listen", &address])
+            .status
+            .success()
+    );
+    assert!(cli(dir.path(), &["init"]).status.success());
+    drop(reserved);
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _child = Child(
+        Command::new(env!("CARGO_BIN_EXE_risunest-sync-server"))
+            .args(["serve", "--data-dir"])
+            .arg(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let http = reqwest::Client::new();
+    let status = loop {
+        if let Ok(locator) = Discovery::load(dir.path()) {
+            assert!(locator.address.ip().is_loopback());
+            if let Ok(response) = http
+                .get(format!("http://{}/status", locator.address))
+                .bearer_auth(locator.token)
+                .send()
+                .await
+            {
+                if let Ok(status) = response.json::<serde_json::Value>().await {
+                    break status;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not become ready"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status["listener"], address);
+    assert!(http
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .is_ok());
+    assert!(!cli(
+        dir.path(),
+        &["network", "configure", "--listen", "0.0.0.0:0"]
+    )
+    .status
+    .success());
+    let saved = cli(dir.path(), &["network", "status"]);
+    let saved: serde_json::Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(saved["port"], port);
 }
 
 #[test]

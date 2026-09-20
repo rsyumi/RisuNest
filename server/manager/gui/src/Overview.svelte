@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Check, Copy, ChevronRight, AlertCircle } from "@lucide/svelte";
-  import { formatBytes, phase, type Status } from "./api";
+  import { message, formatBytes, phase, type Status } from "./api";
   let {
     status,
     connected,
@@ -57,7 +57,8 @@
     ><span>레지스트리 · {phase(status.publication.phase)}</span>
   </div>
   {#if status.tunnel.error || status.publication.error}<p class="warning">
-      <AlertCircle size={15} /> 연결 상태를 확인하세요. 서버에 저장된 데이터는 유지됩니다.
+      <AlertCircle size={15} /> {status.tunnel.error ? message(status.tunnel.error) : "주소 레지스트리에 게시하지 못했습니다."}
+      <code>{status.tunnel.error ?? status.publication.error}</code>
     </p>{/if}
 </section>
 <section class="card storage-summary" aria-label="저장 공간">

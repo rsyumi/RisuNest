@@ -212,6 +212,12 @@ try {
    try { $actionMatches=[StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($action.Path),[IO.Path]::GetFullPath($env:RISUNEST_TASK_PROGRAM)) -and $action.Arguments -eq $env:RISUNEST_TASK_ARGUMENTS } catch { $actionMatches=$false }
   }
  }
+ if($env:RISUNEST_TASK_ACTION -eq 'manual') {
+  $definition=[IO.File]::ReadAllText($env:RISUNEST_TASK_XML).Replace('__CURRENT_SID__',$sid)
+  $task=$folder.RegisterTask($env:RISUNEST_TASK_NAME,$definition,6,$sid,$null,3,$null)
+  $actionMatches=$true
+  $null=$task.Run($null)
+ }
  switch($env:RISUNEST_TASK_ACTION) {
   'install' {
    $stage='read-definition'
@@ -224,7 +230,9 @@ try {
   'remove' { if($null -ne $task){$folder.DeleteTask($env:RISUNEST_TASK_NAME,0)}; $task=$null; $actionMatches=$true }
   'start' { if($null -eq $task){throw 'missing-task'}; if(!$actionMatches){throw 'unexpected-task-action'}; $null=$task.Run($null) }
  }
- @{registered=($null -ne $task);enabled=($null -ne $task -and $task.Enabled);actionMatches=$actionMatches} | ConvertTo-Json -Compress
+ $login=$false
+ if($null -ne $task){foreach($trigger in $task.Definition.Triggers){if($trigger.Type -eq 9 -and $trigger.Enabled){$login=$true}}}
+ @{registered=$login;enabled=($login -and $task.Enabled);actionMatches=$actionMatches} | ConvertTo-Json -Compress
 } catch {
  $reason=$_.Exception; while($reason.InnerException){$reason=$reason.InnerException}
  [Console]::Error.WriteLine($stage+':'+$reason.HResult.ToString('X8'))
@@ -234,7 +242,13 @@ try {
 
 pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupStatus> {
     let mut file = tempfile::NamedTempFile::new().map_err(|_| "startup-file-unavailable")?;
-    file.write_all(task_xml(root, executable)?.as_bytes())
+    let definition = task_xml(root, executable)?;
+    let definition = if action == "manual" {
+        definition.replace("<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>__CURRENT_SID__</UserId></LogonTrigger></Triggers>", "<Triggers/>")
+    } else {
+        definition
+    };
+    file.write_all(definition.as_bytes())
         .map_err(|_| "startup-file-unavailable")?;
     // Close the delete-on-close handle before .NET opens the definition. Its
     // default FileShare.Read cannot coexist with that Windows DELETE access.

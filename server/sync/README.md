@@ -26,7 +26,7 @@ $data = Join-Path $env:LOCALAPPDATA 'RisuNestSync'
 ```
 
 In RisuNest's server synchronization settings, register the endpoint, library ID,
-device ID and token printed for that installation. Use `http://127.0.0.1:4319`
+device ID and token printed for that installation. Use `http://127.0.0.1:14319`
 only on the server machine; other devices need the HTTPS proxy URL described
 below. Pause the daemon before adding another device, then restart it.
 
@@ -74,10 +74,10 @@ the daemon to be stopped. All commands take `--data-dir ABSOLUTE_PATH` and use
 an exclusive owner lock. A second daemon or `init` fails without replacing data.
 Ctrl+C and Unix SIGTERM request graceful shutdown.
 
-The default is `127.0.0.1:4319`. `--listen` accepts loopback addresses only.
+The default is `127.0.0.1:14319`. `--listen` accepts interface and wildcard addresses.
 Configure a trusted HTTPS reverse proxy or Tunnel for remote clients and pass
 `--https-proxy` to acknowledge that origin configuration. This flag does not
-install a proxy, provide TLS, or enable public cleartext binding. Live HTTPS proxy
+install a proxy or provide TLS. Non-loopback listeners also serve HTTP. Live HTTPS proxy
 verification remains pending. Keep the data directory on a local disk
 owned exclusively by the daemon user. Existing symlinks/junctions are rejected.
 

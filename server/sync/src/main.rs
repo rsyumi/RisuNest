@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc};
 
 mod update;
 
-const USAGE: &str = "risunest-sync-server <init|status|serve|maintain|backup|restore|restore-epoch|device add [--qr]|device revoke ID|connection configure|connection status|connection repost> --data-dir ABSOLUTE_PATH [--backup-dir ABSOLUTE_PATH] [--listen 127.0.0.1:4319] [--https-proxy]\nrisunest-sync-server update check\nconnection configure: choose --endpoint HTTPS_URL or --cloudflared ABSOLUTE_EXECUTABLE, optionally --registry REGISTRY_URL.\nUpdate check verifies the signed product catalog and reports the raw package for this OS and architecture without downloading or installing it.\nAdministration commands require the daemon to be stopped. Configured device add emits a private registration URI; --qr also displays its QR. Without connection configuration, manual credential JSON remains available. Backup and restore require a new destination directory. Serve is loopback-only.";
+const USAGE: &str = "risunest-sync-server <init|status|serve|maintain|backup|restore|restore-epoch|device add [--qr]|device revoke ID|connection configure|connection status|connection repost> --data-dir ABSOLUTE_PATH [--backup-dir ABSOLUTE_PATH] [--listen 127.0.0.1:14319] [--https-proxy]\nrisunest-sync-server update check\nconnection configure: choose --endpoint HTTPS_URL or --cloudflared ABSOLUTE_EXECUTABLE, optionally --registry REGISTRY_URL.\nUpdate check verifies the signed product catalog and reports the raw package for this OS and architecture without downloading or installing it.\nAdministration commands require the daemon to be stopped. Configured device add emits a private registration URI; --qr also displays its QR. Without connection configuration, manual credential JSON remains available. Backup and restore require a new destination directory. network configure --listen IP:PORT saves the listener for the next start; network status shows saved settings. The default listener is 127.0.0.1:14319. Non-loopback listeners serve HTTP; use an HTTPS proxy for public connections.";
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +26,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let command = args.next().unwrap();
-    let subcommand = if command == "device" || command == "connection" || command == "update" {
+    let subcommand = if command == "device"
+        || command == "connection"
+        || command == "update"
+        || command == "network"
+    {
         Some(args.next().ok_or(USAGE)?)
     } else {
         None
@@ -46,7 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut data_dir = None;
     let mut backup_dir = None;
-    let mut listen = "127.0.0.1:4319".parse()?;
+    let mut listen: Option<std::net::SocketAddr> = None;
     let mut https_proxy = false;
     let mut endpoint = None;
     let mut cloudflared = None;
@@ -57,7 +61,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--data-dir" if data_dir.is_none() => {
                 data_dir = Some(PathBuf::from(args.next().ok_or(USAGE)?))
             }
-            "--listen" => listen = args.next().ok_or(USAGE)?.parse()?,
+            "--listen" => listen = Some(args.next().ok_or(USAGE)?.parse()?),
             "--backup-dir" if backup_dir.is_none() => {
                 backup_dir = Some(PathBuf::from(args.next().ok_or(USAGE)?))
             }
@@ -89,8 +93,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(USAGE.into()),
         }
     }
+    let data_dir = data_dir.ok_or(USAGE)?;
+    if !data_dir.is_absolute() {
+        return Err("absolute-data-dir-required".into());
+    }
+    if command == "network" {
+        use risunest_sync_server::config::NetworkSettings;
+        match subcommand.as_deref() {
+            Some("configure") => {
+                let listen = listen.ok_or(USAGE)?;
+                NetworkSettings {
+                    schema: 1,
+                    address: listen.ip(),
+                    port: listen.port(),
+                }
+                .save(&data_dir)?;
+            }
+            Some("status") => (),
+            _ => return Err(USAGE.into()),
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&NetworkSettings::load(&data_dir)?)?
+        );
+        return Ok(());
+    }
+    let listen = match listen {
+        Some(value) => value,
+        None => risunest_sync_server::config::NetworkSettings::load(&data_dir)?.socket(),
+    };
     let config = Config {
-        data_dir: data_dir.ok_or(USAGE)?,
+        data_dir,
         listen,
         https_proxy,
     };
@@ -182,7 +215,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&store.connection_status()?)?);
         }
         "serve" => {
-            let listener = tokio::net::TcpListener::bind(config.listen).await?;
+            let listener = match tokio::net::TcpListener::bind(config.listen).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let code = match error.kind() {
+                        std::io::ErrorKind::AddrInUse => "listen-address-in-use",
+                        std::io::ErrorKind::AddrNotAvailable => "listen-address-unavailable",
+                        std::io::ErrorKind::PermissionDenied => "listen-permission-denied",
+                        _ => "listener-start-failed",
+                    };
+                    let _ = std::fs::write(config.data_dir.join("startup-error.txt"), code);
+                    return Err(format!("{code}: {}: {error}", config.listen).into());
+                }
+            };
             let origin = listener.local_addr()?;
             let store = Arc::new(store);
             // A service manager may send SIGTERM as soon as readiness is observable.

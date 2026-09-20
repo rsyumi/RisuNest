@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, untrack, tick } from "svelte";
   import { Copy } from "@lucide/svelte";
-  import { phase, type Status, type Environment } from "./api";
+  import { message, phase, type Status, type Environment } from "./api";
   let {
     status,
     environment,
@@ -86,7 +86,7 @@
 <p class="page-description">
   고정 주소와 임시 주소, 주소 레지스트리를 설정합니다.
 </p>
-<form
+<form aria-label="연결 설정"
   onsubmit={(e) => {
     e.preventDefault();
     void apply();
@@ -131,6 +131,8 @@
         인터넷을 통해 연결할 수 있는 주소를 발급합니다. 다시 시작하면 주소가
         바뀔 수 있습니다.
       </p>
+      {#if status.tunnel.error}<p class="warning" role="alert">{message(status.tunnel.error)} <code>{status.tunnel.error}</code></p>{/if}
+      {#if status.tunnel.logs.length}<details><summary>cloudflared 출력</summary><pre class="tunnel-output">{status.tunnel.logs.join("\n")}</pre></details>{/if}
       {#if status.tunnel.endpoint}<label
           >현재 임시 주소
           <div class="copy-field">

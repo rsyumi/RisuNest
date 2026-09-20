@@ -34,7 +34,8 @@ fn systemd_arg(path: &Path) -> Result<String> {
 }
 #[cfg(not(target_os = "macos"))]
 pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<StartupStatus> {
-    let directory = user_service_directory(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), home)?;
+    let directory =
+        user_service_directory(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), home)?;
     let name = format!("{}.service", instance_name(root));
     let path = directory.join(&name);
     match action {
@@ -105,7 +106,8 @@ pub(super) fn update_schedule(
     policy: UpdatePolicy,
     action: &str,
 ) -> Result<UpdateScheduleStatus> {
-    let directory = user_service_directory(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), home)?;
+    let directory =
+        user_service_directory(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from), home)?;
     let update_service = format!("{}-update.service", instance_name(root));
     let timer = format!("{}-update.timer", instance_name(root));
     let service_path = directory.join(&update_service);
@@ -217,7 +219,13 @@ pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<St
         "install" => {
             std::fs::create_dir_all(&directory).map_err(|_| "user-service-write-failed")?;
             std::fs::write(&path, &expected_body).map_err(|_| "user-service-write-failed")?;
-            // Bootstrap reports policy/signature rejection, never silently elevates.
+        }
+        "remove" if path.exists() => {
+            // Removing future login registration must not stop the current daemon.
+            // The loaded job leaves the user domain at logout.
+            std::fs::remove_file(&path).map_err(|_| "user-service-remove-failed")?;
+        }
+        "start" => {
             let loaded = process("launchctl")
                 .args(["print", &service])
                 .output()
@@ -229,21 +237,9 @@ pub(super) fn startup(root: &Path, executable: &Path, action: &str) -> Result<St
             }
             checked(process("launchctl").args(["bootstrap", &domain]).arg(&path))?;
         }
-        "remove" if path.exists() => {
-            // Removing future login registration must not stop the current daemon.
-            // The loaded job leaves the user domain at logout.
-            std::fs::remove_file(&path).map_err(|_| "user-service-remove-failed")?;
-        }
-        "start" => checked(process("launchctl").args(["kickstart", &service]))?,
         _ => (),
     }
-    let enabled = path.exists()
-        && process("launchctl")
-            .args(["print", &service])
-            .output()
-            .map_err(|_| "user-service-unavailable")?
-            .status
-            .success();
+    let enabled = path.exists();
     let action_matches =
         path.exists() && std::fs::read_to_string(&path).is_ok_and(|body| body == expected_body);
     Ok(StartupStatus {

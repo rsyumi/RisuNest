@@ -214,7 +214,7 @@ async fn status(State(ctx): State<Arc<Context>>) -> Result<Json<Value>> {
             json!(*runtime.publication.borrow()),
         ),
         None => (
-            json!({"phase":"stopped","endpoint":null,"error":null}),
+            json!({"phase":"stopped","endpoint":null,"error":null,"logs":[]}),
             json!({"phase":"stopped","error":null}),
         ),
     };
@@ -222,6 +222,7 @@ async fn status(State(ctx): State<Arc<Context>>) -> Result<Json<Value>> {
     Ok(Json(json!({
         "revision":format!("{}:{}",ctx.session,rt.revision), "uptimeSeconds":ctx.started.elapsed().as_secs(),
         "connection":connection, "connectionState":persisted, "tunnel":tunnel, "publication":publication,
+        "listener":ctx.origin.to_string(),
         "storage":*ctx.usage.read().await, "devices":devices,
         "maintenance":maintenance,
         "version":env!("CARGO_PKG_VERSION"),

@@ -18,16 +18,16 @@ fn owner_lock_and_reinitialization_protect_the_store() {
     assert_eq!(Store::open(dir.path()).unwrap().head().unwrap(), head);
 }
 #[test]
-fn only_loopback_listener_and_absolute_storage_are_allowed() {
+fn explicit_interface_listeners_and_absolute_storage_are_allowed() {
     let dir = tempfile::tempdir().unwrap();
-    for listen in ["0.0.0.0:4319", "192.168.1.2:4319", "[::]:4319"] {
+    for listen in ["0.0.0.0:14319", "192.168.1.2:14319", "[::]:14319"] {
         assert!(Config {
             data_dir: dir.path().into(),
             listen: listen.parse().unwrap(),
             https_proxy: true
         }
         .validate()
-        .is_err());
+        .is_ok());
     }
     assert!(Config {
         data_dir: "relative".into(),
