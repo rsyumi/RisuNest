@@ -32,6 +32,61 @@ export const NATIVE_CAS_IPC_CHUNK_BYTES = 64 * 1024
 /** The largest part one native CAS read returns; native enforces the same value. */
 export const NATIVE_CAS_READ_PART_BYTES = 1024 * 1024
 
+// Keep upload admission aligned with CasUploadPool in asset_repository/commands.rs.
+const MAX_CAS_UPLOAD_BYTES = 512 * 1024 * 1024
+const MAX_CONCURRENT_CAS_UPLOADS = 4
+const MAX_TOTAL_CAS_UPLOAD_BYTES = 1024 * 1024 * 1024
+
+export interface NativeCasUploadBudgetOptions {
+    maxUploads?: number
+    capacityBytes?: number
+}
+
+export interface NativeCasUploadBudget {
+    run<T>(byteSize: number, upload: () => Promise<T>): Promise<T>
+}
+
+/** Shares native upload slots and byte reservations between ownership sessions, in arrival order. */
+export function createNativeCasUploadBudget(options: NativeCasUploadBudgetOptions = {}): NativeCasUploadBudget {
+    const maxUploads = options.maxUploads ?? MAX_CONCURRENT_CAS_UPLOADS
+    const capacity = options.capacityBytes ?? MAX_TOTAL_CAS_UPLOAD_BYTES
+    if (!Number.isSafeInteger(maxUploads) || maxUploads < 1 || maxUploads > MAX_CONCURRENT_CAS_UPLOADS
+        || !Number.isSafeInteger(capacity) || capacity < 1 || capacity > MAX_TOTAL_CAS_UPLOAD_BYTES) {
+        throw new RangeError('Native CAS upload budget exceeds the native limits')
+    }
+    let active = 0
+    let reservedBytes = 0
+    const waiting: { byteSize: number, admit: () => void }[] = []
+    const admitWaiting = () => {
+        while (waiting.length > 0 && active < maxUploads && waiting[0].byteSize <= capacity - reservedBytes) {
+            const next = waiting.shift()!
+            active++
+            reservedBytes += next.byteSize
+            next.admit()
+        }
+    }
+    return {
+        async run(byteSize, upload) {
+            if (!Number.isSafeInteger(byteSize) || byteSize < 0 || byteSize > Math.min(capacity, MAX_CAS_UPLOAD_BYTES)) {
+                throw new RangeError('Native CAS upload size is outside the supported range')
+            }
+            await new Promise<void>(admit => {
+                waiting.push({ byteSize, admit })
+                admitWaiting()
+            })
+            try {
+                return await upload()
+            } finally {
+                active--
+                reservedBytes -= byteSize
+                admitWaiting()
+            }
+        },
+    }
+}
+
+const documentUploadBudget = createNativeCasUploadBudget()
+
 export type NativeCasJobKind =
     | 'direct-asset-or-inlay-write'
     | 'local-backup-restore'
@@ -94,6 +149,7 @@ export async function prepareCasObject(
     data: Uint8Array,
     role: NativeCasObjectRole,
     invokeCommand: InvokeCommand = invoke,
+    budget: NativeCasUploadBudget = documentUploadBudget,
 ): Promise<PreparedImmutablePayload> {
     pinSessionId(sessionId, 'Native CAS job prepare')
     if (data.byteLength <= NATIVE_CAS_IPC_CHUNK_BYTES) {
@@ -103,35 +159,37 @@ export async function prepareCasObject(
             role,
         }), 'Native CAS job prepare')
     }
-    const uploadId = crypto.randomUUID()
-    const sender = await nativeAssetByteSender(invokeCommand)
-    try {
-        const opened = await invokeCommand('asset_cas_job_upload_open', {
-            uploadId,
-            sessionId,
-            role,
-            totalBytes: data.byteLength,
-            binary: sender.binary,
-        }) as { capacity?: unknown }
-        if (opened.capacity !== sender.capacity) {
-            throw new TypeError('Native CAS upload returned an invalid chunk capacity')
-        }
-        for (let offset = 0; offset < data.byteLength;) {
-            const end = Math.min(offset + sender.capacity, data.byteLength)
-            const acknowledged = safeSize(await sender.append('asset_cas_job_upload_chunk',
-                uploadId, offset, data.subarray(offset, end)), 'Native CAS upload chunk')
-            if (acknowledged !== end) {
-                throw new Error('Native CAS upload returned an invalid chunk acknowledgement')
+    return budget.run(data.byteLength, async () => {
+        const uploadId = crypto.randomUUID()
+        const sender = await nativeAssetByteSender(invokeCommand)
+        try {
+            const opened = await invokeCommand('asset_cas_job_upload_open', {
+                uploadId,
+                sessionId,
+                role,
+                totalBytes: data.byteLength,
+                binary: sender.binary,
+            }) as { capacity?: unknown }
+            if (opened.capacity !== sender.capacity) {
+                throw new TypeError('Native CAS upload returned an invalid chunk capacity')
             }
-            offset = end
+            for (let offset = 0; offset < data.byteLength;) {
+                const end = Math.min(offset + sender.capacity, data.byteLength)
+                const acknowledged = safeSize(await sender.append('asset_cas_job_upload_chunk',
+                    uploadId, offset, data.subarray(offset, end)), 'Native CAS upload chunk')
+                if (acknowledged !== end) {
+                    throw new Error('Native CAS upload returned an invalid chunk acknowledgement')
+                }
+                offset = end
+            }
+            return preparedPayload(
+                await invokeCommand('asset_cas_job_upload_finish', { uploadId }),
+                'Native CAS upload finish',
+            )
+        } finally {
+            await invokeCommand('asset_cas_job_upload_cancel', { uploadId }).catch(() => undefined)
         }
-        return preparedPayload(
-            await invokeCommand('asset_cas_job_upload_finish', { uploadId }),
-            'Native CAS upload finish',
-        )
-    } finally {
-        await invokeCommand('asset_cas_job_upload_cancel', { uploadId }).catch(() => undefined)
-    }
+    })
 }
 
 /** A native CAS read whose response did not arrive within the stall limit. */
