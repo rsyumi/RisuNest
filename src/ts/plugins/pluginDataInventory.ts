@@ -11,6 +11,7 @@ import {
 } from './pluginDeviceKeyspace'
 import { pluginStorageStore } from './plugins.svelte'
 import { readNativePluginDeviceValue } from './pluginDeviceTransfer'
+import { describeLocalPluginStorageValue } from './localPluginStorageValue'
 
 /** Which store a value lives in. The device store never leaves this machine. */
 export type PluginDataScope = 'library' | 'device'
@@ -77,10 +78,10 @@ export async function listPluginDataItems(
 
 export async function readPluginDataValue(item: PluginDataItem): Promise<string | null> {
     if (item.space !== undefined) {
-        if (!isTauri) {
-            return await createBrowserPluginDeviceBackend().read(item.owner, item.space, item.key)
-        }
-        return await readNativePluginDeviceValue(item.owner, item.space, item.key)
+        const value = isTauri ? await readNativePluginDeviceValue(item.owner, item.space, item.key)
+            : await createBrowserPluginDeviceBackend().read(item.owner, item.space, item.key)
+        if (!(value instanceof Uint8Array)) return value
+        return JSON.stringify(describeLocalPluginStorageValue(value), null, 2)
     }
     const stored = await getPersistentDataStore().readPluginStorage(item.owner, item.key)
     if (!stored) return null

@@ -204,7 +204,7 @@ fn tracked_tables() -> [(&'static str, Section, &'static str, &'static str, &'st
     ]
 }
 
-fn invalid(message: &str) -> StoreError {
+pub(super) fn invalid(message: &str) -> StoreError {
     StoreError::Validation {
         message: message.to_owned(),
     }

@@ -1,7 +1,7 @@
 use super::classification::*;
 use super::*;
 use serde_json::{json, Map};
-use device_store::plugin_values::{self, text_value as plugin_text};
+use device_store::plugin_values::{self, text_value as plugin_text, raw_value as plugin_raw};
 
 const PERSONA_FIELDS: &[&str] = &[
     "personaPrompt",
@@ -1175,6 +1175,16 @@ fn apply_value(
     if p[0] == "plugin-local" {
         if let UnitValue::Object { descriptor, .. } = value {
             let (rowid, length) = plugin_text::object_row(tx, &descriptor.object_hash)?;
+            if plugin_raw::is_object(tx, &descriptor.object_hash)? {
+                if p[2] != "json" { return Err(error("plugin-local-namespace-invalid")); }
+                validate_plugin_unit(tx, value)?;
+                let info = plugin_raw::inspect_object(tx, &descriptor.object_hash)?;
+                let (clock, writer): (String, String) = tx.query_row("SELECT write_clock,writer_id FROM plugin_device_storage WHERE owner=?1 AND space=?2 AND key=?3", params![p[1],p[2],p[3]], |row| Ok((row.get(0)?, row.get(1)?))).optional()?.unwrap_or(("0".into(), String::new()));
+                return plugin_raw::write_reserved(tx, &p[1], &p[3], &info, &clock, &writer, |output| {
+                    let mut input = tx.blob_open(rusqlite::MAIN_DB, "message_page_objects", "body", rowid, true)?;
+                    std::io::copy(&mut input, output)?; Ok(())
+                });
+            }
             if length > plugin_text::PART_BYTES as u64 {
                 validate_plugin_unit(tx, value)?;
                 let info = plugin_text::inspect_object(tx, &descriptor.object_hash)?;
@@ -1441,6 +1451,10 @@ pub(in crate::persistent_store) fn device_replacement_changes(
         for row in &rows.local_plugins {
             let value = match &row.value {
                 SectionValueRow::Plugin { value, .. } => unit_value(tx, &json!(value))?,
+                SectionValueRow::PluginBinary { object, .. } => {
+                    if local { plugin_unit_value(tx, &row.key1, &row.key2, &row.key3)? }
+                    else { wire(UnitValue::object(RecordDescriptor::content(object.hash.clone())))? }
+                }
                 SectionValueRow::PluginObject { object, .. } => {
                     if local { plugin_unit_value(tx, &row.key1, &row.key2, &row.key3)? }
                     else { wire(UnitValue::object(RecordDescriptor::content(object.hash.clone())))? }
@@ -1534,6 +1548,11 @@ pub(in crate::persistent_store) fn capture_device_changes(
 fn validate_plugin_unit(db: &Connection, value: &UnitValue) -> StoreResult<()> {
     if let UnitValue::Object { descriptor, .. } = value {
         let (_, length) = plugin_text::object_row(db, &descriptor.object_hash)?;
+        if plugin_raw::is_object(db, &descriptor.object_hash)? {
+            if *descriptor != RecordDescriptor::content(descriptor.object_hash.clone()) { return Err(error("invalid-large-unit")); }
+            plugin_raw::inspect_object(db, &descriptor.object_hash)?;
+            return Ok(());
+        }
         if length <= plugin_text::PART_BYTES as u64 { return validate_large_unit(db, value).map(|_| ()); }
         if *descriptor != RecordDescriptor::content(descriptor.object_hash.clone()) {
             return Err(error("invalid-large-unit"));
@@ -1552,6 +1571,12 @@ pub(in crate::persistent_store) fn plugin_unit_value(db: &Connection, owner: &st
         params![owner, space, key], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
     let Some((rowid, size)) = row else { return Ok(UnitValue::Deleted); };
     if size < 0 { return Err(error("plugin device size is invalid")); }
+    let binary: bool = db.query_row("SELECT typeof(value)='blob' FROM plugin_device_storage WHERE rowid=?1", [rowid], |row| row.get(0))?;
+    if binary {
+        if space != "json" { return Err(error("plugin-local-namespace-invalid")); }
+        let info = plugin_raw::store(db, || Ok(db.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?))?;
+        return wire(UnitValue::object(RecordDescriptor::content(info.hash)));
+    }
     if size <= plugin_text::PART_BYTES as i64 {
         let value: String = db.query_row("SELECT value FROM plugin_device_storage WHERE rowid=?1", [rowid], |row| row.get(0))?;
         return unit_value(db, &Value::String(value));

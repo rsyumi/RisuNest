@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, MAIN_DB, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod text_value;
+pub(crate) mod raw_value;
 pub(crate) mod sessions;
 
 /// The renderer loads a whole keyspace only while it stays under this. Past it
@@ -47,6 +48,8 @@ pub(crate) struct PluginDeviceListItem {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum PluginDeviceRead {
+    #[serde(rename_all = "camelCase")]
+    Binary { binary: bool, byte_size: u64, version: String },
     Value(String),
     #[serde(rename_all = "camelCase")]
     Ranges { byte_size: u64, version: String },
@@ -137,6 +140,8 @@ impl DeviceStore {
                 entries: Vec::new(),
             });
         }
+        let binary: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM plugin_device_storage WHERE owner=?1 AND tombstone=0 AND typeof(value)='blob')", [owner], |row| row.get(0))?;
+        if binary { return Ok(PluginDeviceHydration { complete: false, byte_size, entries: vec![] }); }
         let mut statement = self.connection.prepare(
             "SELECT p.space,p.key,p.value,coalesce(r.sequence,0) FROM plugin_device_storage p
                 LEFT JOIN temp.plugin_remote_sequences r ON r.owner=p.owner AND r.space=p.space AND r.key=p.key
@@ -198,6 +203,10 @@ impl DeviceStore {
     }
 
     pub(crate) fn read_plugin_device_transfer(&self, owner: &str, space: &str, key: &str) -> StoreResult<Option<PluginDeviceRead>> {
+        if self.plugin_value_is_binary(owner, space, key)? {
+            let (_, byte_size, version) = self.plugin_value_identity(owner, space, key)?.ok_or_else(|| invalid("plugin value is unavailable"))?;
+            return Ok(Some(PluginDeviceRead::Binary { binary: true, byte_size, version }));
+        }
         let _snapshot = self.connection.unchecked_transaction()?;
         let Some((rowid, byte_size, version)) = self.plugin_value_identity(owner, space, key)? else { return Ok(None); };
         if byte_size <= text_value::PART_BYTES as u64 {
@@ -413,12 +422,21 @@ impl DeviceStore {
                 PluginDeviceMutation::Staged { .. } => {
                     let mut staged = staged.take().ok_or_else(|| invalid("plugin device write session is unavailable"))?;
                     let clock = issue_write_clock(&transaction, Section::LocalPlugins)?;
-                    write_reserved(&transaction, owner, &staged.space, &staged.key, staged.byte_length, clock.as_str(), &writer_id, |blob| {
-                        if std::io::copy(&mut staged.file, blob)? != staged.byte_length {
-                            return Err(invalid("plugin device write session is incomplete"));
-                        }
-                        Ok(())
-                    })?;
+                    if staged.binary {
+                        let info = raw_value::inspect(&mut staged.file)?;
+                        use std::io::{Seek, SeekFrom};
+                        staged.file.seek(SeekFrom::Start(0))?;
+                        raw_value::write_reserved(&transaction, owner, &staged.key, &info, clock.as_str(), &writer_id, |blob| {
+                            std::io::copy(&mut staged.file, blob)?; Ok(())
+                        })?;
+                    } else {
+                        write_reserved(&transaction, owner, &staged.space, &staged.key, staged.byte_length, clock.as_str(), &writer_id, |blob| {
+                            if std::io::copy(&mut staged.file, blob)? != staged.byte_length {
+                                return Err(invalid("plugin device write session is incomplete"));
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
             }
         }

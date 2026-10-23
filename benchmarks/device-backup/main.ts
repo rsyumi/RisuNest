@@ -27,6 +27,7 @@ import { getDeviceMarkers, initializeDeviceMarkers } from '../../src/ts/storage/
 import { updateDeviceSettings } from '../../src/ts/storage/deviceSettings';
 import { normalizeDatabaseDefaults, setDatabase } from '../../src/ts/storage/database.svelte';
 import { pluginValueMeasurement } from './plugin-values';
+import { pluginPerformance } from './plugin-performance';
 import {
   capturePersistentRoot,
   createPersistentDataRuntime,
@@ -646,6 +647,12 @@ const entryCompletion = verifySyntheticRoot()
 });
 
 let legacyMeasurement: Record<string, unknown> = { phase: 'idle' };
+(globalThis as typeof globalThis & { __pluginPerformance?: ReturnType<typeof pluginPerformance> }).__pluginPerformance = pluginPerformance(async () => {
+  await entryCompletion;
+  if (control.failure || control.stage !== 'ready') throw new Error(control.failure ?? 'Fresh synthetic harness required');
+  await nativeInvoke('pds_open');
+});
+
 (globalThis as typeof globalThis & { __legacyRestoreMeasurement?: {
   state(): Record<string, unknown>;
   start(megabytes: 100 | 300 | 600, encoding: 'raw' | 'gzip'): Promise<void>;

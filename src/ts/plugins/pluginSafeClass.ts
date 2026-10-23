@@ -1,4 +1,5 @@
 import { getPluginDeviceKeyspace, type PluginDeviceKeyspace } from "./pluginDeviceKeyspace";
+import { encodeLocalPluginStorageValue, decodeLocalPluginStorageValue, requiresLocalPluginStorageEncoding } from './localPluginStorageValue';
 
 /**
  * Device-local strings for one plugin. Every call is answered from that
@@ -12,7 +13,7 @@ export class SafeLocalStorage {
     }
 
     async getItem(key: string): Promise<string | null> {
-        return await this.#keyspace.getItem('string', key);
+        return await this.#keyspace.getItem('string', key) as string | null;
     }
     async setItem(key: string, value: string): Promise<void> {
         await this.#keyspace.setItem('string', key, value);
@@ -39,40 +40,91 @@ export class SafeLocalStorage {
     }
 }
 
-/** The same device keyspace, holding JSON values under their own space. */
+type LocalQueue = { keys: Map<string, Promise<void>>; clear: Promise<void> | null; enumeration: Promise<void> | null };
+const localQueues = new WeakMap<PluginDeviceKeyspace, LocalQueue>();
+// Symbols cannot be named by a sandbox CALL_INSTANCE message.
+export const localPluginStorageJsonWrite = Symbol('localPluginStorageJsonWrite');
+
+/** Device-local values; old JSON and versioned binary records share one keyspace. */
 export class SafeLocalPluginStorage {
     __classType = 'REMOTE_REQUIRED' as const;
     readonly #keyspace: PluginDeviceKeyspace;
+    readonly #queueState: LocalQueue;
 
     constructor(owner: string, keyspace = getPluginDeviceKeyspace(owner)) {
         this.#keyspace = keyspace;
+        let queue = localQueues.get(keyspace);
+        if (!queue) { queue = { keys: new Map(), clear: null, enumeration: null }; localQueues.set(keyspace, queue); }
+        this.#queueState = queue;
     }
 
     async getItem<T>(key: string): Promise<T | null> {
-        const stored = await this.#keyspace.getItem('json', key);
-        if (stored === null) return null;
-        try {
-            return JSON.parse(stored) as T;
-        } catch {
-            return null;
-        }
+        return this.#queue(key, async () => {
+            const stored = await this.#keyspace.getItem('json', key);
+            if (stored === null) return null;
+            if (stored instanceof Uint8Array) return decodeLocalPluginStorageValue<T>(stored);
+            try {
+                return JSON.parse(stored) as T;
+            } catch {
+                return null;
+            }
+        }, false);
     }
     async setItem<T>(key: string, value: T): Promise<void> {
+        const binary = requiresLocalPluginStorageEncoding(value);
+        if (binary) {
+            // Capture buffers before any await; a later write must not overtake Blob encoding.
+            const encoded = encodeLocalPluginStorageValue(value);
+            void encoded.catch(() => {});
+            return await this.#queue(key, async () => this.#keyspace.setItem('json', key, await encoded));
+        }
         // Avoid V8's fast-stringifier Zone allocation limit for large flat strings.
         const serialized = JSON.stringify(value, null);
         if (typeof serialized !== 'string') {
             throw new TypeError('getLocalPluginStorage values must be JSON-serializable');
         }
-        await this.#keyspace.setItem('json', key, serialized);
+        await this.#queue(key, () => this.#keyspace.setItem('json', key, serialized));
+    }
+    async [localPluginStorageJsonWrite](key: string, serialized: string): Promise<void> {
+        if (typeof key !== 'string' || typeof serialized !== 'string') {
+            throw new TypeError('Invalid local plugin JSON write');
+        }
+        // The frame may forge wire messages. Admit valid JSON text only.
+        JSON.parse(serialized);
+        await this.#queue(key, () => this.#keyspace.setItem('json', key, serialized));
+    }
+    #queue<T>(key: string | null, operation: () => Promise<T>, mutation = true): Promise<T> {
+        const state = this.#queueState;
+        const barriers: Promise<void>[] = key === null ? [...state.keys.values()] : [];
+        const pending = key === null ? undefined : state.keys.get(key);
+        if (pending) barriers.push(pending);
+        if (state.clear) barriers.push(state.clear);
+        if ((mutation || key === null) && state.enumeration) barriers.push(state.enumeration);
+        // Ordinary sequential JSON calls keep the immediate keyspace path.
+        const next = barriers.length === 0 ? operation()
+            : barriers.length === 1 ? barriers[0].then(operation) : Promise.all(barriers).then(operation);
+        const release = () => {
+            if (key !== null) { if (state.keys.get(key) === settled) state.keys.delete(key); }
+            else if (mutation) { if (state.clear === settled) state.clear = null; }
+            else if (state.enumeration === settled) state.enumeration = null;
+        };
+        const settled = next.then(release, release);
+        if (key === null) {
+            if (mutation) state.clear = settled;
+            else state.enumeration = settled;
+        } else {
+            state.keys.set(key, settled);
+        }
+        return next;
     }
     async removeItem(key: string): Promise<void> {
-        await this.#keyspace.removeItem('json', key);
+        await this.#queue(key, () => this.#keyspace.removeItem('json', key));
     }
     async keys(): Promise<string[]> {
-        return await this.#keyspace.keys('json');
+        return await this.#queue(null, () => this.#keyspace.keys('json'), false);
     }
     async clear(): Promise<void> {
-        await this.#keyspace.clear('json');
+        await this.#queue(null, () => this.#keyspace.clear('json'));
     }
 }
 

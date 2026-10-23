@@ -74,7 +74,7 @@ impl DeviceStore {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let (owner, space, key, rowid, kind): (String, String, String, i64, String) = (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
-                if kind != "text" { return Err(invalid("Plugin GC value is not text")); }
+                if kind != "text" && kind != "blob" { return Err(invalid("Plugin GC value is not text")); }
                 let mut value = snapshot.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?;
                 visit(&owner, &space, &key, &mut value)?;
             }

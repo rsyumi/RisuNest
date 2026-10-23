@@ -218,6 +218,8 @@ pub enum PluginValue {
     Object(ObjectReference),
     #[serde(rename = "objects")]
     Objects(Vec<ObjectReference>),
+    #[serde(rename = "binary")]
+    Binary(Vec<ObjectReference>),
 }
 
 impl From<ValueOrObject> for PluginValue {
@@ -233,6 +235,13 @@ impl PluginValue {
             Self::Object(reference) => {
                 if reference.byte_length <= MAX_INLINE_VALUE_BYTES as u64 { return Err(FormatError("invalid-section-value")); }
                 reference.validate()
+            }
+            Self::Binary(references) => {
+                if references.is_empty() { return Err(FormatError("invalid-section-value")); }
+                let mut total = 0u64;
+                for reference in references { reference.validate()?; total = total.checked_add(reference.byte_length).ok_or(FormatError("invalid-section-value"))?; }
+                if total > MAX_PLUGIN_VALUE_BYTES { return Err(FormatError("invalid-section-value")); }
+                Ok(())
             }
             Self::Objects(references) => {
                 if references.len() < 2 { return Err(FormatError("invalid-section-value")); }
@@ -303,7 +312,7 @@ impl SectionValue {
     }
     pub fn object_references(&self) -> &[ObjectReference] {
         match self {
-            Self::LocalPlugin(LocalPluginValue { value: PluginValue::Objects(references), .. }) => references,
+            Self::LocalPlugin(LocalPluginValue { value: PluginValue::Objects(references) | PluginValue::Binary(references), .. }) => references,
             _ => self.object_reference().map(std::slice::from_ref).unwrap_or_default(),
         }
     }
@@ -401,6 +410,7 @@ impl SectionEntry {
                     return Err(FormatError("section-plugin-space-mismatch"));
                 }
                 value.value.validate()?;
+                if value.space != PluginSpace::Json && matches!(value.value, PluginValue::Binary(_)) { return Err(FormatError("invalid-section-value")); }
                 if matches!(value.space, PluginSpace::String)
                     && matches!(&value.value, PluginValue::Inline(inline) if !inline.is_string())
                 {

@@ -886,6 +886,12 @@ upstream RisuAI. RisuNest adds these rules:
   and start empty when it is off. Reconnecting to the same target keeps them.
 - RisuAI and PocketRisu exports never include them.
 
+`getLocalPluginStorage()` preserves supported binary/rich values using a versioned
+encoding; ordinary values and existing records keep their JSON behavior. Its binary
+bytes remain in native device storage and follow the same backup and optional sync
+rules above. Older readers cannot read new binary records. This does not change the
+storage scope or make local values server-backed. See `plugins.md` for supported types.
+
 ## RisuNest whole-object setters
 
 `setDatabase`, `setDatabaseLite`, `setCharacter`, `setCharacterToIndex` and

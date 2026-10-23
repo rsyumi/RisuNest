@@ -8,6 +8,8 @@ vi.mock('@tauri-apps/api/core', async importOriginal => ({
     ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: vi.fn(async () => {}),
 }))
 import { collectPluginReadProvenance, PluginReadBaselines } from '../pluginReadBaselines'
+import { SafeLocalPluginStorage } from '../pluginSafeClass'
+import { PluginDeviceKeyspace, type PluginDeviceBackend, type PluginDeviceValue } from '../pluginDeviceKeyspace'
 import type { fetchNative, GlobalFetchArgs } from '../../globalApi.svelte'
 
 /**
@@ -15,7 +17,7 @@ import type { fetchNative, GlobalFetchArgs } from '../../globalApi.svelte'
  * opened for that script must stay open until the calls the script already made
  * have answered.
  */
-async function runGuest(host: SandboxHost, code: string, prepare?: (child: Window & typeof globalThis) => void): Promise<Window & typeof globalThis> {
+async function runGuest(host: SandboxHost, code: string, prepare?: (child: Window & typeof globalThis) => void, cloneMessages = false): Promise<Window & typeof globalThis> {
     const frame = document.createElement('iframe')
     document.body.appendChild(frame)
     host.run(frame, code, 'settled-test')
@@ -25,12 +27,14 @@ async function runGuest(host: SandboxHost, code: string, prepare?: (child: Windo
         configurable: true,
         value: globalThis.ImageBitmap,
     })
-    vi.spyOn(window, 'postMessage').mockImplementation((data: unknown) => {
-        window.dispatchEvent(new MessageEvent('message', { data, source: child }))
-    })
-    vi.spyOn(child.parent, 'postMessage').mockImplementation((data: unknown) => {
-        window.dispatchEvent(new MessageEvent('message', { data, source: child }))
-    })
+    Object.defineProperty(child, 'structuredClone', { configurable: true, value: globalThis.structuredClone })
+    const deliverToHost = function(data: unknown, _origin?: unknown) {
+        const transfer = arguments[2] as Transferable[] | undefined
+        const received = cloneMessages ? structuredClone(data, { transfer }) : data
+        window.dispatchEvent(new MessageEvent('message', { data: received, source: child }))
+    }
+    vi.spyOn(window, 'postMessage').mockImplementation(deliverToHost)
+    vi.spyOn(child.parent, 'postMessage').mockImplementation(deliverToHost)
     vi.spyOn(child, 'postMessage').mockImplementation(function (
         data: unknown,
         options?: WindowPostMessageOptions,
@@ -38,9 +42,9 @@ async function runGuest(host: SandboxHost, code: string, prepare?: (child: Windo
         const legacyTransfer = arguments[2] as Transferable[] | undefined
         const transfer = options?.transfer ?? legacyTransfer ?? []
         child.dispatchEvent(new childRealm.MessageEvent('message', {
-            data,
+            data: cloneMessages ? structuredClone(data, { transfer }) : data,
             source: child.parent,
-            ports: transfer as MessagePort[],
+            ports: (cloneMessages ? transfer.filter(item => item instanceof MessagePort) : transfer) as MessagePort[],
         }))
     })
     const source = frame.srcdoc.match(/<script nonce="[^"]+">([\s\S]*)<\/script>/)?.[1]
@@ -58,8 +62,117 @@ function bridgeStubs(): Record<string, unknown> {
     }
 }
 
+function localStorageFixture(beforeWrite: () => Promise<void> = async () => {}) {
+    const rows = new Map<string, PluginDeviceValue>()
+    const backend: PluginDeviceBackend = {
+        async hydrate() { return { complete: true, byteSize: 0, entries: [...rows].map(([key, value]) => ({ space: 'json', key, value })) } },
+        async read(_owner, _space, key) { return rows.get(key) ?? null },
+        async keys() { return [...rows.keys()] },
+        async write(_owner, mutations) {
+            await beforeWrite()
+            for (const mutation of mutations) {
+                if (mutation.type === 'set') rows.set(mutation.key, mutation.value)
+                else if (mutation.type === 'delete') rows.delete(mutation.key)
+                else rows.clear()
+            }
+        },
+    }
+    const keyspace = new PluginDeviceKeyspace('rpc-json', backend)
+    return { rows, keyspace, storage: new SafeLocalPluginStorage('rpc-json', keyspace) }
+}
+
 describe('sandbox script completion', () => {
     beforeEach(() => consoleLog.clear())
+
+    it('sends large local JSON arrays as text and keeps their stored representation and write ordering', async () => {
+        let started!: () => void, release!: () => void
+        const admitted = new Promise<void>(resolve => { started = resolve })
+        const gate = new Promise<void>(resolve => { release = resolve })
+        let first = true
+        const fixture = localStorageFixture(async () => { if (first) { first = false; started(); await gate } })
+        const result = vi.fn()
+        const host = new SandboxHost({ ...bridgeStubs(), getLocalPluginStorage: () => fixture.storage, result })
+        try {
+            const child = await runGuest(host, `
+                const storage = await risuai.getLocalPluginStorage();
+                const large = Array.from({ length: 1024 }, (_, id) => ({ id, text: 'entry', optional: undefined, nan: NaN }));
+                const first = storage.setItem('value', large);
+                const second = storage.setItem('value', { last: true });
+                await first;
+                await second;
+                await risuai.result(await storage.getItem('value'));
+            `, undefined, true)
+            await admitted
+            const calls = vi.mocked(child.parent.postMessage).mock.calls.map(([data]) => data as any)
+            const request = calls.find(data => data.method === 'setItem' && typeof data.localPluginJson === 'string')
+            expect(request).toMatchObject({ args: ['value'] })
+            expect(JSON.parse(request.localPluginJson)).toEqual(Array.from({ length: 1024 }, (_, id) => ({ id, text: 'entry', nan: null })))
+            release()
+            await vi.waitFor(() => expect(result).toHaveBeenCalledWith({ last: true }))
+            expect(fixture.rows.get('value')).toBe('{"last":true}')
+        } finally { release(); host.terminate(); fixture.keyspace.dispose() }
+    })
+
+    it('retains binary values when an array getter changes between preflight and the native snapshot', async () => {
+        const fixture = localStorageFixture()
+        const result = vi.fn()
+        const host = new SandboxHost({ ...bridgeStubs(), getLocalPluginStorage: () => fixture.storage, result })
+        try {
+            await runGuest(host, `
+                const storage = await risuai.getLocalPluginStorage();
+                const value = Array(1024).fill(null);
+                const bytes = new Uint8Array([0, 255, 128]);
+                let reads = 0;
+                Object.defineProperty(value, '0', { enumerable: true, get: () => ++reads === 1 ? 'plain' : bytes });
+                await storage.setItem('value', value);
+                const restored = await storage.getItem('value');
+                await risuai.result({ binary: ArrayBuffer.isView(restored[0]), bytes: Array.from(restored[0]) });
+            `, undefined, true)
+            await vi.waitFor(() => expect(result).toHaveBeenCalledWith({ binary: true, bytes: [0, 255, 128] }))
+            expect(fixture.rows.get('value')).toBeInstanceOf(Uint8Array)
+        } finally { host.terminate(); fixture.keyspace.dispose() }
+    })
+
+    it('rejects malformed serialized JSON from the frame without replacing a stored value', async () => {
+        const fixture = localStorageFixture()
+        await fixture.storage.setItem('value', 'kept')
+        const host = new SandboxHost({})
+        const frame = document.createElement('iframe')
+        document.body.append(frame)
+        host.run(frame, '')
+        const internals = host as any
+        internals.instanceRegistry.set('local-storage', fixture.storage)
+        const post = vi.spyOn(frame.contentWindow!, 'postMessage').mockImplementation(() => {})
+        try {
+            window.dispatchEvent(new MessageEvent('message', { source: frame.contentWindow, data: {
+                type: 'CALL_INSTANCE', id: 'local-storage', method: 'setItem', reqId: 'invalid-json',
+                args: ['value'], localPluginJson: '{invalid',
+            } }))
+            await vi.waitFor(() => expect(post.mock.calls.some(([data]) => data.reqId === 'invalid-json' && typeof data.error === 'string')).toBe(true))
+            fixture.keyspace.invalidate()
+            expect(await fixture.storage.getItem('value')).toBe('kept')
+            expect(fixture.rows.get('value')).toBe('"kept"')
+        } finally { host.terminate(); fixture.keyspace.dispose() }
+    })
+
+    it('round-trips cyclic binary graphs and shared backing buffers across both iframe transfers', async () => {
+        const result = vi.fn()
+        const host = new SandboxHost({ ...bridgeStubs(), binaryEcho: (value: unknown) => structuredClone(value), result })
+        await runGuest(host, `
+            const buffer = new Uint8Array([0, 255, 128, 3]).buffer;
+            const value = { buffer, view: new Uint8Array(buffer, 1, 2) };
+            value.self = value;
+            const restored = await risuai.binaryEcho(value);
+            await risuai.result({
+                cyclic: restored.self === restored,
+                shared: restored.view.buffer === restored.buffer,
+                offset: restored.view.byteOffset,
+                bytes: Array.from(restored.view),
+            });
+        `, undefined, true)
+        expect(result).toHaveBeenCalledWith({ cyclic: true, shared: true, offset: 1, bytes: [255, 128] })
+        host.terminate()
+    })
 
     it.each([false, true])('lets the plugin handle file-read failure without reporting it on native=%s', async native => {
         platform.native = native

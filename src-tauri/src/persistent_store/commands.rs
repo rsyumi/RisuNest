@@ -4,6 +4,7 @@ pub(crate) mod image_geometry;
 pub(crate) mod hypa;
 
 use super::archive::ArchivePreview;
+use super::device_store::invalid;
 use super::device_store::plugin_values::{
     PluginDeviceHydration, PluginDeviceListItem, PluginDeviceMutation, PluginDeviceRead, PluginDeviceRange,
 };
@@ -1921,6 +1922,42 @@ pub(crate) fn pds_append_plugin_device_write(
     logged("pds_append_plugin_device_write", with_store_mut(state, |store| {
         store.device_store_mut()?.append_plugin_device_write(&owner, &session_id, offset, &part)
     }))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_open_plugin_device_binary_write(app: AppHandle, state: State<'_, PersistentStoreState>, owner: String, key: String, byte_length: u64) -> Result<super::device_store::plugin_values::sessions::OpenedWrite, StoreError> {
+    logged("pds_open_plugin_device_binary_write", with_store_mut(state, |store| {
+        let device = store.device_store_mut()?;
+        let opened = device.open_plugin_device_binary_write(&owner, &key, byte_length)?;
+        let id = opened.session_id.clone();
+        let receiver: std::sync::Arc<crate::asset_byte_transport::AndroidReceiver> = std::sync::Arc::new(move |offset, bytes| {
+            with_store_mut(app.state::<PersistentStoreState>(), |store| store.device_store_mut()?.append_plugin_device_bytes(&id, offset, bytes)).map_err(|error| error.to_string())
+        });
+        let receiver = crate::asset_byte_transport::register_android_receiver(&opened.session_id, receiver).map_err(|error| {
+            device.abort_plugin_device_write(&owner, &opened.session_id);
+            invalid(&error)
+        })?;
+        device.attach_plugin_binary_receiver(&opened.session_id, receiver)?;
+        Ok(opened)
+    }))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_append_plugin_device_bytes(state: State<'_, PersistentStoreState>, upload_id: String, offset: u64, data: Vec<u8>) -> Result<u64, StoreError> {
+    logged("pds_append_plugin_device_bytes", with_store_mut(state, |store| store.device_store_mut()?.append_plugin_device_bytes(&upload_id, offset, &data)))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_append_plugin_device_bytes_raw(state: State<'_, PersistentStoreState>, request: tauri::ipc::Request<'_>) -> Result<u64, StoreError> {
+    logged("pds_append_plugin_device_bytes_raw", (|| {
+        let (id, offset, bytes) = crate::asset_byte_transport::raw_part(&request).map_err(|_| invalid("Invalid plugin binary part"))?;
+        with_store_mut(state, |store| store.device_store_mut()?.append_plugin_device_bytes(&id, offset, bytes))
+    })())
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_plugin_device_bytes(state: State<'_, PersistentStoreState>, owner: String, space: String, key: String, version: String, offset: u64) -> Result<tauri::ipc::Response, StoreError> {
+    logged("pds_read_plugin_device_bytes", with_store(state, |store| store.device_store()?.read_plugin_device_bytes(&owner, &space, &key, &version, offset)).map(tauri::ipc::Response::new))
 }
 
 #[tauri::command(async)]

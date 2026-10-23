@@ -6,6 +6,54 @@ fn open() -> (tempfile::TempDir, DeviceStore) {
     (directory, store)
 }
 
+#[test]
+fn binary_plugin_values_survive_multipart_backup_restore_and_reopen() {
+    use super::plugin_values::{raw_value, PluginDeviceMutation, PluginDeviceRead};
+    use super::sections::{SectionSpoolBuilder, freeze_backup_sections, restore_frozen_backup_sections};
+    use risunest_external_storage_format::{section::SectionKind, format::FingerprintBuilder, content_identity::hash};
+    let (directory, mut source) = open();
+    let (target_directory, mut target) = open();
+    let bytes = raw_value::fixture(&vec![255; plugin_values::text_value::PART_BYTES + 20]);
+    let opened = source.open_plugin_device_binary_write("owner", "binary", bytes.len() as u64).unwrap();
+    let mut offset = 0;
+    for part in bytes.chunks(crate::asset_byte_transport::BINARY_PART_BYTES) {
+        offset = source.append_plugin_device_bytes(&opened.session_id, offset, part).unwrap();
+    }
+    source.write_plugin_device_values("owner", &[PluginDeviceMutation::Staged { session_id: opened.session_id }]).unwrap();
+    let captured = source.capture_backup_sections(&[SectionKind::Hypa, SectionKind::LocalPlugins, SectionKind::LocalSettings], directory.path()).unwrap();
+    let mut received = vec![];
+    for section in &captured {
+        let mut builder = SectionSpoolBuilder::new_backup(section.kind(), directory.path()).unwrap();
+        let mut fingerprint = FingerprintBuilder::new(&section.kind().fingerprint_domain());
+        section.visit_entries(|entry, object| {
+            assert_eq!(entry.value.object_references().len(), 2);
+            fingerprint.push(&entry.key, &hash(&entry.encode().unwrap())).unwrap();
+            builder.push_backup_entry(entry.clone(), object)
+        }).unwrap();
+        received.push(builder.finish(&fingerprint.finish()).unwrap());
+    }
+    let frozen = freeze_backup_sections(&received.iter().collect::<Vec<_>>()).unwrap();
+    let metadata = serde_json::to_vec(&frozen).unwrap();
+    assert!(metadata.len() < 4096);
+    let frozen = serde_json::from_slice(&metadata).unwrap();
+    let tx = target.transaction().unwrap();
+    for section in &received { section.retain_plugin_objects(&tx).unwrap(); }
+    let stamp = risunest_sync_wire::stamp::Stamp { physical_ms: 1.into(), logical: 0, writer_id: uuid::Uuid::new_v4().to_string() };
+    restore_frozen_backup_sections(&tx, &frozen, &stamp).unwrap();
+    tx.commit().unwrap();
+    drop(target);
+    let target = DeviceStore::open(target_directory.path()).unwrap();
+    let Some(PluginDeviceRead::Binary { version, byte_size, .. }) = target.read_plugin_device_transfer("owner", "json", "binary").unwrap() else { panic!("expected binary value"); };
+    assert_eq!(byte_size, bytes.len() as u64);
+    let mut restored = vec![];
+    while restored.len() < bytes.len() {
+        restored.extend(target.read_plugin_device_bytes("owner", "json", "binary", &version, restored.len() as u64).unwrap());
+    }
+    assert_eq!(restored, bytes);
+    assert!(target.read_plugin_device_transfer("other", "json", "binary").unwrap().is_none());
+    assert_eq!(target.list_plugin_device_keys("owner", "json").unwrap(), vec!["binary"]);
+}
+
 fn insert_embedding(tx: &Transaction<'_>, key: &str, clock: &str) {
     tx.execute(
         "INSERT INTO hypa_embeddings

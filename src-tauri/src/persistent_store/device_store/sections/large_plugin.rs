@@ -1,6 +1,26 @@
 use super::*;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+pub(super) fn capture_binary<R: Read>(target: Option<&Connection>, mut source: impl FnMut() -> StoreResult<R>) -> StoreResult<SectionValueRow> {
+    let object = match target {
+        Some(target) => plugin_values::raw_value::store(target, &mut source)?,
+        None => plugin_values::raw_value::inspect(source()?)?,
+    };
+    let mut input = source()?;
+    let mut parts = vec![];
+    loop {
+        let mut bytes = vec![];
+        std::io::Read::by_ref(&mut input).take(text_value::PART_BYTES as u64).read_to_end(&mut bytes)?;
+        if bytes.is_empty() { break; }
+        let reference = object_reference(&bytes);
+        if let Some(target) = target {
+            target.execute("INSERT OR IGNORE INTO section_objects(hash,bytes) VALUES(?1,?2)", params![hex::encode(reference.content_sha256), bytes])?;
+        }
+        parts.push(reference);
+    }
+    Ok(SectionValueRow::PluginBinary { object, parts })
+}
+
 pub(super) fn capture<R: Read>(target: Option<&Connection>, space: &str, mut source: impl FnMut() -> StoreResult<R>) -> StoreResult<SectionValueRow> {
     if space == "json" {
         serde_json::from_reader::<_, serde::de::IgnoredAny>(std::io::BufReader::new(source()?))
@@ -49,8 +69,10 @@ impl SectionSpoolBuilder {
     }
 
     pub(super) fn decode_entry(&self, entry: SectionEntry, versioned: bool, mut object: impl FnMut(&ObjectReference) -> StoreResult<Vec<u8>>) -> StoreResult<SectionRow> {
-        let SectionValue::LocalPlugin(LocalPluginValue { space, value: PluginValue::Objects(parts) }) = &entry.value else {
-            return SectionRow::from_entry(entry, versioned, object);
+        let (space, parts, binary) = match &entry.value {
+            SectionValue::LocalPlugin(LocalPluginValue { space, value: PluginValue::Objects(parts) }) => (space, parts, false),
+            SectionValue::LocalPlugin(LocalPluginValue { space, value: PluginValue::Binary(parts) }) => (space, parts, true),
+            _ => return SectionRow::from_entry(entry, versioned, object),
         };
         entry.validate().map_err(section_format_error)?;
         let space = match space { PluginSpace::String => "string", PluginSpace::Json => "json" };
@@ -61,10 +83,9 @@ impl SectionSpoolBuilder {
             self.connection.execute("INSERT OR IGNORE INTO section_objects(hash,bytes) VALUES(?1,?2)",
                 params![hex::encode(reference.content_sha256), bytes])?;
         }
-        let mut value = capture(Some(&self.connection), space, || {
-            let mut file = raw.try_clone()?; file.seek(SeekFrom::Start(0))?; Ok(file)
-        })?;
-        if let SectionValueRow::PluginObject { parts: stored, .. } = &mut value { *stored = parts.clone(); }
+        let source = || { let mut file = raw.try_clone()?; file.seek(SeekFrom::Start(0))?; Ok(file) };
+        let mut value = if binary { capture_binary(Some(&self.connection), source)? } else { capture(Some(&self.connection), space, source)? };
+        if let SectionValueRow::PluginObject { parts: stored, .. } | SectionValueRow::PluginBinary { parts: stored, .. } = &mut value { *stored = parts.clone(); }
         let (key1, key2, key3) = decode_entry_key(entry.kind, &entry.key)?;
         let (write_clock, writer_id) = match entry.version {
             Some(version) => (version.write_clock, version.writer_id),
@@ -78,6 +99,9 @@ impl SectionSpoolBuilder {
 impl PreparedSectionRows {
     pub(crate) fn retain_plugin_objects(&self, target: &Transaction<'_>) -> StoreResult<()> {
         self.visit(|row| {
+            if let SectionValueRow::PluginBinary { object, .. } = &row.value {
+                plugin_values::raw_value::copy_object(&self.connection, target, object)?;
+            }
             if let SectionValueRow::PluginObject { object, .. } = row.value {
                 text_value::copy_object(&self.connection, target, &object)?;
             }

@@ -157,10 +157,13 @@ async function sourceHashes() {
     "src-tauri/src/native_file_jobs/restore.rs",
     "benchmarks/legacy-restore/entry-count.mjs",
     "benchmarks/device-backup/plugin-values.ts",
+    "benchmarks/device-backup/plugin-performance.ts",
     "benchmarks/device-backup/plugin-value-driver.mjs",
     "benchmarks/device-backup/plugin-sync-driver.mjs",
     "src/ts/plugins/pluginDeviceTransfer.ts",
     "src/ts/plugins/pluginSafeClass.ts",
+    "src/ts/plugins/pluginDeviceKeyspace.ts",
+    "src/ts/plugins/localPluginStorageValue.ts",
     "src-tauri/src/persistent_store/device_store/plugin_values.rs",
     "src-tauri/src/persistent_store/device_store/plugin_values/text_value.rs",
     "src-tauri/src/persistent_store/device_store/sections/large_plugin.rs",
@@ -228,6 +231,8 @@ function within(candidate, parent) {
 
 async function reuseRun() {
   if (process.argv.length === 2) return null;
+  if (process.argv.length === 3 && ['--plugin-performance', '--plugin-performance-json'].includes(process.argv[2])) return null;
+  if (process.argv.length === 3 && /^--plugin-performance(?:-json)?-built=[0-9a-f-]{36}$/.test(process.argv[2])) return null;
   if (process.argv.length === 3 && /^--legacy-entries=(all|20000|50000|100000|200001)$/.test(process.argv[2])) return null;
   if (process.argv.length === 3 && /^--plugin-values=(all|json|64-string|64-json|256-string|256-json|512-string|512-json)$/.test(process.argv[2])) return null;
   const values = Object.fromEntries(
@@ -328,15 +333,17 @@ async function run() {
   const reuse = await reuseRun();
   const entryCountArgument = process.argv.find(argument => argument.startsWith('--legacy-entries='));
   const pluginValueArgument = process.argv.find(argument => argument.startsWith('--plugin-values='));
+  const preparedPerformance = process.argv.find(argument => /^--plugin-performance(?:-json)?-built=/.test(argument))?.split('=')[1];
+  const jsonPerformanceOnly = process.argv.includes('--plugin-performance-json') || process.argv.some(argument => argument.startsWith('--plugin-performance-json-built='));
   if (entryCountArgument && reuse) throw new Error('Entry measurements require a fresh synthetic profile');
-  const runId = reuse?.previous.runId ?? randomUUID();
+  const runId = reuse?.previous.runId ?? preparedPerformance ?? randomUUID();
   const directory =
     reuse?.previous.directory ??
     path.join(root, ".tmp", `device-windows-smoke-${runId}`);
   const identifier = `io.github.rsyumi.risunest.devicebackupsynthetic.s${runId.replaceAll("-", "")}`;
   const profileName = `smoke-${runId.replaceAll("-", "").slice(0, 24)}`;
   if (!reuse) await mkdir(directory, { recursive: true });
-  const reservation = net.createServer();
+  const reservation = net.createServer(socket => socket.destroy());
   reservation.listen(reuse?.previous.port ?? 0, "127.0.0.1");
   await once(reservation, "listening");
   const port = reservation.address().port;
@@ -349,7 +356,9 @@ async function run() {
     startedAt: new Date().toISOString(),
     stages: [],
     memory: [],
-    environment: { windows: os.release() },
+    environment: { windows: os.release(), cpu: os.cpus()[0]?.model, node: process.version },
+    gitHead: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
+    productDiffSha256: createHash('sha256').update(execFileSync('git', ['diff', 'HEAD', '--', 'src', 'src-tauri', 'crates'], { cwd: root, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] })).digest('hex'),
     sourceHashes: reuse?.previous.sourceHashes ?? (await sourceHashes()),
     ...(reuse
       ? {
@@ -389,13 +398,21 @@ async function run() {
     const profileDirectory = path.join(profilesRoot, profileName);
     const nativeRoot = path.join(profileDirectory, 'data');
     const webview = path.join(profileDirectory, 'webview');
-    if (!reuse && !(await absent(profileDirectory)))
+    if (!reuse && !preparedPerformance && !(await absent(profileDirectory)))
       throw new Error("synthetic-native-profile-already-exists");
     if (reuse && nativeRoot !== reuse.previous.nativeRoot)
       throw new Error("synthetic-prior-native-profile-mismatch");
     report.nativeRoot = nativeRoot;
     const executable = path.join(directory, "RisuNest.exe");
-    if (!reuse) {
+    if (preparedPerformance) {
+      const config = JSON.parse(await readFile(path.join(directory, 'tauri.json'), 'utf8'));
+      if (config.identifier !== identifier || !config.plugins?.risunest?.agent || config.app.windows[0].title !== title)
+        throw new Error('synthetic-prepared-performance-identity-mismatch');
+      // The embedded WebView endpoint is immutable in a previously built agent.
+      report.port = Number(/--remote-debugging-port=(\d+)/.exec(config.app.windows[0].additionalBrowserArgs)[1]);
+      report.preparedExecutable = true;
+      report.executableSha256 = createHash('sha256').update(await readFile(executable)).digest('hex');
+    } else if (!reuse) {
       const config = JSON.parse(
         await readFile(path.join(root, "src-tauri/tauri.conf.json"), "utf8"),
       );
@@ -434,6 +451,8 @@ async function run() {
           "--no-bundle",
           "--config",
           configPath,
+          '--',
+          '--locked',
         ],
         {
           env: { ...process.env, CARGO_TARGET_DIR: target, RISUNEST_SMOKE_ROOT: nativeRoot },
@@ -458,9 +477,8 @@ async function run() {
     } else {
       report.executableSha256 = reuse.previous.executableSha256;
     }
-    reservation.close();
-    await once(reservation, "close");
-    if (!reuse && !(await absent(profileDirectory)))
+    await new Promise(resolve => reservation.close(resolve));
+    if (!reuse && !preparedPerformance && !(await absent(profileDirectory)))
       throw new Error("synthetic-native-profile-created-before-launch");
     async function launch() {
       app = spawn(executable, [`--profile=${profileName}`], {
@@ -482,7 +500,7 @@ async function run() {
           throw new Error(`synthetic-app-exited:${app.exitCode}`);
         try {
           const signal = AbortSignal.timeout(2_000);
-          const targets = await fetch(`http://127.0.0.1:${port}/json/list`, {
+          const targets = await fetch(`http://127.0.0.1:${report.port}/json/list`, {
             signal,
           }).then((response) => response.json());
           endpointResponded = true;
@@ -491,7 +509,7 @@ async function run() {
           );
           if (match) {
             const version = await fetch(
-              `http://127.0.0.1:${port}/json/version`,
+              `http://127.0.0.1:${report.port}/json/version`,
               {
                 signal,
               },
@@ -541,6 +559,33 @@ async function run() {
       process.stdout.write(`synthetic-windows-identity-verified ${runId}\n`);
     }
     await launch();
+    if (process.argv.includes('--plugin-performance') || jsonPerformanceOnly || preparedPerformance) {
+      const readyDeadline = Date.now() + timeoutMs;
+      while (!(await evaluate(page, 'typeof globalThis.__pluginPerformance?.start === "function"'))) {
+        if (Date.now() >= readyDeadline) throw new Error('synthetic-plugin-performance-entry-timeout');
+        await delay(100);
+      }
+      await evaluate(page, `globalThis.__pluginPerformance.start(${jsonPerformanceOnly ? '{binary:false}' : ''});true`);
+      const deadline = Date.now() + 600_000;
+      while (Date.now() < deadline) {
+        const state = await evaluate(page, 'globalThis.__pluginPerformance.state()');
+        report.pluginPerformance = state;
+        if (state.failure) throw new Error(state.failure);
+        if (jsonPerformanceOnly && state.results.some(row => row.name === 'ArrayBuffer-1MiB/correctness')) {
+          // jsonCases() has returned (including its final correctness checks).
+          // Stop this disposable process before repeating the binary workload.
+          report.pluginPerformance = { ...state, phase: 'done', scope: 'json-only',
+            stoppedBeforeRemainingBinaryWorkload: true,
+            results: state.results.filter(row => /^(small-json|array-1000|array-50000|flat-json-8MiB)\//.test(row.name)) };
+          if (report.pluginPerformance.results.length !== 12) throw new Error('synthetic-plugin-json-results-incomplete');
+          report.passed = true;
+          return;
+        }
+        if (state.phase === 'done') { report.passed = true; return; }
+        await delay(500);
+      }
+      throw new Error('synthetic-plugin-performance-timeout');
+    }
     if (pluginValueArgument) {
       const selected = pluginValueArgument.split('=')[1];
       const cases = selected === 'all' ? [64, 256, 512].flatMap(size => ['string', 'json'].map(kind => `${size}-${kind}`))

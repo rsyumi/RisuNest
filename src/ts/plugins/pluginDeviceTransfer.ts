@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isTauriAndroid } from '../platform'
 import { ANDROID_LARGE_COMMIT_SIZE, sendAndroidCommit } from '../storage/androidCommitTransport'
-import type { PluginDeviceMutation, PluginDeviceSpace, PluginDeviceObservation } from './pluginDeviceKeyspace'
+import type { PluginDeviceMutation, PluginDeviceSpace, PluginDeviceObservation, PluginDeviceValue } from './pluginDeviceKeyspace'
+import { nativeAssetByteSender } from '../storage/nativeAssetByteTransport'
 
 export const PLUGIN_DEVICE_VALUE_BYTES = 512 * 1024 * 1024
 export const PLUGIN_DEVICE_PART_BYTES = 8 * 1024 * 1024
@@ -49,7 +50,7 @@ export function* pluginDeviceParts(value: string, limit = PLUGIN_DEVICE_PART_BYT
     if (index > start) yield { part: value.slice(start, index), byteLength }
 }
 
-type NativeMutation = PluginDeviceMutation | { type: 'staged'; sessionId: string }
+type NativeMutation = Exclude<PluginDeviceMutation, { type: 'set' }> | { type: 'set'; space: PluginDeviceSpace; key: string; value: string } | { type: 'staged'; sessionId: string }
 function requestSize(owner: string, mutations: readonly NativeMutation[], observations: readonly PluginDeviceObservation[]): number {
     const empty = mutations.map((mutation) => mutation.type === 'set' ? { ...mutation, value: '' } : mutation)
     return encoder.encode(JSON.stringify({ owner, mutations: empty, observations })).length
@@ -66,15 +67,30 @@ async function send<T>(command: string, request: Record<string, unknown>, bytes:
 export async function writeNativePluginDeviceValues(owner: string, mutations: readonly PluginDeviceMutation[], observations: readonly PluginDeviceObservation[] = []): Promise<PluginDeviceObservation[]> {
     if (mutations.length === 0) return []
     if (mutations.length > 1024) throw new Error('Plugin device write batch is too large')
-    const sizes = mutations.map((mutation) => mutation.type === 'set' ? pluginDeviceValueSize(mutation.value) : 0)
-    const planned = mutations.map((mutation, index): NativeMutation => sizes[index] > PLUGIN_DEVICE_PART_BYTES
-        ? { type: 'staged', sessionId: '00000000-0000-0000-0000-000000000000' } : mutation)
+    const sizes = mutations.map((mutation) => mutation.type === 'set' ? typeof mutation.value === 'string' ? pluginDeviceValueSize(mutation.value) : mutation.value.byteLength : 0)
+    const planned = mutations.map((mutation, index): NativeMutation => mutation.type === 'set' && (mutation.value instanceof Uint8Array || sizes[index] > PLUGIN_DEVICE_PART_BYTES)
+        ? { type: 'staged', sessionId: '00000000-0000-0000-0000-000000000000' } : mutation as NativeMutation)
     if (requestSize(owner, planned, observations) > REQUEST_BYTES) throw new Error('Plugin device write batch is too large')
     const sessions: string[] = []
     try {
         for (let index = 0; index < mutations.length; index++) {
             const mutation = mutations[index]
-            if (mutation.type !== 'set' || sizes[index] <= PLUGIN_DEVICE_PART_BYTES) continue
+            if (mutation.type !== 'set') continue
+            if (mutation.value instanceof Uint8Array) {
+                if (mutation.space !== 'json' || sizes[index] < 2 || sizes[index] > PLUGIN_DEVICE_VALUE_BYTES) throw new Error('Invalid plugin binary value size or space')
+                const sender = await nativeAssetByteSender(invoke)
+                const { sessionId } = await invoke<{ sessionId: string }>('pds_open_plugin_device_binary_write', { owner, key: mutation.key, byteLength: sizes[index] })
+                sessions.push(sessionId)
+                for (let offset = 0; offset < mutation.value.byteLength;) {
+                    const part = mutation.value.subarray(offset, offset + sender.capacity)
+                    const next = await sender.append('pds_append_plugin_device_bytes', sessionId, offset, part)
+                    if (next !== offset + part.byteLength) throw new Error('Invalid plugin binary part acknowledgement')
+                    offset += part.byteLength
+                }
+                planned[index] = { type: 'staged', sessionId }
+                continue
+            }
+            if (sizes[index] <= PLUGIN_DEVICE_PART_BYTES) continue
             const { sessionId } = await invoke<{ sessionId: string }>('pds_open_plugin_device_write', {
                 owner, space: mutation.space, key: mutation.key, encodedLength: sizes[index],
             })
@@ -95,14 +111,31 @@ export async function writeNativePluginDeviceValues(owner: string, mutations: re
     }
 }
 
-type ReadStart = string | { byteSize: number; version: string } | null
+type ReadStart = string | { byteSize: number; version: string; binary?: boolean } | null
 type ReadRange = { type: 'changed' } | { type: 'value'; value: string; nextOffset: number }
 
-export async function readNativePluginDeviceValue(owner: string, space: PluginDeviceSpace, key: string): Promise<string | null> {
+export async function readNativePluginDeviceValue(owner: string, space: PluginDeviceSpace, key: string): Promise<PluginDeviceValue | null> {
     for (let attempt = 0; attempt < 3; attempt++) {
         const opened = await invoke<ReadStart>('pds_read_plugin_device_value', { owner, space, key })
         if (opened == null) return null
         if (typeof opened === 'string') return opened
+        if (opened.binary) {
+            if (space !== 'json' || !Number.isSafeInteger(opened.byteSize) || opened.byteSize < 2 || opened.byteSize > PLUGIN_DEVICE_VALUE_BYTES) throw new Error('Invalid plugin binary size')
+            const value = new Uint8Array(opened.byteSize)
+            try {
+                for (let offset = 0; offset < value.length;) {
+                    const body = await invoke<ArrayBuffer | number[]>('pds_read_plugin_device_bytes', { owner, space, key, version: opened.version, offset })
+                    const part = body instanceof ArrayBuffer ? new Uint8Array(body) : Uint8Array.from(body)
+                    if (!part.length || part.length > value.length - offset) throw new Error('Invalid plugin binary range')
+                    value.set(part, offset)
+                    offset += part.length
+                }
+                return value
+            } catch (error) {
+                if (JSON.stringify(error)?.includes('PLUGIN_DEVICE_CHANGED') || String(error).includes('PLUGIN_DEVICE_CHANGED')) continue
+                throw error
+            }
+        }
         const parts: string[] = []
         let offset = 0, changed = false
         while (offset < opened.byteSize) {

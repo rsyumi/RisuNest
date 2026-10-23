@@ -1110,7 +1110,7 @@ interface PluginStorage {
  * ```typescript
  * const storage = await risuai.getLocalPluginStorage();
  *
- * // Store any JSON-serializable data
+ * // Store JSON data or supported binary values (for example, Blob or Uint8Array)
  * await storage.setItem('config', { theme: 'dark', fontSize: 14 });
  *
  * // Retrieve data with type safety
@@ -1134,7 +1134,10 @@ interface SafeLocalPluginStorage {
     /**
      * Sets an item in storage
      * @param key - Storage key
-     * @param value - Value to store (any JSON-serializable value)
+     * @param value - JSON data, Blob/File, ArrayBuffer, typed arrays/DataView,
+     * Date, Map, Set, RegExp or BigInt. Supported values may be nested.
+     * Ordinary JSON keeps its existing serialization behavior. This is not a
+     * promise to support every IndexedDB type; unsupported rich values reject.
      * @returns Promise that resolves when item is stored
      */
     setItem<T>(key: string, value: T): Promise<void>;

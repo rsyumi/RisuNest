@@ -1073,6 +1073,14 @@ impl PersistentStore {
                 continue;
             }
             if change.key.components()[0] == "plugin-local"
+                && device_store::plugin_values::raw_value::is_object(&self.connection, &descriptor.object_hash)? {
+                let info = device_store::plugin_values::raw_value::inspect_object(&self.connection, &descriptor.object_hash)?;
+                let tx = device.unchecked_transaction()?;
+                device_store::plugin_values::raw_value::copy_object(&self.connection, &tx, &info)?;
+                tx.commit()?;
+                continue;
+            }
+            if change.key.components()[0] == "plugin-local"
                 && device_store::plugin_values::text_value::object_row(&self.connection, &descriptor.object_hash)?.1
                     > device_store::plugin_values::text_value::PART_BYTES as u64
             {

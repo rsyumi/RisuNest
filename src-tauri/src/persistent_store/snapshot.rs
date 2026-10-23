@@ -638,6 +638,13 @@ pub(super) fn collect_device_plugin_asset_roots(store: &super::PersistentStore) 
         let result = (|| -> StoreResult<()> {
             let db = store.device_store()?.connection();
             let (rowid, length) = super::device_store::plugin_values::text_value::object_row(db, &descriptor.object_hash)?;
+            if super::device_store::plugin_values::raw_value::is_object(db, &descriptor.object_hash)? {
+                let info = super::device_store::plugin_values::raw_value::inspect_object(db, &descriptor.object_hash)?;
+                let input = db.blob_open(rusqlite::MAIN_DB, "message_page_objects", "body", rowid, true)?;
+                plugin_text::scan_binary(input, &mut roots)?;
+                if info.hash != descriptor.object_hash { return Err(validation("plugin object hash mismatch")); }
+                return Ok(());
+            }
             if length <= super::device_store::plugin_values::text_value::PART_BYTES as u64 {
                 if let Some(value) = super::lww::json_value_resolved(db, value)? { observe_json_value(&value, None, &mut roots); }
                 return Ok(());

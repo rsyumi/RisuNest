@@ -9,6 +9,7 @@ import {
     type PluginDeviceBackend,
     type PluginDeviceMutation,
     type PluginDeviceSpace,
+    type PluginDeviceValue,
 } from './pluginDeviceKeyspace'
 import { SafeLocalPluginStorage } from './pluginSafeClass'
 import { deletePluginDataItems, type PluginDataItem } from './pluginDataInventory'
@@ -44,7 +45,7 @@ vi.mock('./pluginDeviceStorage', () => {
 
 /** A store every owner shares, so a leak between keyspaces would be visible. */
 function recordingBackend(
-    rows: Array<{ owner: string; space: PluginDeviceSpace; key: string; value: string }> = [],
+    rows: Array<{ owner: string; space: PluginDeviceSpace; key: string; value: PluginDeviceValue }> = [],
     options: { complete?: boolean } = {},
 ) {
     const state = rows.map((row) => ({ ...row }))
@@ -139,9 +140,30 @@ describe('plugin device keyspace', () => {
         await expect(held.getItem('string', 'kept')).resolves.toBe('text')
     })
 
+    it('preserves binary contents and types after invalidating the device cache', async () => {
+        const storage = new SafeLocalPluginStorage('binary-contract')
+        const buffer = Uint8Array.of(0, 255, 128, 3).buffer
+        await storage.setItem('value', { buffer, view: new Uint8Array(buffer, 1, 2), blob: new Blob([buffer], { type: 'audio/wav' }) })
+        for (const wrapper of [storage, new SafeLocalPluginStorage('binary-contract')]) {
+            invalidatePluginDeviceKeyspaces('binary-contract')
+            const value = await wrapper.getItem<{ buffer: ArrayBuffer; view: Uint8Array; blob: Blob }>('value')
+            expect(value!.buffer).toBeInstanceOf(ArrayBuffer)
+            expect(new Uint8Array(value!.buffer)).toEqual(Uint8Array.of(0, 255, 128, 3))
+            expect(value!.view).toBeInstanceOf(Uint8Array)
+            expect(value!.view.buffer).toBe(value!.buffer)
+            expect(value!.view.byteOffset).toBe(1)
+            expect([...value!.view]).toEqual([255, 128])
+            expect(value!.blob.type).toBe('audio/wav')
+            expect(new Uint8Array(await value!.blob.arrayBuffer())).toEqual(new Uint8Array(buffer))
+        }
+        expect(await storage.keys()).toEqual(['value'])
+        await storage.clear()
+        expect(await storage.getItem('value')).toBeNull()
+    })
+
     it('round-trips JSON representations and rejects unsupported values before writing', async () => {
         const storage = new SafeLocalPluginStorage('json-contract')
-        const values = [{ a: 1 }, [1, null], null, 42, 'text', new Date('2020-01-01T00:00:00Z'), new Uint8Array([1, 2])]
+        const values = [{ a: 1 }, [1, null], null, 42, 'text']
         for (const value of values) {
             await storage.setItem('value', value)
             await expect(storage.getItem('value')).resolves.toEqual(JSON.parse(JSON.stringify(value)))
@@ -149,7 +171,7 @@ describe('plugin device keyspace', () => {
         await storage.setItem('value', 'kept')
         const cycle: { self?: unknown } = {}; cycle.self = cycle
         const write = vi.spyOn(pluginDeviceStorage, 'setItem')
-        for (const value of [undefined, () => {}, Symbol('unsupported'), cycle, 1n]) {
+        for (const value of [undefined, () => {}, Symbol('unsupported'), cycle]) {
             await expect(storage.setItem('value', value)).rejects.toBeInstanceOf(TypeError)
             await expect(storage.getItem('value')).resolves.toBe('kept')
         }
@@ -158,6 +180,44 @@ describe('plugin device keyspace', () => {
         await expect(storage.getItem('value')).resolves.toBe('kept')
         await expect(storage.keys()).resolves.toEqual(['value'])
         write.mockRestore()
+    })
+
+    it('keeps rich values and legacy JSON behavior, and rejects unsupported rich values without replacing data', async () => {
+        const storage = new SafeLocalPluginStorage('rich-contract')
+        for (const value of [new Date('2020-01-01T00:00:00Z'), new Map([['x', 1n]]), new Set([1, 2]), /test/gi, 1n, new DataView(Uint8Array.of(1, 2).buffer)]) {
+            await storage.setItem('rich', value)
+            invalidatePluginDeviceKeyspaces('rich-contract')
+            expect(await storage.getItem('rich')).toEqual(value)
+        }
+        await storage.setItem('plain', { optional: undefined, nan: NaN, zero: -0 })
+        expect(await storage.getItem('plain')).toEqual({ nan: null, zero: 0 })
+        await storage.setItem('plain', { toJSON: () => ({ converted: true }) })
+        expect(await storage.getItem('plain')).toEqual({ converted: true })
+        await expect(storage.setItem('plain', new Error('unsupported'))).rejects.toMatchObject({ name: 'DataCloneError' })
+        expect(await storage.getItem('plain')).toEqual({ converted: true })
+    })
+
+    it('orders slow binary writes across wrappers, reads and clear without blocking another key', async () => {
+        const owner = 'ordered-binary'
+        const first = new SafeLocalPluginStorage(owner)
+        const second = new SafeLocalPluginStorage(owner)
+        const blob = new Blob(['slow'])
+        let finish!: (value: ArrayBuffer) => void
+        vi.spyOn(blob, 'arrayBuffer').mockImplementation(() => new Promise(resolve => { finish = resolve }))
+        const slow = first.setItem('slow', blob)
+        const listed = first.keys()
+        expect(await second.getItem('other')).toBeNull()
+        const next = second.setItem('slow', Uint8Array.of(7))
+        const read = first.getItem('slow')
+        const cleared = second.clear()
+        const after = first.getItem('slow')
+        finish(new TextEncoder().encode('slow').buffer)
+        await slow
+        expect(await listed).toEqual(['slow'])
+        await next
+        expect(await read).toEqual(Uint8Array.of(7))
+        await cleared
+        expect(await after).toBeNull()
     })
 
     it('invalidates an already-held shared wrapper', async () => {
@@ -242,7 +302,7 @@ describe('plugin device keyspace', () => {
         await expect(keyspace.keys('string')).resolves.toEqual(operation === 'set' ? ['key'] : [])
     })
 
-    it('keeps writes durable but drops a cache that grows beyond its byte budget', async () => {
+    it('keeps recent values within the cache budget without hiding evicted keys', async () => {
         const { backend } = recordingBackend()
         const reads = vi.spyOn(backend, 'read')
         const hydrations = vi.spyOn(backend, 'hydrate')
@@ -250,9 +310,20 @@ describe('plugin device keyspace', () => {
         const value = 'x'.repeat(PLUGIN_DEVICE_CACHE_BYTES / 4)
         for (const key of ['one', 'two', 'three']) await keyspace.setItem('string', key, value)
         await expect(keyspace.getItem('string', 'three')).resolves.toBe(value)
-        expect(reads).toHaveBeenCalledOnce()
+        expect(reads).not.toHaveBeenCalled()
         expect(hydrations).toHaveBeenCalledOnce()
         await expect(keyspace.keys('string')).resolves.toEqual(['one', 'three', 'two'])
+        await expect(keyspace.getItem('string', 'one')).resolves.toBe(value)
+        await expect(keyspace.getItem('string', 'two')).resolves.toBe(value)
+        expect(reads).toHaveBeenCalledTimes(2)
+        // One oversized value must not evict a different small setting.
+        await keyspace.setItem('json', 'settings', '{"enabled":true}')
+        await keyspace.setItem('string', 'large', 'x'.repeat(PLUGIN_DEVICE_CACHE_BYTES))
+        await keyspace.setItem('json', 'binary', new Uint8Array(PLUGIN_DEVICE_CACHE_BYTES / 2))
+        reads.mockRejectedValueOnce(new Error('Unexpected read of cached settings'))
+        await expect(keyspace.getItem('json', 'settings')).resolves.toBe('{"enabled":true}')
+        await expect(keyspace.getItem('string', 'two')).resolves.toBe(value)
+        await expect(keyspace.keys('string')).resolves.toEqual(['large', 'one', 'three', 'two'])
     })
 
     it('does not accumulate replacement costs for the same cached key', async () => {
@@ -320,7 +391,7 @@ describe('plugin device keyspace', () => {
         await expect(keyspace.getItem('string', 'token')).resolves.toBe('value')
     })
 
-    it('reads key by key when the keyspace is past the hydration limit', async () => {
+    it('loads uncached keys on demand past the hydration limit and keeps small committed values', async () => {
         const { backend } = recordingBackend(
             [
                 { owner: 'plugin-a', space: 'string', key: 'one', value: 'first' },
@@ -337,7 +408,35 @@ describe('plugin device keyspace', () => {
 
         await keyspace.setItem('string', 'three', 'third')
         await expect(keyspace.getItem('string', 'three')).resolves.toBe('third')
+        expect(reads).toHaveBeenCalledTimes(1)
+        await expect(keyspace.getItem('string', 'two')).resolves.toBe('second')
         expect(reads).toHaveBeenCalledTimes(2)
+        await expect(keyspace.keys('string')).resolves.toEqual(['one', 'three', 'two'])
+    })
+
+    it.each(['write', 'invalidate'] as const)('does not cache an old partial read after a newer %s', async action => {
+        const owner = `partial-read-${action}`
+        const { backend } = recordingBackend([{ owner, space: 'json', key: 'settings', value: 'old' }], { complete: false })
+        const read = backend.read.bind(backend)
+        let started!: () => void, release!: () => void
+        const reading = new Promise<void>(resolve => { started = resolve })
+        const gate = new Promise<void>(resolve => { release = resolve })
+        let first = true
+        backend.read = async (...args) => {
+            const value = await read(...args)
+            if (first) { first = false; started(); await gate }
+            return value
+        }
+        const keyspace = new PluginDeviceKeyspace(owner, backend)
+        try {
+            const pending = keyspace.getItem('json', 'settings')
+            await reading
+            if (action === 'invalidate') keyspace.invalidate()
+            await keyspace.setItem('json', 'settings', 'new')
+            release()
+            expect(await pending).toBe('old')
+            expect(await keyspace.getItem('json', 'settings')).toBe('new')
+        } finally { keyspace.dispose() }
     })
 
     it('keeps the browser backend inside the same owner and space boundary', async () => {
@@ -360,6 +459,40 @@ describe('plugin device keyspace', () => {
 
 
 describe('native plugin device observations', () => {
+    it('keeps small JSON settings cached in an incomplete keyspace without hiding other keys or remote changes', async () => {
+        const owner = 'mixed-cached-observations'
+        const { backend, rows } = recordingBackend([
+            { owner, space: 'json', key: 'settings', value: '{"enabled":true}' },
+            { owner, space: 'json', key: 'binary', value: Uint8Array.of(0, 80, 76, 83, 1) },
+        ], { complete: false })
+        let sequence = 'epoch:0', available = true
+        const read = backend.read.bind(backend)
+        backend.sequence = async () => { if (!available) throw new Error('Unexpected native query'); return sequence }
+        backend.read = async (...args) => { if (!available) throw new Error('Unexpected native read'); return read(...args) }
+        const write = backend.write.bind(backend)
+        backend.write = async (owner, mutations, observations) => {
+            if (observations?.some(value => value.sequence !== sequence)) throw new Error('PLUGIN_STORAGE_STALE')
+            await write(owner, mutations)
+            return mutations.flatMap(value => value.type === 'clear' ? [] : [{ space: value.space, key: value.key, sequence }])
+        }
+        const keyspace = new PluginDeviceKeyspace(owner, backend)
+        const storage = new SafeLocalPluginStorage(owner, keyspace)
+        try {
+            expect(await storage.getItem('settings')).toEqual({ enabled: true })
+            available = false
+            expect(await storage.getItem('settings')).toEqual({ enabled: true })
+            expect(await storage.keys()).toEqual(['binary', 'settings'])
+            available = true
+            rows()[0].value = '{"enabled":false}'; sequence = 'epoch:1'
+            await expect(storage.setItem('settings', { enabled: 'stale' })).rejects.toThrow('PLUGIN_STORAGE_STALE')
+            advancePluginStorageRemoteChanges([JSON.stringify(['plugin-local', owner, 'json', 'settings'])])
+            expect(await storage.getItem('settings')).toEqual({ enabled: false })
+            await storage.setItem('settings', { enabled: 'fresh' })
+            available = false
+            expect(await storage.getItem('settings')).toEqual({ enabled: 'fresh' })
+        } finally { keyspace.dispose() }
+    })
+
     it('reuses hydrated values with their original tokens until invalidated, without read IPC', async () => {
         const owner = 'native-cached-observations'
         const { backend, rows } = recordingBackend([{ owner, space: 'json', key: 'settings', value: 'old' }])

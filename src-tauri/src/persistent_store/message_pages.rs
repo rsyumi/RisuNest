@@ -1314,7 +1314,7 @@ impl ObjectRoots {
         while let Some(value) = pending.pop() {
             match value {
                 Value::Object(map) => {
-                    if let Some(plugin) = map.get("PluginObject") {
+                    if let Some(plugin) = map.get("PluginObject").or_else(|| map.get("PluginBinary")) {
                         let hash = plugin.get("object").and_then(|object| object.get("hash")).and_then(Value::as_str)
                             .ok_or_else(|| codec_error("plugin object is missing"))?;
                         risunest_sync_wire::validate_hash(hash).map_err(codec_error)?;

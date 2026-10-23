@@ -5,18 +5,19 @@ import { pluginDeviceStorage, pluginDevicePrefix } from './pluginDeviceStorage'
 import { readNativePluginDeviceValue, writeNativePluginDeviceValues } from './pluginDeviceTransfer'
 
 export type PluginDeviceSpace = 'string' | 'json'
+export type PluginDeviceValue = string | Uint8Array
 
 export const PLUGIN_DEVICE_CACHE_BYTES = 4 * 1024 * 1024
 
 // Conservative UTF-16 payload and per-entry allowance, not a storage limit.
-function cacheEntryBytes(key: string, value: string, sequence = ''): number {
-    return 128 + 2 * (key.length + value.length + sequence.length)
+function cacheEntryBytes(key: string, value: PluginDeviceValue, sequence = ''): number {
+    return 128 + 2 * (key.length + sequence.length) + (typeof value === 'string' ? 2 * value.length : value.byteLength)
 }
 
 export interface PluginDeviceEntry {
     space: PluginDeviceSpace
     key: string
-    value: string
+    value: PluginDeviceValue
     sequence?: string
 }
 
@@ -27,7 +28,7 @@ export interface PluginDeviceHydration {
 }
 
 export type PluginDeviceMutation =
-    | { type: 'set'; space: PluginDeviceSpace; key: string; value: string }
+    | { type: 'set'; space: PluginDeviceSpace; key: string; value: PluginDeviceValue }
     | { type: 'delete'; space: PluginDeviceSpace; key: string }
     | { type: 'clear'; space: PluginDeviceSpace }
 
@@ -36,7 +37,7 @@ export interface PluginDeviceObservation { space: PluginDeviceSpace; key: string
 export interface PluginDeviceBackend {
     sequence?(owner: string, space: PluginDeviceSpace, key: string): Promise<string>
     hydrate(owner: string): Promise<PluginDeviceHydration>
-    read(owner: string, space: PluginDeviceSpace, key: string): Promise<string | null>
+    read(owner: string, space: PluginDeviceSpace, key: string): Promise<PluginDeviceValue | null>
     keys(owner: string, space: PluginDeviceSpace): Promise<string[]>
     write(owner: string, mutations: readonly PluginDeviceMutation[], observations?: readonly PluginDeviceObservation[]): Promise<void | PluginDeviceObservation[]>
 }
@@ -64,8 +65,8 @@ function browserKeyOf(stored: string, owner: string, space: PluginDeviceSpace): 
 }
 
 /**
- * The web build keeps the browser stores. Values stay strings on both sides so
- * one keyspace serves either backend without a second shape.
+ * The web build keeps the browser stores. The plugin store keeps JSON text or
+ * binary records; the separate string space still uses localStorage.
  */
 export function createBrowserPluginDeviceBackend(): PluginDeviceBackend {
     const localKeys = (owner: string): string[] => {
@@ -89,9 +90,9 @@ export function createBrowserPluginDeviceBackend(): PluginDeviceBackend {
         owner: string,
         space: PluginDeviceSpace,
         key: string,
-    ): Promise<string | null> => {
+    ): Promise<PluginDeviceValue | null> => {
         if (space === 'string') return localStorage.getItem(browserKey(owner, space, key))
-        return await pluginDeviceStorage.getItem<string>(browserKey(owner, space, key))
+        return await pluginDeviceStorage.getItem<PluginDeviceValue>(browserKey(owner, space, key))
     }
     return {
         async hydrate(owner: string): Promise<PluginDeviceHydration> {
@@ -101,7 +102,7 @@ export function createBrowserPluginDeviceBackend(): PluginDeviceBackend {
                 const keys = space === 'string' ? localKeys(owner) : await forageKeys(owner)
                 for (const key of keys.sort()) {
                     const value = await read(owner, space, key)
-                    if (typeof value !== 'string') continue
+                    if (typeof value !== 'string' && !(value instanceof Uint8Array)) continue
                     byteSize += cacheEntryBytes(key, value)
                     if (byteSize > PLUGIN_DEVICE_CACHE_BYTES) {
                         return { complete: false, byteSize, entries: [] }
@@ -139,7 +140,7 @@ export function createBrowserPluginDeviceBackend(): PluginDeviceBackend {
                     else await pluginDeviceStorage.removeItem(stored)
                     continue
                 }
-                if (mutation.space === 'string') localStorage.setItem(stored, mutation.value)
+                if (mutation.space === 'string') localStorage.setItem(stored, String(mutation.value))
                 else await pluginDeviceStorage.setItem(stored, mutation.value)
             }
         },
@@ -162,7 +163,7 @@ export function createNativePluginDeviceBackend(): PluginDeviceBackend {
             owner: string,
             space: PluginDeviceSpace,
             key: string,
-        ): Promise<string | null> {
+        ): Promise<PluginDeviceValue | null> {
             return await readNativePluginDeviceValue(owner, space, key)
         },
         async keys(owner: string, space: PluginDeviceSpace): Promise<string[]> {
@@ -186,6 +187,7 @@ export class PluginDeviceKeyspace {
     readonly #owner: string
     readonly #backend: PluginDeviceBackend
     #cache: Map<PluginDeviceSpace, Map<string, PluginDeviceEntry>> | null = null
+    #cacheComplete = false
     #hydration: Promise<void> | null = null
     #cacheBytes = 0
     #generation = 0
@@ -233,22 +235,13 @@ export class PluginDeviceKeyspace {
         const started = (async () => {
             const loaded = await this.#backend.hydrate(this.#owner)
             if (generation !== this.#generation) return
-            if (!loaded.complete) {
-                this.#cache = null
-                return
-            }
-            const cache = new Map<PluginDeviceSpace, Map<string, PluginDeviceEntry>>([
+            this.#cache = new Map<PluginDeviceSpace, Map<string, PluginDeviceEntry>>([
                 ['string', new Map()],
                 ['json', new Map()],
             ])
-            let bytes = 0
-            for (const entry of loaded.entries) {
-                bytes += cacheEntryBytes(entry.key, entry.value, entry.sequence)
-                if (bytes > PLUGIN_DEVICE_CACHE_BYTES) return
-                cache.get(entry.space)?.set(entry.key, entry)
-            }
-            this.#cacheBytes = bytes
-            this.#cache = cache
+            this.#cacheBytes = 0
+            this.#cacheComplete = loaded.complete
+            for (const entry of loaded.entries) this.#remember(entry)
         })()
         this.#hydration = started
         try {
@@ -262,8 +255,39 @@ export class PluginDeviceKeyspace {
     invalidate(): void {
         this.#generation += 1
         this.#cache = null
+        this.#cacheComplete = false
         this.#cacheBytes = 0
         this.#hydration = null
+    }
+
+    // An incomplete owner can still retain small keys. Its key list must keep
+    // coming from the backend; a cache miss never proves a key is absent.
+    #remember(entry: PluginDeviceEntry): void {
+        const cache = this.#cache?.get(entry.space)
+        if (!cache) return
+        const previous = cache.get(entry.key)
+        if (previous) {
+            this.#cacheBytes -= cacheEntryBytes(previous.key, previous.value, previous.sequence)
+            cache.delete(entry.key)
+        }
+        const bytes = cacheEntryBytes(entry.key, entry.value, entry.sequence)
+        if (bytes > PLUGIN_DEVICE_CACHE_BYTES || entry.value instanceof Uint8Array && this.#cacheBytes + bytes > PLUGIN_DEVICE_CACHE_BYTES) {
+            // A binary admission must not displace the existing JSON cache.
+            this.#cacheComplete = false
+            return
+        }
+        while (this.#cacheBytes + bytes > PLUGIN_DEVICE_CACHE_BYTES) {
+            for (const entries of this.#cache!.values()) {
+                const oldest = entries.values().next().value as PluginDeviceEntry | undefined
+                if (!oldest) continue
+                entries.delete(oldest.key)
+                this.#cacheBytes -= cacheEntryBytes(oldest.key, oldest.value, oldest.sequence)
+                break
+            }
+            this.#cacheComplete = false
+        }
+        cache.set(entry.key, entry)
+        this.#cacheBytes += bytes
     }
 
     async #write(mutation: PluginDeviceMutation): Promise<void> {
@@ -295,24 +319,18 @@ export class PluginDeviceKeyspace {
             cache.clear()
             return
         }
-        const previous = cache.get(mutation.key)
-        if (previous !== undefined) this.#cacheBytes -= cacheEntryBytes(mutation.key, previous.value, previous.sequence)
         if (mutation.type === 'delete') {
+            const previous = cache.get(mutation.key)
+            if (previous) this.#cacheBytes -= cacheEntryBytes(mutation.key, previous.value, previous.sequence)
             cache.delete(mutation.key)
             return
         }
         const entry = { space: mutation.space, key: mutation.key, value: mutation.value,
             sequence: committed.find(value => value.space === mutation.space && value.key === mutation.key)?.sequence }
-        this.#cacheBytes += cacheEntryBytes(entry.key, entry.value, entry.sequence)
-        if (this.#cacheBytes > PLUGIN_DEVICE_CACHE_BYTES) {
-            this.#cache = null
-            this.#cacheBytes = 0
-            return
-        }
-        cache.set(mutation.key, entry)
+        this.#remember(entry)
     }
 
-    async getItem(space: PluginDeviceSpace, key: string): Promise<string | null> {
+    async getItem(space: PluginDeviceSpace, key: string): Promise<PluginDeviceValue | null> {
         await this.#hydrate()
         const cached = this.#cache?.get(space)
         const entry = cached?.get(key)
@@ -322,25 +340,34 @@ export class PluginDeviceKeyspace {
                 return entry.value
             }
             const generation = this.#generation
+            const writeSequence = this.#writeSequence
             const sequence = await this.#backend.sequence(this.#owner, space, key)
             const observation = { space, key, sequence }
             this.#observed.set(JSON.stringify([space, key]), observation)
             const value = await this.#backend.read(this.#owner, space, key)
             if (generation !== this.#generation) await this.#reloadIfStale([observation])
+            if (value !== null && generation === this.#generation && writeSequence === this.#writeSequence)
+                this.#remember({ space, key, value, sequence })
             return value
         }
-        if (cached) return entry?.value ?? null
-        return await this.#backend.read(this.#owner, space, key)
+        if (entry) return entry.value
+        if (cached && this.#cacheComplete) return null
+        const generation = this.#generation, writeSequence = this.#writeSequence
+        const value = await this.#backend.read(this.#owner, space, key)
+        if (value !== null && generation === this.#generation && writeSequence === this.#writeSequence)
+            this.#remember({ space, key, value })
+        return value
     }
 
     async keys(space: PluginDeviceSpace): Promise<string[]> {
         await this.#hydrate()
         const cached = this.#cache?.get(space)
-        const keys = cached ? [...cached.keys()] : await this.#backend.keys(this.#owner, space)
+        const keys = cached && this.#cacheComplete ? [...cached.keys()] : await this.#backend.keys(this.#owner, space)
         return keys.sort()
     }
 
-    async setItem(space: PluginDeviceSpace, key: string, value: string): Promise<void> {
+    async setItem(space: PluginDeviceSpace, key: string, value: PluginDeviceValue): Promise<void> {
+        if (space === 'string' && typeof value !== 'string') throw new TypeError('String plugin storage requires text')
         await this.#write({ type: 'set', space, key, value })
     }
 

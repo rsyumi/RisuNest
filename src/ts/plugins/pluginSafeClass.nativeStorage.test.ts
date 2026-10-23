@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { PluginDeviceMutation } from './pluginDeviceKeyspace'
+import type { PluginDeviceMutation, PluginDeviceValue } from './pluginDeviceKeyspace'
 
-const native = vi.hoisted(() => ({ invoke: vi.fn(), values: new Map<string, string>(), android: false }))
+const native = vi.hoisted(() => ({ invoke: vi.fn(), values: new Map<string, PluginDeviceValue>(), android: false }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: 'tauri', os: native.android ? 'android' : 'windows' })))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }))
 vi.mock('./plugins.svelte', () => ({ pluginStorageStore: { invalidate: vi.fn() } }))
@@ -9,7 +9,7 @@ vi.mock('../storage/persistentDataStoreFactory', () => ({ getPersistentDataStore
 
 import { SafeLocalPluginStorage } from './pluginSafeClass'
 import { invalidatePluginDeviceKeyspaces } from './pluginDeviceKeyspace'
-import { deletePluginDataItems } from './pluginDataInventory'
+import { deletePluginDataItems, readPluginDataValue } from './pluginDataInventory'
 import { pluginDeviceParts, pluginDeviceValueSize, readNativePluginDeviceValue, writeNativePluginDeviceValues, PLUGIN_DEVICE_PART_BYTES } from './pluginDeviceTransfer'
 import { ANDROID_COMMIT_CHUNK_BYTES, ANDROID_LARGE_COMMIT_SIZE } from '../storage/androidCommitTransport'
 
@@ -42,6 +42,61 @@ beforeEach(() => {
 })
 
 describe('native JSON plugin values', () => {
+    it.each([false, true])('persists binary parts and reads fresh buffers through native IPC (android=%s)', async android => {
+        native.android = android
+        const sessions = new Map<string, { key: string; bytes: Uint8Array; offset: number }>()
+        const previous = native.invoke.getMockImplementation()!
+        let fail = false
+        native.invoke.mockImplementation(async (command, args, options) => {
+            if (command === 'native_asset_bytes_probe') return true
+            if (command === 'pds_open_plugin_device_binary_write') {
+                sessions.set('binary-session', { key: args.key, bytes: new Uint8Array(args.byteLength), offset: 0 })
+                return { sessionId: 'binary-session' }
+            }
+            if (command === 'pds_append_plugin_device_bytes_raw') {
+                if (fail) throw new Error('synthetic binary disk failure')
+                const session = sessions.get(options.headers['x-risunest-upload-id'])!
+                const offset = Number(options.headers['x-risunest-offset'])
+                expect(offset).toBe(session.offset)
+                session.bytes.set(args, offset)
+                session.offset += args.byteLength
+                return session.offset
+            }
+            if (command === 'pds_write_plugin_device_values' && args.mutations[0].type === 'staged') {
+                const session = sessions.get(args.mutations[0].sessionId)!
+                expect(session.offset).toBe(session.bytes.length)
+                native.values.set(session.key, session.bytes)
+                return []
+            }
+            if (command === 'pds_abort_plugin_device_write') { sessions.delete(args.sessionId); return }
+            if (command === 'pds_hydrate_plugin_device_storage') return { complete: false, byteSize: 0, entries: [] }
+            if (command === 'pds_read_plugin_device_value') {
+                const bytes = native.values.get(args.key)
+                return bytes instanceof Uint8Array ? { binary: true, byteSize: bytes.length, version: 'binary-version' } : bytes ?? null
+            }
+            if (command === 'pds_read_plugin_device_bytes') return (native.values.get(args.key) as Uint8Array).slice(args.offset, args.offset + 256 * 1024).buffer
+            return previous(command, args)
+        })
+        const storage = new SafeLocalPluginStorage('native-binary')
+        const bytes = new Uint8Array(256 * 1024 + 3).map((_, index) => index % 256)
+        await storage.setItem('binary', bytes)
+        expect(native.values.get('binary')).toBeInstanceOf(Uint8Array)
+        expect(sessions.size).toBe(0)
+        const description = JSON.parse((await readPluginDataValue({ owner: 'native-binary', space: 'json', key: 'binary', valueType: 'json', byteSize: 0, automatic: false }))!)
+        expect(description).toEqual({ type: 'Uint8Array', byteSize: (native.values.get('binary') as Uint8Array).byteLength })
+        invalidatePluginDeviceKeyspaces('native-binary')
+        const first = await storage.getItem<Uint8Array>('binary')
+        expect(first).toEqual(bytes)
+        structuredClone(first, { transfer: [first!.buffer] })
+        expect(await storage.getItem('binary')).toEqual(bytes)
+        fail = true
+        await expect(storage.setItem('binary', Uint8Array.of(9))).rejects.toThrow('synthetic binary disk failure')
+        expect(sessions.size).toBe(0)
+        expect(await storage.getItem('binary')).toEqual(bytes)
+        await storage.removeItem('binary')
+        expect(await storage.getItem('binary')).toBeNull()
+    })
+
     it('includes observation fields when routing a write across the Android IPC size boundary', async () => {
         native.android = true
         const observations = [{ space: 'string' as const, key: 'key', sequence: 'epoch:2' }]
@@ -133,7 +188,7 @@ describe('native JSON plugin values', () => {
         }
         const cycle: { self?: unknown } = {}; cycle.self = cycle
         native.invoke.mockClear()
-        for (const value of [undefined, () => {}, Symbol('unsupported'), cycle, 1n]) {
+        for (const value of [undefined, () => {}, Symbol('unsupported'), cycle]) {
             await expect(storage.setItem('value', value)).rejects.toBeInstanceOf(TypeError)
             await expect(storage.getItem('value')).resolves.toBe('text')
         }

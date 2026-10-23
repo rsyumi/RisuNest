@@ -50,6 +50,52 @@ test('real iframe clones payloads and delivers responses asynchronously', async 
     await expect(page.locator('[data-risu-plugin-frame]')).toHaveAttribute('sandbox', 'allow-scripts allow-modals allow-downloads')
 })
 
+test('large local JSON uses the text wire while binary graphs retain bytes and aliases', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadLocal(`
+        const storage = await risuai.getLocalPluginStorage();
+        const values = Array.from({ length: 1024 }, (_, id) => ({ id, optional: undefined, nan: NaN }));
+        const pending = storage.setItem('json', values);
+        values[0].id = -1;
+        await pending;
+        const restored = await storage.getItem('json');
+        const buffer = new Uint8Array([0, 255, 128]).buffer;
+        const binary = Array(1024).fill(null);
+        binary[0] = { buffer, view: new Uint8Array(buffer, 1, 2) };
+        binary[1] = binary;
+        await storage.setItem('binary', binary);
+        const decoded = await storage.getItem('binary');
+        await risuai.result({ first: restored[0], length: restored.length,
+            binary: decoded[0].view instanceof Uint8Array,
+            shared: decoded[0].view.buffer === decoded[0].buffer, cycle: decoded[1] === decoded,
+            bytes: Array.from(decoded[0].view) });
+    `))
+    await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toEqual({
+        first: { id: 0, nan: null }, length: 1024, binary: true, shared: true, cycle: true, bytes: [255, 128],
+    })
+    const requests = await page.evaluate(() => window.boundary.bridgeMessages.filter(message => message.method === 'setItem'))
+    expect(requests.find(message => message.args[0] === 'json')).toMatchObject({ args: ['json'], localPluginJson: expect.any(String) })
+    expect(requests.find(message => message.args[0] === 'binary')).not.toHaveProperty('localPluginJson')
+})
+
+test('guest prototype JSON hooks keep the ordinary host serialization semantics', async ({ page }) => {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadLocal(`
+        const storage = await risuai.getLocalPluginStorage();
+        Array.prototype.toJSON = () => ['guest hook'];
+        Object.defineProperty(Array.prototype, '300', { configurable: true, get: () => 'inherited' });
+        const value = Array(2048);
+        value[0] = { id: 0 };
+        await storage.setItem('value', value);
+        const restored = await storage.getItem('value');
+        delete Array.prototype.toJSON;
+        delete Array.prototype[300];
+        await risuai.result({ first: restored[0], inherited: restored[300], length: restored.length });
+    `))
+    await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toEqual({ first: { id: 0 }, inherited: null, length: 2048 })
+    expect(await page.evaluate(() => window.boundary.bridgeMessages.find(message => message.method === 'setItem'))).not.toHaveProperty('localPluginJson')
+})
+
 const callbackScript = `
 try {
     window.addEventListener('message', event => {

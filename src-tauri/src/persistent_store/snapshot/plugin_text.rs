@@ -186,10 +186,32 @@ fn json_value(input: &mut impl BufRead, roots: &mut AssetRootSet, cold: u8, dept
 }
 
 pub(super) fn scan(mut input: impl Read + Seek, roots: &mut AssetRootSet) -> StoreResult<()> {
+    let mut magic = [0; 5];
+    let count = input.read(&mut magic)?;
+    input.seek(SeekFrom::Start(0))?;
+    if count == 5 && magic == [0, 80, 76, 83, 1] { return scan_binary(input, roots); }
     let valid = serde_json::from_reader::<_, serde::de::IgnoredAny>(BufReader::new(&mut input)).is_ok();
     input.seek(SeekFrom::Start(0))?;
     if valid { json_value(&mut BufReader::new(input), roots, 0, 0)?; }
     else { scan_raw(input, roots, 0)?; }
+    Ok(())
+}
+
+pub(super) fn scan_binary(mut input: impl Read + Seek, roots: &mut AssetRootSet) -> StoreResult<()> {
+    let info = crate::persistent_store::device_store::plugin_values::raw_value::inspect(&mut input)?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut header = [0; 13];
+    input.read_exact(&mut header)?;
+    let lengths = [u32::from_le_bytes(header[5..9].try_into().unwrap()), u32::from_le_bytes(header[9..13].try_into().unwrap())];
+    let mut offset = 13;
+    for length in lengths {
+        serde_json::from_reader::<_, serde::de::IgnoredAny>(BufReader::new((&mut input).take(length as u64))).map_err(io::Error::other)?;
+        input.seek(SeekFrom::Start(offset))?;
+        json_value(&mut BufReader::new((&mut input).take(length as u64)), roots, 0, 0)?;
+        offset += length as u64;
+        input.seek(SeekFrom::Start(offset))?;
+    }
+    if offset > info.byte_length { return Err(invalid().into()); }
     Ok(())
 }
 

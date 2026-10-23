@@ -715,7 +715,7 @@ These checks cannot detect a remote change that this device has not received yet
 
 ### Local Plugin Storage
 
-`getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts JSON-serializable values and is appropriate for structured device-only settings or caches. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone.
+`getLocalPluginStorage()` is also device-local and follows the same sync rule as `safeLocalStorage`. Unlike `safeLocalStorage`, it accepts JSON data and supported binary/rich values: Blob/File (including MIME type and file metadata), ArrayBuffer, typed arrays/DataView, Date, Map, Set, RegExp and BigInt, including nesting in objects and arrays. In RisuNest it is confined to your plugin, and it is a separate space from `safeLocalStorage`, so clearing one leaves the other alone. Ordinary JSON retains its existing serialization behavior. Unsupported rich objects reject rather than silently becoming `{}`; full IndexedDB type compatibility is not promised.
 
 `getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
@@ -744,13 +744,17 @@ await storage.clear();
 
 On the native app `safeLocalStorage` and `getLocalPluginStorage()` are kept in the installation's own device file. RisuNest treats both spaces as follows:
 
-- **Value size** is limited to 512 MiB of UTF-8 bytes after JSON-encoding the stored string. For `getLocalPluginStorage()`, the stored string is the serialized JSON value. An oversized write rejects without replacing the previous value. Large values still need enough WebView memory to construct and read them.
+- **Value size** is limited to 512 MiB. For ordinary text/JSON this counts UTF-8 bytes after JSON-encoding the stored string. Binary records count their encoded metadata and raw bytes. An oversized write rejects without replacing the previous value. Large values still need enough WebView memory to construct and read them.
 - **Full backups** always include both spaces, whether or not they sync. Restoring a full backup replaces them with the backup's values.
 - **Sync** carries them only when the user turns on the local plugin data option in RisuNest settings. The option is off by default, applies to both spaces of every plugin, and covers both the sync server and external storage. With it off, each device keeps its own values.
 - **First connection to a sync target that already holds data** clears both spaces for every plugin, including plugins that are no longer installed. With the option on they are then filled from the target; with it off they start empty. Reconnecting to the same target keeps them.
 - **RisuAI and PocketRisu exports** never include them.
 
 Plugin permissions and OS-issued handles are not transferred by any of these.
+
+Binary values use a versioned format in the same device file, not server-backed or WebView-only storage. Existing JSON records remain readable. Binary records, backups containing them, and synchronized binary values require a reader with binary support; older versions cannot interpret them. Contents already lost through an earlier JSON conversion cannot be recovered. Awaiting a write still means it has been kept by the native store.
+
+Ordinary JSON continues to use the existing JSON text format. Small settings can stay cached even when the same plugin stores binary values; admitting a binary value does not displace the plugin's existing cached JSON. The shared cache remains bounded and is separate from the stored-value size limit.
 
 ### Database Access
 

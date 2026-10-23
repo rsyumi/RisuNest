@@ -71,6 +71,10 @@ pub(crate) enum SectionValueRow {
         space: String,
         value: String,
     },
+    PluginBinary {
+        object: plugin_values::raw_value::BinaryInfo,
+        parts: Vec<ObjectReference>,
+    },
     PluginObject {
         space: String,
         object: text_value::TextInfo,
@@ -101,6 +105,7 @@ impl SectionValueRow {
                 if a_space == "json" && b_space == "json" => same_json(a, b),
             (Self::Setting { value: a }, Self::Setting { value: b }) => same_json(a, b),
             (Self::PluginObject { space: a, object: x, .. }, Self::PluginObject { space: b, object: y, .. }) => a == b && x == y,
+            (Self::PluginBinary { object: a, .. }, Self::PluginBinary { object: b, .. }) => a == b,
             (Self::Plugin { space, value }, Self::PluginObject { space: other_space, object, .. })
             | (Self::PluginObject { space: other_space, object, .. }, Self::Plugin { space, value }) => {
                 space == other_space && text_value::encode(value.as_bytes(), std::io::sink(), text_value::MAX_VALUE_BYTES).ok().as_ref() == Some(object)
@@ -131,7 +136,7 @@ impl SectionValueRow {
         let bytes = match self {
             Self::Hypa { vector, .. } => vector.as_slice(),
             Self::Plugin { value, .. } | Self::Setting { value } => value.as_bytes(),
-            Self::PluginObject { .. } | Self::PluginPermission { .. } | Self::Tombstone { .. } => return None,
+            Self::PluginBinary { .. } | Self::PluginObject { .. } | Self::PluginPermission { .. } | Self::Tombstone { .. } => return None,
         };
         rides_as_object(bytes).then_some(bytes)
     }
@@ -140,7 +145,7 @@ impl SectionValueRow {
         match self {
             Self::Hypa { vector, .. } => Some(std::mem::take(vector)),
             Self::Plugin { value, .. } | Self::Setting { value } => Some(std::mem::take(value).into_bytes()),
-            Self::PluginObject { .. } | Self::PluginPermission { .. } | Self::Tombstone { .. } => None,
+            Self::PluginBinary { .. } | Self::PluginObject { .. } | Self::PluginPermission { .. } | Self::Tombstone { .. } => None,
         }
     }
 }
@@ -403,7 +408,7 @@ fn vector_identity(vector: &InlineOrObject) -> StoreResult<([u8; 32], u64)> {
 }
 
 fn plugin_columns() -> String {
-    format!("rowid AS value_rowid,owner,space,key,CASE WHEN byte_size<={} THEN value END AS value,byte_size,tombstone,write_clock,writer_id,published_clock,first_published_generation,first_published_at_ms", text_value::PART_BYTES)
+    format!("rowid AS value_rowid,typeof(value)='blob' AS binary,owner,space,key,CASE WHEN byte_size<={} THEN value END AS value,byte_size,tombstone,write_clock,writer_id,published_clock,first_published_generation,first_published_at_ms", text_value::PART_BYTES)
 }
 
 fn row_from_sql(db: &Connection, section: Section, row: &rusqlite::Row<'_>, objects: Option<&Connection>) -> StoreResult<SectionRow> {
@@ -422,7 +427,11 @@ fn row_from_sql(db: &Connection, section: Section, row: &rusqlite::Row<'_>, obje
             Section::LocalPlugins => {
                 let size: i64 = row.get("byte_size")?;
                 let space: String = row.get("space")?;
-                if size > text_value::PART_BYTES as i64 {
+                if row.get::<_, bool>("binary")? {
+                    let rowid = row.get("value_rowid")?;
+                    if space != "json" { return Err(invalid("Binary plugin value belongs to another space")); }
+                    large_plugin::capture_binary(objects, || Ok(db.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?))?
+                } else if size > text_value::PART_BYTES as i64 {
                     let rowid = row.get("value_rowid")?;
                     large_plugin::capture(objects, &space, || Ok(db.blob_open(rusqlite::MAIN_DB, "plugin_device_storage", "value", rowid, true)?))?
                 } else { SectionValueRow::Plugin { space, value: row.get("value")? } }
@@ -545,6 +554,10 @@ impl SectionRow {
                 };
                 SectionValue::LocalPlugin(LocalPluginValue { space, value: value.into() })
             }
+            (SectionValueRow::PluginBinary { parts, .. }, SectionKind::LocalPlugins) => {
+                if self.key2 != "json" { return Err(invalid("Binary plugin value belongs to another space")); }
+                SectionValue::LocalPlugin(LocalPluginValue { space: PluginSpace::Json, value: PluginValue::Binary(parts.clone()) })
+            }
             (SectionValueRow::PluginObject { space, parts, .. }, SectionKind::LocalPlugins) => {
                 if space != &self.key2 { return Err(invalid("Plugin value names another space")); }
                 let space = match space.as_str() { "string" => PluginSpace::String, "json" => PluginSpace::Json,
@@ -614,6 +627,7 @@ impl SectionRow {
                     (PluginSpace::String, PluginValue::Object(reference)) => object_text(&reference, &mut object, false)?,
                     (PluginSpace::Json, PluginValue::Inline(value)) => json_text(ValueOrObject::Inline(value), &mut object)?,
                     (PluginSpace::Json, PluginValue::Object(reference)) => json_text(ValueOrObject::Object(reference), &mut object)?,
+                    (_, PluginValue::Binary(_)) => return Err(invalid("Binary plugin value requires a section spool")),
                     (_, PluginValue::Objects(_)) => return Err(invalid("Multipart plugin value requires a section spool")),
                 };
                 if text_value::encoded_length(&text) > text_value::MAX_VALUE_BYTES { return Err(invalid("plugin device value is too large")); }
@@ -1094,6 +1108,9 @@ fn validate_sync_row(section: Section, row: &SectionRow) -> StoreResult<()> {
             }
             if space == "json" { serde_json::from_str::<serde::de::IgnoredAny>(value)?; }
             if text_value::encoded_length(value) > text_value::MAX_VALUE_BYTES { return Err(invalid("plugin device value is too large")); }
+        }
+        (Section::LocalPlugins, SectionValueRow::PluginBinary { object, .. }) => {
+            if row.key2 != "json" || object.byte_length == 0 || object.byte_length > text_value::MAX_VALUE_BYTES { return Err(invalid("Binary plugin value has an invalid identity or size")); }
         }
         (Section::LocalPlugins, SectionValueRow::PluginObject { space, object, .. }) => {
             if space != &row.key2 || !matches!(space.as_str(), "string" | "json") || object.encoded_length > text_value::MAX_VALUE_BYTES {
@@ -1603,6 +1620,17 @@ fn write_row(
                     published_clock
                 ],
             )?;
+        }
+        (Section::LocalPlugins, SectionValueRow::PluginBinary { object, .. }) => {
+            if row.key2 != "json" { return Err(invalid("Binary plugin value belongs to another space")); }
+            let raw = &plugin_values::raw_value::inspect_object(tx, &object.hash)?;
+            if raw != object { return Err(invalid("Binary plugin identity differs")); }
+            let (source, _) = text_value::object_row(tx, &object.hash)?;
+            plugin_values::raw_value::write_reserved(tx, &row.key1, &row.key3, object, row.write_clock.as_str(), &row.writer_id, |target| {
+                let mut input = tx.blob_open(rusqlite::MAIN_DB, "message_page_objects", "body", source, true)?;
+                std::io::copy(&mut input, target)?; Ok(())
+            })?;
+            tx.execute("UPDATE plugin_device_storage SET published_clock=?4 WHERE owner=?1 AND space=?2 AND key=?3", params![row.key1,row.key2,row.key3,published_clock])?;
         }
         (Section::LocalPlugins, SectionValueRow::PluginObject { space, object, .. }) => {
             if *space != row.key2 { return Err(invalid("received plugin value names another space")); }

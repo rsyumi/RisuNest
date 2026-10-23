@@ -10,6 +10,8 @@ const TOTAL_SESSIONS: usize = 8;
 const STAGING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(super) struct PendingWrite {
+    pub(super) binary: bool,
+    receiver: Option<std::sync::Arc<crate::asset_byte_transport::AndroidReceiver>>,
     pub(super) owner: String,
     pub(super) space: String,
     pub(super) key: String,
@@ -44,7 +46,7 @@ impl WriteSessions {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OpenedWrite { session_id: String }
+pub(crate) struct OpenedWrite { pub(crate) session_id: String }
 
 impl DeviceStore {
     pub(crate) fn open_plugin_device_write(&mut self, owner: &str, space: &str, key: &str, encoded_length: u64) -> StoreResult<OpenedWrite> {
@@ -61,7 +63,7 @@ impl DeviceStore {
             return Err(invalid("plugin device write sessions are full"));
         }
         let id = uuid::Uuid::new_v4().to_string();
-        sessions.insert(id.clone(), PendingWrite { owner: owner.into(), space: space.into(), key: key.into(),
+        sessions.insert(id.clone(), PendingWrite { binary: false, receiver: None, owner: owner.into(), space: space.into(), key: key.into(),
             file: tempfile::tempfile()?, byte_length: 0, encoded_length, received_encoded: 2, touched: Instant::now() });
         Ok(OpenedWrite { session_id: id })
     }
@@ -72,7 +74,7 @@ impl DeviceStore {
             .ok_or_else(|| invalid("plugin device write session is unavailable"))?;
         let result = (|| {
             let encoded = text_value::encoded_length(part);
-            if part.is_empty() || encoded > text_value::PART_BYTES as u64 || offset != session.byte_length
+            if session.binary || part.is_empty() || encoded > text_value::PART_BYTES as u64 || offset != session.byte_length
                 || session.received_encoded + encoded - 2 > session.encoded_length {
                 return Err(invalid("plugin device write part is invalid"));
             }
@@ -90,6 +92,38 @@ impl DeviceStore {
         if self.plugin_writes.sessions.get(id).is_some_and(|session| session.owner == owner) {
             self.plugin_writes.sessions.remove(id);
         }
+    }
+
+    pub(crate) fn open_plugin_device_binary_write(&mut self, owner: &str, key: &str, length: u64) -> StoreResult<OpenedWrite> {
+        let opened = self.open_plugin_device_write(owner, "json", key, length)?;
+        let session = self.plugin_writes.sessions.get_mut(&opened.session_id).unwrap();
+        session.binary = true;
+        session.received_encoded = 0;
+        Ok(opened)
+    }
+
+    pub(crate) fn attach_plugin_binary_receiver(&mut self, id: &str, receiver: std::sync::Arc<crate::asset_byte_transport::AndroidReceiver>) -> StoreResult<()> {
+        let session = self.plugin_writes.sessions.get_mut(id).ok_or_else(|| invalid("plugin device write session is unavailable"))?;
+        session.receiver = Some(receiver);
+        Ok(())
+    }
+
+    pub(crate) fn append_plugin_device_bytes(&mut self, id: &str, offset: u64, bytes: &[u8]) -> StoreResult<u64> {
+        self.plugin_writes.expire();
+        let session = self.plugin_writes.sessions.get_mut(id).ok_or_else(|| invalid("plugin device write session is unavailable"))?;
+        let result = (|| {
+            if !session.binary || bytes.is_empty() || bytes.len() > crate::asset_byte_transport::BINARY_PART_BYTES
+                || offset != session.byte_length || offset + bytes.len() as u64 > session.encoded_length {
+                return Err(invalid("plugin binary write part is invalid"));
+            }
+            session.file.write_all(bytes)?;
+            session.byte_length += bytes.len() as u64;
+            session.received_encoded = session.byte_length;
+            session.touched = Instant::now();
+            Ok(session.byte_length)
+        })();
+        if result.is_err() { self.plugin_writes.sessions.remove(id); }
+        result
     }
 }
 

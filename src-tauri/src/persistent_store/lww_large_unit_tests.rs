@@ -4,6 +4,33 @@ use crate::persistent_store::message_pages;
 const LANGUAGE: [&str; 2] = ["root", "language"];
 const PLUGIN_KEY: [&str; 4] = ["plugin-local", "synthetic-owner", "string", "large"];
 
+#[test]
+fn binary_plugin_local_values_sync_only_when_enabled_and_keep_original_bytes() {
+    use device_store::plugin_values::{raw_value, PluginDeviceMutation, PluginDeviceRead};
+    let (_directory, mut source) = store();
+    let key = ["plugin-local", "binary-owner", "json", "binary"];
+    let bytes = raw_value::fixture(&[0, 255, 128, 3]);
+    let opened = source.device_store_mut().unwrap().open_plugin_device_binary_write(key[1], key[3], bytes.len() as u64).unwrap();
+    source.device_store_mut().unwrap().append_plugin_device_bytes(&opened.session_id, 0, &bytes).unwrap();
+    source.device_store_mut().unwrap().write_plugin_device_values(key[1], &[PluginDeviceMutation::Staged { session_id: opened.session_id }]).unwrap();
+    assert!(!source.lww_read_outbox(source.lww_binding_authority().unwrap(), 1000).unwrap().entries.iter().any(|entry| entry.key == unit_key(&key).unwrap()));
+    source.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
+    let entry = outbox_value(&source, &key);
+    assert_eq!(source.lww_object_body(object_hash(&entry.value)).unwrap(), Some(bytes.clone()));
+    let (_target_directory, mut target) = store();
+    let incoming = published(&target, &bytes);
+    receive(&mut target, Change { key: unit_key(&key).unwrap(), stamp: stamp(1), value: incoming });
+    assert!(target.device_store().unwrap().read_plugin_device_transfer(key[1], key[2], key[3]).unwrap().is_none());
+    target.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
+    // Publication applies the retained unit when the device joins this section.
+    target.lww_read_outbox(target.lww_binding_authority().unwrap(), 1000).unwrap();
+    let Some(PluginDeviceRead::Binary { version, .. }) = target.device_store().unwrap().read_plugin_device_transfer(key[1], key[2], key[3]).unwrap() else { panic!("expected synchronized binary value"); };
+    assert_eq!(target.device_store().unwrap().read_plugin_device_bytes(key[1], key[2], key[3], &version, 0).unwrap(), bytes);
+    let (_, roots) = crate::persistent_store::snapshot::collect_device_plugin_asset_roots(&target).unwrap();
+    assert!(!roots.retain_all_objects);
+    assert!(roots.blockers.is_empty());
+}
+
 fn store() -> (tempfile::TempDir, PersistentStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = PersistentStore::open(dir.path()).unwrap();
