@@ -226,21 +226,23 @@ fn risum_stages_positional_assets_and_preserves_declared_extensions() {
             "name": "fixture",
             "assets": [
                 ["portrait", "", "PNG"],
-                ["voice", "", "ogg"]
+                ["voice", "", "ogg"],
+                ["undeclared", "", null]
             ],
             "unknown": {"kept": true}
         }
     });
-    let bytes = risum(&main, &[b"image-bytes", b"audio-bytes"], true);
+    let bytes = risum(&main, &[b"image-bytes", b"audio-bytes", b"other-bytes"], true);
 
     let parsed = parse_risum(&mut Cursor::new(bytes), &staging, &limits(), &|| false).unwrap();
 
     assert_eq!(parsed.metadata, main);
-    assert_eq!(parsed.assets.len(), 2);
+    assert_eq!(parsed.assets.len(), 3);
     assert_eq!(parsed.assets[0].position, 0);
     assert_eq!(parsed.assets[0].declared_extension, "PNG");
     assert_eq!(parsed.assets[1].position, 1);
     assert_eq!(parsed.assets[1].declared_extension, "ogg");
+    assert_eq!(parsed.assets[2].declared_extension, "");
     assert_eq!(
         read_staged(root.path(), &parsed.assets[0].payload.staged_name),
         b"image-bytes"

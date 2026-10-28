@@ -565,8 +565,24 @@ fn prepare_risum_content(
                 ));
             }
             tuple[1] = Value::String(String::new());
+            if tuple[2].is_null() {
+                tuple[2] = Value::String(String::new());
+            }
         }
     }
+    // An asset without a declared extension is stored under its image format,
+    // so it is still served as an image.
+    let extensions = parsed
+        .assets
+        .iter()
+        .map(|asset| {
+            if asset.declared_extension.is_empty() {
+                sniffed_image_extension(&owned_directory.join(&asset.payload.staged_name))
+            } else {
+                Ok(asset.declared_extension.clone())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut assets = Vec::with_capacity(parsed.assets.len());
     let mut manifest_entries = Vec::with_capacity(parsed.assets.len());
     report_content_progress(
@@ -583,9 +599,8 @@ fn prepare_risum_content(
         progress_items: 1,
     }).collect::<Vec<_>>();
     let promoted = prepare_content_payloads(cas, cas_session, &inputs, ImportPinning::DuringPreparation, job)?;
-    for (asset, prepared) in parsed.assets.into_iter().zip(promoted) {
+    for ((asset, prepared), extension) in parsed.assets.into_iter().zip(promoted).zip(extensions) {
         if job.is_cancel_requested() { return Err(content_cancelled()); }
-        let extension = asset.declared_extension;
         if prepared.content_hash != asset.payload.sha256
             || prepared.byte_size != asset.payload.byte_size
         {
@@ -1025,6 +1040,20 @@ pub(super) fn content_classification_limits() -> ImportLimits {
     limits.max_container_directory_bytes = charx_limits.max_directory_bytes;
     limits.charx_probe_metadata_bytes = charx_limits.max_metadata_bytes;
     limits
+}
+
+fn sniffed_image_extension(path: &Path) -> Result<String, NativeJobError> {
+    let mut head = Vec::with_capacity(16);
+    open_regular_file_no_follow(path)?
+        .file
+        .take(16)
+        .read_to_end(&mut head)
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    Ok(image::guess_format(&head)
+        .ok()
+        .and_then(|format| format.extensions_str().first())
+        .map(|extension| (*extension).to_owned())
+        .unwrap_or_default())
 }
 
 fn storage_suffix(extension: Option<&str>) -> String {
