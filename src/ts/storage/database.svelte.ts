@@ -1009,7 +1009,7 @@ export interface Database{
     personaNote:boolean
     assetWidth:number
     animationSpeed:number
-    botSettingAtStart:false
+    botSettingAtStart:boolean
     NAIsettings:NAISettings
     hideRealm:boolean
     blockedRealmCreators:BlockedRealmCreator[]

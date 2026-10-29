@@ -221,7 +221,7 @@
           "optional": false
         },
         "botSettingAtStart": {
-          "node": "n9",
+          "node": "n19",
           "optional": false
         },
         "bulkEnabling": {

@@ -5,6 +5,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { execFileSync } from "node:child_process";
 
 const require = createRequire(import.meta.url);
@@ -79,10 +80,28 @@ export function verifyReferenceRevision(target) {
   return rootPath;
 }
 
+// Reference declarations that the reference's own code contradicts, as
+// `Type.field` to the node the reference actually writes and reads.
+const referenceCorrections = {
+  // Its settings checkbox writes true, and bootstrap reads the field as truthy.
+  "Database.botSettingAtStart": { kind: "scalar", type: "boolean" },
+};
+
 export function generateContract(target) {
   const reference = references[target];
   const rootPath = verifyReferenceRevision(target);
   const { root, types, nodes, files } = sourceContract(rootPath);
+  for (const [name, node] of Object.entries(referenceCorrections)) {
+    const [type, field] = name.split(".");
+    const declared = nodes[types[type]]?.fields[field];
+    if (!declared) throw new Error(`${target} reference no longer declares ${name}`);
+    if (isDeepStrictEqual(nodes[declared.node], node))
+      throw new Error(`${target} reference already declares ${name} as corrected`);
+    declared.node =
+      Object.keys(nodes).find((id) => isDeepStrictEqual(nodes[id], node)) ??
+      `n${Object.keys(nodes).length}`;
+    nodes[declared.node] = node;
+  }
   for (const name of [
     "src/ts/storage/risuSave.ts",
     "src/ts/bootstrap.ts",

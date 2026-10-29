@@ -28,7 +28,10 @@ at the exact pinned revision, and `RISUAI_REFERENCE_DEPENDENCIES` and
 `POCKETRISU_REFERENCE_DEPENDENCIES` another library directory; `--prepare`
 writes to the selected directories, and `--target risuai` or `--target pocket`
 limits it to one target. The contract generator checks the revision and
-hashes the actual source bytes. Running either generator without `--check`
+hashes the actual source bytes. Its `referenceCorrections` replace the few
+reference declarations that the reference's own code contradicts, and it stops
+once a reference declares a corrected field itself, so the correction can be
+removed. Running either generator without `--check`
 updates its generated JSON; do this only as part of an explicit reference update
 with acceptance review. Source checks accept LF and CRLF checkouts; other source
 changes still fail.
