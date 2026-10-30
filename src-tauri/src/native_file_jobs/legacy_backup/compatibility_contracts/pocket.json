@@ -81,7 +81,7 @@
       "kind": "object",
       "fields": {
         "account": {
-          "node": "n1",
+          "node": "n876",
           "optional": true
         },
         "adaptiveThinkingEffort": {
@@ -105,7 +105,7 @@
           "optional": false
         },
         "allowAllExtentionFiles": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "allowV21Plugin": {
@@ -117,7 +117,7 @@
           "optional": false
         },
         "alwaysScrollToNewMessage": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "animationSpeed": {
@@ -133,7 +133,7 @@
           "optional": false
         },
         "apiKeyPool": {
-          "node": "n20",
+          "node": "n878",
           "optional": true
         },
         "apiType": {
@@ -169,7 +169,7 @@
           "optional": false
         },
         "autoScrollToNewMessage": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "autoSuggestClean": {
@@ -209,7 +209,7 @@
           "optional": false
         },
         "blockquoteStyling": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "botPresets": {
@@ -229,7 +229,7 @@
           "optional": false
         },
         "chainOfThought": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "characterOrder": {
@@ -245,15 +245,15 @@
           "optional": false
         },
         "chatLoadAdditionalPages": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "chatLoadInitialPages": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "checkCorruption": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "cipherChat": {
@@ -321,7 +321,7 @@
           "optional": false
         },
         "createFolderOnBranch": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "currentPluginProvider": {
@@ -365,7 +365,7 @@
           "optional": false
         },
         "customQuotesData": {
-          "node": "n603",
+          "node": "n880",
           "optional": true
         },
         "customSounds": {
@@ -393,11 +393,11 @@
           "optional": false
         },
         "defaultModelBinding": {
-          "node": "n232",
+          "node": "n881",
           "optional": true
         },
         "defaultToggleValues": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "descriptionPrefix": {
@@ -413,7 +413,7 @@
           "optional": false
         },
         "disableSeperateParameterChangeOnPresetChange": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "disableToggleBinding": {
@@ -437,19 +437,19 @@
           "optional": false
         },
         "dynamicModelRegistry": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "dynamicOutput": {
-          "node": "n59",
+          "node": "n883",
           "optional": true
         },
         "echoDelay": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "echoMessage": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "elevenLabKey": {
@@ -473,7 +473,7 @@
           "optional": false
         },
         "enableBookmark": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "enableCustomFlags": {
@@ -493,7 +493,7 @@
           "optional": false
         },
         "enableRemoteSaving": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "enableScrollToActiveChar": {
@@ -545,7 +545,7 @@
           "optional": false
         },
         "forceProxyAsOpenAI": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "forceReplaceUrl": {
@@ -569,7 +569,7 @@
           "optional": false
         },
         "geminiStream": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "generationSeed": {
@@ -609,11 +609,11 @@
           "optional": false
         },
         "groupOtherBotRole": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "groupTemplate": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "guiHTML": {
@@ -621,7 +621,7 @@
           "optional": false
         },
         "hamburgerButtonBottom": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "heightMode": {
@@ -629,7 +629,7 @@
           "optional": false
         },
         "hideAllImages": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "hideApiKey": {
@@ -637,11 +637,11 @@
           "optional": false
         },
         "hideLeftBarCollapseButton": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "hideMessagePageCount": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "hideRealm": {
@@ -657,11 +657,11 @@
           "optional": false
         },
         "htmlTranslation": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "hubServerType": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "huggingfaceKey": {
@@ -769,11 +769,11 @@
           "optional": false
         },
         "lastPatchNoteCheckVersion": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "legacyMediaFindings": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "legacyTranslation": {
@@ -801,11 +801,11 @@
           "optional": false
         },
         "localStopStrings": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "longPressToPopupEditor": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "loreBook": {
@@ -845,11 +845,11 @@
           "optional": false
         },
         "memoryLimitThickness": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "memoryPresetFolders": {
-          "node": "n646",
+          "node": "n885",
           "optional": true
         },
         "memoryPresetId": {
@@ -877,23 +877,23 @@
           "optional": false
         },
         "mistralKey": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "modelPresetFolders": {
-          "node": "n646",
+          "node": "n885",
           "optional": true
         },
         "modelPresetMigrationAppliedAt": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "modelPresetMigrationReport": {
-          "node": "n661",
+          "node": "n886",
           "optional": true
         },
         "modelPresetMigrationVersion": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "modelPresets": {
@@ -901,23 +901,23 @@
           "optional": false
         },
         "modelProfileRegistryBaseUrl": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "modelProfileRegistryCache": {
-          "node": "n751",
+          "node": "n887",
           "optional": true
         },
         "modelProfileRegistryLastFetched": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "modelProfileVisibilityLevel": {
-          "node": "n767",
+          "node": "n888",
           "optional": true
         },
         "modelRegistrySeen": {
-          "node": "n770",
+          "node": "n889",
           "optional": true
         },
         "modelTools": {
@@ -925,7 +925,7 @@
           "optional": false
         },
         "moduleFolders": {
-          "node": "n646",
+          "node": "n885",
           "optional": true
         },
         "moduleIntergration": {
@@ -933,11 +933,11 @@
           "optional": false
         },
         "moduleModelBindings": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "moduleModelBindingsEnabled": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "modules": {
@@ -945,11 +945,11 @@
           "optional": false
         },
         "moveInsteadOfCopyOnCMPConvert": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "NAIadventure": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "NAIApiKey": {
@@ -957,7 +957,7 @@
           "optional": false
         },
         "NAIappendName": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "NAII2I": {
@@ -1009,11 +1009,11 @@
           "optional": false
         },
         "newImageHandlingBeta": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "newMessageButtonStyle": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "newOAIHandle": {
@@ -1021,39 +1021,39 @@
           "optional": false
         },
         "nodeOnlyArchivedCharacters": {
-          "node": "n793",
+          "node": "n890",
           "optional": true
         },
         "nodeOnlyAutoCleanAssets": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "nodeOnlyHiddenCharacterIds": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "nodeOnlyHideArchivedCharacters": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "nodeOnlyHideRecentChats": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "nodeOnlyModelModeLock": {
-          "node": "n796",
+          "node": "n891",
           "optional": true
         },
         "nodeOnlyRestoreLastChat": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "nodeOnlyScrollButtonType": {
-          "node": "n799",
+          "node": "n892",
           "optional": true
         },
         "nodeOnlyServerSideRequests": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "nodeOnlyStandardChatWidth": {
@@ -1129,7 +1129,7 @@
           "optional": false
         },
         "personaFolders": {
-          "node": "n646",
+          "node": "n885",
           "optional": true
         },
         "personaNote": {
@@ -1157,11 +1157,11 @@
           "optional": false
         },
         "pluginDevelopMode": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "pluginFolders": {
-          "node": "n646",
+          "node": "n885",
           "optional": true
         },
         "plugins": {
@@ -1169,7 +1169,7 @@
           "optional": false
         },
         "pluginStorageMeta": {
-          "node": "n828",
+          "node": "n893",
           "optional": true
         },
         "pluginV2": {
@@ -1201,7 +1201,7 @@
           "optional": false
         },
         "promptPresetFolders": {
-          "node": "n646",
+          "node": "n885",
           "optional": true
         },
         "promptSettings": {
@@ -1209,7 +1209,7 @@
           "optional": false
         },
         "promptTemplate": {
-          "node": "n93",
+          "node": "n894",
           "optional": true
         },
         "promptTextInfoInsideChat": {
@@ -1245,7 +1245,7 @@
           "optional": false
         },
         "requestInfoInsideChat": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "requestLocation": {
@@ -1281,11 +1281,11 @@
           "optional": false
         },
         "saveSignatures": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "saveTime": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "sdCFG": {
@@ -1333,7 +1333,7 @@
           "optional": false
         },
         "seperateParametersByModel": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "seperateParametersEnabled": {
@@ -1361,7 +1361,7 @@
           "optional": false
         },
         "showInputActionBar": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "showMemoryLimit": {
@@ -1369,7 +1369,7 @@
           "optional": false
         },
         "showMenuChatList": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "showMenuHypaMemoryModal": {
@@ -1413,7 +1413,7 @@
           "optional": false
         },
         "sideMenuRerollButton": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "simplifiedToolUse": {
@@ -1441,7 +1441,7 @@
           "optional": false
         },
         "streamingDisplayOptimizationMode": {
-          "node": "n172",
+          "node": "n895",
           "optional": true
         },
         "strictJsonSchema": {
@@ -1485,7 +1485,7 @@
           "optional": false
         },
         "textBorder": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "textgenWebUIBlockingURL": {
@@ -1497,15 +1497,15 @@
           "optional": false
         },
         "textScreenBorder": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "textScreenColor": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "textScreenRounded": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "textTheme": {
@@ -1525,7 +1525,7 @@
           "optional": false
         },
         "thinkingTokens": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "thinkingType": {
@@ -1533,11 +1533,11 @@
           "optional": false
         },
         "toggleConfirmRecommendedPreset": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "togglePresets": {
-          "node": "n856",
+          "node": "n896",
           "optional": true
         },
         "top_a": {
@@ -1569,7 +1569,7 @@
           "optional": false
         },
         "translatorInputLanguage": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "translatorMaxResponse": {
@@ -1593,7 +1593,7 @@
           "optional": false
         },
         "ttsAutoSpeech": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "unformatQuotes": {
@@ -1621,7 +1621,7 @@
           "optional": false
         },
         "useCustomModelRegistry": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "useExperimental": {
@@ -1641,7 +1641,7 @@
           "optional": false
         },
         "useModelPresetByDefault": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "usePlainFetch": {
@@ -1729,7 +1729,9 @@
     },
     "n1": {
       "kind": "union",
-      "variants": ["n2"]
+      "variants": [
+        "n2"
+      ]
     },
     "n2": {
       "kind": "object",
@@ -1747,7 +1749,7 @@
           "optional": false
         },
         "useSync": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         }
       },
@@ -1757,15 +1759,15 @@
       "kind": "object",
       "fields": {
         "access_token": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "expires_in": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "refresh_token": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -1773,7 +1775,9 @@
     },
     "n4": {
       "kind": "union",
-      "variants": ["n5"]
+      "variants": [
+        "n5"
+      ]
     },
     "n5": {
       "kind": "scalar",
@@ -1781,7 +1785,9 @@
     },
     "n6": {
       "kind": "union",
-      "variants": ["n7"]
+      "variants": [
+        "n7"
+      ]
     },
     "n7": {
       "kind": "scalar",
@@ -1789,7 +1795,10 @@
     },
     "n8": {
       "kind": "union",
-      "variants": ["n9", "n10"]
+      "variants": [
+        "n9",
+        "n10"
+      ]
     },
     "n9": {
       "kind": "literal",
@@ -1801,7 +1810,12 @@
     },
     "n11": {
       "kind": "union",
-      "variants": ["n12", "n13", "n14", "n15"]
+      "variants": [
+        "n12",
+        "n13",
+        "n14",
+        "n15"
+      ]
     },
     "n12": {
       "kind": "literal",
@@ -1825,8 +1839,14 @@
     },
     "n17": {
       "kind": "tuple",
-      "items": ["n5", "n5"],
-      "optional": [false, false]
+      "items": [
+        "n5",
+        "n5"
+      ],
+      "optional": [
+        false,
+        false
+      ]
     },
     "n18": {
       "kind": "object",
@@ -1876,7 +1896,9 @@
     },
     "n20": {
       "kind": "union",
-      "variants": ["n21"]
+      "variants": [
+        "n21"
+      ]
     },
     "n21": {
       "kind": "object",
@@ -1903,7 +1925,7 @@
           "optional": false
         },
         "provider": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "updatedAt": {
@@ -1953,8 +1975,14 @@
     },
     "n27": {
       "kind": "tuple",
-      "items": ["n5", "n7"],
-      "optional": [false, false]
+      "items": [
+        "n5",
+        "n7"
+      ],
+      "optional": [
+        false,
+        false
+      ]
     },
     "n28": {
       "kind": "array",
@@ -1964,11 +1992,11 @@
       "kind": "object",
       "fields": {
         "adaptiveThinkingEffort": {
-          "node": "n30",
+          "node": "n897",
           "optional": true
         },
         "aiModel": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "ainconfig": {
@@ -1976,19 +2004,19 @@
           "optional": false
         },
         "apiType": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "autoSuggestClean": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "autoSuggestPrefix": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "autoSuggestPrompt": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "bias": {
@@ -1996,55 +2024,55 @@
           "optional": false
         },
         "currentPluginProvider": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "customAPIFormat": {
-          "node": "n31",
+          "node": "n898",
           "optional": true
         },
         "customFlags": {
-          "node": "n56",
+          "node": "n899",
           "optional": true
         },
         "customPromptTemplateToggle": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "customProxyRequestModel": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "dynamicOutput": {
-          "node": "n59",
+          "node": "n883",
           "optional": true
         },
         "enableCustomFlags": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "extractJson": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "fallbackModels": {
-          "node": "n61",
+          "node": "n900",
           "optional": true
         },
         "fallbackWhenBlankResponse": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "forceReplaceUrl": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "forceReplaceUrl2": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "formatingOrder": {
@@ -2060,23 +2088,23 @@
           "optional": false
         },
         "groupOtherBotRole": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "groupTemplate": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "id": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "image": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "instructChatTemplate": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "jailbreak": {
@@ -2084,31 +2112,31 @@
           "optional": false
         },
         "JinjaTemplate": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "jsonSchema": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "jsonSchemaEnabled": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "koboldURL": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "localNetworkMode": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "localNetworkTimeoutSec": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "localStopStrings": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "mainPrompt": {
@@ -2124,35 +2152,35 @@
           "optional": false
         },
         "min_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "modelBinding": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "modelTools": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "moduleIntergration": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "NAIadventure": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "NAIappendName": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "NAISettings": {
-          "node": "n85",
+          "node": "n902",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "ooba": {
@@ -2160,19 +2188,19 @@
           "optional": false
         },
         "openAIKey": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "openrouterProvider": {
-          "node": "n89",
+          "node": "n903",
           "optional": true
         },
         "openrouterRequestModel": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "outputImageModal": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "PresensePenalty": {
@@ -2184,75 +2212,75 @@
           "optional": false
         },
         "promptSettings": {
-          "node": "n91",
+          "node": "n904",
           "optional": true
         },
         "promptTemplate": {
-          "node": "n93",
+          "node": "n894",
           "optional": true
         },
         "proxyKey": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "proxyRequestModel": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "reasonEffort": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "regex": {
-          "node": "n124",
+          "node": "n905",
           "optional": true
         },
         "repetition_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "reverseProxyOobaArgs": {
-          "node": "n127",
+          "node": "n906",
           "optional": true
         },
         "seperateModels": {
-          "node": "n132",
+          "node": "n907",
           "optional": true
         },
         "seperateModelsForAxModels": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "seperateParameters": {
-          "node": "n134",
+          "node": "n908",
           "optional": true
         },
         "seperateParametersEnabled": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "strictJsonSchema": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "subModel": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "subModelBinding": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "systemContentReplacement": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "systemRoleReplacement": {
-          "node": "n142",
+          "node": "n909",
           "optional": true
         },
         "taskModelBindings": {
-          "node": "n143",
+          "node": "n910",
           "optional": true
         },
         "temperature": {
@@ -2260,43 +2288,43 @@
           "optional": false
         },
         "templateDefaultVariables": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "textgenWebUIBlockingURL": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "textgenWebUIStreamURL": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "thinkingTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "thinkingType": {
-          "node": "n137",
+          "node": "n911",
           "optional": true
         },
         "top_a": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "top_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "useInstructPrompt": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "verbosity": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -2304,7 +2332,12 @@
     },
     "n30": {
       "kind": "union",
-      "variants": ["n12", "n13", "n14", "n15"]
+      "variants": [
+        "n12",
+        "n13",
+        "n14",
+        "n15"
+      ]
     },
     "n31": {
       "kind": "union",
@@ -2433,7 +2466,9 @@
     },
     "n56": {
       "kind": "union",
-      "variants": ["n57"]
+      "variants": [
+        "n57"
+      ]
     },
     "n57": {
       "kind": "array",
@@ -2469,7 +2504,9 @@
     },
     "n59": {
       "kind": "union",
-      "variants": ["n60"]
+      "variants": [
+        "n60"
+      ]
     },
     "n60": {
       "kind": "object",
@@ -2507,7 +2544,9 @@
     },
     "n61": {
       "kind": "union",
-      "variants": ["n62"]
+      "variants": [
+        "n62"
+      ]
     },
     "n62": {
       "kind": "object",
@@ -2596,11 +2635,18 @@
     },
     "n75": {
       "kind": "union",
-      "variants": ["n25"]
+      "variants": [
+        "n25"
+      ]
     },
     "n76": {
       "kind": "union",
-      "variants": ["n77", "n79", "n81", "n83"]
+      "variants": [
+        "n77",
+        "n79",
+        "n81",
+        "n83"
+      ]
     },
     "n77": {
       "kind": "object",
@@ -2646,7 +2692,7 @@
           "optional": false
         },
         "legacySource": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "reason": {
@@ -2676,13 +2722,15 @@
     },
     "n85": {
       "kind": "union",
-      "variants": ["n86"]
+      "variants": [
+        "n86"
+      ]
     },
     "n86": {
       "kind": "object",
       "fields": {
         "cfg_scale": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "frequencyPenalty": {
@@ -2690,11 +2738,11 @@
           "optional": false
         },
         "mirostat_lr": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "mirostat_tau": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "presencePenalty": {
@@ -2882,7 +2930,9 @@
     },
     "n89": {
       "kind": "union",
-      "variants": ["n90"]
+      "variants": [
+        "n90"
+      ]
     },
     "n90": {
       "kind": "object",
@@ -2904,7 +2954,9 @@
     },
     "n91": {
       "kind": "union",
-      "variants": ["n92"]
+      "variants": [
+        "n92"
+      ]
     },
     "n92": {
       "kind": "object",
@@ -2914,11 +2966,11 @@
           "optional": false
         },
         "customChainOfThought": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "maxThoughtTagDepth": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "postEndInnerFormat": {
@@ -2934,7 +2986,7 @@
           "optional": false
         },
         "trimStartNewChat": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "utilOverride": {
@@ -2946,7 +2998,9 @@
     },
     "n93": {
       "kind": "union",
-      "variants": ["n94"]
+      "variants": [
+        "n94"
+      ]
     },
     "n94": {
       "kind": "array",
@@ -2954,13 +3008,20 @@
     },
     "n95": {
       "kind": "union",
-      "variants": ["n96", "n106", "n111", "n115", "n117", "n119"]
+      "variants": [
+        "n96",
+        "n106",
+        "n111",
+        "n115",
+        "n117",
+        "n119"
+      ]
     },
     "n96": {
       "kind": "object",
       "fields": {
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "role": {
@@ -2984,7 +3045,11 @@
     },
     "n97": {
       "kind": "union",
-      "variants": ["n98", "n99", "n100"]
+      "variants": [
+        "n98",
+        "n99",
+        "n100"
+      ]
     },
     "n98": {
       "kind": "literal",
@@ -3000,7 +3065,11 @@
     },
     "n101": {
       "kind": "union",
-      "variants": ["n66", "n102", "n103"]
+      "variants": [
+        "n66",
+        "n102",
+        "n103"
+      ]
     },
     "n102": {
       "kind": "literal",
@@ -3012,7 +3081,11 @@
     },
     "n104": {
       "kind": "union",
-      "variants": ["n65", "n69", "n105"]
+      "variants": [
+        "n65",
+        "n69",
+        "n105"
+      ]
     },
     "n105": {
       "kind": "literal",
@@ -3022,15 +3095,15 @@
       "kind": "object",
       "fields": {
         "innerFormat": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "role2": {
-          "node": "n107",
+          "node": "n912",
           "optional": true
         },
         "type": {
@@ -3042,11 +3115,21 @@
     },
     "n107": {
       "kind": "union",
-      "variants": ["n98", "n99", "n100"]
+      "variants": [
+        "n98",
+        "n99",
+        "n100"
+      ]
     },
     "n108": {
       "kind": "union",
-      "variants": ["n68", "n72", "n73", "n109", "n110"]
+      "variants": [
+        "n68",
+        "n72",
+        "n73",
+        "n109",
+        "n110"
+      ]
     },
     "n109": {
       "kind": "literal",
@@ -3060,11 +3143,11 @@
       "kind": "object",
       "fields": {
         "chatAsOriginalOnSystem": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "rangeEnd": {
@@ -3084,7 +3167,10 @@
     },
     "n112": {
       "kind": "union",
-      "variants": ["n7", "n113"]
+      "variants": [
+        "n7",
+        "n113"
+      ]
     },
     "n113": {
       "kind": "literal",
@@ -3098,19 +3184,19 @@
       "kind": "object",
       "fields": {
         "defaultText": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "innerFormat": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "role2": {
-          "node": "n107",
+          "node": "n912",
           "optional": true
         },
         "type": {
@@ -3128,7 +3214,7 @@
       "kind": "object",
       "fields": {
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "text": {
@@ -3170,7 +3256,12 @@
     },
     "n120": {
       "kind": "union",
-      "variants": ["n98", "n100", "n121", "n122"]
+      "variants": [
+        "n98",
+        "n100",
+        "n121",
+        "n122"
+      ]
     },
     "n121": {
       "kind": "literal",
@@ -3186,7 +3277,9 @@
     },
     "n124": {
       "kind": "union",
-      "variants": ["n125"]
+      "variants": [
+        "n125"
+      ]
     },
     "n125": {
       "kind": "array",
@@ -3196,7 +3289,7 @@
       "kind": "object",
       "fields": {
         "ableFlag": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "comment": {
@@ -3204,7 +3297,7 @@
           "optional": false
         },
         "flag": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "in": {
@@ -3224,97 +3317,99 @@
     },
     "n127": {
       "kind": "union",
-      "variants": ["n128"]
+      "variants": [
+        "n128"
+      ]
     },
     "n128": {
       "kind": "object",
       "fields": {
         "add_bos_token": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "auto_max_new_tokens": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "ban_eos_token": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "chat_instruct_command": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "context": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "context_instruct": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "custom_token_bans": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "do_sample": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "early_stopping": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "encoder_repetition_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "epsilon_cutoff": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "eta_cutoff": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "grammar_string": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "greeting": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "guidance_scale": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "length_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "max_tokens_second": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "min_length": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "min_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "mirostat_eta": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "mirostat_mode": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "mirostat_tau": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "mode": {
@@ -3322,91 +3417,91 @@
           "optional": false
         },
         "name1": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name1_instruct": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name2": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name2_instruct": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "negative_prompt": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "no_repeat_ngram_size": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "num_beams": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "penalty_alpha": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "preset": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "repetition_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "repetition_penalty_range": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "seed": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "skip_special_tokens": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "system_message": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "temperature_last": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "tfs": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "tokenizer": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "top_a": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "truncation_length": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "turn_template": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "typical_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -3414,7 +3509,11 @@
     },
     "n129": {
       "kind": "union",
-      "variants": ["n114", "n130", "n131"]
+      "variants": [
+        "n114",
+        "n130",
+        "n131"
+      ]
     },
     "n130": {
       "kind": "literal",
@@ -3426,7 +3525,9 @@
     },
     "n132": {
       "kind": "union",
-      "variants": ["n133"]
+      "variants": [
+        "n133"
+      ]
     },
     "n133": {
       "kind": "object",
@@ -3452,7 +3553,9 @@
     },
     "n134": {
       "kind": "union",
-      "variants": ["n135"]
+      "variants": [
+        "n135"
+      ]
     },
     "n135": {
       "kind": "object",
@@ -3484,59 +3587,59 @@
       "kind": "object",
       "fields": {
         "adaptive_thinking_effort": {
-          "node": "n30",
+          "node": "n897",
           "optional": true
         },
         "frequency_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "min_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "outputImageModal": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "presence_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "reasoning_effort": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "repetition_penalty": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "temperature": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "thinking_tokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "thinking_type": {
-          "node": "n137",
+          "node": "n911",
           "optional": true
         },
         "top_a": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "top_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "verbosity": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -3544,7 +3647,11 @@
     },
     "n137": {
       "kind": "union",
-      "variants": ["n138", "n139", "n140"]
+      "variants": [
+        "n138",
+        "n139",
+        "n140"
+      ]
     },
     "n138": {
       "kind": "literal",
@@ -3565,37 +3672,42 @@
     },
     "n142": {
       "kind": "union",
-      "variants": ["n98", "n121"]
+      "variants": [
+        "n98",
+        "n121"
+      ]
     },
     "n143": {
       "kind": "union",
-      "variants": ["n144"]
+      "variants": [
+        "n144"
+      ]
     },
     "n144": {
       "kind": "object",
       "fields": {
         "emotion": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "memory": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "model": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "otherAx": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "submodel": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         },
         "translate": {
-          "node": "n76",
+          "node": "n901",
           "optional": true
         }
       },
@@ -3607,7 +3719,10 @@
     },
     "n146": {
       "kind": "union",
-      "variants": ["n5", "n147"]
+      "variants": [
+        "n5",
+        "n147"
+      ]
     },
     "n147": {
       "kind": "object",
@@ -3625,11 +3740,11 @@
           "optional": false
         },
         "img": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "imgFile": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name": {
@@ -3637,11 +3752,11 @@
           "optional": false
         },
         "nodeOnlyDisplay": {
-          "node": "n148",
+          "node": "n913",
           "optional": true
         },
         "nodeOnlyIcon": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -3649,7 +3764,11 @@
     },
     "n148": {
       "kind": "union",
-      "variants": ["n149", "n150", "n151"]
+      "variants": [
+        "n149",
+        "n150",
+        "n151"
+      ]
     },
     "n149": {
       "kind": "literal",
@@ -3671,15 +3790,15 @@
       "kind": "object",
       "fields": {
         "additionalAssetManifest": {
-          "node": "n154",
+          "node": "n914",
           "optional": true
         },
         "additionalAssets": {
-          "node": "n160",
+          "node": "n915",
           "optional": true
         },
         "additionalData": {
-          "node": "n163",
+          "node": "n916",
           "optional": true
         },
         "additionalText": {
@@ -3691,11 +3810,11 @@
           "optional": false
         },
         "backgroundCSS": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "backgroundHTML": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "bias": {
@@ -3703,7 +3822,7 @@
           "optional": false
         },
         "ccAssets": {
-          "node": "n165",
+          "node": "n917",
           "optional": true
         },
         "chaId": {
@@ -3727,15 +3846,15 @@
           "optional": false
         },
         "coldstorage": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "coldStoragedChats": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "creation_date": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "creator": {
@@ -3747,7 +3866,7 @@
           "optional": false
         },
         "customModuleToggle": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "customscript": {
@@ -3755,11 +3874,11 @@
           "optional": false
         },
         "defaultVariables": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "depth_prompt": {
-          "node": "n240",
+          "node": "n918",
           "optional": true
         },
         "desc": {
@@ -3767,7 +3886,7 @@
           "optional": false
         },
         "doNotChangeSeperateModels": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "emotionImages": {
@@ -3775,7 +3894,7 @@
           "optional": false
         },
         "escapeOutput": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "exampleMessage": {
@@ -3783,7 +3902,7 @@
           "optional": false
         },
         "extentions": {
-          "node": "n242",
+          "node": "n919",
           "optional": true
         },
         "firstMessage": {
@@ -3795,7 +3914,7 @@
           "optional": false
         },
         "fishSpeechConfig": {
-          "node": "n245",
+          "node": "n920",
           "optional": true
         },
         "globalLore": {
@@ -3803,43 +3922,43 @@
           "optional": false
         },
         "gptSoVitsConfig": {
-          "node": "n249",
+          "node": "n921",
           "optional": true
         },
         "group_only_greetings": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "hfTTS": {
-          "node": "n274",
+          "node": "n922",
           "optional": true
         },
         "hideChatIcon": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "image": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "imported": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "inlayViewScreen": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "largePortrait": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "lastInteraction": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "license": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "loreExt": {
@@ -3847,31 +3966,31 @@
           "optional": true
         },
         "loreSettings": {
-          "node": "n276",
+          "node": "n923",
           "optional": true
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "memoryPresetId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "modification_date": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "moduleNamespace": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "modules": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "naittsConfig": {
-          "node": "n278",
+          "node": "n924",
           "optional": true
         },
         "name": {
@@ -3879,11 +3998,11 @@
           "optional": false
         },
         "newGenData": {
-          "node": "n280",
+          "node": "n925",
           "optional": true
         },
         "nickname": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "notes": {
@@ -3891,11 +4010,11 @@
           "optional": false
         },
         "oaiTTSConfig": {
-          "node": "n282",
+          "node": "n926",
           "optional": true
         },
         "oaiVoice": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "personality": {
@@ -3903,35 +4022,35 @@
           "optional": false
         },
         "postHistoryInstructions": {
-          "node": "n5",
+          "node": "n251",
           "optional": false
         },
         "prebuiltAssetCommand": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "prebuiltAssetExclude": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "prebuiltAssetStyle": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "private": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "realmId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "reloadKeys": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "removedQuotes": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "replaceGlobalNote": {
@@ -3943,7 +4062,7 @@
           "optional": false
         },
         "scriptstate": {
-          "node": "n291",
+          "node": "n927",
           "optional": true
         },
         "sdData": {
@@ -3951,11 +4070,11 @@
           "optional": false
         },
         "source": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "supaMemory": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "systemPrompt": {
@@ -3967,11 +4086,11 @@
           "optional": false
         },
         "translatorNote": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "trashTime": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "triggerscript": {
@@ -3979,19 +4098,19 @@
           "optional": false
         },
         "ttsMode": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "ttsReadOnlyQuoted": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "ttsSpeech": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "type": {
-          "node": "n585",
+          "node": "n928",
           "optional": true
         },
         "utilityBot": {
@@ -4003,15 +4122,15 @@
           "optional": false
         },
         "virtualscript": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "vits": {
-          "node": "n589",
+          "node": "n929",
           "optional": true
         },
         "voicevoxConfig": {
-          "node": "n592",
+          "node": "n930",
           "optional": true
         }
       },
@@ -4019,7 +4138,9 @@
     },
     "n154": {
       "kind": "union",
-      "variants": ["n155"]
+      "variants": [
+        "n155"
+      ]
     },
     "n155": {
       "kind": "object",
@@ -4033,11 +4154,11 @@
           "optional": false
         },
         "ownerId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "ownerKind": {
-          "node": "n156",
+          "node": "n931",
           "optional": true
         },
         "sha256": {
@@ -4053,7 +4174,11 @@
     },
     "n156": {
       "kind": "union",
-      "variants": ["n157", "n158", "n159"]
+      "variants": [
+        "n157",
+        "n158",
+        "n159"
+      ]
     },
     "n157": {
       "kind": "literal",
@@ -4069,7 +4194,9 @@
     },
     "n160": {
       "kind": "union",
-      "variants": ["n161"]
+      "variants": [
+        "n161"
+      ]
     },
     "n161": {
       "kind": "array",
@@ -4077,26 +4204,36 @@
     },
     "n162": {
       "kind": "tuple",
-      "items": ["n5", "n5", "n5"],
-      "optional": [false, false, false]
+      "items": [
+        "n5",
+        "n5",
+        "n5"
+      ],
+      "optional": [
+        false,
+        false,
+        false
+      ]
     },
     "n163": {
       "kind": "union",
-      "variants": ["n164"]
+      "variants": [
+        "n164"
+      ]
     },
     "n164": {
       "kind": "object",
       "fields": {
         "character_version": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "creator": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "tag": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         }
       },
@@ -4104,7 +4241,9 @@
     },
     "n165": {
       "kind": "union",
-      "variants": ["n166"]
+      "variants": [
+        "n166"
+      ]
     },
     "n166": {
       "kind": "array",
@@ -4140,7 +4279,7 @@
       "kind": "object",
       "fields": {
         "color": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "folded": {
@@ -4152,7 +4291,7 @@
           "optional": false
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -4166,55 +4305,55 @@
       "kind": "object",
       "fields": {
         "_placeholder": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "activeStreamingDisplayOptimizationMode": {
-          "node": "n172",
+          "node": "n895",
           "optional": true
         },
         "bindedBotPreset": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "bindedPersona": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "bookmarkNames": {
-          "node": "n175",
+          "node": "n932",
           "optional": true
         },
         "bookmarks": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "firstMessageDisabled": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "fmIndex": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "hypaV3Data": {
-          "node": "n177",
+          "node": "n933",
           "optional": true
         },
         "id": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "isStreaming": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "lastDate": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "localLore": {
@@ -4222,7 +4361,7 @@
           "optional": false
         },
         "memoryPresetId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "message": {
@@ -4230,11 +4369,11 @@
           "optional": false
         },
         "modelBinding": {
-          "node": "n232",
+          "node": "n881",
           "optional": true
         },
         "modules": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "name": {
@@ -4246,31 +4385,31 @@
           "optional": false
         },
         "savedToggleValues": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "scriptstate": {
-          "node": "n237",
+          "node": "n934",
           "optional": true
         },
         "sdData": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "suggestMessages": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "supaMemory": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "useModelPreset": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "usePromptPresetParams": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         }
       },
@@ -4278,7 +4417,11 @@
     },
     "n172": {
       "kind": "union",
-      "variants": ["n138", "n173", "n174"]
+      "variants": [
+        "n138",
+        "n173",
+        "n174"
+      ]
     },
     "n173": {
       "kind": "literal",
@@ -4290,7 +4433,9 @@
     },
     "n175": {
       "kind": "union",
-      "variants": ["n176"]
+      "variants": [
+        "n176"
+      ]
     },
     "n176": {
       "kind": "object",
@@ -4299,25 +4444,27 @@
     },
     "n177": {
       "kind": "union",
-      "variants": ["n178"]
+      "variants": [
+        "n178"
+      ]
     },
     "n178": {
       "kind": "object",
       "fields": {
         "categories": {
-          "node": "n179",
+          "node": "n935",
           "optional": true
         },
         "lastSelectedSummaries": {
-          "node": "n182",
+          "node": "n936",
           "optional": true
         },
         "metrics": {
-          "node": "n184",
+          "node": "n937",
           "optional": true
         },
         "modalSettings": {
-          "node": "n186",
+          "node": "n938",
           "optional": true
         },
         "summaries": {
@@ -4329,7 +4476,9 @@
     },
     "n179": {
       "kind": "union",
-      "variants": ["n180"]
+      "variants": [
+        "n180"
+      ]
     },
     "n180": {
       "kind": "array",
@@ -4351,7 +4500,9 @@
     },
     "n182": {
       "kind": "union",
-      "variants": ["n183"]
+      "variants": [
+        "n183"
+      ]
     },
     "n183": {
       "kind": "array",
@@ -4359,7 +4510,9 @@
     },
     "n184": {
       "kind": "union",
-      "variants": ["n185"]
+      "variants": [
+        "n185"
+      ]
     },
     "n185": {
       "kind": "object",
@@ -4385,7 +4538,9 @@
     },
     "n186": {
       "kind": "union",
-      "variants": ["n187"]
+      "variants": [
+        "n187"
+      ]
     },
     "n187": {
       "kind": "object",
@@ -4419,7 +4574,11 @@
     },
     "n188": {
       "kind": "union",
-      "variants": ["n189", "n190", "n191"]
+      "variants": [
+        "n189",
+        "n190",
+        "n191"
+      ]
     },
     "n189": {
       "kind": "literal",
@@ -4441,7 +4600,7 @@
       "kind": "object",
       "fields": {
         "categoryId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "chatMemos": {
@@ -4453,7 +4612,7 @@
           "optional": false
         },
         "tags": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "text": {
@@ -4471,7 +4630,7 @@
       "kind": "object",
       "fields": {
         "activationPercent": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "alwaysActive": {
@@ -4479,7 +4638,7 @@
           "optional": false
         },
         "bookVersion": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "comment": {
@@ -4491,15 +4650,15 @@
           "optional": false
         },
         "extentions": {
-          "node": "n196",
+          "node": "n939",
           "optional": true
         },
         "folder": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "id": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "insertorder": {
@@ -4511,7 +4670,7 @@
           "optional": false
         },
         "loreCache": {
-          "node": "n198",
+          "node": "n940",
           "optional": true
         },
         "mode": {
@@ -4527,7 +4686,7 @@
           "optional": false
         },
         "useRegex": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         }
       },
@@ -4535,7 +4694,9 @@
     },
     "n196": {
       "kind": "union",
-      "variants": ["n197"]
+      "variants": [
+        "n197"
+      ]
     },
     "n197": {
       "kind": "object",
@@ -4549,7 +4710,9 @@
     },
     "n198": {
       "kind": "union",
-      "variants": ["n199"]
+      "variants": [
+        "n199"
+      ]
     },
     "n199": {
       "kind": "object",
@@ -4567,7 +4730,13 @@
     },
     "n200": {
       "kind": "union",
-      "variants": ["n105", "n201", "n202", "n203", "n204"]
+      "variants": [
+        "n105",
+        "n201",
+        "n202",
+        "n203",
+        "n204"
+      ]
     },
     "n201": {
       "kind": "literal",
@@ -4593,7 +4762,7 @@
       "kind": "object",
       "fields": {
         "chatId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "data": {
@@ -4601,27 +4770,27 @@
           "optional": false
         },
         "disabled": {
-          "node": "n207",
+          "node": "n941",
           "optional": true
         },
         "generationInfo": {
-          "node": "n209",
+          "node": "n942",
           "optional": true
         },
         "isComment": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "otherUser": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "promptInfo": {
-          "node": "n213",
+          "node": "n943",
           "optional": true
         },
         "role": {
@@ -4629,19 +4798,19 @@
           "optional": false
         },
         "saying": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "swipeId": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "swipes": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "time": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -4649,7 +4818,11 @@
     },
     "n207": {
       "kind": "union",
-      "variants": ["n9", "n10", "n208"]
+      "variants": [
+        "n9",
+        "n10",
+        "n208"
+      ]
     },
     "n208": {
       "kind": "literal",
@@ -4657,37 +4830,39 @@
     },
     "n209": {
       "kind": "union",
-      "variants": ["n210"]
+      "variants": [
+        "n210"
+      ]
     },
     "n210": {
       "kind": "object",
       "fields": {
         "generationId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "inputTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "maxContext": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "model": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "modelId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "outputTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "stageTiming": {
-          "node": "n211",
+          "node": "n944",
           "optional": true
         }
       },
@@ -4695,25 +4870,27 @@
     },
     "n211": {
       "kind": "union",
-      "variants": ["n212"]
+      "variants": [
+        "n212"
+      ]
     },
     "n212": {
       "kind": "object",
       "fields": {
         "stage1": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "stage2": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "stage3": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "stage4": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -4721,21 +4898,23 @@
     },
     "n213": {
       "kind": "union",
-      "variants": ["n214"]
+      "variants": [
+        "n214"
+      ]
     },
     "n214": {
       "kind": "object",
       "fields": {
         "promptName": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "promptText": {
-          "node": "n215",
+          "node": "n945",
           "optional": true
         },
         "promptToggles": {
-          "node": "n227",
+          "node": "n946",
           "optional": true
         }
       },
@@ -4743,7 +4922,9 @@
     },
     "n215": {
       "kind": "union",
-      "variants": ["n216"]
+      "variants": [
+        "n216"
+      ]
     },
     "n216": {
       "kind": "array",
@@ -4753,11 +4934,11 @@
       "kind": "object",
       "fields": {
         "attr": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "cachePoint": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "content": {
@@ -4765,19 +4946,19 @@
           "optional": false
         },
         "memo": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "multimodals": {
-          "node": "n218",
+          "node": "n947",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "removable": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "role": {
@@ -4785,7 +4966,7 @@
           "optional": false
         },
         "thoughts": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         }
       },
@@ -4793,7 +4974,9 @@
     },
     "n218": {
       "kind": "union",
-      "variants": ["n219"]
+      "variants": [
+        "n219"
+      ]
     },
     "n219": {
       "kind": "array",
@@ -4807,7 +4990,7 @@
           "optional": false
         },
         "height": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "type": {
@@ -4815,7 +4998,7 @@
           "optional": false
         },
         "width": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -4823,7 +5006,12 @@
     },
     "n221": {
       "kind": "union",
-      "variants": ["n150", "n222", "n223", "n224"]
+      "variants": [
+        "n150",
+        "n222",
+        "n223",
+        "n224"
+      ]
     },
     "n222": {
       "kind": "literal",
@@ -4839,7 +5027,12 @@
     },
     "n225": {
       "kind": "union",
-      "variants": ["n226", "n98", "n100", "n121"]
+      "variants": [
+        "n226",
+        "n98",
+        "n100",
+        "n121"
+      ]
     },
     "n226": {
       "kind": "literal",
@@ -4847,7 +5040,9 @@
     },
     "n227": {
       "kind": "union",
-      "variants": ["n228"]
+      "variants": [
+        "n228"
+      ]
     },
     "n228": {
       "kind": "array",
@@ -4869,7 +5064,10 @@
     },
     "n230": {
       "kind": "union",
-      "variants": ["n98", "n231"]
+      "variants": [
+        "n98",
+        "n231"
+      ]
     },
     "n231": {
       "kind": "literal",
@@ -4877,7 +5075,9 @@
     },
     "n232": {
       "kind": "union",
-      "variants": ["n233"]
+      "variants": [
+        "n233"
+      ]
     },
     "n233": {
       "kind": "object",
@@ -4887,7 +5087,7 @@
           "optional": false
         },
         "main": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "separateAux": {
@@ -4895,7 +5095,7 @@
           "optional": false
         },
         "sub": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -4905,19 +5105,19 @@
       "kind": "object",
       "fields": {
         "emotion": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "memory": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "otherAx": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "translate": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -4925,7 +5125,9 @@
     },
     "n235": {
       "kind": "union",
-      "variants": ["n236"]
+      "variants": [
+        "n236"
+      ]
     },
     "n236": {
       "kind": "object",
@@ -4934,7 +5136,9 @@
     },
     "n237": {
       "kind": "union",
-      "variants": ["n238"]
+      "variants": [
+        "n238"
+      ]
     },
     "n238": {
       "kind": "object",
@@ -4943,11 +5147,18 @@
     },
     "n239": {
       "kind": "union",
-      "variants": ["n5", "n7", "n9", "n10"]
+      "variants": [
+        "n5",
+        "n7",
+        "n9",
+        "n10"
+      ]
     },
     "n240": {
       "kind": "union",
-      "variants": ["n241"]
+      "variants": [
+        "n241"
+      ]
     },
     "n241": {
       "kind": "object",
@@ -4965,7 +5176,9 @@
     },
     "n242": {
       "kind": "union",
-      "variants": ["n243"]
+      "variants": [
+        "n243"
+      ]
     },
     "n243": {
       "kind": "object",
@@ -4978,7 +5191,9 @@
     },
     "n245": {
       "kind": "union",
-      "variants": ["n246"]
+      "variants": [
+        "n246"
+      ]
     },
     "n246": {
       "kind": "object",
@@ -4988,7 +5203,7 @@
           "optional": false
         },
         "model": {
-          "node": "n247",
+          "node": "n948",
           "optional": true
         },
         "normalize": {
@@ -5000,7 +5215,9 @@
     },
     "n247": {
       "kind": "union",
-      "variants": ["n248"]
+      "variants": [
+        "n248"
+      ]
     },
     "n248": {
       "kind": "object",
@@ -5022,7 +5239,9 @@
     },
     "n249": {
       "kind": "union",
-      "variants": ["n250"]
+      "variants": [
+        "n250"
+      ]
     },
     "n250": {
       "kind": "object",
@@ -5032,63 +5251,63 @@
           "optional": true
         },
         "prompt_lang": {
-          "node": "n253",
+          "node": "n949",
           "optional": true
         },
         "ref_audio_data": {
-          "node": "n265",
+          "node": "n950",
           "optional": true
         },
         "ref_audio_path": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "speed": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "temperature": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "text": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "text_lang": {
-          "node": "n253",
+          "node": "n949",
           "optional": true
         },
         "text_split_method": {
-          "node": "n267",
+          "node": "n951",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "top_p": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "url": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "use_auto_path": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "use_long_audio": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "use_prompt": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "volume": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -5096,7 +5315,10 @@
     },
     "n251": {
       "kind": "union",
-      "variants": ["n252", "n5"]
+      "variants": [
+        "n252",
+        "n5"
+      ]
     },
     "n252": {
       "kind": "scalar",
@@ -5164,7 +5386,9 @@
     },
     "n265": {
       "kind": "union",
-      "variants": ["n266"]
+      "variants": [
+        "n266"
+      ]
     },
     "n266": {
       "kind": "object",
@@ -5182,7 +5406,14 @@
     },
     "n267": {
       "kind": "union",
-      "variants": ["n268", "n269", "n270", "n271", "n272", "n273"]
+      "variants": [
+        "n268",
+        "n269",
+        "n270",
+        "n271",
+        "n272",
+        "n273"
+      ]
     },
     "n268": {
       "kind": "literal",
@@ -5210,7 +5441,9 @@
     },
     "n274": {
       "kind": "union",
-      "variants": ["n275"]
+      "variants": [
+        "n275"
+      ]
     },
     "n275": {
       "kind": "object",
@@ -5228,13 +5461,15 @@
     },
     "n276": {
       "kind": "union",
-      "variants": ["n277"]
+      "variants": [
+        "n277"
+      ]
     },
     "n277": {
       "kind": "object",
       "fields": {
         "fullWordMatching": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "recursiveScanning": {
@@ -5254,21 +5489,23 @@
     },
     "n278": {
       "kind": "union",
-      "variants": ["n279"]
+      "variants": [
+        "n279"
+      ]
     },
     "n279": {
       "kind": "object",
       "fields": {
         "customvoice": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "version": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "voice": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -5276,7 +5513,9 @@
     },
     "n280": {
       "kind": "union",
-      "variants": ["n281"]
+      "variants": [
+        "n281"
+      ]
     },
     "n281": {
       "kind": "object",
@@ -5302,33 +5541,35 @@
     },
     "n282": {
       "kind": "union",
-      "variants": ["n283"]
+      "variants": [
+        "n283"
+      ]
     },
     "n283": {
       "kind": "object",
       "fields": {
         "apiKey": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "baseURL": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "enabled": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "format": {
-          "node": "n284",
+          "node": "n952",
           "optional": true
         },
         "model": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "voice": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -5336,7 +5577,14 @@
     },
     "n284": {
       "kind": "union",
-      "variants": ["n285", "n286", "n287", "n288", "n289", "n290"]
+      "variants": [
+        "n285",
+        "n286",
+        "n287",
+        "n288",
+        "n289",
+        "n290"
+      ]
     },
     "n285": {
       "kind": "literal",
@@ -5364,7 +5612,9 @@
     },
     "n291": {
       "kind": "union",
-      "variants": ["n292"]
+      "variants": [
+        "n292"
+      ]
     },
     "n292": {
       "kind": "object",
@@ -5391,11 +5641,11 @@
           "optional": false
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "moduleId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "type": {
@@ -5411,7 +5661,11 @@
     },
     "n296": {
       "kind": "union",
-      "variants": ["n297", "n310", "n316"]
+      "variants": [
+        "n297",
+        "n310",
+        "n316"
+      ]
     },
     "n297": {
       "kind": "object",
@@ -5482,7 +5736,10 @@
     },
     "n307": {
       "kind": "union",
-      "variants": ["n308", "n309"]
+      "variants": [
+        "n308",
+        "n309"
+      ]
     },
     "n308": {
       "kind": "literal",
@@ -5520,7 +5777,11 @@
     },
     "n312": {
       "kind": "union",
-      "variants": ["n313", "n314", "n315"]
+      "variants": [
+        "n313",
+        "n314",
+        "n315"
+      ]
     },
     "n313": {
       "kind": "literal",
@@ -5898,7 +6159,13 @@
     },
     "n337": {
       "kind": "union",
-      "variants": ["n299", "n338", "n339", "n340", "n341"]
+      "variants": [
+        "n299",
+        "n338",
+        "n339",
+        "n340",
+        "n341"
+      ]
     },
     "n338": {
       "kind": "literal",
@@ -5940,7 +6207,11 @@
     },
     "n344": {
       "kind": "union",
-      "variants": ["n345", "n346", "n347"]
+      "variants": [
+        "n345",
+        "n346",
+        "n347"
+      ]
     },
     "n345": {
       "kind": "literal",
@@ -6068,7 +6339,10 @@
     },
     "n360": {
       "kind": "union",
-      "variants": ["n361", "n362"]
+      "variants": [
+        "n361",
+        "n362"
+      ]
     },
     "n361": {
       "kind": "literal",
@@ -6082,7 +6356,7 @@
       "kind": "object",
       "fields": {
         "code": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "indent": {
@@ -6132,7 +6406,14 @@
     },
     "n366": {
       "kind": "union",
-      "variants": ["n299", "n300", "n301", "n302", "n303", "n304"]
+      "variants": [
+        "n299",
+        "n300",
+        "n301",
+        "n302",
+        "n303",
+        "n304"
+      ]
     },
     "n367": {
       "kind": "literal",
@@ -6160,7 +6441,7 @@
       "kind": "object",
       "fields": {
         "endOfLoop": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "indent": {
@@ -6210,7 +6491,14 @@
     },
     "n373": {
       "kind": "union",
-      "variants": ["n299", "n338", "n339", "n340", "n341", "n374"]
+      "variants": [
+        "n299",
+        "n338",
+        "n339",
+        "n340",
+        "n341",
+        "n374"
+      ]
     },
     "n374": {
       "kind": "literal",
@@ -6586,7 +6874,7 @@
           "optional": false
         },
         "streaming": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "type": {
@@ -6606,7 +6894,10 @@
     },
     "n403": {
       "kind": "union",
-      "variants": ["n404", "n405"]
+      "variants": [
+        "n404",
+        "n405"
+      ]
     },
     "n404": {
       "kind": "literal",
@@ -7224,7 +7515,11 @@
     },
     "n444": {
       "kind": "union",
-      "variants": ["n308", "n309", "n315"]
+      "variants": [
+        "n308",
+        "n309",
+        "n315"
+      ]
     },
     "n445": {
       "kind": "literal",
@@ -9187,7 +9482,14 @@
     },
     "n579": {
       "kind": "union",
-      "variants": ["n345", "n580", "n581", "n582", "n583", "n584"]
+      "variants": [
+        "n345",
+        "n580",
+        "n581",
+        "n582",
+        "n583",
+        "n584"
+      ]
     },
     "n580": {
       "kind": "literal",
@@ -9211,11 +9513,17 @@
     },
     "n585": {
       "kind": "union",
-      "variants": ["n158"]
+      "variants": [
+        "n158"
+      ]
     },
     "n586": {
       "kind": "union",
-      "variants": ["n84", "n587", "n588"]
+      "variants": [
+        "n84",
+        "n587",
+        "n588"
+      ]
     },
     "n587": {
       "kind": "literal",
@@ -9227,7 +9535,9 @@
     },
     "n589": {
       "kind": "union",
-      "variants": ["n590"]
+      "variants": [
+        "n590"
+      ]
     },
     "n590": {
       "kind": "object",
@@ -9241,7 +9551,7 @@
           "optional": false
         },
         "name": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -9254,29 +9564,31 @@
     },
     "n592": {
       "kind": "union",
-      "variants": ["n593"]
+      "variants": [
+        "n593"
+      ]
     },
     "n593": {
       "kind": "object",
       "fields": {
         "INTONATION_SCALE": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "PITCH_SCALE": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "speaker": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "SPEED_SCALE": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "VOLUME_SCALE": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -9334,7 +9646,10 @@
     },
     "n595": {
       "kind": "union",
-      "variants": ["n596", "n597"]
+      "variants": [
+        "n596",
+        "n597"
+      ]
     },
     "n596": {
       "kind": "literal",
@@ -9470,12 +9785,24 @@
     },
     "n603": {
       "kind": "union",
-      "variants": ["n604"]
+      "variants": [
+        "n604"
+      ]
     },
     "n604": {
       "kind": "tuple",
-      "items": ["n5", "n5", "n5", "n5"],
-      "optional": [false, false, false, false]
+      "items": [
+        "n5",
+        "n5",
+        "n5",
+        "n5"
+      ],
+      "optional": [
+        false,
+        false,
+        false,
+        false
+      ]
     },
     "n605": {
       "kind": "array",
@@ -9559,7 +9886,10 @@
     },
     "n610": {
       "kind": "union",
-      "variants": ["n405", "n611"]
+      "variants": [
+        "n405",
+        "n611"
+      ]
     },
     "n611": {
       "kind": "literal",
@@ -9640,11 +9970,11 @@
           "optional": false
         },
         "alt": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "ctrl": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "key": {
@@ -9652,7 +9982,7 @@
           "optional": false
         },
         "shift": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         }
       },
@@ -9877,7 +10207,11 @@
     },
     "n641": {
       "kind": "union",
-      "variants": ["n138", "n642", "n643"]
+      "variants": [
+        "n138",
+        "n642",
+        "n643"
+      ]
     },
     "n642": {
       "kind": "literal",
@@ -9907,7 +10241,9 @@
     },
     "n646": {
       "kind": "union",
-      "variants": ["n647"]
+      "variants": [
+        "n647"
+      ]
     },
     "n647": {
       "kind": "array",
@@ -9939,11 +10275,11 @@
           "optional": false
         },
         "canon": {
-          "node": "n658",
+          "node": "n953",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "id": {
@@ -9985,7 +10321,10 @@
     },
     "n653": {
       "kind": "union",
-      "variants": ["n654", "n655"]
+      "variants": [
+        "n654",
+        "n655"
+      ]
     },
     "n654": {
       "kind": "literal",
@@ -10006,7 +10345,9 @@
     },
     "n658": {
       "kind": "union",
-      "variants": ["n659"]
+      "variants": [
+        "n659"
+      ]
     },
     "n659": {
       "kind": "object",
@@ -10032,7 +10373,9 @@
     },
     "n661": {
       "kind": "union",
-      "variants": ["n662"]
+      "variants": [
+        "n662"
+      ]
     },
     "n662": {
       "kind": "object",
@@ -10068,15 +10411,15 @@
       "kind": "object",
       "fields": {
         "additionalParamsText": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "alternateRole": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "apiKeyRef": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "createdAt": {
@@ -10084,27 +10427,27 @@
           "optional": false
         },
         "customBody": {
-          "node": "n665",
+          "node": "n954",
           "optional": true
         },
         "customHeaders": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "decoupledStreaming": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "fallbackModelPresetIds": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "foldSystemPrompt": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "id": {
@@ -10112,11 +10455,11 @@
           "optional": false
         },
         "ignoreContextWindowCap": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "imageInput": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "inlineCredential": {
@@ -10124,15 +10467,15 @@
           "optional": true
         },
         "keepFirstSystemPrompt": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "maxContext": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "migrationSource": {
-          "node": "n666",
+          "node": "n955",
           "optional": true
         },
         "name": {
@@ -10140,19 +10483,19 @@
           "optional": false
         },
         "notes": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "order": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "orphanValues": {
-          "node": "n665",
+          "node": "n954",
           "optional": true
         },
         "pinned": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "profileSnapshot": {
@@ -10160,23 +10503,23 @@
           "optional": false
         },
         "promptCaching": {
-          "node": "n747",
+          "node": "n956",
           "optional": true
         },
         "sourceProfile": {
-          "node": "n749",
+          "node": "n957",
           "optional": true
         },
         "startWithUserInput": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "tokenizerOverride": {
-          "node": "n695",
+          "node": "n958",
           "optional": true
         },
         "toolUse": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "updatedAt": {
@@ -10188,7 +10531,7 @@
           "optional": false
         },
         "useStreaming": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         }
       },
@@ -10196,11 +10539,15 @@
     },
     "n665": {
       "kind": "union",
-      "variants": ["n656"]
+      "variants": [
+        "n656"
+      ]
     },
     "n666": {
       "kind": "union",
-      "variants": ["n667"]
+      "variants": [
+        "n667"
+      ]
     },
     "n667": {
       "kind": "object",
@@ -10232,11 +10579,11 @@
           "optional": false
         },
         "bodyTemplate": {
-          "node": "n665",
+          "node": "n954",
           "optional": true
         },
         "capabilities": {
-          "node": "n680",
+          "node": "n959",
           "optional": true
         },
         "defaults": {
@@ -10248,11 +10595,11 @@
           "optional": false
         },
         "headerTemplate": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "limits": {
-          "node": "n693",
+          "node": "n960",
           "optional": true
         },
         "modelId": {
@@ -10276,7 +10623,7 @@
           "optional": false
         },
         "recommendedTokenizer": {
-          "node": "n695",
+          "node": "n958",
           "optional": true
         },
         "schema": {
@@ -10292,7 +10639,11 @@
     },
     "n669": {
       "kind": "union",
-      "variants": ["n670", "n671", "n672"]
+      "variants": [
+        "n670",
+        "n671",
+        "n672"
+      ]
     },
     "n670": {
       "kind": "literal",
@@ -10310,7 +10661,7 @@
       "kind": "object",
       "fields": {
         "fields": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "kind": {
@@ -10322,7 +10673,14 @@
     },
     "n674": {
       "kind": "union",
-      "variants": ["n84", "n675", "n676", "n677", "n678", "n679"]
+      "variants": [
+        "n84",
+        "n675",
+        "n676",
+        "n677",
+        "n678",
+        "n679"
+      ]
     },
     "n675": {
       "kind": "literal",
@@ -10346,7 +10704,9 @@
     },
     "n680": {
       "kind": "union",
-      "variants": ["n681"]
+      "variants": [
+        "n681"
+      ]
     },
     "n681": {
       "kind": "array",
@@ -10354,7 +10714,14 @@
     },
     "n682": {
       "kind": "union",
-      "variants": ["n123", "n683", "n684", "n685", "n686", "n687"]
+      "variants": [
+        "n123",
+        "n683",
+        "n684",
+        "n685",
+        "n686",
+        "n687"
+      ]
     },
     "n683": {
       "kind": "literal",
@@ -10384,7 +10751,7 @@
           "optional": false
         },
         "url": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -10392,7 +10759,11 @@
     },
     "n689": {
       "kind": "union",
-      "variants": ["n690", "n691", "n692"]
+      "variants": [
+        "n690",
+        "n691",
+        "n692"
+      ]
     },
     "n690": {
       "kind": "literal",
@@ -10408,33 +10779,35 @@
     },
     "n693": {
       "kind": "union",
-      "variants": ["n694"]
+      "variants": [
+        "n694"
+      ]
     },
     "n694": {
       "kind": "object",
       "fields": {
         "contextWindowTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "known": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "maxOutputTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "notes": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "notesI18n": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "sourceUrls": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         }
       },
@@ -10507,15 +10880,15 @@
           "optional": true
         },
         "description": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "descriptionI18n": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "enum": {
-          "node": "n708",
+          "node": "n961",
           "optional": true
         },
         "key": {
@@ -10527,27 +10900,27 @@
           "optional": false
         },
         "mapsTo": {
-          "node": "n711",
+          "node": "n962",
           "optional": true
         },
         "max": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "min": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "required": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "secret": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "step": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "type": {
@@ -10559,7 +10932,9 @@
     },
     "n708": {
       "kind": "union",
-      "variants": ["n709"]
+      "variants": [
+        "n709"
+      ]
     },
     "n709": {
       "kind": "array",
@@ -10581,7 +10956,9 @@
     },
     "n711": {
       "kind": "union",
-      "variants": ["n712"]
+      "variants": [
+        "n712"
+      ]
     },
     "n712": {
       "kind": "object",
@@ -10599,7 +10976,13 @@
     },
     "n713": {
       "kind": "union",
-      "variants": ["n620", "n678", "n714", "n715", "n716"]
+      "variants": [
+        "n620",
+        "n678",
+        "n714",
+        "n715",
+        "n716"
+      ]
     },
     "n714": {
       "kind": "literal",
@@ -10615,7 +10998,15 @@
     },
     "n717": {
       "kind": "union",
-      "variants": ["n718", "n719", "n720", "n686", "n721", "n722", "n723"]
+      "variants": [
+        "n718",
+        "n719",
+        "n720",
+        "n686",
+        "n721",
+        "n722",
+        "n723"
+      ]
     },
     "n718": {
       "kind": "literal",
@@ -10663,11 +11054,11 @@
       "kind": "object",
       "fields": {
         "group": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "help": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "key": {
@@ -10675,15 +11066,15 @@
           "optional": false
         },
         "order": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "placeholder": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "showIf": {
-          "node": "n727",
+          "node": "n963",
           "optional": true
         },
         "visibility": {
@@ -10699,7 +11090,9 @@
     },
     "n727": {
       "kind": "union",
-      "variants": ["n728"]
+      "variants": [
+        "n728"
+      ]
     },
     "n728": {
       "kind": "object",
@@ -10721,7 +11114,11 @@
     },
     "n729": {
       "kind": "union",
-      "variants": ["n730", "n731", "n732"]
+      "variants": [
+        "n730",
+        "n731",
+        "n732"
+      ]
     },
     "n730": {
       "kind": "literal",
@@ -10812,11 +11209,11 @@
           "optional": false
         },
         "labelI18n": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "order": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -10824,7 +11221,9 @@
     },
     "n747": {
       "kind": "union",
-      "variants": ["n748"]
+      "variants": [
+        "n748"
+      ]
     },
     "n748": {
       "kind": "object",
@@ -10834,19 +11233,19 @@
           "optional": false
         },
         "extendTtlOnHit": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "growthTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "minPromptTokens": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "ttlSec": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -10854,7 +11253,9 @@
     },
     "n749": {
       "kind": "union",
-      "variants": ["n750"]
+      "variants": [
+        "n750"
+      ]
     },
     "n750": {
       "kind": "object",
@@ -10868,7 +11269,7 @@
           "optional": false
         },
         "profileUpdatedAt": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "profileVersion": {
@@ -10876,7 +11277,7 @@
           "optional": false
         },
         "providerBaseVersion": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "registryId": {
@@ -10888,7 +11289,9 @@
     },
     "n751": {
       "kind": "union",
-      "variants": ["n752"]
+      "variants": [
+        "n752"
+      ]
     },
     "n752": {
       "kind": "object",
@@ -10913,15 +11316,15 @@
       "kind": "object",
       "fields": {
         "baseProviderHashes": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "baseProviders": {
-          "node": "n755",
+          "node": "n964",
           "optional": true
         },
         "contentHash": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "fetchedAt": {
@@ -10929,19 +11332,19 @@
           "optional": false
         },
         "indexVersion": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "profileHashes": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "profiles": {
-          "node": "n760",
+          "node": "n965",
           "optional": true
         },
         "source": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -10949,7 +11352,9 @@
     },
     "n755": {
       "kind": "union",
-      "variants": ["n756"]
+      "variants": [
+        "n756"
+      ]
     },
     "n756": {
       "kind": "object",
@@ -10968,15 +11373,15 @@
           "optional": false
         },
         "capabilities": {
-          "node": "n680",
+          "node": "n959",
           "optional": true
         },
         "defaultBody": {
-          "node": "n665",
+          "node": "n954",
           "optional": true
         },
         "defaultHeaders": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "displayName": {
@@ -10992,7 +11397,7 @@
           "optional": false
         },
         "limits": {
-          "node": "n693",
+          "node": "n960",
           "optional": true
         },
         "requestSchema": {
@@ -11024,7 +11429,9 @@
     },
     "n760": {
       "kind": "union",
-      "variants": ["n761"]
+      "variants": [
+        "n761"
+      ]
     },
     "n761": {
       "kind": "object",
@@ -11039,11 +11446,11 @@
           "optional": false
         },
         "bodyTemplate": {
-          "node": "n665",
+          "node": "n954",
           "optional": true
         },
         "capabilities": {
-          "node": "n680",
+          "node": "n959",
           "optional": true
         },
         "defaults": {
@@ -11051,11 +11458,11 @@
           "optional": false
         },
         "description": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "descriptionI18n": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "displayName": {
@@ -11063,7 +11470,7 @@
           "optional": false
         },
         "displayNameI18n": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "endpoint": {
@@ -11071,7 +11478,7 @@
           "optional": false
         },
         "headerTemplate": {
-          "node": "n235",
+          "node": "n882",
           "optional": true
         },
         "id": {
@@ -11079,7 +11486,7 @@
           "optional": false
         },
         "limits": {
-          "node": "n693",
+          "node": "n960",
           "optional": true
         },
         "modelId": {
@@ -11095,7 +11502,7 @@
           "optional": false
         },
         "recommendedTokenizer": {
-          "node": "n695",
+          "node": "n958",
           "optional": true
         },
         "schema": {
@@ -11103,7 +11510,7 @@
           "optional": false
         },
         "sortOrder": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "sourceUrls": {
@@ -11111,15 +11518,15 @@
           "optional": false
         },
         "statusReason": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "statusSourceUrls": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "tags": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "uiSchema": {
@@ -11127,7 +11534,7 @@
           "optional": false
         },
         "updatedAt": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "version": {
@@ -11139,7 +11546,11 @@
     },
     "n763": {
       "kind": "union",
-      "variants": ["n764", "n765", "n766"]
+      "variants": [
+        "n764",
+        "n765",
+        "n766"
+      ]
     },
     "n764": {
       "kind": "literal",
@@ -11155,7 +11566,11 @@
     },
     "n767": {
       "kind": "union",
-      "variants": ["n122", "n768", "n769"]
+      "variants": [
+        "n122",
+        "n768",
+        "n769"
+      ]
     },
     "n768": {
       "kind": "literal",
@@ -11167,7 +11582,9 @@
     },
     "n770": {
       "kind": "union",
-      "variants": ["n771"]
+      "variants": [
+        "n771"
+      ]
     },
     "n771": {
       "kind": "object",
@@ -11182,23 +11599,23 @@
       "kind": "object",
       "fields": {
         "assetManifest": {
-          "node": "n154",
+          "node": "n914",
           "optional": true
         },
         "assets": {
-          "node": "n160",
+          "node": "n915",
           "optional": true
         },
         "backgroundEmbedding": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "cjs": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "customModuleToggle": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "description": {
@@ -11206,15 +11623,15 @@
           "optional": false
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "hideIcon": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "icon": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "id": {
@@ -11222,15 +11639,15 @@
           "optional": false
         },
         "lorebook": {
-          "node": "n774",
+          "node": "n966",
           "optional": true
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "mcp": {
-          "node": "n775",
+          "node": "n967",
           "optional": true
         },
         "name": {
@@ -11238,15 +11655,15 @@
           "optional": false
         },
         "namespace": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "regex": {
-          "node": "n124",
+          "node": "n905",
           "optional": true
         },
         "trigger": {
-          "node": "n777",
+          "node": "n968",
           "optional": true
         }
       },
@@ -11254,11 +11671,15 @@
     },
     "n774": {
       "kind": "union",
-      "variants": ["n194"]
+      "variants": [
+        "n194"
+      ]
     },
     "n775": {
       "kind": "union",
-      "variants": ["n776"]
+      "variants": [
+        "n776"
+      ]
     },
     "n776": {
       "kind": "object",
@@ -11272,7 +11693,9 @@
     },
     "n777": {
       "kind": "union",
-      "variants": ["n293"]
+      "variants": [
+        "n293"
+      ]
     },
     "n778": {
       "kind": "object",
@@ -11326,7 +11749,7 @@
           "optional": false
         },
         "reference_image_multiple": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "reference_mode": {
@@ -11334,7 +11757,7 @@
           "optional": false
         },
         "reference_strength_multiple": {
-          "node": "n182",
+          "node": "n936",
           "optional": true
         },
         "sampler": {
@@ -11382,11 +11805,11 @@
           "optional": false
         },
         "vibe_data": {
-          "node": "n786",
+          "node": "n969",
           "optional": true
         },
         "vibe_model_selection": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "width": {
@@ -11480,7 +11903,9 @@
     },
     "n786": {
       "kind": "union",
-      "variants": ["n787"]
+      "variants": [
+        "n787"
+      ]
     },
     "n787": {
       "kind": "object",
@@ -11582,7 +12007,9 @@
     },
     "n793": {
       "kind": "union",
-      "variants": ["n794"]
+      "variants": [
+        "n794"
+      ]
     },
     "n794": {
       "kind": "array",
@@ -11612,7 +12039,7 @@
           "optional": false
         },
         "creation_date": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "image": {
@@ -11628,7 +12055,7 @@
           "optional": false
         },
         "nickname": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "tags": {
@@ -11636,7 +12063,7 @@
           "optional": false
         },
         "trashedAt": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         }
       },
@@ -11644,7 +12071,11 @@
     },
     "n796": {
       "kind": "union",
-      "variants": ["n84", "n797", "n798"]
+      "variants": [
+        "n84",
+        "n797",
+        "n798"
+      ]
     },
     "n797": {
       "kind": "literal",
@@ -11656,7 +12087,11 @@
     },
     "n799": {
       "kind": "union",
-      "variants": ["n138", "n800", "n801"]
+      "variants": [
+        "n138",
+        "n800",
+        "n801"
+      ]
     },
     "n800": {
       "kind": "literal",
@@ -11668,7 +12103,11 @@
     },
     "n802": {
       "kind": "union",
-      "variants": ["n803", "n804", "n805"]
+      "variants": [
+        "n803",
+        "n804",
+        "n805"
+      ]
     },
     "n803": {
       "kind": "literal",
@@ -11753,11 +12192,11 @@
       "kind": "object",
       "fields": {
         "embeddedModule": {
-          "node": "n812",
+          "node": "n970",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "icon": {
@@ -11765,11 +12204,11 @@
           "optional": false
         },
         "id": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "largePortrait": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "name": {
@@ -11777,7 +12216,7 @@
           "optional": false
         },
         "note": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "personaPrompt": {
@@ -11789,7 +12228,9 @@
     },
     "n812": {
       "kind": "union",
-      "variants": ["n773"]
+      "variants": [
+        "n773"
+      ]
     },
     "n813": {
       "kind": "object",
@@ -11804,7 +12245,7 @@
       "kind": "object",
       "fields": {
         "allowedIPC": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "argMeta": {
@@ -11820,15 +12261,15 @@
           "optional": false
         },
         "displayName": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "enabled": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "name": {
@@ -11836,7 +12277,7 @@
           "optional": false
         },
         "nodeOnlyFullStorageAccess": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "realArg": {
@@ -11848,15 +12289,15 @@
           "optional": false
         },
         "updateURL": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "version": {
-          "node": "n825",
+          "node": "n971",
           "optional": true
         },
         "versionOfPlugin": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         }
       },
@@ -11879,7 +12320,11 @@
     },
     "n819": {
       "kind": "union",
-      "variants": ["n718", "n25", "n820"]
+      "variants": [
+        "n718",
+        "n25",
+        "n820"
+      ]
     },
     "n820": {
       "kind": "literal",
@@ -11893,7 +12338,7 @@
       "kind": "object",
       "fields": {
         "hoverText": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "link": {
@@ -11910,11 +12355,19 @@
     },
     "n824": {
       "kind": "union",
-      "variants": ["n5", "n7"]
+      "variants": [
+        "n5",
+        "n7"
+      ]
     },
     "n825": {
       "kind": "union",
-      "variants": ["n33", "n34", "n826", "n827"]
+      "variants": [
+        "n33",
+        "n34",
+        "n826",
+        "n827"
+      ]
     },
     "n826": {
       "kind": "literal",
@@ -11926,7 +12379,9 @@
     },
     "n828": {
       "kind": "union",
-      "variants": ["n829"]
+      "variants": [
+        "n829"
+      ]
     },
     "n829": {
       "kind": "object",
@@ -11979,7 +12434,10 @@
     },
     "n832": {
       "kind": "union",
-      "variants": ["n833", "n834"]
+      "variants": [
+        "n833",
+        "n834"
+      ]
     },
     "n833": {
       "kind": "literal",
@@ -11991,7 +12449,10 @@
     },
     "n835": {
       "kind": "union",
-      "variants": ["n836", "n837"]
+      "variants": [
+        "n836",
+        "n837"
+      ]
     },
     "n836": {
       "kind": "literal",
@@ -12003,7 +12464,10 @@
     },
     "n838": {
       "kind": "union",
-      "variants": ["n839", "n840"]
+      "variants": [
+        "n839",
+        "n840"
+      ]
     },
     "n839": {
       "kind": "literal",
@@ -12053,7 +12517,12 @@
     },
     "n842": {
       "kind": "union",
-      "variants": ["n843", "n844", "n845", "n846"]
+      "variants": [
+        "n843",
+        "n844",
+        "n845",
+        "n846"
+      ]
     },
     "n843": {
       "kind": "literal",
@@ -12135,7 +12604,10 @@
     },
     "n850": {
       "kind": "union",
-      "variants": ["n98", "n121"]
+      "variants": [
+        "n98",
+        "n121"
+      ]
     },
     "n851": {
       "kind": "array",
@@ -12157,7 +12629,7 @@
           "optional": false
         },
         "blockquoteStyling": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "colorScheme": {
@@ -12185,7 +12657,7 @@
           "optional": false
         },
         "customQuotesData": {
-          "node": "n603",
+          "node": "n880",
           "optional": true
         },
         "customTextTheme": {
@@ -12201,7 +12673,7 @@
           "optional": false
         },
         "hideAllImages": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "hideApiKey": {
@@ -12209,7 +12681,7 @@
           "optional": false
         },
         "hideMessagePageCount": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "hideRealm": {
@@ -12225,7 +12697,7 @@
           "optional": false
         },
         "memoryLimitThickness": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "menuSideBar": {
@@ -12237,7 +12709,7 @@
           "optional": false
         },
         "nodeOnlyStandardChatWidth": {
-          "node": "n854",
+          "node": "n972",
           "optional": true
         },
         "roundIcons": {
@@ -12281,19 +12753,19 @@
           "optional": false
         },
         "textBorder": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "textScreenBorder": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "textScreenColor": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "textScreenRounded": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         },
         "textTheme": {
@@ -12371,15 +12843,25 @@
     },
     "n854": {
       "kind": "union",
-      "variants": ["n803", "n804", "n805"]
+      "variants": [
+        "n803",
+        "n804",
+        "n805"
+      ]
     },
     "n855": {
       "kind": "union",
-      "variants": ["n138", "n139", "n140"]
+      "variants": [
+        "n138",
+        "n139",
+        "n140"
+      ]
     },
     "n856": {
       "kind": "union",
-      "variants": ["n857"]
+      "variants": [
+        "n857"
+      ]
     },
     "n857": {
       "kind": "array",
@@ -12393,7 +12875,7 @@
           "optional": false
         },
         "promptPresetName": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "values": {
@@ -12427,7 +12909,14 @@
     },
     "n861": {
       "kind": "union",
-      "variants": ["n84", "n862", "n863", "n864", "n865", "n866"]
+      "variants": [
+        "n84",
+        "n862",
+        "n863",
+        "n864",
+        "n865",
+        "n866"
+      ]
     },
     "n862": {
       "kind": "literal",
@@ -12499,13 +12988,17 @@
     },
     "n870": {
       "kind": "union",
-      "variants": ["n138", "n173", "n174"]
+      "variants": [
+        "n138",
+        "n173",
+        "n174"
+      ]
     },
     "n871": {
       "kind": "object",
       "fields": {
         "snapshot": {
-          "node": "n8",
+          "node": "n877",
           "optional": true
         }
       },
@@ -12513,15 +13006,26 @@
     },
     "n872": {
       "kind": "union",
-      "variants": ["n150", "n222", "n223"]
+      "variants": [
+        "n150",
+        "n222",
+        "n223"
+      ]
     },
     "n873": {
       "kind": "union",
-      "variants": ["n149", "n150", "n151"]
+      "variants": [
+        "n149",
+        "n150",
+        "n151"
+      ]
     },
     "n874": {
       "kind": "union",
-      "variants": ["n171", "n875"]
+      "variants": [
+        "n171",
+        "n875"
+      ]
     },
     "n875": {
       "kind": "object",
@@ -12531,7 +13035,7 @@
           "optional": false
         },
         "folderId": {
-          "node": "n4",
+          "node": "n251",
           "optional": true
         },
         "id": {
@@ -12539,11 +13043,11 @@
           "optional": false
         },
         "lastDate": {
-          "node": "n6",
+          "node": "n879",
           "optional": true
         },
         "modules": {
-          "node": "n75",
+          "node": "n884",
           "optional": true
         },
         "name": {
@@ -12552,6 +13056,768 @@
         }
       },
       "additional": null
+    },
+    "n876": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n2"
+      ]
+    },
+    "n877": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n9",
+        "n10"
+      ]
+    },
+    "n878": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n21"
+      ]
+    },
+    "n879": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n7"
+      ]
+    },
+    "n880": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n604"
+      ]
+    },
+    "n881": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n233"
+      ]
+    },
+    "n882": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n236"
+      ]
+    },
+    "n883": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n60"
+      ]
+    },
+    "n884": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n25"
+      ]
+    },
+    "n885": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n647"
+      ]
+    },
+    "n886": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n662"
+      ]
+    },
+    "n887": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n752"
+      ]
+    },
+    "n888": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n122",
+        "n768",
+        "n769"
+      ]
+    },
+    "n889": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n771"
+      ]
+    },
+    "n890": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n794"
+      ]
+    },
+    "n891": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n84",
+        "n797",
+        "n798"
+      ]
+    },
+    "n892": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n138",
+        "n800",
+        "n801"
+      ]
+    },
+    "n893": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n829"
+      ]
+    },
+    "n894": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n94"
+      ]
+    },
+    "n895": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n138",
+        "n173",
+        "n174"
+      ]
+    },
+    "n896": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n857"
+      ]
+    },
+    "n897": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n12",
+        "n13",
+        "n14",
+        "n15"
+      ]
+    },
+    "n898": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n32",
+        "n33",
+        "n34",
+        "n35",
+        "n36",
+        "n37",
+        "n38",
+        "n39",
+        "n40",
+        "n41",
+        "n42",
+        "n43",
+        "n44",
+        "n45",
+        "n46",
+        "n47",
+        "n48",
+        "n49",
+        "n50",
+        "n51",
+        "n52",
+        "n53",
+        "n54",
+        "n55"
+      ]
+    },
+    "n899": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n57"
+      ]
+    },
+    "n900": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n62"
+      ]
+    },
+    "n901": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n77",
+        "n79",
+        "n81",
+        "n83"
+      ]
+    },
+    "n902": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n86"
+      ]
+    },
+    "n903": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n90"
+      ]
+    },
+    "n904": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n92"
+      ]
+    },
+    "n905": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n125"
+      ]
+    },
+    "n906": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n128"
+      ]
+    },
+    "n907": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n133"
+      ]
+    },
+    "n908": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n135"
+      ]
+    },
+    "n909": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n98",
+        "n121"
+      ]
+    },
+    "n910": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n144"
+      ]
+    },
+    "n911": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n138",
+        "n139",
+        "n140"
+      ]
+    },
+    "n912": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n98",
+        "n99",
+        "n100"
+      ]
+    },
+    "n913": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n149",
+        "n150",
+        "n151"
+      ]
+    },
+    "n914": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n155"
+      ]
+    },
+    "n915": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n161"
+      ]
+    },
+    "n916": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n164"
+      ]
+    },
+    "n917": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n166"
+      ]
+    },
+    "n918": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n241"
+      ]
+    },
+    "n919": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n243"
+      ]
+    },
+    "n920": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n246"
+      ]
+    },
+    "n921": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n250"
+      ]
+    },
+    "n922": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n275"
+      ]
+    },
+    "n923": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n277"
+      ]
+    },
+    "n924": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n279"
+      ]
+    },
+    "n925": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n281"
+      ]
+    },
+    "n926": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n283"
+      ]
+    },
+    "n927": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n292"
+      ]
+    },
+    "n928": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n158"
+      ]
+    },
+    "n929": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n590"
+      ]
+    },
+    "n930": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n593"
+      ]
+    },
+    "n931": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n157",
+        "n158",
+        "n159"
+      ]
+    },
+    "n932": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n176"
+      ]
+    },
+    "n933": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n178"
+      ]
+    },
+    "n934": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n238"
+      ]
+    },
+    "n935": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n180"
+      ]
+    },
+    "n936": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n183"
+      ]
+    },
+    "n937": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n185"
+      ]
+    },
+    "n938": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n187"
+      ]
+    },
+    "n939": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n197"
+      ]
+    },
+    "n940": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n199"
+      ]
+    },
+    "n941": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n9",
+        "n10",
+        "n208"
+      ]
+    },
+    "n942": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n210"
+      ]
+    },
+    "n943": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n214"
+      ]
+    },
+    "n944": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n212"
+      ]
+    },
+    "n945": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n216"
+      ]
+    },
+    "n946": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n228"
+      ]
+    },
+    "n947": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n219"
+      ]
+    },
+    "n948": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n248"
+      ]
+    },
+    "n949": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n254",
+        "n255",
+        "n256",
+        "n257",
+        "n258",
+        "n259",
+        "n260",
+        "n261",
+        "n262",
+        "n263",
+        "n264"
+      ]
+    },
+    "n950": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n266"
+      ]
+    },
+    "n951": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n268",
+        "n269",
+        "n270",
+        "n271",
+        "n272",
+        "n273"
+      ]
+    },
+    "n952": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n285",
+        "n286",
+        "n287",
+        "n288",
+        "n289",
+        "n290"
+      ]
+    },
+    "n953": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n659"
+      ]
+    },
+    "n954": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n656"
+      ]
+    },
+    "n955": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n667"
+      ]
+    },
+    "n956": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n748"
+      ]
+    },
+    "n957": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n750"
+      ]
+    },
+    "n958": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n696",
+        "n697",
+        "n698",
+        "n699",
+        "n700",
+        "n701",
+        "n702",
+        "n703",
+        "n704",
+        "n705"
+      ]
+    },
+    "n959": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n681"
+      ]
+    },
+    "n960": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n694"
+      ]
+    },
+    "n961": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n709"
+      ]
+    },
+    "n962": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n712"
+      ]
+    },
+    "n963": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n728"
+      ]
+    },
+    "n964": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n756"
+      ]
+    },
+    "n965": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n761"
+      ]
+    },
+    "n966": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n194"
+      ]
+    },
+    "n967": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n776"
+      ]
+    },
+    "n968": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n293"
+      ]
+    },
+    "n969": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n787"
+      ]
+    },
+    "n970": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n773"
+      ]
+    },
+    "n971": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n33",
+        "n34",
+        "n826",
+        "n827"
+      ]
+    },
+    "n972": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n803",
+        "n804",
+        "n805"
+      ]
     }
   }
 }

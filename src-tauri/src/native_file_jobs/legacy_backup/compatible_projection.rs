@@ -834,6 +834,25 @@ mod tests {
     }
 
     #[test]
+    fn compatible_projection_keeps_null_where_the_references_store_it() {
+        // Both references store these nulls; thinkingTokens and
+        // postHistoryInstructions are required fields.
+        let records = [
+            ("DataBase", json!({"thinkingTokens": null, "textScreenColor": null, "textScreenBorder": null, "promptTemplate": null})),
+            ("character", json!({"postHistoryInstructions": null})),
+            ("Chat", json!({"folderId": null})),
+            ("Message", json!({"role": "user", "data": "synthetic", "name": null})),
+        ];
+        for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
+            let mut projector = Projector::new(target).unwrap();
+            for (name, value) in &records {
+                assert_eq!(projector.project(name, value).map_err(|error| error.message), Ok(value.clone()));
+            }
+            assert!(projector.losses.0.is_empty());
+        }
+    }
+
+    #[test]
     fn compatible_projection_drops_parameter_overrides_that_are_not_parameter_sets() {
         // Upstream's Separate Parameters section also renders the per-model map,
         // so its inputs write single parameter values straight into it.

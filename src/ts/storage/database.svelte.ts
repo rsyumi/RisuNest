@@ -1218,7 +1218,7 @@ export interface Database{
     checkCorruption?: boolean
     toggleConfirmRecommendedPreset?: boolean
     useExperimentalGoogleTranslator:boolean
-    thinkingTokens: number
+    thinkingTokens: number|null
     thinkingType: 'off' | 'budget' | 'adaptive'
     deepseekThinkingType: 'off' | 'enabled'
     adaptiveThinkingEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -1448,7 +1448,7 @@ export interface character{
     removedQuotes?:boolean
     creatorNotes:string
     systemPrompt:string
-    postHistoryInstructions:string
+    postHistoryInstructions:string|null
     alternateGreetings:string[]
     tags:string[]
     creator:string

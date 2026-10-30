@@ -292,6 +292,54 @@ for (const target of ["risuai", "pocket"]) {
       );
 
       await t.test(
+        "nulls the references store survive the actual reference loader",
+        async () => {
+          const fixture = {
+            characters: [
+              {
+                chaId: "synthetic-null-fields",
+                type: "character",
+                name: "Synthetic",
+                postHistoryInstructions: null,
+                globalLore: [{ key: "합성", content: "합성 설명", activationPercent: null }],
+                chats: [
+                  {
+                    id: "synthetic-null-chat",
+                    name: "",
+                    folderId: null,
+                    message: [{ role: "user", data: "합성 입력", chatId: "m1", name: null }],
+                  },
+                ],
+              },
+            ],
+            characterOrder: [
+              { id: "synthetic-folder", name: "Folder", color: "", data: ["synthetic-null-fields"], imgFile: null },
+            ],
+            botPresets: [{ name: "Synthetic preset", koboldURL: null, thinkingTokens: null, promptTemplate: null }],
+            textScreenColor: null,
+            textScreenBorder: null,
+            localStopStrings: null,
+            promptTemplate: null,
+            thinkingTokens: null,
+            formatversion: 5,
+          };
+          const nulls = (db) => {
+            const [character] = db.characters;
+            const [preset] = db.botPresets;
+            return [
+              db.textScreenColor, db.textScreenBorder, db.localStopStrings, db.promptTemplate, db.thinkingTokens,
+              db.characterOrder[0].imgFile, preset.koboldURL, preset.thinkingTokens, preset.promptTemplate,
+              character.postHistoryInstructions, character.globalLore[0].activationPercent,
+              character.chats[0].folderId, character.chats[0].message[0].name,
+            ];
+          };
+          assert.equal(accepts(contract, contract.root, fixture), true);
+          const { resaved } = await harness.roundTrip(compressedWire(fixture));
+          assert.deepEqual(plain(nulls(resaved)), nulls(fixture));
+        },
+      );
+
+      await t.test(
         "explicit dictionary/freeform values survive schema checks",
         () => {
           const value = {

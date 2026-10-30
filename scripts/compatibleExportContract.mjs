@@ -81,26 +81,51 @@ export function verifyReferenceRevision(target) {
 }
 
 // Reference declarations that the reference's own code contradicts, as
-// `Type.field` to the node the reference actually writes and reads.
+// `Type.field` to the node the reference actually writes and reads, or
+// "nullable" for a required field it also stores null in.
 const referenceCorrections = {
   // Its settings checkbox writes true, and bootstrap reads the field as truthy.
   "Database.botSettingAtStart": { kind: "scalar", type: "boolean" },
+  // Applying a preset without thinking tokens stores null.
+  "Database.thinkingTokens": "nullable",
+  // The character format update moves the instructions to the chat note and stores null.
+  "character.postHistoryInstructions": "nullable",
 };
 
 export function generateContract(target) {
   const reference = references[target];
   const rootPath = verifyReferenceRevision(target);
   const { root, types, nodes, files } = sourceContract(rootPath);
-  for (const [name, node] of Object.entries(referenceCorrections)) {
+  const intern = (node) => {
+    const id =
+      Object.keys(nodes).find((id) => isDeepStrictEqual(nodes[id], node)) ??
+      `n${Object.keys(nodes).length}`;
+    nodes[id] = node;
+    return id;
+  };
+  const nullable = (id) =>
+    nodes[id].kind === "never" || acceptsContract({ nodes }, id, null)
+      ? id
+      : intern({
+          kind: "union",
+          variants: [
+            intern({ kind: "scalar", type: "null" }),
+            ...(nodes[id].kind === "union" ? nodes[id].variants : [id]),
+          ],
+        });
+  // The references compile without strictNullChecks and their loaders treat
+  // null like a missing value, so they store null in optional fields too.
+  for (const node of Object.values(nodes))
+    for (const field of node.kind === "object" ? Object.values(node.fields) : [])
+      if (field.optional) field.node = nullable(field.node);
+  for (const [name, correction] of Object.entries(referenceCorrections)) {
     const [type, field] = name.split(".");
     const declared = nodes[types[type]]?.fields[field];
     if (!declared) throw new Error(`${target} reference no longer declares ${name}`);
-    if (isDeepStrictEqual(nodes[declared.node], node))
+    const corrected = correction === "nullable" ? nullable(declared.node) : intern(correction);
+    if (isDeepStrictEqual(nodes[corrected], nodes[declared.node]))
       throw new Error(`${target} reference already declares ${name} as corrected`);
-    declared.node =
-      Object.keys(nodes).find((id) => isDeepStrictEqual(nodes[id], node)) ??
-      `n${Object.keys(nodes).length}`;
-    nodes[declared.node] = node;
+    declared.node = corrected;
   }
   for (const name of [
     "src/ts/storage/risuSave.ts",

@@ -75,7 +75,7 @@
       "kind": "object",
       "fields": {
         "account": {
-          "node": "n1",
+          "node": "n749",
           "optional": true
         },
         "adaptiveThinkingEffort": {
@@ -99,11 +99,11 @@
           "optional": false
         },
         "allowAllExtentionFiles": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "alwaysScrollToNewMessage": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "animationSpeed": {
@@ -159,7 +159,7 @@
           "optional": false
         },
         "autoScrollToNewMessage": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "autoSuggestClean": {
@@ -203,7 +203,7 @@
           "optional": false
         },
         "blockquoteStyling": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "botPresets": {
@@ -223,7 +223,7 @@
           "optional": false
         },
         "chainOfThought": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "characterOrder": {
@@ -235,15 +235,15 @@
           "optional": false
         },
         "chatLoadAdditionalPages": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "chatLoadInitialPages": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "checkCorruption": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "cipherChat": {
@@ -311,7 +311,7 @@
           "optional": false
         },
         "createFolderOnBranch": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "currentPluginProvider": {
@@ -363,7 +363,7 @@
           "optional": false
         },
         "customQuotesData": {
-          "node": "n615",
+          "node": "n752",
           "optional": true
         },
         "customSidebarItems": {
@@ -407,11 +407,11 @@
           "optional": false
         },
         "disableAprilFools": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "disableSeperateParameterChangeOnPresetChange": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "doNotChangeFallbackModels": {
@@ -431,19 +431,19 @@
           "optional": false
         },
         "dynamicModelRegistry": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "dynamicOutput": {
-          "node": "n67",
+          "node": "n753",
           "optional": true
         },
         "echoDelay": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "echoMessage": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "elevenLabKey": {
@@ -467,7 +467,7 @@
           "optional": false
         },
         "enableBookmark": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "enableCustomFlags": {
@@ -487,11 +487,11 @@
           "optional": false
         },
         "enableRemoteSaving": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "enableRisuaiProTools": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "enableScrollToActiveChar": {
@@ -499,7 +499,7 @@
           "optional": false
         },
         "epEnabled": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "extractJson": {
@@ -547,7 +547,7 @@
           "optional": false
         },
         "forceProxyAsOpenAI": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "forceReplaceUrl": {
@@ -571,7 +571,7 @@
           "optional": false
         },
         "geminiStream": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "generationSeed": {
@@ -611,11 +611,11 @@
           "optional": false
         },
         "groupOtherBotRole": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "groupTemplate": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "guiHTML": {
@@ -623,7 +623,7 @@
           "optional": false
         },
         "hamburgerButtonBottom": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "hanuraiEnable": {
@@ -643,7 +643,7 @@
           "optional": false
         },
         "hideAllImages": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "hideApiKey": {
@@ -663,11 +663,11 @@
           "optional": false
         },
         "htmlTranslation": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "hubServerType": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "huggingfaceKey": {
@@ -799,11 +799,11 @@
           "optional": false
         },
         "lastPatchNoteCheckVersion": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "legacyMediaFindings": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "legacyTranslation": {
@@ -839,11 +839,11 @@
           "optional": false
         },
         "localStopStrings": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "longPressToPopupEditor": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "loreBook": {
@@ -887,7 +887,7 @@
           "optional": false
         },
         "memoryLimitThickness": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "menuSideBar": {
@@ -899,7 +899,7 @@
           "optional": false
         },
         "mistralKey": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "modelTools": {
@@ -915,11 +915,11 @@
           "optional": false
         },
         "moveInsteadOfCopyOnCMPConvert": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "NAIadventure": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "NAIApiKey": {
@@ -927,7 +927,7 @@
           "optional": false
         },
         "NAIappendName": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "NAII2I": {
@@ -979,11 +979,11 @@
           "optional": false
         },
         "newImageHandlingBeta": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "newMessageButtonStyle": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "newOAIHandle": {
@@ -1115,7 +1115,7 @@
           "optional": false
         },
         "pluginDevelopMode": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "plugins": {
@@ -1155,7 +1155,7 @@
           "optional": false
         },
         "promptTemplate": {
-          "node": "n92",
+          "node": "n755",
           "optional": true
         },
         "promptTextInfoInsideChat": {
@@ -1187,7 +1187,7 @@
           "optional": false
         },
         "removePunctuationHypa": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "repetition_penalty": {
@@ -1195,7 +1195,7 @@
           "optional": false
         },
         "requestInfoInsideChat": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "requestLocation": {
@@ -1223,11 +1223,11 @@
           "optional": false
         },
         "saveSignatures": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "saveTime": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "sdCFG": {
@@ -1267,7 +1267,7 @@
           "optional": false
         },
         "seperateParametersByModel": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "seperateParametersEnabled": {
@@ -1299,7 +1299,7 @@
           "optional": false
         },
         "showMenuChatList": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "showMenuHypaMemoryModal": {
@@ -1327,7 +1327,7 @@
           "optional": false
         },
         "sideMenuRerollButton": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "simplifiedToolUse": {
@@ -1335,7 +1335,7 @@
           "optional": false
         },
         "skipSavingAssetsOnWebSync": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "stabilityKey": {
@@ -1359,7 +1359,7 @@
           "optional": false
         },
         "streamingDisplayOptimizationMode": {
-          "node": "n159",
+          "node": "n756",
           "optional": true
         },
         "strictJsonSchema": {
@@ -1411,7 +1411,7 @@
           "optional": false
         },
         "textBorder": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "textgenWebUIBlockingURL": {
@@ -1423,15 +1423,15 @@
           "optional": false
         },
         "textScreenBorder": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "textScreenColor": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "textScreenRounded": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "textTheme": {
@@ -1443,7 +1443,7 @@
           "optional": false
         },
         "thinkingTokens": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "thinkingType": {
@@ -1451,7 +1451,7 @@
           "optional": false
         },
         "toggleConfirmRecommendedPreset": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "top_a": {
@@ -1475,7 +1475,7 @@
           "optional": false
         },
         "translatorInputLanguage": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "translatorMaxResponse": {
@@ -1499,7 +1499,7 @@
           "optional": false
         },
         "ttsAutoSpeech": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "unformatQuotes": {
@@ -1643,7 +1643,7 @@
           "optional": false
         },
         "kei": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "token": {
@@ -1651,7 +1651,7 @@
           "optional": false
         },
         "useSync": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         }
       },
@@ -1661,15 +1661,15 @@
       "kind": "object",
       "fields": {
         "access_token": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "expires_in": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "refresh_token": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -1876,11 +1876,11 @@
       "kind": "object",
       "fields": {
         "adaptiveThinkingEffort": {
-          "node": "n30",
+          "node": "n757",
           "optional": true
         },
         "aiModel": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "ainconfig": {
@@ -1888,19 +1888,19 @@
           "optional": false
         },
         "apiType": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "autoSuggestClean": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "autoSuggestPrefix": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "autoSuggestPrompt": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "bias": {
@@ -1908,59 +1908,59 @@
           "optional": false
         },
         "currentPluginProvider": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "customAPIFormat": {
-          "node": "n31",
+          "node": "n758",
           "optional": true
         },
         "customFlags": {
-          "node": "n56",
+          "node": "n759",
           "optional": true
         },
         "customPromptTemplateToggle": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "customProxyRequestModel": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "deepseekReasoningEffort": {
-          "node": "n63",
+          "node": "n760",
           "optional": true
         },
         "deepseekThinkingType": {
-          "node": "n64",
+          "node": "n761",
           "optional": true
         },
         "dynamicOutput": {
-          "node": "n67",
+          "node": "n753",
           "optional": true
         },
         "enableCustomFlags": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "extractJson": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "fallbackModels": {
-          "node": "n69",
+          "node": "n762",
           "optional": true
         },
         "fallbackWhenBlankResponse": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "forceReplaceUrl": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "forceReplaceUrl2": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "formatingOrder": {
@@ -1976,19 +1976,19 @@
           "optional": false
         },
         "groupOtherBotRole": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "groupTemplate": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "image": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "instructChatTemplate": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "jailbreak": {
@@ -1996,31 +1996,31 @@
           "optional": false
         },
         "JinjaTemplate": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "jsonSchema": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "jsonSchemaEnabled": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "koboldURL": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "localNetworkMode": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "localNetworkTimeoutSec": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "localStopStrings": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "mainPrompt": {
@@ -2036,31 +2036,31 @@
           "optional": false
         },
         "min_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "modelTools": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "moduleIntergration": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "NAIadventure": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "NAIappendName": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "NAISettings": {
-          "node": "n84",
+          "node": "n763",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "ooba": {
@@ -2068,19 +2068,19 @@
           "optional": false
         },
         "openAIKey": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "openrouterProvider": {
-          "node": "n88",
+          "node": "n764",
           "optional": true
         },
         "openrouterRequestModel": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "outputImageModal": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "PresensePenalty": {
@@ -2092,67 +2092,67 @@
           "optional": false
         },
         "promptSettings": {
-          "node": "n90",
+          "node": "n765",
           "optional": true
         },
         "promptTemplate": {
-          "node": "n92",
+          "node": "n755",
           "optional": true
         },
         "proxyKey": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "proxyRequestModel": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "reasonEffort": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "regex": {
-          "node": "n123",
+          "node": "n766",
           "optional": true
         },
         "repetition_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "reverseProxyOobaArgs": {
-          "node": "n126",
+          "node": "n767",
           "optional": true
         },
         "seperateModels": {
-          "node": "n131",
+          "node": "n768",
           "optional": true
         },
         "seperateModelsForAxModels": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "seperateParameters": {
-          "node": "n133",
+          "node": "n769",
           "optional": true
         },
         "seperateParametersEnabled": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "strictJsonSchema": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "subModel": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "systemContentReplacement": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "systemRoleReplacement": {
-          "node": "n140",
+          "node": "n770",
           "optional": true
         },
         "temperature": {
@@ -2160,43 +2160,43 @@
           "optional": false
         },
         "templateDefaultVariables": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "textgenWebUIBlockingURL": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "textgenWebUIStreamURL": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "thinkingTokens": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "thinkingType": {
-          "node": "n136",
+          "node": "n771",
           "optional": true
         },
         "top_a": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "top_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "useInstructPrompt": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "verbosity": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -2565,7 +2565,7 @@
       "kind": "object",
       "fields": {
         "cfg_scale": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "frequencyPenalty": {
@@ -2573,11 +2573,11 @@
           "optional": false
         },
         "mirostat_lr": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "mirostat_tau": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "presencePenalty": {
@@ -2801,11 +2801,11 @@
           "optional": false
         },
         "customChainOfThought": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "maxThoughtTagDepth": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "postEndInnerFormat": {
@@ -2821,7 +2821,7 @@
           "optional": false
         },
         "trimStartNewChat": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "utilOverride": {
@@ -2856,7 +2856,7 @@
       "kind": "object",
       "fields": {
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "role": {
@@ -2930,15 +2930,15 @@
       "kind": "object",
       "fields": {
         "innerFormat": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "role2": {
-          "node": "n106",
+          "node": "n772",
           "optional": true
         },
         "type": {
@@ -2978,11 +2978,11 @@
       "kind": "object",
       "fields": {
         "chatAsOriginalOnSystem": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "rangeEnd": {
@@ -3019,19 +3019,19 @@
       "kind": "object",
       "fields": {
         "defaultText": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "innerFormat": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "role2": {
-          "node": "n106",
+          "node": "n772",
           "optional": true
         },
         "type": {
@@ -3049,7 +3049,7 @@
       "kind": "object",
       "fields": {
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "text": {
@@ -3124,7 +3124,7 @@
       "kind": "object",
       "fields": {
         "ableFlag": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "comment": {
@@ -3132,7 +3132,7 @@
           "optional": false
         },
         "flag": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "in": {
@@ -3160,91 +3160,91 @@
       "kind": "object",
       "fields": {
         "add_bos_token": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "auto_max_new_tokens": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "ban_eos_token": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "chat_instruct_command": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "context": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "context_instruct": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "custom_token_bans": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "do_sample": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "early_stopping": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "encoder_repetition_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "epsilon_cutoff": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "eta_cutoff": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "grammar_string": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "greeting": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "guidance_scale": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "length_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "max_tokens_second": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "min_length": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "min_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "mirostat_eta": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "mirostat_mode": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "mirostat_tau": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "mode": {
@@ -3252,91 +3252,91 @@
           "optional": false
         },
         "name1": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "name1_instruct": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "name2": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "name2_instruct": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "negative_prompt": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "no_repeat_ngram_size": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "num_beams": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "penalty_alpha": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "preset": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "repetition_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "repetition_penalty_range": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "seed": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "skip_special_tokens": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "system_message": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "temperature_last": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "tfs": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "tokenizer": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "top_a": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "truncation_length": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "turn_template": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "typical_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -3422,67 +3422,67 @@
       "kind": "object",
       "fields": {
         "adaptive_thinking_effort": {
-          "node": "n30",
+          "node": "n757",
           "optional": true
         },
         "deepseek_reasoning_effort": {
-          "node": "n63",
+          "node": "n760",
           "optional": true
         },
         "deepseek_thinking_type": {
-          "node": "n64",
+          "node": "n761",
           "optional": true
         },
         "frequency_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "min_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "outputImageModal": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "presence_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "reasoning_effort": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "repetition_penalty": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "temperature": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "thinking_tokens": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "thinking_type": {
-          "node": "n136",
+          "node": "n771",
           "optional": true
         },
         "top_a": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "top_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "verbosity": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -3543,11 +3543,11 @@
           "optional": false
         },
         "img": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "imgFile": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "name": {
@@ -3572,11 +3572,11 @@
       "kind": "object",
       "fields": {
         "additionalAssets": {
-          "node": "n147",
+          "node": "n773",
           "optional": true
         },
         "additionalData": {
-          "node": "n150",
+          "node": "n774",
           "optional": true
         },
         "additionalText": {
@@ -3588,11 +3588,11 @@
           "optional": false
         },
         "backgroundCSS": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "backgroundHTML": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "bias": {
@@ -3600,7 +3600,7 @@
           "optional": false
         },
         "ccAssets": {
-          "node": "n152",
+          "node": "n775",
           "optional": true
         },
         "chaId": {
@@ -3624,15 +3624,15 @@
           "optional": false
         },
         "coldstorage": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "coldStoragedChats": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "creation_date": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "creator": {
@@ -3644,7 +3644,7 @@
           "optional": false
         },
         "customModuleToggle": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "customscript": {
@@ -3652,11 +3652,11 @@
           "optional": false
         },
         "defaultVariables": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "depth_prompt": {
-          "node": "n231",
+          "node": "n776",
           "optional": true
         },
         "desc": {
@@ -3664,7 +3664,7 @@
           "optional": false
         },
         "doNotChangeSeperateModels": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "emotionImages": {
@@ -3672,7 +3672,7 @@
           "optional": false
         },
         "escapeOutput": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "exampleMessage": {
@@ -3680,7 +3680,7 @@
           "optional": false
         },
         "extentions": {
-          "node": "n233",
+          "node": "n777",
           "optional": true
         },
         "firstMessage": {
@@ -3692,7 +3692,7 @@
           "optional": false
         },
         "fishSpeechConfig": {
-          "node": "n236",
+          "node": "n778",
           "optional": true
         },
         "globalLore": {
@@ -3700,43 +3700,43 @@
           "optional": false
         },
         "gptSoVitsConfig": {
-          "node": "n240",
+          "node": "n779",
           "optional": true
         },
         "group_only_greetings": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "hfTTS": {
-          "node": "n265",
+          "node": "n780",
           "optional": true
         },
         "hideChatIcon": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "image": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "imported": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "inlayViewScreen": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "largePortrait": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "lastInteraction": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "license": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "loreExt": {
@@ -3744,31 +3744,31 @@
           "optional": true
         },
         "lorePlus": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "loreSettings": {
-          "node": "n267",
+          "node": "n781",
           "optional": true
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "modification_date": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "moduleNamespace": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "modules": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "naittsConfig": {
-          "node": "n269",
+          "node": "n782",
           "optional": true
         },
         "name": {
@@ -3776,11 +3776,11 @@
           "optional": false
         },
         "newGenData": {
-          "node": "n271",
+          "node": "n783",
           "optional": true
         },
         "nickname": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "notes": {
@@ -3788,15 +3788,15 @@
           "optional": false
         },
         "oaiTTSConfig": {
-          "node": "n273",
+          "node": "n784",
           "optional": true
         },
         "oaiVoice": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "onboarding": {
-          "node": "n282",
+          "node": "n785",
           "optional": true
         },
         "personality": {
@@ -3804,35 +3804,35 @@
           "optional": false
         },
         "postHistoryInstructions": {
-          "node": "n5",
+          "node": "n242",
           "optional": false
         },
         "prebuiltAssetCommand": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "prebuiltAssetExclude": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "prebuiltAssetStyle": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "private": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "realmId": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "reloadKeys": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "removedQuotes": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "replaceGlobalNote": {
@@ -3844,7 +3844,7 @@
           "optional": false
         },
         "scriptstate": {
-          "node": "n294",
+          "node": "n786",
           "optional": true
         },
         "sdData": {
@@ -3852,11 +3852,11 @@
           "optional": false
         },
         "source": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "supaMemory": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "systemPrompt": {
@@ -3868,11 +3868,11 @@
           "optional": false
         },
         "translatorNote": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "trashTime": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "triggerscript": {
@@ -3880,19 +3880,19 @@
           "optional": false
         },
         "ttsMode": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "ttsReadOnlyQuoted": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "ttsSpeech": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "type": {
-          "node": "n588",
+          "node": "n787",
           "optional": true
         },
         "utilityBot": {
@@ -3904,15 +3904,15 @@
           "optional": false
         },
         "virtualscript": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "vits": {
-          "node": "n594",
+          "node": "n788",
           "optional": true
         },
         "voicevoxConfig": {
-          "node": "n597",
+          "node": "n789",
           "optional": true
         }
       },
@@ -3951,15 +3951,15 @@
       "kind": "object",
       "fields": {
         "character_version": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "creator": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "tag": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         }
       },
@@ -4005,7 +4005,7 @@
       "kind": "object",
       "fields": {
         "color": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "folded": {
@@ -4017,7 +4017,7 @@
           "optional": false
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -4031,55 +4031,55 @@
       "kind": "object",
       "fields": {
         "activeStreamingDisplayOptimizationMode": {
-          "node": "n159",
+          "node": "n756",
           "optional": true
         },
         "bindedPersona": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "bookmarkNames": {
-          "node": "n162",
+          "node": "n790",
           "optional": true
         },
         "bookmarks": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "fmIndex": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "folderId": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "GLGlobalVariables": {
-          "node": "n164",
+          "node": "n791",
           "optional": true
         },
         "hypaV2Data": {
-          "node": "n166",
+          "node": "n792",
           "optional": true
         },
         "hypaV3Data": {
-          "node": "n172",
+          "node": "n793",
           "optional": true
         },
         "id": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "isStreaming": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "lastDate": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "lastMemory": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "localLore": {
@@ -4091,7 +4091,7 @@
           "optional": false
         },
         "modules": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "name": {
@@ -4103,27 +4103,27 @@
           "optional": false
         },
         "onboardingDone": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "scriptstate": {
-          "node": "n228",
+          "node": "n794",
           "optional": true
         },
         "sdData": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "suggestMessages": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "supaMemoryData": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "useLocallySetGlobalVariables": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         }
       },
@@ -4245,19 +4245,19 @@
       "kind": "object",
       "fields": {
         "categories": {
-          "node": "n174",
+          "node": "n795",
           "optional": true
         },
         "lastSelectedSummaries": {
-          "node": "n177",
+          "node": "n796",
           "optional": true
         },
         "metrics": {
-          "node": "n179",
+          "node": "n797",
           "optional": true
         },
         "modalSettings": {
-          "node": "n181",
+          "node": "n798",
           "optional": true
         },
         "summaries": {
@@ -4393,7 +4393,7 @@
       "kind": "object",
       "fields": {
         "categoryId": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "chatMemos": {
@@ -4405,7 +4405,7 @@
           "optional": false
         },
         "tags": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "text": {
@@ -4423,7 +4423,7 @@
       "kind": "object",
       "fields": {
         "activationPercent": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "alwaysActive": {
@@ -4431,7 +4431,7 @@
           "optional": false
         },
         "bookVersion": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "comment": {
@@ -4443,15 +4443,15 @@
           "optional": false
         },
         "extentions": {
-          "node": "n191",
+          "node": "n799",
           "optional": true
         },
         "folder": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "id": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "insertorder": {
@@ -4463,7 +4463,7 @@
           "optional": false
         },
         "loreCache": {
-          "node": "n193",
+          "node": "n800",
           "optional": true
         },
         "mode": {
@@ -4479,7 +4479,7 @@
           "optional": false
         },
         "useRegex": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         }
       },
@@ -4555,7 +4555,7 @@
       "kind": "object",
       "fields": {
         "chatId": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "data": {
@@ -4563,27 +4563,27 @@
           "optional": false
         },
         "disabled": {
-          "node": "n202",
+          "node": "n801",
           "optional": true
         },
         "generationInfo": {
-          "node": "n204",
+          "node": "n802",
           "optional": true
         },
         "isComment": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "otherUser": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "promptInfo": {
-          "node": "n208",
+          "node": "n803",
           "optional": true
         },
         "role": {
@@ -4591,11 +4591,11 @@
           "optional": false
         },
         "saying": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "time": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -4623,27 +4623,27 @@
       "kind": "object",
       "fields": {
         "generationId": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "inputTokens": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "maxContext": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "model": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "outputTokens": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "stageTiming": {
-          "node": "n206",
+          "node": "n804",
           "optional": true
         }
       },
@@ -4659,19 +4659,19 @@
       "kind": "object",
       "fields": {
         "stage1": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "stage2": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "stage3": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "stage4": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -4687,15 +4687,15 @@
       "kind": "object",
       "fields": {
         "promptName": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "promptText": {
-          "node": "n210",
+          "node": "n805",
           "optional": true
         },
         "promptToggles": {
-          "node": "n223",
+          "node": "n806",
           "optional": true
         }
       },
@@ -4715,11 +4715,11 @@
       "kind": "object",
       "fields": {
         "attr": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "cachePoint": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "content": {
@@ -4727,19 +4727,19 @@
           "optional": false
         },
         "memo": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "multimodals": {
-          "node": "n213",
+          "node": "n807",
           "optional": true
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "removable": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "role": {
@@ -4747,7 +4747,7 @@
           "optional": false
         },
         "thoughts": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         }
       },
@@ -4771,7 +4771,7 @@
           "optional": false
         },
         "height": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "type": {
@@ -4779,7 +4779,7 @@
           "optional": false
         },
         "width": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -4927,7 +4927,7 @@
           "optional": false
         },
         "model": {
-          "node": "n238",
+          "node": "n808",
           "optional": true
         },
         "normalize": {
@@ -4975,63 +4975,63 @@
           "optional": true
         },
         "prompt_lang": {
-          "node": "n244",
+          "node": "n809",
           "optional": true
         },
         "ref_audio_data": {
-          "node": "n256",
+          "node": "n810",
           "optional": true
         },
         "ref_audio_path": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "speed": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "temperature": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "text": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "text_lang": {
-          "node": "n244",
+          "node": "n809",
           "optional": true
         },
         "text_split_method": {
-          "node": "n258",
+          "node": "n811",
           "optional": true
         },
         "top_k": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "top_p": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "url": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "use_auto_path": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "use_long_audio": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "use_prompt": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "volume": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -5193,7 +5193,7 @@
       "kind": "object",
       "fields": {
         "fullWordMatching": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "recursiveScanning": {
@@ -5221,15 +5221,15 @@
       "kind": "object",
       "fields": {
         "customvoice": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "version": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "voice": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -5273,27 +5273,27 @@
       "kind": "object",
       "fields": {
         "apiKey": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "baseURL": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "enabled": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "format": {
-          "node": "n275",
+          "node": "n812",
           "optional": true
         },
         "model": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "voice": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -5344,7 +5344,7 @@
       "kind": "object",
       "fields": {
         "description": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "enabled": {
@@ -5352,11 +5352,11 @@
           "optional": false
         },
         "floatingButton": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "html": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "mode": {
@@ -5368,7 +5368,7 @@
           "optional": false
         },
         "title": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -5397,7 +5397,7 @@
       "kind": "object",
       "fields": {
         "description": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "id": {
@@ -5409,11 +5409,11 @@
           "optional": false
         },
         "placeholder": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "required": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "title": {
@@ -5496,7 +5496,7 @@
           "optional": false
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "type": {
@@ -6207,7 +6207,7 @@
       "kind": "object",
       "fields": {
         "code": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "indent": {
@@ -6292,7 +6292,7 @@
       "kind": "object",
       "fields": {
         "endOfLoop": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "indent": {
@@ -6725,7 +6725,7 @@
           "optional": false
         },
         "streaming": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "type": {
@@ -9410,7 +9410,7 @@
           "optional": false
         },
         "name": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -9431,23 +9431,23 @@
       "kind": "object",
       "fields": {
         "INTONATION_SCALE": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "PITCH_SCALE": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "speaker": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "SPEED_SCALE": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "VOLUME_SCALE": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         }
       },
@@ -9457,7 +9457,7 @@
       "kind": "object",
       "fields": {
         "additionalAssets": {
-          "node": "n147",
+          "node": "n773",
           "optional": true
         },
         "additionalData": {
@@ -9465,11 +9465,11 @@
           "optional": true
         },
         "additionalText": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "alternateGreetings": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "autoMode": {
@@ -9477,11 +9477,11 @@
           "optional": false
         },
         "backgroundCSS": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "backgroundHTML": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "chaId": {
@@ -9513,15 +9513,15 @@
           "optional": false
         },
         "coldstorage": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "coldStoragedChats": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "creatorNotes": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "customscript": {
@@ -9529,11 +9529,11 @@
           "optional": false
         },
         "defaultVariables": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "depth_prompt": {
-          "node": "n601",
+          "node": "n813",
           "optional": true
         },
         "emotionImages": {
@@ -9541,7 +9541,7 @@
           "optional": false
         },
         "exampleMessage": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "firstMessage": {
@@ -9549,7 +9549,7 @@
           "optional": false
         },
         "firstMsgIndex": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "fishSpeechConfig": {
@@ -9569,35 +9569,35 @@
           "optional": true
         },
         "hideChatIcon": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "image": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "lastInteraction": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "license": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "lorePlus": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "loreSettings": {
-          "node": "n267",
+          "node": "n781",
           "optional": true
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "modules": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "naittsConfig": {
@@ -9609,7 +9609,7 @@
           "optional": false
         },
         "nickname": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "oaiTTSConfig": {
@@ -9617,31 +9617,31 @@
           "optional": true
         },
         "oaiVoice": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "oneAtTime": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "orderByOrder": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "personality": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "prebuiltAssetCommand": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "prebuiltAssetExclude": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "prebuiltAssetStyle": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "realmId": {
@@ -9649,51 +9649,51 @@
           "optional": false
         },
         "reloadKeys": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "removedQuotes": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "replaceGlobalNote": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "scenario": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "suggestMessages": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "supaMemory": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "systemPrompt": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "translatorNote": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "trashTime": {
-          "node": "n6",
+          "node": "n751",
           "optional": true
         },
         "ttsMode": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "ttsReadOnlyQuoted": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "ttsSpeech": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "type": {
@@ -9705,7 +9705,7 @@
           "optional": false
         },
         "utilityBot": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "viewScreen": {
@@ -9713,11 +9713,11 @@
           "optional": false
         },
         "virtualscript": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "vits": {
-          "node": "n594",
+          "node": "n788",
           "optional": true
         },
         "voicevoxConfig": {
@@ -10188,11 +10188,11 @@
           "optional": false
         },
         "alt": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "ctrl": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "key": {
@@ -10200,7 +10200,7 @@
           "optional": false
         },
         "shift": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         }
       },
@@ -10476,7 +10476,7 @@
           "optional": false
         },
         "icons": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "id": {
@@ -10537,19 +10537,19 @@
       "kind": "object",
       "fields": {
         "assets": {
-          "node": "n147",
+          "node": "n773",
           "optional": true
         },
         "backgroundEmbedding": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "cjs": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "customModuleToggle": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "description": {
@@ -10557,11 +10557,11 @@
           "optional": false
         },
         "hideIcon": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "icon": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "id": {
@@ -10569,15 +10569,15 @@
           "optional": false
         },
         "lorebook": {
-          "node": "n670",
+          "node": "n814",
           "optional": true
         },
         "lowLevelAccess": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "mcp": {
-          "node": "n671",
+          "node": "n815",
           "optional": true
         },
         "name": {
@@ -10585,15 +10585,15 @@
           "optional": false
         },
         "namespace": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "regex": {
-          "node": "n123",
+          "node": "n766",
           "optional": true
         },
         "trigger": {
-          "node": "n673",
+          "node": "n816",
           "optional": true
         }
       },
@@ -10679,7 +10679,7 @@
           "optional": false
         },
         "reference_image_multiple": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "reference_mode": {
@@ -10687,7 +10687,7 @@
           "optional": false
         },
         "reference_strength_multiple": {
-          "node": "n177",
+          "node": "n796",
           "optional": true
         },
         "sampler": {
@@ -10735,11 +10735,11 @@
           "optional": false
         },
         "vibe_data": {
-          "node": "n682",
+          "node": "n817",
           "optional": true
         },
         "vibe_model_selection": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "width": {
@@ -11047,7 +11047,7 @@
       "kind": "object",
       "fields": {
         "embeddedModule": {
-          "node": "n702",
+          "node": "n818",
           "optional": true
         },
         "icon": {
@@ -11055,11 +11055,11 @@
           "optional": false
         },
         "id": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "largePortrait": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "name": {
@@ -11067,7 +11067,7 @@
           "optional": false
         },
         "note": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "personaPrompt": {
@@ -11096,7 +11096,7 @@
       "kind": "object",
       "fields": {
         "allowedIPC": {
-          "node": "n83",
+          "node": "n754",
           "optional": true
         },
         "argMeta": {
@@ -11112,11 +11112,11 @@
           "optional": false
         },
         "displayName": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "enabled": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         },
         "name": {
@@ -11132,15 +11132,15 @@
           "optional": false
         },
         "updateURL": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "version": {
-          "node": "n716",
+          "node": "n819",
           "optional": true
         },
         "versionOfPlugin": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         }
       },
@@ -11185,7 +11185,7 @@
       "kind": "object",
       "fields": {
         "hoverText": {
-          "node": "n4",
+          "node": "n242",
           "optional": true
         },
         "link": {
@@ -11527,7 +11527,7 @@
       "kind": "object",
       "fields": {
         "snapshot": {
-          "node": "n8",
+          "node": "n750",
           "optional": true
         }
       },
@@ -11539,6 +11539,565 @@
         "n217",
         "n218",
         "n219"
+      ]
+    },
+    "n749": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n2"
+      ]
+    },
+    "n750": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n9",
+        "n10"
+      ]
+    },
+    "n751": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n7"
+      ]
+    },
+    "n752": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n616"
+      ]
+    },
+    "n753": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n68"
+      ]
+    },
+    "n754": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n23"
+      ]
+    },
+    "n755": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n93"
+      ]
+    },
+    "n756": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n65",
+        "n160",
+        "n161"
+      ]
+    },
+    "n757": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n12",
+        "n13",
+        "n14",
+        "n15",
+        "n16"
+      ]
+    },
+    "n758": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n32",
+        "n33",
+        "n34",
+        "n35",
+        "n36",
+        "n37",
+        "n38",
+        "n39",
+        "n40",
+        "n41",
+        "n42",
+        "n43",
+        "n44",
+        "n45",
+        "n46",
+        "n47",
+        "n48",
+        "n49",
+        "n50",
+        "n51",
+        "n52",
+        "n53",
+        "n54",
+        "n55"
+      ]
+    },
+    "n759": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n57"
+      ]
+    },
+    "n760": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n14",
+        "n16"
+      ]
+    },
+    "n761": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n65",
+        "n66"
+      ]
+    },
+    "n762": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n70"
+      ]
+    },
+    "n763": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n85"
+      ]
+    },
+    "n764": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n89"
+      ]
+    },
+    "n765": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n91"
+      ]
+    },
+    "n766": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n124"
+      ]
+    },
+    "n767": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n127"
+      ]
+    },
+    "n768": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n132"
+      ]
+    },
+    "n769": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n134"
+      ]
+    },
+    "n770": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n97",
+        "n120"
+      ]
+    },
+    "n771": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n65",
+        "n137",
+        "n138"
+      ]
+    },
+    "n772": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n97",
+        "n98",
+        "n99"
+      ]
+    },
+    "n773": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n148"
+      ]
+    },
+    "n774": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n151"
+      ]
+    },
+    "n775": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n153"
+      ]
+    },
+    "n776": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n232"
+      ]
+    },
+    "n777": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n234"
+      ]
+    },
+    "n778": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n237"
+      ]
+    },
+    "n779": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n241"
+      ]
+    },
+    "n780": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n266"
+      ]
+    },
+    "n781": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n268"
+      ]
+    },
+    "n782": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n270"
+      ]
+    },
+    "n783": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n272"
+      ]
+    },
+    "n784": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n274"
+      ]
+    },
+    "n785": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n283"
+      ]
+    },
+    "n786": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n295"
+      ]
+    },
+    "n787": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n589"
+      ]
+    },
+    "n788": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n595"
+      ]
+    },
+    "n789": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n598"
+      ]
+    },
+    "n790": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n163"
+      ]
+    },
+    "n791": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n165"
+      ]
+    },
+    "n792": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n167"
+      ]
+    },
+    "n793": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n173"
+      ]
+    },
+    "n794": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n229"
+      ]
+    },
+    "n795": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n175"
+      ]
+    },
+    "n796": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n178"
+      ]
+    },
+    "n797": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n180"
+      ]
+    },
+    "n798": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n182"
+      ]
+    },
+    "n799": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n192"
+      ]
+    },
+    "n800": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n194"
+      ]
+    },
+    "n801": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n9",
+        "n10",
+        "n203"
+      ]
+    },
+    "n802": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n205"
+      ]
+    },
+    "n803": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n209"
+      ]
+    },
+    "n804": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n207"
+      ]
+    },
+    "n805": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n211"
+      ]
+    },
+    "n806": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n224"
+      ]
+    },
+    "n807": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n214"
+      ]
+    },
+    "n808": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n239"
+      ]
+    },
+    "n809": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n245",
+        "n246",
+        "n247",
+        "n248",
+        "n249",
+        "n250",
+        "n251",
+        "n252",
+        "n253",
+        "n254",
+        "n255"
+      ]
+    },
+    "n810": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n257"
+      ]
+    },
+    "n811": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n259",
+        "n260",
+        "n261",
+        "n262",
+        "n263",
+        "n264"
+      ]
+    },
+    "n812": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n276",
+        "n277",
+        "n278",
+        "n279",
+        "n280",
+        "n281"
+      ]
+    },
+    "n813": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n602"
+      ]
+    },
+    "n814": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n189"
+      ]
+    },
+    "n815": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n672"
+      ]
+    },
+    "n816": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n296"
+      ]
+    },
+    "n817": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n683"
+      ]
+    },
+    "n818": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n669"
+      ]
+    },
+    "n819": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n33",
+        "n34",
+        "n717",
+        "n718"
       ]
     }
   }
