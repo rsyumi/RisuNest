@@ -59,6 +59,11 @@ export const LLMCacheStorage = localforage.createInstance({
 
 let waitTrans = 0
 
+// Google refuses some client names with 429 in some regions while it still answers others.
+const googleTranslateClients = ['dict-chrome-ex', 'at', 'gtx']
+// The client that answered last, which later requests ask first.
+let googleTranslateClient = 0
+
 export interface TranslateHTMLContext {
     scriptContext: ProcessScriptCaptureContext
     projectedChatID?: number
@@ -280,24 +285,37 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
     }
 
 
-    const url = `https://${arg.host}/translate_a/single?client=gtx&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}`
-
     // The text goes in the body, which has no URL length limit.
     const request = {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
         body: 'q=' + encodeURIComponent(text),
     }
-    // Google can refuse one HTTP client while it still answers another, and a refusal
-    // may reach the WebView only as a network error.
     let f: Response | null = null
-    try {
-        f = await fetch(url, request)
-    } catch (error) {
-        if(!isTauri) throw error
+    let networkError: unknown
+    for(let attempt = 0; attempt < googleTranslateClients.length; attempt++){
+        // Release the refused response before asking the next client.
+        await f?.body?.cancel().catch(() => {})
+        f = null
+        const client = (googleTranslateClient + attempt) % googleTranslateClients.length
+        const url = `https://${arg.host}/translate_a/single?client=${googleTranslateClients[client]}&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}`
+        // Google can refuse one HTTP client while it still answers another, and a refusal
+        // may reach the WebView only as a network error.
+        try {
+            f = await fetch(url, request)
+        } catch (error) {
+            networkError = error
+        }
+        if(isTauri && (f === null || f.status === 429)){
+            f = await fetchNative(url, { ...request, logFetch: false })
+        }
+        if(f !== null && f.status !== 429){
+            googleTranslateClient = client
+            break
+        }
     }
-    if(isTauri && (f === null || f.status === 429)){
-        f = await fetchNative(url, { ...request, logFetch: false })
+    if(f === null){
+        throw networkError
     }
 
     if(!f.ok){

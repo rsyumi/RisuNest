@@ -185,18 +185,19 @@ describe('Google Translate', () => {
     const translated = () => new Response(JSON.stringify([[['KO paragraph']]]))
     const refused = () => new Response('<html>synthetic refusal</html>', { status: 429 })
     const unreachable = (): Response => { throw new TypeError('Load failed') }
-    function googleRequest(runtime: 'tauri' | 'web', webView: () => Response, native: () => Response = translated) {
+    function googleRequest(runtime: 'tauri' | 'web', webView: (url: string) => Response, native: (url: string) => Response = translated) {
         f.translatorType = 'google'
         f.tauri = runtime === 'tauri'
-        const webFetch = vi.fn(async (_url: URL | string, _init: SentRequest) => webView())
+        const webFetch = vi.fn(async (url: URL | string, _init: SentRequest) => webView(String(url)))
         vi.stubGlobal('fetch', webFetch)
-        vi.mocked(pluginFetch).mockImplementation(async () => native())
+        vi.mocked(pluginFetch).mockImplementation(async url => native(String(url)))
         const requests = (calls: unknown[][], body: 'body' | 'dataText') => calls.map(([url, init]) => (
             { url: String(url), method: (init as SentRequest).method, q: new URLSearchParams((init as SentRequest)[body]).get('q') }
         ))
         return () => ({ webView: requests(webFetch.mock.calls, 'body'), native: requests(vi.mocked(pluginFetch).mock.calls, 'dataText') })
     }
-    const endpoint = 'https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=en&tl=ko'
+    const endpoint = 'https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&dt=t&sl=en&tl=ko'
+    const clientOf = ({ url }: { url: string }) => new URL(url).searchParams.get('client')
 
     it.each(['tauri', 'web'] as const)('sends a paragraph of any length in the WebView request body on %s', async runtime => {
         const sent = googleRequest(runtime, translated)
@@ -221,12 +222,26 @@ describe('Google Translate', () => {
         googleRequest('tauri', unreachable, () => { throw new TypeError('synthetic native transport failure') })
         await expect(translate('paragraph neither client can send', false)).rejects.toThrow('synthetic native transport failure')
     })
-    it('keeps the original text, reports the status and releases the native response when both clients are refused on Tauri', async () => {
+    it('keeps the original text, reports the status and releases every native response when Google refuses every client on Tauri', async () => {
         const release = vi.fn()
-        googleRequest('tauri', unreachable, () => new Response(new ReadableStream({ cancel: release }), { status: 429 }))
+        const sent = googleRequest('tauri', unreachable, () => new Response(new ReadableStream({ cancel: release }), { status: 429 }))
         const text = 'paragraph Google refuses'
         await expect(translate(text, false)).resolves.toBe(text)
         expect(f.alert).toHaveBeenCalledExactlyOnceWith('ERR::Google Translate Error 429')
-        expect(release).toHaveBeenCalledOnce()
+        expect(sent().native.map(clientOf)).toEqual(['dict-chrome-ex', 'at', 'gtx'])
+        expect(release).toHaveBeenCalledTimes(3)
+    })
+    it.each([['tauri', refused], ['web', unreachable]] as const)('asks the next client when Google refuses one on %s and keeps asking the client that answered', async (runtime, refusal) => {
+        let refusedClient = 'dict-chrome-ex'
+        const answer = (url: string) => clientOf({ url }) === refusedClient ? refusal() : translated()
+        const sent = googleRequest(runtime, answer, answer)
+        await expect(translate(`${runtime} paragraph after the first client is refused`, false)).resolves.toBe('KO paragraph')
+        await expect(translate(`${runtime} paragraph for the client that answered`, false)).resolves.toBe('KO paragraph')
+        refusedClient = 'at'
+        await expect(translate(`${runtime} paragraph after the second client is refused`, false)).resolves.toBe('KO paragraph')
+        refusedClient = 'gtx'
+        await expect(translate(`${runtime} paragraph after the last client is refused`, false)).resolves.toBe('KO paragraph')
+        expect(sent().webView.map(clientOf)).toEqual(['dict-chrome-ex', 'at', 'at', 'at', 'gtx', 'gtx', 'dict-chrome-ex'])
+        expect(f.alert).not.toHaveBeenCalled()
     })
 })

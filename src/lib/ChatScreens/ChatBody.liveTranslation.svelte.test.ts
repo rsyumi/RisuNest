@@ -142,13 +142,16 @@ describe('live row translation around a generation', () => {
     })
 
     test('shows a row untranslated when its translation request fails', async () => {
-        const translationRequests = vi.fn(async () => { throw new TypeError('Load failed') })
+        const translationRequests = vi.fn(async (_url: string | URL) => { throw new TypeError('Load failed') })
         vi.stubGlobal('fetch', translationRequests)
         f.parse.mockImplementation(async (value: string) => `rendered ${value}`)
         mountLiveRow('reply the translator cannot reach', { translatorType: 'google' })
 
         await vi.waitFor(() => expect(target.textContent).toBe('rendered reply the translator cannot reach'))
         expect(get(alertStore)).toMatchObject({ type: 'error', msg: 'Error while parsing chat message: Load failed' })
-        expect(translationRequests).toHaveBeenCalledOnce()
+        // The translator may ask another endpoint, but the row never sends a request again.
+        const urls = translationRequests.mock.calls.map(([url]) => String(url))
+        expect(urls).not.toHaveLength(0)
+        expect(new Set(urls).size).toBe(urls.length)
     })
 })
