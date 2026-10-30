@@ -39,7 +39,8 @@ pub(crate) async fn app_lock_write_record(app: AppHandle, record: String) -> Res
     record_operation(move || {
         let state = app.state::<PersistentStoreState>();
         let _guard = state.admit_renderer_operation().map_err(|error| error.to_string())?;
-        write_record(&crate::app_paths::data_root(&app)?, &record).map_err(|error| error.to_string())
+        let root = crate::app_paths::data_root(&app)?;
+        state.outside_store_open(|| write_record(&root, &record)).and_then(|written| written).map_err(|error| error.to_string())
     }).await
 }
 

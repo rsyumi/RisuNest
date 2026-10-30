@@ -55,9 +55,12 @@ fn receive_page_more() -> bool { true }
 
 pub(crate) struct OperationLog(pub(crate) Connection);
 impl OperationLog {
+    pub(crate) fn path(root: &Path) -> std::path::PathBuf {
+        root.join("server-sync/lww-operations.sqlite")
+    }
     pub(crate) fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root.join("server-sync"))?;
-        let db = crate::sqlite_open::open(root.join("server-sync/lww-operations.sqlite"))?;
+        let db = crate::sqlite_open::open(Self::path(root))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS publications(id TEXT PRIMARY KEY, digest TEXT NOT NULL, body BLOB NOT NULL, intent TEXT NOT NULL, receipt TEXT,acknowledged INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS pending_publications ON publications(id) WHERE receipt IS NULL; CREATE INDEX IF NOT EXISTS unacknowledged_publications ON publications(id) WHERE acknowledged=0;")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS bootstrap(authority TEXT PRIMARY KEY,pin TEXT NOT NULL,after_key TEXT,cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS receive_pages(authority TEXT PRIMARY KEY,body TEXT NOT NULL,next_key TEXT,bootstrap INTEGER NOT NULL,done INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS configurations(slot TEXT PRIMARY KEY,config TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS claims(id TEXT PRIMARY KEY,body TEXT NOT NULL);")?;
         Ok(Self(db))

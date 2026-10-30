@@ -43,6 +43,7 @@ pub(crate) struct PersistentStoreState {
     renderer_gate: Arc<RendererGate>,
     archive_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     retired_purge_started: AtomicBool,
+    compaction_checked: AtomicBool,
 }
 
 struct ArchiveOperationGuard<'a> {
@@ -172,6 +173,15 @@ impl PersistentStoreState {
         };
         cancelled.store(true, Ordering::Release);
         Ok(true)
+    }
+
+    /// Runs a write to a store file that does not go through the store, such as
+    /// the recovery shell's app lock record, after any store open under way.
+    pub(crate) fn outside_store_open<T>(&self, operation: impl FnOnce() -> T) -> StoreResult<T> {
+        let _store = self.store.lock().map_err(|error| StoreError::Store {
+            message: format!("persistent store mutex poisoned: {error}"),
+        })?;
+        Ok(operation())
     }
 
     pub(crate) fn maintenance_active(&self) -> bool {
@@ -376,6 +386,7 @@ impl Default for PersistentStoreState {
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
             retired_purge_started: AtomicBool::new(false),
+            compaction_checked: AtomicBool::new(false),
         }
     }
 }
@@ -456,7 +467,7 @@ pub(crate) struct PersistentStoreOpenResult {
     revision: i64,
 }
 
-fn current_time_ms() -> StoreResult<i64> {
+pub(super) fn current_time_ms() -> StoreResult<i64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| StoreError::Store {
@@ -613,7 +624,14 @@ pub(crate) fn open_for_renderer<R: tauri::Runtime>(
 ) -> StoreResult<PersistentStoreOpenResult> {
     let operation_guard = state.admit_renderer_operation()?;
     let app_data_dir = crate::app_paths::data_root(app).map_err(|message| StoreError::Store { message })?;
-    let (opened, first_open) = open_renderer_persistent_store_admitted(state, &operation_guard, &app_data_dir)?;
+    let admission = app.try_state::<crate::native_file_jobs::NativeFileJobState>()
+        .map(|jobs| Arc::clone(&jobs.admission));
+    let compaction = admission.as_ref().map(|admission| FirstOpenCompaction {
+        admission,
+        limits: super::compaction::STARTUP_COMPACTION,
+        repository_lock: crate::asset_repository::coordinator::try_lock_repository_mutation,
+    });
+    let (opened, first_open) = open_renderer_persistent_store_admitted(state, &operation_guard, &app_data_dir, compaction)?;
     start_retired_purge(app, state);
     // A page that starts before the store opens cannot judge the asset journals
     // whose owners only the store records, so they are judged again now.
@@ -633,14 +651,16 @@ pub(crate) fn open_renderer_persistent_store(
     app_data_dir: &Path,
 ) -> StoreResult<PersistentStoreOpenResult> {
     let operation_guard = state.admit_renderer_operation()?;
-    open_renderer_persistent_store_admitted(state, &operation_guard, app_data_dir).map(|(opened, _)| opened)
+    open_renderer_persistent_store_admitted(state, &operation_guard, app_data_dir, None).map(|(opened, _)| opened)
 }
 
-/// Also returns whether this call opened the store.
+/// Also returns whether this call opened the store. The first open of the
+/// process also compacts sparse store files under `compaction`.
 fn open_renderer_persistent_store_admitted(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
     app_data_dir: &Path,
+    compaction: Option<FirstOpenCompaction<'_>>,
 ) -> StoreResult<(PersistentStoreOpenResult, bool)> {
     if !operation_guard.belongs_to(state) {
         return Err(StoreError::Validation {
@@ -651,7 +671,33 @@ fn open_renderer_persistent_store_admitted(
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     let opening = store.is_none();
-    open_persistent_store(app_data_dir, &mut store).map(|opened| (opened, opening))
+    let opened = open_persistent_store(app_data_dir, &mut store)?;
+    if opening && !state.compaction_checked.swap(true, Ordering::AcqRel) {
+        if let (Some(compaction), Some(store)) = (compaction, store.as_mut()) {
+            compact_at_first_open(compaction, store);
+        }
+    }
+    Ok((opened, opening))
+}
+
+struct FirstOpenCompaction<'a> {
+    admission: &'a Arc<crate::native_file_jobs::admission::Admission>,
+    limits: super::compaction::CompactionLimits,
+    /// Returns `None` when the repository mutation lock is busy.
+    repository_lock: fn() -> std::io::Result<Option<std::sync::MutexGuard<'static, ()>>>,
+}
+
+/// Compaction copies each file back over itself, so a commit by another
+/// connection in between would be lost. At the first open nothing else holds
+/// the files: job and status stores open from this store, native jobs and
+/// server sync need the file admission taken here, and asset job releases need
+/// the repository lock. A busy holder skips compaction until the next start.
+fn compact_at_first_open(compaction: FirstOpenCompaction<'_>, store: &mut PersistentStore) {
+    let Ok(_permit) = compaction.admission.file(true) else { return; };
+    let Ok(Some(_repository)) = (compaction.repository_lock)() else { return; };
+    if let Err(error) = store.compact_sparse_files(compaction.limits) {
+        crate::nlog!("warn", "Store compaction failed: {error}");
+    }
 }
 
 fn open_persistent_store(
@@ -2619,6 +2665,71 @@ mod tests {
         let operation = cleanup.admit_renderer_operation().unwrap();
         sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
         assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1));
+
+        // Marks past their grace go first, though the cursor has passed them,
+        // and count toward the same batch.
+        let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
+        let (_expired_directory, expired) = open();
+        let operation = expired.admit_renderer_operation().unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        assert_eq!(count(&expired, "message_page_objects"), (1, 1), "expired marks waited for the cursor");
+        assert_eq!(count(&expired, "message_page_object_marks"), (0, 0), "the batch went past its limit");
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        assert_eq!(count(&expired, "message_page_object_marks"), (1, 1));
+        assert_eq!(count(&expired, "message_page_sweep_cursor"), (0, 0));
+    }
+
+    #[test]
+    fn only_the_first_open_of_a_process_compacts_the_store_files() {
+        use crate::native_file_jobs::admission::Admission;
+        let limits = super::super::compaction::CompactionLimits { min_free_bytes: 1 << 20, max_used_bytes: 1 << 30 };
+        let directory = tempdir().unwrap();
+        let files = [super::super::DATABASE_FILE, super::super::device_store::DEVICE_DATABASE_FILE]
+            .map(|file| directory.path().join("persistent").join(file));
+        let pages = || files.clone().map(|file| {
+            crate::sqlite_open::open(file).unwrap().query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0)).unwrap()
+        });
+        drop(PersistentStore::open(directory.path()).unwrap());
+        for file in &files {
+            crate::sqlite_open::open(file).unwrap().execute_batch("CREATE TABLE synthetic_filler(body BLOB NOT NULL);
+                INSERT INTO synthetic_filler WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1024)
+                    SELECT randomblob(4096) FROM n;
+                DROP TABLE synthetic_filler; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let grown = pages();
+        let admission = Arc::new(Admission::default());
+        // Other tests take the repository lock, so the open that must compact waits for it.
+        let compaction = |repository_lock| Some(FirstOpenCompaction { admission: &admission, limits, repository_lock });
+        let waiting = || crate::asset_repository::coordinator::lock_repository_mutation().map(Some);
+
+        let state = PersistentStoreState::default();
+        let operation = state.admit_renderer_operation().unwrap();
+        let held = admission.file(false).unwrap();
+        open_renderer_persistent_store_admitted(&state, &operation, directory.path(), compaction(waiting)).unwrap();
+        drop(held);
+        assert_eq!(pages(), grown, "a store was compacted while a native job held the library");
+        state.store.lock().unwrap().take();
+        open_renderer_persistent_store_admitted(&state, &operation, directory.path(), compaction(waiting)).unwrap();
+        assert_eq!(pages(), grown, "a later open of the same process compacted");
+        drop(operation);
+        drop(state);
+
+        let state = PersistentStoreState::default();
+        let operation = state.admit_renderer_operation().unwrap();
+        open_renderer_persistent_store_admitted(&state, &operation, directory.path(), compaction(|| Ok(None))).unwrap();
+        assert_eq!(pages(), grown, "a store was compacted while an asset job held the repository");
+        drop(operation);
+        drop(state);
+
+        let state = PersistentStoreState::default();
+        let operation = state.admit_renderer_operation().unwrap();
+        open_renderer_persistent_store_admitted(&state, &operation, directory.path(), compaction(waiting)).unwrap();
+        let compacted = pages();
+        assert!(compacted[0] < grown[0] / 2 && compacted[1] < grown[1] / 2, "{compacted:?} of {grown:?}");
+        let guard = state.store.lock().unwrap();
+        let store = guard.as_ref().unwrap();
+        assert!(store.revision().is_ok() && store.device_store().unwrap().revision().is_ok());
     }
 
     #[test]
@@ -3488,6 +3599,7 @@ mod tests {
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
             retired_purge_started: AtomicBool::new(false),
+            compaction_checked: AtomicBool::new(false),
         });
         let barrier = Arc::new(Barrier::new(3));
         let active = Arc::new(AtomicUsize::new(0));

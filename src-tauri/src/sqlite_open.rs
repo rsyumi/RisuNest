@@ -18,7 +18,7 @@ pub(crate) fn open_with_flags(path: impl AsRef<Path>, flags: OpenFlags) -> Resul
 /// that no checkpoint passes, so a database is opened by its plain drive path
 /// whenever that path names the same file.
 #[cfg(windows)]
-fn sqlite_path(path: &Path) -> &Path {
+pub(crate) fn sqlite_path(path: &Path) -> &Path {
     let plain = path
         .to_str()
         .and_then(|path| path.strip_prefix(r"\\?\"))
@@ -38,7 +38,7 @@ fn sqlite_path(path: &Path) -> &Path {
 }
 
 #[cfg(not(windows))]
-fn sqlite_path(path: &Path) -> &Path {
+pub(crate) fn sqlite_path(path: &Path) -> &Path {
     path
 }
 

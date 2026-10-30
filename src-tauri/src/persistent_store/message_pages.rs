@@ -1370,6 +1370,17 @@ pub(super) fn object_roots<'a>(
     Ok(roots)
 }
 
+/// Every unit value found inside `bodies`, which no store table holds, such as
+/// received pages that are not staged yet.
+pub(super) fn json_roots(objects: &Connection, bodies: &[Value], scratch: Connection) -> StoreResult<ObjectRoots> {
+    let mut roots = ObjectRoots::new(scratch)?;
+    for body in bodies {
+        roots.json(objects, body)?;
+    }
+    roots.scratch.execute_batch("COMMIT")?;
+    Ok(roots)
+}
+
 /// Collects the objects that library rows visible on `db` reference: page
 /// indexes and manifests of every generation, unit values in every unit table,
 /// and hashes kept by staged restores and external storage captures.
@@ -1460,17 +1471,55 @@ pub(crate) struct ObjectSweep {
     pub(crate) wrapped: bool,
 }
 
-/// Visits up to `limit` objects of the store that `tx` writes, after its stored
-/// cursor. An object nothing references is marked the first time and deleted
-/// once it has stayed unreferenced for `grace_ms`; a referenced object loses
-/// its mark.
+/// Visits up to `limit` objects of the store that `tx` writes: first those whose
+/// mark is older than `grace_ms`, wherever they are, then those after its
+/// stored cursor. An object none of `roots` references is marked the first time
+/// and deleted once it has stayed unreferenced for `grace_ms`; a referenced
+/// object loses its mark. Deleted hashes are added to `deleted`.
 pub(super) fn sweep_objects(
     tx: &Transaction<'_>,
-    roots: &ObjectRoots,
+    roots: &[&ObjectRoots],
     now_ms: i64,
     grace_ms: i64,
     limit: usize,
+    deleted: &mut Vec<String>,
 ) -> StoreResult<ObjectSweep> {
+    let referenced = |hash: &str| -> StoreResult<bool> {
+        for roots in roots {
+            if roots.contains(hash)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let mut sweep = ObjectSweep::default();
+    // Marks are few next to objects, so they are read without an index.
+    let expired: Vec<(String, Option<i64>)> = {
+        let mut statement = tx.prepare(
+            "SELECT m.hash,length(o.body) FROM message_page_object_marks m
+            LEFT JOIN message_page_objects o ON o.hash=m.hash
+            WHERE m.unreferenced_since<=?1 LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![now_ms.saturating_sub(grace_ms), limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (hash, size) in &expired {
+        match size {
+            Some(size) if !referenced(hash)? => {
+                tx.execute("DELETE FROM message_page_objects WHERE hash=?1", [hash])?;
+                sweep.deleted += 1;
+                sweep.deleted_bytes += u64::try_from(*size).unwrap_or(0);
+                deleted.push(hash.clone());
+            }
+            _ => {
+                tx.execute("DELETE FROM message_page_object_marks WHERE hash=?1", [hash])?;
+            }
+        }
+    }
+    let limit = limit - expired.len();
+    if limit == 0 {
+        return Ok(sweep);
+    }
     let after: Option<String> = tx
         .query_row("SELECT after_hash FROM message_page_sweep_cursor WHERE singleton=1", [], |row| row.get(0))
         .optional()?;
@@ -1483,9 +1532,8 @@ pub(super) fn sweep_objects(
         let rows = statement.query_map(params![after, limit as i64], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<_, _>>()?
     };
-    let mut sweep = ObjectSweep::default();
     for (hash, size, mark) in &candidates {
-        if roots.contains(hash)? {
+        if referenced(hash)? {
             if mark.is_some() {
                 tx.execute("DELETE FROM message_page_object_marks WHERE hash=?1", [hash])?;
             }
@@ -1500,6 +1548,7 @@ pub(super) fn sweep_objects(
                 tx.execute("DELETE FROM message_page_objects WHERE hash=?1", [hash])?;
                 sweep.deleted += 1;
                 sweep.deleted_bytes += u64::try_from(*size).unwrap_or(0);
+                deleted.push(hash.clone());
             }
             Some(_) => {}
         }
@@ -1517,6 +1566,21 @@ pub(super) fn sweep_objects(
         }
     }
     Ok(sweep)
+}
+
+/// Marks the objects among `hashes` that this store holds as unreferenced since
+/// `since`, keeping an older mark. A sweep still deletes only what it finds
+/// unreferenced.
+pub(super) fn mark_unreferenced<'a>(db: &Connection, hashes: impl IntoIterator<Item = &'a str>, since: i64) -> StoreResult<()> {
+    let mut statement = db.prepare_cached(
+        "INSERT INTO message_page_object_marks(hash,unreferenced_since)
+        SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)
+        ON CONFLICT(hash) DO UPDATE SET unreferenced_since=min(unreferenced_since,excluded.unreferenced_since)",
+    )?;
+    for hash in hashes {
+        statement.execute(params![hash, since])?;
+    }
+    Ok(())
 }
 
 /// A marked object may be collected soon, so callers that would otherwise skip

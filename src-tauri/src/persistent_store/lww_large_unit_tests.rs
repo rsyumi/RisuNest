@@ -263,34 +263,51 @@ fn device_object(store: &PersistentStore, table: &str, hash: &str) -> bool {
 
 #[test]
 fn a_superseded_device_large_unit_body_is_reclaimed_once_no_backup_lease_reads_it() {
-    let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
+    use device_store::plugin_values::PluginDeviceMutation;
+    let (grace, short) = (super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, super::super::SUPERSEDED_OBJECT_GRACE_MS);
     let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
     let device = super::super::MessageObjectStore::Device;
+    let clock = || super::super::commands::current_time_ms().unwrap();
     let (_dir, mut store) = store();
     store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
-    let (old, new) = (text(MAX_INLINE_UNIT_BYTES + 3), text(MAX_INLINE_UNIT_BYTES + 4));
-    let old_hash = risunest_sync_wire::hash(&canonical(&Value::String(old.clone())));
-    let new_hash = risunest_sync_wire::hash(&canonical(&Value::String(new.clone())));
+    let [old, new, newer, newest] = [3, 4, 5, 6].map(|extra| text(MAX_INLINE_UNIT_BYTES + extra));
+    let hash = |value: &str| risunest_sync_wire::hash(&canonical(&Value::String(value.to_owned())));
     write_plugin(&mut store, &old);
     ack_all(&mut store);
     let lease = store.lww_acquire_library_backup_capture(store.revision().unwrap()).unwrap();
     write_plugin(&mut store, &new);
     ack_all(&mut store);
-    assert!(device_object(&store, "message_page_objects", &old_hash));
+    assert!(device_object(&store, "message_page_objects", &hash(&old)));
 
-    let now = 1_900_000_000_000i64;
-    store.sweep_message_page_objects(device, now, limit).unwrap();
-    store.sweep_message_page_objects(device, now + grace, limit).unwrap();
-    assert!(device_object(&store, "message_page_objects", &old_hash), "a backup lease still reads the old device unit");
+    let now = clock();
+    store.sweep_message_page_objects(device, now + short, limit).unwrap();
+    assert!(device_object(&store, "message_page_objects", &hash(&old)), "a backup lease still reads the old device unit");
+    assert!(!device_object(&store, "message_page_object_marks", &hash(&old)), "a referenced body kept its mark");
     store.release_revision(&lease.lease).unwrap();
-    store.sweep_message_page_objects(device, now + 2 * grace, limit).unwrap();
-    assert!(device_object(&store, "message_page_object_marks", &old_hash));
-    store.sweep_message_page_objects(device, now + 3 * grace, limit).unwrap();
-    assert!(!device_object(&store, "message_page_objects", &old_hash), "the superseded device body survived");
-    assert!(device_object(&store, "message_page_objects", &new_hash));
-    assert!(!device_object(&store, "message_page_object_marks", &new_hash));
-    assert_eq!(plugin_value(&store), Some(new.clone()));
-    assert_eq!(store.lww_object_body(&new_hash).unwrap(), Some(canonical(&Value::String(new))));
+    store.sweep_message_page_objects(device, now + 2 * short, limit).unwrap();
+    assert!(device_object(&store, "message_page_object_marks", &hash(&old)));
+    store.sweep_message_page_objects(device, now + 2 * short + grace, limit).unwrap();
+    assert!(!device_object(&store, "message_page_objects", &hash(&old)), "the superseded device body survived");
+
+    // With no reader left, a replaced body waits only the short grace, unless
+    // another key still names it.
+    store.device_store_mut().unwrap().write_plugin_device_values(PLUGIN_KEY[1], &[
+        PluginDeviceMutation::Set { space: PLUGIN_KEY[2].into(), key: "copy".into(), value: newer.clone() },
+    ]).unwrap();
+    let before = clock();
+    write_plugin(&mut store, &newer);
+    write_plugin(&mut store, &newest);
+    let after = clock();
+    ack_all(&mut store);
+    store.sweep_message_page_objects(device, before + short - 60_000, limit).unwrap();
+    assert!(device_object(&store, "message_page_objects", &hash(&new)), "a replaced body went before its grace");
+    store.sweep_message_page_objects(device, after + short, limit).unwrap();
+    assert!(!device_object(&store, "message_page_objects", &hash(&new)), "a replaced body outlived the short grace");
+    assert!(device_object(&store, "message_page_objects", &hash(&newer)), "a body another key names was deleted");
+    assert!(!device_object(&store, "message_page_object_marks", &hash(&newer)));
+    assert!(!device_object(&store, "message_page_object_marks", &hash(&newest)));
+    assert_eq!(plugin_value(&store), Some(newest.clone()));
+    assert_eq!(store.lww_object_body(&hash(&newest)).unwrap(), Some(canonical(&Value::String(newest))));
 }
 
 #[test]
@@ -300,7 +317,7 @@ fn a_marked_body_is_stored_again_before_a_write_or_receive_relies_on_it() {
     store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
     let values = [MAX_INLINE_UNIT_BYTES + 3, MAX_INLINE_UNIT_BYTES + 4, MAX_INLINE_UNIT_BYTES + 5].map(text);
     let hashes = values.clone().map(|value| risunest_sync_wire::hash(&canonical(&Value::String(value))));
-    let now = 1_900_000_000_000i64;
+    let now = super::super::commands::current_time_ms().unwrap();
     write_plugin(&mut store, &values[0]);
     write_plugin(&mut store, &values[1]);
     ack_all(&mut store);
@@ -328,6 +345,87 @@ fn a_marked_body_is_stored_again_before_a_write_or_receive_relies_on_it() {
     assert_eq!(store.external_lww_verified_control_size(&control_hash).unwrap(), Some(control.len() as u64));
 }
 
+
+#[test]
+fn received_plugin_bodies_wait_the_short_grace_in_either_store() {
+    let (short, limit) = (super::super::SUPERSEDED_OBJECT_GRACE_MS, super::super::MESSAGE_PAGE_SWEEP_LIMIT);
+    let (library, device) = (super::super::MessageObjectStore::Library, super::super::MessageObjectStore::Device);
+    let clock = || super::super::commands::current_time_ms().unwrap();
+    let (_dir, mut store) = store();
+    store.device_store_mut().unwrap().set_section_participating(device_store::Section::LocalPlugins, true).unwrap();
+    let library_object = |store: &PersistentStore, table: &str, hash: &str| -> bool {
+        store.connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE hash=?1)"), [hash], |row| row.get(0)).unwrap()
+    };
+    let bodies = [3, 4, 5, 6].map(|extra| canonical(&Value::String(text(MAX_INLINE_UNIT_BYTES + extra))));
+    let hashes = bodies.clone().map(|body| risunest_sync_wire::hash(&body));
+    let change = |key: &[&str], value, time| Change { key: unit_key(key).unwrap(), stamp: stamp(time), value };
+
+    // A shared plugin value lives in the library store.
+    const SHARED: [&str; 3] = ["plugin", "synthetic-owner", "settings"];
+    let value = published(&store, &bodies[0]);
+    receive(&mut store, change(&SHARED, value, 1));
+    let value = published(&store, &bodies[1]);
+    let before = clock();
+    receive(&mut store, change(&SHARED, value, 2));
+    let after = clock();
+    store.sweep_message_page_objects(library, before + short - 60_000, limit).unwrap();
+    assert!(library_object(&store, "message_page_objects", &hashes[0]), "a replaced shared body went before its grace");
+    store.sweep_message_page_objects(library, after + short, limit).unwrap();
+    assert!(!library_object(&store, "message_page_objects", &hashes[0]), "a replaced shared body outlived the short grace");
+    assert!(library_object(&store, "message_page_objects", &hashes[1]));
+
+    // A received device value leaves its body in the library store as well.
+    let value = published(&store, &bodies[2]);
+    receive(&mut store, change(&PLUGIN_KEY, value, 3));
+    assert!(device_object(&store, "message_page_objects", &hashes[2]) && library_object(&store, "message_page_objects", &hashes[2]));
+    let value = published(&store, &bodies[3]);
+    receive(&mut store, change(&PLUGIN_KEY, value, 4));
+    let after = clock();
+    store.sweep_message_page_objects(device, after + short, limit).unwrap();
+    assert!(!device_object(&store, "message_page_objects", &hashes[2]));
+    assert!(library_object(&store, "message_page_objects", &hashes[2]));
+    store.sweep_message_page_objects(library, after + 2 * short - 60_000, limit).unwrap();
+    assert!(library_object(&store, "message_page_objects", &hashes[2]), "the library copy went before its grace");
+    store.sweep_message_page_objects(library, after + 2 * short, limit).unwrap();
+    assert!(!library_object(&store, "message_page_objects", &hashes[2]), "the library copy of a reclaimed device body stayed");
+    assert!(library_object(&store, "message_page_objects", &hashes[3]), "the library copy of the current device body was deleted");
+    assert!(device_object(&store, "message_page_objects", &hashes[3]));
+    assert_eq!(plugin_value(&store), Some(text(MAX_INLINE_UNIT_BYTES + 6)));
+}
+
+#[test]
+fn a_body_only_a_pending_received_page_names_survives_the_sweep() {
+    use crate::server_sync::lww_client::OperationLog;
+    let (grace, limit) = (super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, super::super::MESSAGE_PAGE_SWEEP_LIMIT);
+    let library = super::super::MessageObjectStore::Library;
+    let (_dir, mut store) = store();
+    let root = store.repository_root().to_owned();
+    let present = |store: &PersistentStore, hash: &str| -> bool {
+        store.connection.query_row("SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)", [hash], |row| row.get(0)).unwrap()
+    };
+    let now = 1_900_000_000_000i64;
+    store.sweep_message_page_objects(library, now, limit).unwrap();
+    assert!(!OperationLog::path(&root).exists(), "a sweep created the operation log");
+
+    let body = canonical(&Value::String(text(MAX_INLINE_UNIT_BYTES + 7)));
+    let hash = risunest_sync_wire::hash(&body);
+    let page = StageReceive {
+        header: Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "synthetic-page".into() },
+        changes: vec![Change { key: unit_key(&LANGUAGE).unwrap(), stamp: stamp(1), value: published(&store, &body) }],
+        progress: Progress { kind: "server".into(), cursor: 1.into(), writer_id: None },
+        admitted_time_upper_ms: 1.into(),
+    };
+    let log = OperationLog::open(&root).unwrap();
+    log.0.execute("INSERT INTO receive_pages VALUES('synthetic-authority',?1,NULL,0,0)", [serde_json::to_string(&page).unwrap()]).unwrap();
+    for step in 0..3 {
+        store.sweep_message_page_objects(library, now + step * grace, limit).unwrap();
+    }
+    assert!(present(&store, &hash), "a body a pending received page names was deleted");
+    log.0.execute("DELETE FROM receive_pages", []).unwrap();
+    store.sweep_message_page_objects(library, now + 3 * grace, limit).unwrap();
+    store.sweep_message_page_objects(library, now + 4 * grace, limit).unwrap();
+    assert!(!present(&store, &hash));
+}
 
 #[test]
 fn conditional_plugin_local_writes_reject_received_values_deletions_and_staged_payloads() {
