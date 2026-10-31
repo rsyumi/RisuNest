@@ -1492,10 +1492,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         }
     }
 
-    if(DBState.db.personaPrompt){
+    const personaPrompt = getPersonaPrompt()
+    if(personaPrompt){
         unformated.personaPrompt.push({
             role: 'system',
-            content: risuChatParser(getPersonaPrompt(), {chara: currentChar})
+            content: risuChatParser(personaPrompt, {chara: currentChar})
         })
     }
     
