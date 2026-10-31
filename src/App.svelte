@@ -18,6 +18,7 @@
     import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { readModule } from './ts/process/modules';
     import { alertNormal } from './ts/alert';
+    import { showsDialog } from './ts/alertQueue';
     import { language } from './lang';
     import RealmFrame from './lib/UI/Realm/RealmFrame.svelte';
     import SavePopupIconComp from './lib/Others/SavePopupIcon.svelte';
@@ -72,7 +73,8 @@
     import { openRisuNestSettingsTab } from './ts/setting/risuNestSettingsTabs'
 
     const bootFailureVisible = $derived(!$loadedStore && !$recoveryStart && !!$bootFailure)
-    const appLockVisible = $derived(isTauri && !bootFailureVisible && ($loadedStore || !!$recoveryStart) && appLock.gated)
+    // A dialog during loading waits behind the lock, so the lock screen comes up before loading finishes.
+    const appLockVisible = $derived(isTauri && !bootFailureVisible && ($loadedStore || !!$recoveryStart || showsDialog($alertStore)) && appLock.gated)
 
     const appLockFramesHidden = $derived(isTauri && !bootFailureVisible && appLock.gated)
 
@@ -96,7 +98,7 @@
     $effect(() => {
         if (!isTauri) return
         const failure = bootFailureVisible
-        const loading = !$loadedStore && !$recoveryStart && !$bootFailure
+        const loading = !$loadedStore && !$recoveryStart && !$bootFailure && !appLockVisible
         const epoch = appLock.state.epoch
         const presentation = appLock.state.presentationRevision
         const initialized = appLock.state.initialized
