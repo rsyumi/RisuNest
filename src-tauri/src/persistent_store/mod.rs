@@ -3205,13 +3205,36 @@ impl PersistentStore {
     /// a reference committed before the pass is seen. They are read again only
     /// after a change on either connection or to the held leases; pages server
     /// sync received and has not staged yet are read on every pass. Callers hold
-    /// native file admission so no replacement runs meanwhile. A copy of a
-    /// deleted object in the other store then waits only the short grace.
+    /// native file admission so no replacement runs meanwhile. Copies of the
+    /// deleted objects in the other store are marked with the short grace before
+    /// the deletion commits, so a failed mark leaves the deletion to a later pass.
     pub(crate) fn sweep_message_page_objects(
         &mut self,
         target: MessageObjectStore,
         now_ms: i64,
         limit: usize,
+    ) -> StoreResult<message_pages::ObjectSweep> {
+        self.sweep_message_page_batch(target, now_ms, limit, true)
+    }
+
+    /// The next batch of a pass that `sweep_message_page_objects` began. The
+    /// pass already visited the marks past their grace, so this batch visits
+    /// only the objects after the cursor.
+    pub(crate) fn continue_message_page_sweep(
+        &mut self,
+        target: MessageObjectStore,
+        now_ms: i64,
+        limit: usize,
+    ) -> StoreResult<message_pages::ObjectSweep> {
+        self.sweep_message_page_batch(target, now_ms, limit, false)
+    }
+
+    fn sweep_message_page_batch(
+        &mut self,
+        target: MessageObjectStore,
+        now_ms: i64,
+        limit: usize,
+        expired_marks: bool,
     ) -> StoreResult<message_pages::ObjectSweep> {
         let Ok(device) = self.device_store.as_mut() else {
             return Ok(message_pages::ObjectSweep { wrapped: true, ..Default::default() });
@@ -3236,10 +3259,11 @@ impl PersistentStore {
                 now_ms,
                 ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
                 limit,
+                expired_marks,
                 &mut deleted,
             )?;
-            transaction.commit()?;
             mark_other_copies(&self.connection, &deleted, early)?;
+            transaction.commit()?;
             self.message_object_roots.committed(before, &self.connection, device.connection());
             return Ok(sweep);
         }
@@ -3258,10 +3282,11 @@ impl PersistentStore {
             now_ms,
             ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
             limit,
+            expired_marks,
             &mut deleted,
         )?;
-        transaction.commit()?;
         mark_other_copies(device.connection(), &deleted, early)?;
+        transaction.commit()?;
         self.message_object_roots.committed(before, &self.connection, device.connection());
         Ok(sweep)
     }

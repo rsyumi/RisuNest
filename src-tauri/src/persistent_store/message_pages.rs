@@ -1471,17 +1471,19 @@ pub(crate) struct ObjectSweep {
     pub(crate) wrapped: bool,
 }
 
-/// Visits up to `limit` objects of the store that `tx` writes: first those whose
-/// mark is older than `grace_ms`, wherever they are, then those after its
-/// stored cursor. An object none of `roots` references is marked the first time
-/// and deleted once it has stayed unreferenced for `grace_ms`; a referenced
-/// object loses its mark. Deleted hashes are added to `deleted`.
+/// Visits up to `limit` objects of the store that `tx` writes: first, when
+/// `expired_marks` is set, those whose mark is older than `grace_ms`, wherever
+/// they are, then those after its stored cursor. An object none of `roots`
+/// references is marked the first time and deleted once it has stayed
+/// unreferenced for `grace_ms`; a referenced object loses its mark. Deleted
+/// hashes are added to `deleted`.
 pub(super) fn sweep_objects(
     tx: &Transaction<'_>,
     roots: &[&ObjectRoots],
     now_ms: i64,
     grace_ms: i64,
     limit: usize,
+    expired_marks: bool,
     deleted: &mut Vec<String>,
 ) -> StoreResult<ObjectSweep> {
     let referenced = |hash: &str| -> StoreResult<bool> {
@@ -1493,8 +1495,9 @@ pub(super) fn sweep_objects(
         Ok(false)
     };
     let mut sweep = ObjectSweep::default();
-    // Marks are few next to objects, so they are read without an index.
-    let expired: Vec<(String, Option<i64>)> = {
+    // Without an index this reads every mark, so a pass of several batches
+    // reads them in its first batch only.
+    let expired: Vec<(String, Option<i64>)> = if expired_marks {
         let mut statement = tx.prepare(
             "SELECT m.hash,length(o.body) FROM message_page_object_marks m
             LEFT JOIN message_page_objects o ON o.hash=m.hash
@@ -1502,6 +1505,8 @@ pub(super) fn sweep_objects(
         )?;
         let rows = statement.query_map(params![now_ms.saturating_sub(grace_ms), limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
     };
     for (hash, size) in &expired {
         match size {
@@ -1527,7 +1532,7 @@ pub(super) fn sweep_objects(
         let mut statement = tx.prepare(
             "SELECT o.hash,length(o.body),m.unreferenced_since FROM message_page_objects o
             LEFT JOIN message_page_object_marks m ON m.hash=o.hash
-            WHERE ?1 IS NULL OR o.hash>?1 ORDER BY o.hash LIMIT ?2",
+            WHERE o.hash>coalesce(?1,'') ORDER BY o.hash LIMIT ?2",
         )?;
         let rows = statement.query_map(params![after, limit as i64], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<_, _>>()?

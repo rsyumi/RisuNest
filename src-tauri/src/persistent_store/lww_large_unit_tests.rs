@@ -381,6 +381,12 @@ fn received_plugin_bodies_wait_the_short_grace_in_either_store() {
     let value = published(&store, &bodies[3]);
     receive(&mut store, change(&PLUGIN_KEY, value, 4));
     let after = clock();
+    // A mark the library store refuses keeps the device copy for the next sweep.
+    store.connection.execute_batch("CREATE TEMP TRIGGER synthetic_mark_refusal BEFORE INSERT ON main.message_page_object_marks
+        BEGIN SELECT RAISE(ABORT,'synthetic mark refusal'); END;").unwrap();
+    assert!(store.sweep_message_page_objects(device, after + short, limit).is_err());
+    assert!(device_object(&store, "message_page_objects", &hashes[2]), "the device copy went without marking the library copy");
+    store.connection.execute_batch("DROP TRIGGER temp.synthetic_mark_refusal").unwrap();
     store.sweep_message_page_objects(device, after + short, limit).unwrap();
     assert!(!device_object(&store, "message_page_objects", &hashes[2]));
     assert!(library_object(&store, "message_page_objects", &hashes[2]));

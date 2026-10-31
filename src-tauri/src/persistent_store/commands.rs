@@ -1766,13 +1766,17 @@ fn sweep_message_pages(
         return Ok(());
     };
     for target in [super::MessageObjectStore::Library, super::MessageObjectStore::Device] {
+        let mut first = true;
         loop {
             let Ok(_permit) = admission.file(false) else {
                 return Ok(());
             };
-            let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| {
+            let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| if first {
                 store.sweep_message_page_objects(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
+            } else {
+                store.continue_message_page_sweep(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
             })?;
+            first = false;
             if sweep.wrapped || budget == SweepBudget::OneBatch {
                 break;
             }
@@ -2678,6 +2682,43 @@ mod tests {
         sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
         assert_eq!(count(&expired, "message_page_object_marks"), (1, 1));
         assert_eq!(count(&expired, "message_page_sweep_cursor"), (0, 0));
+    }
+
+    #[test]
+    fn a_cleanup_pass_reads_the_marks_once_however_many_batches_it_takes() {
+        use crate::native_file_jobs::admission::Admission;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
+        let admission = Arc::new(Admission::default());
+        // The first pass marks every object and none waits out its grace in the
+        // second, so reading the marks finds nothing to delete there.
+        let steps = |batches: usize| {
+            let directory = tempdir().unwrap();
+            let store = PersistentStore::open(directory.path()).unwrap();
+            let tx = store.connection.unchecked_transaction().unwrap();
+            for index in 0..batches * limit {
+                let body = format!("synthetic-orphan-object-{index}").into_bytes();
+                super::super::message_pages::put_object(&tx, &risunest_sync_wire::hash(&body), &body).unwrap();
+            }
+            tx.commit().unwrap();
+            let state = PersistentStoreState::with_test_store(store);
+            let operation = state.admit_renderer_operation().unwrap();
+            sweep_message_pages(Some(&admission), &state, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
+            let counted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&counted);
+            let count = move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            };
+            state.store.lock().unwrap().as_ref().unwrap().connection.progress_handler(64, Some(count)).unwrap();
+            sweep_message_pages(Some(&admission), &state, &operation, 2_000, SweepBudget::UntilWrapped).unwrap();
+            state.store.lock().unwrap().as_ref().unwrap().connection.progress_handler(64, None::<fn() -> bool>).unwrap();
+            counted.load(Ordering::Relaxed)
+        };
+        // Batches of equal cost make 16 about 8 times 2; reading every mark or
+        // every object before the cursor in each batch grows faster than that.
+        let (fewer, more) = (steps(2), steps(16));
+        assert!(more <= fewer * 12, "{fewer} steps for 2 batches of marked objects, {more} for 16");
     }
 
     #[test]

@@ -82,7 +82,7 @@ mod tests {
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA user_version=7; PRAGMA application_id=1234;
             CREATE TABLE kept(value TEXT NOT NULL);
             CREATE TABLE bodies(hash TEXT PRIMARY KEY, body BLOB NOT NULL);
-            CREATE INDEX kept_values ON kept(value);").unwrap();
+            CREATE INDEX body_sizes ON bodies(length(body));").unwrap();
         let tx = connection.unchecked_transaction().unwrap();
         for index in 0..400 {
             tx.execute("INSERT INTO bodies VALUES(?1,?2)", rusqlite::params![format!("synthetic-{index}"), vec![7u8; 8_192]]).unwrap();
@@ -97,6 +97,8 @@ mod tests {
         connection
     }
 
+    /// `kept` has no index, so it shows whether the copy renumbered rowids, as a
+    /// plain `VACUUM` does for such a table.
     fn snapshot(connection: &Connection) -> (Vec<(i64, String)>, Vec<String>, i64, i64, String) {
         let rows = connection.prepare("SELECT rowid,value FROM kept ORDER BY rowid").unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
