@@ -20,7 +20,6 @@ vi.mock('../platform', async () => (await import('../platform.testSupport')).pla
 )))
 vi.mock('@tauri-apps/plugin-http', async () => (await import('../globalApi.testSupport')).tauriHttpModule())
 
-import { fetch as pluginFetch } from '@tauri-apps/plugin-http'
 import { getDatabase } from '../storage/database.svelte'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { doingChat } from '../process/generationState'
@@ -185,10 +184,10 @@ describe('Google Translate', () => {
     const translated = () => new Response(JSON.stringify([[['KO paragraph']]]))
     const refused = () => new Response('<html>synthetic refusal</html>', { status: 429 })
     const unreachable = (): Response => { throw new TypeError('Load failed') }
-    function googleRequest(runtime: 'tauri' | 'web', webView: (url: string) => Response, native: (url: string) => Response = translated) {
+    function googleRequest(runtime: 'tauri' | 'web', webView: (url: string, q: string | null) => Response | Promise<Response>, native: (url: string) => Response = translated) {
         f.translatorType = 'google'
         f.tauri = runtime === 'tauri'
-        const webFetch = vi.fn(async (url: URL | string, _init: SentRequest) => webView(String(url)))
+        const webFetch = vi.fn(async (url: URL | string, init: SentRequest) => webView(String(url), new URLSearchParams(init.body).get('q')))
         vi.stubGlobal('fetch', webFetch)
         vi.mocked(pluginFetch).mockImplementation(async url => native(String(url)))
         const requests = (calls: unknown[][], body: 'body' | 'dataText') => calls.map(([url, init]) => (
@@ -198,6 +197,14 @@ describe('Google Translate', () => {
     }
     const endpoint = 'https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&dt=t&sl=en&tl=ko'
     const clientOf = ({ url }: { url: string }) => new URL(url).searchParams.get('client')
+    // Translations remember the client that answered, so every test starts the translator anew.
+    let translate: typeof import('./translator').translate
+    let pluginFetch: typeof import('@tauri-apps/plugin-http').fetch
+    beforeEach(async () => {
+        vi.resetModules()
+        ;({ translate } = await import('./translator'))
+        ;({ fetch: pluginFetch } = await import('@tauri-apps/plugin-http'))
+    })
 
     it.each(['tauri', 'web'] as const)('sends a paragraph of any length in the WebView request body on %s', async runtime => {
         const sent = googleRequest(runtime, translated)
@@ -212,10 +219,11 @@ describe('Google Translate', () => {
         expect(sent().native).toEqual([{ url: endpoint, method: 'POST', q: text }])
     })
     it('translates through the experimental Google page on Tauri', async () => {
+        const { globalFetch } = await vi.importActual<typeof import('../globalApi.svelte')>('../globalApi.svelte')
         const page = '<html><body><div class="result-container">KO experimental</div></body></html>'
         googleRequest('tauri', translated, () => new Response(page, { headers: { 'Content-Type': 'text/html' } }))
         f.experimentalGoogle = true
-        f.fetch.mockImplementation((await vi.importActual<typeof import('../globalApi.svelte')>('../globalApi.svelte')).globalFetch)
+        f.fetch.mockImplementation(globalFetch)
         await expect(translate('paragraph for the experimental Google page', false)).resolves.toBe('KO experimental')
     })
     it('passes on the native error when neither client reaches Google on Tauri', async () => {
@@ -243,5 +251,24 @@ describe('Google Translate', () => {
         await expect(translate(`${runtime} paragraph after the last client is refused`, false)).resolves.toBe('KO paragraph')
         expect(sent().webView.map(clientOf)).toEqual(['dict-chrome-ex', 'at', 'at', 'at', 'gtx', 'gtx', 'dict-chrome-ex'])
         expect(f.alert).not.toHaveBeenCalled()
+    })
+    it('asks every client for a translation that waited while another one found the client Google answers', async () => {
+        let release!: () => void
+        const held = new Promise<void>(resolve => { release = resolve })
+        const waitingText = 'paragraph whose first request waits'
+        const sent = googleRequest('web', async (url, q) => {
+            if(q === waitingText && clientOf({ url }) === 'dict-chrome-ex') await held
+            return clientOf({ url }) === 'gtx' ? translated() : refused()
+        })
+        const waiting = translate(waitingText, false)
+        await expect(translate('paragraph that finds the client Google answers', false)).resolves.toBe('KO paragraph')
+        expect(sent().webView.filter(({ q }) => q === waitingText).map(clientOf)).toEqual(['dict-chrome-ex'])
+        release()
+        await expect(waiting).resolves.toBe('KO paragraph')
+        expect(f.alert).not.toHaveBeenCalled()
+    })
+    it('asks the next client on Tauri when the native request for a refused client fails', async () => {
+        googleRequest('tauri', url => clientOf({ url }) === 'dict-chrome-ex' ? refused() : translated(), () => { throw new TypeError('synthetic native transport failure') })
+        await expect(translate('paragraph whose native request fails', false)).resolves.toBe('KO paragraph')
     })
 })

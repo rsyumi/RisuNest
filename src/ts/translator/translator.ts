@@ -293,11 +293,13 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
     }
     let f: Response | null = null
     let networkError: unknown
+    // Another translation may change the remembered client while this one walks the list.
+    const firstClient = googleTranslateClient
     for(let attempt = 0; attempt < googleTranslateClients.length; attempt++){
         // Release the refused response before asking the next client.
         await f?.body?.cancel().catch(() => {})
         f = null
-        const client = (googleTranslateClient + attempt) % googleTranslateClients.length
+        const client = (firstClient + attempt) % googleTranslateClients.length
         const url = `https://${arg.host}/translate_a/single?client=${googleTranslateClients[client]}&dt=t&sl=${db.translatorInputLanguage}&tl=${arg.to}`
         // Google can refuse one HTTP client while it still answers another, and a refusal
         // may reach the WebView only as a network error.
@@ -307,7 +309,11 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
             networkError = error
         }
         if(isTauri && (f === null || f.status === 429)){
-            f = await fetchNative(url, { ...request, logFetch: false })
+            try {
+                f = await fetchNative(url, { ...request, logFetch: false })
+            } catch (error) {
+                networkError = error
+            }
         }
         if(f !== null && f.status !== 429){
             googleTranslateClient = client
