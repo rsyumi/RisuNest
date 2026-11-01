@@ -27,6 +27,7 @@ use tauri::http::{
 use tauri::{AppHandle, Manager};
 
 pub(crate) mod ipc;
+mod canvas;
 mod animation_policy;
 mod thumbnail;
 

@@ -50,6 +50,76 @@ test('real iframe clones payloads and delivers responses asynchronously', async 
     await expect(page.locator('[data-risu-plugin-frame]')).toHaveAttribute('sandbox', 'allow-scripts allow-modals allow-downloads')
 })
 
+const canvasEncoderCases = ['toBlob', 'convertToBlob'].flatMap(method => [false, true].map(forceFallback => ({ method, forceFallback })))
+for (const { method, forceFallback } of canvasEncoderCases) {
+    test(`native plugin ${method} returns real WebP while preserving the canvas snapshot with PNG fallback=${forceFallback}`, async ({ page }) => {
+        const encoded = [...await readFile(new URL('../fixtures/images/still.webp', import.meta.url))]
+        await page.addInitScript(({ bytes, forceFallback }) => {
+            if (window.parent !== window) return
+            if (forceFallback) {
+                const srcdoc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'srcdoc')!
+                // WebKit does not run Playwright init scripts in srcdoc frames. Install the
+                // unsupported-encoder boundary before the real guest bridge in both engines.
+                const installPngFallback = function() {
+                    const toBlob = HTMLCanvasElement.prototype.toBlob
+                    HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+                        return toBlob.call(this, callback, String(type).toLowerCase() === 'image/webp' ? 'image/png' : type, quality)
+                    }
+                    if (typeof OffscreenCanvas !== 'undefined') {
+                        const convertToBlob = OffscreenCanvas.prototype.convertToBlob
+                        OffscreenCanvas.prototype.convertToBlob = function(options) {
+                            return convertToBlob.call(this, String(options?.type).toLowerCase() === 'image/webp' ? { ...options, type: 'image/png' } : options)
+                        }
+                    }
+                }
+                Object.defineProperty(HTMLIFrameElement.prototype, 'srcdoc', {
+                    ...srcdoc,
+                    set(html: string) {
+                        srcdoc.set!.call(this, html.replace(/(<script nonce="[^"]+">)/, opening => `${opening}(${installPngFallback.toString()})();`))
+                    },
+                })
+            }
+            const requests: unknown[] = []
+            Object.assign(window, { canvasEncodeRequests: requests, __TAURI_INTERNALS__: {
+                metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+                invoke: async (command: string, args: { data: number[]; width: number; height: number; quality: number }) => {
+                    if (command !== 'native_media_encode_canvas_webp') throw new Error(`Unexpected native command: ${command}`)
+                    requests.push(args)
+                    return { data: bytes, outputSize: bytes.length, metadata: { mime: 'image/webp', size: bytes.length, width: args.width, height: args.height } }
+                },
+            } })
+        }, { bytes: encoded, forceFallback })
+        await page.goto('/')
+        const browserType = await page.evaluate(async method => {
+            if (method === 'convertToBlob') {
+                if (typeof OffscreenCanvas === 'undefined') return null
+                const canvas = new OffscreenCanvas(4, 3)
+                canvas.getContext('2d')
+                return (await canvas.convertToBlob({ type: 'image/webp' })).type
+            }
+            return (await new Promise<Blob | null>(resolve => document.createElement('canvas').toBlob(resolve, 'image/webp')))!.type
+        }, method)
+        test.skip(browserType === null, 'This WebKit runner has no OffscreenCanvas')
+        await page.evaluate(method => window.boundary.loadLocal(`
+            const canvas = ${method === 'toBlob' ? "document.createElement('canvas')" : 'new OffscreenCanvas(4, 3)'};
+            canvas.width = 4; canvas.height = 3;
+            const context = canvas.getContext('2d');
+            context.fillStyle = 'rgba(0,128,255,0.5)'; context.fillRect(0,0,4,3);
+            const pending = ${method === 'toBlob' ? "new Promise(resolve => canvas.toBlob(resolve, 'image/webp', 0.85))" : "canvas.convertToBlob({ type: 'image/webp', quality: 0.85 })"};
+            context.fillStyle = 'red'; context.fillRect(0,0,4,3);
+            const blob = await pending;
+            if (!blob || blob.type !== 'image/webp') throw new Error('이 브라우저는 WebP 저장을 지원하지 않습니다.');
+            const decoded = await createImageBitmap(blob);
+            await risuai.result({ type: blob.type, width: decoded.width, height: decoded.height, nativeExposed: '__TAURI_INTERNALS__' in window });
+            decoded.close();
+        `), method)
+        await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toEqual({ type: 'image/webp', width: 4, height: 3, nativeExposed: false })
+        const requests = await page.evaluate(() => (window as any).canvasEncodeRequests)
+        if (!forceFallback && browserType === 'image/webp') expect(requests).toEqual([])
+        else expect(requests).toEqual([{ data: Array.from({ length: 12 }, () => [0, 128, 255, 128]).flat(), width: 4, height: 3, quality: 0.85 }])
+    })
+}
+
 test('local plugin storage keeps structured clone values across the real iframe bridge', async ({ page }) => {
     // The native device store is a process boundary; parts live in this page.
     await page.addInitScript(() => {

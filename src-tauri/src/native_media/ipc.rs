@@ -16,6 +16,20 @@ const MAX_NATIVE_MEDIA_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CONCURRENT_NATIVE_MEDIA_TRANSFERS: usize = 4;
 const MAX_TOTAL_NATIVE_MEDIA_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024;
 
+enum EncodeRequest {
+    Inlay { id: String, name: String, options: Option<InlayEncodeOptions> },
+    CanvasWebp { width: u32, height: u32, quality: f32 },
+}
+
+impl EncodeRequest {
+    fn encode(self, data: &[u8]) -> Result<EncodedInlayImage<'_>, String> {
+        match self {
+            Self::Inlay { id, name, options } => encode_inlay_image(&id, data, &name, options),
+            Self::CanvasWebp { width, height, quality } => super::canvas::encode_webp(data, width, height, quality),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct NativeMediaInputOpened {
     capacity: usize,
@@ -672,67 +686,91 @@ pub(crate) async fn native_media_encode_inlay_finish(
     name: String,
     options: Option<InlayEncodeOptions>,
 ) -> Result<EncodedInlayIpcResult, String> {
-    logged("native_media_encode_inlay_finish", async move {
-        let cleanup_app = app.clone();
-        let cleanup_id = upload_id.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app
-                .state::<PersistentStoreState>()
-                .admit_renderer_operation()
+    logged("native_media_encode_inlay_finish", encode_uploaded(app, upload_id, EncodeRequest::Inlay { id, name, options }).await)
+}
+
+#[tauri::command(async)]
+pub(crate) async fn native_media_encode_canvas_webp_finish(
+    app: AppHandle, upload_id: String, width: u32, height: u32, quality: f32,
+) -> Result<EncodedInlayIpcResult, String> {
+    logged("native_media_encode_canvas_webp_finish", encode_uploaded(app, upload_id, EncodeRequest::CanvasWebp { width, height, quality }).await)
+}
+
+#[tauri::command(async)]
+pub(crate) async fn native_media_encode_canvas_webp(
+    app: AppHandle, data: Vec<u8>, width: u32, height: u32, quality: f32,
+) -> Result<EncodedInlayIpcResult, String> {
+    logged("native_media_encode_canvas_webp", async move {
+        tauri::async_runtime::spawn_blocking(move || {
+            let _operation = app.state::<PersistentStoreState>().admit_renderer_operation()
                 .map_err(|error| error.to_string())?;
-            let state = app.state::<NativeMediaIpcState>();
-            let input = state
-                .pool
-                .lock()
-                .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
-                .begin_uploaded_processing(&upload_id)?;
-            let _admission = state.admit_processing(&upload_id)?;
-            let (input, data) = match read_processing_input(input) {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Ok(mut pool) = state.pool.lock() {
-                        pool.finish_processing(&upload_id);
-                    }
-                    return Err(error);
-                }
-            };
-            let encoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                encode_inlay_image(&id, &data, &name, options)
-            })) {
-                Ok(Ok(value)) => value,
-                Ok(Err(error)) => {
-                    if let Ok(mut pool) = state.pool.lock() {
-                        pool.finish_processing(&input.id);
-                    }
-                    return Err(error);
-                }
-                Err(_) => {
-                    if let Ok(mut pool) = state.pool.lock() {
-                        pool.finish_processing(&input.id);
-                    }
-                    return Err("native Inlay encoder panicked".to_owned());
-                }
-            };
-            let processing_id = input.id;
-            let generation = input.generation;
-            drop(input.file);
-            finish_encoded_result(&state, processing_id, generation, encoded)
-        })
-        .await;
-        match result {
-            Ok(result) => result,
-            Err(error) => {
-                if let Some(state) = cleanup_app.try_state::<NativeMediaIpcState>() {
-                    if let Ok(mut pool) = state.pool.lock() {
-                        pool.finish_processing(&cleanup_id);
-                    }
-                }
-                Err(format!(
-                    "failed to join native Inlay streamed encoder: {error}"
-                ))
-            }
-        }
+            encode_direct_request(&app.state::<NativeMediaIpcState>(), &data, EncodeRequest::CanvasWebp { width, height, quality })
+        }).await.map_err(|error| format!("failed to join native canvas encoder: {error}"))?
     }.await)
+}
+
+async fn encode_uploaded(
+    app: AppHandle, upload_id: String, request: EncodeRequest,
+) -> Result<EncodedInlayIpcResult, String> {
+    let cleanup_app = app.clone();
+    let cleanup_id = upload_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let _operation = app
+            .state::<PersistentStoreState>()
+            .admit_renderer_operation()
+            .map_err(|error| error.to_string())?;
+        let state = app.state::<NativeMediaIpcState>();
+        let input = state
+            .pool
+            .lock()
+            .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
+            .begin_uploaded_processing(&upload_id)?;
+        let _admission = state.admit_processing(&upload_id)?;
+        let (input, data) = match read_processing_input(input) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Ok(mut pool) = state.pool.lock() {
+                    pool.finish_processing(&upload_id);
+                }
+                return Err(error);
+            }
+        };
+        let encoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            request.encode(&data)
+        })) {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                if let Ok(mut pool) = state.pool.lock() {
+                    pool.finish_processing(&input.id);
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Ok(mut pool) = state.pool.lock() {
+                    pool.finish_processing(&input.id);
+                }
+                return Err("native Inlay encoder panicked".to_owned());
+            }
+        };
+        let processing_id = input.id;
+        let generation = input.generation;
+        drop(input.file);
+        finish_encoded_result(&state, processing_id, generation, encoded)
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(state) = cleanup_app.try_state::<NativeMediaIpcState>() {
+                if let Ok(mut pool) = state.pool.lock() {
+                    pool.finish_processing(&cleanup_id);
+                }
+            }
+            Err(format!(
+                "failed to join native Inlay streamed encoder: {error}"
+            ))
+        }
+    }
 }
 
 #[tauri::command(async)]
@@ -781,6 +819,12 @@ pub(super) fn encode_direct(
     name: &str,
     options: Option<InlayEncodeOptions>,
 ) -> Result<EncodedInlayIpcResult, String> {
+    encode_direct_request(state, data, EncodeRequest::Inlay { id: id.to_owned(), name: name.to_owned(), options })
+}
+
+fn encode_direct_request(
+    state: &NativeMediaIpcState, data: &[u8], request: EncodeRequest,
+) -> Result<EncodedInlayIpcResult, String> {
     if data.len() > NATIVE_MEDIA_IPC_CHUNK_BYTES {
         return Err("native Inlay direct encoder input exceeds one IPC chunk".to_owned());
     }
@@ -791,7 +835,7 @@ pub(super) fn encode_direct(
         .begin_direct_processing(data.len() as u64)?;
     let _admission = state.admit_processing(&output_id)?;
     let encoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        encode_inlay_image(id, data, name, options)
+        request.encode(data)
     })) {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
@@ -812,6 +856,20 @@ pub(super) fn encode_direct(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canvas_encoding_returns_webp_and_releases_invalid_inputs() {
+        let state = super::NativeMediaIpcState::default();
+        let request = || super::EncodeRequest::CanvasWebp { width: 1, height: 1, quality: 0.85 };
+        let result = super::encode_direct_request(&state, &[20, 40, 80, 128], request()).unwrap();
+        assert!(!result.source_kept);
+        let decoded = image::load_from_memory(result.data.as_ref().unwrap()).unwrap().into_rgba8();
+        assert_eq!(decoded.dimensions(), (1, 1));
+        assert_eq!(decoded.get_pixel(0, 0)[3], 128);
+        assert!(super::encode_direct_request(&state, &[0; 3], request()).is_err());
+        assert!(state.pool.lock().unwrap().transfers.is_empty());
+        assert_eq!(state.pool.lock().unwrap().reserved_bytes, 0);
+    }
+
     #[test]
     fn queued_direct_encoders_do_not_start_before_admission_and_cancel_without_leaking() {
         let state = super::NativeMediaIpcState::default();
