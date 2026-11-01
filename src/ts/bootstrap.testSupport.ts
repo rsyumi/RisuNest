@@ -134,6 +134,12 @@ export function deviceSettingsModule(startup: BootstrapTestState) {
     } satisfies Partial<DeviceSettings>
 }
 
+export function storeCompactionModule() {
+    return {
+        compactRequestedStoreAtStart: vi.fn(async () => null), showStoreCompactionNotice: vi.fn(async () => {}),
+    } satisfies Partial<typeof import('./storage/storeCompaction')>
+}
+
 export function persistentStorageRuntimeModule() {
     return {
         initializePersistentStorage: vi.fn(),

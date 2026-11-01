@@ -13,6 +13,7 @@ import { assetResidencyStatus } from './sync/serverAssetResidency.testSupport'
 const stats = {
     snapshotBytes: 2 * 1024 * 1024,
     databaseBytes: 2 * 1024 * 1024,
+    databaseReclaimableBytes: 0,
     assetObjects: { count: 4, bytes: 3 * 1024 * 1024 },
     assetBodies: { count: 4, bytes: 3 * 1024 * 1024 },
     missingAssetBodies: { count: 0, bytes: 0 },

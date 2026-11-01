@@ -174,6 +174,15 @@ impl PersistentStoreState {
         Ok(true)
     }
 
+    /// Runs a write to a store file that does not go through the store, such as
+    /// the recovery shell's app lock record, after any store open under way.
+    pub(crate) fn outside_store_open<T>(&self, operation: impl FnOnce() -> T) -> StoreResult<T> {
+        let _store = self.store.lock().map_err(|error| StoreError::Store {
+            message: format!("persistent store mutex poisoned: {error}"),
+        })?;
+        Ok(operation())
+    }
+
     pub(crate) fn maintenance_active(&self) -> bool {
         self.renderer_gate
             .state
@@ -456,7 +465,7 @@ pub(crate) struct PersistentStoreOpenResult {
     revision: i64,
 }
 
-fn current_time_ms() -> StoreResult<i64> {
+pub(super) fn current_time_ms() -> StoreResult<i64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| StoreError::Store {
@@ -652,6 +661,111 @@ fn open_renderer_persistent_store_admitted(
     })?;
     let opening = store.is_none();
     open_persistent_store(app_data_dir, &mut store).map(|opened| (opened, opening))
+}
+
+/// Compacts the store files before the renderer opens the store when the
+/// previous start requested it, reporting the bytes copied through `progress`.
+/// Returns `None` when nothing was requested.
+#[tauri::command(async)]
+pub(crate) fn pds_store_compaction_at_start(
+    app: AppHandle,
+    state: State<'_, PersistentStoreState>,
+    progress: tauri::ipc::Channel<super::compaction::CompactionProgress>,
+) -> Result<Option<super::compaction::StartCompaction>, StoreError> {
+    logged("pds_store_compaction_at_start", (|| {
+        let operation_guard = state.admit_renderer_operation()?;
+        let app_data_dir = crate::app_paths::data_root(&app).map_err(|message| StoreError::Store { message })?;
+        let admission = app.try_state::<crate::native_file_jobs::NativeFileJobState>()
+            .map(|jobs| Arc::clone(&jobs.admission))
+            .ok_or_else(|| StoreError::Store { message: "native file admission is unavailable".to_owned() })?;
+        compact_requested_store(&state, &operation_guard, &app_data_dir, RequestedCompaction {
+            admission: &admission,
+            repository_lock: crate::asset_repository::coordinator::try_lock_repository_mutation,
+            available_space: |path: &Path| fs2::available_space(path),
+            progress_interval: super::compaction::PROGRESS_INTERVAL,
+        }, move |value| { let _ = progress.send(value); })
+    })())
+}
+
+struct RequestedCompaction<'a, S> {
+    admission: &'a Arc<crate::native_file_jobs::admission::Admission>,
+    /// Returns `None` when the repository mutation lock is busy.
+    repository_lock: fn() -> std::io::Result<Option<std::sync::MutexGuard<'static, ()>>>,
+    available_space: S,
+    progress_interval: std::time::Duration,
+}
+
+/// Compaction puts a copy in place of each store file, so a commit by another
+/// connection to the old file would be lost. Before the renderer opens the
+/// store nothing else holds the files: job and status stores open from the
+/// store, native jobs and server sync need the file admission taken here, asset
+/// job releases need the repository lock, and the recovery shell's app lock
+/// writer waits for the store mutex. A busy holder fails the compaction.
+fn compact_requested_store<S: Fn(&Path) -> std::io::Result<u64>>(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+    app_data_dir: &Path,
+    compaction: RequestedCompaction<'_, S>,
+    report: impl Fn(super::compaction::CompactionProgress) + Clone + Send + 'static,
+) -> StoreResult<Option<super::compaction::StartCompaction>> {
+    if !operation_guard.belongs_to(state) {
+        return Err(StoreError::Validation {
+            message: "renderer operation permit belongs to another persistent store".to_owned(),
+        });
+    }
+    if !super::compaction::requested(app_data_dir)? {
+        return Ok(None);
+    }
+    let store = state.store.lock().map_err(|error| StoreError::Store {
+        message: format!("persistent store mutex poisoned: {error}"),
+    })?;
+    // A renderer reload within the process finds the store open, and the
+    // request waits for the next start.
+    if store.is_some() {
+        return Ok(None);
+    }
+    // Recovery finishes on the files before they are copied.
+    let files = PersistentStore::open(app_data_dir)?.database_pages()?;
+    let permit = compaction.admission.file(true).ok();
+    let repository = (compaction.repository_lock)().ok().flatten();
+    let compacted = super::compaction::compact_requested(
+        app_data_dir,
+        files,
+        permit.is_some() && repository.is_some(),
+        compaction.available_space,
+        compaction.progress_interval,
+        report,
+    );
+    drop((permit, repository, store));
+    Ok(Some(compacted))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_store_compaction_request(
+    state: State<'_, PersistentStoreState>,
+) -> Result<StoreCompactionRequest, StoreError> {
+    logged(
+        "pds_store_compaction_request",
+        with_store(state, |store| Ok(match store.request_compaction(|path| fs2::available_space(path))? {
+            Some(shortfall_bytes) => StoreCompactionRequest::NoSpace { shortfall_bytes },
+            None => StoreCompactionRequest::Requested,
+        })),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", rename_all_fields = "camelCase")]
+pub(crate) enum StoreCompactionRequest {
+    Requested,
+    NoSpace { shortfall_bytes: u64 },
+}
+
+/// The reclaimable bytes the start notice offers, or `None` when it offers nothing.
+#[tauri::command(async)]
+pub(crate) fn pds_store_compaction_offer(
+    state: State<'_, PersistentStoreState>,
+) -> Result<Option<u64>, StoreError> {
+    logged("pds_store_compaction_offer", with_store(state, PersistentStore::compaction_offer))
 }
 
 fn open_persistent_store(
@@ -1720,13 +1834,17 @@ fn sweep_message_pages(
         return Ok(());
     };
     for target in [super::MessageObjectStore::Library, super::MessageObjectStore::Device] {
+        let mut first = true;
         loop {
             let Ok(_permit) = admission.file(false) else {
                 return Ok(());
             };
-            let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| {
+            let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| if first {
                 store.sweep_message_page_objects(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
+            } else {
+                store.continue_message_page_sweep(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
             })?;
+            first = false;
             if sweep.wrapped || budget == SweepBudget::OneBatch {
                 break;
             }
@@ -2619,6 +2737,143 @@ mod tests {
         let operation = cleanup.admit_renderer_operation().unwrap();
         sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
         assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1));
+
+        // Marks past their grace go first, though the cursor has passed them,
+        // and count toward the same batch.
+        let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
+        let (_expired_directory, expired) = open();
+        let operation = expired.admit_renderer_operation().unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        assert_eq!(count(&expired, "message_page_objects"), (1, 1), "expired marks waited for the cursor");
+        assert_eq!(count(&expired, "message_page_object_marks"), (0, 0), "the batch went past its limit");
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        assert_eq!(count(&expired, "message_page_object_marks"), (1, 1));
+        assert_eq!(count(&expired, "message_page_sweep_cursor"), (0, 0));
+    }
+
+    #[test]
+    fn a_cleanup_pass_reads_the_marks_once_however_many_batches_it_takes() {
+        use crate::native_file_jobs::admission::Admission;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
+        let admission = Arc::new(Admission::default());
+        // The first pass marks every object and none waits out its grace in the
+        // second, so reading the marks finds nothing to delete there.
+        let steps = |batches: usize| {
+            let directory = tempdir().unwrap();
+            let store = PersistentStore::open(directory.path()).unwrap();
+            let tx = store.connection.unchecked_transaction().unwrap();
+            for index in 0..batches * limit {
+                let body = format!("synthetic-orphan-object-{index}").into_bytes();
+                super::super::message_pages::put_object(&tx, &risunest_sync_wire::hash(&body), &body).unwrap();
+            }
+            tx.commit().unwrap();
+            let state = PersistentStoreState::with_test_store(store);
+            let operation = state.admit_renderer_operation().unwrap();
+            sweep_message_pages(Some(&admission), &state, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
+            let counted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&counted);
+            let count = move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            };
+            state.store.lock().unwrap().as_ref().unwrap().connection.progress_handler(64, Some(count)).unwrap();
+            sweep_message_pages(Some(&admission), &state, &operation, 2_000, SweepBudget::UntilWrapped).unwrap();
+            state.store.lock().unwrap().as_ref().unwrap().connection.progress_handler(64, None::<fn() -> bool>).unwrap();
+            counted.load(Ordering::Relaxed)
+        };
+        // Batches of equal cost make 16 about 8 times 2; reading every mark or
+        // every object before the cursor in each batch grows faster than that.
+        let (fewer, more) = (steps(2), steps(16));
+        assert!(more <= fewer * 12, "{fewer} steps for 2 batches of marked objects, {more} for 16");
+    }
+
+    #[test]
+    fn a_requested_start_compacts_the_closed_store_files_once() {
+        use super::super::compaction::{CompactionProgress, StartCompaction};
+        use crate::native_file_jobs::admission::Admission;
+        type Lock = fn() -> std::io::Result<Option<std::sync::MutexGuard<'static, ()>>>;
+        type Space = fn(&Path) -> std::io::Result<u64>;
+        let directory = tempdir().unwrap();
+        let persistent = directory.path().join("persistent");
+        let files = [super::super::DATABASE_FILE, super::super::device_store::DEVICE_DATABASE_FILE]
+            .map(|file| persistent.join(file));
+        let lengths = || files.clone().map(|file| std::fs::metadata(file).unwrap().len());
+        let request = persistent.join("store-compaction-requested");
+        drop(PersistentStore::open(directory.path()).unwrap());
+        for file in &files {
+            crate::sqlite_open::open(file).unwrap().execute_batch("CREATE TABLE synthetic_filler(body BLOB NOT NULL);
+                INSERT INTO synthetic_filler WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1024)
+                    SELECT randomblob(4096) FROM n;
+                DROP TABLE synthetic_filler; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let reclaimable = PersistentStore::open(directory.path()).unwrap().storage_stats().unwrap().database_reclaimable_bytes;
+        assert!(reclaimable >= 8 << 20, "{reclaimable}");
+        let grown = lengths();
+        let admission = Arc::new(Admission::default());
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let compact = |state: &PersistentStoreState, repository_lock: Lock, available_space: Space| {
+            let operation = state.admit_renderer_operation().unwrap();
+            let sink = Arc::clone(&reports);
+            compact_requested_store(state, &operation, directory.path(), RequestedCompaction {
+                admission: &admission, repository_lock, available_space, progress_interval: std::time::Duration::ZERO,
+            }, move |value: CompactionProgress| sink.lock().unwrap().push(value)).unwrap()
+        };
+        let request_compaction = |available: u64| PersistentStore::open(directory.path()).unwrap()
+            .request_compaction(|_| Ok(available)).unwrap();
+        // Other tests take the repository lock, so the start that must compact waits for it.
+        let waiting: Lock = || crate::asset_repository::coordinator::lock_repository_mutation().map(Some);
+        let room: Space = |_| Ok(u64::MAX);
+        let state = PersistentStoreState::default();
+
+        assert_eq!(compact(&state, waiting, room), None, "a start without a request compacted");
+        let shortfall = request_compaction(0);
+        assert!(shortfall.is_some_and(|bytes| bytes > 64 << 20) && !request.exists(), "{shortfall:?}");
+        assert_eq!(request_compaction(u64::MAX), None);
+        let held = admission.file(false).unwrap();
+        assert_eq!(compact(&state, waiting, room), Some(StartCompaction::Failed));
+        drop(held);
+        assert!(!request.exists(), "a start that could not compact kept the request");
+        request_compaction(u64::MAX);
+        assert_eq!(compact(&state, || Ok(None), room), Some(StartCompaction::Failed));
+        request_compaction(u64::MAX);
+        assert!(matches!(compact(&state, waiting, |_| Ok(0)), Some(StartCompaction::NoSpace { shortfall_bytes }) if shortfall_bytes > 64 << 20));
+        request_compaction(u64::MAX);
+        assert_eq!(compact(&state, waiting, |_| Err(std::io::Error::other("synthetic"))), Some(StartCompaction::Failed));
+        assert!(!request.exists());
+        assert_eq!(lengths(), grown, "a start that did not compact changed the files");
+
+        request_compaction(u64::MAX);
+        let operation = state.admit_renderer_operation().unwrap();
+        open_renderer_persistent_store_admitted(&state, &operation, directory.path()).unwrap();
+        drop(operation);
+        assert_eq!(compact(&state, waiting, room), None, "a reload within the process compacted the open store");
+        state.store.lock().unwrap().take();
+        assert_eq!(lengths(), grown, "an open other than the start compacted");
+        assert!(request.exists());
+
+        reports.lock().unwrap().clear();
+        let Some(StartCompaction::Compacted { reclaimed_bytes }) = compact(&state, waiting, room) else {
+            panic!("the requested start did not compact");
+        };
+        let compacted = lengths();
+        assert!(compacted[0] < grown[0] / 2 && compacted[1] < grown[1] / 2, "{compacted:?} of {grown:?}");
+        assert_eq!(reclaimed_bytes, grown.iter().sum::<u64>() - compacted.iter().sum::<u64>());
+        assert!(!request.exists());
+        let reports = reports.lock().unwrap().clone();
+        let total = reports[0].total_bytes;
+        assert!(reports.iter().all(|report| report.total_bytes == total)
+            && reports.windows(2).all(|pair| pair[0].done_bytes <= pair[1].done_bytes), "{reports:?}");
+        assert_eq!(reports.last().map(|report| report.done_bytes), Some(total));
+        let store = PersistentStore::open(directory.path()).unwrap();
+        assert!(store.revision().is_ok() && store.device_store().unwrap().revision().is_ok());
+        for connection in [&store.connection, store.device_store().unwrap().connection()] {
+            assert_eq!(connection.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)).unwrap(), "wal");
+        }
+        assert_eq!(store.storage_stats().unwrap().database_reclaimable_bytes, 0);
+        drop(store);
+        assert_eq!(compact(&state, waiting, room), None, "the next start compacted again");
     }
 
     #[test]

@@ -95,6 +95,7 @@ import { withPersistentRevisionLease } from "./storage/persistentRecordIterator"
 import {
     initializePersistentStorage,
 } from "./storage/persistentStorageRuntime";
+import { compactRequestedStoreAtStart, showStoreCompactionNotice } from "./storage/storeCompaction";
 import {
     acknowledgeRecoveredNativeRestores,
     reconcileNativeFileJobsBeforeBootstrap,
@@ -236,6 +237,10 @@ export async function loadData() {
         }
 
         await transition('persistent-storage', language.risuNest.startup.storage)
+        const storeCompaction = isTauri
+            ? await compactRequestedStoreAtStart((text) => { LoadingStatusState.text = text })
+            : null
+        LoadingStatusState.text = language.risuNest.startup.storage
         await initializePersistentStorage()
         if (isTauri) {
             stage = 'device-settings'
@@ -970,6 +975,10 @@ export async function loadData() {
                 void import('./plugins/defaultPluginBootstrap.svelte')
                     .then(({ startDefaultPluginBootstrap }) => startDefaultPluginBootstrap())
                     .catch(error => console.error('Default plugin bootstrap failed', error))
+            }
+            if (isTauri) {
+                await showStoreCompactionNotice(storeCompaction)
+                    .catch(error => console.error('Store compaction notice failed', error))
             }
             if (isTauri && !isTauriAndroid && await takeRendererRecovery()) {
                 // A dialog replaces the toast, so it waits for queued dialogs.

@@ -878,6 +878,9 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         #[cfg(desktop)]
         appimage_integration::appimage_integration_register,
         persistent_store::commands::pds_storage_stats,
+        persistent_store::commands::pds_store_compaction_at_start,
+        persistent_store::commands::pds_store_compaction_request,
+        persistent_store::commands::pds_store_compaction_offer,
         persistent_store::commands::pds_snapshot_delete,
         persistent_store::commands::pds_asset_gc_preview,
         persistent_store::commands::pds_asset_gc_execute,

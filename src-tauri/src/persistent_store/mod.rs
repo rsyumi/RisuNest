@@ -6,6 +6,7 @@ pub(crate) mod asset_object_catalog;
 pub(crate) mod asset_residency;
 pub(crate) mod commands;
 pub(crate) mod commit;
+pub(crate) mod compaction;
 pub(crate) mod content_capture;
 mod message_pages;
 #[cfg(test)]
@@ -75,6 +76,9 @@ pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 pub(crate) const ASSET_GC_PRODUCT_PAGE_LIMIT: i64 = 128;
 const ASSET_GC_PRODUCT_MINIMUM_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+/// How long the objects of a superseded plugin value stay unreferenced before
+/// a sweep may delete them.
+const SUPERSEDED_OBJECT_GRACE_MS: i64 = 10 * 60 * 1_000;
 pub(crate) const MESSAGE_PAGE_SWEEP_LIMIT: usize = 1_024;
 
 /// The store whose message objects one sweep batch visits. Each keeps its own
@@ -1056,6 +1060,52 @@ impl MessageObjectRootsCache {
     }
 }
 
+/// Bodies of the pages server sync received and has not staged yet. Only its
+/// log names their objects, so a sweep reads them on every pass and never
+/// creates the log.
+fn received_page_bodies(repository_root: &Path) -> StoreResult<Vec<Value>> {
+    let path = crate::server_sync::lww_client::OperationLog::path(repository_root);
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let log = crate::sqlite_open::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    log.busy_timeout(Duration::from_secs(5))?;
+    let present: bool = log.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='receive_pages')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        return Ok(Vec::new());
+    }
+    let mut statement = log.prepare("SELECT body FROM receive_pages")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
+fn mark_other_copies(other: &Connection, deleted: &[String], since: i64) -> StoreResult<()> {
+    if deleted.is_empty() {
+        return Ok(());
+    }
+    let transaction = other.unchecked_transaction()?;
+    message_pages::mark_unreferenced(&transaction, deleted.iter().map(String::as_str), since)?;
+    Ok(transaction.commit()?)
+}
+
+fn received_roots(
+    repository_root: &Path,
+    bodies: &[Value],
+    objects: &Connection,
+) -> StoreResult<Option<(message_pages::ObjectRoots, tempfile::TempDir)>> {
+    if bodies.is_empty() {
+        return Ok(None);
+    }
+    let scratch = crate::external_storage::leftovers::managed_scratch(repository_root, "message-roots-")
+        .map_err(|error| StoreError::Store { message: error.to_string() })?;
+    let roots = message_pages::json_roots(objects, bodies, crate::sqlite_open::open(scratch.path().join("roots.sqlite"))?)?;
+    Ok(Some((roots, scratch)))
+}
+
 /// One generation, held open for a diagnosis. It outlives the store mutex on purpose: a deep
 /// scan reads every stored object, and the library stays writable while it does.
 pub(crate) struct DataHealthReader {
@@ -1343,6 +1393,8 @@ pub(crate) struct StorageDeletionStats {
 pub(crate) struct PersistentStorageStats {
     pub(crate) snapshot_bytes: u64,
     pub(crate) database_bytes: u64,
+    /// Free pages of the library and device store files, which compaction returns.
+    pub(crate) database_reclaimable_bytes: u64,
     /// Every catalogued object, including those whose body is not on this device.
     pub(crate) asset_objects: StorageCountBytes,
     /// The object files this device stores.
@@ -2892,6 +2944,7 @@ impl PersistentStore {
         Ok(PersistentStorageStats {
             snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
             database_bytes,
+            database_reclaimable_bytes: self.database_pages()?.iter().map(|(_, pages)| pages.free_bytes).sum(),
             asset_objects,
             asset_bodies,
             missing_asset_bodies,
@@ -3153,13 +3206,38 @@ impl PersistentStore {
     /// One bounded pass over one store's message objects. Roots are read under the
     /// store lock and, for the store being swept, inside its write transaction, so
     /// a reference committed before the pass is seen. They are read again only
-    /// after a change on either connection or to the held leases. Callers hold
-    /// native file admission so no replacement runs meanwhile.
+    /// after a change on either connection or to the held leases; pages server
+    /// sync received and has not staged yet are read on every pass. Callers hold
+    /// native file admission so no replacement runs meanwhile. Copies of the
+    /// deleted objects in the other store are marked with the short grace before
+    /// the deletion commits, so a failed mark leaves the deletion to a later pass.
     pub(crate) fn sweep_message_page_objects(
         &mut self,
         target: MessageObjectStore,
         now_ms: i64,
         limit: usize,
+    ) -> StoreResult<message_pages::ObjectSweep> {
+        self.sweep_message_page_batch(target, now_ms, limit, true)
+    }
+
+    /// The next batch of a pass that `sweep_message_page_objects` began. The
+    /// pass already visited the marks past their grace, so this batch visits
+    /// only the objects after the cursor.
+    pub(crate) fn continue_message_page_sweep(
+        &mut self,
+        target: MessageObjectStore,
+        now_ms: i64,
+        limit: usize,
+    ) -> StoreResult<message_pages::ObjectSweep> {
+        self.sweep_message_page_batch(target, now_ms, limit, false)
+    }
+
+    fn sweep_message_page_batch(
+        &mut self,
+        target: MessageObjectStore,
+        now_ms: i64,
+        limit: usize,
+        expired_marks: bool,
     ) -> StoreResult<message_pages::ObjectSweep> {
         let Ok(device) = self.device_store.as_mut() else {
             return Ok(message_pages::ObjectSweep { wrapped: true, ..Default::default() });
@@ -3167,6 +3245,9 @@ impl PersistentStore {
         let mut lease_ids: Vec<String> = self.revision_leases.keys().cloned().collect();
         lease_ids.sort();
         let leases = self.revision_leases.values().map(|lease| &lease.connection);
+        let received = received_page_bodies(&self.repository_root)?;
+        let mut deleted = Vec::new();
+        let early = now_ms.saturating_sub(ASSET_GC_PRODUCT_MINIMUM_GRACE_MS - SUPERSEDED_OBJECT_GRACE_MS);
         if target == MessageObjectStore::Device {
             let transaction = device.transaction()?;
             let token = MessageObjectRootsToken::read(&self.connection, &transaction, lease_ids)?;
@@ -3174,13 +3255,17 @@ impl PersistentStore {
             let roots = self.message_object_roots.roots(target, token, &self.repository_root, |scratch| {
                 message_pages::object_roots(&self.connection, leases, &transaction, &transaction, scratch)
             })?;
+            let received = received_roots(&self.repository_root, &received, &transaction)?;
             let sweep = message_pages::sweep_objects(
                 &transaction,
-                roots,
+                &[roots].into_iter().chain(received.as_ref().map(|(roots, _)| roots)).collect::<Vec<_>>(),
                 now_ms,
                 ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
                 limit,
+                expired_marks,
+                &mut deleted,
             )?;
+            mark_other_copies(&self.connection, &deleted, early)?;
             transaction.commit()?;
             self.message_object_roots.committed(before, &self.connection, device.connection());
             return Ok(sweep);
@@ -3193,13 +3278,17 @@ impl PersistentStore {
         let roots = self.message_object_roots.roots(target, token, &self.repository_root, |scratch| {
             message_pages::object_roots(&transaction, leases, device.connection(), &transaction, scratch)
         })?;
+        let received = received_roots(&self.repository_root, &received, &transaction)?;
         let sweep = message_pages::sweep_objects(
             &transaction,
-            roots,
+            &[roots].into_iter().chain(received.as_ref().map(|(roots, _)| roots)).collect::<Vec<_>>(),
             now_ms,
             ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
             limit,
+            expired_marks,
+            &mut deleted,
         )?;
+        mark_other_copies(device.connection(), &deleted, early)?;
         transaction.commit()?;
         self.message_object_roots.committed(before, &self.connection, device.connection());
         Ok(sweep)

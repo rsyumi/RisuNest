@@ -20,6 +20,7 @@
         previewNativePersistentAssetGc,
         restoreNativePersistentSnapshot,
     } from 'src/ts/storage/nativePersistentMaintenance'
+    import { requestStoreCompaction } from 'src/ts/storage/storeCompaction'
     import { getSyncConflictBackupStore } from 'src/ts/storage/sync/syncConflictBackup'
     import { assetAliasCleanupTarget, flushPendingData } from 'src/ts/storage/persistentDataRuntime.svelte'
     import { deleteUnusedAssetAliases } from 'src/ts/storage/deletedOwnerAssetCleanup'
@@ -54,6 +55,7 @@
     let view = $state(dashboard.snapshot())
     // Restoring restarts the app, so the flag only ever clears on cancel or failure.
     let restoringSnapshot: string | null = $state(null)
+    let requestingCompaction = $state(false)
     let rollup = $derived(
         view.stats && view.loadedSources.length === 4
             ? storageDashboardRollup(
@@ -244,6 +246,12 @@
     async function cleanupTemp(): Promise<void> {
         if (!await alertConfirm(syncLabels.cleanConfirm)) return
         try { await dashboard.cleanupTemp() } catch (error) { showActionError(error) }
+    }
+
+    async function compactDatabase(): Promise<void> {
+        if (requestingCompaction || !await alertConfirm(strings.compactConfirm)) return
+        requestingCompaction = true
+        try { await requestStoreCompaction() } catch (error) { showActionError(error) } finally { requestingCompaction = false }
     }
 
     async function createSnapshot(): Promise<void> {
@@ -453,6 +461,10 @@
                     {/if}
                 {/if}
             {/snippet}
+        </SettingRow>
+        <SettingRow data-storage-action="compact" label={strings.compactTitle} help={strings.compactHelp}>
+            <span class="text-sm text-textcolor2 tabular-nums">{strings.compactReclaimable.replace('{0}', formatRisuNestStorageBytes(view.stats.databaseReclaimableBytes))}</span>
+            <SettingButton variant="secondary" busy={requestingCompaction} disabled={view.stats.databaseReclaimableBytes === 0} onclick={compactDatabase}>{strings.compact}</SettingButton>
         </SettingRow>
     {/if}
 </SettingGroup>

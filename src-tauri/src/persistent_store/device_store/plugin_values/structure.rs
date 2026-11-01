@@ -361,7 +361,7 @@ mod tests {
     }
 
     use crate::persistent_store::device_store::plugin_values::{admit_structure_row, PluginDeviceMutation};
-    use crate::persistent_store::{MessageObjectStore, PersistentStore, ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, MESSAGE_PAGE_SWEEP_LIMIT};
+    use crate::persistent_store::{MessageObjectStore, PersistentStore, ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, MESSAGE_PAGE_SWEEP_LIMIT, SUPERSEDED_OBJECT_GRACE_MS};
 
     const OWNER: &str = "synthetic-owner";
 
@@ -489,6 +489,27 @@ mod tests {
         store.sweep_message_page_objects(device, now + 8 * grace, limit).unwrap();
         assert!(!object(&store, "message_page_objects", &orphan));
         assert!(object(&store, "message_page_objects", &second_hash));
+
+        // A part a later value no longer names waits only the short grace, and
+        // one whose row is not committed yet keeps the long one.
+        let clock = || crate::persistent_store::commands::current_time_ms().unwrap();
+        let third = b"third synthetic part".as_slice();
+        let third_hash = upload(&mut store, third);
+        let before = clock();
+        set(&mut store, "json", "value", text(&[&third_hash], third.len() as u64)).unwrap();
+        let after = clock();
+        let pending = upload(&mut store, b"pending synthetic part");
+        store.sweep_message_page_objects(device, before + SUPERSEDED_OBJECT_GRACE_MS - 60_000, limit).unwrap();
+        assert!(object(&store, "message_page_objects", &second_hash), "a replaced part went before its grace");
+        store.sweep_message_page_objects(device, after + SUPERSEDED_OBJECT_GRACE_MS, limit).unwrap();
+        assert!(!object(&store, "message_page_objects", &second_hash), "a replaced part outlived the short grace");
+        assert!(object(&store, "message_page_objects", &third_hash));
+        assert!(object(&store, "message_page_objects", &pending), "an uploaded part lost the long grace");
+        // A part the next value still names stays unmarked.
+        let retyped = text(&[&third_hash], third.len() as u64).replace("Uint8Array", "Int8Array");
+        set(&mut store, "json", "value", retyped.clone()).unwrap();
+        assert_eq!(read(&store, "value"), Some(retyped));
+        assert!(!object(&store, "message_page_object_marks", &third_hash), "a part the new value names was marked");
     }
 
     fn missing_hash() -> String { "c".repeat(64) }

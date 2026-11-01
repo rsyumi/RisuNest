@@ -17,3 +17,14 @@ pub(crate) fn lock_repository_mutation() -> io::Result<MutexGuard<'static, ()>> 
         .lock()
         .map_err(|error| io::Error::other(format!("repository mutation mutex poisoned: {error}")))
 }
+
+/// The repository mutation lock when no one holds it.
+pub(crate) fn try_lock_repository_mutation() -> io::Result<Option<MutexGuard<'static, ()>>> {
+    match REPOSITORY_MUTATION.get_or_init(|| Mutex::new(())).try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            Err(io::Error::other(format!("repository mutation mutex poisoned: {error}")))
+        }
+    }
+}

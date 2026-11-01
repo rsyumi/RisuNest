@@ -568,6 +568,12 @@ pub(super) fn put_unit(
     version: &str,
     publish: Option<DecimalU64>,
 ) -> StoreResult<()> {
+    let superseded = superseded_plugin_objects(db, key, value)?;
+    if !superseded.is_empty() {
+        let since = super::commands::current_time_ms()?
+            .saturating_sub(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS - super::SUPERSEDED_OBJECT_GRACE_MS);
+        super::message_pages::mark_unreferenced(db, superseded.iter().map(String::as_str), since)?;
+    }
     let identity = value_identity(value)?;
     let stamp = serde_json::to_string(stamp)?;
     let value = serde_json::to_string(value)?;
@@ -590,6 +596,28 @@ pub(super) fn put_unit(
         suppress_retired(db, key)?;
     }
     Ok(())
+}
+/// Objects the stored value of a plugin key names and `value` does not. Plugin
+/// values are rewritten in whole, often, so these wait a short grace instead
+/// of the one for objects whose last reference is unknown.
+fn superseded_plugin_objects(db: &Connection, key: &UnitKey, value: &UnitValue) -> StoreResult<Vec<String>> {
+    if !matches!(key.components()[0].as_str(), "plugin" | "plugin-local") {
+        return Ok(Vec::new());
+    }
+    let Some((_, UnitValue::Object { descriptor_hash, descriptor })) = read_unit(db, key)? else {
+        return Ok(Vec::new());
+    };
+    let mut hashes: BTreeSet<String> = [descriptor_hash, descriptor.object_hash].into_iter()
+        .chain(descriptor.dependencies)
+        .collect();
+    if let UnitValue::Object { descriptor_hash, descriptor } = value {
+        hashes.remove(descriptor_hash);
+        hashes.remove(&descriptor.object_hash);
+        for hash in &descriptor.dependencies {
+            hashes.remove(hash);
+        }
+    }
+    Ok(hashes.into_iter().collect())
 }
 fn parent_keys(key: &UnitKey) -> StoreResult<Vec<UnitKey>> {
     let c = key.components();
