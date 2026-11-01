@@ -22,6 +22,13 @@ enum EncodeRequest {
 }
 
 impl EncodeRequest {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Inlay { .. } => "Inlay",
+            Self::CanvasWebp { .. } => "canvas WebP",
+        }
+    }
+
     fn encode(self, data: &[u8]) -> Result<EncodedInlayImage<'_>, String> {
         match self {
             Self::Inlay { id, name, options } => encode_inlay_image(&id, data, &name, options),
@@ -714,6 +721,7 @@ async fn encode_uploaded(
 ) -> Result<EncodedInlayIpcResult, String> {
     let cleanup_app = app.clone();
     let cleanup_id = upload_id.clone();
+    let label = request.label();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _operation = app
             .state::<PersistentStoreState>()
@@ -749,7 +757,7 @@ async fn encode_uploaded(
                 if let Ok(mut pool) = state.pool.lock() {
                     pool.finish_processing(&input.id);
                 }
-                return Err("native Inlay encoder panicked".to_owned());
+                return Err(format!("native {label} encoder panicked"));
             }
         };
         let processing_id = input.id;
@@ -767,7 +775,7 @@ async fn encode_uploaded(
                 }
             }
             Err(format!(
-                "failed to join native Inlay streamed encoder: {error}"
+                "failed to join native {label} streamed encoder: {error}"
             ))
         }
     }
@@ -825,8 +833,9 @@ pub(super) fn encode_direct(
 fn encode_direct_request(
     state: &NativeMediaIpcState, data: &[u8], request: EncodeRequest,
 ) -> Result<EncodedInlayIpcResult, String> {
+    let label = request.label();
     if data.len() > NATIVE_MEDIA_IPC_CHUNK_BYTES {
-        return Err("native Inlay direct encoder input exceeds one IPC chunk".to_owned());
+        return Err(format!("native {label} direct encoder input exceeds one IPC chunk"));
     }
     let (output_id, generation) = state
         .pool
@@ -848,7 +857,7 @@ fn encode_direct_request(
             if let Ok(mut pool) = state.pool.lock() {
                 pool.finish_processing(&output_id);
             }
-            return Err("native Inlay encoder panicked".to_owned());
+            return Err(format!("native {label} encoder panicked"));
         }
     };
     finish_encoded_result(state, output_id, generation, encoded)

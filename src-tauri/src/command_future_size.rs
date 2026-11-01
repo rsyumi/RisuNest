@@ -140,6 +140,8 @@ async_commands![
     appimage_integration::appimage_integration_register,
     native_tokenizer::tokenize_batch,
     native_media::native_media_encode_inlay_image,
+    native_media::ipc::native_media_encode_canvas_webp,
+    native_media::ipc::native_media_encode_canvas_webp_finish,
     native_media::ipc::native_media_inlay_input_open,
     native_media::ipc::native_media_inlay_input_chunk,
     native_media::ipc::native_media_inlay_input_chunk_raw,
