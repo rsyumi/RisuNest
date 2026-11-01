@@ -47,6 +47,21 @@ internal class GenerationForegroundLifecycle {
     return true
   }
 
+  /** Keeps a service that already runs from stopping, without starting one; returns the token [leave] takes, or null. */
+  @Synchronized
+  fun join(): Long? {
+    if (count == 0) return null
+    count += 1
+    return activeToken
+  }
+
+  /** Ends a [join], unless the service it joined has stopped since. */
+  @Synchronized
+  fun leave(token: Long, stopService: (Boolean) -> Boolean): Boolean {
+    if (token != activeToken) return false
+    return end(stopService)
+  }
+
   /** [stopService] receives whether the current start reached the service; one that has not stops itself on arrival. */
   @Synchronized
   fun end(stopService: (Boolean) -> Boolean): Boolean {
@@ -118,7 +133,8 @@ internal data class BackgroundTaskStatus(val kind: String, val percent: Int = -1
 
 /**
  * Holds owned by the page. A deferred hold takes service time only while promoted, which is while the app is off screen.
- * [onHeldChanged] hears when the page starts or stops holding any work, deferred or not, protected or not.
+ * [onHeldChanged] hears when the page starts or stops holding any work, deferred or not, protected or not; it hears
+ * that the last hold ended before that hold's service time ends, so it can keep the service from stopping.
  */
 internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Unit = {}) {
   private class Entry(val kind: String, val deferred: Boolean, val userInitiated: Boolean, val onExpired: (String) -> Unit) {
@@ -171,8 +187,8 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
 
   fun end(id: String, stop: () -> Boolean): Boolean {
     val entry = tasks.remove(id) ?: return false
-    if (entry.holding) stop()
     reportHeld(before = true)
+    if (entry.holding) stop()
     return true
   }
 
@@ -221,22 +237,36 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
 }
 
 private const val PAGE_KEPT_ACTIVE_RELEASE_DELAY_MILLIS = 2_000L
+// A few seconds past the release, so holds that hidden handlers begin join the running service.
+private const val PAGE_KEPT_SERVICE_LINGER_MILLIS = 5_000L
 
 /**
  * Decides when the WebView keeps the page running off screen, so Chromium does not freeze background work.
  * It starts only while the activity is resumed, so a hold the page begins after it went hidden off screen cannot
  * make it visible again, and it ends a moment after the last hold, so work that follows at once stays covered.
+ * Off screen, the service stays up from the last hold until a moment after the release, since the app cannot start
+ * it again from the background; [keepService] returns what lets it stop, or null when no service runs.
  */
 internal class PageKeptActivePolicy(
   private val apply: (Boolean) -> Unit,
+  private val keepService: () -> (() -> Unit)?,
   private val postDelayed: (Runnable, Long) -> Unit,
   private val removeCallbacks: (Runnable) -> Unit,
   private val releaseDelayMillis: Long = PAGE_KEPT_ACTIVE_RELEASE_DELAY_MILLIS,
+  private val serviceLingerMillis: Long = PAGE_KEPT_SERVICE_LINGER_MILLIS,
 ) {
   private var held = false
   private var resumed = false
   private var kept = false
-  private val release = Runnable { if (!held) keep(false) }
+  private var serviceKept: (() -> Unit)? = null
+  private val letServiceStop = Runnable {
+    serviceKept?.invoke()
+    serviceKept = null
+  }
+  private val release = Runnable {
+    if (!held) keep(false)
+    postDelayed(letServiceStop, serviceLingerMillis)
+  }
 
   fun onHeldChanged(held: Boolean) {
     this.held = held
@@ -250,9 +280,14 @@ internal class PageKeptActivePolicy(
 
   private fun update() {
     removeCallbacks(release)
+    if (resumed) {
+      removeCallbacks(letServiceStop)
+      letServiceStop.run()
+    }
     if (held) {
       if (resumed) keep(true)
     } else if (kept) {
+      if (!resumed && serviceKept == null) serviceKept = keepService()
       postDelayed(release, releaseDelayMillis)
     }
   }
@@ -386,6 +421,8 @@ class GenerationForegroundService : Service() {
   }
 
   private fun refreshNotification() {
+    // Kept up past its last hold, the service goes on showing the work it last ran.
+    if (background.snapshot().isEmpty()) return
     val notification = buildNotification()
     NotificationManagerCompat.from(this).notify(GENERATION_FOREGROUND_NOTIFICATION_ID, notification)
   }
@@ -487,6 +524,12 @@ class GenerationForegroundService : Service() {
 
     internal fun endTask(context: Context, id: String): Boolean = background.end(id) { stop(context) }
 
+    /** Keeps the running service from stopping, without starting one; returns what lets it stop, or null. */
+    internal fun keepService(context: Context): (() -> Unit)? {
+      val token = lifecycle.join() ?: return null
+      return { stop(context, token) }
+    }
+
     /** Off screen, deferred holds take the service; back on screen, they give it back. */
     internal fun setVisible(context: Context, visible: Boolean) {
       if (visible) background.demote { stop(context) }
@@ -516,12 +559,13 @@ class GenerationForegroundService : Service() {
     private fun stopService(context: Context, activated: Boolean): Boolean =
       !activated || runCatching { context.stopService(Intent(context, GenerationForegroundService::class.java)) }.getOrDefault(false)
 
-    private fun stop(context: Context): Boolean {
+    private fun stop(context: Context, joined: Long? = null): Boolean {
       var stopping = false
-      val result = lifecycle.end { activated ->
+      val stopLast = { activated: Boolean ->
         stopping = true
         stopService(context, activated)
       }
+      val result = if (joined == null) lifecycle.end(stopLast) else lifecycle.leave(joined, stopLast)
       if (!stopping) runCatching { instance?.refreshNotification() }
       return result
     }

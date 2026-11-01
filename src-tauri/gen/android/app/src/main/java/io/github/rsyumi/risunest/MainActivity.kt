@@ -602,6 +602,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val mainHandler = Handler(Looper.getMainLooper())
   private val pageKeptActive = PageKeptActivePolicy(
     apply = ::setWebViewKeptActive,
+    keepService = { GenerationForegroundService.keepService(this) },
     postDelayed = { task, delay -> mainHandler.postDelayed(task, delay) },
     removeCallbacks = { task -> mainHandler.removeCallbacks(task) },
   )
