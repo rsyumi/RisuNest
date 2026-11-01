@@ -11,6 +11,7 @@ const maintenance = vi.hoisted(() => ({
     deleteNativePersistentSnapshot: vi.fn(),
     createNativePersistentSnapshot: vi.fn(),
     restoreNativePersistentSnapshot: vi.fn(),
+    restartNativeApp: vi.fn(async () => {}),
 }))
 const server = vi.hoisted(() => ({
     getServerSyncBackupInventory: vi.fn(),
@@ -50,6 +51,7 @@ const syncText = languageEnglish.risuNest.serverSync
 const stats = {
     snapshotBytes: 2 * 1024 * 1024,
     databaseBytes: 1024 * 1024,
+    databaseReclaimableBytes: 0,
     assetObjects: { count: 2, bytes: 2 * 1024 * 1024 }, assetBodies: { count: 2, bytes: 2 * 1024 * 1024 },
     missingAssetBodies: { count: 0, bytes: 0 }, inlayBodies: { count: 1, bytes: 1024 * 1024 }, assetAliases: [{ kind: 'inlay', inlayType: null, count: 1, bytes: 1024 * 1024 }], pluginStorage: { count: 1, bytes: 1024 },
     characters: { active: { count: 2, bytes: 0 }, trashedCount: 1 }, conversations: { count: 3, messageCount: 4 }, assetObjectDeletions: [],
@@ -403,6 +405,34 @@ describe('RisuNestStorageDashboard', () => {
 
         const row = target.querySelector<HTMLElement>('[data-storage-action="gc"]')!
         expect(row.querySelector('p')?.textContent).toBe('Finds and deletes files that nothing refers to.')
+    })
+
+    it('offers database compaction only when the files can shrink, and restarts after recording it', async () => {
+        const strings = languageEnglish.risuNest.storage
+        const reclaimable = 3 * 1024 * 1024
+        const order: string[] = []
+        runtime.flushPendingData.mockImplementationOnce(async () => { order.push('flush') })
+        core.invoke.mockImplementation(async (command) => {
+            order.push(command)
+            return command === 'pds_store_compaction_request' ? { kind: 'requested' } : { revision: 2 }
+        })
+        maintenance.restartNativeApp.mockImplementationOnce(async () => { order.push('restart') })
+        alerts.alertConfirm.mockResolvedValue(true)
+        const target = setup(Promise.resolve({ ...stats, databaseReclaimableBytes: reclaimable }))
+        await vi.waitFor(() => expect(target.querySelector('[data-storage-action="compact"]')).not.toBeNull())
+
+        const row = target.querySelector<HTMLElement>('[data-storage-action="compact"]')!
+        expect(row.textContent).toContain(strings.compactReclaimable.replace('{0}', '3.0 MiB'))
+        exact(row, strings.compact)!.click()
+        await vi.waitFor(() => expect(order).toContain('restart'))
+        expect(alerts.alertConfirm).toHaveBeenCalledWith(strings.compactConfirm)
+        expect(order).toEqual(['flush', 'pds_store_compaction_request', 'restart'])
+    })
+
+    it('disables database compaction when the files have no free space', async () => {
+        const target = setup()
+        await vi.waitFor(() => expect(target.querySelector('[data-storage-action="compact"]')).not.toBeNull())
+        expect(exact(target, languageEnglish.risuNest.storage.compact)?.disabled).toBe(true)
     })
 
     it('formats large counts with locale separators', async () => {

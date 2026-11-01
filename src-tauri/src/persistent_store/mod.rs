@@ -1393,6 +1393,8 @@ pub(crate) struct StorageDeletionStats {
 pub(crate) struct PersistentStorageStats {
     pub(crate) snapshot_bytes: u64,
     pub(crate) database_bytes: u64,
+    /// Free pages of the library and device store files, which compaction returns.
+    pub(crate) database_reclaimable_bytes: u64,
     /// Every catalogued object, including those whose body is not on this device.
     pub(crate) asset_objects: StorageCountBytes,
     /// The object files this device stores.
@@ -2942,6 +2944,7 @@ impl PersistentStore {
         Ok(PersistentStorageStats {
             snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
             database_bytes,
+            database_reclaimable_bytes: self.database_pages()?.iter().map(|(_, pages)| pages.free_bytes).sum(),
             asset_objects,
             asset_bodies,
             missing_asset_bodies,
@@ -3289,22 +3292,6 @@ impl PersistentStore {
         transaction.commit()?;
         self.message_object_roots.committed(before, &self.connection, device.connection());
         Ok(sweep)
-    }
-
-    /// Compacts each store file that is mostly free pages. The caller makes
-    /// sure no other connection writes either file meanwhile.
-    pub(crate) fn compact_sparse_files(&mut self, limits: compaction::CompactionLimits) -> StoreResult<()> {
-        let root = self.repository_root.clone();
-        let mut connections = vec![("library", &mut self.connection)];
-        if let Ok(device) = self.device_store.as_mut() {
-            connections.push(("device", &mut device.connection));
-        }
-        for (name, connection) in connections {
-            if let Some(found) = compaction::compact_if_sparse(connection, &root, limits, |path| fs2::available_space(path))? {
-                crate::nlog!("info", "Compacted the {name} store: {} used bytes, {} free bytes", found.used_bytes, found.free_bytes);
-            }
-        }
-        Ok(())
     }
 
     /// How many times a message object sweep read its roots.

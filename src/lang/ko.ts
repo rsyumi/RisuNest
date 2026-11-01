@@ -2205,6 +2205,7 @@ export const languageKorean = {
         },
         startup: {
             storage: '저장소 여는 중',
+            compacting: '데이터베이스 압축 중 {0}%',
             data: '대화 데이터 준비 중',
             compatibility: '플러그인 호환 데이터 준비 중',
             plugins: '플러그인 준비 중',
@@ -2602,6 +2603,20 @@ export const languageKorean = {
             gcDeletedResult: '삭제됨: {0}개 ({1})',
             gcConfirm:
                 '어디에서도 사용하지 않는 파일 {0}개({1})를 삭제합니다. 계속하시겠습니까?',
+            compactTitle: '데이터베이스 압축',
+            compactHelp: '데이터베이스에서 사용하지 않는 공간을 정리해 파일 크기를 줄이며, 앱이 다시 시작됩니다.',
+            compactReclaimable: '확보 가능 {0}',
+            compact: '압축',
+            compactConfirm:
+                '앱을 다시 시작해 데이터베이스를 압축하며, 시작이 평소보다 오래 걸릴 수 있습니다. 계속하시겠습니까?',
+            compactNoSpace: '저장 공간이 부족해 압축할 수 없습니다. {0} 이상 확보한 뒤 다시 시도하세요.',
+            compactRestartFailed: '앱을 다시 시작하지 못했습니다. 앱을 다시 시작하면 데이터베이스를 압축합니다.',
+            compactOffer:
+                '데이터베이스를 압축하면 {0}의 공간을 확보할 수 있습니다. 압축하면 앱이 다시 시작되며, 시작이 평소보다 오래 걸릴 수 있습니다. 지금 압축하시겠습니까?',
+            compacted: '데이터베이스를 압축해 {0}를 확보했습니다.',
+            compactStartNoSpace:
+                '저장 공간이 부족해 데이터베이스를 압축하지 못했습니다. {0} 이상 확보한 뒤 다시 시도하세요.',
+            compactFailed: '데이터베이스를 압축하지 못했습니다. 다시 시도하세요.',
             deleteSnapshotConfirm:
                 '이 스냅샷을 삭제하시겠습니까? 삭제하면 이 시점으로 되돌릴 수 없습니다.',
             deleteConflictBackupConfirm:

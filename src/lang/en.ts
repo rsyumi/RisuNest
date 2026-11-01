@@ -2390,6 +2390,7 @@ export const languageEnglish = {
         },
         startup: {
             storage: 'Opening storage',
+            compacting: 'Compacting database {0}%',
             data: 'Preparing chat data',
             compatibility: 'Preparing plugin compatibility data',
             plugins: 'Preparing plugins',
@@ -2787,6 +2788,20 @@ export const languageEnglish = {
             gcResult: 'Removable: {0} items ({1})',
             gcDeletedResult: 'Deleted: {0} items ({1})',
             gcConfirm: 'This will delete {0} unused files ({1}). Continue?',
+            compactTitle: 'Database compaction',
+            compactHelp: 'Clears unused space in the database to make its files smaller, and restarts the app.',
+            compactReclaimable: '{0} reclaimable',
+            compact: 'Compact',
+            compactConfirm:
+                'The app restarts to compact the database, and the start may take longer than usual. Continue?',
+            compactNoSpace: 'Not enough storage space to compact. Free up at least {0} and try again.',
+            compactRestartFailed: "Couldn't restart the app. The database is compacted the next time the app starts.",
+            compactOffer:
+                'Compacting the database frees {0}. Compacting restarts the app, and the start may take longer than usual. Compact now?',
+            compacted: 'Compacted the database and freed {0}.',
+            compactStartNoSpace:
+                "Not enough storage space to compact the database. Free up at least {0} and try again.",
+            compactFailed: "Couldn't compact the database. Try again.",
             deleteSnapshotConfirm:
                 "Delete this snapshot? You won't be able to restore to this point.",
             deleteConflictBackupConfirm:
