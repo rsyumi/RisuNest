@@ -2,6 +2,7 @@
 export function installCanvasWebpCompatibility(
     encode: (data: Uint8Array, width: number, height: number, quality: number) => Promise<Uint8Array>,
 ): void {
+    // Callers keep the browser's PNG when this fails, which is what plugins received before.
     async function webp(blob: Blob, quality: unknown): Promise<Blob> {
         if (!blob || blob.type !== 'image/png') return blob
         // Decode the browser's snapshot, rather than reading a canvas the plugin may have changed.
@@ -35,7 +36,7 @@ export function installCanvasWebpCompatibility(
         }
         return toBlob.call(this, blob => {
             if (!blob) { callback(null); return }
-            void webp(blob, quality).then(callback, () => callback(null))
+            void webp(blob, quality).catch(() => blob).then(callback)
         }, type, quality)
     }
 
@@ -45,7 +46,7 @@ export function installCanvasWebpCompatibility(
             const result = convertToBlob.apply(this, arguments)
             if (String(options?.type).toLowerCase() !== 'image/webp') return result
             const quality = options?.quality
-            return result.then(blob => webp(blob, quality))
+            return result.then(blob => webp(blob, quality).catch(() => blob))
         }
     }
 }

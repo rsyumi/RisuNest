@@ -1219,7 +1219,7 @@ export class SandboxHost {
                         if (data.method === '_encodeCanvasWebp') {
                             if (!isTauri) throw new Error('Native WebP encoding is unavailable')
                             const { encodeNativeCanvasWebp } = await import('./nativeCanvasWebp')
-                            result = await encodeNativeCanvasWebp(args[0], args[1], args[2], args[3]);
+                            result = await encodeNativeCanvasWebp(args[0], args[1], args[2], args[3], () => this.terminated);
                         } else if (downloadSignal) {
                             result = await this.download!(args[0], args[1], downloadSignal);
                         } else {

@@ -1,7 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import { consumeBoundedNativeMediaOutput, invokeWithBoundedNativeMediaInput } from '../../storage/nativeMediaIpc'
 
-export async function encodeNativeCanvasWebp(data: unknown, width: unknown, height: unknown, quality: unknown): Promise<Uint8Array> {
+// Native media transfers are shared with Inlay encoding and refuse requests beyond a few at once.
+let queue: Promise<unknown> = Promise.resolve()
+
+export async function encodeNativeCanvasWebp(
+    data: unknown, width: unknown, height: unknown, quality: unknown, cancelled: () => boolean = () => false,
+): Promise<Uint8Array> {
     if (!(data instanceof Uint8Array)
         || !Number.isInteger(width) || !Number.isInteger(height)
         || (width as number) <= 0 || (height as number) <= 0
@@ -11,6 +16,15 @@ export async function encodeNativeCanvasWebp(data: unknown, width: unknown, heig
         || typeof quality !== 'number' || !Number.isFinite(quality) || quality < 0 || quality > 1) {
         throw new TypeError('Invalid plugin WebP canvas input')
     }
+    const encoded = queue.then(() => {
+        if (cancelled()) throw new Error('Plugin WebP canvas request was cancelled')
+        return encode(data, width as number, height as number, quality)
+    })
+    queue = encoded.catch(() => undefined)
+    return await encoded
+}
+
+async function encode(data: Uint8Array, width: number, height: number, quality: number): Promise<Uint8Array> {
     const result = await invokeWithBoundedNativeMediaInput(invoke, {
         data,
         directCommand: 'native_media_encode_canvas_webp',
