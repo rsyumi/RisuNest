@@ -4,6 +4,7 @@ import { consoleLog, installConsoleCapture, isConsoleLogLevel } from '../../cons
 import { attachPluginReadProvenance, collectPluginReadProvenance, type PluginReadProvenance } from '../pluginReadBaselines'
 import { type PluginDownloadHandler } from './pluginDownload'
 import { installWebviewBridge } from '../../webviewDownload'
+import { installCanvasWebpCompatibility } from './canvasWebp'
 
 type MsgType =
     | 'CALL_ROOT'
@@ -1215,7 +1216,11 @@ export class SandboxHost {
 
 
                     if (data.type === 'CALL_ROOT') {
-                        if (downloadSignal) {
+                        if (data.method === '_encodeCanvasWebp') {
+                            if (!isTauri) throw new Error('Native WebP encoding is unavailable')
+                            const { encodeNativeCanvasWebp } = await import('./nativeCanvasWebp')
+                            result = await encodeNativeCanvasWebp(args[0], args[1], args[2], args[3]);
+                        } else if (downloadSignal) {
                             result = await this.download!(args[0], args[1], downloadSignal);
                         } else {
                             const fn = this.apiFactory[data.method!];
@@ -1363,6 +1368,7 @@ export class SandboxHost {
             window.addEventListener('unhandledrejection', event => reportPluginError(event.reason));
             (async () => {
                 ${GUEST_BRIDGE_SCRIPT}
+                ${isTauri ? `(${installCanvasWebpCompatibility.toString()})((data, width, height, quality) => window.risuai._encodeCanvasWebp(data, width, height, quality));` : ''}
                 ${this.download ? `(${installWebviewBridge.toString()})((name, source) => window.risuai._downloadFile(name, source), reportPluginError);` : ''}
                     
                 const settled = () => {
