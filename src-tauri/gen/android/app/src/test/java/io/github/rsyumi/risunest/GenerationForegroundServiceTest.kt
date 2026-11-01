@@ -16,8 +16,9 @@ import org.w3c.dom.Element
 class GenerationForegroundServiceTest {
   private fun taskId(index: Int) = "00000000-0000-4000-8000-%012d".format(index)
 
-  private class Hosted {
-    val registry = BackgroundTaskRegistry()
+  private class Hosted(onHeldChanged: (Boolean) -> Unit = {}) {
+    val heldChanges = mutableListOf<Boolean>()
+    val registry = BackgroundTaskRegistry { heldChanges.add(it); onHeldChanged(it) }
     val lifecycle = GenerationForegroundLifecycle()
     var starts = 0
     var stops = 0
@@ -27,6 +28,10 @@ class GenerationForegroundServiceTest {
       if (lifecycle.begin { if (refuse == null) { starts++; true } else false }) null else refuse
     }
     val stop: () -> Boolean = { lifecycle.end { stops++; true } }
+    fun keepService(): (() -> Unit)? {
+      val token = lifecycle.join() ?: return null
+      return { lifecycle.leave(token) { stops++; true } }
+    }
     fun begin(id: String, kind: String, deferred: Boolean = false, userInitiated: Boolean = false, refresh: () -> Unit = {}) =
       registry.begin(id, kind, deferred, userInitiated, start, { expired.add(it) }, refresh)
     fun end(id: String) = registry.end(id, stop)
@@ -75,6 +80,7 @@ class GenerationForegroundServiceTest {
     val host = Hosted()
     assertEquals(BACKGROUND_INVALID, host.begin(taskId(1), "unknown"))
     assertEquals(BACKGROUND_INVALID, host.begin("not-a-uuid", "backup"))
+    assertTrue(host.heldChanges.isEmpty())
     assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(2), "backup"))
     assertEquals(BACKGROUND_INVALID, host.begin(taskId(2), "sync"))
     assertTrue(host.end(taskId(2)))
@@ -98,6 +104,8 @@ class GenerationForegroundServiceTest {
     assertEquals(BACKGROUND_DEFERRED, host.begin(taskId(2), "generation", deferred = true))
     assertEquals(0, host.starts)
     assertTrue(host.registry.snapshot().isEmpty())
+    // Waiting holds count as held work before the app leaves the screen.
+    assertEquals(listOf(true), host.heldChanges)
     assertTrue(host.end(taskId(2)))
     assertEquals(0, host.stops)
 
@@ -112,8 +120,10 @@ class GenerationForegroundServiceTest {
     assertEquals(1, host.stops)
     assertTrue(host.registry.snapshot().isEmpty())
     assertTrue(host.end(taskId(1)))
+    assertEquals(listOf(true), host.heldChanges)
     assertTrue(host.end(taskId(3)))
     assertEquals(1, host.stops)
+    assertEquals(listOf(true, false), host.heldChanges)
   }
 
   @Test
@@ -157,6 +167,100 @@ class GenerationForegroundServiceTest {
     assertEquals(listOf(taskId(2)), host.expired)
     host.registry.promote(host.start)
     assertEquals(listOf(BackgroundTaskStatus("sync")), host.registry.snapshot())
+    assertEquals(listOf(true), host.heldChanges)
+    host.registry.clear()
+    assertEquals(listOf(true, false), host.heldChanges)
+    host.begin(taskId(3), "backup")
+    host.registry.clearAll()
+    assertEquals(listOf(true, false, true, false), host.heldChanges)
+  }
+
+  private class Delays {
+    private val pending = mutableListOf<Runnable>()
+    val post: (Runnable, Long) -> Unit = { task, _ -> pending.add(task) }
+    val remove: (Runnable) -> Unit = { pending.remove(it) }
+    fun elapse() = pending.toList().also { pending.clear() }.forEach(Runnable::run)
+  }
+
+  @Test
+  fun `the page stays active off screen only for work held when the app left and a moment after it ends`() {
+    val delays = Delays()
+    val kept = mutableListOf<Boolean>()
+    val policy = PageKeptActivePolicy({ kept.add(it) }, { null }, delays.post, delays.remove)
+    policy.onResumedChanged(true)
+    policy.onHeldChanged(true)
+    assertEquals(listOf(true), kept)
+    policy.onResumedChanged(false)
+    policy.onHeldChanged(false)
+    // Work that begins inside the release delay stays covered.
+    policy.onHeldChanged(true)
+    delays.elapse()
+    assertEquals(listOf(true), kept)
+    policy.onHeldChanged(false)
+    assertEquals(listOf(true), kept)
+    delays.elapse()
+    assertEquals(listOf(true, false), kept)
+
+    // A hold begun after the page went hidden off screen cannot make it visible again.
+    policy.onHeldChanged(true)
+    delays.elapse()
+    assertEquals(listOf(true, false), kept)
+    policy.onResumedChanged(true)
+    assertEquals(listOf(true, false, true), kept)
+  }
+
+  @Test
+  fun `off screen the service outlives the last hold until a moment after the page release so later holds join it`() {
+    val delays = Delays()
+    val kept = mutableListOf<Boolean>()
+    lateinit var policy: PageKeptActivePolicy
+    val host = Hosted { policy.onHeldChanged(it) }
+    policy = PageKeptActivePolicy({ kept.add(it) }, host::keepService, delays.post, delays.remove)
+    policy.onResumedChanged(true)
+    assertEquals(BACKGROUND_DEFERRED, host.begin(taskId(1), "generation", deferred = true))
+    policy.onResumedChanged(false)
+    host.registry.promote(host.start)
+    // From here the platform refuses a service start, as it does once the app is in the background.
+    host.refuse = BACKGROUND_REFUSED
+
+    assertTrue(host.end(taskId(1)))
+    assertEquals(0, host.stops)
+    assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(2), "sync", deferred = true))
+    assertTrue(host.end(taskId(2)))
+    delays.elapse()
+    assertEquals(listOf(true, false), kept)
+    // A hold a hidden handler begins after the release joins the service instead of being refused.
+    assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(3), "sync", deferred = true))
+    assertEquals(1, host.starts)
+    delays.elapse()
+    assertEquals(0, host.stops)
+    assertTrue(host.end(taskId(3)))
+    assertEquals(1, host.stops)
+    assertEquals(listOf(true, false), kept)
+
+    // Back on screen the service stops at once, and a stale keep cannot stop a later service.
+    host.refuse = null
+    host.registry.demote(host.stop)
+    policy.onResumedChanged(true)
+    host.begin(taskId(4), "generation", deferred = true)
+    policy.onResumedChanged(false)
+    host.registry.promote(host.start)
+    assertTrue(host.end(taskId(4)))
+    delays.elapse()
+    host.registry.demote(host.stop)
+    policy.onResumedChanged(true)
+    assertEquals(2, host.stops)
+    host.begin(taskId(5), "generation", deferred = true)
+    policy.onResumedChanged(false)
+    host.registry.promote(host.start)
+    assertTrue(host.end(taskId(5)))
+    delays.elapse()
+    host.lifecycle.stopAll { true }
+    host.begin(taskId(6), "backup")
+    delays.elapse()
+    assertEquals(2, host.stops)
+    assertTrue(host.end(taskId(6)))
+    assertEquals(3, host.stops)
   }
 
   @Test
