@@ -906,6 +906,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_log::native_log_set_file_enabled,
         native_tokenizer::tokenize_batch,
         native_media::native_media_encode_inlay_image,
+        native_media::ipc::native_media_encode_canvas_webp,
+        native_media::ipc::native_media_encode_canvas_webp_finish,
         native_media::ipc::native_media_inlay_input_open,
         native_media::ipc::native_media_inlay_input_chunk,
         native_media::ipc::native_media_inlay_input_chunk_raw,
