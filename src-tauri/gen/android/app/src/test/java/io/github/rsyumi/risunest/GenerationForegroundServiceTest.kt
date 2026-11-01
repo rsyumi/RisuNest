@@ -17,7 +17,8 @@ class GenerationForegroundServiceTest {
   private fun taskId(index: Int) = "00000000-0000-4000-8000-%012d".format(index)
 
   private class Hosted {
-    val registry = BackgroundTaskRegistry()
+    val heldChanges = mutableListOf<Boolean>()
+    val registry = BackgroundTaskRegistry { heldChanges.add(it) }
     val lifecycle = GenerationForegroundLifecycle()
     var starts = 0
     var stops = 0
@@ -75,6 +76,7 @@ class GenerationForegroundServiceTest {
     val host = Hosted()
     assertEquals(BACKGROUND_INVALID, host.begin(taskId(1), "unknown"))
     assertEquals(BACKGROUND_INVALID, host.begin("not-a-uuid", "backup"))
+    assertTrue(host.heldChanges.isEmpty())
     assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(2), "backup"))
     assertEquals(BACKGROUND_INVALID, host.begin(taskId(2), "sync"))
     assertTrue(host.end(taskId(2)))
@@ -98,6 +100,8 @@ class GenerationForegroundServiceTest {
     assertEquals(BACKGROUND_DEFERRED, host.begin(taskId(2), "generation", deferred = true))
     assertEquals(0, host.starts)
     assertTrue(host.registry.snapshot().isEmpty())
+    // Waiting holds count as held work before the app leaves the screen.
+    assertEquals(listOf(true), host.heldChanges)
     assertTrue(host.end(taskId(2)))
     assertEquals(0, host.stops)
 
@@ -112,8 +116,10 @@ class GenerationForegroundServiceTest {
     assertEquals(1, host.stops)
     assertTrue(host.registry.snapshot().isEmpty())
     assertTrue(host.end(taskId(1)))
+    assertEquals(listOf(true), host.heldChanges)
     assertTrue(host.end(taskId(3)))
     assertEquals(1, host.stops)
+    assertEquals(listOf(true, false), host.heldChanges)
   }
 
   @Test
@@ -157,6 +163,46 @@ class GenerationForegroundServiceTest {
     assertEquals(listOf(taskId(2)), host.expired)
     host.registry.promote(host.start)
     assertEquals(listOf(BackgroundTaskStatus("sync")), host.registry.snapshot())
+    assertEquals(listOf(true), host.heldChanges)
+    host.registry.clear()
+    assertEquals(listOf(true, false), host.heldChanges)
+    host.begin(taskId(3), "backup")
+    host.registry.clearAll()
+    assertEquals(listOf(true, false, true, false), host.heldChanges)
+  }
+
+  private class Delays {
+    private val pending = mutableListOf<Runnable>()
+    val post: (Runnable, Long) -> Unit = { task, _ -> pending.add(task) }
+    val remove: (Runnable) -> Unit = { pending.remove(it) }
+    fun elapse() = pending.toList().also { pending.clear() }.forEach(Runnable::run)
+  }
+
+  @Test
+  fun `the page stays active off screen only for work held when the app left and a moment after it ends`() {
+    val delays = Delays()
+    val kept = mutableListOf<Boolean>()
+    val policy = PageKeptActivePolicy({ kept.add(it) }, delays.post, delays.remove)
+    policy.onResumedChanged(true)
+    policy.onHeldChanged(true)
+    assertEquals(listOf(true), kept)
+    policy.onResumedChanged(false)
+    policy.onHeldChanged(false)
+    // Work that begins inside the release delay stays covered.
+    policy.onHeldChanged(true)
+    delays.elapse()
+    assertEquals(listOf(true), kept)
+    policy.onHeldChanged(false)
+    assertEquals(listOf(true), kept)
+    delays.elapse()
+    assertEquals(listOf(true, false), kept)
+
+    // A hold begun after the page went hidden off screen cannot make it visible again.
+    policy.onHeldChanged(true)
+    delays.elapse()
+    assertEquals(listOf(true, false), kept)
+    policy.onResumedChanged(true)
+    assertEquals(listOf(true, false, true), kept)
   }
 
   @Test

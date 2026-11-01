@@ -600,6 +600,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     )
   }
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val pageKeptActive = PageKeptActivePolicy(
+    apply = ::setWebViewKeptActive,
+    postDelayed = { task, delay -> mainHandler.postDelayed(task, delay) },
+    removeCallbacks = { task -> mainHandler.removeCallbacks(task) },
+  )
+  private val heldObserver: (Boolean) -> Unit = pageKeptActive::onHeldChanged
   private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private val portableSourceOwner = PortableSourceOwner()
   private val safSourcePickFlow = SafSourcePickFlow { block -> safScope.launch { block() } }
@@ -757,6 +763,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
     showRendererRecoveryWarning()
     diagnoseWebViewProvider()
+    GenerationForegroundService.observeHeld(heldObserver)
   }
 
   override fun recoverRenderer(webView: WebView, didCrash: Boolean): Boolean {
@@ -913,6 +920,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
 
   override fun onResume() {
     super.onResume()
+    pageKeptActive.onResumedChanged(true)
     appLock.onResume()
     rendererRestartGate.onResume()
     dispatchNotificationStateRefresh()
@@ -921,6 +929,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   override fun onPause() {
     appLock.onPause()
     rendererRestartGate.onPause()
+    pageKeptActive.onResumedChanged(false)
     super.onPause()
   }
 
@@ -1005,6 +1014,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   override fun onDestroy() {
+    // Detached first, so ending the holds below posts no release after this activity is gone.
+    GenerationForegroundService.stopObservingHeld(heldObserver)
     appLock.close()
     exitWaitDialog?.dismiss()
     exitWaitDialog = null

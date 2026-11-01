@@ -7,6 +7,7 @@
 package {{package}}
 
 import android.annotation.SuppressLint
+import android.view.View
 import android.webkit.*
 import android.content.Context
 import androidx.webkit.WebViewCompat
@@ -90,6 +91,21 @@ class RustWebView(context: Context, val initScripts: Array<String>, val id: Stri
     fun getCookies(url: String): String {
         val cookieManager = CookieManager.getInstance()
         return cookieManager.getCookie(url)
+    }
+
+    // RisuNest: while set, Chromium sees the window as visible, so it does not
+    // freeze the page when the app leaves the screen.
+    private var windowVisibility = View.VISIBLE
+    var keepWindowVisible = false
+        set(value) {
+            if (field == value) return
+            field = value
+            super.onWindowVisibilityChanged(if (value) View.VISIBLE else windowVisibility)
+        }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        windowVisibility = visibility
+        super.onWindowVisibilityChanged(if (keepWindowVisible) View.VISIBLE else visibility)
     }
 
     {{class-extension}}

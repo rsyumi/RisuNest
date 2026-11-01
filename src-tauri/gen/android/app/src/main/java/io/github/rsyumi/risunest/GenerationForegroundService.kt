@@ -116,8 +116,11 @@ internal class GenerationForegroundLifecycle {
 
 internal data class BackgroundTaskStatus(val kind: String, val percent: Int = -1, val userInitiated: Boolean = false)
 
-/** Holds owned by the page. A deferred hold takes service time only while promoted, which is while the app is off screen. */
-internal class BackgroundTaskRegistry {
+/**
+ * Holds owned by the page. A deferred hold takes service time only while promoted, which is while the app is off screen.
+ * [onHeldChanged] hears when the page starts or stops holding any work, deferred or not, protected or not.
+ */
+internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Unit = {}) {
   private class Entry(val kind: String, val deferred: Boolean, val userInitiated: Boolean, val onExpired: (String) -> Unit) {
     var percent = -1
     var holding = false
@@ -125,6 +128,12 @@ internal class BackgroundTaskRegistry {
 
   private val tasks = linkedMapOf<String, Entry>()
   private var visible = true
+
+  val held: Boolean get() = tasks.isNotEmpty()
+
+  private fun reportHeld(before: Boolean) {
+    if (held != before) runCatching { onHeldChanged(held) }
+  }
 
   /** [start] starts or joins the service and returns null, or the reason the platform refused it. */
   fun begin(
@@ -139,6 +148,7 @@ internal class BackgroundTaskRegistry {
     if (kind !in BACKGROUND_TASK_KINDS || !isCanonicalUuidV4(id) || id in tasks) return BACKGROUND_INVALID
     val entry = Entry(kind, deferred, userInitiated, onExpired)
     tasks[id] = entry
+    reportHeld(before = tasks.size > 1)
     if (deferred && visible) return BACKGROUND_DEFERRED
     // A refused hold stays registered, so the next time the app leaves the screen protects it.
     start()?.let { return it }
@@ -162,6 +172,7 @@ internal class BackgroundTaskRegistry {
   fun end(id: String, stop: () -> Boolean): Boolean {
     val entry = tasks.remove(id) ?: return false
     if (entry.holding) stop()
+    reportHeld(before = true)
     return true
   }
 
@@ -195,13 +206,61 @@ internal class BackgroundTaskRegistry {
 
   /** Ends the holds the service protected, as when its time runs out or it is destroyed. */
   fun clear(notify: Boolean = false) {
+    val before = held
     val ended = tasks.filterValues { it.holding }
     ended.keys.forEach(tasks::remove)
     if (notify) ended.forEach { (id, entry) -> runCatching { entry.onExpired(id) } }
+    reportHeld(before)
   }
 
   fun clearAll() {
+    val before = held
     tasks.clear()
+    reportHeld(before)
+  }
+}
+
+private const val PAGE_KEPT_ACTIVE_RELEASE_DELAY_MILLIS = 2_000L
+
+/**
+ * Decides when the WebView keeps the page running off screen, so Chromium does not freeze background work.
+ * It starts only while the activity is resumed, so a hold the page begins after it went hidden off screen cannot
+ * make it visible again, and it ends a moment after the last hold, so work that follows at once stays covered.
+ */
+internal class PageKeptActivePolicy(
+  private val apply: (Boolean) -> Unit,
+  private val postDelayed: (Runnable, Long) -> Unit,
+  private val removeCallbacks: (Runnable) -> Unit,
+  private val releaseDelayMillis: Long = PAGE_KEPT_ACTIVE_RELEASE_DELAY_MILLIS,
+) {
+  private var held = false
+  private var resumed = false
+  private var kept = false
+  private val release = Runnable { if (!held) keep(false) }
+
+  fun onHeldChanged(held: Boolean) {
+    this.held = held
+    update()
+  }
+
+  fun onResumedChanged(resumed: Boolean) {
+    this.resumed = resumed
+    update()
+  }
+
+  private fun update() {
+    removeCallbacks(release)
+    if (held) {
+      if (resumed) keep(true)
+    } else if (kept) {
+      postDelayed(release, releaseDelayMillis)
+    }
+  }
+
+  private fun keep(value: Boolean) {
+    if (kept == value) return
+    kept = value
+    apply(value)
   }
 }
 
@@ -396,8 +455,20 @@ class GenerationForegroundService : Service() {
 
   companion object {
     private val lifecycle = GenerationForegroundLifecycle()
-    private val background = BackgroundTaskRegistry()
+    private var heldObserver: ((Boolean) -> Unit)? = null
+    private val background = BackgroundTaskRegistry { held -> heldObserver?.invoke(held) }
     private var instance: GenerationForegroundService? = null
+
+    /** [observer] hears at once and on every change whether the page holds background work. */
+    internal fun observeHeld(observer: (Boolean) -> Unit) {
+      heldObserver = observer
+      observer(background.held)
+    }
+
+    /** A newer activity may have replaced [observer] already, so only that observer detaches. */
+    internal fun stopObservingHeld(observer: (Boolean) -> Unit) {
+      if (heldObserver === observer) heldObserver = null
+    }
 
     internal fun beginTask(
       context: Context,
