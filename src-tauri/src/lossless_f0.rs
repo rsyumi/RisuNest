@@ -1280,6 +1280,15 @@ fn scan_inlays(
 }
 
 fn inlay_tokens(value: &str) -> Vec<(String, usize)> {
+    inlay_token_spans(value)
+        .into_iter()
+        .map(|(key, span)| (key.to_owned(), value[..span.start].encode_utf16().count()))
+        .collect()
+}
+
+/// Each inlay token in `value` with the byte range of its whole `{{…}}` text, in the order the
+/// reference graph numbers them.
+pub(crate) fn inlay_token_spans(value: &str) -> Vec<(&str, std::ops::Range<usize>)> {
     let mut tokens = Vec::new();
     let mut cursor = 0;
     while let Some(relative_start) = value[cursor..].find("{{") {
@@ -1300,7 +1309,7 @@ fn inlay_tokens(value: &str) -> Vec<(String, usize)> {
         let key_end = key_start + relative_end;
         let key = &value[key_start..key_end];
         if !key.is_empty() && !key.chars().any(is_js_dot_line_terminator) {
-            tokens.push((key.to_owned(), value[..start].encode_utf16().count()));
+            tokens.push((key, start..key_end + 2));
             cursor = key_end + 2;
         } else {
             cursor = after_open;
@@ -1492,7 +1501,7 @@ fn is_external_asset_key(key: &str) -> bool {
             && matches!(key.as_bytes()[2], b'/' | b'\\'))
 }
 
-fn property_path(path: &str, key: &str) -> String {
+pub(crate) fn property_path(path: &str, key: &str) -> String {
     if is_property_identifier(key) {
         format!("{path}.{key}")
     } else {

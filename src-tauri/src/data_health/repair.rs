@@ -2,7 +2,7 @@
 //! Nothing here touches the store: the planner reads findings and reports candidates, and the
 //! store applies the chosen ones to a staged copy that the existing gate re-checks.
 
-use super::{codes, Finding, Owner, ScanResult};
+use super::{codes, Finding, Locator, Owner, ScanResult};
 
 /// One change the reader can choose. `id` is stable for a diagnosis, so a selection made in the
 /// preview still names the same change when it is applied.
@@ -23,11 +23,14 @@ pub(crate) struct RepairCandidate {
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub(crate) enum RepairAction {
     SelectFirstConversation { character_id: String },
-    /// Removes one reference from the field that holds it. The stored bytes stay where they are.
+    /// Removes one reference from the record that holds it: the field or entry at `source_path`,
+    /// or only the inlay token named by `token`. The stored bytes stay where they are.
     DropReference {
         owner: Owner,
         source_path: String,
         occurrence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<u64>,
     },
     /// Removes an alias whose stored payload is absent or no longer matches it.
     DropAlias { kind: String, key: String },
@@ -136,6 +139,52 @@ fn record_candidates(index: usize, finding: &Finding) -> Vec<RepairCandidate> {
     Vec::new()
 }
 
+/// Owners whose records a repair edits. A persona, module, folder or loadout lives inside the
+/// root under its own identity, so its references are left to the reader rather than offered as
+/// a change the whole selection would then fail on.
+const EDITABLE_OWNERS: &[&str] = &["root", "preset", "plugin-storage", "character", "conversation"];
+
+/// A conversation's `$.message[N]…` as the path within message row N, the record a repair edits.
+fn message_location(owner: &Owner, path: &str) -> Option<(Owner, String)> {
+    if owner.kind != "conversation" {
+        return None;
+    }
+    let (index, rest) = path.strip_prefix("$.message[")?.split_once(']')?;
+    index.parse::<u64>().ok()?;
+    Some((
+        Owner {
+            kind: "message".to_owned(),
+            id: format!("{}/{index}", owner.id),
+        },
+        format!("${rest}"),
+    ))
+}
+
+/// What removing one reference takes out of which record. An inlay is cut from its text, and an
+/// asset held by a tuple or an entry takes that whole tuple or entry, so no half of it is left.
+/// None when a repair cannot remove exactly that reference.
+fn reference_removal(finding: &Finding, locator: &Locator) -> Option<(Owner, String, Option<u64>)> {
+    if !EDITABLE_OWNERS.contains(&finding.owner.kind.as_str()) {
+        return None;
+    }
+    let (owner, path) = message_location(&finding.owner, &locator.source_path)
+        .unwrap_or_else(|| (finding.owner.clone(), locator.source_path.clone()));
+    match finding.target.as_ref().map(|target| target.kind.as_str()) {
+        // A diagnosis written before tokens were numbered cannot say which part of the text to cut.
+        Some("inlay") => Some((owner, path, Some(locator.token?))),
+        Some("asset") => {
+            let entry = path
+                .strip_suffix("[1]")
+                .or_else(|| path.strip_suffix(".uri"))
+                .filter(|entry| entry.ends_with(']'))
+                .map(str::to_owned)
+                .unwrap_or(path);
+            Some((owner, entry, None))
+        }
+        _ => Some((owner, path, None)),
+    }
+}
+
 /// Reads a diagnosis and reports what each finding can be answered with. A finding no action
 /// fits keeps an empty list, which the screen shows as needing manual action.
 pub(crate) fn plan(result: &ScanResult) -> Vec<RepairCandidate> {
@@ -152,12 +201,16 @@ pub(crate) fn plan(result: &ScanResult) -> Vec<RepairCandidate> {
                     }, true, false));
                     continue;
                 }
+                let Some((owner, source_path, token)) = reference_removal(finding, locator) else {
+                    continue;
+                };
                 candidates.push(candidate(
                     index,
                     RepairAction::DropReference {
-                        owner: finding.owner.clone(),
-                        source_path: locator.source_path.clone(),
+                        owner,
+                        source_path,
                         occurrence: locator.occurrence,
+                        token,
                     },
                     true,
                     true,

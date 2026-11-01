@@ -942,9 +942,13 @@ impl LibraryView<'_> {
 }
 
 fn reference_finding(code: &'static str, reference: &F0Reference, detail: &str) -> Finding {
-    Finding::new(code, &reference.owner_kind, &reference.owner_id, detail)
+    let finding = Finding::new(code, &reference.owner_kind, &reference.owner_id, detail)
         .at(&reference.source_path, reference.occurrence)
-        .targeting(&reference.target_kind, &reference.target_key)
+        .targeting(&reference.target_kind, &reference.target_key);
+    match reference.metadata.get("tokenIndex").and_then(Value::as_u64) {
+        Some(token) if reference.target_kind == "inlay" => finding.in_token(token),
+        _ => finding,
+    }
 }
 
 fn named(value: &Value, collection: &str, field: &str, key: &str) -> bool {

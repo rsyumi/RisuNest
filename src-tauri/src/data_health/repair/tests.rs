@@ -44,7 +44,41 @@ fn a_dangling_reference_offers_removing_it_and_says_the_value_is_gone() {
             },
             source_path: "$.image".to_owned(),
             occurrence: 0,
+            token: None,
         }
+    );
+}
+
+#[test]
+fn a_reference_removal_takes_its_whole_entry_and_cuts_only_a_numbered_inlay() {
+    let inlay = || reference().at("$.firstMessage", 1).targeting("inlay", "gone");
+    let message = Finding::new(codes::REFERENCE_MISSING, "conversation", "char-1/chat-1", "")
+        .at("$.message[7].data", 0)
+        .targeting("inlay", "gone")
+        .in_token(0);
+    let plan = plan(&result(vec![
+        reference().at("$.ccAssets[2].uri", 0),
+        // A diagnosis written before tokens were numbered.
+        inlay(),
+        inlay().in_token(3),
+        message,
+    ]));
+    let removals: Vec<_> = plan
+        .iter()
+        .map(|candidate| match &candidate.action {
+            RepairAction::DropReference { owner, source_path, token, .. } => {
+                (candidate.finding, owner.kind.as_str(), owner.id.as_str(), source_path.as_str(), *token)
+            }
+            other => panic!("unexpected action: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        removals,
+        [
+            (0, "character", "char-1", "$.ccAssets[2]", None),
+            (2, "character", "char-1", "$.firstMessage", Some(3)),
+            (3, "message", "char-1/chat-1/7", "$.data", Some(0)),
+        ]
     );
 }
 
