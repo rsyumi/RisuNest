@@ -39,14 +39,33 @@ fn parse_path(path: &str) -> Option<Vec<Step>> {
             steps.push(Step::Key(tail[..end].to_owned()));
             rest = &tail[end..];
         } else if let Some(tail) = rest.strip_prefix('[') {
-            let end = tail.find(']')?;
-            steps.push(Step::Index(tail[..end].parse().ok()?));
-            rest = &tail[end + 1..];
+            if tail.starts_with('"') {
+                // A key that is not an identifier is written as a JSON string, which may itself
+                // hold `]`, quotes or escapes.
+                let mut strings = serde_json::Deserializer::from_str(tail).into_iter::<String>();
+                let key = strings.next()?.ok()?;
+                rest = tail[strings.byte_offset()..].strip_prefix(']')?;
+                steps.push(Step::Key(key));
+            } else {
+                let end = tail.find(']')?;
+                steps.push(Step::Index(tail[..end].parse().ok()?));
+                rest = &tail[end + 1..];
+            }
         } else {
             return None;
         }
     }
     Some(steps)
+}
+
+fn value_at<'a>(mut cursor: &'a mut Value, steps: &[Step]) -> Option<&'a mut Value> {
+    for step in steps {
+        cursor = match step {
+            Step::Key(key) => cursor.as_object_mut()?.get_mut(key)?,
+            Step::Index(index) => cursor.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    Some(cursor)
 }
 
 /// Removes what one path points at. A missing path is not an error: the record may already have
@@ -55,20 +74,9 @@ fn remove_at(value: &mut Value, steps: &[Step]) {
     let Some((last, parents)) = steps.split_last() else {
         return;
     };
-    let mut cursor = value;
-    for step in parents {
-        cursor = match step {
-            Step::Key(key) => match cursor.as_object_mut().and_then(|map| map.get_mut(key)) {
-                Some(next) => next,
-                None => return,
-            },
-            Step::Index(index) => match cursor.as_array_mut().and_then(|items| items.get_mut(*index))
-            {
-                Some(next) => next,
-                None => return,
-            },
-        };
-    }
+    let Some(cursor) = value_at(value, parents) else {
+        return;
+    };
     match last {
         Step::Key(key) => {
             if let Some(map) = cursor.as_object_mut() {
@@ -83,6 +91,24 @@ fn remove_at(value: &mut Value, steps: &[Step]) {
             }
         }
     }
+}
+
+/// Cuts the numbered inlay tokens out of the text at `steps` and keeps the rest of it. Text that
+/// is gone or holds fewer tokens is left alone, as a missing path is.
+fn cut_tokens(value: &mut Value, steps: &[Step], tokens: &BTreeSet<u64>) {
+    let Some(Value::String(text)) = value_at(value, steps) else {
+        return;
+    };
+    let mut kept = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (index, (_, span)) in crate::lossless_f0::inlay_token_spans(text).into_iter().enumerate() {
+        if tokens.contains(&(index as u64)) {
+            kept.push_str(&text[cursor..span.start]);
+            cursor = span.end;
+        }
+    }
+    kept.push_str(&text[cursor..]);
+    *text = kept;
 }
 
 /// Where one record lives: the table that holds it and the identity columns that name it.
@@ -183,7 +209,7 @@ fn drop_references(
     transaction: &Connection,
     staging: &str,
     located: &Located,
-    mut paths: Vec<Vec<Step>>,
+    edits: Vec<(Vec<Step>, Option<u64>)>,
 ) -> StoreResult<()> {
     let sql_where = where_identity(located.table);
     let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&staging];
@@ -211,7 +237,22 @@ fn drop_references(
     let Ok(mut value) = serde_json::from_str::<Value>(&serialized) else {
         return Ok(());
     };
+    let mut tokens: BTreeMap<Vec<Step>, BTreeSet<u64>> = BTreeMap::new();
+    let mut paths = Vec::new();
+    for (steps, token) in edits {
+        match token {
+            Some(token) => {
+                tokens.entry(steps).or_default().insert(token);
+            }
+            None => paths.push(steps),
+        }
+    }
+    // A cut keeps its text in place, so every cut runs before a removal can shift an element.
+    for (steps, tokens) in &tokens {
+        cut_tokens(&mut value, steps, tokens);
+    }
     paths.sort();
+    paths.dedup();
     for steps in paths.into_iter().rev() {
         remove_at(&mut value, &steps);
     }
@@ -689,11 +730,14 @@ fn repair_targets(records: &[RecordChange]) -> StoreResult<RepairTargets> {
 /// Groups the reference removals by the record that holds them, so one record is rewritten once.
 fn reference_edits(
     candidates: &[RepairCandidate],
-) -> StoreResult<BTreeMap<(String, String), Vec<Vec<Step>>>> {
-    let mut edits: BTreeMap<(String, String), Vec<Vec<Step>>> = BTreeMap::new();
+) -> StoreResult<BTreeMap<(String, String), Vec<(Vec<Step>, Option<u64>)>>> {
+    let mut edits: BTreeMap<(String, String), Vec<(Vec<Step>, Option<u64>)>> = BTreeMap::new();
     for candidate in candidates {
         let RepairAction::DropReference {
-            owner, source_path, ..
+            owner,
+            source_path,
+            token,
+            ..
         } = &candidate.action
         else {
             continue;
@@ -703,7 +747,7 @@ fn reference_edits(
         edits
             .entry((owner.kind.clone(), owner.id.clone()))
             .or_default()
-            .push(steps);
+            .push((steps, *token));
     }
     Ok(edits)
 }

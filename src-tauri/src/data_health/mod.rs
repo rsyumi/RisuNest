@@ -47,6 +47,10 @@ pub(crate) struct Owner {
 pub(crate) struct Locator {
     pub(crate) source_path: String,
     pub(crate) occurrence: u64,
+    /// Which inlay token of the text at `source_path` this is. A diagnosis written before tokens
+    /// were numbered has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -98,7 +102,16 @@ impl Finding {
         self.locator = Some(Locator {
             source_path: source_path.into(),
             occurrence,
+            token: None,
         });
+        self
+    }
+
+    /// Names the inlay token of the located text. A finding without a locator has no text.
+    pub(crate) fn in_token(mut self, token: u64) -> Self {
+        if let Some(locator) = &mut self.locator {
+            locator.token = Some(token);
+        }
         self
     }
 

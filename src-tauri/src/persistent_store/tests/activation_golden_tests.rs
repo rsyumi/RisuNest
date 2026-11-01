@@ -630,6 +630,7 @@ fn active_manifests_equal_a_full_capture_after_every_mutation_kind() {
                     },
                     source_path: "$.time".into(),
                     occurrence: 0,
+                    token: None,
                 },
                 finding: 0,
                 preferred: true,
