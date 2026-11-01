@@ -158,7 +158,7 @@ export function nativeFileJobRecoveryModule() {
 }
 
 export function persistentBootstrapModule(startup: BootstrapTestState) {
-    return { bootstrapPersistentDatabase: async () => ({ database: startup.database, revision: 1, source: 'persistent' }) } satisfies Partial<typeof import('./storage/persistentBootstrap')>
+    return { bootstrapPersistentDatabase: vi.fn(async () => ({ database: startup.database, revision: 1, source: 'persistent' })) } satisfies Partial<typeof import('./storage/persistentBootstrap')>
 }
 
 export function databaseModule(startup: BootstrapTestState) {

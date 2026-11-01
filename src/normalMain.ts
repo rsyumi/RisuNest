@@ -17,11 +17,14 @@ import { yieldToUi } from "./ts/ui/yieldToUi";
 import { decideBoot } from "./ts/storage/recoveryMode.svelte";
 import { recoveryStart } from "./ts/stores.svelte";
 import { changeLanguage } from "./lang";
+import { uiLanguageFor } from "./lang/uiLanguages";
 import { installNativeWebviewHandling } from "./ts/nativeWebviewStartup";
 
 installAppLockInput();
 installNativeWebviewHandling();
 preLoadCheck();
+// The library's language setting has not loaded, so the start follows the device's until it does.
+changeLanguage(uiLanguageFor(navigator.language));
 const app = mount(App, {
   target: document.getElementById("app"),
 });
@@ -45,8 +48,6 @@ function startNormally(): void {
 void decideBoot().then(async (mode) => {
   if (mode === "normal") startNormally();
   else {
-    // The library's language setting has not loaded, so the recovery shell follows the device's.
-    changeLanguage(navigator.language.split("-")[0]);
     if (isTauri) {
       await initializeAppLock({
         recovery: true,

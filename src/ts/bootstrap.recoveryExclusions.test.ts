@@ -102,7 +102,11 @@ vi.mock('./process/transformers', async () => (await import('./bootstrap.testSup
 vi.mock('./process/files/inlayProviderImage', async () => (await import('./bootstrap.testSupport')).inlayProviderImageModule())
 
 import { loadData } from './bootstrap'
-import { language } from 'src/lang'
+import { changeLanguage, language } from 'src/lang'
+import { languageEnglish } from 'src/lang/en'
+import { languageKorean } from 'src/lang/ko'
+import { bootstrapPersistentDatabase } from './storage/persistentBootstrap'
+import { safeStructuredClone } from './safeStructuredClone'
 import { afterPluginsStarted, keepPluginsOffForThisStart, loadPlugins } from './plugins/plugins.svelte'
 import { pluginStartupGate, configurePluginStartup, setPluginStartupSyncExcluded, retryPluginStartup } from './plugins/pluginStartupGate'
 import { shouldReconcileNativeFileJobs, reconcileNativeFileJobsBeforeBootstrap } from './storage/nativeFileJobRecovery'
@@ -497,5 +501,35 @@ describe('native setup failure', () => {
             stage: 'native-setup',
         })
         expect(alertError).not.toHaveBeenCalled()
+    })
+})
+
+describe('startup language', () => {
+    // The suite unstubs every global after each test, the setup's clone that changeLanguage uses included.
+    beforeEach(() => vi.stubGlobal('safeStructuredClone', safeStructuredClone))
+    afterEach(() => changeLanguage('en'))
+
+    // The entry applies the device language before the app mounts; Korean stands in for it here.
+    it.each([
+        ['en', languageEnglish.risuNest.startup.data],
+        [undefined, languageKorean.risuNest.startup.data],
+    ])('keeps the start language until the library language (%s) is read', async (libraryLanguage, dataText) => {
+        startup.native = true
+        startup.exclusions = []
+        const shown: string[] = []
+        vi.mocked(initializePersistentStorage).mockImplementationOnce(async () => { shown.push(LoadingStatusState.text) })
+        vi.mocked(bootstrapPersistentDatabase).mockImplementationOnce(async ({ onPhase }) => {
+            await onPhase?.('storage')
+            shown.push(LoadingStatusState.text)
+            await onPhase?.('data', libraryLanguage)
+            shown.push(LoadingStatusState.text)
+            return { database: startup.database, revision: 1 }
+        })
+        changeLanguage('ko')
+
+        await loadData()
+
+        const opening = languageKorean.risuNest.startup.storage
+        expect(shown).toEqual([opening, opening, dataText])
     })
 })

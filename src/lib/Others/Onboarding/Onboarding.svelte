@@ -24,7 +24,7 @@
     } from '@lucide/svelte'
 
     import { changeLanguage, language } from 'src/lang'
-    import { UI_LANGUAGES } from 'src/lang/uiLanguages'
+    import { UI_LANGUAGES, uiLanguageFor } from 'src/lang/uiLanguages'
     import { alertConfirm, alertError, alertNormal, openRisuAccountLogin } from 'src/ts/alert'
     import { restoreNativeOfficialAccountBackup } from 'src/ts/storage/sync/nativeOfficialAccountOperations'
     import { NativeAccountLoginError } from 'src/ts/storage/sync/nativeOfficialAccountFlow'
@@ -113,8 +113,7 @@
     const t = $derived(strings.risuNest.onboarding)
 
     {
-        const browserLangShort = navigator.language.split('-')[0]
-        const initialLanguage = UI_LANGUAGES.find((option) => option.value === browserLangShort)?.value ?? 'en'
+        const initialLanguage = uiLanguageFor(navigator.language)
         changeLanguage(initialLanguage)
         DBState.db.language = initialLanguage
     }

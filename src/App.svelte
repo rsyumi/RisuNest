@@ -155,6 +155,12 @@
     })
 
     let startupElapsedSeconds = $state(0)
+    // `language` is a plain module binding. A start switches it to the library's language right before
+    // the next status text, so the label is read again with each one.
+    const startupLabel = $derived.by(() => {
+        void LoadingStatusState.text
+        return language.loading
+    })
     $effect(() => {
         const startedAt = LoadingStatusState.startedAt
         if ($loadedStore || $bootFailure || startedAt === null) return
@@ -349,7 +355,7 @@
                 class="w-full h-full flex justify-center items-center text-textcolor text-xl bg-darkbg"
             >
                 <LoadingIndicator
-                    label={language.loading}
+                    label={startupLabel}
                     detail={LoadingStatusState.text}
                     elapsedText={language.risuNest.startup.elapsed(startupElapsedSeconds)}
                 />
