@@ -2,7 +2,7 @@
   "version": 1,
   "target": "risuai",
   "reference": {
-    "revision": "02a83695d81eb4e083453c4524b8c7d463df95aa",
+    "revision": "ea61945f9038e0189807d075f55f4e66ab7e98bf",
     "files": {
       "src/lib/Others/HypaV3Modal/types.ts": "da5150348b4008ff3ce02d3f36616fb5d9fe15b790835509ccaafa9f2c61a825",
       "src/ts/bootstrap.ts": "42f08a8c8bef88809ea1d4e09a7dfdc362d12d3bd2107da748cfdce9f6849128",
@@ -12,17 +12,17 @@
       "src/ts/loadout.ts": "34436b205d7e6785f390fe9cacec4ef4ec56ef180889bfff302073a4b9cae007",
       "src/ts/model/ooba.ts": "76ce8b012b18e88b29d41647e9192b72c28de7b4aa4a257486e6d0b407449b50",
       "src/ts/model/types.ts": "036b60d573aa370da9b57f847c227b614c44ce4c9f6f0c89e150339e818d28fd",
-      "src/ts/plugins/plugins.svelte.ts": "126a75376086090b56acc47966a004ca7c551513435aeb9255d6b5e0a1a763ab",
+      "src/ts/plugins/plugins.svelte.ts": "5c455564f098b6324fed54a6948a896e220ccd85d8a811b71c56173e7814ba53",
       "src/ts/process/index.svelte.ts": "6868ea6dc85ed8f83139996818b91728ce8e8628887c1ca33ee5907cf625ae92",
       "src/ts/process/memory/hypamemory.ts": "17370da796a075e5546a8a4a2645b7fe4e48bca6a447871cd40072fc8446d799",
       "src/ts/process/memory/hypav2.ts": "24889ada48327c8fa609ce012c8154b7b64bfbf749d694e8376806f4e7bab4a2",
       "src/ts/process/memory/hypav3.ts": "78807144e945828869c7575007219e4ab4b07354cfd7dddb772e39db155a2553",
       "src/ts/process/models/nai.ts": "18d5ab2c81f93c70bffffe78dabb9c93263af71a2ff4879b12ad2b435c779eec",
-      "src/ts/process/modules.ts": "09313d53f877b23d5c6ffcfd79a65074bf403a4aa11ca2ecbb1d27e004aad1df",
+      "src/ts/process/modules.ts": "a247a8d2e7632831e611456dad080fc517668a3fb24f9d8429ea56420a2475ce",
       "src/ts/process/prompt.ts": "40e939fe61f515f53aa0b060c6693578dd3a59e556e016344db5f0750a9bbe3c",
       "src/ts/process/transformers.ts": "c40d093fc79f51e305ba494fb2608d69deb7c6be14c0873b0ddb382b1f4a8592",
       "src/ts/process/triggers.ts": "973cc85b47b95ee61d4258b9e22dca2dd9b968f6d3f04fa0d04dcb254fc0c56e",
-      "src/ts/storage/database.svelte.ts": "b09eea924c44b868159b9b5c28a615b8e83a29323d162ceba1162d702bea9170",
+      "src/ts/storage/database.svelte.ts": "bd6c529064674071cfa17daba8987f7442edadbd679f66c7f0ba2713c826c0c9",
       "src/ts/storage/risuSave.ts": "85d059f34bb59a9640191130ea678143995b6bbe0188c7e3980ccfc58a1951a4",
       "src/ts/translator/presets.ts": "a7a9c7a55f1f171f2451b5a0e2be05424b50b698b62e1e6f0a6c743cc0132c1d"
     }

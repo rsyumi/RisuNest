@@ -164,14 +164,15 @@ describe('legacy module export', () => {
         expect(alertError).toHaveBeenCalledWith(expect.any(StdioModuleImportError))
     })
 
-    it.each(['https://synthetic.invalid/mcp', 'internal:dice', 'plugin:synthetic'])('preserves %s in JSON and RISUM imports', async url => {
+    it.each(['https://synthetic.invalid/mcp', 'internal:dice', 'plugin:synthetic'])('drops %s from JSON and RISUM imports', async url => {
         const module = { id: 'source', name: 'Synthetic', description: '', mcp: { url } }
         await importModuleData({
             name: 'synthetic.json', data: Buffer.from(JSON.stringify({ ...module, type: 'risuModule' })),
         })
         const exported = await exportModuleLegacy(module, { alertEnd: false, saveData: false })
         await importModuleData({ name: 'synthetic.risum', data: exported })
-        expect(DBState.db.modules.map(module => module.mcp?.url)).toEqual([url, url])
+        expect(DBState.db.modules.map(module => module.name)).toEqual(['Synthetic', 'Synthetic'])
+        expect(DBState.db.modules.map(module => Object.hasOwn(module, 'mcp'))).toEqual([false, false])
         expect(alertError).not.toHaveBeenCalled()
     })
 

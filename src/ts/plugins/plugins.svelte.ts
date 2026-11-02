@@ -11,7 +11,6 @@ import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, saveAsset } from "../globalApi.svelte";
 import { DBState, hotReloading } from "../stores.svelte";
 import type { ScriptMode } from "../process/scripts";
-import { reconcilePluginListUpdate } from "./pluginListUpdate";
 import { areV3PluginsIdle, canInterruptV3Plugins, customV3ProviderMetaStore, loadV3Plugins, prepareV3PluginsForReload, subscribeV3PluginActivity } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
@@ -789,14 +788,68 @@ export async function pluginProcess(arg: {
     }
 }
 
-export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
+// Answers to plugin-requested installs and replacements last until the app restarts.
+const declinedPluginRequests = new Set<string>()
+const carriedPluginApprovals = new Set<string>()
+const pendingPluginRequests = new Map<string, Promise<boolean>>()
 
-    const { additions } = reconcilePluginListUpdate(DBState.db.plugins, plugins)
-    const approved: RisuPlugin[] = []
-    for (const plugin of additions) {
-        if (plugin.version !== '3.0' || plugin.name === '*') continue
-        const confirmation = await alertConfirm(language.confirmInstallPluginViaPlugin.replace('{plugin}', plugin.name))
-        if (confirmation) approved.push(plugin)
+function canonicalPluginJson(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonicalPluginJson).join(',')}]`
+    if (value && typeof value === 'object') {
+        return `{${Object.keys(value).sort().flatMap(key => {
+            const entry = (value as Record<string, unknown>)[key]
+            return entry === undefined ? [] : [`${JSON.stringify(key)}:${canonicalPluginJson(entry)}`]
+        }).join(',')}}`
     }
-    return reconcilePluginListUpdate(DBState.db.plugins, approved).additions
+    return JSON.stringify(value) ?? 'null'
+}
+
+async function pluginRequestKey(requester: string, kind: 'install' | 'replace', plugin: RisuPlugin): Promise<string> {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalPluginJson(plugin)))
+    const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+    return JSON.stringify([requester, kind, plugin.name, hash])
+}
+
+/**
+ * Asks before a plugin installs a plugin or replaces an installed plugin's script.
+ * Returns the approved records; `installPlugin` approvals carry over once to the next matching `setDatabase`.
+ */
+export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[], requester: string, source: 'installPlugin' | 'setDatabase'){
+    const approved: RisuPlugin[] = []
+    const seen = new Set<string>()
+    for (const plugin of plugins) {
+        if (plugin?.version !== '3.0' || typeof plugin.name !== 'string' || plugin.name === '*' || seen.has(plugin.name)) continue
+        seen.add(plugin.name)
+        const installedPlugins: RisuPlugin[] = DBState.db.plugins ?? []
+        const installed = installedPlugins.find(value => value.name === plugin.name)
+        if (installed && installed.script === plugin.script) continue
+        const key = await pluginRequestKey(requester, installed ? 'replace' : 'install', plugin)
+        if (declinedPluginRequests.has(key)) continue
+        if (source === 'setDatabase' && carriedPluginApprovals.delete(key)) {
+            approved.push(plugin)
+            continue
+        }
+        let request = pendingPluginRequests.get(key)
+        if (!request) {
+            const installedName = (name: string) => {
+                const record = installedPlugins.find(value => value.name === name)
+                return record ? record.displayName ?? record.name : name
+            }
+            const messages = language.risuNest.plugins
+            const message = !installed
+                ? messages.installViaPlugin.replace('{source}', () => installedName(requester)).replaceAll('{plugin}', () => plugin.name)
+                : requester === plugin.name
+                    ? messages.replaceSelfViaPlugin.replaceAll('{plugin}', () => installedName(plugin.name))
+                    : messages.replaceViaPlugin.replace('{source}', () => installedName(requester)).replaceAll('{plugin}', () => installedName(plugin.name))
+            request = alertConfirm(message).then(confirmed => {
+                if (!confirmed) declinedPluginRequests.add(key)
+                return confirmed
+            }).finally(() => pendingPluginRequests.delete(key))
+            pendingPluginRequests.set(key, request)
+        }
+        if (!await request) continue
+        if (source === 'installPlugin') carriedPluginApprovals.add(key)
+        approved.push(plugin)
+    }
+    return approved
 }

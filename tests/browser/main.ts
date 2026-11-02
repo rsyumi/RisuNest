@@ -14,7 +14,7 @@ const events: unknown[] = []
 const bridgeMessages: any[] = []
 window.addEventListener('message', event => {
     if (event.data?.fixture) events.push(event.data)
-    if (['CALL_ROOT', 'CALL_INSTANCE', 'EXEC_RESULT', 'CALLBACK_RETURN'].includes(event.data?.type)) bridgeMessages.push(event.data)
+    if (['CALL_ROOT', 'CALL_INSTANCE', 'EXEC_RESULT', 'CALLBACK_RETURN', 'RELEASE_INSTANCE'].includes(event.data?.type)) bridgeMessages.push(event.data)
 })
 let callbackResult: unknown = null
 let oldHost: ReturnType<typeof getV3PluginInstance>
@@ -33,6 +33,7 @@ const driver = {
     state: fixtureState, events, bridgeMessages,
     get localResult() { return localResult },
     get localRows() { return [...localRows].map(([key, value]) => ({ key, value })) },
+    get localInstances() { return (localHost as unknown as { instanceRegistry: Map<string, unknown> } | undefined)?.instanceRegistry.size },
     /** Runs a plugin whose getLocalPluginStorage() is the real host class over an in-memory device keyspace. */
     loadLocal(script: string) {
         localHost?.terminate()

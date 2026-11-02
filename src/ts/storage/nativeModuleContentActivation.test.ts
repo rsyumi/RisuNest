@@ -85,16 +85,16 @@ describe('native RISUM module activation', () => {
         expect(receipt.confirmActivated).not.toHaveBeenCalled()
     })
 
-    it.each(['https://synthetic.invalid/mcp', 'internal:dice', 'plugin:synthetic'])('preserves %s on native import', async url => {
+    it.each(['https://synthetic.invalid/mcp', 'internal:dice', 'plugin:synthetic'])('drops %s on native import', async url => {
         const content = risumContent()
         content.metadata.mcp = { url }
         const append = vi.fn()
         await activatePreparedNativeModuleContent(content, {
             prepareOwnerManifestAndSeal: vi.fn(), sealPreparedContent: vi.fn(),
         }, { confirmLowLevelAccess: async () => true, createId: () => 'new-id', append })
-        expect(append).toHaveBeenCalledWith(expect.objectContaining({
-            module: expect.objectContaining({ mcp: { url } }),
-        }), undefined)
+        expect(append).toHaveBeenCalledOnce()
+        expect(append.mock.calls[0][0].module).toMatchObject({ id: 'new-id' })
+        expect(append.mock.calls[0][0].module).not.toHaveProperty('mcp')
     })
 
     it('confirms low-level access, seals native roots, then atomically appends full metadata', async () => {

@@ -1383,6 +1383,13 @@ export function createPluginDatabaseAccess(
             }
             const changedKeys = new Set(intents.map(intent => String(intent.path[0])))
             const detachedUpdate = Object.fromEntries(Object.entries(detachedSubmission).filter(([key]) => changedKeys.has(key)))
+            const isPluginRecordSet = (intent: (typeof intents)[number]) =>
+                intent.path[0] === 'plugins' && intent.path.length === 2 && intent.path[1] !== '$order' && intent.type === 'set'
+            // Only records the plugin changed are requested: omissions, reordering and unchanged copies are ignored.
+            const requestedPlugins = intents.filter(isPluginRecordSet).map(intent => intent.value as RisuPlugin)
+            if (requestedPlugins.length) detachedUpdate.plugins = requestedPlugins
+            else delete detachedUpdate.plugins
+            const scriptsBeforeConfirmation = new Map((dependencies.getCompatibilityDatabase().plugins ?? []).map(plugin => [plugin.name, plugin.script]))
             const preparedUpdate = dependencies.prepareAuthoritativeDatabaseUpdate
                 ? await dependencies.prepareAuthoritativeDatabaseUpdate(detachedUpdate)
                 : detachedUpdate
@@ -1396,16 +1403,23 @@ export function createPluginDatabaseAccess(
                 validateCompleteCharacters(preparedUpdate.characters)
             }
             let acceptedIntents = intents
-            if (Object.hasOwn(detachedUpdate, 'plugins')) {
+            if (changedKeys.has('plugins')) {
                 const installed = dependencies.getCompatibilityDatabase().plugins ?? []
-                const installedNames = new Set(installed.map(plugin => plugin.name))
+                const installedScripts = new Map(installed.map(plugin => [plugin.name, plugin.script]))
                 const approved = new Map((preparedUpdate.plugins as RisuPlugin[] | undefined ?? []).map(plugin => [plugin.name, plugin]))
-                const additions = intents.filter(intent => intent.path[0] === 'plugins' && intent.path.length === 2 && intent.path[1] !== '$order' && intent.type === 'set' && !installedNames.has(String(intent.path[1])) && approved.has(String(intent.path[1])))
-                    .map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
-                // Whole-list API submissions request installation, while addressed storage deletes remain independent.
-                acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...additions]
-                if (additions.length) {
-                    const addedNames = new Set(additions.map(intent => String(intent.path[1])))
+                // An approval applies only to the list it was asked about: an install while the name is
+                // still free, a replacement while the installed script is still the one it replaces.
+                const accepted = intents.filter(intent => {
+                    const name = String(intent.path[1])
+                    if (!isPluginRecordSet(intent) || !approved.has(name)) return false
+                    return scriptsBeforeConfirmation.has(name)
+                        ? installedScripts.has(name) && installedScripts.get(name) === scriptsBeforeConfirmation.get(name)
+                        : !installedScripts.has(name)
+                }).map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
+                // Whole-list API submissions request installation or replacement, while addressed storage deletes remain independent.
+                acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...accepted]
+                const addedNames = new Set(accepted.map(intent => String(intent.path[1])).filter(name => !installedScripts.has(name)))
+                if (addedNames.size) {
                     acceptedIntents.push({ path: ['plugins', '$order'], type: 'set', value: [...installed.map(plugin => plugin.name), ...[...approved.keys()].filter(name => addedNames.has(name))] })
                 }
             }

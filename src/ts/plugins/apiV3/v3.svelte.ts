@@ -144,7 +144,7 @@ function getPluginDatabaseAccess(owner: string, storage: PluginOwnerStorage): Pl
             if (!Object.prototype.hasOwnProperty.call(database, 'plugins')) return database
             return {
                 ...database,
-                plugins: await handlePluginInstallViaPlugin(database.plugins as RisuPlugin[]),
+                plugins: await handlePluginInstallViaPlugin(database.plugins as RisuPlugin[], owner, 'setDatabase'),
             }
         },
         snapshot: <T>(value: T) => $state.snapshot(value) as T,
@@ -498,6 +498,7 @@ type SafeMutationRecordObject = {
     type: string;
     target: SafeElement;
     addedNodes: SafeElement[];
+    removedNodes: SafeElement[];
 }
 
 class SafeClassArray<T> {
@@ -522,10 +523,12 @@ class SafeMutationRecord{
     #type: string;
     #target: SafeElement;
     #addedNodes: SafeClassArray<SafeElement>;
-    constructor(type: string, target: SafeElement, addedNodes: SafeElement[]) {
+    #removedNodes: SafeClassArray<SafeElement>;
+    constructor(type: string, target: SafeElement, addedNodes: SafeElement[], removedNodes: SafeElement[]) {
         this.#type = type;
         this.#target = target;
         this.#addedNodes = new SafeClassArray<SafeElement>(addedNodes);
+        this.#removedNodes = new SafeClassArray<SafeElement>(removedNodes);
     }
     getType(): string {
         return this.#type;
@@ -535,6 +538,9 @@ class SafeMutationRecord{
     }
     getAddedNodes(): SafeClassArray<SafeElement> {
         return this.#addedNodes;
+    }
+    getRemovedNodes(): SafeClassArray<SafeElement> {
+        return this.#removedNodes;
     }
 }
 
@@ -571,7 +577,8 @@ class SafeMutationObserver {
                 safeClassed.push(new SafeMutationRecord(
                     record.type,
                     record.target,
-                    record.addedNodes
+                    record.addedNodes,
+                    record.removedNodes,
                 ));
             }
             callback(safeClassed);
@@ -989,7 +996,7 @@ const makeRisuaiAPIV3 = (
         risunestOnGenerationEnd: (callback?: unknown) =>
             risunest.onGenerationEnd(callback),
 
-        installPlugin: handlePluginInstallViaPlugin,
+        installPlugin: (plugins: RisuPlugin[]) => handlePluginInstallViaPlugin(plugins, plugin.name, 'installPlugin'),
 
         // --- Color Scheme APIs ---
         changeColorScheme: (name: string) => {

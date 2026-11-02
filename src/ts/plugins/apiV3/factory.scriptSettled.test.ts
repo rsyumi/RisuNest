@@ -743,6 +743,31 @@ describe('sandbox result lifetime and policy', () => {
         expect(cancel).toHaveBeenCalledTimes(1)
     })
 
+    it('releases every instance a batched release names and keeps the others callable', async () => {
+        const host = new SandboxHost({ make: (label: string) => ({ __classType: 'REMOTE_REQUIRED', label: () => label }) })
+        const frame = document.createElement('iframe')
+        document.body.append(frame)
+        host.run(frame, '')
+        const post = vi.spyOn(frame.contentWindow!, 'postMessage')
+        const send = (data: unknown) => window.dispatchEvent(new MessageEvent('message', { source: frame.contentWindow, data }))
+        const reply = async (reqId: string) => {
+            await vi.waitFor(() => expect(post.mock.calls.some(([message]) => message.reqId === reqId)).toBe(true))
+            return post.mock.calls.find(([message]) => message.reqId === reqId)![0]
+        }
+        const ids: string[] = []
+        for (const label of ['first', 'second', 'kept']) {
+            send({ type: 'CALL_ROOT', method: 'make', reqId: `make-${label}`, args: [label] })
+            ids.push((await reply(`make-${label}`)).result.id)
+        }
+        expect(new Set(ids).size).toBe(3)
+        send({ type: 'RELEASE_INSTANCE', ids: ids.slice(0, 2) })
+        ids.forEach((id, index) => send({ type: 'CALL_INSTANCE', id, method: 'label', reqId: `label-${index}`, args: [] }))
+        expect((await reply('label-0')).error).toMatch(/not found or released/)
+        expect((await reply('label-1')).error).toMatch(/not found or released/)
+        expect((await reply('label-2')).result).toBe('kept')
+        host.terminate()
+    })
+
     it('cancels an undeliverable response body', async () => {
         let resolve!: (value: unknown) => void
         const host = new SandboxHost({ call: () => new Promise(done => { resolve = done }) })

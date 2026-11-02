@@ -2,7 +2,7 @@
 
 Export saved web RisuAI data, ordinary assets, archived chats, and **all inlays stored in the current browser**, including unreferenced inlays, into a RisuNest-compatible `.bin` backup.
 
-Supports local IndexedDB/OPFS storage and RisuAI account storage. The storage adapter targets RisuAI **v2026.10.211**. The panel supports Korean and English, with a language selector.
+Supports local IndexedDB/OPFS storage and RisuAI account storage. The storage adapter targets RisuAI **v2026.10.292**. The panel supports Korean and English, with a language selector.
 
 ## Use
 
