@@ -661,6 +661,7 @@ export async function characterURLImport() {
         try { assertModuleMCPImportAllowed(importData) }
         catch (error) { alertError(error); return false }
         importData.id = v4()
+        delete importData.mcp
 
         if (importData.lowLevelAccess) {
             const conf = await alertConfirm(language.lowLevelAccessConfirm)
