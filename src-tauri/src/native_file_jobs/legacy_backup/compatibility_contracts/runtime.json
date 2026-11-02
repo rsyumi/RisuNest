@@ -2,7 +2,7 @@
   "risuai": {
     "package.json": "d4a622da718f66e48906b0195727bea2c7679dc121a2dd58ba900abbc99d7bf8",
     "pnpm-lock.yaml": "a0458035c4c9c84443ffbf2936a1fd00e38d1ac23ad767437e1e658766df25e6",
-    "src/lang/en.ts": "78d44f4f0fea5584825ea546c1995a2df9d815a13603d1f7f1cfa7ef01767a03",
+    "src/lang/en.ts": "740b531878e9f099f705ba1f51e678079ecc1759652ae0d4a3709073dbc89cb0",
     "src/lang/index.ts": "f3867231d19819ddf1da2817ba33e06a32eac223b002dff56d33bd43768e1271",
     "src/ts/bootstrap.ts": "42f08a8c8bef88809ea1d4e09a7dfdc362d12d3bd2107da748cfdce9f6849128",
     "src/ts/characters.ts": "18b7907bc921d5a4253e94ee779eca10d5ed34abdf5d0b9c6386e2ec74597232",
@@ -19,7 +19,7 @@
     "src/ts/process/pluginStorageStore.ts": "21c1a4a2bad18e3c55c6a285f4b1e201b5c98c5326f5678256ecb0ead7ace97a",
     "src/ts/process/templates/templates.ts": "df1f1fd87f0c59a146be01dcad5575b725795d45abcfdc23537700ee096e7cd3",
     "src/ts/sionyw.ts": "ba6ffb62fbb8c3cc14f765e6cacfee53e7e8c998acff1ace4bbebd088b974d64",
-    "src/ts/storage/database.svelte.ts": "b09eea924c44b868159b9b5c28a615b8e83a29323d162ceba1162d702bea9170",
+    "src/ts/storage/database.svelte.ts": "bd6c529064674071cfa17daba8987f7442edadbd679f66c7f0ba2713c826c0c9",
     "src/ts/storage/defaultPrompts.ts": "6a60c32f8b1ec8701517ed8055b093d5388fafb4600dfeeb8ea69c689a911e5a",
     "src/ts/storage/risuSave.ts": "85d059f34bb59a9640191130ea678143995b6bbe0188c7e3980ccfc58a1951a4",
     "src/ts/storage/saveKV.ts": "8682e9e7bcc85e994cda704ea23d49058277d574c229a2d1eb53b97b13894bca",

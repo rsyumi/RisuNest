@@ -3,7 +3,7 @@
   <h1>RisuNest</h1>
   <p><strong>Windows · macOS · Linux · Android · iOS 용 RisuAI 네이티브 포크 프로젝트.</strong></p>
 
-  [![RisuAI 2026.10.211](https://img.shields.io/badge/RisuAI-2026.10.211-blue)](https://github.com/kwaroran/RisuAI)
+  [![RisuAI 2026.10.292](https://img.shields.io/badge/RisuAI-2026.10.292-blue)](https://github.com/kwaroran/RisuAI)
   [![Tauri 2](https://img.shields.io/badge/Tauri-2-%2324C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
   [![Svelte 5](https://img.shields.io/badge/Svelte-5-FF3E00?logo=svelte&logoColor=white)](https://svelte.dev/)
   [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
