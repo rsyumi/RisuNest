@@ -326,6 +326,7 @@ const SYNCHRONOUS_CHARACTER_SET_ERROR =
     'Synchronous plugin character updates are unavailable. Use async setDatabase().'
 const STALE_DATABASE_SET_ERROR =
     'Plugin database update became stale because navigation state changed.'
+class PluginApprovalOvertakenError extends Error {}
 const DANGEROUS_DATABASE_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 export function linkPluginQueryAbortSignals(
@@ -1402,29 +1403,52 @@ export function createPluginDatabaseAccess(
             if (hasCharacterUpdate(preparedUpdate)) {
                 validateCompleteCharacters(preparedUpdate.characters)
             }
-            let acceptedIntents = intents
-            if (changedKeys.has('plugins')) {
-                const installed = dependencies.getCompatibilityDatabase().plugins ?? []
-                const installedScripts = new Map(installed.map(plugin => [plugin.name, plugin.script]))
-                const approved = new Map((preparedUpdate.plugins as RisuPlugin[] | undefined ?? []).map(plugin => [plugin.name, plugin]))
-                // An approval applies only to the list it was asked about: an install while the name is
-                // still free, a replacement while the installed script is still the one it replaces.
-                const accepted = intents.filter(intent => {
-                    const name = String(intent.path[1])
-                    if (!isPluginRecordSet(intent) || !approved.has(name)) return false
-                    return scriptsBeforeConfirmation.has(name)
-                        ? installedScripts.has(name) && installedScripts.get(name) === scriptsBeforeConfirmation.get(name)
-                        : !installedScripts.has(name)
-                }).map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
-                // Whole-list API submissions request installation or replacement, while addressed storage deletes remain independent.
-                acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...accepted]
-                const addedNames = new Set(accepted.map(intent => String(intent.path[1])).filter(name => !installedScripts.has(name)))
-                if (addedNames.size) {
-                    acceptedIntents.push({ path: ['plugins', '$order'], type: 'set', value: [...installed.map(plugin => plugin.name), ...[...approved.keys()].filter(name => addedNames.has(name))] })
+            const approved = new Map((preparedUpdate.plugins as RisuPlugin[] | undefined ?? []).map(plugin => [plugin.name, plugin]))
+            const installedPlugins = () => dependencies.getCompatibilityDatabase().plugins ?? []
+            // An approval applies only to the list it was asked about: an install while the name is
+            // still free, a replacement while the installed script is still the one it replaces.
+            const approvalHolds = (name: string, installed: readonly RisuPlugin[]) => {
+                const current = installed.find(plugin => plugin.name === name)
+                return scriptsBeforeConfirmation.has(name)
+                    ? !!current && current.script === scriptsBeforeConfirmation.get(name)
+                    : !current
+            }
+            while (true) {
+                let acceptedIntents = intents
+                let acceptedNames: string[] = []
+                if (changedKeys.has('plugins')) {
+                    const installed = installedPlugins()
+                    acceptedNames = intents
+                        .filter(intent => isPluginRecordSet(intent) && approved.has(String(intent.path[1])))
+                        .map(intent => String(intent.path[1]))
+                        .filter(name => approvalHolds(name, installed))
+                    const accepted = intents.filter(intent => isPluginRecordSet(intent) && acceptedNames.includes(String(intent.path[1])))
+                        .map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
+                    // Whole-list API submissions request installation or replacement, while addressed storage deletes remain independent.
+                    acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...accepted]
+                    const addedNames = new Set(acceptedNames.filter(name => !installed.some(plugin => plugin.name === name)))
+                    if (addedNames.size) {
+                        acceptedIntents.push({ path: ['plugins', '$order'], type: 'set', value: [...installed.map(plugin => plugin.name), ...[...approved.keys()].filter(name => addedNames.has(name))] })
+                    }
+                }
+                const changes = databaseUnitChanges(acceptedIntents, preparedUpdate, allowedKeys)
+                const storageCheck = storageWriteCheck(prepareStorageWrite, changes.units)
+                try {
+                    await dependencies.commitPersistentUnitIntent('plugin-setDatabase', changes.units, [], changes.wholeMessages, undefined, {
+                        // The write can wait behind other saves, so every attempt checks the approvals again.
+                        validate: () => {
+                            const installed = installedPlugins()
+                            if (!acceptedNames.every(name => approvalHolds(name, installed))) throw new PluginApprovalOvertakenError()
+                            storageCheck.validate()
+                        },
+                        committed: storageCheck.committed,
+                    })
+                    break
+                } catch (error) {
+                    // Nothing was written; commit again without the approvals the plugin list overtook.
+                    if (!(error instanceof PluginApprovalOvertakenError)) throw error
                 }
             }
-            const changes = databaseUnitChanges(acceptedIntents, preparedUpdate, allowedKeys)
-            await dependencies.commitPersistentUnitIntent('plugin-setDatabase', changes.units, [], changes.wholeMessages, undefined, storageWriteCheck(prepareStorageWrite, changes.units))
             dependencies.assertPersistentMutationAllowed(authorityEpoch)
 
         },

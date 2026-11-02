@@ -399,6 +399,72 @@ describe('persistent production runtime', () => {
         expect(exported.pluginCustomStorage).toEqual(storage)
     })
 
+    it('keeps a plugin the user updated while an approved replacement waited behind another save', async () => {
+        const database = makeDatabase()
+        const caller = { name: PLUGIN_ACCESS_OWNER, version: '3.0' as const, enabled: true, script: 'caller', realArg: {}, arguments: {}, customLink: [], argMeta: {} }
+        const target = { ...caller, name: 'target', script: 'target v1' }
+        const added = { ...caller, name: 'added', script: 'added' }
+        database.plugins = [caller, target] as Database['plugins']
+        const store = makeStore(`runtime-plugin-approval-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        let queued!: () => void
+        const commitQueued = new Promise<void>((resolve) => { queued = resolve })
+        const access = createPluginDatabaseAccess({
+            owner: PLUGIN_ACCESS_OWNER,
+            store,
+            flushPendingData: (reason) => runtime.flushPendingData(reason),
+            getCompatibilityDatabase: () => adapter.current(),
+            getSelectedCharacterId: () => adapter.current().characters[0]?.chaId ?? null,
+            captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
+            acquireCompleteConversation: (reason, conversationTarget) => runtime.acquireCompleteConversation(reason, conversationTarget),
+            refreshSelectedConversationAfterReplacement: (conversationTarget, expectedSession) =>
+                runtime.refreshSelectedConversationAfterReplacement(conversationTarget, expectedSession),
+            getPersistentRevision: () => runtime.revision,
+            commitPersistentUnitIntent: (...args) => {
+                const committing = runtime.commitPersistentUnitIntent(...args)
+                queued()
+                return committing
+            },
+            // Stands in for the approval dialog, which approves every requested record here.
+            prepareAuthoritativeDatabaseUpdate: async (update) => update,
+            reportIdentityReplacementRejected: vi.fn(),
+            getNavigationGeneration: () => runtime.getNavigationGeneration(),
+            readPluginStorageSnapshot: vi.fn(async () => ({})),
+            getStorageAuthorityEpoch: () => runtime.getStorageAuthorityEpoch(),
+            assertPersistentMutationAllowed: (epoch) => runtime.assertPersistentMutationAllowed(epoch),
+            snapshot: structuredClone,
+        })
+        let release!: () => void
+        let paused!: () => void
+        const exportStarted = new Promise<void>((resolve) => { paused = resolve })
+        const exporting = runtime.withPausedPersistentWrites('test-export', async () => {
+            paused()
+            await new Promise<void>((resolve) => { release = resolve })
+        })
+        await exportStarted
+        const writing = access.setDatabase({ plugins: [caller, { ...target, script: 'target from plugin' }, added] }, ['plugins'])
+        await commitQueued
+        adapter.current().plugins[1] = { ...target, script: 'target from user' }
+        runtime.markPersistentDataDirty(64)
+        release()
+        await exporting
+        await writing
+        await runtime.flushPendingData('test')
+
+        const expected = [[PLUGIN_ACCESS_OWNER, 'caller'], ['target', 'target from user'], ['added', 'added']]
+        expect(adapter.current().plugins.map((plugin) => [plugin.name, plugin.script])).toEqual(expected)
+        const persisted = await store.materializeDatabase(runtime.revision)
+        expect(persisted.plugins.map((plugin) => [plugin.name, plugin.script])).toEqual(expected)
+    })
+
     it('production capture helpers do not traverse inactive characters', () => {
         const database = makeDatabase()
         const inactive = structuredClone(database.characters[0])
