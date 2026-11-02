@@ -106,6 +106,7 @@ export async function activatePreparedNativeModuleContent(
 
     const moduleId = dependencies.createId()
     module.id = moduleId
+    delete module.mcp
     if (Object.hasOwn(module, 'assets')) {
         if (
             !Array.isArray(module.assets) ||

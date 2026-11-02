@@ -4,6 +4,7 @@ import goldenCardJson from './storage/tests/roadmap14/fixtures/charx/card-v3.jso
 const mocks = vi.hoisted(() => ({
     database: {
         characters: [] as any[],
+        modules: [] as any[],
         statics: { imports: 0 },
         blockedRealmCreators: [] as any[],
     },
@@ -154,6 +155,7 @@ vi.mock('./media', () => ({
 }))
 
 import {
+    characterURLImport,
     downloadRisuHub,
     exportCharacterCard,
     exportChar,
@@ -1094,5 +1096,20 @@ describe('character card additions', () => {
         expect(requests).toEqual([expect.stringMatching(/\/hub\/info\/synthetic-card$/)])
         expect(String(mocks.alertError.mock.calls[0]?.[0])).toContain('synthetic lookup failure')
         expect(mocks.alertRisuServiceTOS).not.toHaveBeenCalled()
+    })
+
+    it('drops MCP data from a module imported by URL', async () => {
+        mocks.database.modules = []
+        const module = { type: 'risuModule', id: 'source', name: 'Synthetic', description: '', mcp: { url: 'internal:dice' } }
+        location.hash = '#import_module=' + encodeURIComponent(Buffer.from(JSON.stringify(module)).toString('base64'))
+        try {
+            await characterURLImport()
+        } finally {
+            location.hash = ''
+        }
+        expect(mocks.database.modules).toHaveLength(1)
+        expect(mocks.database.modules[0]).toMatchObject({ name: 'Synthetic', id: 'card-id-1' })
+        expect(mocks.database.modules[0]).not.toHaveProperty('mcp')
+        expect(mocks.alertError).not.toHaveBeenCalled()
     })
 })
