@@ -2308,6 +2308,10 @@ export const languageEnglish = {
             unsupportedApiVersionLoad:
                 'These plugins use an unsupported Plugin API version and did not run. Install versions updated to API 3.0.\n\n{plugins}',
 
+            installViaPlugin: 'The plugin "{source}" is trying to install the plugin "{plugin}". Do you want to install it?',
+            replaceViaPlugin: 'The plugin "{source}" is trying to replace the code of the plugin "{plugin}". If you replace it, the new code uses the data saved by "{plugin}". Do you want to replace it?',
+            replaceSelfViaPlugin: 'The plugin "{plugin}" is trying to replace its own code. Do you want to replace it?',
+
             "removeTitle": "Remove this plugin?",
             "removeDescription": "Deleting plugin data also removes its settings and saved content, even if you reinstall the plugin. Keeping plugin data lets you use it again after reinstalling.",
             "removeDataOption": "Also delete plugin data",

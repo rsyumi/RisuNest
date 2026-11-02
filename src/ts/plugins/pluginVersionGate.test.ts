@@ -35,6 +35,7 @@ import {
 import { importPlugin, loadPlugins, loadPluginsAfterAuthoritativeRestore, handlePluginInstallViaPlugin, applyPreparedPluginDatabaseUpdate, allowedDbKeys, cancelPluginReloadAfterSync, PLUGIN_SYNC_RELOAD_WAIT_LIMIT_MS, requestPluginReloadAfterSync, type RisuPlugin } from './plugins.svelte'
 
 import { createPluginDatabaseAccess } from './pluginDatabaseAccess'
+import { language } from 'src/lang'
 
 let alertError: ReturnType<typeof vi.spyOn>
 
@@ -211,9 +212,9 @@ describe('plugin API version gate', () => {
 
 
 describe('plugin list database mutation policy', () => {
-    function access() {
+    function access(owner = 'caller') {
         return createPluginDatabaseAccess({
-            owner: 'caller',
+            owner,
             getPersistentRevision:()=>1,
             commitPersistentUnitIntent:async (_reason:string,units:readonly import('./pluginUnitIntents').PluginUnitMutation[])=>{
                 let order: string[] | undefined
@@ -241,11 +242,12 @@ describe('plugin list database mutation policy', () => {
             mutatePluginStorage: async () => undefined,
             flushPendingData: async () => undefined,
             prepareAuthoritativeDatabaseUpdate: async (value: Record<string, unknown>) => ({
-                ...value, ...(value.plugins ? { plugins: await handlePluginInstallViaPlugin(value.plugins as RisuPlugin[]) } : {}),
+                ...value, ...(value.plugins ? { plugins: await handlePluginInstallViaPlugin(value.plugins as RisuPlugin[], owner, 'setDatabase') } : {}),
             }),
         } as any)
     }
-    it.each(['lite', 'async'])('preserves every installed record on %s round trips, omissions and replacement attempts', async (kind) => {
+    // Declined requests stay declined for the whole module, so each test submits its own scripts.
+    it.each(['lite', 'async'])('replaces a changed script only after an approved %s request and keeps every other installed record', async (kind) => {
         const installed = [makePlugin('caller', '3.0'), makePlugin('other', '3.0')]
         installed[1].realArg = { marker: 'private' }
         getDatabase().plugins = installed
@@ -256,32 +258,109 @@ describe('plugin list database mutation policy', () => {
             ? api.setDatabaseLite({ plugins }, allowedDbKeys)
             : api.setDatabase({ plugins }, allowedDbKeys)
         await write(before)
-        expect(getDatabase().plugins).toEqual(before)
-        await write([{ ...before[1], script: 'replacement', enabled: false, realArg: { marker: 'changed' }, allowedIPC: ['all'] }])
+        await write([{ ...before[1], enabled: false, realArg: { marker: 'changed' } }])
         expect(getDatabase().plugins).toEqual(before)
         expect(confirm).not.toHaveBeenCalled()
+        const replacement = { ...before[1], script: `replacement ${kind}`, enabled: false, realArg: { marker: 'changed' }, allowedIPC: ['all'] }
+        await write([replacement])
+        await write([replacement])
+        expect(getDatabase().plugins).toEqual(before)
+        expect(confirm).toHaveBeenCalledTimes(kind === 'lite' ? 0 : 1)
+        confirm.mockResolvedValue(true)
+        const approved = { ...replacement, script: `approved ${kind}` }
+        await write([approved])
+        expect(getDatabase().plugins).toEqual(kind === 'lite' ? before : [before[0], approved])
+        expect(confirm).toHaveBeenCalledTimes(kind === 'lite' ? 0 : 2)
+    })
+    it('names plugins in requests by their installed records', async () => {
+        const caller = { ...makePlugin('caller', '3.0'), displayName: 'Caller Plugin', script: 'caller v1' }
+        const other = { ...makePlugin('other', '3.0'), displayName: 'Other Plugin', script: 'other v1' }
+        getDatabase().plugins = [caller, other]
+        const confirm = vi.spyOn(alertModule, 'alertConfirm').mockResolvedValue(false)
+        const api = access()
+        await api.setDatabase({ plugins: [caller, other, { ...makePlugin('fresh', '3.0'), displayName: 'Other Plugin', script: 'fresh' }] }, allowedDbKeys)
+        await api.setDatabase({ plugins: [{ ...caller, displayName: 'Other Plugin', script: 'caller v2' }, other] }, allowedDbKeys)
+        await api.setDatabase({ plugins: [caller, { ...other, displayName: 'Trusted', script: 'other v2' }] }, allowedDbKeys)
+        const messages = language.risuNest.plugins
+        expect(confirm.mock.calls.map(([message]) => message)).toEqual([
+            messages.installViaPlugin.replace('{source}', 'Caller Plugin').replaceAll('{plugin}', 'fresh'),
+            messages.replaceSelfViaPlugin.replaceAll('{plugin}', 'Caller Plugin'),
+            messages.replaceViaPlugin.replace('{source}', 'Caller Plugin').replaceAll('{plugin}', 'Other Plugin'),
+        ])
+        expect(getDatabase().plugins).toEqual([caller, other])
+    })
+    it('asks only about records the plugin changed when it writes back an old copy of the plugin list', async () => {
+        getDatabase().plugins = [makePlugin('caller', '3.0'), { ...makePlugin('other', '3.0'), script: 'other v1' }]
+        const confirm = vi.spyOn(alertModule, 'alertConfirm').mockResolvedValue(true)
+        const api = access()
+        const read = await api.getDatabaseSnapshot(['plugins'], allowedDbKeys) as { plugins: RisuPlugin[] }
+        getDatabase().plugins[1] = { ...getDatabase().plugins[1], script: 'other v2' }
+        await api.setDatabase(read, allowedDbKeys)
+        expect(confirm).not.toHaveBeenCalled()
+        const fresh = { ...makePlugin('fresh', '3.0'), script: 'fresh' }
+        await api.setDatabase({ plugins: [...read.plugins, fresh] }, allowedDbKeys)
+        expect(confirm).toHaveBeenCalledOnce()
+        expect(getDatabase().plugins.map(plugin => [plugin.name, plugin.script])).toEqual([['caller', ''], ['other', 'other v2'], ['fresh', 'fresh']])
+    })
+    it('drops an approval that the plugin list overtook while the dialog was open', async () => {
+        const caller = makePlugin('caller', '3.0')
+        getDatabase().plugins = [caller, { ...makePlugin('other', '3.0'), script: 'other v1' }]
+        let answer!: (confirmed: boolean) => void
+        const confirm = vi.spyOn(alertModule, 'alertConfirm').mockReturnValue(new Promise<boolean>(resolve => { answer = resolve }))
+        const writing = access().setDatabase({ plugins: [
+            caller, { ...makePlugin('other', '3.0'), script: 'plugin other v2' }, { ...makePlugin('fresh', '3.0'), script: 'plugin fresh' },
+        ] }, allowedDbKeys)
+        await vi.waitFor(() => expect(confirm).toHaveBeenCalledOnce())
+        const userList = [caller, { ...makePlugin('other', '3.0'), script: 'user other v3' }, { ...makePlugin('fresh', '3.0'), script: 'user fresh' }]
+        getDatabase().plugins = structuredClone(userList)
+        answer(true)
+        await writing
+        expect(getDatabase().plugins).toEqual(userList)
+    })
+    it('carries one installPlugin approval to the next matching setDatabase and shares a dialog between identical requests', async () => {
+        const caller = makePlugin('caller', '3.0')
+        getDatabase().plugins = [caller]
+        const proposed = { ...makePlugin('carried', '3.0'), script: 'carried' }
+        let answer!: (confirmed: boolean) => void
+        const confirm = vi.spyOn(alertModule, 'alertConfirm').mockResolvedValue(false)
+            .mockReturnValueOnce(new Promise<boolean>(resolve => { answer = resolve }))
+        const first = handlePluginInstallViaPlugin([proposed, proposed], 'caller', 'installPlugin')
+        const second = handlePluginInstallViaPlugin([proposed], 'caller', 'installPlugin')
+        await vi.waitFor(() => expect(confirm).toHaveBeenCalledOnce())
+        answer(true)
+        expect(await first).toEqual([proposed])
+        expect(await second).toEqual([proposed])
+        await access().setDatabase({ plugins: [caller, proposed] }, allowedDbKeys)
+        expect(confirm).toHaveBeenCalledOnce()
+        expect(getDatabase().plugins).toEqual([caller, proposed])
+        getDatabase().plugins = [caller]
+        await access().setDatabase({ plugins: [caller, proposed] }, allowedDbKeys)
+        expect(confirm).toHaveBeenCalledTimes(2)
+        expect(getDatabase().plugins).toEqual([caller])
     })
     it('does not disclose existing plugin arguments through the installation helper', async () => {
         getDatabase().plugins = [{ ...makePlugin('other', '3.0'), realArg: { marker: 'private' } }]
-        expect(await handlePluginInstallViaPlugin([])).toEqual([])
-        expect(await handlePluginInstallViaPlugin([makePlugin('other', '3.0')])).toEqual([])
+        expect(await handlePluginInstallViaPlugin([], 'caller', 'installPlugin')).toEqual([])
+        expect(await handlePluginInstallViaPlugin([makePlugin('other', '3.0')], 'caller', 'installPlugin')).toEqual([])
     })
-    it('requires async approval for additions and never runs lite additions', async () => {
+    it('requires async approval for additions, remembers a decline and never runs lite additions', async () => {
         const original = makePlugin('original', '3.0')
         getDatabase().plugins = [original]
-        const proposed = makePlugin('new', '3.0')
+        const proposed = { ...makePlugin('new', '3.0'), script: 'declined' }
         const confirm = vi.spyOn(alertModule, 'alertConfirm').mockResolvedValue(false)
         const api = access()
         await api.setDatabaseLite({ plugins: [proposed] }, allowedDbKeys)
         expect(confirm).not.toHaveBeenCalled()
         expect(getDatabase().plugins).toEqual([original])
         await api.setDatabase({ plugins: [proposed] }, allowedDbKeys)
+        await api.setDatabase({ plugins: [proposed] }, allowedDbKeys)
         expect(confirm).toHaveBeenCalledTimes(1)
         expect(getDatabase().plugins).toEqual([original])
         confirm.mockResolvedValue(true)
-        await api.setDatabase({ plugins: [proposed, proposed] }, allowedDbKeys)
+        const retried = { ...proposed, script: 'approved' }
+        await api.setDatabase({ plugins: [retried, retried] }, allowedDbKeys)
         expect(confirm).toHaveBeenCalledTimes(2)
-        expect(getDatabase().plugins).toEqual([original, proposed])
+        expect(getDatabase().plugins).toEqual([original, retried])
         await loadPlugins()
         expect(vi.mocked(loadV3Plugins).mock.calls.at(-1)![0].map((plugin) => plugin.name)).toEqual(['original', 'new'])
     })

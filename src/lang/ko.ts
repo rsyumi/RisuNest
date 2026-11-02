@@ -870,6 +870,14 @@ export const languageKorean = {
     "SpacedView": "멀티플",
     "emphasizedView": "더블",
     "pluginWarn": "악성 플러그인 설치 시 문제가 생길 수 있습니다.",
+    "fetchLogConsent": "'{}' 플러그인이 로그를 가져오려고 합니다. 로그에 민감한 정보가 포함될 수 있습니다. 허용하시겠습니까?",
+    "getFullDatabaseConsent": "'{}' 플러그인이 전체 데이터베이스에 접근하려고 합니다. 민감한 정보가 노출될 수 있습니다. 허용하시겠습니까?",
+    "mainDomAccessConsent": "'{}' 플러그인이 앱 화면의 DOM에 접근하려고 합니다. 민감한 정보가 노출될 수 있습니다. 허용하시겠습니까?",
+    "replacerPermissionConsent": "'{}' 플러그인이 채팅 내용을 바꾸는 권한을 요청합니다. 대화 내용이 조작될 수 있습니다. 허용하시겠습니까?",
+    "providerPermissionConsent": "'{}' 플러그인이 모델 사용 권한을 요청합니다. 사용자가 요청하지 않은 API 호출이 일어날 수 있습니다. 허용하시겠습니까?",
+    "inlayPermissionConsent": "'{}' 플러그인이 인레이 접근 권한을 요청합니다. 플러그인이 인레이를 읽고 쓰고 수정할 수 있습니다. 허용하시겠습니까?",
+    "sendChatConsent": "'{}' 플러그인이 사용자 대신 채팅 메시지를 보내는 권한을 요청합니다. 보낸 메시지에 AI가 응답합니다. 허용하시겠습니까?",
+    "hostToolPermissionConsent": "'{}' 플러그인이 MCP를 포함한 도구 호출 권한을 요청합니다. 플러그인이 데이터를 읽거나 바꿀 수 있습니다. 허용하시겠습니까?",
     "resetAllPluginPermissions": "플러그인 권한 초기화",
     "resetAllPluginPermissionsConfirm": "모든 플러그인의 저장된 권한을 초기화하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.",
     "resetAllPluginPermissionsDone": "플러그인 권한을 초기화했습니다",
@@ -2121,6 +2129,10 @@ export const languageKorean = {
                 '플러그인 API {version} 버전은 지원하지 않습니다. API 3.0으로 업데이트된 버전을 설치하세요.',
             unsupportedApiVersionLoad:
                 '다음 플러그인은 지원하지 않는 플러그인 API 버전을 사용하므로 실행되지 않았습니다. API 3.0으로 업데이트된 버전을 설치하세요.\n\n{plugins}',
+
+            installViaPlugin: "'{source}' 플러그인이 '{plugin}' 플러그인을 설치하려고 합니다. 설치하시겠습니까?",
+            replaceViaPlugin: "'{source}' 플러그인이 '{plugin}' 플러그인의 코드를 교체하려고 합니다. 교체할 경우 '{plugin}' 플러그인에 저장된 데이터를 새 코드가 사용합니다. 교체하시겠습니까?",
+            replaceSelfViaPlugin: "'{plugin}' 플러그인이 자신의 코드를 교체하려고 합니다. 교체하시겠습니까?",
 
             "removeTitle": "플러그인을 삭제하시겠습니까?",
             "removeDescription": "플러그인 데이터를 함께 삭제할 경우 플러그인을 다시 설치해도 설정과 저장된 내용이 복원되지 않습니다. 플러그인 데이터를 유지하면 다시 설치했을 때 기존 내용을 그대로 사용할 수 있습니다.",

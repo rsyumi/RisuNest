@@ -144,7 +144,7 @@ function getPluginDatabaseAccess(owner: string, storage: PluginOwnerStorage): Pl
             if (!Object.prototype.hasOwnProperty.call(database, 'plugins')) return database
             return {
                 ...database,
-                plugins: await handlePluginInstallViaPlugin(database.plugins as RisuPlugin[]),
+                plugins: await handlePluginInstallViaPlugin(database.plugins as RisuPlugin[], owner, 'setDatabase'),
             }
         },
         snapshot: <T>(value: T) => $state.snapshot(value) as T,
@@ -996,7 +996,7 @@ const makeRisuaiAPIV3 = (
         risunestOnGenerationEnd: (callback?: unknown) =>
             risunest.onGenerationEnd(callback),
 
-        installPlugin: handlePluginInstallViaPlugin,
+        installPlugin: (plugins: RisuPlugin[]) => handlePluginInstallViaPlugin(plugins, plugin.name, 'installPlugin'),
 
         // --- Color Scheme APIs ---
         changeColorScheme: (name: string) => {

@@ -446,18 +446,27 @@ describe('plugin unit writes with read provenance', () => {
         expect(harness.commitPersistentUnitIntent).toHaveBeenCalledWith('plugin-setChatToIndex', [{ key: '["conversation","active","active-chat-a","name"]', type: 'set', value: 'Edited chat' }], [], [])
     })
 
-    it('commits only approved plugin additions and preserves installed records on API list omission and replacement', async () => {
+    it('confirms only changed plugin records and commits approved additions and in-place replacements', async () => {
         const harness = createHarness()
         const original = { name: 'installed', script: 'original', version: '3.0', enabled: true }
         harness.compatibilityDatabase.plugins = [original] as any
         harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [] }))
         await harness.access.setDatabase({ plugins: [] }, ['plugins'])
+        expect(harness.prepareAuthoritativeDatabaseUpdate.mock.calls.at(-1)?.[0]).not.toHaveProperty('plugins')
         expect(harness.commitPersistentUnitIntent.mock.calls.at(-1)?.[1]).toEqual([])
-        await harness.access.setDatabase({ plugins: [{ ...original, script: 'replacement' }] }, ['plugins'])
+        const replacement = { ...original, script: 'replacement' }
+        await harness.access.setDatabase({ plugins: [replacement] }, ['plugins'])
+        expect(harness.prepareAuthoritativeDatabaseUpdate.mock.calls.at(-1)?.[0]).toEqual({ plugins: [replacement] })
         expect(harness.commitPersistentUnitIntent.mock.calls.at(-1)?.[1]).toEqual([])
         const proposed = { name: 'new', script: 'proposed', version: '3.0', enabled: true }
-        await harness.access.setDatabase({ plugins: [proposed] }, ['plugins'])
+        await harness.access.setDatabase({ plugins: [original, proposed] }, ['plugins'])
+        expect(harness.prepareAuthoritativeDatabaseUpdate.mock.calls.at(-1)?.[0]).toEqual({ plugins: [proposed] })
         expect(harness.commitPersistentUnitIntent.mock.calls.at(-1)?.[1]).toEqual([])
+        harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [replacement] }))
+        await harness.access.setDatabase({ plugins: [replacement] }, ['plugins'])
+        expect(harness.commitPersistentUnitIntent.mock.calls.at(-1)?.[1]).toEqual([
+            { key: '["record","plugins","installed"]', type: 'set', value: replacement },
+        ])
         harness.prepareAuthoritativeDatabaseUpdate.mockImplementation(async update => ({ ...update, plugins: [proposed] }))
         await harness.access.setDatabase({ plugins: [proposed, proposed] }, ['plugins'])
         expect(harness.commitPersistentUnitIntent.mock.calls.at(-1)?.[1]).toEqual([
