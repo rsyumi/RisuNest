@@ -104,6 +104,10 @@ fn recording_server(fail_push: std::sync::Arc<std::sync::atomic::AtomicBool>) ->
                 async move {
                     let path = request.uri().path();
                     if path == "/push" && fail_push.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Finish the upload so an early disconnect cannot hide the 503 response.
+                        axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .expect("synthetic push request body");
                         return axum::response::Response::builder()
                             .status(503)
                             .body(axum::body::Body::from("{\"error\":\"unavailable\"}"))
