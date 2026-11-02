@@ -804,10 +804,14 @@ function canonicalPluginJson(value: unknown): string {
     return JSON.stringify(value) ?? 'null'
 }
 
-async function pluginRequestKey(requester: string, kind: 'install' | 'replace', plugin: RisuPlugin): Promise<string> {
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalPluginJson(plugin)))
-    const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
-    return JSON.stringify([requester, kind, plugin.name, hash])
+async function sha256Hex(text: string): Promise<string> {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
+// An answer covers one requester, one submitted record and the script it replaces (null for an install).
+async function pluginRequestKey(requester: string, plugin: RisuPlugin, replacedScript: string | null): Promise<string> {
+    return JSON.stringify([requester, plugin.name, await sha256Hex(canonicalPluginJson(plugin)), replacedScript === null ? null : await sha256Hex(replacedScript)])
 }
 
 /**
@@ -823,7 +827,7 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[], reques
         const installedPlugins: RisuPlugin[] = DBState.db.plugins ?? []
         const installed = installedPlugins.find(value => value.name === plugin.name)
         if (installed && installed.script === plugin.script) continue
-        const key = await pluginRequestKey(requester, installed ? 'replace' : 'install', plugin)
+        const key = await pluginRequestKey(requester, plugin, installed ? installed.script : null)
         if (declinedPluginRequests.has(key)) continue
         if (source === 'setDatabase' && carriedPluginApprovals.delete(key)) {
             approved.push(plugin)

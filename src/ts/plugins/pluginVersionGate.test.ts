@@ -317,7 +317,7 @@ describe('plugin list database mutation policy', () => {
         await writing
         expect(getDatabase().plugins).toEqual(userList)
     })
-    it('carries one installPlugin approval to the next matching setDatabase and shares a dialog between identical requests', async () => {
+    it('carries one installPlugin approval to the next setDatabase of the same record over the same installed script and shares a dialog between identical requests', async () => {
         const caller = makePlugin('caller', '3.0')
         getDatabase().plugins = [caller]
         const proposed = { ...makePlugin('carried', '3.0'), script: 'carried' }
@@ -337,6 +337,16 @@ describe('plugin list database mutation policy', () => {
         await access().setDatabase({ plugins: [caller, proposed] }, allowedDbKeys)
         expect(confirm).toHaveBeenCalledTimes(2)
         expect(getDatabase().plugins).toEqual([caller])
+        const target = { ...makePlugin('target', '3.0'), script: 'target v1' }
+        getDatabase().plugins = [caller, target]
+        const replacement = { ...target, script: 'target from caller' }
+        confirm.mockResolvedValueOnce(true)
+        expect(await handlePluginInstallViaPlugin([replacement], 'caller', 'installPlugin')).toEqual([replacement])
+        const updated = { ...target, script: 'target from user' }
+        getDatabase().plugins = [caller, updated]
+        await access().setDatabase({ plugins: [caller, replacement] }, allowedDbKeys)
+        expect(confirm).toHaveBeenCalledTimes(4)
+        expect(getDatabase().plugins).toEqual([caller, updated])
     })
     it('does not disclose existing plugin arguments through the installation helper', async () => {
         getDatabase().plugins = [{ ...makePlugin('other', '3.0'), realArg: { marker: 'private' } }]
