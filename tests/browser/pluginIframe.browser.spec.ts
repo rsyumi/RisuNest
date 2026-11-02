@@ -549,3 +549,23 @@ test('main popup windows and named iframe targets keep their native browser beha
     expect(await page.evaluate(() => window.boundary.downloads.opened)).toEqual([])
     await (await popup).close()
 })
+
+test.describe('guest reference release', () => {
+    test.skip(({ browserName }) => browserName !== 'chromium', 'Only Chromium can force garbage collection')
+
+    test('a remote reference the plugin no longer holds is released on the host after collection', async ({ page }) => {
+        await page.goto('/')
+        await page.evaluate(() => window.boundary.loadLocal(`
+            for (let i = 0; i < 3; i++) await risuai.getLocalPluginStorage();
+            await risuai.result(typeof gc);
+            for (let i = 0; i < 50; i++) {
+                gc();
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+        `))
+        await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toBe('function')
+        await expect.poll(() => page.evaluate(() => window.boundary.bridgeMessages
+            .filter(message => message.type === 'RELEASE_INSTANCE').flatMap(message => message.ids ?? []).length)).toBe(3)
+        expect(await page.evaluate(() => window.boundary.localInstances)).toBe(0)
+    })
+})
