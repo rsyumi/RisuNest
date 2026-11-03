@@ -713,6 +713,7 @@ export class SaveCoordinator {
     private localFlushPromise: Promise<void> | null = null
     private localFlushDuringPublicationPromise: Promise<void> | null = null
     private queuedOperationCount = 0
+    private queuedStorageOnlyOperationCount = 0
     private publicationInProgress = false
     private readonly operationStateWaiters = new Set<() => void>()
     private additionPromise: Promise<void> | null = null
@@ -795,6 +796,11 @@ export class SaveCoordinator {
     }
 
     get hasPendingPersistenceWork(): boolean {
+        return this.queuedStorageOnlyOperationCount > 0 || this.hasPendingWorkingSetPersistence
+    }
+
+    /** Pending work apart from queued storage-only mutations, which carry no working-set edit. */
+    private get hasPendingWorkingSetPersistence(): boolean {
         return (
             this.dirtyGeneration !== this.persistedDirtyGeneration ||
             this.pendingByteCount > 0 ||
@@ -802,7 +808,7 @@ export class SaveCoordinator {
             this.flushPromise !== null ||
             this.localFlushPromise !== null ||
             this.localFlushDuringPublicationPromise !== null ||
-            this.queuedOperationCount > 0 ||
+            this.queuedOperationCount > this.queuedStorageOnlyOperationCount ||
             this.additionPromise !== null ||
             this.pendingCharacterAddition !== null ||
             this.reservedCharacterAddition !== null ||
@@ -943,7 +949,7 @@ export class SaveCoordinator {
             this.currentRevision = revision
             this.dependencies.onStorageOnlyRevision?.(revision)
             this.dependencies.onLocalRevision?.(revision)
-        })
+        }, this.authorityEpoch, true)
     }
 
     adoptHydratedCharacter(
@@ -1038,7 +1044,7 @@ export class SaveCoordinator {
 
     retireWindowedSelectedConversation(): void {
         this.assertPersistentMutationAllowed()
-        if (this.hasPendingPersistenceWork || !this.captureMatchesBaseline()) {
+        if (this.hasPendingWorkingSetPersistence || !this.captureMatchesBaseline()) {
             throw new Error('Selected conversation ownership has pending persistence')
         }
         this.windowedCharacterBaseline = null
@@ -2060,15 +2066,19 @@ export class SaveCoordinator {
                 rootValue = await reader.readRoot()
                 this.assertReadRevision(revision, rootValue.revision)
                 for (const id of deletedIds) {
-                    const targetValue = await reader.readCharacter(id)
-                    const expirySummary = expiryCutoff === undefined || !isTauri ? null : await reader.readCharacterSummary(id)
+                    const summary = isTauri ? await reader.readCharacterSummary(id) : null
+                    // The native store keeps an archived character's details in its archive and refuses to read them, so
+                    // its owned keys come from the store with the conversation keys.
+                    const archived = Boolean(summary?.archived)
+                    const targetValue = archived ? null : await reader.readCharacter(id)
                     const expired = expiryCutoff === undefined || (isTauri
-                        ? expirySummary?.trashed && expirySummary.trashStampMs !== undefined && BigInt(expirySummary.trashStampMs) < BigInt(expiryCutoff)
+                        ? summary?.trashed && summary.trashStampMs !== undefined && BigInt(summary.trashStampMs) < BigInt(expiryCutoff)
                         : targetValue?.value.trashTime !== undefined && targetValue.value.trashTime < expiryCutoff)
-                    if (!targetValue || !expired) {
+                    if (!(archived || targetValue) || !expired) {
                         deletedIds.delete(id)
                         continue
                     }
+                    if (!targetValue) continue
                     this.assertReadRevision(revision, targetValue.revision)
                     if (targetValue.value.chaId !== id) throw new Error(`Character ${id} returned mismatched detail`)
                     ownedAssetKeys.set(id, collectOwnedAssetKeys(targetValue.value))
@@ -2837,8 +2847,10 @@ export class SaveCoordinator {
     private enqueue<T>(
         operation: () => Promise<T>,
         expectedAuthorityEpoch: number | null = this.authorityEpoch,
+        storageOnly = false,
     ): Promise<T> {
         this.queuedOperationCount += 1
+        if (storageOnly) this.queuedStorageOnlyOperationCount += 1
         this.persistenceWasBusy = true
         this.notifyOperationStateChange()
         return this.operationMutex.runExclusive(async () => {
@@ -2849,6 +2861,7 @@ export class SaveCoordinator {
                 return await operation()
             } finally {
                 this.queuedOperationCount -= 1
+                if (storageOnly) this.queuedStorageOnlyOperationCount -= 1
                 this.notifyOperationStateChange()
             }
         })

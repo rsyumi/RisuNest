@@ -11,11 +11,12 @@ import {scheduleDeletedOwnerAssetCleanup} from './deletedOwnerAssetCleanup'
 import type {WorkingSetCommit} from './persistentDataStore'
 
 const day=24*60*60*1000
-function fixture(stamp: string | undefined, recheck=stamp) {
+function fixture(stamp: string | undefined, recheck=stamp, archived=false) {
     const database=makeDatabase()
     database.characterOrder=['char-a']
     database.loadouts=[{id:'loadout',characterIds:['char-a','char-b']}] as typeof database.loadouts
-    const summary={id:'char-a',name:'Synthetic',type:'character' as const,configuredIndex:0,recentAt:0,trashed:true,conversationCount:0,trashTime:1,trashStampMs:stamp}
+    const summary={id:'char-a',name:'Synthetic',type:'character' as const,configuredIndex:0,recentAt:0,trashed:true,conversationCount:0,trashTime:1,trashStampMs:stamp,
+        ...(archived ? {archived:{archivedAt:1,conversationCount:1,messageCount:1}} : {})}
     // The native store: commits and alias deletes both expect its revision and advance it.
     const native={revision:1}
     const advance=(expectedRevision:number)=>{
@@ -26,8 +27,9 @@ function fixture(stamp: string | undefined, recheck=stamp) {
     core.invoke.mockImplementation(async(command,args)=>command==='pds_asset_delete_orphaned_aliases'?advance(args.expectedRevision):{})
     const release=vi.fn(async()=>{})
     const lease=(revision:number)=>createLeaseStub({revision,readRoot:async()=>({revision,value:capturePersistentRoot(database)}),
-        readCharacter:async(id)=>({revision,value:{...database.characters[0],chaId:id,trashTime:1,image:'assets/expired.png',
-            additionalAssets:[['extra','assets/extra.png','png']]}}),
+        // The native store refuses to read the details an archive holds.
+        readCharacter:async(id)=>{if(archived) throw new Error(`Character ${id} is archived`); return {revision,value:{...database.characters[0],chaId:id,trashTime:1,image:'assets/expired.png',
+            additionalAssets:[['extra','assets/extra.png','png']]}}},
         readCharacterSummary:async()=>({...summary,trashStampMs:recheck}),
         queryCharacters:async()=>({revision,items:[]}),release,
     })
@@ -78,6 +80,14 @@ describe('native stamped trash expiry', () => {
         await vi.waitFor(()=>expect(f.native.revision).toBe(3))
         await expect(f.coordinator.deletePersistentCharacters(['char-b'],'purge')).resolves.toBe(1)
         expect(f.commit).toHaveBeenLastCalledWith(expect.objectContaining({expectedRevision:3}))
+    })
+    it('deletes an archived character with the keys the store reports for it', async()=>{
+        const f=fixture('1','1',true)
+        await expect(f.coordinator.deletePersistentCharacters(['char-a'],'purge')).resolves.toBe(1)
+        expect(f.commit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({expectedRevision:1,
+            unitMutations:expect.arrayContaining([{type:'delete',key:'["exists","character","char-a"]'}])}))
+        await vi.waitFor(()=>expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases',{expectedRevision:2,owner:{
+            keys:['assets/chat.png'],startedAtMs:expect.any(Number)}}))
     })
     it('does not retry an expired candidate against a newer unchecked revision',async()=>{
         const f=fixture('1')

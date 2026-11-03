@@ -201,6 +201,26 @@ describe('SaveCoordinator', () => {
             expect(() => harness.coordinator.retireWindowedSelectedConversation()).not.toThrow()
         })
 
+        it('retires windowed ownership while only a storage-only mutation is queued behind the flush', async () => {
+            const harness = makeWindowedHarness()
+            harness.database.username = 'Saved before leaving'
+            harness.coordinator.markPersistentDataDirty(0)
+            const cleanup = deferred<void>()
+            void harness.coordinator.flushPendingData('deleted-owner-assets')
+            const storageOnly = harness.coordinator.runStorageOnlyMutation(async (expectedRevision) => {
+                await cleanup.promise
+                return expectedRevision + 1
+            })
+            expect(() => harness.coordinator.retireWindowedSelectedConversation()).toThrow('pending persistence')
+            await harness.coordinator.flushPendingData('deactivate-working-set')
+            expect(harness.coordinator.hasPendingPersistenceWork).toBe(true)
+            expect(() => harness.coordinator.retireWindowedSelectedConversation()).not.toThrow()
+            cleanup.resolve()
+            await storageOnly
+            expect(harness.coordinator.revision).toBe(4)
+            expect(harness.coordinator.hasPendingPersistenceWork).toBe(false)
+        })
+
         it('commits a character addition beside the windowed selection and keeps later saves to their own changes', async () => {
             const harness = makeWindowedHarness()
             const added = {
