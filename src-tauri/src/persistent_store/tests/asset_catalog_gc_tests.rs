@@ -1716,6 +1716,7 @@ fn unused_file_cleanup_keeps_aliases_referenced_in_any_stored_form_or_held_by_an
     let keys = [
         "assets/shared.png", "assets/html.png", "assets/backslash.png", "assets/한글.png",
         "assets/plugin-bare.png", "assets/setting.png", "assets/archived.png",
+        "assets/archived-html.png", "assets/archived-chat.png", "assets/archived-local.png",
         "assets/snapshotted.png", "assets/ledger.png",
     ];
     // Only this alias is old enough for the snapshot to hold it.
@@ -1741,10 +1742,28 @@ fn unused_file_cleanup_keeps_aliases_referenced_in_any_stored_form_or_held_by_an
         [super::super::lww::unit_key(&["character", "manifest-owner", "additionalAssets"]).unwrap().as_str()]).unwrap();
     // A newer body, so the manifest holds a different object than the alias names.
     put_asset(&mut store, "assets/manifest.png", b"synthetic newer manifest body");
-    add_synthetic_character(&mut store, "archived", "assets/archived.png");
+    store.commit(&WorkingSetCommit {
+        add_character: Some(json!({
+            "chaId": "archived", "type": "character", "name": "Synthetic", "image": "",
+            "desc": "assets/archived.png", "firstMessage": r#"<p><img src="assets/archived-html.png"></p>"#,
+            // A field this device keeps for itself, which only the local payload holds.
+            "syntheticLocalNote": r#"<img src="assets/archived-local.png">"#,
+            "lastInteraction": 500,
+            "chats": [{"id": "archived-chat", "name": "Chat", "message": [
+                {"role": "char", "data": r#"앞 글<img src="assets/archived-chat.png">뒤 글"#, "chatId": "archived-first"},
+            ]}],
+        })),
+        ..empty_working_set_commit(store.revision().unwrap())
+    }).unwrap();
     store.archive_character("archived", store.revision().unwrap(), 10).unwrap();
-    // Only the archived payload still names this key.
+    // Only the archived payload still names these keys.
     assert!(store.connection.execute(r#"DELETE FROM lww_units WHERE key LIKE '["character","archived"%'"#, []).unwrap() > 0);
+    // Another device that receives the archive holds what its shared payload names.
+    let archived = super::super::archive::read_archived_object(
+        &store.connection, &super::active_generation(&store.connection).unwrap(), "archived").unwrap().unwrap();
+    for key in ["assets/archived-html.png", "assets/archived-chat.png"] {
+        assert!(archived.shared_asset_hashes.contains(&alias_object(&store, key).unwrap()), "{key} must be shared");
+    }
     store.commit(&WorkingSetCommit {
         plugin_storage: Some(vec![PluginStorageMutation::Set {
             owner: "synthetic-plugin".into(), key: "portrait".into(), value: json!({"id": "plugin-bare.png"}),

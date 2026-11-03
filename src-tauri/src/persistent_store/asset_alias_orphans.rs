@@ -766,6 +766,16 @@ fn collect_owned_keys(text: &str, keys: &mut BTreeSet<String>) {
     }
 }
 
+/// Adds the owned keys every string in `value` names, as `collect_owned_keys` finds them.
+pub(super) fn collect_value_owned_keys(value: &serde_json::Value, keys: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => collect_owned_keys(text, keys),
+        serde_json::Value::Array(values) => values.iter().for_each(|value| collect_value_owned_keys(value, keys)),
+        serde_json::Value::Object(values) => values.values().for_each(|value| collect_value_owned_keys(value, keys)),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::AssetKeyMatcher;
