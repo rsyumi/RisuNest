@@ -508,8 +508,8 @@ describe('persistent save mutation observation', () => {
                 session.updateChatVariables(new Map([['hp', '9']]))
                 session.updateChatVariables(new Map([['mood', 'calm']]))
             } else {
-                session.edit(session.locate(2), { role: 'char', data: 'updated response', chatId: 'response-id', custom: { nested: ['한글', '🙂'] } } as Chat['message'][number])
-                session.edit(session.locate(2), { role: 'char', data: 'final response', chatId: 'response-id' })
+                session.edit(session.locate(2), { role: 'char', data: 'updated response', chatId: 'response-id' })
+                session.edit(session.locate(2), { role: 'char', data: 'final response', chatId: 'response-id', custom: { nested: ['한글', '🙂'] } } as Chat['message'][number])
             }
 
             // Whether the flush serializes or copies an unchanged message body.
@@ -550,13 +550,12 @@ describe('persistent save mutation observation', () => {
         if (kind === 'metadata') {
             expect(reactive.request.conversations?.map((mutation) =>
                 'conversation' in mutation ? (mutation.conversation as Chat).scriptstate : null,
-            )).toEqual([{ $hp: '9' }, { $hp: '9', $mood: 'calm' }])
+            )).toEqual([{ $hp: '9', $mood: 'calm' }])
         } else {
             expect(reactive.request.conversations?.map((mutation) =>
                 mutation.type === 'replace-range' ? [mutation.start, mutation.deleteCount, mutation.messages] : null,
             )).toEqual([
-                [2, 1, [{ role: 'char', data: 'updated response', chatId: 'response-id', custom: { nested: ['한글', '🙂'] } }]],
-                [2, 1, [{ role: 'char', data: 'final response', chatId: 'response-id' }]],
+                [2, 1, [{ role: 'char', data: 'final response', chatId: 'response-id', custom: { nested: ['한글', '🙂'] } }]],
             ])
         }
     })

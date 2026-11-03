@@ -287,6 +287,7 @@ describe('SaveCoordinator', () => {
                 deleteCount: number
                 messages: Array<{ role: string; data: string }>
                 conversationName?: string
+                note?: string
             },
         ) {
             coordinator.recordActiveConversationMutation({
@@ -306,7 +307,7 @@ describe('SaveCoordinator', () => {
                     id: options.conversationId ?? 'two',
                     name: options.conversationName ?? 'Two',
                     localLore: [],
-                    note: '',
+                    note: options.note ?? '',
                 },
             })
         }
@@ -996,6 +997,79 @@ describe('SaveCoordinator', () => {
             expect(harness.onPersisted.mock.calls.map(([event]) => event.sessionVersion)).toEqual([
                 1,
                 2,
+            ])
+        })
+
+        it('folds a reply streamed while the store is blocked into one catch-up range under the commit limit', async () => {
+            const blocked = deferred<void>()
+            const entered = deferred<void>()
+            let persistedTotal = 10_000
+            const commit = vi.fn(async (input: WorkingSetCommit) => {
+                const bytes = new TextEncoder().encode(JSON.stringify(input)).byteLength
+                if (commit.mock.calls.length === 1) {
+                    entered.resolve()
+                    await blocked.promise
+                }
+                if (bytes > 32 * 1024) throw new PayloadTooLargeError('commit', bytes)
+                for (const mutation of input.conversations ?? []) {
+                    if (mutation.type === 'replace-range') persistedTotal += mutation.messages.length - mutation.deleteCount
+                }
+                return { revision: input.expectedRevision + 1 }
+            })
+            const harness = makeWindowedHarness({ commit })
+            harness.readConversationWindow.mockImplementation(async () => ({
+                revision: harness.coordinator.revision,
+                value: {
+                    characterId: 'char-a',
+                    conversationId: 'two',
+                    messages: [{ role: 'user' as const, data: 'first persisted message' }],
+                    startIndex: 0,
+                    endIndex: 1,
+                    totalMessages: persistedTotal,
+                    hasMoreBefore: false,
+                    hasMoreAfter: true,
+                },
+            }))
+            const note = 'n'.repeat(2048)
+            harness.projectedConversation.note = note
+            let version = 0
+            const record = (deleteCount: number, data: string) => {
+                recordWindowedMutation(harness.coordinator, {
+                    sessionToken: harness.sessionToken,
+                    previousVersion: version,
+                    sessionVersion: version + 1,
+                    start: 10_000,
+                    deleteCount,
+                    messages: [{ role: 'char', data }],
+                    note,
+                })
+                version += 1
+                harness.replaceAuthority({ ...harness.authority()!, sessionVersion: version, totalMessages: 10_001 })
+            }
+
+            record(0, '')
+            const flushing = harness.coordinator.flushPendingData('blocked-stream')
+            await entered.promise
+            let reply = ''
+            for (let update = 1; update <= 40; update++) {
+                reply += 'x'.repeat(100)
+                record(1, reply)
+            }
+            blocked.resolve()
+            await flushing
+
+            expect(commit.mock.calls.map(([input]) => input.conversations)).toEqual([
+                [expect.objectContaining({ start: 10_000, deleteCount: 0, messages: [{ role: 'char', data: '' }] })],
+                [expect.objectContaining({
+                    start: 10_000,
+                    deleteCount: 1,
+                    messages: [{ role: 'char', data: reply }],
+                    conversation: expect.objectContaining({ note }),
+                })],
+            ])
+            expect(harness.onPersisted.mock.calls.map(([event]) => [event.sessionVersion, event.revision])).toEqual([
+                [1, 3],
+                ...Array.from({ length: 40 }, (_, index) => [index + 2, 4]),
             ])
         })
 

@@ -857,6 +857,167 @@ describe('SaveCoordinator', () => {
         expect(coordinator.pendingConversationMutationDiagnostics).toEqual({ pendingEvents: 0, unacknowledgedMs: undefined })
     })
 
+    function makeAcknowledgedSession(
+        store: ConstructorParameters<typeof SaveCoordinator>[0]['store'],
+        database: Database,
+        revision: number,
+    ) {
+        const persisted: Array<[version: number, revision: number]> = []
+        let session!: ActiveConversationSession
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
+            onConversationMutationPersisted: (event) => {
+                persisted.push([event.sessionVersion, event.revision])
+                session.acknowledgePersisted(event.sessionToken, event.sessionVersion, event.revision)
+            },
+        })
+        coordinator.initialize(revision)
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation: database.characters[0].chats[1],
+            storeRevision: revision,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+        return { coordinator, session, persisted }
+    }
+
+    it('folds a reply streamed while the store is blocked into one catch-up range under the commit limit', async () => {
+        const database = makeChattyDatabase()
+        database.characters[0].chats[1].note = 'n'.repeat(2048)
+        const storage = await createPersistentStoreHarness(structuredClone(database))
+        const realCommit = storage.store.commit.bind(storage.store)
+        const blocked = deferred<void>()
+        const entered = deferred<void>()
+        const committedRanges: number[] = []
+        vi.spyOn(storage.store, 'commit').mockImplementation(async (input) => {
+            const bytes = new TextEncoder().encode(JSON.stringify(input)).byteLength
+            if (committedRanges.length === 0) {
+                entered.resolve()
+                await blocked.promise
+            }
+            if (bytes > 32 * 1024) throw new PayloadTooLargeError('commit', bytes)
+            committedRanges.push(input.conversations?.length ?? 0)
+            return realCommit(input)
+        })
+        const { coordinator, session, persisted } = makeAcknowledgedSession(storage.store, database, storage.revision)
+
+        session.append({ role: 'char', data: '' })
+        const flushing = coordinator.flushPendingDataLocally('blocked-stream')
+        await entered.promise
+        let reply = ''
+        for (let update = 1; update <= 40; update++) {
+            reply += 'x'.repeat(100)
+            session.edit(session.locate(2), { role: 'char', data: reply })
+            if (update === 20) session.updateChatVariables(new Map([['progress', 'half']]))
+        }
+        expect(coordinator.pendingConversationMutationDiagnostics.pendingEvents).toBe(42)
+        blocked.resolve()
+        await flushing
+
+        expect(committedRanges).toEqual([1, 1])
+        const stored = (await storage.store.readConversation('char-a', 'two'))?.value
+        expect(stored?.message.at(-1)?.data).toBe(reply)
+        expect(stored).toMatchObject({ note: 'n'.repeat(2048), scriptstate: { $progress: 'half' } })
+        expect(persisted).toEqual([
+            [1, storage.revision + 1],
+            ...Array.from({ length: 41 }, (_, index) => [index + 2, storage.revision + 2]),
+        ])
+        expect(session.persistedVersion).toBe(42)
+    })
+
+    it('merges a reply streamed around a failed save into one retried range', async () => {
+        const database = makeChattyDatabase()
+        const blocked = deferred<void>()
+        const entered = deferred<void>()
+        const commit = vi.fn()
+            .mockImplementationOnce(async () => {
+                entered.resolve()
+                await blocked.promise
+                throw new Error('synthetic write failure')
+            })
+            .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const { coordinator, session, persisted } = makeAcknowledgedSession(makeStore(commit), database, 2)
+
+        session.append({ role: 'char', data: 'reply' })
+        const failing = coordinator.flushPendingDataLocally('failing-store')
+        await entered.promise
+        session.edit(session.locate(2), { role: 'char', data: 'reply continued' })
+        blocked.resolve()
+        await expect(failing).rejects.toThrow('synthetic write failure')
+        session.edit(session.locate(2), { role: 'char', data: 'reply continued further' })
+        await coordinator.flushPendingDataLocally('retry')
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].conversations).toEqual([expect.objectContaining({
+            start: 2,
+            deleteCount: 0,
+            messages: [{ role: 'char', data: 'reply continued further' }],
+        })])
+        expect(persisted.map(([version]) => version)).toEqual([1, 2, 3])
+    })
+
+    it('starts a new pending entry for an edit outside the streamed reply, a second append and a delete', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const { coordinator, session, persisted } = makeAcknowledgedSession(makeStore(commit), database, 2)
+
+        session.append({ role: 'char', data: 'reply' })
+        session.edit(session.locate(2), { role: 'char', data: 'reply streamed' })
+        session.edit(session.locate(0), { role: 'user', data: 'edited first' })
+        session.edit(session.locate(2), { role: 'char', data: 'reply final' })
+        session.append({ role: 'user', data: 'next' })
+        session.edit(session.locate(3), { role: 'user', data: 'next edited' })
+        session.delete(session.locate(3))
+        await coordinator.flushPendingDataLocally('non-foldable')
+
+        expect(commit.mock.calls[0][0].conversations.map(
+            ({ start, deleteCount, messages }: { start: number; deleteCount: number; messages: unknown[] }) =>
+                ({ start, deleteCount, messages }),
+        )).toEqual([
+            { start: 2, deleteCount: 0, messages: [{ role: 'char', data: 'reply streamed' }] },
+            { start: 0, deleteCount: 1, messages: [{ role: 'user', data: 'edited first' }] },
+            { start: 2, deleteCount: 1, messages: [{ role: 'char', data: 'reply final' }] },
+            { start: 3, deleteCount: 0, messages: [{ role: 'user', data: 'next edited' }] },
+            { start: 3, deleteCount: 1, messages: [] },
+        ])
+        expect(persisted.map(([version]) => version)).toEqual([1, 2, 3, 4, 5, 6, 7])
+    })
+
+    it('keeps the stored recency when a later streamed update stops naming lastDate', async () => {
+        const database = makeChattyDatabase()
+        const conversation = database.characters[0].chats[1]
+        conversation.lastDate = 100
+        const storage = await createPersistentStoreHarness(structuredClone(database))
+        const { coordinator, session } = makeAcknowledgedSession(storage.store, database, storage.revision)
+        const initial = cloneConversationMetadata(conversation)
+        const dated = { ...initial, lastDate: 500 }
+        const { lastDate: _lastDate, ...undated } = dated
+
+        session.applyOperation({
+            expectedVersion: 0,
+            expectedMetadata: initial,
+            metadata: dated,
+            range: { position: session.positionAt(2), deleteCount: 0, messages: [{ role: 'char', data: 'reply' }] },
+        })
+        session.applyOperation({
+            expectedVersion: 1,
+            expectedMetadata: dated,
+            metadata: undated,
+            range: { position: session.positionAt(2), deleteCount: 1, messages: [{ role: 'char', data: 'reply continued' }] },
+        })
+        await coordinator.flushPendingDataLocally('recency')
+
+        const summaries = await storage.store.queryConversations({ characterId: 'char-a', order: 'configured', limit: 10 })
+        expect(summaries.items.find((summary) => summary.id === 'two')?.recentAt).toBe(500)
+        expect((await storage.store.readConversation('char-a', 'two'))?.value.message.at(-1)?.data).toBe('reply continued')
+    })
+
     it('pins only covered session commands while their store commit is in flight', async () => {
         const database = makeChattyDatabase()
         let finishCommit!: () => void
@@ -1133,6 +1294,7 @@ describe('SaveCoordinator', () => {
         })
 
         session.append({ role: 'user', data: 'session append' })
+        session.edit(session.locate(2), { role: 'user', data: 'session append continued' })
         conversation.message[0].data = 'untracked live edit'
         coordinator.markPersistentDataDirty(1)
         await coordinator.flushPendingData('same-conversation-fallback')
@@ -1143,9 +1305,9 @@ describe('SaveCoordinator', () => {
                 conversationId: 'two',
             }),
         ])
-        expect(onFallbackPersisted).toHaveBeenCalledOnce()
+        expect(onFallbackPersisted.mock.calls.map(([event]) => event.sessionVersion)).toEqual([1, 2])
         expect(session.residencyFallbackActive).toBe(true)
-        expect(session.persistedVersion).toBe(1)
+        expect(session.persistedVersion).toBe(2)
         expect(coordinator.hasPendingPersistenceWork).toBe(false)
     })
 
