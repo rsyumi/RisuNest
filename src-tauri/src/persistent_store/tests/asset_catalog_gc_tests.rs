@@ -1932,3 +1932,47 @@ fn deleted_character_conversations_give_the_owned_keys_they_name() {
     );
     assert_eq!(store.character_conversation_asset_keys(&owner, 1).unwrap().len(), 1);
 }
+
+/// An archived character's details and chats live in its archive, which a permanent delete does
+/// not read, so its owned keys are the aliases of the objects the archive recorded.
+#[test]
+fn an_archived_character_gives_the_owned_keys_its_archive_recorded() {
+    use crate::server_sync::lww_tests::put_asset;
+    use super::super::asset_alias_orphans::OrphanAliasScope;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    for key in ["assets/avatar.png", "assets/chat.png", "assets/other.png"] {
+        put_asset(&mut store, key, format!("synthetic body of {key}").as_bytes());
+    }
+    store.commit(&WorkingSetCommit {
+        add_character: Some(json!({
+            "chaId": "owner", "type": "character", "name": "Synthetic", "image": "assets/avatar.png", "desc": "",
+            "lastInteraction": 500,
+            "chats": [{"id": "owner-chat", "name": "Chat", "message": [
+                {"role": "user", "data": "assets/chat.png", "chatId": "owner-first"},
+            ]}],
+        })),
+        ..empty_working_set_commit(store.revision().unwrap())
+    }).unwrap();
+    add_synthetic_character(&mut store, "other", "assets/other.png");
+    store.archive_character("owner", store.revision().unwrap(), 10).unwrap();
+
+    let owner = ["owner".to_owned()];
+    let keys = store.character_conversation_asset_keys(&owner, 100).unwrap();
+    assert_eq!(keys, std::collections::BTreeSet::from(["assets/avatar.png", "assets/chat.png"].map(str::to_owned)));
+    assert_eq!(store.character_conversation_asset_keys(&owner, 1).unwrap().len(), 1);
+
+    let started_at_ms = super::super::device_store::now_ms().unwrap() + 1;
+    store.commit(&WorkingSetCommit {
+        unit_mutations: Some(vec![super::super::lww::UnitMutation::Delete {
+            key: super::super::lww::unit_key(&["exists", "character", "owner"]).unwrap(),
+        }]),
+        ..empty_working_set_commit(store.revision().unwrap())
+    }).unwrap();
+    let generation = super::active_generation(&store.connection).unwrap();
+    assert!(super::super::archive::read_archived_object(&store.connection, &generation, "owner").unwrap().is_none());
+    let deleted = store.delete_orphaned_asset_aliases(&OrphanAliasScope::DeletedOwner { keys: &keys, started_at_ms }).unwrap();
+    assert_eq!(deleted.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>(), ["assets/avatar.png", "assets/chat.png"]);
+    assert!(alias_object(&store, "assets/other.png").is_some());
+}

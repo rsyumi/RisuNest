@@ -1995,7 +1995,8 @@ fn delete_deleted_owner_files(
 const DELETED_CHARACTERS_MAX: usize = 128;
 
 /// The owned asset keys the conversations of characters about to be permanently deleted name,
-/// which a read of their details leaves out.
+/// which a read of their details leaves out, and the keys of archived characters, whose details
+/// cannot be read.
 #[tauri::command(async)]
 pub(crate) fn pds_character_asset_keys(
     state: State<'_, PersistentStoreState>,

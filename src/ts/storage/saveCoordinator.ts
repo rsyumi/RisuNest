@@ -2066,15 +2066,19 @@ export class SaveCoordinator {
                 rootValue = await reader.readRoot()
                 this.assertReadRevision(revision, rootValue.revision)
                 for (const id of deletedIds) {
-                    const targetValue = await reader.readCharacter(id)
-                    const expirySummary = expiryCutoff === undefined || !isTauri ? null : await reader.readCharacterSummary(id)
+                    const summary = isTauri ? await reader.readCharacterSummary(id) : null
+                    // The native store keeps an archived character's details in its archive and refuses to read them, so
+                    // its owned keys come from the store with the conversation keys.
+                    const archived = Boolean(summary?.archived)
+                    const targetValue = archived ? null : await reader.readCharacter(id)
                     const expired = expiryCutoff === undefined || (isTauri
-                        ? expirySummary?.trashed && expirySummary.trashStampMs !== undefined && BigInt(expirySummary.trashStampMs) < BigInt(expiryCutoff)
+                        ? summary?.trashed && summary.trashStampMs !== undefined && BigInt(summary.trashStampMs) < BigInt(expiryCutoff)
                         : targetValue?.value.trashTime !== undefined && targetValue.value.trashTime < expiryCutoff)
-                    if (!targetValue || !expired) {
+                    if (!(archived || targetValue) || !expired) {
                         deletedIds.delete(id)
                         continue
                     }
+                    if (!targetValue) continue
                     this.assertReadRevision(revision, targetValue.revision)
                     if (targetValue.value.chaId !== id) throw new Error(`Character ${id} returned mismatched detail`)
                     ownedAssetKeys.set(id, collectOwnedAssetKeys(targetValue.value))

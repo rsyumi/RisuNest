@@ -670,7 +670,8 @@ fn ascii_escaped(text: &str, uppercase: bool) -> String {
 
 impl PersistentStore {
     /// The owned keys the conversations of `character_ids` name in their details and messages, by
-    /// the rules the renderer applies to a deleted owner's own data, up to `limit` keys.
+    /// the rules the renderer applies to a deleted owner's own data, and the keys of archived
+    /// characters, up to `limit` keys.
     pub(crate) fn character_conversation_asset_keys(
         &self,
         character_ids: &[String],
@@ -703,6 +704,32 @@ impl PersistentStore {
                         return Ok(keys.into_iter().take(limit).collect());
                     }
                 }
+            }
+        }
+        // An archived character's details and chats are inside its archive, which the renderer
+        // cannot read, so its keys are the owned aliases of the objects the archive recorded.
+        let mut archived_hashes = BTreeSet::new();
+        for character_id in character_ids {
+            if let Some(archived) = super::archive::read_archived_object(&self.connection, &generation, character_id)? {
+                archived_hashes.extend(archived.asset_hashes.into_iter().chain(archived.shared_asset_hashes));
+            }
+        }
+        if archived_hashes.is_empty() {
+            return Ok(keys);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT logical_key, object_hash FROM asset_aliases
+             WHERE generation = ?1 AND kind = 'asset' AND object_hash IS NOT NULL",
+        )?;
+        let mut rows = statement.query([&generation])?;
+        while let Some(row) = rows.next()? {
+            let key = row.get::<_, String>(0)?;
+            if !archived_hashes.contains(&row.get::<_, String>(1)?) || owned_key(&key).as_ref() != Some(&key) {
+                continue;
+            }
+            keys.insert(key);
+            if keys.len() >= limit {
+                return Ok(keys.into_iter().take(limit).collect());
             }
         }
         Ok(keys)
