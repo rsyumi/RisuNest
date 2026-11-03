@@ -142,6 +142,25 @@ function baselineSourcePlugin(): Plugin | null {
     }
 }
 
+// Packages that baseline sources import but the installed dependencies no
+// longer provide. A moved entry point maps to the one the working tree imports,
+// and a removed package maps to a stub.
+const baselineDependencyAliases = [
+    {
+        find: /^web-streams-polyfill\/ponyfill\/es2018$/,
+        replacement: 'web-streams-polyfill',
+    },
+    {
+        find: /^peerjs$/,
+        replacement: path.join(
+            repositoryRoot,
+            'benchmarks',
+            'ui-responsiveness',
+            'baseline-peerjs-stub.ts',
+        ),
+    },
+]
+
 async function resolveMainConfig(): Promise<UserConfig> {
     const environment: ConfigEnv = {
         command: 'build',
@@ -159,6 +178,9 @@ export default defineConfig(async () =>
         root: repositoryRoot,
         publicDir: false,
         plugins: [baselineSourcePlugin()],
+        resolve: {
+            alias: sourceMode === 'baseline' ? baselineDependencyAliases : [],
+        },
         build: {
             outDir: outputDirectory,
             emptyOutDir: true,
