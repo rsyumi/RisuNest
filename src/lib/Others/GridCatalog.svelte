@@ -246,8 +246,12 @@
                                     </button>
                                 {/if}
                             {/if}
-                            <button class="hover:text-textcolor text-textcolor2" onclick={() => {
-                                removeChar(char.chaId, char.name, char.archived ? 'permanent' : 'normal')
+                            <button class="hover:text-textcolor text-textcolor2" onclick={async () => {
+                                try {
+                                    await removeChar(char.chaId, char.name, char.archived ? 'permanent' : 'normal')
+                                } catch (error) {
+                                    alertError(backgroundErrorMessage(error))
+                                }
                             }}>
                                 <TrashIcon />
                             </button>
@@ -312,8 +316,12 @@
                             }}>
                                 <ArchiveRestoreIcon />
                             </button>
-                            <button class="hover:text-textcolor text-textcolor2" onclick={() => {
-                                removeChar(char.chaId, char.name, 'permanent')
+                            <button class="hover:text-textcolor text-textcolor2" onclick={async () => {
+                                try {
+                                    await removeChar(char.chaId, char.name, 'permanent')
+                                } catch (error) {
+                                    alertError(backgroundErrorMessage(error))
+                                }
                             }}>
                                 <TrashIcon />
                             </button>
