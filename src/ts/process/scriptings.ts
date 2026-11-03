@@ -1124,7 +1124,13 @@ export async function runScripted(code:string, arg:{
                 for (const source of loreSources) {
                     for (const b of source) {
                         if (b.comment === search) {
-                            found.push({ ...b, content: risuChatParser(b.content, { chara: selectedChar }) })
+                            found.push({ ...b, content: risuChatParser(b.content, {
+                                chara: selectedChar,
+                                db,
+                                selectedCharacterId: ScriptingEngineState.selectedCharacterId,
+                                getChatVar: ScriptingEngineState.getVar,
+                                setChatVar: ScriptingEngineState.setVar,
+                            }) })
                         }
                     }
                 }
