@@ -83,6 +83,71 @@ fn a_reference_removal_takes_its_whole_entry_and_cuts_only_a_numbered_inlay() {
 }
 
 #[test]
+fn an_owner_inside_the_root_is_offered_only_when_one_entry_carries_it() {
+    let inside = |kind: &str, id: &str, path: &str, target: &str| {
+        Finding::new(codes::REFERENCE_MISSING, kind, id, "").at(path, 0).targeting(target, "gone")
+    };
+    let plan = plan(&result(vec![
+        inside("persona", "persona-a", "$.icon", "asset").in_sole_entry(),
+        inside("persona", "persona-a", "$.embeddedModule.assets[2][1]", "asset").in_sole_entry(),
+        inside("module", "module-a", "$.assets[1][1]", "asset").in_sole_entry(),
+        inside("module", "module-a", "$.lorebook[0].content", "inlay").in_token(1).in_sole_entry(),
+        inside("loadout", "Loadout", "$.characterIds[0]", "character").in_sole_entry(),
+        // No entry or several carry this identity, or the diagnosis was written before the mark.
+        inside("persona", "persona-b", "$.icon", "asset"),
+        // Removing these leaves the finding in place.
+        inside("persona", "persona-a", "$.embeddedModule.id", "module").in_sole_entry(),
+        inside("loadout", "Loadout", "$.presetName", "preset").in_sole_entry(),
+        inside("loadout", "Loadout", "$.personaId", "persona").in_sole_entry(),
+        inside("folder", "folder-a", "$.img", "asset").in_sole_entry(),
+    ]));
+    let removals: Vec<_> = plan
+        .iter()
+        .map(|candidate| match &candidate.action {
+            RepairAction::DropReference { owner, source_path, token, .. } => {
+                (candidate.finding, owner.kind.as_str(), owner.id.as_str(), source_path.as_str(), *token)
+            }
+            other => panic!("unexpected action: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        removals,
+        [
+            (0, "persona", "persona-a", "$.icon", None),
+            (1, "persona", "persona-a", "$.embeddedModule.assets[2]", None),
+            (2, "module", "module-a", "$.assets[1]", None),
+            (3, "module", "module-a", "$.lorebook[0].content", Some(1)),
+            (4, "loadout", "Loadout", "$.characterIds[0]", None),
+        ]
+    );
+}
+
+#[test]
+fn a_root_entry_is_named_only_by_an_identity_one_entry_carries_itself() {
+    let root = serde_json::json!({
+        "personas": [{ "id": "a" }, { "name": "no id" }, { "id": "dup" }, { "id": "dup" }, { "id": "#1" }, {}, { "id": "#9" }],
+        "modules": [{ "name": "no id" }, { "id": "m" }],
+        "loadouts": [{ "id": "loadout-id", "name": "Loadout" }],
+    });
+    let entry = |kind: &str, id: &str| {
+        root_entry(&root, &Owner { kind: kind.to_owned(), id: id.to_owned() })
+    };
+    assert_eq!(entry("persona", "a"), Some(("personas", 0)));
+    assert_eq!(entry("module", "m"), Some(("modules", 1)));
+    assert_eq!(entry("loadout", "Loadout"), Some(("loadouts", 0)), "a loadout is named by its name");
+    assert_eq!(entry("loadout", "loadout-id"), None);
+    assert_eq!(entry("persona", "dup"), None, "several entries carry it");
+    assert_eq!(entry("persona", "gone"), None);
+    // A persona without an id is named by its position, which another entry can take, and an id
+    // that spells a position is shared with the persona at that position.
+    assert_eq!(entry("persona", "#5"), None);
+    assert_eq!(entry("persona", "#1"), None);
+    assert_eq!(entry("persona", "#9"), Some(("personas", 6)));
+    assert_eq!(entry("module", ""), None, "a module without an id is named by nothing");
+    assert_eq!(entry("character", "a"), None);
+}
+
+#[test]
 fn a_payload_that_no_longer_matches_offers_removal_first_and_adoption_second() {
     let plan = plan(&result(vec![Finding::new(
         codes::ALIAS_OBJECT_MISMATCH,

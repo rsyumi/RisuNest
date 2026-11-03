@@ -9,7 +9,8 @@ use super::{
     StoreError, StoreResult, WorkingSetCommit,
 };
 use crate::data_health::journal::{Journal, RecordChange};
-use crate::data_health::repair::{RepairAction, RepairCandidate};
+use crate::data_health::repair::{root_entry, RepairAction, RepairCandidate};
+use crate::data_health::Owner;
 use risunest_sync_wire::stamp::Stamp;
 use rusqlite::{types::ValueRef, Connection, TransactionBehavior};
 use serde_json::{json, Value};
@@ -116,6 +117,8 @@ struct Located {
     table: &'static str,
     key: Vec<String>,
     column: &'static str,
+    /// An owner kept inside the root, found again by its identity when the repair is applied.
+    entry: Option<Owner>,
 }
 
 /// Maps a finding's owner onto the row that holds it. An owner shape nothing here names cannot
@@ -127,11 +130,22 @@ fn locate(owner_kind: &str, owner_id: &str) -> Option<Located> {
             table: "root",
             key: Vec::new(),
             column: "value",
+            entry: None,
+        }),
+        "persona" | "module" | "loadout" => Some(Located {
+            table: "root",
+            key: Vec::new(),
+            column: "value",
+            entry: Some(Owner {
+                kind: owner_kind.to_owned(),
+                id: owner_id.to_owned(),
+            }),
         }),
         "preset" => Some(Located {
             table: "bot_presets",
             key: vec![owner_id.to_owned()],
             column: "value",
+            entry: None,
         }),
         "plugin-storage" => Some(Located {
             table: "plugin_storage",
@@ -140,21 +154,25 @@ fn locate(owner_kind: &str, owner_id: &str) -> Option<Located> {
                 vec![identity.get("owner")?.as_str()?.to_owned(), identity.get("key")?.as_str()?.to_owned()]
             },
             column: "value",
+            entry: None,
         }),
         "character" => Some(Located {
             table: "characters",
             key: vec![owner_id.to_owned()],
             column: "detail",
+            entry: None,
         }),
         "conversation" if parts.len() == 2 => Some(Located {
             table: "conversations",
             key: parts,
             column: "detail",
+            entry: None,
         }),
         "message" if parts.len() == 3 => Some(Located {
             table: "messages",
             key: parts,
             column: "value",
+            entry: None,
         }),
         _ => None,
     }
@@ -237,9 +255,26 @@ fn drop_references(
     let Ok(mut value) = serde_json::from_str::<Value>(&serialized) else {
         return Ok(());
     };
+    // An owner inside the root is found again by its identity, so an entry that moved since the
+    // diagnosis is still the one edited, and an identity no single entry carries refuses the
+    // repair rather than edit another entry.
+    let entry = match &located.entry {
+        Some(owner) => {
+            let (collection, index) = root_entry(&value, owner).ok_or_else(|| {
+                validation(format!("the {} the diagnosis named is no longer one entry", owner.kind))
+            })?;
+            vec![Step::Key(collection.to_owned()), Step::Index(index)]
+        }
+        None => Vec::new(),
+    };
     let mut tokens: BTreeMap<Vec<Step>, BTreeSet<u64>> = BTreeMap::new();
     let mut paths = Vec::new();
     for (steps, token) in edits {
+        // Removing an empty path leaves a record alone, so it must not remove the entry either.
+        if steps.is_empty() && token.is_none() {
+            continue;
+        }
+        let steps: Vec<Step> = entry.iter().cloned().chain(steps).collect();
         match token {
             Some(token) => {
                 tokens.entry(steps).or_default().insert(token);
@@ -275,6 +310,44 @@ fn drop_references(
                 .chain(std::iter::once(updated)),
         ),
     )?;
+    Ok(())
+}
+
+/// Drops the owner head of every module in the root whose assets the repair changed, as a save
+/// does, so no head describes tuples its module no longer holds.
+fn release_changed_owner_heads(transaction: &Connection, active: &str, staging: &str) -> StoreResult<()> {
+    let root = |generation: &str| -> StoreResult<Option<Value>> {
+        let serialized: Option<String> = rusqlite::OptionalExtension::optional(transaction.query_row(
+            "SELECT value FROM root WHERE generation=?1",
+            [generation],
+            |row| row.get(0),
+        ))?;
+        Ok(serialized.and_then(|serialized| serde_json::from_str(&serialized).ok()))
+    };
+    let (Some(before), Some(after)) = (root(active)?, root(staging)?) else {
+        return Ok(());
+    };
+    let heads = transaction
+        .prepare(
+            "SELECT owner_kind, owner_locator FROM asset_owner_heads
+             WHERE generation=?1 AND owner_kind IN ('root-module-assets', 'persona-embedded-module-assets')",
+        )?
+        .query_map([staging], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (kind, locator) in heads {
+        let Ok(owner) = super::AssetOwnerLocator::from_storage(&kind, &locator) else {
+            continue;
+        };
+        let (Some(old), Some(new)) = (owner.root_parent(&before), owner.root_parent(&after)) else {
+            continue;
+        };
+        if old.get("assets") != new.get("assets") {
+            transaction.execute(
+                "DELETE FROM asset_owner_heads WHERE generation=?1 AND owner_kind=?2 AND owner_locator=?3",
+                rusqlite::params![staging, kind, locator],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -600,8 +673,9 @@ fn record_changes(
     Ok(changes.into_values().collect())
 }
 
-/// Objects the staged generation stopped referencing. They are held by the journal, so the
-/// unused file cleanup leaves them alone while an undo is still possible.
+/// Objects the staged generation stopped referencing, payloads and owner manifests alike. They
+/// are held by the journal, so the unused file cleanup leaves them alone while an undo is still
+/// possible.
 fn released_objects(
     connection: &Connection,
     active: &str,
@@ -611,8 +685,12 @@ fn released_objects(
     let mut statement = connection.prepare(
         "SELECT object_hash FROM asset_aliases
          WHERE generation=?1 AND object_hash IS NOT NULL
+         UNION SELECT manifest_hash FROM asset_owner_heads
+         WHERE generation=?1 AND manifest_hash IS NOT NULL
          EXCEPT SELECT object_hash FROM asset_aliases
-         WHERE generation=?2 AND object_hash IS NOT NULL",
+         WHERE generation=?2 AND object_hash IS NOT NULL
+         EXCEPT SELECT manifest_hash FROM asset_owner_heads
+         WHERE generation=?2 AND manifest_hash IS NOT NULL",
     )?;
     let mut rows = statement.query(rusqlite::params![active, staging])?;
     while let Some(row) = rows.next()? {
@@ -826,10 +904,15 @@ impl PersistentStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         copy_generation(&transaction, &active, staging)?;
+        let mut root_entries = false;
         for ((kind, id), paths) in edits {
             let located = locate(&kind, &id)
                 .ok_or_else(|| validation(format!("{kind} records cannot be edited by a repair")))?;
+            root_entries |= located.entry.is_some();
             drop_references(&transaction, staging, &located, paths)?;
+        }
+        if root_entries {
+            release_changed_owner_heads(&transaction, &active, staging)?;
         }
         for candidate in candidates {
             match &candidate.action {
