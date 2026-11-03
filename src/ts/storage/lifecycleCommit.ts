@@ -42,6 +42,7 @@ function isExitCoordinator(
 interface NativeLifecycleDetail {
     reason?: unknown
     ackToken?: unknown
+    trimLevel?: unknown
 }
 
 interface NativeLifecycleFlushBridge {
@@ -220,8 +221,15 @@ export function registerLifecycleCommitListeners(
     const onNativeLifecycle = (event: Event) => {
         const detail = (event as CustomEvent<NativeLifecycleDetail>).detail
         const reason = detail?.reason
+        // Android reports the return to the screen only for the log.
+        if (reason === 'start') {
+            generationDiagnostics.lifecycle('start')
+            return
+        }
         if (reason !== 'stop' && reason !== 'trim-memory' && reason !== 'exit') return
-        generationDiagnostics.lifecycle(reason)
+        const level = detail?.trimLevel
+        const trimLevel = reason === 'trim-memory' && typeof level === 'number' && Number.isSafeInteger(level) ? level : undefined
+        generationDiagnostics.lifecycle(reason, trimLevel)
         const ackToken = typeof detail?.ackToken === 'string' ? detail.ackToken : undefined
         if (reason === 'exit' && ackToken !== undefined) {
             requestExitFlush(ackToken)
@@ -230,8 +238,14 @@ export function registerLifecycleCommitListeners(
         requestFlush(reason, ackToken)
     }
 
+    // Chromium freezes a hidden page and resumes it on return; Android IPC sends the freeze before the page stops.
+    const onFreeze = () => generationDiagnostics.lifecycle('freeze')
+    const onResume = () => generationDiagnostics.lifecycle('resume')
+
     window.addEventListener('pagehide', onPageHide)
     document.addEventListener('visibilitychange', onVisibilityChange)
+    document.addEventListener('freeze', onFreeze)
+    document.addEventListener('resume', onResume)
     window.addEventListener('risu-native-lifecycle', onNativeLifecycle)
     setNativeExitListenerReady(true)
 
@@ -239,6 +253,8 @@ export function registerLifecycleCommitListeners(
         setNativeExitListenerReady(false)
         window.removeEventListener('pagehide', onPageHide)
         document.removeEventListener('visibilitychange', onVisibilityChange)
+        document.removeEventListener('freeze', onFreeze)
+        document.removeEventListener('resume', onResume)
         window.removeEventListener('risu-native-lifecycle', onNativeLifecycle)
     }
 }

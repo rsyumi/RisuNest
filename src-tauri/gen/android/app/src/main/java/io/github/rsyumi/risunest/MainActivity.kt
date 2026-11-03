@@ -55,6 +55,7 @@ private const val ROOT_BACK_EVENT = "risunest-root-back"
 private const val ROOT_BACK_REPLY_TIMEOUT_MILLIS = 1_000L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val OPENED_FILES_EVENT = "risu-opened-files"
+private const val START_REASON = "start"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
@@ -325,15 +326,20 @@ private data class PendingLegacyBackupSource(
 )
 
 internal class LifecycleFlushDispatcher(
-  private val dispatch: (String) -> Unit,
+  private val dispatch: (reason: String, trimLevel: Int?) -> Unit,
 ) {
+  /** The app is on screen again; the page records it without a flush. */
+  fun onStart() {
+    dispatch(START_REASON, null)
+  }
+
   fun onStop() {
-    dispatch(STOP_REASON)
+    dispatch(STOP_REASON, null)
   }
 
   fun onTrimMemory(level: Int) {
     if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
-      dispatch(TRIM_MEMORY_REASON)
+      dispatch(TRIM_MEMORY_REASON, level)
     }
   }
 }
@@ -909,6 +915,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   override fun onStart() {
     super.onStart()
     GenerationForegroundService.setVisible(this, true)
+    lifecycleFlushDispatcher.onStart()
   }
 
   override fun onStop() {
@@ -1055,9 +1062,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     super.onTrimMemory(level)
   }
 
-  private fun dispatchLifecycleFlush(reason: String) {
+  private fun dispatchLifecycleFlush(reason: String, trimLevel: Int? = null) {
+    val level = trimLevel?.let { ",trimLevel:$it" } ?: ""
     lifecycleWebView?.evaluateJavascript(
-      "window.dispatchEvent(new CustomEvent('$NATIVE_LIFECYCLE_EVENT',{detail:{reason:'$reason'}}));",
+      "window.dispatchEvent(new CustomEvent('$NATIVE_LIFECYCLE_EVENT',{detail:{reason:'$reason'$level}}));",
       null,
     )
   }
