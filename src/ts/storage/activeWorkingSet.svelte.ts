@@ -1129,6 +1129,17 @@ export class ActiveWorkingSet {
             )
         await this.dependencies.coordinator.flushPendingData('deactivate-working-set')
         if (generation !== this.navigationGeneration) return false
+        // Another save can queue while the awaited flush is completing.
+        for (
+            let attempt = 0;
+            attempt < WINDOWED_PUBLISH_SETTLE_ATTEMPTS &&
+            this.dependencies.coordinator.hasPendingPersistenceWork === true;
+            attempt++
+        ) {
+            await this.dependencies.coordinator.flushPendingData('deactivate-working-set')
+            if (generation !== this.navigationGeneration) return false
+        }
+        if (this.dependencies.coordinator.hasPendingPersistenceWork === true) return false
         if (this.dependencies.canDeactivateWorkingSet?.() === false) return false
         if ([...activeIds].some(
             (id) => this.dependencies.canDeactivateCharacter?.(id) === false,

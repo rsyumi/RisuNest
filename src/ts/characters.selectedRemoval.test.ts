@@ -115,6 +115,18 @@ describe('leaving a selected character with its character tab open', { timeout: 
         expect(opened.live().characters.map((character) => character.chaId)).toEqual([opened.other.chaId])
     })
 
+    it('permanently deletes a character after moving it to the trash', async () => {
+        const opened = await openSelectedCharacterTab('selected-removal-from-trash')
+        await opened.removeChar(opened.selected.chaId, opened.selected.name)
+        await opened.tick()
+
+        await opened.removeChar(opened.selected.chaId, opened.selected.name, 'permanent')
+
+        expect(opened.selectedIndex()).toBe(-1)
+        expect(await opened.store.readCharacter(opened.selected.chaId)).toBeNull()
+        expect(opened.live().characters.map((character) => character.chaId)).toEqual([opened.other.chaId])
+    })
+
     it('goes home without the tab reading a released stub', async () => {
         const opened = await openSelectedCharacterTab('selected-removal-home')
 

@@ -174,6 +174,7 @@ async function makeWindowedHarness(input: {
         hasPendingPersistenceWork: false,
         initialize: vi.fn(),
         flushPendingData: vi.fn(async () => undefined),
+        retireWindowedSelectedConversation: vi.fn(),
         replacePersistentDatabase: vi.fn(async () => undefined),
         adoptHydratedCharacter: vi.fn(() => true),
         runSelectedConversationTransition: vi.fn(<T>(transition: () => T) =>
@@ -1067,6 +1068,40 @@ describe('ActiveWorkingSet', () => {
         expect(harness.releaseInactiveCharacter).not.toHaveBeenCalled()
         expect(harness.coordinator.retireWindowedSelectedConversation).not.toHaveBeenCalled()
         expect([...harness.workingSet.activeCharacterIds]).toEqual(['char-a'])
+    })
+
+    it('settles persistence queued as the leave flush completes before releasing characters', async () => {
+        const harness = await makeWindowedHarness({ characters: [makeCharacter('a', [makeChat('chat-a')])] })
+        await harness.workingSet.activateCharacter('a')
+        harness.coordinator.flushPendingData.mockImplementationOnce(async () => {
+            harness.coordinator.hasPendingPersistenceWork = true
+        }).mockImplementationOnce(async () => {
+            harness.coordinator.hasPendingPersistenceWork = false
+        })
+        harness.coordinator.retireWindowedSelectedConversation.mockImplementation(() => {
+            if (harness.coordinator.hasPendingPersistenceWork) throw new Error('Selected conversation ownership has pending persistence')
+        })
+
+        await expect(harness.workingSet.deactivate()).resolves.toBe(true)
+
+        expect([...harness.workingSet.activeCharacterIds]).toEqual([])
+        expect(harness.workingSet.captureSelectedConversationTarget()).toBeNull()
+    })
+
+    it('retains the selected conversation when persistence stays busy while leaving', async () => {
+        const harness = await makeWindowedHarness({ characters: [makeCharacter('a', [makeChat('chat-a')])] })
+        await harness.workingSet.activateCharacter('a')
+        harness.coordinator.flushPendingData.mockImplementation(async () => {
+            harness.coordinator.hasPendingPersistenceWork = true
+        })
+
+        await expect(harness.workingSet.deactivate()).resolves.toBe(false)
+
+        expect([...harness.workingSet.activeCharacterIds]).toEqual(['a'])
+        expect(harness.workingSet.captureSelectedConversationTarget()).toMatchObject({
+            characterId: 'a', conversationId: 'chat-a',
+        })
+        expect(harness.coordinator.retireWindowedSelectedConversation).not.toHaveBeenCalled()
     })
 
     it('keeps a streaming character active until a later leave after settlement', async () => {
