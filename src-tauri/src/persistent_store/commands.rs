@@ -596,6 +596,7 @@ pub(crate) fn commit_staged_replacement(
     app: &AppHandle,
     staging_id: &str,
     expected_revision: Option<i64>,
+    binding_authority: Option<&str>,
 ) -> StoreResult<RevisionResult> {
     let state = app.state::<PersistentStoreState>();
     let operation_guard = state.admit_renderer_operation()?;
@@ -603,7 +604,7 @@ pub(crate) fn commit_staged_replacement(
         store.prepare_replace_commit(staging_id, expected_revision)
     })?;
     with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-        store.finish_prepared_replace(prepared)
+        store.finish_prepared_replace_under(prepared, binding_authority)
     })
 }
 
@@ -1491,7 +1492,7 @@ pub(crate) fn pds_replace_commit(
     staging_id: String,
     expected_revision: Option<i64>,
 ) -> Result<RevisionResult, StoreError> {
-    logged("pds_replace_commit", commit_staged_replacement(&app, &staging_id, expected_revision))
+    logged("pds_replace_commit", commit_staged_replacement(&app, &staging_id, expected_revision, None))
 }
 
 #[tauri::command(async)]

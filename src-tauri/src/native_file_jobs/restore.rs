@@ -143,7 +143,8 @@ pub(crate) trait ReplacementSink: Send + Sync {
     fn incomplete_restore_preview(&self) -> StoreResult<super::IncompleteRestorePreview> {
         Ok(super::IncompleteRestorePreview::default())
     }
-    fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult>;
+    /// `binding_authority` is the authority `prepare_activation_receipt` recorded, which the commit keeps.
+    fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult>;
     fn abort(&self, staging_id: &str) -> StoreResult<()>;
 }
 
@@ -468,7 +469,7 @@ fn restore_risu_save_reader_controlled<R: Read>(
             publication: None,
         };
         let authority = sink.prepare_activation_receipt(&staging_id, job, &result).map_err(store_error)?;
-        result.revision = match sink.commit(&staging_id, activation_revision) {
+        result.revision = match sink.commit(&staging_id, activation_revision, authority.as_deref()) {
             Ok(committed) => committed.revision,
             Err(error) => {
                 if let Some(authority) = authority.as_deref() {
@@ -3083,6 +3084,7 @@ pub(super) mod tests {
         fail_character_batches: bool,
         record_activation: bool,
         lose_commit_reply: bool,
+        switch_binding_before_commit: bool,
         pub(crate) abort_calls: AtomicUsize,
         preserve_calls: AtomicUsize,
         full_character_calls: AtomicUsize,
@@ -3255,11 +3257,19 @@ pub(super) mod tests {
                 .map(|_| ())
         }
 
-        fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
-            let result = self.store
-                .lock()
-                .unwrap()
-                .replace_commit(staging_id, Some(expected_revision))?;
+        fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
+            let mut store = self.store.lock().unwrap();
+            if self.switch_binding_before_commit {
+                use crate::persistent_store::sync_selection::{SwitchBindingRequest, SyncTarget};
+                let before = store.lww_binding_state().unwrap();
+                store.switch_lww_binding(&SwitchBindingRequest {
+                    initial_publication: false,
+                    header: crate::persistent_store::lww::Header { binding_authority: before.target_authority, request_id: "synthetic-switch-before-restore".into() },
+                    expected_selection_epoch: before.selection_epoch, target: SyncTarget::None, inspection_id: None,
+                }).unwrap();
+            }
+            let prepared = store.prepare_replace_commit(staging_id, Some(expected_revision))?;
+            let result = store.finish_prepared_replace_under(prepared, binding_authority)?;
             if self.lose_commit_reply { return Err(StoreError::Store { message: "Synthetic post-commit cleanup failure".into() }); }
             Ok(result)
         }
@@ -3289,6 +3299,7 @@ pub(super) mod tests {
                 fail_character_batches: false,
                 record_activation: false,
                 lose_commit_reply: false,
+                switch_binding_before_commit: false,
                 abort_calls: AtomicUsize::new(0),
                 preserve_calls: AtomicUsize::new(0),
                 full_character_calls: AtomicUsize::new(0),
@@ -4271,6 +4282,30 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn a_binding_switch_after_the_activation_receipt_refuses_the_commit_and_leaves_the_receipt_resolvable() {
+        let (directory, mut sink) = fixture();
+        sink.record_activation = true;
+        sink.switch_binding_before_commit = true;
+        let path = directory.path().join("switched.risudat");
+        fs::write(&path, save_bytes(valid_blocks())).unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+
+        let error = restore_block_risu_save_path(&path, 1, &job, &sink).unwrap_err();
+
+        assert!(error.message.contains("binding-authority-changed"), "{error:?}");
+        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
+        let store = sink.store.lock().unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        let restarted = JobRegistry::default();
+        super::super::restore_receipts::reconcile(&store, &restarted).unwrap();
+        let recovered = restarted.status(&job.id()).unwrap();
+        assert_eq!(recovered.state, JobState::Cancelled);
+        assert_eq!(recovered.activation_revision, None);
+    }
+
     fn msgpackr_parity_fixture() -> Value {
         serde_json::from_str(MSGPACKR_PARITY_FIXTURE).unwrap()
     }
@@ -4594,7 +4629,7 @@ pub(super) mod tests {
         job.start(JobPhase::ReadingSource).unwrap();
         let staging_id = sink.begin().unwrap().staging_id;
         stage_legacy_json(&database, &staging_id, &job, &sink).unwrap();
-        sink.commit(&staging_id, 1).unwrap();
+        sink.commit(&staging_id, 1, None).unwrap();
         let restored = sink.store.lock().unwrap().materialize(None).unwrap();
         let chats = restored["characters"][0]["chats"].as_array().unwrap();
         assert_eq!(chats.len(), 3);
@@ -4629,7 +4664,7 @@ pub(super) mod tests {
         job.start(JobPhase::ReadingSource).unwrap();
         let staging_id = sink.begin().unwrap().staging_id;
         stage_legacy_json(&database, &staging_id, &job, &sink).unwrap();
-        sink.commit(&staging_id, 1).unwrap();
+        sink.commit(&staging_id, 1, None).unwrap();
 
         let exported_path = {
             let mut store = sink.store.lock().unwrap();
@@ -5189,6 +5224,7 @@ pub(super) mod tests {
             fail_character_batches: false,
             record_activation: false,
             lose_commit_reply: false,
+            switch_binding_before_commit: false,
             abort_calls: AtomicUsize::new(0),
             preserve_calls: AtomicUsize::new(0),
             full_character_calls: AtomicUsize::new(0),
@@ -5554,8 +5590,8 @@ pub(super) mod tests {
             self.inner.add_characters(staging_id, characters)
         }
 
-        fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
-            self.inner.commit(staging_id, expected_revision)
+        fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
+            self.inner.commit(staging_id, expected_revision, binding_authority)
         }
 
         fn abort(&self, staging_id: &str) -> StoreResult<()> {
@@ -5870,8 +5906,8 @@ pub(super) mod tests {
             self.inner.add_characters(staging_id, characters)
         }
 
-        fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
-            self.inner.commit(staging_id, expected_revision)
+        fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
+            self.inner.commit(staging_id, expected_revision, binding_authority)
         }
 
         fn abort(&self, staging_id: &str) -> StoreResult<()> {

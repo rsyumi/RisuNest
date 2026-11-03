@@ -2450,8 +2450,23 @@ impl PersistentStore {
         &mut self,
         prepared: PreparedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
+        self.finish_prepared_replace_under(prepared, None)
+    }
+
+    /// Commits under `binding_authority` when the caller already recorded one for
+    /// this staging, so a binding switch since then fails with
+    /// `binding-authority-changed` instead of committing under another authority.
+    pub(crate) fn finish_prepared_replace_under(
+        &mut self,
+        prepared: PreparedReplaceCommit,
+        binding_authority: Option<&str>,
+    ) -> StoreResult<RevisionResult> {
         self.lww_prepared_replacement_revision(&prepared.staging_id, Some(prepared.revision))?;
-        let header=lww::Header{binding_authority:self.lww_binding_authority()?,request_id:prepared.staging_id.clone()};
+        let binding_authority = match binding_authority {
+            Some(authority) => risunest_sync_wire::stamp::DecimalU64::try_from(authority.to_owned()).map_err(lww::error)?,
+            None => self.lww_binding_authority()?,
+        };
+        let header=lww::Header{binding_authority,request_id:prepared.staging_id.clone()};
         self.lww_commit_replacement(&header,&prepared.staging_id)
     }
 
