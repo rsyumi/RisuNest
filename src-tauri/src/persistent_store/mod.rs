@@ -2816,12 +2816,13 @@ impl PersistentStore {
     }
 
     pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> StoreResult<()> {
-        if mode == CheckpointMode::Truncate && self.active_readers.active_count() > 0 {
-            return Err(StoreError::Store {
-                message: "truncate checkpoint cannot run while an active read lease pins the WAL"
-                    .to_owned(),
-            });
-        }
+        // A truncate would wait out the busy timeout behind an active read lease. The
+        // committed frames stay in the WAL, so a passive checkpoint is all that can run.
+        let mode = if mode == CheckpointMode::Truncate && self.active_readers.active_count() > 0 {
+            CheckpointMode::Passive
+        } else {
+            mode
+        };
         snapshot::checkpoint(&self.connection, mode)
     }
 
