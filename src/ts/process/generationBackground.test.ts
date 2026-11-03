@@ -26,7 +26,7 @@ vi.mock('../iosNative', async importOriginal => ({
 
 import { beginDeferredMobileBackgroundTask, beginMobileBackgroundTask, hasMobileBackgroundTasks } from '../mobileBackgroundTask'
 import { BackgroundExecutionExpiredError } from '../iosNative'
-import { beginGenerationBackground, holdModelCall } from './generationBackground'
+import { beginGenerationBackground, holdModelCall, holdScriptRun } from './generationBackground'
 import { reserveGeneration } from './generationState'
 
 function hold(signal?: AbortSignal) {
@@ -158,6 +158,38 @@ describe('model calls outside a reserved generation', () => {
         const reservation = reserveGeneration()!
         try { await expect(holdModelCall(async () => 'reserved')).resolves.toBe('reserved') }
         finally { reservation.release() }
+        expect(beginDeferredMobileBackgroundTask).not.toHaveBeenCalled()
+    })
+})
+
+describe('script runs a chat message starts', () => {
+    it('hold a deferred generation hold until the run settles or fails, even inside a reserved generation', async () => {
+        const held = hold()
+        vi.mocked(beginDeferredMobileBackgroundTask).mockReturnValue(held)
+        let finish!: (value: string) => void
+        const run = holdScriptRun(() => new Promise<string>(resolve => { finish = resolve }))
+        expect(beginDeferredMobileBackgroundTask).toHaveBeenCalledExactlyOnceWith('generation')
+        await Promise.resolve()
+        expect(held.dispose).not.toHaveBeenCalled()
+        finish('done')
+        await expect(run).resolves.toBe('done')
+        await vi.waitFor(() => expect(held.dispose).toHaveBeenCalledOnce())
+
+        const failing = hold()
+        vi.mocked(beginDeferredMobileBackgroundTask).mockReturnValue(failing)
+        const failure = new Error('script failed')
+        const reservation = reserveGeneration()!
+        try { await expect(holdScriptRun(async () => { throw failure })).rejects.toBe(failure) }
+        finally { reservation.release() }
+        await vi.waitFor(() => expect(failing.dispose).toHaveBeenCalledOnce())
+    })
+
+    it('take no hold on desktop or with the keep-alive setting off', async () => {
+        mocks.os = 'windows'
+        await expect(holdScriptRun(async () => 'desktop')).resolves.toBe('desktop')
+        mocks.os = 'android'
+        mocks.keepAlive = false
+        await expect(holdScriptRun(async () => 'off')).resolves.toBe('off')
         expect(beginDeferredMobileBackgroundTask).not.toHaveBeenCalled()
     })
 })
