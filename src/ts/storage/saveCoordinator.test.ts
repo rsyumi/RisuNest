@@ -929,6 +929,8 @@ describe('SaveCoordinator', () => {
             ...Array.from({ length: 41 }, (_, index) => [index + 2, storage.revision + 2]),
         ])
         expect(session.persistedVersion).toBe(42)
+        expect(session.residencyFallbackActive).toBe(false)
+        expect(session.pinCount('dirty')).toBe(0)
     })
 
     it('merges a reply streamed around a failed save into one retried range', async () => {
