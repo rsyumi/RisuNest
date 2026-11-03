@@ -10,6 +10,7 @@ package-lock.json
 node_modules
 /.pnpm-store/
 dist/
+/dist-staging/
 save/
 dist-web/
 dist-ssr
@@ -64,6 +65,7 @@ dist.zip
 !/scripts/testAndroid.ps1
 !/scripts/testIOSPortableSourceContracts.mjs
 !/scripts/buildLocal.mjs
+!/scripts/buildTauriFrontend.mjs
 .env
 /server/node/ssl/certificate
 .worktrees/
