@@ -277,6 +277,15 @@ await (async function() {
         return transferables;
     }
 
+    // Same rule as the host: a failed stream never reaches the other side as a clean end.
+    function streamErrorMessage(error) {
+        try {
+            if (error && typeof error.message === 'string' && error.message) return error.message;
+            if (error !== undefined && error !== null && error !== '') return String(error);
+        } catch (_) {}
+        return 'Stream failed';
+    }
+
     function replaceStreamsWithPorts(obj) {
         const ports = [];
         const cleanups = [];
@@ -316,7 +325,7 @@ await (async function() {
                         ch.port1.postMessage({ done: false, value });
                     }
                 } catch (e) {
-                    try { ch.port1.postMessage({ done: true, error: e.message }); } catch(_) {}
+                    try { ch.port1.postMessage({ done: true, error: streamErrorMessage(e) }); } catch(_) {}
                     finish();
                 } finally {
                     reading = false;
@@ -648,6 +657,17 @@ await (async function() {
 const requestSignalKeys = new Map([['nativeFetch', 'signal'], ['risuFetch', 'abortSignal']]);
 export const UNREAD_PLUGIN_STREAM_TIMEOUT_MS = 60_000;
 
+// A stream may fail with any value (plugin-http fails with plain strings), so
+// the other side gets a message that is never empty.
+function streamErrorMessage(error: unknown): string {
+    try {
+        const message = (error as { message?: unknown } | null | undefined)?.message;
+        if (typeof message === 'string' && message) return message;
+        if (error !== undefined && error !== null && error !== '') return String(error);
+    } catch (_) {}
+    return 'Stream failed';
+}
+
 export class SandboxHost {
     private iframe: HTMLIFrameElement;
     private apiFactory: any;
@@ -977,8 +997,8 @@ export class SandboxHost {
                         if (done) { ch.port1.postMessage({ done: true }); finish(); return; }
                         ch.port1.postMessage({ done: false, value });
                     }
-                } catch (e: any) {
-                    try { ch.port1.postMessage({ done: true, error: e.message }); } catch(_) {}
+                } catch (e) {
+                    try { ch.port1.postMessage({ done: true, error: streamErrorMessage(e) }); } catch(_) {}
                     finish();
                 } finally {
                     reading = false;
