@@ -90,6 +90,24 @@ const referenceCorrections = {
   "Database.thinkingTokens": "nullable",
   // The character format update moves the instructions to the chat note and stores null.
   "character.postHistoryInstructions": "nullable",
+  // A cleared number setting stores null, which the loader replaces with the default.
+  ...Object.fromEntries(
+    [
+      "loreBookDepth",
+      "loreBookToken",
+      "autoContinueMinTokens",
+      "requestRetrys",
+      "genTime",
+      "assetMaxDifference",
+      "localNetworkTimeoutSec",
+      "maxContext",
+      "maxResponse",
+      "generationSeed",
+    ].map((field) => [`Database.${field}`, "nullable"]),
+  ),
+  // Saving the preset copies a cleared maxContext or maxResponse into it.
+  "botPreset.maxContext": "nullable",
+  "botPreset.maxResponse": "nullable",
 };
 
 export function generateContract(target) {

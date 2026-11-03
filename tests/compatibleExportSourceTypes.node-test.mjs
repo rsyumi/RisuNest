@@ -177,9 +177,10 @@ test("every value a settings control writes fits the declared Database type", ()
   const string = checker.getStringType();
   const number = checker.getNumberType();
   // What each control writes; option controls write their option values.
+  // A cleared number input writes null.
   const written = {
     check: [checker.getBooleanType()],
-    number: [number],
+    number: [number, checker.getNullType()],
     slider: [number],
     text: [string],
     textarea: [string],
