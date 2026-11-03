@@ -9,7 +9,7 @@ mod install;
 mod scheduler;
 pub(crate) mod upload;
 
-pub(crate) use cold::ColdSource;
+pub(crate) use cold::{ColdSource, SpoolLimits};
 
 use super::error::job_error;
 use super::official_snapshot::OfficialSnapshotCredential;
