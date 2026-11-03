@@ -81,10 +81,13 @@ impl RootSpool {
         raw.map(|raw|decode(&raw)).transpose()
     }
 
-    pub(super) fn visit_values(&self, mut visit: impl FnMut(Value) -> StoreResult<()>) -> StoreResult<()> {
+    pub(super) fn visit_value_texts(&self, mut visit: impl FnMut(&str) -> StoreResult<()>) -> StoreResult<()> {
         let mut statement=self.db.prepare("SELECT value FROM fields WHERE kind=1 UNION ALL SELECT value FROM members WHERE value IS NOT NULL")?;
         let mut rows=statement.query([])?;
-        while let Some(row)=rows.next()? { self.check_cancelled()?; visit(decode(&row.get::<_,String>(0)?)?)?; }
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            visit(row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?)?;
+        }
         Ok(())
     }
 
