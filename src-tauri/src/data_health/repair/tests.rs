@@ -93,12 +93,15 @@ fn an_owner_inside_the_root_is_offered_only_when_one_entry_carries_it() {
         inside("module", "module-a", "$.assets[1][1]", "asset").in_sole_entry(),
         inside("module", "module-a", "$.lorebook[0].content", "inlay").in_token(1).in_sole_entry(),
         inside("loadout", "Loadout", "$.characterIds[0]", "character").in_sole_entry(),
+        inside("root", "database", "$.customBackground", "asset"),
         // No entry or several carry this identity, or the diagnosis was written before the mark.
         inside("persona", "persona-b", "$.icon", "asset"),
         // Removing these leaves the finding in place.
         inside("persona", "persona-a", "$.embeddedModule.id", "module").in_sole_entry(),
         inside("loadout", "Loadout", "$.presetName", "preset").in_sole_entry(),
         inside("loadout", "Loadout", "$.personaId", "persona").in_sole_entry(),
+        inside("root", "database", "$.botPresetsId", "preset"),
+        inside("root", "database", "$.selectedPersona", "persona"),
         inside("folder", "folder-a", "$.img", "asset").in_sole_entry(),
     ]));
     let removals: Vec<_> = plan
@@ -118,6 +121,7 @@ fn an_owner_inside_the_root_is_offered_only_when_one_entry_carries_it() {
             (2, "module", "module-a", "$.assets[1]", None),
             (3, "module", "module-a", "$.lorebook[0].content", Some(1)),
             (4, "loadout", "Loadout", "$.characterIds[0]", None),
+            (5, "root", "database", "$.customBackground", None),
         ]
     );
 }

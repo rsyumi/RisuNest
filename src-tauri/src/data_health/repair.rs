@@ -144,9 +144,12 @@ fn record_candidates(index: usize, finding: &Finding) -> Vec<RepairCandidate> {
 /// rebuilt on save, so its references are left to the reader.
 const EDITABLE_OWNERS: &[&str] = &["root", "preset", "plugin-storage", "character", "conversation"];
 
-/// Fields of an owner inside the root that removing cannot answer. The reference graph reports a
-/// loadout's preset and persona even when they are absent, and an embedded module's id names it.
+/// Fields that removing cannot answer. The reference graph reports the selected preset and
+/// persona, and a loadout's preset and persona, even when they are absent, and an embedded
+/// module's id names it.
 const KEPT_FIELDS: &[(&str, &str)] = &[
+    ("root", "$.botPresetsId"),
+    ("root", "$.selectedPersona"),
     ("persona", "$.embeddedModule.id"),
     ("loadout", "$.presetName"),
     ("loadout", "$.personaId"),
@@ -191,10 +194,9 @@ pub(crate) fn root_entry(root: &serde_json::Value, owner: &Owner) -> Option<(&'s
 }
 
 fn editable(owner_kind: &str, locator: &Locator) -> bool {
-    EDITABLE_OWNERS.contains(&owner_kind)
-        || (locator.sole_entry
-            && root_collection(owner_kind).is_some()
-            && !KEPT_FIELDS.contains(&(owner_kind, locator.source_path.as_str())))
+    !KEPT_FIELDS.contains(&(owner_kind, locator.source_path.as_str()))
+        && (EDITABLE_OWNERS.contains(&owner_kind)
+            || (locator.sole_entry && root_collection(owner_kind).is_some()))
 }
 
 /// A conversation's `$.message[N]…` as the path within message row N, the record a repair edits.

@@ -1270,9 +1270,8 @@ fn a_repair_finds_its_entry_in_the_root_again_when_applied() {
         .unwrap();
     store.replace_commit(&staging, Some(0)).unwrap();
     stored_alias(&mut store, 9);
-    let selected = diagnosed_candidates(&mut store, |action| {
-        matches!(action, RepairAction::DropReference { owner, .. } if owner.kind != "root")
-    });
+    // The root selects no preset or persona, and removing a selection cannot answer that.
+    let selected = diagnosed_candidates(&mut store, |action| matches!(action, RepairAction::DropReference { .. }));
     assert_eq!(selected.len(), 2, "{selected:?}");
     let revision = store.revision().unwrap();
     // The lists change under the diagnosis without a save moving the revision.
