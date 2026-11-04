@@ -368,7 +368,8 @@ await (async function() {
                 start(controller) {
                     port.onmessage = (e) => {
                         if (e.data.done) {
-                            if (e.data.error) controller.error(new Error(e.data.error));
+                            // A failed read is a TypeError, as fetch reports a body that fails midway.
+                            if (e.data.error) controller.error(new TypeError(e.data.error));
                             else controller.close();
                             port.onmessage = null;
                             port.close();

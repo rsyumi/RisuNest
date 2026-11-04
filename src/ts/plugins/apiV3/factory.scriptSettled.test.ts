@@ -324,7 +324,10 @@ describe('sandbox script completion', () => {
         }
         const reader = stream.getReader()
         expect(await reader.read()).toEqual({ done: false, value: 'chunk' })
-        await expect(reader.read()).rejects.toThrow(reason)
+        const failure = await reader.read().then(() => undefined, (error: unknown) => error)
+        expect((failure as Error | undefined)?.message).toBe(reason ?? 'Stream failed')
+        // The plugin sees what fetch reports for a body that fails midway.
+        if (owner === 'host') expect(failure).toBeInstanceOf((child as any).TypeError)
         await vi.waitFor(() => expect(host.isIdle()).toBe(true))
         host.terminate()
     })
