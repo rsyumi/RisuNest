@@ -369,6 +369,13 @@ export async function runScripted(code:string, arg:{
                 const db = getScriptingDatabase()
                 return db.characters[getScriptingCharacterIndex(db)]
             }
+            // CBS in script API results reads this invocation's database and its buffered variable writes.
+            const scriptingParserOptions = (db: Database | undefined) => ({
+                db,
+                selectedCharacterId: ScriptingEngineState.selectedCharacterId,
+                getChatVar: ScriptingEngineState.getVar,
+                setChatVar: ScriptingEngineState.setVar,
+            })
             const updateCapturedCharacterField = (
                 field: CapturedCharacterField,
                 value: string,
@@ -591,10 +598,7 @@ export async function runScripted(code:string, arg:{
                     : operationCharacter ?? getScriptingCharacter()
                 return risuChatParser(value, {
                     chara: parserCharacter,
-                    db: ScriptingEngineState.access ? database : ScriptingEngineState.operationDatabase,
-                    selectedCharacterId: ScriptingEngineState.selectedCharacterId,
-                    getChatVar: ScriptingEngineState.getVar,
-                    setChatVar: ScriptingEngineState.setVar,
+                    ...scriptingParserOptions(ScriptingEngineState.access ? database : ScriptingEngineState.operationDatabase),
                 })
             })
             
@@ -1080,7 +1084,7 @@ export async function runScripted(code:string, arg:{
                 const selectedChar = getScriptingCharacterIndex(db)
                 const char = db.characters[selectedChar]
 
-                return risuChatParser(getPersonaPrompt(), { chara: char })
+                return risuChatParser(getPersonaPrompt(), { chara: char, ...scriptingParserOptions(db) })
             })
 
             declareAPI('getAuthorsNote', (id:string) => {
@@ -1124,13 +1128,7 @@ export async function runScripted(code:string, arg:{
                 for (const source of loreSources) {
                     for (const b of source) {
                         if (b.comment === search) {
-                            found.push({ ...b, content: risuChatParser(b.content, {
-                                chara: selectedChar,
-                                db,
-                                selectedCharacterId: ScriptingEngineState.selectedCharacterId,
-                                getChatVar: ScriptingEngineState.getVar,
-                                setChatVar: ScriptingEngineState.setVar,
-                            }) })
+                            found.push({ ...b, content: risuChatParser(b.content, { chara: selectedChar, ...scriptingParserOptions(db) }) })
                         }
                     }
                 }
@@ -1189,6 +1187,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
+                flushScriptingVariables()
 
                 const db = getScriptingDatabase()
 
@@ -1206,7 +1205,7 @@ export async function runScripted(code:string, arg:{
                 const loreBooks = []
 
                 for (const book of fullLoreBooks) {
-                    const parsed = risuChatParser(book.prompt, { chara: selectedChar }).trim()
+                    const parsed = risuChatParser(book.prompt, { chara: selectedChar, ...scriptingParserOptions(db) }).trim()
                     if (parsed.length === 0) {
                         continue
                     }
