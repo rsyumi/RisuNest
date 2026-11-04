@@ -3032,6 +3032,10 @@ pub(super) fn store_error(error: StoreError) -> NativeJobError {
             NativeJobError::new("store-error", "persistent snapshot was released")
         }
         StoreError::RawBodyUnavailable | StoreError::CommitBusy => NativeJobError::new("store-error", error.to_string()),
+        // A sync binding switch before activation refuses the commit like a concurrent revision.
+        StoreError::Validation { message } if message == "binding-authority-changed" => {
+            NativeJobError::new("revision-conflict", message)
+        }
         StoreError::Committed { message, .. } | StoreError::CommitDecode { message } | StoreError::Validation { message } | StoreError::SchemaMismatch { message } | StoreError::Store { message } => {
             NativeJobError::new("store-error", message)
         }
@@ -4294,6 +4298,7 @@ pub(super) mod tests {
 
         let error = restore_block_risu_save_path(&path, 1, &job, &sink).unwrap_err();
 
+        assert_eq!(error.code, "revision-conflict", "{error:?}");
         assert!(error.message.contains("binding-authority-changed"), "{error:?}");
         assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
         let store = sink.store.lock().unwrap();
