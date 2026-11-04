@@ -66,7 +66,7 @@ impl ReplacementSink for RecordingSink {
         Ok(())
     }
 
-    fn commit(&self, _staging_id: &str, _expected_revision: i64) -> StoreResult<RevisionResult> {
+    fn commit(&self, _staging_id: &str, _expected_revision: i64, _binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
         Err(StoreError::Store {
             message: "the recording sink does not activate".to_owned(),
         })
@@ -643,7 +643,7 @@ impl ReplacementSink for RootOnlySink {
         *self.observed.lock().unwrap()=Some((hex::encode(writer.0.finalize()),writer.1,records,maximum));
         Ok(())
     }
-    fn commit(&self,_:&str,_:i64)->StoreResult<RevisionResult> { panic!("decoder fixture never activates") }
+    fn commit(&self,_:&str,_:i64,_:Option<&str>)->StoreResult<RevisionResult> { panic!("decoder fixture never activates") }
     fn abort(&self,_:&str)->StoreResult<()> { Ok(()) }
 }
 
@@ -729,7 +729,7 @@ fn cancellation_during_root_sink_finalization_aborts_stage_and_owned_spool() {
             self.job.request_cancel().unwrap();
             self.store.lock().unwrap().replace_put_upstream_stream(id,root)
         }
-        fn commit(&self,_:&str,_:i64)->StoreResult<RevisionResult> { panic!("cancelled stage activated") }
+        fn commit(&self,_:&str,_:i64,_:Option<&str>)->StoreResult<RevisionResult> { panic!("cancelled stage activated") }
         fn abort(&self,id:&str)->StoreResult<()> {
             self.aborted.fetch_add(1,Ordering::AcqRel);
             self.store.lock().unwrap().replace_abort(id)

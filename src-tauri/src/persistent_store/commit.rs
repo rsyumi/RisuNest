@@ -3,7 +3,7 @@ use super::{
     ConversationMutation, PluginStorageMutation, RevisionResult, StagingResult, StoreError,
     StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
-use super::plugin_owner;
+use super::{plugin_owner, replacement_scan};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1235,10 +1235,8 @@ fn prune_proven_unreachable_forwarded_aliases(
     }
 
     let mut references = BTreeSet::new();
-    root.visit_values(|value| {
-        observe_replacement_alias_references(&value, &mut references);
-        Ok(())
-    })?;
+    // The spool's own decoder reads root values without a depth limit.
+    root.visit_value_texts(|text| replacement_scan::observe_alias_references(text, true, &mut references))?;
     for query in [
         "SELECT value FROM bot_presets WHERE generation = ?1",
         "SELECT detail FROM characters WHERE generation = ?1",
@@ -1248,8 +1246,8 @@ fn prune_proven_unreachable_forwarded_aliases(
         let mut statement = transaction.prepare(query)?;
         let mut rows = statement.query([generation])?;
         while let Some(row) = rows.next()? {
-            let encoded: String = row.get(0)?;
-            observe_replacement_alias_references(&serde_json::from_str(&encoded)?, &mut references);
+            let encoded = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+            replacement_scan::observe_alias_references(encoded, false, &mut references)?;
         }
     }
     for query in [
@@ -1259,7 +1257,7 @@ fn prune_proven_unreachable_forwarded_aliases(
         let mut statement = transaction.prepare(query)?;
         let mut rows = statement.query([generation])?;
         while let Some(row) = rows.next()? {
-            observe_replacement_alias_text(&row.get::<_, String>(0)?, &mut references);
+            replacement_scan::observe_alias_text(&row.get::<_, String>(0)?, &mut references);
         }
     }
 
@@ -1328,52 +1326,12 @@ fn replacement_asset_owner_scan_is_complete(
         .prepare("SELECT detail FROM characters WHERE generation = ?1 ORDER BY character_id ASC")?;
     let mut rows = statement.query([generation])?;
     while let Some(row) = rows.next()? {
-        let detail: Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
-        let Some(detail) = detail.as_object() else {
-            return Ok(false);
-        };
-        if detail
-            .get("additionalAssets")
-            .is_some_and(|value| !value.is_array())
-        {
+        let detail = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+        if !replacement_scan::additional_assets_are_listed(detail)? {
             return Ok(false);
         }
     }
     Ok(true)
-}
-
-fn observe_replacement_alias_references(value: &Value, references: &mut BTreeSet<String>) {
-    match value {
-        Value::String(value) => observe_replacement_alias_text(value, references),
-        Value::Array(values) => {
-            for value in values {
-                observe_replacement_alias_references(value, references);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                observe_replacement_alias_references(value, references);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn observe_replacement_alias_text(value: &str, references: &mut BTreeSet<String>) {
-    if value.starts_with("assets/") {
-        references.insert(value.to_owned());
-    }
-    for prefix in ["{{inlay::", "{{inlayed::", "{{inlayeddata::"] {
-        let mut remainder = value;
-        while let Some(start) = remainder.find(prefix) {
-            remainder = &remainder[start + prefix.len()..];
-            let Some(end) = remainder.find("}}") else {
-                break;
-            };
-            references.insert(remainder[..end].to_owned());
-            remainder = &remainder[end + 2..];
-        }
-    }
 }
 
 fn validate_staged_owner_heads(database: &Value, heads: &[AssetOwnerHead]) -> StoreResult<()> {
@@ -1530,18 +1488,22 @@ fn replacement_owner_tuple(
     if !root.is_object() { return Err(validation("Replacement root must be an object")); }
     match owner {
         AssetOwnerLocator::CharacterAdditionalAssets { character_id } => {
-            let detail: Option<String> = connection
+            let assets = connection
                 .query_row(
                     "SELECT detail FROM characters
                      WHERE generation = ?1 AND character_id = ?2",
                     params![generation, character_id],
-                    |row| row.get(0),
+                    |row| Ok(replacement_scan::additional_assets(row.get_ref(0)?.as_str()?)),
                 )
-                .optional()?;
-            let Some(detail) = detail else {
-                return Ok(None);
-            };
-            replacement_owner_tuple_from_parent(&serde_json::from_str(&detail)?, "additionalAssets")
+                .optional()?
+                .transpose()?;
+            Ok(match assets {
+                None | Some(replacement_scan::AdditionalAssets::Unusable) => None,
+                Some(replacement_scan::AdditionalAssets::Absent) => Some(ReplacementOwnerTuple::Absent),
+                Some(replacement_scan::AdditionalAssets::Entries(entries)) => {
+                    Some(ReplacementOwnerTuple::Present(entries))
+                }
+            })
         }
         AssetOwnerLocator::RootModuleAssets { .. } | AssetOwnerLocator::PersonaEmbeddedModuleAssets { .. } => {
             let Some(module)=owner.root_parent(root) else{return Ok(None)};

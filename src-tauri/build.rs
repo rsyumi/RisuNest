@@ -49,6 +49,12 @@ fn main() {
 
     tauri_build::try_build(attributes).expect("failed to run Tauri build script");
 
+    // Non-dev builds embed `frontendDist`. Rustc tracks only the files it embedded, so a
+    // file added to the frontend build alone would otherwise leave the crate fresh.
+    if !tauri_build::is_dev() && std::path::Path::new("../dist").exists() {
+        println!("cargo:rerun-if-changed=../dist");
+    }
+
     if windows_msvc {
         let manifest = std::path::PathBuf::from(
             std::env::var_os("CARGO_MANIFEST_DIR")

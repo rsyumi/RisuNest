@@ -176,6 +176,31 @@ async function waitForPage(debugPort) {
     throw new Error('Browser CDP endpoint did not become ready')
 }
 
+// Edge can hand its session to another process and exit, so stopping the spawned process
+// does not always stop the browser that holds the profile.
+async function closeBrowser(debugPort) {
+    const endpoint = `http://${HOST}:${debugPort}/json/version`
+    try {
+        const browser = new CdpClient(
+            (await (await fetch(endpoint)).json()).webSocketDebuggerUrl,
+        )
+        await browser.connect()
+        await browser.call('Browser.close', {}, 5_000).catch(() => {})
+        browser.close()
+    } catch {
+        return
+    }
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+        try {
+            await fetch(endpoint)
+        } catch {
+            return
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+}
+
 async function evaluate(client, expression) {
     const response = await client.call('Runtime.evaluate', {
         expression,
@@ -306,6 +331,7 @@ async function main() {
     let profile
     let server
     let browser
+    let debugPort
     let client
     try {
         await runProcess(
@@ -332,11 +358,12 @@ async function main() {
                 },
             },
         )
-        const [serverPort, debugPort, browserExecutable] = await Promise.all([
+        const [serverPort, port, browserExecutable] = await Promise.all([
             freePort(),
             freePort(),
             findBrowser(),
         ])
+        debugPort = port
         profile = await mkdtemp(path.join(os.tmpdir(), PROFILE_PREFIX))
         server = serve(distDirectory)
         server.listen(serverPort, HOST)
@@ -431,6 +458,7 @@ async function main() {
         )
     } finally {
         client?.close()
+        if (browser) await closeBrowser(debugPort)
         server?.close()
         await stopProcess(browser)
         if (profile) {

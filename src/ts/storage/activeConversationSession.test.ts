@@ -1368,10 +1368,14 @@ describe('ActiveConversationSession', () => {
         const sessionToken = first.sessionToken
 
         expect(session.acknowledgePersisted(sessionToken, 1, 8)).toBe(true)
+        expect(session.pendingMutations).toEqual([
+            { start: 0, deleteCount: 1, messages: [message('first', 'edited')], sessionVersion: 2 },
+        ])
         expect(() => session.acknowledgePersisted(sessionToken, 2, 8)).not.toThrow()
         expect(session.persistedVersion).toBe(2)
         expect(session.storeRevision).toBe(8)
         expect(session.pendingMutations).toEqual([])
+        expect(session.residencyFallbackActive).toBe(false)
     })
 
     it('falls back to the complete owner when an untracked structural mutation precedes a command', () => {

@@ -835,10 +835,17 @@ mod tests {
 
     #[test]
     fn compatible_projection_keeps_null_where_the_references_store_it() {
-        // Both references store these nulls; thinkingTokens and
-        // postHistoryInstructions are required fields.
+        // Both references store these nulls; thinkingTokens,
+        // postHistoryInstructions and the cleared number settings are
+        // required fields.
         let records = [
             ("DataBase", json!({"thinkingTokens": null, "textScreenColor": null, "textScreenBorder": null, "promptTemplate": null})),
+            ("DataBase", json!({
+                "loreBookDepth": null, "loreBookToken": null, "autoContinueMinTokens": null, "requestRetrys": null,
+                "genTime": null, "assetMaxDifference": null, "localNetworkTimeoutSec": null, "maxContext": null,
+                "maxResponse": null, "generationSeed": null,
+            })),
+            ("botPreset", json!({"maxContext": null, "maxResponse": null})),
             ("character", json!({"postHistoryInstructions": null})),
             ("Chat", json!({"folderId": null})),
             ("Message", json!({"role": "user", "data": "synthetic", "name": null})),

@@ -51,6 +51,10 @@ pub(crate) struct Locator {
     /// were numbered has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) token: Option<u64>,
+    /// The owner is kept inside the root, and exactly one entry there carried its identity when
+    /// the library was scanned. A diagnosis written before owners were marked has none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) sole_entry: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -103,7 +107,16 @@ impl Finding {
             source_path: source_path.into(),
             occurrence,
             token: None,
+            sole_entry: false,
         });
+        self
+    }
+
+    /// Marks the located owner as the one entry of its root collection that carries its identity.
+    pub(crate) fn in_sole_entry(mut self) -> Self {
+        if let Some(locator) = &mut self.locator {
+            locator.sole_entry = true;
+        }
         self
     }
 

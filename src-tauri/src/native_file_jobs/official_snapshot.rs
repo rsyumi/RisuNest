@@ -1,5 +1,5 @@
 use risunest_network_log::reqwest::RequestBuilderExt;
-use super::official_assets::ColdSource;
+use super::official_assets::{ColdSource, SpoolLimits};
 use super::{restore, ImportCounts, IncompleteRestorePreview, JobControl, JobDetail, JobKind, JobPhase, JobProgress, JobResultSummary, JobStage, JobState, NativeJobError, OpenedJobSource, StageUnit};
 use crate::persistent_store::commit::StagedPluginPreview;
 use crate::persistent_store::upstream_stream::RootSpool;
@@ -47,6 +47,17 @@ pub(crate) fn restore_official_snapshot(
     job: &JobControl,
     sink: &dyn restore::ReplacementSink,
 ) -> Result<JobResultSummary, NativeJobError> {
+    restore_with_spool(request, expected_revision, owned_directory, job, sink, SpoolLimits::default())
+}
+
+fn restore_with_spool(
+    request: OfficialSnapshotRestoreRequest,
+    expected_revision: i64,
+    owned_directory: &Path,
+    job: &JobControl,
+    sink: &dyn restore::ReplacementSink,
+    spool: SpoolLimits,
+) -> Result<JobResultSummary, NativeJobError> {
     job.start(JobPhase::ReadingSource)
         .map_err(job_state_error)?;
     report_download_progress(job, 0, None)?;
@@ -63,28 +74,30 @@ pub(crate) fn restore_official_snapshot(
     let limit = restore::RestoreLimits::default().max_decoded_block_bytes;
     let sink = OfficialSink {
         inner: sink,
-        cold: ColdSource::new(&request.base_url, &request.credential, owned_directory, job, limit)?,
+        cold: ColdSource::new(&request.base_url, &request.credential, owned_directory, job, limit, spool)?,
         incomplete: Mutex::default(),
     };
-    restore::restore_started_risu_save(
-        source,
-        expected_revision,
-        job,
-        &sink,
-        restore::RestoreProgressScale {
-            base_bytes: downloaded_bytes,
-            total_bytes: Some(downloaded_bytes * 2),
-            spool_directory: Some(owned_directory.to_path_buf()),
-            cold_payloads: Some(sink.cold.progress()),
-            ..Default::default()
-        },
-    )
+    sink.cold.with_read_ahead(&owned_directory.join(SNAPSHOT_FILE), || {
+        restore::restore_started_risu_save(
+            source,
+            expected_revision,
+            job,
+            &sink,
+            restore::RestoreProgressScale {
+                base_bytes: downloaded_bytes,
+                total_bytes: Some(downloaded_bytes * 2),
+                spool_directory: Some(owned_directory.to_path_buf()),
+                cold_payloads: Some(sink.cold.progress()),
+                ..Default::default()
+            },
+        )
+    })
     // A cold item read that ended staging reports why, not the staging error it caused.
     .map_err(|error| sink.cold.fatal().unwrap_or(error))
 }
 
 /// Stages into the library like any restore, and reads the snapshot's cold
-/// references from the account while their records are staged.
+/// references from the account ahead of the records that hold them.
 struct OfficialSink<'a> {
     inner: &'a dyn restore::ReplacementSink,
     cold: ColdSource<'a>,
@@ -176,8 +189,8 @@ impl restore::ReplacementSink for OfficialSink<'_> {
         Ok(preview)
     }
 
-    fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
-        self.inner.commit(staging_id, expected_revision)
+    fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
+        self.inner.commit(staging_id, expected_revision, binding_authority)
     }
 
     fn abort(&self, staging_id: &str) -> StoreResult<()> {
@@ -527,8 +540,10 @@ mod tests {
     use super::*;
     use crate::native_file_jobs::{JobKind, JobRegistry};
     use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpListener};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Condvar};
     use std::thread;
     use std::time::Instant;
     use tempfile::TempDir;
@@ -1172,29 +1187,32 @@ mod tests {
         server.join().unwrap();
     }
 
-    /// Answers each request on its own connection, by path and `x-risu-key`,
-    /// and keeps every request head it saw.
-    fn account_server(respond: impl Fn(&str, &str) -> Vec<u8> + Send + 'static) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+    /// Answers each request on a thread of its own, by path and `x-risu-key`,
+    /// and keeps every request head in the order the requests arrived.
+    fn account_server(respond: impl Fn(&str, &str, &mut TcpStream) + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let seen = requests.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (seen, respond) = (requests.clone(), Arc::new(respond));
         thread::spawn(move || {
             for stream in listener.incoming() {
-                let mut stream = stream.unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0];
-                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
-                    request.push(byte[0]);
-                }
-                let head = String::from_utf8_lossy(&request).into_owned();
-                let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
-                let key = head.lines()
-                    .find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("x-risu-key")))
-                    .map_or("", |(_, value)| value.trim()).to_owned();
-                seen.lock().unwrap().push(head);
-                let _ = stream.write_all(&respond(&path, &key));
-                let _ = stream.shutdown(Shutdown::Write);
+                let Ok(mut stream) = stream else { continue };
+                let (seen, respond) = (seen.clone(), respond.clone());
+                thread::spawn(move || {
+                    let mut request = Vec::new();
+                    let mut byte = [0];
+                    while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                        request.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&request).into_owned();
+                    let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+                    let key = head.lines()
+                        .find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("x-risu-key")))
+                        .map_or("", |(_, value)| value.trim()).to_owned();
+                    seen.lock().unwrap().push(head);
+                    respond(&path, &key, &mut stream);
+                    let _ = stream.shutdown(Shutdown::Write);
+                });
             }
         });
         (format!("http://{address}"), requests)
@@ -1217,36 +1235,96 @@ mod tests {
         }
     }
 
+    fn cold_chat(id: &str, key: &str) -> Value {
+        serde_json::json!({"id": id, "name": id, "message": [{"role": "char", "data": format!("\u{ef01}COLDSTORAGE\u{ef01}{key}"), "chatId": format!("{id}-message")}]})
+    }
+
+    /// A snapshot whose plugin values are the cold items `cold-0`, `cold-1` and on.
+    fn cold_plugin_values(count: usize) -> Vec<Vec<u8>> {
+        let storage = (0..count).map(|index| (format!("value-{index}"), Value::String(format!("cold-{index}")))).collect::<serde_json::Map<_, _>>();
+        let mut blocks = restore::tests::valid_blocks();
+        blocks[5] = restore::tests::block(11, false, "pluginStorage", &serde_json::json!({"_coldplugin": storage}));
+        blocks
+    }
+
+    fn plugin_value(store: &crate::persistent_store::PersistentStore, key: &str) -> Option<Value> {
+        store.read_plugin_storage(crate::persistent_store::plugin_owner::UNOWNED_OWNER, key, None).unwrap().map(|row| row.value)
+    }
+
+    /// Events the account server saw, which a reply can wait on.
+    type Events = Arc<(Mutex<Vec<String>>, Condvar)>;
+
+    fn note(events: &Events, event: String) {
+        events.0.lock().unwrap().push(event);
+        events.1.notify_all();
+    }
+
+    /// Waits up to `timeout` for `event`, and returns whether it happened.
+    fn wait_for(events: &Events, event: &str, timeout: Duration) -> bool {
+        let (events, changed) = &**events;
+        let (events, _) = changed.wait_timeout_while(events.lock().unwrap(), timeout, |events| !events.iter().any(|seen| seen == event)).unwrap();
+        events.iter().any(|seen| seen == event)
+    }
+
     struct AccountRestore {
         _directory: TempDir,
+        owned: TempDir,
         sink: restore::tests::StoreSink,
-        job: std::sync::Arc<JobControl>,
+        job: Arc<JobControl>,
         outcome: Result<JobResultSummary, NativeJobError>,
         cold_reads: Vec<String>,
-        /// The job's detail as each cold item read arrived, by key.
-        cold_read_details: Vec<(String, Option<JobDetail>)>,
+        /// Each conversation row staging put, by name, with the job's detail then.
+        rows: Vec<(String, Option<JobDetail>)>,
+    }
+
+    impl AccountRestore {
+        /// How many times the restore read `key`.
+        fn reads(&self, key: &str) -> usize {
+            self.cold_reads.iter().filter(|head| head.contains(&format!("x-risu-key: {key}\r\n"))).count()
+        }
+    }
+
+    /// A restore job and the directory it owns.
+    struct Account {
+        job: Arc<JobControl>,
+        owned: TempDir,
+    }
+
+    impl Account {
+        fn new() -> Self {
+            Self { job: JobRegistry::default().create(JobKind::RestoreOfficialAccountSnapshot).unwrap(), owned: TempDir::new().unwrap() }
+        }
+
+        /// Restores `blocks` as the account snapshot under `spool` while `cold`
+        /// writes the reply to each cold item read, by its key.
+        fn restore(self, blocks: Vec<Vec<u8>>, spool: SpoolLimits, cold: impl Fn(&str, &mut TcpStream) + Send + Sync + 'static) -> AccountRestore {
+            let snapshot = restore::tests::save_bytes(blocks);
+            let (base_url, requests) = account_server(move |path, key, stream| {
+                if path == "/hub/account/coldstorage" {
+                    cold(key, stream);
+                } else {
+                    let _ = stream.write_all(&response("200 OK", "", &snapshot));
+                }
+            });
+            let (directory, mut sink) = restore::tests::fixture();
+            let rows = Arc::new(Mutex::new(Vec::new()));
+            sink.on_conversation_row = Some(Box::new({
+                let (job, rows) = (self.job.clone(), rows.clone());
+                move |detail: &Value| rows.lock().unwrap().push((detail["name"].as_str().unwrap_or_default().to_owned(), job.status().detail))
+            }));
+            let outcome = restore_with_spool(request(base_url), 1, self.owned.path(), &self.job, &sink, spool);
+            let cold_reads = requests.lock().unwrap().iter().filter(|head| head.contains(" /hub/account/coldstorage ")).cloned().collect();
+            let rows = rows.lock().unwrap().clone();
+            AccountRestore { _directory: directory, owned: self.owned, sink, job: self.job, outcome, cold_reads, rows }
+        }
     }
 
     /// Restores `blocks` as the account snapshot while `cold` answers each cold
     /// item read by its key.
-    fn restore_from_account(blocks: Vec<Vec<u8>>, cold: impl Fn(&str) -> Vec<u8> + Send + 'static) -> AccountRestore {
-        let snapshot = restore::tests::save_bytes(blocks);
-        let job = JobRegistry::default().create(JobKind::RestoreOfficialAccountSnapshot).unwrap();
-        let details = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let (base_url, requests) = account_server({
-            let (job, details) = (job.clone(), details.clone());
-            move |path, key| {
-                if path != "/hub/account/coldstorage" { return response("200 OK", "", &snapshot) }
-                details.lock().unwrap().push((key.to_owned(), job.status().detail));
-                cold(key)
-            }
-        });
-        let (directory, sink) = restore::tests::fixture();
-        let owned = TempDir::new().unwrap();
-        let outcome = restore_official_snapshot(request(base_url), 1, owned.path(), &job, &sink);
-        let cold_reads = requests.lock().unwrap().iter().filter(|head| head.contains(" /hub/account/coldstorage ")).cloned().collect();
-        let cold_read_details = details.lock().unwrap().clone();
-        AccountRestore { _directory: directory, sink, job, outcome, cold_reads, cold_read_details }
+    fn restore_from_account(blocks: Vec<Vec<u8>>, cold: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> AccountRestore {
+        Account::new().restore(blocks, SpoolLimits::default(), move |key, stream| {
+            let _ = stream.write_all(&cold(key));
+        })
     }
 
     #[test]
@@ -1265,28 +1343,29 @@ mod tests {
         ]}});
         let chat = serde_json::json!({"message": messages});
         let block_count = blocks.len() as u64;
+        // The database bytes read once the character block is read.
+        let database_bytes = restore::tests::save_bytes(blocks[..7].to_vec()).len() as u64;
         let character = cold_item(&character, "gzip");
-        let character_bytes = character.len() as u64;
+        let chat = cold_item(&chat, "zlib");
+        let item_bytes = (character.len() + chat.len()) as u64;
         let restore = restore_from_account(blocks, move |key| match key {
             "cold-character" => response("200 OK", "", &character),
-            "cold-chat" => response("200 OK", "", &cold_item(&chat, "zlib")),
+            "cold-chat" => response("200 OK", "", &chat),
             "cold-null" => response("200 OK", "", &cold_item(&Value::Null, "deflate")),
             "cold-flaky" => response("503 Service Unavailable", "Retry-After: 0\r\n", b""),
             _ => response("404 Not Found", "", b""),
         });
 
-        let result = restore.outcome.unwrap();
+        let result = restore.outcome.as_ref().unwrap();
         assert_eq!(result.warning_codes, ["unavailable-cold-payloads:1", "missing-backup-data:1", "damaged-plugin-storage:1"]);
         // Each item read counts with the blocks: the character and chat while the
         // blocks are read, and the plugin value once `staging-database` has begun.
         assert_eq!(restore.job.status().progress.completed_items, block_count + 3);
-        // The character's chats are read within its block, and the database read
-        // moves by the character's bytes, its total unknown from then on.
-        let detail_at = |key: &str| restore.cold_read_details.iter().find(|(read, _)| read == key).and_then(|(_, detail)| detail.clone()).unwrap();
-        let (before, after) = (detail_at("cold-character"), detail_at("cold-chat"));
-        assert_eq!(before.stage, JobStage::ReadingDatabase);
-        assert!(before.stage_total.is_some());
-        assert_eq!((after.stage, after.stage_completed, after.stage_total), (before.stage, before.stage_completed + character_bytes, None));
+        // An item counts when staging takes it, however early it was read: once
+        // the chat is staged, the database read has moved by the character and
+        // chat bytes alone, its total unknown from then on.
+        let detail = restore.rows.iter().find(|(name, _)| name == "Present").and_then(|(_, detail)| detail.clone()).unwrap();
+        assert_eq!((detail.stage, detail.stage_completed, detail.stage_total), (JobStage::ReadingDatabase, database_bytes + item_bytes, None));
         let preview = restore.job.status().incomplete_restore_preview.unwrap();
         assert_eq!(preview.unavailable_cold_keys, ["cold-missing"]);
         assert_eq!(preview.character_names, ["Expanded"]);
@@ -1295,39 +1374,248 @@ mod tests {
         assert_eq!(restored["characters"][0]["name"], "Expanded");
         assert_eq!(restored["characters"][0]["chats"][0]["message"], messages);
         assert_eq!(restored["characters"][0]["chats"][1]["message"], serde_json::json!([]));
-        let unowned = |key| store.read_plugin_storage(crate::persistent_store::plugin_owner::UNOWNED_OWNER, key, None).unwrap().map(|row| row.value);
         // An item that holds JSON null is a stored null, not a missing item.
-        assert_eq!(unowned("nullValue"), Some(Value::Null));
-        assert_eq!(unowned("gone"), None);
-        assert_eq!(unowned("flaky"), None);
+        assert_eq!(plugin_value(&store, "nullValue"), Some(Value::Null));
+        assert_eq!(plugin_value(&store, "gone"), None);
+        assert_eq!(plugin_value(&store, "flaky"), None);
         assert!(restore.cold_reads.iter().all(|head| head.contains("x-risu-auth: test-token\r\n")));
         // Each item is read once, and a failing one only within its retry budget.
-        let reads = |key: &str| restore.cold_reads.iter().filter(|head| head.contains(&format!("x-risu-key: {key}\r\n"))).count();
         for key in ["cold-character", "cold-chat", "cold-missing", "cold-null", "cold-gone"] {
-            assert_eq!(reads(key), 1, "{key}");
+            assert_eq!(restore.reads(key), 1, "{key}");
         }
-        assert_eq!(reads("cold-flaky"), 3);
+        assert_eq!(restore.reads("cold-flaky"), 3);
     }
 
     #[test]
     fn snapshot_restore_stops_before_activation_when_the_account_stops_cold_reads() {
-        let storage = (0..5).map(|index| (format!("value-{index}"), Value::String(format!("cold-{index}")))).collect::<serde_json::Map<_, _>>();
-        for (status, code, reads) in [
-            ("401 Unauthorized", "reauthentication-needed", 1),
-            ("403 Forbidden", "reauthentication-needed", 1),
-            // Five items in a row that exhaust their retries mean the service is down.
-            ("503 Service Unavailable", "network-error", 15),
+        for (status, code) in [
+            ("401 Unauthorized", "reauthentication-needed"),
+            ("403 Forbidden", "reauthentication-needed"),
+            ("503 Service Unavailable", "network-error"),
         ] {
-            let mut blocks = restore::tests::valid_blocks();
-            blocks[5] = restore::tests::block(11, false, "pluginStorage", &serde_json::json!({"_coldplugin": storage}));
-            let restore = restore_from_account(blocks, move |_| response(status, "Retry-After: 0\r\n", b""));
+            let restore = restore_from_account(cold_plugin_values(6), move |_| response(status, "Retry-After: 0\r\n", b""));
 
-            let error = restore.outcome.unwrap_err();
+            let error = restore.outcome.as_ref().unwrap_err();
             assert_eq!(error.code, code, "{status}");
-            assert_eq!(restore.cold_reads.len(), reads, "{status}");
-            assert_eq!(restore.sink.abort_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+            let reads = (0..6).map(|index| restore.reads(&format!("cold-{index}"))).collect::<Vec<_>>();
+            if status.starts_with('5') {
+                // Five items in a row that exhaust their retries mean the service
+                // is down, and nothing more is read.
+                assert_eq!(reads, [3, 3, 3, 3, 3, 0]);
+            } else {
+                // A rejected credential ends the reads both slots hold, and the
+                // restore starts over once the renderer signs in again.
+                let total = reads.iter().sum::<usize>();
+                assert!((1..=2).contains(&total) && reads.iter().all(|&count| count <= 1), "{status}: {reads:?}");
+            }
+            assert_eq!(restore.sink.abort_calls.load(Ordering::Acquire), 1);
             assert_eq!(restore.sink.store.lock().unwrap().revision().unwrap(), 1);
         }
+    }
+
+    #[test]
+    fn snapshot_restore_reads_cold_items_ahead_of_staging_in_its_order() {
+        let mut blocks = restore::tests::valid_blocks();
+        blocks[5] = restore::tests::block(11, false, "pluginStorage", &serde_json::json!({"_coldplugin": {"value": "cold-p"}}));
+        blocks[6] = restore::tests::block(2, true, "char-1", &serde_json::json!({"chaId": "char-1", "name": "Stub", "chats": [], "coldstorage": "cold-c"}));
+        blocks.push(restore::tests::block(2, false, "char-2", &serde_json::json!({"chaId": "char-2", "name": "Second", "chats": [cold_chat("chat-s", "cold-s")]})));
+        let events = Events::default();
+        let late = Arc::new(Mutex::new(Vec::<String>::new()));
+        let restore = Account::new().restore(blocks, SpoolLimits::default(), {
+            let (events, late) = (events.clone(), late.clone());
+            move |key, stream| {
+                note(&events, key.to_owned());
+                // Staging asks for the second chat only once it has the first, so
+                // the first waits for a read of the second that only reading ahead
+                // starts. The other character's chat holds the second slot until then.
+                let after = match key {
+                    "cold-c1" => Some("cold-c2"),
+                    "cold-s" => Some("cold-c1"),
+                    _ => None,
+                };
+                if after.is_some_and(|after| !wait_for(&events, after, Duration::from_secs(5))) {
+                    late.lock().unwrap().push(key.to_owned());
+                }
+                let item = match key {
+                    "cold-c" => serde_json::json!({"character": {"chaId": "char-1", "name": "Expanded", "chats": [cold_chat("chat-1", "cold-c1"), cold_chat("chat-2", "cold-c2")]}}),
+                    "cold-p" => serde_json::json!("plugin value"),
+                    _ => serde_json::json!({"message": [{"role": "char", "data": key, "chatId": format!("{key}-message")}]}),
+                };
+                let _ = stream.write_all(&response("200 OK", "", &cold_item(&item, "gzip")));
+            }
+        });
+
+        restore.outcome.as_ref().unwrap();
+        assert_eq!(*late.lock().unwrap(), Vec::<String>::new());
+        // The character's chats, named only inside its item, are read before the
+        // plugin value the snapshot named long before them.
+        let order = events.0.lock().unwrap().clone();
+        let at = |key: &str| order.iter().position(|seen| seen == key).unwrap();
+        assert!(at("cold-c1") < at("cold-c2") && at("cold-c2") < at("cold-p") && at("cold-s") < at("cold-p"), "{order:?}");
+        let store = restore.sink.store.lock().unwrap();
+        let restored = store.materialize(None).unwrap();
+        assert_eq!(restored["characters"][0]["chats"][1]["message"][0]["data"], "cold-c2");
+        assert_eq!(restored["characters"][1]["chats"][0]["message"][0]["data"], "cold-s");
+        assert_eq!(plugin_value(&store, "value"), Some(serde_json::json!("plugin value")));
+        for key in ["cold-c", "cold-c1", "cold-c2", "cold-s", "cold-p"] {
+            assert_eq!(restore.reads(key), 1, "{key}");
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_reads_ahead_only_as_far_as_the_spool_allows() {
+        // Two items, or the bytes of one.
+        for spool in [SpoolLimits { items: 2, bytes: u64::MAX }, SpoolLimits { items: 64, bytes: 1 }] {
+            let events = Events::default();
+            let restore = Account::new().restore(cold_plugin_values(4), spool, {
+                let events = events.clone();
+                move |key, stream| {
+                    note(&events, format!("read {key}"));
+                    if key == "cold-0" {
+                        // With the second item spooled, a third read waits until
+                        // staging takes the first.
+                        wait_for(&events, "answered cold-1", Duration::from_secs(5));
+                        wait_for(&events, "read cold-2", Duration::from_millis(500));
+                        note(&events, "release cold-0".to_owned());
+                    }
+                    let _ = stream.write_all(&response("200 OK", "", &cold_item(&Value::String(key.to_owned()), "gzip")));
+                    note(&events, format!("answered {key}"));
+                }
+            });
+
+            restore.outcome.as_ref().unwrap();
+            let events = events.0.lock().unwrap().clone();
+            let at = |event: &str| events.iter().position(|seen| seen == event).unwrap();
+            assert!(at("release cold-0") < at("read cold-2"), "{spool:?}: {events:?}");
+            let store = restore.sink.store.lock().unwrap();
+            for index in 0..4 {
+                assert_eq!(plugin_value(&store, &format!("value-{index}")), Some(Value::String(format!("cold-{index}"))));
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_reading_ahead_stages_what_reading_on_demand_stages() {
+        let mut blocks = restore::tests::valid_blocks();
+        // The expanded character replaces the stub's chats, whose item is never read.
+        blocks[6] = restore::tests::block(2, true, "char-1", &serde_json::json!({
+            "chaId": "char-1", "name": "Stub", "chats": [cold_chat("stub", "cold-stub")], "coldstorage": "cold-c1"
+        }));
+        // A chat item named twice is read twice, as staging asks for it twice.
+        blocks.push(restore::tests::block(2, false, "char-2", &serde_json::json!({
+            "chaId": "char-2", "name": "Second",
+            "chats": [cold_chat("c2-a", "cold-s1"), cold_chat("c2-b", "cold-c1-a"), {"id": "c2-c", "name": "c2-c", "message": []}]
+        })));
+        // A character whose item is missing keeps its own chats.
+        blocks.push(restore::tests::block(2, true, "char-3", &serde_json::json!({
+            "chaId": "char-3", "name": "Third", "chats": [cold_chat("c3-a", "cold-s2")], "coldstorage": "cold-c3"
+        })));
+        // A group is not restored, so its item is never read.
+        blocks.push(restore::tests::block(2, false, "group", &serde_json::json!({
+            "chaId": "group", "name": "Group", "type": "group", "chats": [], "coldstorage": "cold-group"
+        })));
+        fn reply(key: &str) -> Vec<u8> {
+            let item = match key {
+                "cold-c1" => serde_json::json!({"character": {"chaId": "char-1", "name": "Expanded", "chats": [cold_chat("c1-a", "cold-c1-a"), cold_chat("c1-b", "cold-c1-b")]}}),
+                "cold-index" => serde_json::json!({"type": "risu-plugin-storage-index", "version": 1, "trash": [], "entries": [
+                    {"k": "a", "l": "cold-large"}, {"k": "s", "s": "\"small\""}
+                ]}),
+                "cold-pa" => serde_json::json!("plugin value"),
+                "cold-large" => serde_json::json!("large value"),
+                "cold-null" => Value::Null,
+                "cold-c1-a" | "cold-s2" => serde_json::json!({"message": [{"role": "char", "data": key, "chatId": format!("{key}-message")}]}),
+                "cold-s1" | "cold-flaky" => return response("503 Service Unavailable", "Retry-After: 0\r\n", b""),
+                _ => return response("404 Not Found", "", b""),
+            };
+            response("200 OK", "", &cold_item(&item, "zlib"))
+        }
+        let staged = |blocks: &[Vec<u8>], spool: SpoolLimits| {
+            let restore = Account::new().restore(blocks.to_vec(), spool, move |key, stream| {
+                let _ = stream.write_all(&reply(key));
+            });
+            let result = restore.outcome.as_ref().unwrap();
+            let status = restore.job.status();
+            let mut reads = std::collections::BTreeMap::new();
+            for head in &restore.cold_reads {
+                let key = head.lines().find_map(|line| line.strip_prefix("x-risu-key: ")).unwrap_or_default();
+                *reads.entry(key.to_owned()).or_insert(0) += 1;
+            }
+            let store = restore.sink.store.lock().unwrap();
+            let plugins = ["a", "n", "f", "g", "s", "inline"].map(|key| plugin_value(&store, key));
+            // Records outside the characters take new ids in every restore.
+            let library = store.materialize(None).unwrap();
+            let characters = &library["characters"];
+            serde_json::json!({
+                "warnings": result.warning_codes,
+                "characters": characters,
+                "plugins": plugins,
+                "preview": status.incomplete_restore_preview,
+                "progress": status.progress,
+                "detail": status.detail,
+                "reads": reads,
+            })
+        };
+
+        let character_reads = serde_json::json!({"cold-c1": 1, "cold-c1-a": 2, "cold-c1-b": 1, "cold-c3": 1, "cold-s1": 3, "cold-s2": 1});
+        for (storage, plugin_reads) in [
+            (
+                serde_json::json!({"_coldplugin": {"a": "cold-pa", "n": "cold-null", "f": "cold-flaky", "g": "cold-gone"}}),
+                serde_json::json!({"cold-pa": 1, "cold-null": 1, "cold-flaky": 3, "cold-gone": 1}),
+            ),
+            // The index names the values to read, and the legacy values it
+            // replaces, only once it is read.
+            (
+                serde_json::json!({"_coldpluginIndex": "cold-index", "_coldplugin": {"a": "cold-pa", "g": "cold-gone"}, "inline": 1}),
+                serde_json::json!({"cold-index": 1, "cold-large": 1, "cold-gone": 1}),
+            ),
+        ] {
+            blocks[5] = restore::tests::block(11, false, "pluginStorage", &storage);
+            let ahead = staged(&blocks, SpoolLimits::default());
+            // With no spool, each item is read only when staging asks for it.
+            let on_demand = staged(&blocks, SpoolLimits { items: 0, bytes: 0 });
+            assert_eq!(ahead, on_demand, "{storage}");
+            let mut reads = character_reads.clone();
+            reads.as_object_mut().unwrap().extend(plugin_reads.as_object().unwrap().clone());
+            assert_eq!(ahead["reads"], reads, "{storage}");
+        }
+    }
+
+    #[test]
+    fn cancelling_a_snapshot_restore_while_reading_ahead_leaves_no_items_behind() {
+        let account = Account::new();
+        let (job, owned) = (account.job.clone(), account.owned.path().to_owned());
+        let cancelled_at = Arc::new(Mutex::new(None));
+        let started = AtomicUsize::new(0);
+        let restore = account.restore(cold_plugin_values(4), SpoolLimits::default(), {
+            let cancelled_at = cancelled_at.clone();
+            move |_, stream| {
+                // Half of the body, so each read holds part of an item when it stops.
+                let body = cold_item(&Value::String("cold".repeat(1024)), "gzip");
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = stream.write_all(&body[..body.len() / 2]);
+                let _ = stream.flush();
+                if started.fetch_add(1, Ordering::AcqRel) == 1 {
+                    // Both slots hold a read: cancel once both have spooled bytes.
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let spooled = || fs::read_dir(&owned).unwrap().filter(|entry| entry.as_ref().unwrap().path().extension().is_some_and(|extension| extension == "part")).count();
+                    while spooled() < 2 && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    *cancelled_at.lock().unwrap() = Some(Instant::now());
+                    job.request_cancel().unwrap();
+                }
+                // Hold the rest until the restore drops the read.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = stream.read(&mut [0; 1]);
+            }
+        });
+
+        assert_eq!(restore.outcome.as_ref().unwrap_err().code, "cancelled");
+        assert!(cancelled_at.lock().unwrap().unwrap().elapsed() < Duration::from_secs(5));
+        assert_eq!(restore.sink.abort_calls.load(Ordering::Acquire), 1);
+        assert_eq!(restore.sink.store.lock().unwrap().revision().unwrap(), 1);
+        let left = fs::read_dir(restore.owned.path()).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).filter(|name| name != SNAPSHOT_FILE).collect::<Vec<_>>();
+        assert_eq!(left, Vec::<String>::new());
     }
 
     #[test]

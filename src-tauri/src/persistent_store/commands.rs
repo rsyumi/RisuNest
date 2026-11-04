@@ -596,6 +596,7 @@ pub(crate) fn commit_staged_replacement(
     app: &AppHandle,
     staging_id: &str,
     expected_revision: Option<i64>,
+    binding_authority: Option<&str>,
 ) -> StoreResult<RevisionResult> {
     let state = app.state::<PersistentStoreState>();
     let operation_guard = state.admit_renderer_operation()?;
@@ -603,7 +604,7 @@ pub(crate) fn commit_staged_replacement(
         store.prepare_replace_commit(staging_id, expected_revision)
     })?;
     with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-        store.finish_prepared_replace(prepared)
+        store.finish_prepared_replace_under(prepared, binding_authority)
     })
 }
 
@@ -1491,7 +1492,7 @@ pub(crate) fn pds_replace_commit(
     staging_id: String,
     expected_revision: Option<i64>,
 ) -> Result<RevisionResult, StoreError> {
-    logged("pds_replace_commit", commit_staged_replacement(&app, &staging_id, expected_revision))
+    logged("pds_replace_commit", commit_staged_replacement(&app, &staging_id, expected_revision, None))
 }
 
 #[tauri::command(async)]
@@ -1620,7 +1621,7 @@ pub(crate) fn pds_checkpoint(
     state: State<'_, PersistentStoreState>,
     mode: CheckpointMode,
 ) -> Result<(), StoreError> {
-    logged("pds_checkpoint", with_store(state, |store| store.checkpoint(mode)))
+    logged("pds_checkpoint", with_store(state, |store| store.checkpoint_or_passive(mode)))
 }
 
 #[tauri::command(async)]
@@ -2596,6 +2597,35 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    /// The lifecycle, exit and macOS save paths request a truncate through this command.
+    /// A reader outside the lease registry keeps it busy, and the commits stay in the WAL.
+    #[test]
+    fn checkpoint_command_checkpoints_passively_when_an_unregistered_reader_keeps_truncate_busy() {
+        let directory = tempdir().unwrap();
+        let store = PersistentStore::open(directory.path()).unwrap();
+        store.connection
+            .execute_batch("PRAGMA wal_autocheckpoint = 0; INSERT INTO app_kv VALUES ('first', '1');")
+            .unwrap();
+        store.connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let database_path = directory.path().join("persistent/persistent.sqlite");
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", database_path.display()));
+        let reader = rusqlite::Connection::open(&database_path).unwrap();
+        reader.execute_batch("BEGIN; SELECT value FROM app_kv WHERE key = 'first';").unwrap();
+        store.connection.execute("INSERT INTO app_kv VALUES ('second', '2')", []).unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(PersistentStoreState::with_test_store(store));
+
+        pds_checkpoint(app.state(), CheckpointMode::Truncate)
+            .expect("busy truncate request checkpoints passively");
+        assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        pds_checkpoint(app.state(), CheckpointMode::Truncate).expect("unblocked truncate");
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
+    }
 
     /// The intent recovery every mutable command runs first takes no device-store
     /// write when nothing settled, so another connection's long write does not fail it.
