@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
+import androidx.annotation.Keep
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -299,6 +300,20 @@ internal class PageKeptActivePolicy(
   }
 }
 
+private fun startNotAllowed(error: Exception): Boolean =
+  error.javaClass.name == "android.app.ForegroundServiceStartNotAllowedException"
+
+/** Writes a refused service start to the app log the user can export. */
+@Keep
+internal object BackgroundServiceLog {
+  external fun recordRefused(foreground: Boolean, background: Boolean)
+
+  fun refused(foreground: Boolean, error: Exception) {
+    // JVM tests run without the native library.
+    runCatching { recordRefused(foreground, startNotAllowed(error)) }
+  }
+}
+
 internal enum class BackgroundNotificationIcon { SYNC, UPLOAD, DOWNLOAD, CHAT }
 
 internal data class BackgroundNotificationLine(val kind: String, val percent: Int)
@@ -404,6 +419,7 @@ class GenerationForegroundService : Service() {
     true
   } catch (error: Exception) {
     Log.w(TAG, "Foreground service start was refused", error)
+    BackgroundServiceLog.refused(foreground = true, error)
     false
   }
 
@@ -548,8 +564,9 @@ class GenerationForegroundService : Service() {
           )
           true
         } catch (error: Exception) {
-          if (error.javaClass.name == "android.app.ForegroundServiceStartNotAllowedException") refusal = BACKGROUND_REFUSED
+          if (startNotAllowed(error)) refusal = BACKGROUND_REFUSED
           Log.w(TAG, "Background service start was refused", error)
+          BackgroundServiceLog.refused(foreground = false, error)
           false
         }
       }

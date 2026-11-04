@@ -24,10 +24,18 @@ const runtime = vi.hoisted(() => ({
     activeSession: null as unknown,
     persistent: {} as Record<string, unknown>,
 }))
-const actionMocks = vi.hoisted(() => ({
-    runTrigger: vi.fn(),
-    runLuaInteractionTrigger: vi.fn(),
-}))
+const actionMocks = vi.hoisted(() => {
+    const hold = { held: false }
+    return {
+        hold,
+        runTrigger: vi.fn(),
+        runLuaInteractionTrigger: vi.fn(),
+        holdScriptRun: vi.fn(async <T>(operation: () => Promise<T>): Promise<T> => {
+            hold.held = true
+            try { return await operation() } finally { hold.held = false }
+        }),
+    }
+})
 const parserCalls = vi.hoisted(() => [] as Array<{
     chara?: unknown
     role?: string
@@ -128,6 +136,10 @@ vi.mock('src/ts/process/scriptings', () => ({
     runLuaInteractionTrigger: actionMocks.runLuaInteractionTrigger,
 }) satisfies Partial<typeof import('src/ts/process/scriptings')>)
 vi.mock('src/ts/process/triggers', () => ({ runTrigger: actionMocks.runTrigger }))
+vi.mock('src/ts/process/generationBackground', async importOriginal => ({
+    ...await importOriginal<typeof import('src/ts/process/generationBackground')>(),
+    holdScriptRun: actionMocks.holdScriptRun,
+}))
 vi.mock('src/ts/process/tts', () => ({ sayTTS: vi.fn() }))
 vi.mock('src/ts/util', () => ({
     capitalize: (value: string) => value,
@@ -2203,8 +2215,9 @@ describe('Chat frozen capture presentation', () => {
         return { harness, requireCurrent, body }
     }
 
-    test('runs a manual windowed trigger only inside the complete conversation gateway', async () => {
-        actionMocks.runTrigger.mockResolvedValue(null)
+    test('runs a manual windowed trigger only inside the complete conversation gateway and a background hold', async () => {
+        const heldDuringTrigger: boolean[] = []
+        actionMocks.runTrigger.mockImplementation(async () => { heldDuringTrigger.push(actionMocks.hold.held); return null })
         probedDisplayRows.length = 0
         const { harness, requireCurrent, body } = await mountWindowedTriggerRow()
         const trigger = document.createElement('button')
@@ -2224,6 +2237,9 @@ describe('Chat frozen capture presentation', () => {
             )
             expect(requireCurrent).toHaveBeenCalledTimes(2)
         })
+        // Script work a message starts keeps running after Home.
+        expect(heldDuringTrigger).toEqual([true])
+        expect(actionMocks.hold.held).toBe(false)
         const row = probedDisplayRows.at(-1)!
         const revision = row.rebuildRevision
         const pointer = get(ReloadChatPointer)[1] ?? 0
@@ -2237,7 +2253,8 @@ describe('Chat frozen capture presentation', () => {
     })
 
     test('submits form values captured at submit time through the complete conversation gateway', async () => {
-        actionMocks.runLuaInteractionTrigger.mockResolvedValue(null)
+        let heldDuringForm: boolean | undefined
+        actionMocks.runLuaInteractionTrigger.mockImplementation(async () => { heldDuringForm = actionMocks.hold.held; return null })
         const { harness, requireCurrent, body } = await mountWindowedTriggerRow()
         // The gateway runs the trigger later, after the row may have changed the form.
         harness.withCompleteSelectedConversation.mockImplementation(async (_reason, operation) => {
@@ -2262,6 +2279,7 @@ describe('Chat frozen capture presentation', () => {
         expect([type, character, formName]).toEqual(['form', harness.completeCharacter, 'survey'])
         expect(Object.entries(meta.data)).toEqual([['choice', ['a', 'b']], ['__proto__', 'kept'], ['go', 'yes']])
         expect(harness.withCompleteSelectedConversation).toHaveBeenCalledWith('manual-chat-trigger', expect.any(Function))
+        expect(heldDuringForm).toBe(true)
     })
 
     test('prevents the submit of a message form without risu-form and runs no trigger', async () => {

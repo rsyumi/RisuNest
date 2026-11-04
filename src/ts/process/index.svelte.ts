@@ -4,7 +4,7 @@ import { registerGeneratingConversation } from '../storage/generatingConversatio
 import { openGenerationRequestPhase } from './generationRequestPhase'
 import { noteGenerationMessage, noteGenerationStarted } from './generationEnd'
 import { boundedGenerationFallbackReason } from './boundedGenerationAdmission'
-import { generationDiagnostics, type GenerationDiagnosticAdmission, type GenerationDiagnosticFallback, type GenerationDiagnosticOutcome, type GenerationDiagnosticPhase, type GenerationDiagnosticPhaseDetails, type GenerationDiagnosticTrace, type GenerationSavePath } from '../generationDiagnostics'
+import { generationDiagnostics, type GenerationDiagnosticAdmission, type GenerationDiagnosticFallback, type GenerationDiagnosticOutcome, type GenerationDiagnosticPhase, type GenerationDiagnosticPhaseDetails, type GenerationDiagnosticTrace, type GenerationFailureReason, type GenerationSavePath } from '../generationDiagnostics'
 import { get, writable } from "svelte/store";
 import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, setCurrentChat, type Message } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
@@ -232,9 +232,16 @@ interface GenerationCompletionLifecycle {
     diagnostics: GenerationDiagnosticTrace
     admission: GenerationDiagnosticAdmission
     diagnosticOutcome?: GenerationDiagnosticOutcome
+    /** Why the open phase is failing; recorded only with a failed exit. */
+    diagnosticReason?: GenerationFailureReason
     enterDiagnosticPhase(phase: GenerationDiagnosticPhase, details?: GenerationDiagnosticPhaseDetails): void
     finishDiagnosticPhase(outcome?: GenerationDiagnosticOutcome): void
     savePath(): GenerationSavePath
+}
+
+function preparationFailed(lifecycle: GenerationCompletionLifecycle, reason: GenerationFailureReason): false {
+    lifecycle.diagnosticReason = reason
+    return false
 }
 
 function diagnosticFallback(reason: string | null): GenerationDiagnosticFallback {
@@ -766,7 +773,9 @@ export async function sendChat(arg:{
             diagnostics.phase(phase, 'enter', details)
         },
         finishDiagnosticPhase(outcome = 'ok') {
-            if (activeDiagnosticPhase) diagnostics.phase(activeDiagnosticPhase, 'exit', { outcome })
+            if (activeDiagnosticPhase) diagnostics.phase(activeDiagnosticPhase, 'exit', {
+                outcome, reason: outcome === 'failed' ? lifecycle.diagnosticReason : undefined,
+            })
             activeDiagnosticPhase = null
         },
         savePath() {
@@ -821,6 +830,7 @@ export async function sendChat(arg:{
         lifecycle.diagnosticOutcome ??= result ? 'ok' : 'failed'
         return lifecycle.isTargetCurrent() && result
     } catch (error) {
+        lifecycle.diagnosticReason ??= error instanceof PersistentMutationFencedError ? 'fenced' : 'error'
         if (generationSignal?.signal?.aborted || arg.signal?.aborted) {
             generationReturned = true
             return false
@@ -1210,7 +1220,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     if (interactionAuthority) {
         if (interactionAuthority.characterId !== nowChatroom.chaId
             || interactionAuthority.conversationId !== nowChatroom.chats[nowChatroom.chatPage]?.id
-            || !recordSelectedCharacterLastInteraction(interactionAuthority, nowChatroom.lastInteraction, interactionTime)) return false
+            || !recordSelectedCharacterLastInteraction(interactionAuthority, nowChatroom.lastInteraction, interactionTime)) return preparationFailed(lifecycle, 'conversation-changed')
         nowChatroom.lastInteraction = interactionTime
     } else if (characterDetailWritable()) {
         nowChatroom.lastInteraction = interactionTime
@@ -1224,7 +1234,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             nowChatroom.chaId,
             historyWindow ? nowChatroom.chats[selectedChat] : selectedConversation,
         )
-    ) return false
+    ) return preparationFailed(lifecycle, 'conversation-changed')
     if (!boundedChat) {
         ensureCurrentConversationMessageIds(
             nowChatroom,
@@ -1839,7 +1849,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         if (!historyWindow) setCurrentChat(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            return false
+            return preparationFailed(lifecycle, 'trigger-stop')
         }
     }
 
@@ -2129,7 +2139,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             })
 
             if(hn === false){
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
 
             chats = hn.chats
@@ -2142,7 +2152,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 if (abortSignal.aborted) return false
                 console.log(sp)
                 throwError(sp.error)
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
@@ -2185,7 +2195,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 if (abortSignal.aborted) return false
                 console.log(sp)
                 throwError(sp.error)
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
@@ -2207,7 +2217,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             })
             if(sp.error){
                 throwError(sp.error)
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
@@ -2225,7 +2235,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             if(chats.length <= 1){
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
 
-                return false
+                return preparationFailed(lifecycle, 'token-limit')
             }
 
             currentTokens -= await tokenizer.tokenizeChat(chats[0])
@@ -2590,7 +2600,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
-                return false
+                return preparationFailed(lifecycle, 'token-limit')
             }
             if(formated[pointer].removable){
                 inputTokens -= await tokenizer.tokenizeChat(formated[pointer])
