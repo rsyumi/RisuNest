@@ -189,8 +189,8 @@ impl restore::ReplacementSink for OfficialSink<'_> {
         Ok(preview)
     }
 
-    fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
-        self.inner.commit(staging_id, expected_revision)
+    fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
+        self.inner.commit(staging_id, expected_revision, binding_authority)
     }
 
     fn abort(&self, staging_id: &str) -> StoreResult<()> {

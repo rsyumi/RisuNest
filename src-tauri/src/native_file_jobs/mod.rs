@@ -3453,11 +3453,13 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         &self,
         staging_id: &str,
         expected_revision: i64,
+        binding_authority: Option<&str>,
     ) -> crate::persistent_store::StoreResult<crate::persistent_store::RevisionResult> {
         crate::persistent_store::commands::commit_staged_replacement(
             &self.app,
             staging_id,
             Some(expected_revision),
+            binding_authority,
         )
     }
 

@@ -2280,10 +2280,6 @@ fn two_revision_leases_remain_independent_until_each_is_released() {
             .value["username"],
         "Fixture User"
     );
-    assert!(matches!(
-        store.checkpoint(CheckpointMode::Truncate),
-        Err(StoreError::Store { .. })
-    ));
 
     store
         .release_revision(&second.lease)

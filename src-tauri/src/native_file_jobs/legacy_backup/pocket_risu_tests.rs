@@ -37,7 +37,7 @@ impl restore::ReplacementSink for StoreSink {
             .unwrap()
             .replace_add_characters(id, expanded.as_deref().unwrap_or(characters))
     }
-    fn commit(&self, id: &str, revision: i64) -> StoreResult<RevisionResult> {
+    fn commit(&self, id: &str, revision: i64, _binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
         let mut store = self.store.lock().unwrap();
         store.replace_put_asset_aliases(id, &self.payloads.asset_aliases)?;
         self.durable
