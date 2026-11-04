@@ -557,7 +557,7 @@ async function main() {
     }
 }
 
-const BASELINE_REVISION = '793930f17731547c7e9f2fe7bf0be6f6a5bbd462'
+const BASELINE_REVISION = 'd6d9ba9411c7ed2ed3b4829f4616a458321dc791'
 
 main().catch((error) => {
     process.stderr.write(`${error.stack ?? error}\n`)
