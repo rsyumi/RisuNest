@@ -30,8 +30,9 @@ async function runGuest(host: SandboxHost, code: string, prepare?: (child: Windo
     vi.spyOn(window, 'postMessage').mockImplementation((data: unknown) => {
         window.dispatchEvent(new MessageEvent('message', { data, source: child }))
     })
-    vi.spyOn(child.parent, 'postMessage').mockImplementation((data: unknown) => {
-        window.dispatchEvent(new MessageEvent('message', { data, source: child }))
+    vi.spyOn(child.parent, 'postMessage').mockImplementation(function (data: unknown) {
+        const transfer = (arguments[2] as Transferable[] | undefined) ?? []
+        window.dispatchEvent(new MessageEvent('message', { data, source: child, ports: transfer as MessagePort[] }))
     })
     vi.spyOn(child, 'postMessage').mockImplementation(function (
         data: unknown,
@@ -292,6 +293,43 @@ describe('sandbox script completion', () => {
             host.terminate()
             vi.useRealTimers()
         }
+    })
+
+    // plugin-http fails a response body with plain strings, such as 'Request cancelled'.
+    it.each([
+        ['host', 'Request cancelled'],
+        ['host', undefined],
+        ['plugin', 'Request cancelled'],
+        ['plugin', undefined],
+    ] as const)('delivers a %s stream that fails with %s as an error, not as its end', async (owner, reason) => {
+        let callback!: () => Promise<ReadableStream>
+        const host = new SandboxHost({
+            ...bridgeStubs(),
+            stream: () => new ReadableStream({ start(controller) { controller.enqueue('chunk') }, pull: () => Promise.reject(reason) }),
+            register: (fn: typeof callback) => { callback = fn },
+        })
+        const thrown = JSON.stringify(reason) ?? 'undefined'
+        const child = await runGuest(host, owner === 'host'
+            ? `globalThis.response = await risuai.stream()`
+            : `await risuai.register(() => new ReadableStream({ start(controller) { controller.enqueue('chunk') }, pull: () => Promise.reject(${thrown}) }))`,
+            // happy-dom frames lack MessageChannel, which the plugin side needs to send a stream.
+            child => Object.assign(child, { MessageChannel }))
+        let stream: ReadableStream
+        if (owner === 'host') {
+            await vi.waitFor(() => expect((child as any).response).toBeDefined())
+            stream = (child as any).response
+        } else {
+            await vi.waitFor(() => expect(callback).toBeTypeOf('function'))
+            stream = await callback()
+        }
+        const reader = stream.getReader()
+        expect(await reader.read()).toEqual({ done: false, value: 'chunk' })
+        const failure = await reader.read().then(() => undefined, (error: unknown) => error)
+        expect((failure as Error | undefined)?.message).toBe(reason ?? 'Stream failed')
+        // The plugin sees what fetch reports for a body that fails midway.
+        if (owner === 'host') expect(failure).toBeInstanceOf((child as any).TypeError)
+        await vi.waitFor(() => expect(host.isIdle()).toBe(true))
+        host.terminate()
     })
 
     // Each method reads the signal field of the host function it reaches.
