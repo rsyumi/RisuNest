@@ -1099,7 +1099,36 @@ Section Uninstall
     Delete "$INSTDIR\uninstall.exe"
     ${If} ${Errors}
       ; _?= runs the uninstaller in place; its caller removes that image after exit.
-      StrCmp $EXEPATH "$INSTDIR\uninstall.exe" sync_uninstall_image_retained
+      ; Either path may use 8.3 names, `.` or `..` segments or doubled separators, so
+      ; compare their full long forms. A path that cannot be converted never matches.
+      StrCpy $0 $EXEPATH
+      System::Call 'kernel32::GetFullPathNameW(w r0, i ${NSIS_MAX_STRLEN}, w .r1, p 0) i .r2'
+      ${If} $2 = 0
+      ${OrIf} $2 >= ${NSIS_MAX_STRLEN}
+        StrCpy $1 ""
+      ${Else}
+        System::Call 'kernel32::GetLongPathNameW(w r1, w .r0, i ${NSIS_MAX_STRLEN}) i .r2'
+        ${If} $2 <> 0
+        ${AndIf} $2 < ${NSIS_MAX_STRLEN}
+          StrCpy $1 $0
+        ${EndIf}
+      ${EndIf}
+      StrCpy $0 "$INSTDIR\uninstall.exe"
+      System::Call 'kernel32::GetFullPathNameW(w r0, i ${NSIS_MAX_STRLEN}, w .r3, p 0) i .r2'
+      ${If} $2 = 0
+      ${OrIf} $2 >= ${NSIS_MAX_STRLEN}
+        StrCpy $3 ""
+      ${Else}
+        System::Call 'kernel32::GetLongPathNameW(w r3, w .r0, i ${NSIS_MAX_STRLEN}) i .r2'
+        ${If} $2 <> 0
+        ${AndIf} $2 < ${NSIS_MAX_STRLEN}
+          StrCpy $3 $0
+        ${EndIf}
+      ${EndIf}
+      ${If} $1 != ""
+      ${AndIf} $1 == $3
+        Goto sync_uninstall_image_retained
+      ${EndIf}
       WriteRegStr ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}" "DisplayName" "${PRODUCTNAME}"
       WriteRegStr ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}" "UninstallString" "$\"$INSTDIR\uninstall.exe$\""
       WriteRegStr ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}" "InstallLocation" "$\"$INSTDIR$\""
