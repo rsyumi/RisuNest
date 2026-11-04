@@ -50,12 +50,14 @@ export function utilModule() {
         getUserIcon: vi.fn(),
         getUserName: vi.fn(),
         parseKeyValue: vi.fn(() => []),
+        pickHashRand: vi.fn(),
     } satisfies Partial<typeof import('../../util')>
 }
 
 /** An empty database with an empty current character and chat. */
 export function databaseModule(overrides: Overrides<DatabaseModule> = {}) {
     const module = {
+        appVer: 'test',
         getCurrentCharacter: vi.fn(() => ({}) as ReturnType<DatabaseModule['getCurrentCharacter']>),
         getCurrentChat: vi.fn(() => ({ message: [] }) as ReturnType<DatabaseModule['getCurrentChat']>),
         getDatabase: vi.fn(() => ({ characters: [] }) as ReturnType<DatabaseModule['getDatabase']>),
