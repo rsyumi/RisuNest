@@ -19,6 +19,9 @@ pub(crate) struct RootSpool {
     cancelled: Arc<AtomicBool>,
 }
 
+const MEMBERS_IN_ORDER: &str = "SELECT key,value FROM members WHERE field=?1 AND value IS NOT NULL
+    ORDER BY array_index IS NULL,array_index,rowid";
+
 fn invalid(message: &str) -> StoreError {
     StoreError::Validation { message: message.to_owned() }
 }
@@ -49,6 +52,7 @@ impl RootSpool {
         db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048;
             CREATE TABLE fields (key TEXT UNIQUE NOT NULL, kind INTEGER NOT NULL, value TEXT, array_index INTEGER);
             CREATE TABLE members (field TEXT NOT NULL, key TEXT NOT NULL, value TEXT, array_index INTEGER, UNIQUE(field,key));
+            CREATE INDEX members_order ON members(field,array_index IS NULL,array_index);
             CREATE TABLE identities (scope TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(scope,id));")?;
         Ok(Self { db, _file: file, cancelled })
     }
@@ -77,10 +81,13 @@ impl RootSpool {
         raw.map(|raw|decode(&raw)).transpose()
     }
 
-    pub(super) fn visit_values(&self, mut visit: impl FnMut(Value) -> StoreResult<()>) -> StoreResult<()> {
+    pub(super) fn visit_value_texts(&self, mut visit: impl FnMut(&str) -> StoreResult<()>) -> StoreResult<()> {
         let mut statement=self.db.prepare("SELECT value FROM fields WHERE kind=1 UNION ALL SELECT value FROM members WHERE value IS NOT NULL")?;
         let mut rows=statement.query([])?;
-        while let Some(row)=rows.next()? { self.check_cancelled()?; visit(decode(&row.get::<_,String>(0)?)?)?; }
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            visit(row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?)?;
+        }
         Ok(())
     }
 
@@ -149,9 +156,10 @@ impl RootSpool {
         Ok(())
     }
 
+    /// Members are read from `members_order` as the walk advances, so `visit`
+    /// may replace or remove the member it is given but must not add members to `field`.
     pub(crate) fn visit(&self, field: &str, mut visit: impl FnMut(&str, Value) -> StoreResult<()>) -> StoreResult<()> {
-        let mut statement = self.db.prepare("SELECT key,value FROM members WHERE field=?1 AND value IS NOT NULL
-            ORDER BY array_index IS NULL,array_index,rowid")?;
+        let mut statement = self.db.prepare(MEMBERS_IN_ORDER)?;
         let mut rows = statement.query([field])?;
         while let Some(row) = rows.next()? {
             self.check_cancelled()?;
@@ -229,8 +237,7 @@ impl RootSpool {
         } else {
             writer.write_all(if kind == FieldKind::Array { b"[" } else { b"{" })?;
             let mut first = true;
-            let mut statement = self.db.prepare("SELECT key,value FROM members WHERE field=?1 AND value IS NOT NULL
-                ORDER BY array_index IS NULL,array_index,rowid")?;
+            let mut statement = self.db.prepare(MEMBERS_IN_ORDER)?;
             let mut rows = statement.query([key])?;
             while let Some(row) = rows.next()? {
                 self.check_cancelled()?;
@@ -490,6 +497,24 @@ mod tests {
         streamed.replace_commit(&b,Some(0)).unwrap();
         assert_eq!(streamed.revision().unwrap(),1);
         assert_eq!(streamed.materialize(None).unwrap()["temperature"],0.8);
+    }
+
+    #[test]
+    fn member_reads_keep_member_order_without_sorting_values() {
+        let root=RootSpool::new(Arc::new(AtomicBool::new(false))).unwrap();
+        root.begin("object",FieldKind::Object).unwrap();
+        for key in ["b","10","removed","2","4294967295","01","0"] { root.put_member("object",key,Some(&json!(key))).unwrap(); }
+        root.remove_member("object","removed").unwrap();
+        let mut keys=Vec::new();
+        root.visit("object",|key,_| { keys.push(key.to_owned()); Ok(()) }).unwrap();
+        assert_eq!(keys,["0","2","10","b","4294967295","01"]);
+        let mut text=Vec::new();
+        root.write_root(&mut text,false).unwrap();
+        assert_eq!(String::from_utf8(text).unwrap(),r#"{"object":{"0":"0","2":"2","10":"10","b":"b","4294967295":"4294967295","01":"01"}}"#);
+        // A sorter would hold every member value, in RAM under Android's SQLITE_TEMP_STORE=3.
+        let plan=root.db.prepare(&format!("EXPLAIN QUERY PLAN {MEMBERS_IN_ORDER}")).unwrap()
+            .query_map(["object"],|row| row.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert!(!plan.iter().any(|step| step.contains("USE TEMP B-TREE")),"{plan:?}");
     }
 
     #[test]

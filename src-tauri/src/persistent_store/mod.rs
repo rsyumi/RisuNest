@@ -40,6 +40,7 @@ mod preservation;
 mod query;
 mod record_apply;
 mod record_projection;
+mod replacement_scan;
 mod schema;
 #[cfg(test)]
 mod schema_contract_tests;
