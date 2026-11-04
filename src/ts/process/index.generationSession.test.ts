@@ -580,19 +580,41 @@ describe('sendChat generation session integration', () => {
         expect(isGenerationReserved()).toBe(false)
     })
 
-    it.each(['provider', 'semantic'] as const)('records a failed %s phase without recording the error', async (failureStage) => {
+    it.each([
+        ['provider', 'awaiting-provider', 'error'],
+        ['semantic', 'semantic-output', 'error'],
+        ['stream', 'semantic-output', 'stream-error'],
+    ] as const)('records a failed %s phase and its reason without recording the error', async (failureStage, phase, reason) => {
         installDatabase()
         const failure = new Error('PRIVATE_FAILURE_CANARY')
         if (failureStage === 'provider') mocks.modelResponse = () => { throw failure }
+        else if (failureStage === 'stream') mocks.modelResponse = () => ({
+            type: 'streaming',
+            result: new ReadableStream<Record<string, string>>({
+                start(controller) {
+                    controller.enqueue({ response: 'partial' })
+                    controller.error(failure)
+                },
+            }),
+        })
         else mocks.processScriptFull.mockImplementation(async (_char, data, mode) => {
             if (mode === 'editoutput') throw failure
             return { data, emoChanged: false }
         })
         await expect(sendChat()).rejects.toBe(failure)
-        const phase = failureStage === 'provider' ? 'awaiting-provider' : 'semantic-output'
-        expect(mocks.diagnosticEvents).toContainEqual(expect.objectContaining({ phase, edge: 'exit', outcome: 'failed' }))
+        expect(mocks.diagnosticEvents).toContainEqual(expect.objectContaining({ phase, edge: 'exit', outcome: 'failed', reason }))
         expect(mocks.diagnosticEvents).toContainEqual(expect.objectContaining({ phase: 'settled', edge: 'exit', outcome: 'failed' }))
         expect(JSON.stringify(mocks.diagnosticEvents)).not.toContain('PRIVATE_FAILURE_CANARY')
+    })
+
+    it('records why prompt preparation stopped', async () => {
+        installDatabase()
+        DBState.db.maxContext = 0
+        await expect(sendChat()).resolves.toBe(false)
+        expect(mocks.diagnosticEvents).toContainEqual(expect.objectContaining({
+            phase: 'prompt-preparation', edge: 'exit', outcome: 'failed', reason: 'token-limit',
+        }))
+        expect(mocks.modelRequestCount).toBe(0)
     })
 
     it('caps the local caption image without changing the stored attachment', async () => {

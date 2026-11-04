@@ -111,3 +111,18 @@ export async function holdModelCall<T>(operation: (signal?: AbortSignal) => Prom
         if (!streaming) release()
     }
 }
+
+/**
+ * Keeps bot script work that a chat button, form or manual trigger starts running after Home, as a model call is kept.
+ * Its model calls still take their own holds, so each one stops when the platform's time runs out.
+ */
+export async function holdScriptRun<T>(operation: () => Promise<T>): Promise<T> {
+    // A reserved generation can end before the script does, so the script holds even inside one.
+    if ((!isTauriAndroid && !isTauriIOS) || (isTauriAndroid && !androidKeepAlive())) return operation()
+    const hold = Promise.resolve(beginDeferredMobileBackgroundTask('generation'))
+    try {
+        return await operation()
+    } finally {
+        void hold.then(task => task.dispose())
+    }
+}

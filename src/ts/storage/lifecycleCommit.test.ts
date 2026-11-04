@@ -454,6 +454,48 @@ describe('registerLifecycleCommitListeners', () => {
         }
     })
 
+    it('records the return, the trim level and page freeze and resume on the Tauri production path without extra flushes', async () => {
+        checkpointNativePersistentStore.mockClear()
+        vi.resetModules()
+        vi.doMock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'android' }))
+        const diagnosticEvents: Record<string, unknown>[] = []
+        vi.doMock('@tauri-apps/api/core', async (importOriginal) => ({
+            ...await importOriginal<typeof import('@tauri-apps/api/core')>(),
+            invoke: async (command: string, args?: { event?: Record<string, unknown> }) => {
+                if (command === 'native_generation_diagnostic' && args?.event) diagnosticEvents.push(args.event)
+                return 7
+            },
+        }))
+        const { registerLifecycleCommitListeners: registerTauri } = await import('./lifecycleCommit')
+        const { generationDiagnostics } = await import('../generationDiagnostics')
+        generationDiagnostics.startDocument()
+        await Promise.resolve()
+        const flush = vi.fn(async () => undefined)
+        const dispose = registerTauri(flush)
+
+        try {
+            document.dispatchEvent(new Event('freeze'))
+            document.dispatchEvent(new Event('resume'))
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'trim-memory', trimLevel: 20 } }))
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'stop', trimLevel: 20 } }))
+
+            await vi.waitFor(() => expect(flush.mock.calls).toEqual([['trim-memory'], ['stop']]))
+            expect(diagnosticEvents.slice(1)).toEqual([
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 1, event: 'freeze' },
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 2, event: 'resume' },
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 3, event: 'start' },
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 4, event: 'trim-memory', trimLevel: 20 },
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 5, event: 'stop' },
+            ])
+        } finally {
+            dispose()
+            vi.doUnmock('../platform')
+            vi.doUnmock('@tauri-apps/api/core')
+            vi.resetModules()
+        }
+    })
+
     it('acknowledges the native ack token when the flush fails', async () => {
         const onFlushComplete = vi.fn()
         ;(window as any).RisuLifecycleBridge = { onFlushComplete }
