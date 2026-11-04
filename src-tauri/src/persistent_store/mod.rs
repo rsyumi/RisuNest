@@ -2841,6 +2841,17 @@ impl PersistentStore {
         snapshot::checkpoint(&self.connection, mode)
     }
 
+    /// A save path's checkpoint: a truncate kept busy by a reader outside the lease
+    /// registry still leaves every commit in the WAL, so it checkpoints passively.
+    pub(crate) fn checkpoint_or_passive(&self, mode: CheckpointMode) -> StoreResult<()> {
+        match self.checkpoint(mode) {
+            Err(error) if mode == CheckpointMode::Truncate && checkpoint_was_busy(&error) => {
+                snapshot::checkpoint(&self.connection, CheckpointMode::Passive)
+            }
+            result => result,
+        }
+    }
+
     pub(crate) fn snapshot_create(&mut self, reason: &str) -> StoreResult<SnapshotCreated> {
         snapshot::create(self, reason)
     }
