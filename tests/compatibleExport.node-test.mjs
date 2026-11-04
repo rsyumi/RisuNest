@@ -315,7 +315,10 @@ for (const target of ["risuai", "pocket"]) {
             characterOrder: [
               { id: "synthetic-folder", name: "Folder", color: "", data: ["synthetic-null-fields"], imgFile: null },
             ],
-            botPresets: [{ name: "Synthetic preset", koboldURL: null, thinkingTokens: null, promptTemplate: null }],
+            botPresets: [{
+              name: "Synthetic preset", koboldURL: null, thinkingTokens: null, promptTemplate: null,
+              maxContext: null, maxResponse: null,
+            }],
             textScreenColor: null,
             textScreenBorder: null,
             localStopStrings: null,
@@ -323,12 +326,19 @@ for (const target of ["risuai", "pocket"]) {
             thinkingTokens: null,
             formatversion: 5,
           };
+          // Cleared number settings, which the loader replaces with its defaults.
+          const numbers = [
+            "loreBookDepth", "loreBookToken", "autoContinueMinTokens", "requestRetrys", "genTime",
+            "assetMaxDifference", "localNetworkTimeoutSec", "maxContext", "maxResponse", "generationSeed",
+          ];
+          for (const key of numbers) fixture[key] = null;
           const nulls = (db) => {
             const [character] = db.characters;
             const [preset] = db.botPresets;
             return [
               db.textScreenColor, db.textScreenBorder, db.localStopStrings, db.promptTemplate, db.thinkingTokens,
               db.characterOrder[0].imgFile, preset.koboldURL, preset.thinkingTokens, preset.promptTemplate,
+              preset.maxContext, preset.maxResponse,
               character.postHistoryInstructions, character.globalLore[0].activationPercent,
               character.chats[0].folderId, character.chats[0].message[0].name,
             ];
@@ -336,6 +346,10 @@ for (const target of ["risuai", "pocket"]) {
           assert.equal(accepts(contract, contract.root, fixture), true);
           const { resaved } = await harness.roundTrip(compressedWire(fixture));
           assert.deepEqual(plain(nulls(resaved)), nulls(fixture));
+          assert.deepEqual(
+            numbers.filter((key) => !Number.isFinite(resaved[key])),
+            [],
+          );
         },
       );
 
