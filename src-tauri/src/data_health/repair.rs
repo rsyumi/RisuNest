@@ -139,10 +139,65 @@ fn record_candidates(index: usize, finding: &Finding) -> Vec<RepairCandidate> {
     Vec::new()
 }
 
-/// Owners whose records a repair edits. A persona, module, folder or loadout lives inside the
-/// root under its own identity, so its references are left to the reader rather than offered as
-/// a change the whole selection would then fail on.
+/// Owners whose records a repair edits. A persona, module or loadout lives inside the root under
+/// its own identity and is edited only when one entry there carries it. A folder's entries are
+/// rebuilt on save, so its references are left to the reader.
 const EDITABLE_OWNERS: &[&str] = &["root", "preset", "plugin-storage", "character", "conversation"];
+
+/// Fields that removing cannot answer. The reference graph reports the selected preset and
+/// persona, and a loadout's preset and persona, even when they are absent, and an embedded
+/// module's id names it.
+const KEPT_FIELDS: &[(&str, &str)] = &[
+    ("root", "$.botPresetsId"),
+    ("root", "$.selectedPersona"),
+    ("persona", "$.embeddedModule.id"),
+    ("loadout", "$.presetName"),
+    ("loadout", "$.personaId"),
+];
+
+/// The root collection that keeps owners of this kind, and the field that names its entries.
+pub(crate) fn root_collection(owner_kind: &str) -> Option<(&'static str, &'static str)> {
+    match owner_kind {
+        "persona" => Some(("personas", "id")),
+        "module" => Some(("modules", "id")),
+        "loadout" => Some(("loadouts", "name")),
+        _ => None,
+    }
+}
+
+/// The collection and position of the one root entry that carries an owner's identity. None when
+/// no entry or several carry it, or when the reference graph named the owner by its position, as
+/// it names a persona without an id, since another entry can take that position.
+pub(crate) fn root_entry(root: &serde_json::Value, owner: &Owner) -> Option<(&'static str, usize)> {
+    let (collection, field) = root_collection(&owner.kind)?;
+    if owner.id.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for (index, entry) in root.get(collection)?.as_array()?.iter().enumerate() {
+        let named = entry.get(field).and_then(serde_json::Value::as_str);
+        let carries = match named {
+            Some(identity) => identity == owner.id,
+            None => owner.kind == "persona" && owner.id == format!("#{index}"),
+        };
+        if carries {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((index, named.is_some()));
+        }
+    }
+    match found {
+        Some((index, true)) => Some((collection, index)),
+        _ => None,
+    }
+}
+
+fn editable(owner_kind: &str, locator: &Locator) -> bool {
+    !KEPT_FIELDS.contains(&(owner_kind, locator.source_path.as_str()))
+        && (EDITABLE_OWNERS.contains(&owner_kind)
+            || (locator.sole_entry && root_collection(owner_kind).is_some()))
+}
 
 /// A conversation's `$.message[N]…` as the path within message row N, the record a repair edits.
 fn message_location(owner: &Owner, path: &str) -> Option<(Owner, String)> {
@@ -164,7 +219,7 @@ fn message_location(owner: &Owner, path: &str) -> Option<(Owner, String)> {
 /// asset held by a tuple or an entry takes that whole tuple or entry, so no half of it is left.
 /// None when a repair cannot remove exactly that reference.
 fn reference_removal(finding: &Finding, locator: &Locator) -> Option<(Owner, String, Option<u64>)> {
-    if !EDITABLE_OWNERS.contains(&finding.owner.kind.as_str()) {
+    if !editable(&finding.owner.kind, locator) {
         return None;
     }
     let (owner, path) = message_location(&finding.owner, &locator.source_path)
