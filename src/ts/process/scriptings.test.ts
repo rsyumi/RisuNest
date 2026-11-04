@@ -3235,3 +3235,49 @@ test('preserves synchronous writes and reads around an async LLM boundary', asyn
   expect(result.res).toBe('1:2')
   expect(variables.get('counter')).toBe('2')
 })
+
+test('expands lorebook requests using variables written earlier in the Lua button handler', async () => {
+  const fixture = operationCharacterFixture('lorebook-pending-variables')
+  fixture.char.globalLore = [{
+    comment: 'request-template', content: 'Context: {{getvar::request_context}}',
+    key: '', secondkey: '', alwaysActive: false, selective: false, insertorder: 100, mode: 'normal',
+  }]
+  fixture.chat.scriptstate = { $request_context: 'previous context' }
+  fixture.char.triggerscript = luaTriggerScript(`
+    function onButtonClick(id, data)
+      setChatVar(id, 'request_context', 'updated context')
+      local books = getLoreBooks(id, 'request-template')
+      addChat(id, 'user', books[1].content)
+    end
+  `)
+  installOperationCharacterFixture(fixture)
+  vi.mocked(getCurrentChat).mockReturnValue(fixture.chat)
+  vi.mocked(getCurrentCharacter).mockReturnValue(fixture.char)
+  continuationRuntime.session = fixture.session
+  vi.doMock('../util', async () => ({
+    ...(await import('./tests/scriptingsTestHarness')).utilModule(),
+    pickHashRand: vi.fn(),
+  }))
+  vi.doMock('../storage/database.svelte', () => ({
+    getDatabase, getCurrentChat, getCurrentCharacter, appVer: 'test',
+  }))
+  vi.doMock('dompurify', async () => {
+    const { Window } = await import('happy-dom')
+    const { default: createDOMPurify } = await vi.importActual<typeof import('dompurify')>('dompurify')
+    return { default: createDOMPurify(new Window() as unknown as Parameters<typeof createDOMPurify>[0]) }
+  })
+  const parser = await vi.importActual<typeof import('../parser/parser.svelte')>('../parser/parser.svelte')
+  vi.mocked(risuChatParser).mockImplementation(parser.risuChatParser)
+  const { runLuaInteractionTrigger } = await import('./scriptings')
+  try {
+    await runLuaInteractionTrigger('button', fixture.char, 'request')
+    expect(fixture.chat.message.at(-1)?.data).toBe('Context: updated context')
+    expect(fixture.chat.scriptstate?.$request_context).toBe('updated context')
+  } finally {
+    vi.doUnmock('dompurify')
+    vi.doMock('../util', async () => (await import('./tests/scriptingsTestHarness')).utilModule())
+    vi.doMock('../storage/database.svelte', async () => (await import('./tests/scriptingsTestHarness')).databaseModule())
+    vi.mocked(risuChatParser).mockReset()
+    continuationRuntime.session = null
+  }
+})
