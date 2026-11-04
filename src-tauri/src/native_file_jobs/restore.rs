@@ -4,6 +4,7 @@ mod upstream_import;
 pub(super) mod pocket_features;
 mod historical;
 mod cold_plugin_storage;
+pub(crate) mod cold_keys;
 use super::{
     ImportCounts, JobControl, JobDetail, JobPhase, JobProgress, JobResultSummary, JobStage,
     NativeJobError, OpenedJobSource, StageUnit,
@@ -202,6 +203,8 @@ pub(crate) struct RestoreProgressScale {
 pub(crate) struct ColdPayloadProgress {
     pub(crate) items: AtomicU64,
     pub(crate) bytes: AtomicU64,
+    /// The source bytes read so far; staging looks up only keys named before them.
+    pub(crate) source: AtomicU64,
 }
 
 /// Reports cold payload bytes read while the database read waits for the sink,
@@ -2867,6 +2870,9 @@ impl<'a, R: Read> TrackedReader<'a, R> {
         }
         self.hasher.update(&buffer[..read]);
         self.completed += read as u64;
+        if let Some(cold) = &self.scale.cold_payloads {
+            cold.source.store(self.completed, Ordering::Release);
+        }
         self.report()?;
         Ok(read)
     }
@@ -3093,6 +3099,8 @@ pub(super) mod tests {
         unavailable_cold_payloads: std::collections::HashMap<String, ColdPayloadUnavailable>,
         unavailable_cold: Mutex<Vec<(String, String)>>,
         cancel_after_page: Option<(Arc<JobRegistry>, String)>,
+        /// Called with each conversation row as it is staged.
+        pub(crate) on_conversation_row: Option<Box<dyn Fn(&Value) + Send + Sync>>,
     }
 
     impl ReplacementSink for StoreSink {
@@ -3206,6 +3214,7 @@ pub(super) mod tests {
                     message: "simulated disk full".to_owned(),
                 });
             }
+            if let Some(observe) = &self.on_conversation_row { observe(detail); }
             self.store.lock().unwrap().replace_put_conversation_row(
                 staging_id,
                 character_id,
@@ -3299,6 +3308,7 @@ pub(super) mod tests {
                 unavailable_cold_payloads: Default::default(),
                 unavailable_cold: Mutex::new(Vec::new()),
                 cancel_after_page: None,
+                on_conversation_row: None,
             },
         )
     }
@@ -5199,6 +5209,7 @@ pub(super) mod tests {
             unavailable_cold_payloads: Default::default(),
             unavailable_cold: Mutex::new(Vec::new()),
             cancel_after_page: None,
+            on_conversation_row: None,
         };
         let job = JobRegistry::default()
             .create(JobKind::RestoreBlockRisuSave)
