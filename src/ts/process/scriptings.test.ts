@@ -2929,13 +2929,18 @@ test.each(['current', 'navigated'] as const)('releases a read-only Lua edit oper
   }
 })
 
-test('settles a resumed coroutine rejection without leaving an unhandled rejection', async () => {
+test('settles a resumed coroutine rejection without leaving an unhandled rejection', async ({ task }) => {
   const readyMessage = '\nRISUNEST_A4_COROUTINE_READY\n'
   if (process.env.RISUNEST_A4_COROUTINE_CHILD !== 'true') {
+    // Another project's copy would start inside this copy's execution allowance.
+    const project = task.file.projectName
+    const spawnedAt = performance.now()
+    let readyAt: number | undefined
     const child = spawn(process.execPath, [
       resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'),
       'run',
       'src/ts/process/scriptings.test.ts',
+      ...(project ? ['--project', project] : []),
       '--pool=threads',
       '--maxWorkers=1',
       '--no-file-parallelism',
@@ -2972,6 +2977,7 @@ test('settles a resumed coroutine rejection without leaving an unhandled rejecti
         stdout += chunk
         if (!ready && !timedOut && stdout.includes(readyMessage)) {
           ready = true
+          readyAt = performance.now()
           clearTimeout(timeout)
           timeout = setTimeout(() => expire('execution'), 8_000)
         }
@@ -2987,8 +2993,12 @@ test('settles a resumed coroutine rejection without leaving an unhandled rejecti
     }).finally(() => {
       if (child.exitCode === null) child.kill()
     })
+    const closedAt = performance.now()
+    const timing = readyAt === undefined
+      ? `no ready line; closed ${Math.round(closedAt - spawnedAt)} ms after spawn`
+      : `ready ${Math.round(readyAt - spawnedAt)} ms after spawn; closed ${Math.round(closedAt - readyAt)} ms after ready`
 
-    expect(childResult, `${stdout}\n${stderr}`).toEqual({ code: 0, ready: true, timedOut: null })
+    expect(childResult, `${timing}\n${stdout}\n${stderr}`).toEqual({ code: 0, ready: true, timedOut: null })
     return
   }
 
