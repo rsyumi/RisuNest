@@ -1328,8 +1328,8 @@ fn owner_heads(store: &PersistentStore) -> Vec<(String, String)> {
 /// Selecting everything the diagnosis offers applies as one repair, and each change removes the
 /// dangling reference itself: an inlay token leaves the text around it, an asset tuple goes as a
 /// whole, and a reference the repair cannot address is not offered. An owner inside the root is
-/// edited where one entry carries its identity, and a module whose assets change loses the
-/// manifest that described them.
+/// edited where one entry carries its identity, and a module or character whose assets change
+/// loses the manifest that described them.
 #[test]
 fn every_offered_reference_repair_applies_and_removes_only_the_reference() {
     use crate::persistent_store::AssetOwnerLocator;
@@ -1371,19 +1371,6 @@ fn every_offered_reference_repair_applies_and_removes_only_the_reference() {
             }),
         )
         .unwrap();
-    let heads = [
-        owner_head(
-            &store,
-            AssetOwnerLocator::RootModuleAssets { module_id: "module-a".into() },
-            &[["kept", "assets/kept.png", "png"], ["gone", "assets/missing.png", "png"]],
-        ),
-        owner_head(
-            &store,
-            AssetOwnerLocator::PersonaEmbeddedModuleAssets { persona_id: "persona-a".into(), module_id: "embedded-a".into() },
-            &[["gone", "assets/missing.png", "png"], ["kept", "assets/kept.png", "png"]],
-        ),
-    ];
-    store.replace_put_asset_owner_heads(&staging, &heads).unwrap();
     store
         .replace_put_presets(&staging, &[json!({ "id": "preset-a", "name": "Preset A" })])
         .unwrap();
@@ -1394,6 +1381,7 @@ fn every_offered_reference_repair_applies_and_removes_only_the_reference() {
                 "chaId": "char-a", "name": "A", "type": "character", "chatPage": 0,
                 "firstMessage": "before {{inlay::gone-a}} after",
                 "emotionImages": [["happy", "assets/missing.png"], ["calm", "assets/kept.png"]],
+                "additionalAssets": [["gone", "assets/missing.png", "png"], ["kept", "assets/kept.png", "png"]],
                 "chats": [{
                     "id": "conv-a", "name": "Chat A",
                     "scriptstate": {
@@ -1405,6 +1393,24 @@ fn every_offered_reference_repair_applies_and_removes_only_the_reference() {
             })],
         )
         .unwrap();
+    let heads = [
+        owner_head(
+            &store,
+            AssetOwnerLocator::RootModuleAssets { module_id: "module-a".into() },
+            &[["kept", "assets/kept.png", "png"], ["gone", "assets/missing.png", "png"]],
+        ),
+        owner_head(
+            &store,
+            AssetOwnerLocator::PersonaEmbeddedModuleAssets { persona_id: "persona-a".into(), module_id: "embedded-a".into() },
+            &[["gone", "assets/missing.png", "png"], ["kept", "assets/kept.png", "png"]],
+        ),
+        owner_head(
+            &store,
+            AssetOwnerLocator::CharacterAdditionalAssets { character_id: "char-a".into() },
+            &[["gone", "assets/missing.png", "png"], ["kept", "assets/kept.png", "png"]],
+        ),
+    ];
+    store.replace_put_asset_owner_heads(&staging, &heads).unwrap();
     store.replace_commit(&staging, Some(0)).unwrap();
     store
         .commit(&crate::persistent_store::WorkingSetCommit {
@@ -1434,7 +1440,7 @@ fn every_offered_reference_repair_applies_and_removes_only_the_reference() {
     assert_eq!(unoffered("Shared"), 2, "two loadouts carry that name: {:?}", result.items);
     let revision = store.revision().unwrap();
     let (original_root, original_heads) = (root_of(&store), owner_heads(&store));
-    assert_eq!(original_heads.len(), 2);
+    assert_eq!(original_heads.len(), 3);
     let (repaired, journal) = store.apply_repair(revision, &offered, 10).unwrap();
     assert_eq!(unpublished(&mut store), Vec::<UnitKey>::new());
     let manifests: BTreeSet<String> = heads.iter().filter_map(|head| head.manifest_hash.clone()).collect();
@@ -1446,6 +1452,7 @@ fn every_offered_reference_repair_applies_and_removes_only_the_reference() {
     let character = json_record(&store, "characters", &["char-a"]);
     assert_eq!(character["firstMessage"], "before  after");
     assert_eq!(character["emotionImages"], json!([["calm", "assets/kept.png"]]));
+    assert_eq!(character["additionalAssets"], json!([["kept", "assets/kept.png", "png"]]));
     assert_eq!(
         json_record(&store, "conversations", &["char-a", "conv-a"])["scriptstate"],
         json!({ "$__name.with.dots": "", "한글 변수": "x  y " })

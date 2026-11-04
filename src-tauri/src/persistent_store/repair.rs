@@ -313,17 +313,49 @@ fn drop_references(
     Ok(())
 }
 
-/// Drops the owner head of every module in the root whose assets the repair changed, as a save
-/// does, so no head describes tuples its module no longer holds.
-fn release_changed_owner_heads(transaction: &Connection, active: &str, staging: &str) -> StoreResult<()> {
-    let root = |generation: &str| -> StoreResult<Option<Value>> {
+/// Drops the owner head of every module in the root and every character whose assets the repair
+/// changed, as a save does, so no head describes tuples its owner no longer holds.
+fn release_changed_owner_heads(
+    transaction: &Connection,
+    active: &str,
+    staging: &str,
+    root_entries: bool,
+    characters: &BTreeSet<String>,
+) -> StoreResult<()> {
+    let record = |sql: &str, generation: &str, key: &[&str]| -> StoreResult<Option<Value>> {
         let serialized: Option<String> = rusqlite::OptionalExtension::optional(transaction.query_row(
-            "SELECT value FROM root WHERE generation=?1",
-            [generation],
+            sql,
+            rusqlite::params_from_iter(std::iter::once(generation).chain(key.iter().copied())),
             |row| row.get(0),
         ))?;
         Ok(serialized.and_then(|serialized| serde_json::from_str(&serialized).ok()))
     };
+    let release = |kind: &str, locator: &str| -> StoreResult<()> {
+        transaction.execute(
+            "DELETE FROM asset_owner_heads WHERE generation=?1 AND owner_kind=?2 AND owner_locator=?3",
+            rusqlite::params![staging, kind, locator],
+        )?;
+        Ok(())
+    };
+    for character_id in characters {
+        let detail = |generation| {
+            record(
+                "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+                generation,
+                &[character_id.as_str()],
+            )
+        };
+        let (Some(old), Some(new)) = (detail(active)?, detail(staging)?) else {
+            continue;
+        };
+        if old.get("additionalAssets") != new.get("additionalAssets") {
+            release("character-additional-assets", character_id)?;
+        }
+    }
+    if !root_entries {
+        return Ok(());
+    }
+    let root = |generation| record("SELECT value FROM root WHERE generation=?1", generation, &[]);
     let (Some(before), Some(after)) = (root(active)?, root(staging)?) else {
         return Ok(());
     };
@@ -342,10 +374,7 @@ fn release_changed_owner_heads(transaction: &Connection, active: &str, staging: 
             continue;
         };
         if old.get("assets") != new.get("assets") {
-            transaction.execute(
-                "DELETE FROM asset_owner_heads WHERE generation=?1 AND owner_kind=?2 AND owner_locator=?3",
-                rusqlite::params![staging, kind, locator],
-            )?;
+            release(&kind, &locator)?;
         }
     }
     Ok(())
@@ -905,15 +934,17 @@ impl PersistentStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         copy_generation(&transaction, &active, staging)?;
         let mut root_entries = false;
+        let mut characters = BTreeSet::new();
         for ((kind, id), paths) in edits {
             let located = locate(&kind, &id)
                 .ok_or_else(|| validation(format!("{kind} records cannot be edited by a repair")))?;
             root_entries |= located.entry.is_some();
             drop_references(&transaction, staging, &located, paths)?;
+            if located.table == "characters" {
+                characters.insert(id);
+            }
         }
-        if root_entries {
-            release_changed_owner_heads(&transaction, &active, staging)?;
-        }
+        release_changed_owner_heads(&transaction, &active, staging, root_entries, &characters)?;
         for candidate in candidates {
             match &candidate.action {
                 RepairAction::SelectFirstConversation { character_id } => {
