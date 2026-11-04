@@ -49,7 +49,7 @@ test('a source map that differs only in Rolldown file references keeps the exist
   const map = id => JSON.stringify({ sources: ['../../src/etc/bg.jpg'], sourcesContent: [`export default import.meta.ROLLDOWN_FILE_URL_${id}`] })
   tree(dist, { 'assets/a.js.map': map('Ngmgj7KrmSrUoXH_NFNtFA'), 'assets/b.js.map': map('x'), 'assets/a.js': 'import.meta.ROLLDOWN_FILE_URL_x' })
   tree(staging, {
-    'assets/a.js.map': map('8HSUfh7cJHNFxCkInNzNXw'),
+    'assets/a.js.map': map('0PgJxXqjw$KAl6PgZjQb5g'),
     'assets/b.js.map': map('x').replace('bg.jpg', 'bg.webp'),
     'assets/a.js': 'import.meta.ROLLDOWN_FILE_URL_y',
   })

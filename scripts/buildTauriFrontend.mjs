@@ -8,7 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 // Rolldown gives asset file references a new ID on each build, and source maps carry the
 // referencing module sources verbatim.
-const fileReference = /import\.meta\.ROLLDOWN_FILE_URL_[\w-]+/g
+const fileReference = /import\.meta\.ROLLDOWN_FILE_URL_[\w$-]+/g
 
 function sameOutput(name, current, next) {
   if (current.equals(next)) return true
