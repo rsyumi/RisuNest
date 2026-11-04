@@ -6,16 +6,40 @@
 
 use super::StoreResult;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 /// Whether `text` is an object whose `additionalAssets`, when present, is an array.
 pub(super) fn additional_assets_are_listed(text: &str) -> StoreResult<bool> {
+    let property = read(text, Property { name: "additionalAssets", value: IsArray })?;
+    Ok(matches!(property, Some(None | Some(true))))
+}
+
+/// The `additionalAssets` of a stored character detail.
+#[derive(Debug, PartialEq)]
+pub(super) enum AdditionalAssets {
+    Absent,
+    Entries(Vec<Value>),
+    /// The detail is not an object, or the property is not an array.
+    Unusable,
+}
+
+/// Decodes only the `additionalAssets` of a stored character detail into values.
+pub(super) fn additional_assets(text: &str) -> StoreResult<AdditionalAssets> {
+    Ok(match read(text, Property { name: "additionalAssets", value: Entries })? {
+        Some(None) => AdditionalAssets::Absent,
+        Some(Some(Some(entries))) => AdditionalAssets::Entries(entries),
+        None | Some(Some(None)) => AdditionalAssets::Unusable,
+    })
+}
+
+fn read<'de, S: DeserializeSeed<'de>>(text: &'de str, seed: S) -> StoreResult<S::Value> {
     let mut decoder = serde_json::Deserializer::from_str(text);
-    let listed = AdditionalAssets.deserialize(&mut decoder)?;
+    let value = seed.deserialize(&mut decoder)?;
     decoder.end()?;
-    Ok(listed)
+    Ok(value)
 }
 
 /// Adds the asset keys and Inlay ids named by string values in `text`.
@@ -124,6 +148,7 @@ impl<'de> Visitor<'de> for Key {
     }
 }
 
+#[derive(Clone, Copy)]
 struct IsArray;
 
 impl<'de> DeserializeSeed<'de> for IsArray {
@@ -150,37 +175,75 @@ impl<'de> Visitor<'de> for IsArray {
     }
 }
 
-struct AdditionalAssets;
+/// An array's elements as parsed values, or `None` for any other value.
+#[derive(Clone, Copy)]
+struct Entries;
 
-impl<'de> DeserializeSeed<'de> for AdditionalAssets {
-    type Value = bool;
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
+impl<'de> DeserializeSeed<'de> for Entries {
+    type Value = Option<Vec<Value>>;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         deserializer.deserialize_any(self)
     }
 }
 
-impl<'de> Visitor<'de> for AdditionalAssets {
-    type Value = bool;
+impl<'de> Visitor<'de> for Entries {
+    type Value = Option<Vec<Value>>;
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a character detail")
+        formatter.write_str("a JSON value")
     }
-    scalars!(false);
-    fn visit_str<E: de::Error>(self, _: &str) -> Result<bool, E> {
-        Ok(false)
+    scalars!(None);
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, values: A) -> Result<bool, A::Error> {
-        Skip.visit_seq(values).map(|()| false)
+    fn visit_seq<A: SeqAccess<'de>>(self, mut values: A) -> Result<Self::Value, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(entry) = values.next_element::<Value>()? {
+            entries.push(entry);
+        }
+        Ok(Some(entries))
     }
-    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<bool, A::Error> {
-        let mut listed = true;
+    fn visit_map<A: MapAccess<'de>>(self, entries: A) -> Result<Self::Value, A::Error> {
+        Skip.visit_map(entries).map(|()| None)
+    }
+}
+
+/// One property of an object, decoded by `value` while every other value is
+/// skipped. `None` when the value is not an object, `Some(None)` when the
+/// property is absent.
+struct Property<S> {
+    name: &'static str,
+    value: S,
+}
+
+impl<'de, S: DeserializeSeed<'de> + Copy> DeserializeSeed<'de> for Property<S> {
+    type Value = Option<Option<S::Value>>;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, S: DeserializeSeed<'de> + Copy> Visitor<'de> for Property<S> {
+    type Value = Option<Option<S::Value>>;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    scalars!(None);
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, values: A) -> Result<Self::Value, A::Error> {
+        Skip.visit_seq(values).map(|()| None)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Self::Value, A::Error> {
+        let mut found = None;
         while let Some(key) = entries.next_key_seed(Key)? {
-            if key == "additionalAssets" {
-                listed = entries.next_value_seed(IsArray)?;
+            if key == self.name {
+                found = Some(entries.next_value_seed(self.value)?);
             } else {
                 entries.next_value_seed(Skip)?;
             }
         }
-        Ok(listed)
+        Ok(Some(found))
     }
 }
 
@@ -302,10 +365,40 @@ mod tests {
     #[test]
     fn malformed_text_fails_as_a_parse_would() {
         let deep = format!("{{\"a\":{}1{}}}", "[".repeat(200), "]".repeat(200));
-        for text in [r#"{"a":1} trailing"#, r#"{"a":"#, "", r#"{"a":1e400}"#, r#"{"a":"\ud800"}"#, deep.as_str()] {
+        let deep_entries = format!("{{\"additionalAssets\":[{}1{}]}}", "[".repeat(200), "]".repeat(200));
+        for text in [
+            r#"{"a":1} trailing"#, r#"{"a":"#, "", r#"{"a":1e400}"#, r#"{"a":"\ud800"}"#, deep.as_str(),
+            r#"{"additionalAssets":[1e400]}"#, r#"{"additionalAssets":["\ud800"]}"#, deep_entries.as_str(),
+        ] {
             assert!(serde_json::from_str::<serde_json::Value>(text).is_err(), "{text}");
             assert!(additional_assets_are_listed(text).is_err(), "{text}");
+            assert!(additional_assets(text).is_err(), "{text}");
             assert!(references(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn additional_assets_entries_follow_the_parsed_detail() {
+        use serde_json::json;
+        use AdditionalAssets::{Absent, Entries, Unusable};
+        for (text, expected) in [
+            (r#"{"name":"x","nested":{"additionalAssets":[1]}}"#, Absent),
+            (
+                r#"{"additionalAssets":[["a","assets/a.png","png"],{"k":1,"k":2},7,null],"after":{"additionalAssets":{}}}"#,
+                Entries(vec![json!(["a", "assets/a.png", "png"]), json!({"k": 2}), json!(7), json!(null)]),
+            ),
+            (r#"{"additionalAssets":[]}"#, Entries(Vec::new())),
+            (r#"{"additionalAssets":{},"additionalAssets":[1]}"#, Entries(vec![json!(1)])),
+            (r#"{"additionalAssets":[1],"additionalAssets":[2]}"#, Entries(vec![json!(2)])),
+            (r#"{"additionalAssets":["escaped"]}"#, Entries(vec![json!("escaped")])),
+            (r#"{"additionalAssets":[1],"additionalAssets":"x"}"#, Unusable),
+            (r#"{"additionalAssets":null}"#, Unusable),
+            (r#"{"additionalAssets":{"0":1}}"#, Unusable),
+            (r#"[{"additionalAssets":[]}]"#, Unusable),
+            ("null", Unusable),
+            (r#""text""#, Unusable),
+        ] {
+            assert_eq!(additional_assets(text).unwrap(), expected, "{text}");
         }
     }
 }

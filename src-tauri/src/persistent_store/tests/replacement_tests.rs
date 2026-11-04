@@ -577,3 +577,49 @@ fn database_only_replacement_drops_forwarded_aliases_that_no_staged_value_names(
         assert_eq!(surviving, kept);
     }
 }
+
+#[test]
+fn database_only_replacement_keeps_character_owner_heads_only_for_unchanged_assets() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let character = |id: &str, assets: Option<Value>| {
+        let mut character = json!({ "type": "character", "chaId": id, "name": id, "chats": [] });
+        if let Some(assets) = assets { character["additionalAssets"] = assets; }
+        character
+    };
+    let owner = |id: &str| AssetOwnerLocator::CharacterAdditionalAssets { character_id: id.to_owned() };
+    let heads = [
+        ("kept", AssetOwnerHead::present(owner("kept"), "11".repeat(32), 1)),
+        ("changed", AssetOwnerHead::present(owner("changed"), "22".repeat(32), 1)),
+        ("absent", AssetOwnerHead::absent(owner("absent"))),
+        ("malformed", AssetOwnerHead::absent(owner("malformed"))),
+    ];
+    let initial = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&initial, &json!({})).unwrap();
+    store.replace_add_characters(&initial, &[
+        character("kept", Some(json!([["a", "assets/a", "bin"]]))),
+        character("changed", Some(json!([["b", "assets/b", "bin"]]))),
+        character("absent", None),
+        character("malformed", None),
+    ]).unwrap();
+    store.replace_put_asset_owner_heads(&initial, &heads.clone().map(|(_, head)| head)).unwrap();
+    store.replace_commit(&initial, Some(0)).unwrap();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage, &json!({})).unwrap();
+    let mut kept = character("kept", Some(json!([["a", "assets/a", "bin"]])));
+    kept["name"] = json!("Renamed");
+    store.replace_add_characters(&stage, &[
+        kept,
+        character("changed", Some(json!([["c", "assets/c", "bin"]]))),
+        character("absent", None),
+        character("malformed", Some(json!({}))),
+    ]).unwrap();
+    store.replace_preserve_repositories(&stage, Some(1)).unwrap();
+    store.replace_commit(&stage, Some(1)).unwrap();
+    let retained = heads
+        .iter()
+        .filter(|(_, head)| store.read_asset_owner_head(&head.owner, None).unwrap().is_some_and(|stored| stored.value == *head))
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    assert_eq!(retained, ["kept", "absent"]);
+}

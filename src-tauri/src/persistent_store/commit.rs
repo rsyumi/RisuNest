@@ -1488,18 +1488,22 @@ fn replacement_owner_tuple(
     if !root.is_object() { return Err(validation("Replacement root must be an object")); }
     match owner {
         AssetOwnerLocator::CharacterAdditionalAssets { character_id } => {
-            let detail: Option<String> = connection
+            let assets = connection
                 .query_row(
                     "SELECT detail FROM characters
                      WHERE generation = ?1 AND character_id = ?2",
                     params![generation, character_id],
-                    |row| row.get(0),
+                    |row| Ok(replacement_scan::additional_assets(row.get_ref(0)?.as_str()?)),
                 )
-                .optional()?;
-            let Some(detail) = detail else {
-                return Ok(None);
-            };
-            replacement_owner_tuple_from_parent(&serde_json::from_str(&detail)?, "additionalAssets")
+                .optional()?
+                .transpose()?;
+            Ok(match assets {
+                None | Some(replacement_scan::AdditionalAssets::Unusable) => None,
+                Some(replacement_scan::AdditionalAssets::Absent) => Some(ReplacementOwnerTuple::Absent),
+                Some(replacement_scan::AdditionalAssets::Entries(entries)) => {
+                    Some(ReplacementOwnerTuple::Present(entries))
+                }
+            })
         }
         AssetOwnerLocator::RootModuleAssets { .. } | AssetOwnerLocator::PersonaEmbeddedModuleAssets { .. } => {
             let Some(module)=owner.root_parent(root) else{return Ok(None)};
