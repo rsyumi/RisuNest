@@ -2,7 +2,10 @@
 //! snapshot, a reader thread reads the cold items the snapshot names ahead of
 //! staging, under the slots and retry rules of the asset reads, and inflates
 //! each into the job directory, where a bounded spool keeps it until staging
-//! takes it. An item staging asks for that is not read yet is read next.
+//! takes it. An item staging asks for that is not read yet is read next. When
+//! the reader does not know the key yet, it first waits until the snapshot
+//! scan has passed every block staging has read, so a key the scan names is
+//! read as the scan names it.
 use super::download::{latin1_header, AccountReader};
 use super::scheduler::{Attempt, Exchange, Outcome, Pause, Scheduler, Settled, StopReason};
 use crate::native_file_jobs::official_snapshot::{await_network_operation, OfficialSnapshotCredential, NETWORK_IDLE_TIMEOUT};
@@ -735,5 +738,51 @@ fn stopped(reason: StopReason) -> NativeJobError {
             NativeJobError::new("store-error", "Official account cold item could not be stored")
         }
         StopReason::Service => NativeJobError::new("network-error", "Official account cold storage is not responding"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_file_jobs::{JobKind, JobRegistry};
+
+    type Reads = Vec<(String, Option<Position>, bool)>;
+
+    /// The keys the reader reads after one turn; the reads are never sent.
+    fn reading<'s, 'a>(prefetch: &mut Prefetch<'s, 'a>) -> Reads {
+        let mut reads = FuturesUnordered::new();
+        prefetch.receive();
+        prefetch.start(&mut reads);
+        let mut reading = prefetch.reading.values().map(|reading| (reading.key.clone(), reading.position, reading.character)).collect::<Vec<_>>();
+        reading.sort();
+        reading
+    }
+
+    #[test]
+    fn a_key_the_reader_does_not_know_waits_until_the_scan_reaches_staging() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreOfficialAccountSnapshot).unwrap();
+        let credential = OfficialSnapshotCredential::RisuAuth { token: "test-token".to_owned() };
+        let source = ColdSource::new("http://127.0.0.1:9", &credential, directory.path(), &job, 1024, SpoolLimits::default()).unwrap();
+        let (keys, received) = mpsc::sync_channel(8);
+        let mut prefetch = Prefetch::new(&source, received);
+
+        // Staging has read past the block naming the character item while the
+        // scan has not finished that block.
+        source.progress.source.store(200, Ordering::Release);
+        source.scanned.store(100, Ordering::Release);
+        source.lock().demand = Some("cold-c".to_owned());
+        assert_eq!(reading(&mut prefetch), Reads::new());
+        // Once the scan names it, it is read as the character item the scan found.
+        keys.send(ColdKey { key: "cold-c".to_owned(), character: true }).unwrap();
+        source.scanned.store(200, Ordering::Release);
+        assert_eq!(reading(&mut prefetch), [("cold-c".to_owned(), Some((0, 0)), true)]);
+
+        // A key the scan does not name is read once the scan ends.
+        source.progress.source.store(300, Ordering::Release);
+        source.lock().demand = Some("cold-x".to_owned());
+        assert_eq!(reading(&mut prefetch), [("cold-c".to_owned(), Some((0, 0)), true)]);
+        source.scanned.store(u64::MAX, Ordering::Release);
+        assert_eq!(reading(&mut prefetch), [("cold-c".to_owned(), Some((0, 0)), true), ("cold-x".to_owned(), None, false)]);
     }
 }
