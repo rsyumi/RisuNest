@@ -309,6 +309,7 @@ async function translateMain(text:string, arg:{from:string, to:string, host:stri
             networkError = error
         }
         if(isTauri && (f === null || f.status === 429)){
+            await f?.body?.cancel().catch(() => {})
             try {
                 f = await fetchNative(url, { ...request, logFetch: false })
             } catch (error) {
