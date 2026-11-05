@@ -177,7 +177,7 @@ impl PersistentStoreState {
     /// Runs a write to a store file that does not go through the store, such as
     /// the recovery shell's app lock record, after any store open under way.
     pub(crate) fn outside_store_open<T>(&self, operation: impl FnOnce() -> T) -> StoreResult<T> {
-        let _store = self.store.lock().map_err(|error| StoreError::Store {
+        let _store = lock_store(&self.store).map_err(|error| StoreError::Store {
             message: format!("persistent store mutex poisoned: {error}"),
         })?;
         Ok(operation())
@@ -247,6 +247,7 @@ impl PersistentStoreState {
         }))
     }
 
+    #[track_caller]
     pub(crate) fn open_admitted_native_job_store(
         &self,
         operation: &RendererOperationGuard,
@@ -254,6 +255,7 @@ impl PersistentStoreState {
         with_store_mutex_admitted(self, operation, PersistentStore::open_native_job_store)
     }
 
+    #[track_caller]
     pub(crate) fn with_status_job_store<T>(&self, operation: impl FnOnce(&PersistentStore) -> T) -> StoreResult<T> {
         let permit = self.admit_renderer_operation()?;
         let mut cached = self.status_store.lock().map_err(|_| renderer_gate_error())?;
@@ -286,7 +288,7 @@ impl PersistentStoreState {
         }
         drop(state);
         self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
-        self.store.lock().map_err(|_| renderer_gate_error())?.take();
+        lock_store(&self.store).map_err(|_| renderer_gate_error())?.take();
         Ok(maintenance)
     }
 
@@ -298,8 +300,7 @@ impl PersistentStoreState {
         // No new operation can enter between draining and closing the store.
         // Reopening after the guard is released refreshes the connection after
         // native restore and discards leases owned by the previous renderer.
-        self.store
-            .lock()
+        lock_store(&self.store)
             .map_err(|error| StoreError::Store {
                 message: format!("persistent store mutex poisoned: {error}"),
             })?
@@ -356,7 +357,7 @@ impl PersistentStoreState {
                 message: "device maintenance guard belongs to another persistent store".to_owned(),
             });
         }
-        let mut store = self.store.lock().map_err(|error| StoreError::Store {
+        let mut store = lock_store(&self.store).map_err(|error| StoreError::Store {
             message: format!("persistent store mutex poisoned: {error}"),
         })?;
         open_persistent_store(app_data_dir, &mut store).map(|_| ())
@@ -366,7 +367,7 @@ impl PersistentStoreState {
         let Some(_maintenance) = self.try_acquire_renderer_maintenance()? else {
             return Ok(());
         };
-        let mut store = self.store.lock().map_err(|error| StoreError::Store {
+        let mut store = lock_store(&self.store).map_err(|error| StoreError::Store {
             message: format!("persistent store mutex poisoned: {error}"),
         })?;
         if let Some(store) = store.as_mut() {
@@ -476,6 +477,14 @@ pub(super) fn current_time_ms() -> StoreResult<i64> {
     })
 }
 
+/// Locks the renderer store. A wait or hold long enough to hold up other
+/// commands is recorded with the command that called the store helper.
+#[track_caller]
+fn lock_store(store: &Mutex<Option<PersistentStore>>) -> std::sync::LockResult<crate::slow_log::TimedGuard<'_, Option<PersistentStore>>> {
+    crate::slow_log::lock(store, "persistent store")
+}
+
+#[track_caller]
 pub(crate) fn with_store<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
@@ -483,17 +492,19 @@ pub(crate) fn with_store<T>(
     with_store_mutex(&state, operation)
 }
 
+#[track_caller]
 pub(crate) fn with_store_if_ready<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<Option<T>> {
     let Some(_guard) = state.try_admit_renderer_operation()? else { return Ok(None); };
-    let store = state.store.lock().map_err(|error| StoreError::Store {
+    let store = lock_store(&state.store).map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     store.as_ref().map(operation).transpose()
 }
 
+#[track_caller]
 fn with_store_mutex<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&PersistentStore) -> StoreResult<T>,
@@ -502,6 +513,7 @@ fn with_store_mutex<T>(
     with_store_mutex_admitted(state, &operation_guard, operation)
 }
 
+#[track_caller]
 fn with_store_mutex_admitted<T>(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
@@ -512,7 +524,7 @@ fn with_store_mutex_admitted<T>(
             message: "renderer operation permit belongs to another persistent store".to_owned(),
         });
     }
-    let store = state.store.lock().map_err(|error| StoreError::Store {
+    let store = lock_store(&state.store).map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     let store = store.as_ref().ok_or_else(|| StoreError::Validation {
@@ -534,7 +546,7 @@ fn with_snapshot_directory<T>(
 ) -> StoreResult<T> {
     let _operation = state.admit_renderer_operation()?;
     let directory = {
-        let store = state.store.lock().map_err(|error| StoreError::Store {
+        let store = lock_store(&state.store).map_err(|error| StoreError::Store {
             message: format!("persistent store mutex poisoned: {error}"),
         })?;
         store
@@ -549,6 +561,7 @@ fn with_snapshot_directory<T>(
     operation(&directory)
 }
 
+#[track_caller]
 pub(crate) fn with_store_mut<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
@@ -556,6 +569,7 @@ pub(crate) fn with_store_mut<T>(
     with_store_mutex_mut(&state, operation)
 }
 
+#[track_caller]
 fn with_store_mutex_mut<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
@@ -564,6 +578,7 @@ fn with_store_mutex_mut<T>(
     with_store_mutex_mut_admitted(state, &operation_guard, operation)
 }
 
+#[track_caller]
 pub(crate) fn with_store_mut_admitted<T>(
     state: State<'_, PersistentStoreState>,
     operation_guard: &RendererOperationGuard,
@@ -572,6 +587,7 @@ pub(crate) fn with_store_mut_admitted<T>(
     with_store_mutex_mut_admitted(&state, operation_guard, operation)
 }
 
+#[track_caller]
 fn with_store_mutex_mut_admitted<T>(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
@@ -582,7 +598,7 @@ fn with_store_mutex_mut_admitted<T>(
             message: "renderer operation permit belongs to another persistent store".to_owned(),
         });
     }
-    let mut store = state.store.lock().map_err(|error| StoreError::Store {
+    let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     let store = store.as_mut().ok_or_else(|| StoreError::Validation {
@@ -592,6 +608,7 @@ fn with_store_mutex_mut_admitted<T>(
     operation(store)
 }
 
+#[track_caller]
 pub(crate) fn commit_staged_replacement(
     app: &AppHandle,
     staging_id: &str,
@@ -657,7 +674,7 @@ fn open_renderer_persistent_store_admitted(
             message: "renderer operation permit belongs to another persistent store".to_owned(),
         });
     }
-    let mut store = state.store.lock().map_err(|error| StoreError::Store {
+    let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     let opening = store.is_none();
@@ -717,7 +734,7 @@ fn compact_requested_store<S: Fn(&Path) -> std::io::Result<u64>>(
     if !super::compaction::requested(app_data_dir)? {
         return Ok(None);
     }
-    let store = state.store.lock().map_err(|error| StoreError::Store {
+    let store = lock_store(&state.store).map_err(|error| StoreError::Store {
         message: format!("persistent store mutex poisoned: {error}"),
     })?;
     // A renderer reload within the process finds the store open, and the
@@ -1640,7 +1657,7 @@ pub(crate) fn pds_snapshot_create(
                 })?;
         let started = std::time::Instant::now();
         let (mut archive, scratch, current_bytes, inventory) = {
-            let mut store = state.store.lock().map_err(|error| StoreError::Store {
+            let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
                 message: format!("persistent store mutex poisoned: {error}"),
             })?;
             let store = store.as_mut().ok_or_else(|| StoreError::Validation {
@@ -3077,6 +3094,41 @@ mod tests {
         let maintenance = state.acquire_device_maintenance().unwrap();
         assert!(with_snapshot_directory(&state, super::super::snapshot::list).is_err());
         drop(maintenance);
+    }
+
+    #[test]
+    fn a_long_store_wait_is_recorded_with_the_calling_command() {
+        use std::time::Duration;
+        let directory = tempdir().unwrap();
+        let state = PersistentStoreState::default();
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let recorded = |at: &str| crate::native_log::global_state().tail(None).into_iter().rev()
+            .find(|entry| entry.message.ends_with(&format!(" at {at}")));
+        let (held, holding) = std::sync::mpsc::channel();
+        let waiting = std::thread::scope(|scope| {
+            let holder = scope.spawn(|| with_store_mutex(&state, |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(())
+            }));
+            holding.recv().unwrap();
+            let at = crate::slow_log::with_test_threshold(Duration::from_millis(40), || {
+                let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
+                at
+            });
+            holder.join().unwrap().unwrap();
+            at
+        });
+        let entry = recorded(&waiting).unwrap();
+        assert_eq!((entry.level.as_str(), entry.target.as_str()), ("warn", "slow-operation"));
+        let waited: u128 = entry.message.split(" after waiting ").nth(1)
+            .and_then(|rest| rest.split(' ').next()).unwrap().parse().unwrap();
+        assert!(waited >= 40, "{}", entry.message);
+        let quick = crate::slow_log::with_test_threshold(Duration::from_secs(60), || {
+            let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
+            at
+        });
+        assert!(recorded(&quick).is_none());
     }
 
     #[test]

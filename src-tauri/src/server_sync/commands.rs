@@ -180,7 +180,10 @@ async fn logged_blocking<T: Send + 'static>(
     stage: &str,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    recorded(stage, blocking(operation).await)
+    let started = std::time::Instant::now();
+    let result = blocking(operation).await;
+    crate::slow_log::record_stage("server sync", stage, started);
+    recorded(stage, result)
 }
 /// Refusals a caller meets in normal use, such as another operation holding
 /// the library. With the transient outcomes `retryable` names they are logged
@@ -966,5 +969,16 @@ mod failure_log_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_blocking_command_records_a_stage_that_reaches_the_slow_threshold() {
+        let run = |stage: &'static str| tauri::async_runtime::block_on(logged_blocking(stage, || Ok(())));
+        crate::slow_log::with_test_threshold(std::time::Duration::from_secs(60), || run("synthetic-quick-stage")).unwrap();
+        crate::slow_log::with_test_threshold(std::time::Duration::ZERO, || run("synthetic-slow-stage")).unwrap();
+        let entries = crate::native_log::global_state().tail(None);
+        assert!(!entries.iter().any(|entry| entry.message.starts_with("server sync synthetic-quick-stage ")));
+        let entry = entries.iter().rev().find(|entry| entry.message.starts_with("server sync synthetic-slow-stage took ")).unwrap();
+        assert_eq!((entry.level.as_str(), entry.target.as_str()), ("warn", "slow-operation"));
     }
 }
