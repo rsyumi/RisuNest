@@ -63,7 +63,7 @@ test('real markdown and Lua editors retain editing, find, undo and save with a r
     expect(errors).toEqual([])
 })
 
-test('an IME composition covers its line in the line font and hides while the line is scrolled out', async ({ page, browserName }) => {
+test('an IME composition covers its line in the line font and hides while the line is scrolled out or wraps', async ({ page, browserName }) => {
     test.skip(browserName !== 'chromium', 'Composes through the Chromium DevTools protocol')
     await page.goto('/monaco.html')
     await page.waitForFunction(() => !!window.monacoDriver)
@@ -91,4 +91,30 @@ test('an IME composition covers its line in the line font and hides while the li
     await page.evaluate(line => window.monacoDriver.moveTo(line, 1), line)
     await compose('ㄱ', '가')
     await expect.poll(() => composition(line)).toMatchObject({ composing: true, visible: true, onLine: true })
+    await cdp.send('Input.insertText', { text: '가' })
+
+    // Monaco leaves the textarea in place on a line that wraps, so only the line shows the composition.
+    const prose = '테스트입니다. 테스트. '.repeat(30)
+    await page.evaluate(text => window.monacoDriver.place(text, 1, text.indexOf('\n') + 1), `${prose}\nnext`)
+    await compose('ㅇ', '아', '안')
+    await expect.poll(() => composition(1)).toMatchObject({ composing: true, visible: false })
+    await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value?.split('\n')[0])).toBe(`${prose}안`)
+    await cdp.send('Input.insertText', { text: '안' })
+    await expect.poll(() => composition(1)).toMatchObject({ composing: false })
+    expect(await page.evaluate(() => window.monacoDriver.state().value)).toBe(`${prose}안\nnext`)
+})
+
+test('wrapped prose fills each row until the next word no longer fits', async ({ page }) => {
+    await page.goto('/monaco.html')
+    await page.waitForFunction(() => !!window.monacoDriver)
+    await page.evaluate(() => window.monacoDriver.open('markdown'))
+    await expect(page.locator('#editor textarea.inputarea')).toBeFocused()
+    await page.evaluate(text => window.monacoDriver.place(text, 1, 1), `${'테스트입니다. 테스트. '.repeat(40)}\nnext`)
+    await expect.poll(() => page.evaluate(() => window.monacoDriver.wrapping(1).length)).toBeGreaterThan(1)
+    for (const row of await page.evaluate(() => window.monacoDriver.wrapping(1))) {
+        expect(row.overflow).toBeLessThanOrEqual(0)
+        expect(row.free).toBeLessThan(row.nextWord + 1)
+        // Korean words move to the next row whole.
+        expect(row.endsWithSpace).toBe(true)
+    }
 })

@@ -40,7 +40,7 @@
 
     let container: HTMLDivElement;
     let editor: monaco.editor.IStandaloneCodeEditor;
-    let compositionOffscreen = $state(false);
+    let compositionHidden = $state(false);
 
     onMount(() => {
         editor = monaco.editor.create(container, {
@@ -52,6 +52,10 @@
             automaticLayout: true,
             minimap: { enabled: false },
             wordWrap: 'on',
+            // Lines render in the app font, so wrapping measures the text instead of counting fixed-width columns.
+            wrappingStrategy: 'advanced',
+            // Measured wrapping would otherwise split Korean words between syllables.
+            wordBreak: 'keepAll',
             lineNumbers: 'on',
             scrollBeyondLastLine: false,
             fontSize: 14,
@@ -71,11 +75,14 @@
             value = newValue;
             onchange?.(newValue);
         });
-        // Monaco stops moving its composition textarea once the composed line leaves the viewport.
+        // Monaco stops moving its composition textarea once the composed line leaves the viewport,
+        // and leaves it in place on a line that wraps, where it shows a sliver of the line's text.
         const trackCompositionLine = () => {
             const position = editor.getPosition();
             const visible = position && editor.getScrolledVisiblePosition(position);
-            compositionOffscreen = !visible || visible.top + visible.height <= 0 || visible.top >= editor.getLayoutInfo().height;
+            const model = editor.getModel();
+            const wrapped = !!position && !!model && editor.getTopForPosition(position.lineNumber, 1) !== editor.getTopForPosition(position.lineNumber, model.getLineMaxColumn(position.lineNumber));
+            compositionHidden = !visible || visible.top + visible.height <= 0 || visible.top >= editor.getLayoutInfo().height || wrapped;
         };
         let compositionFrame: number | undefined;
         const scheduleCompositionLine = () => {
@@ -113,14 +120,14 @@
     });
 </script>
 
-<div bind:this={container} class="w-full h-full" class:composition-offscreen={compositionOffscreen}></div>
+<div bind:this={container} class="w-full h-full" class:composition-hidden={compositionHidden}></div>
 
 <style>
     /* The app font reaches the rendered lines but not the composition textarea, whose font Monaco sets inline. */
     div :global(.monaco-editor .inputarea.ime-input) {
         font-family: var(--risu-font-family) !important;
     }
-    .composition-offscreen :global(.monaco-editor .inputarea.ime-input) {
+    .composition-hidden :global(.monaco-editor .inputarea.ime-input) {
         opacity: 0;
     }
 </style>
