@@ -254,31 +254,7 @@ pub async fn fetch<R: Runtime>(
 
     let scheme = url.scheme();
     let method = Method::from_bytes(method.as_bytes())?;
-
-    let mut headers = HeaderMap::new();
-    for (h, v) in headers_raw {
-        let name = HeaderName::from_str(&h)?;
-        // RisuNest: the client offers only the codings it decodes. A caller's value could
-        // select one it does not, and that body would reach the page still encoded.
-        if name == header::ACCEPT_ENCODING {
-            continue;
-        }
-        #[cfg(not(feature = "unsafe-headers"))]
-        if is_unsafe_header(&name) {
-            #[cfg(debug_assertions)]
-            {
-                eprintln!(
-                    "[\x1b[33mWARNING\x1b[0m] Skipping {name} header as it is a forbidden header per fetch spec https://fetch.spec.whatwg.org/#terminology-headers"
-                );
-                eprintln!(
-                    "[\x1b[33mWARNING\x1b[0m] if keeping the header is a desired behavior, you can enable `unsafe-headers` feature flag in your Cargo.toml"
-                );
-            }
-            continue;
-        }
-
-        headers.append(name, HeaderValue::from_str(&v)?);
-    }
+    let headers = request_headers(headers_raw, &method, data.is_some())?;
 
     match scheme {
         "http" | "https" => {
@@ -341,43 +317,6 @@ pub async fn fetch<R: Runtime>(
 
             let mut request = builder.build()?.request(method.clone(), url);
 
-            // POST and PUT requests should always have a 0 length content-length,
-            // if there is no body. https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
-            if data.is_none() && matches!(method, Method::POST | Method::PUT) {
-                headers.append(header::CONTENT_LENGTH, HeaderValue::from_str("0")?);
-            }
-
-            if headers.contains_key(header::RANGE) {
-                // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch step 18
-                // If httpRequest's header list contains `Range`, then append (`Accept-Encoding`, `identity`)
-                headers.append(header::ACCEPT_ENCODING, HeaderValue::from_str("identity")?);
-            }
-
-            if !headers.contains_key(header::USER_AGENT) {
-                headers.append(header::USER_AGENT, HeaderValue::from_str(HTTP_USER_AGENT)?);
-            }
-
-            // ensure we have an Origin header set
-            if (cfg!(not(feature = "unsafe-headers")) || !headers.contains_key(header::ORIGIN))
-                && let Ok(url) = webview.url()
-            {
-                // The url crate returns OpaqueOrigin for tauri://localhost which serializes to "null"
-                let origin = if url.scheme() == "tauri" {
-                    "tauri://localhost".to_string()
-                } else {
-                    url.origin().ascii_serialization()
-                };
-                headers.append(header::ORIGIN, HeaderValue::from_str(&origin)?);
-            }
-
-            // In case empty origin is passed, remove it. Some services do not like Origin header
-            // so this way we can remove it in explicit way. The default behaviour is still to set it
-            if cfg!(feature = "unsafe-headers")
-                && headers.get(header::ORIGIN) == Some(&HeaderValue::from_static(""))
-            {
-                headers.remove(header::ORIGIN);
-            };
-
             if let Some(data) = data {
                 request = request.body(data);
             }
@@ -416,6 +355,63 @@ pub async fn fetch<R: Runtime>(
         }
         _ => Err(Error::SchemeNotSupport(scheme.to_string())),
     }
+}
+
+/// The headers a request leaves with: the caller's, plus the defaults the client adds.
+fn request_headers(
+    headers_raw: Vec<(String, String)>,
+    method: &Method,
+    has_body: bool,
+) -> crate::Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    for (h, v) in headers_raw {
+        let name = HeaderName::from_str(&h)?;
+        // RisuNest: the client offers only the codings it decodes. A caller's value could
+        // select one it does not, and that body would reach the page still encoded.
+        if name == header::ACCEPT_ENCODING {
+            continue;
+        }
+        #[cfg(not(feature = "unsafe-headers"))]
+        if is_unsafe_header(&name) {
+            #[cfg(debug_assertions)]
+            {
+                eprintln!(
+                    "[\x1b[33mWARNING\x1b[0m] Skipping {name} header as it is a forbidden header per fetch spec https://fetch.spec.whatwg.org/#terminology-headers"
+                );
+                eprintln!(
+                    "[\x1b[33mWARNING\x1b[0m] if keeping the header is a desired behavior, you can enable `unsafe-headers` feature flag in your Cargo.toml"
+                );
+            }
+            continue;
+        }
+
+        headers.append(name, HeaderValue::from_str(&v)?);
+    }
+
+    // POST and PUT requests should always have a 0 length content-length,
+    // if there is no body. https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
+    if !has_body && matches!(*method, Method::POST | Method::PUT) {
+        headers.append(header::CONTENT_LENGTH, HeaderValue::from_str("0")?);
+    }
+
+    if headers.contains_key(header::RANGE) {
+        // https://fetch.spec.whatwg.org/#http-network-or-cache-fetch step 18
+        // If httpRequest's header list contains `Range`, then append (`Accept-Encoding`, `identity`)
+        headers.append(header::ACCEPT_ENCODING, HeaderValue::from_str("identity")?);
+    }
+
+    if !headers.contains_key(header::USER_AGENT) {
+        headers.append(header::USER_AGENT, HeaderValue::from_str(HTTP_USER_AGENT)?);
+    }
+
+    // RisuNest: no Origin is derived from the webview, so a request reads as a native client's
+    // instead of a browser's cross-origin request, which some services reject. An empty Origin
+    // from the caller also means none.
+    if headers.get(header::ORIGIN) == Some(&HeaderValue::from_static("")) {
+        headers.remove(header::ORIGIN);
+    }
+
+    Ok(headers)
 }
 
 // RisuNest: the text body is sent as its UTF-8 bytes, exactly as the byte body would be.
@@ -767,5 +763,96 @@ mod risunest_request_body_tests {
     fn a_request_with_both_bodies_is_rejected() {
         let error = request_body(Some(vec![1]), Some("a".into())).unwrap_err();
         assert!(matches!(error, Error::ConflictingBody));
+    }
+}
+
+#[cfg(test)]
+mod risunest_request_header_tests {
+    use super::*;
+
+    fn sent(headers: &[(&str, &str)], method: Method, has_body: bool) -> Vec<(String, String)> {
+        let raw = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let mut sent: Vec<_> = request_headers(raw, &method, has_body)
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_string()))
+            .collect();
+        sent.sort();
+        sent
+    }
+
+    fn expected(headers: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut expected: Vec<_> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        expected.sort();
+        expected
+    }
+
+    #[test]
+    fn a_request_carries_the_caller_headers_and_a_user_agent() {
+        assert_eq!(
+            sent(
+                &[("x-api-key", "key"), ("anthropic-version", "2023-06-01")],
+                Method::GET,
+                false,
+            ),
+            expected(&[
+                ("x-api-key", "key"),
+                ("anthropic-version", "2023-06-01"),
+                ("user-agent", HTTP_USER_AGENT),
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_bodiless_post_declares_an_empty_body_and_keeps_the_caller_user_agent() {
+        assert_eq!(
+            sent(&[("user-agent", "Caller/1")], Method::POST, false),
+            expected(&[("content-length", "0"), ("user-agent", "Caller/1")]),
+        );
+        assert_eq!(
+            sent(&[("content-type", "application/json")], Method::POST, true),
+            expected(&[
+                ("content-type", "application/json"),
+                ("user-agent", HTTP_USER_AGENT)
+            ]),
+        );
+    }
+
+    #[test]
+    fn a_range_request_asks_for_an_unencoded_body_whatever_the_caller_offered() {
+        assert_eq!(
+            sent(
+                &[("range", "bytes=0-9"), ("accept-encoding", "br")],
+                Method::GET,
+                false
+            ),
+            expected(&[
+                ("range", "bytes=0-9"),
+                ("accept-encoding", "identity"),
+                ("user-agent", HTTP_USER_AGENT),
+            ]),
+        );
+    }
+
+    #[cfg(feature = "unsafe-headers")]
+    #[test]
+    fn a_caller_origin_is_sent_unless_it_is_empty() {
+        assert_eq!(
+            sent(&[("origin", "https://example.com")], Method::GET, false),
+            expected(&[
+                ("origin", "https://example.com"),
+                ("user-agent", HTTP_USER_AGENT)
+            ]),
+        );
+        assert_eq!(
+            sent(&[("origin", "")], Method::GET, false),
+            expected(&[("user-agent", HTTP_USER_AGENT)]),
+        );
     }
 }
