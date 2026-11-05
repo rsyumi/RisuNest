@@ -212,11 +212,13 @@ describe('Google Translate', () => {
         await expect(translate(text, false)).resolves.toBe('KO paragraph')
         expect(sent()).toEqual({ webView: [{ url: endpoint, method: 'POST', q: text }], native: [] })
     })
-    it.each([['a network error', unreachable], ['a 429', refused]])('asks the native client on Tauri when the WebView request ends in %s', async (failure, webView) => {
-        const sent = googleRequest('tauri', webView)
+    it.each([['a network error', false], ['a 429', true]])('asks the native client on Tauri and releases the WebView response when the WebView request ends in %s', async (failure, refusedByGoogle) => {
+        const release = vi.fn()
+        const sent = googleRequest('tauri', () => refusedByGoogle ? new Response(new ReadableStream({ cancel: release }), { status: 429 }) : unreachable())
         const text = `paragraph the WebView cannot get translated after ${failure}`
         await expect(translate(text, false)).resolves.toBe('KO paragraph')
         expect(sent().native).toEqual([{ url: endpoint, method: 'POST', q: text }])
+        expect(release).toHaveBeenCalledTimes(refusedByGoogle ? 1 : 0)
     })
     it('translates through the experimental Google page on Tauri', async () => {
         const { globalFetch } = await vi.importActual<typeof import('../globalApi.svelte')>('../globalApi.svelte')
