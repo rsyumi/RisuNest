@@ -6,6 +6,7 @@ import { mutatePersistentCharacterDetail } from './storage/persistentDataRuntime
 import {
     captureChatBindingTarget,
     conversationMutationBlockedByGeneration,
+    saveChatBinding,
     updateChatBinding,
 } from './chatBindings.svelte'
 import { withModule, type ModuleScope } from './process/moduleSelection'
@@ -56,6 +57,7 @@ export function setModuleScope(scope: ModuleScope, moduleId: string, enabled: bo
         try {
             const conversation = target.conversation
             await updateChatBinding(conversation, { modules: withModule(conversation.modules, moduleId, enabled) })
+            await saveChatBinding()
             return true
         } catch (error) {
             reportFailure(error)

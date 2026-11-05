@@ -400,8 +400,6 @@ it.each([
     await finishedEdit('module-scope')
     await finishedEdit('module-scope')
     expect(selectedChat().modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
-    // With the chat screen open the edit waits in the conversation session until the next save.
-    await current.runtime.flushPendingData('module-scope-chat')
     expect((await savedChat())?.modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
     // Opening the menu and the chat scope read no messages; the character scope reads what the memory switch reads.
     expect(current.fullReads).toEqual(fullReadsBeforeModules)
@@ -415,7 +413,6 @@ it.each([
     expect((await scopeButton('synthetic-module-a', 'global')).getAttribute('aria-pressed')).toBe('false')
     chatA.click()
     await finishedEdit('module-scope')
-    await current.runtime.flushPendingData('module-scope-menu')
     expect((await savedChat())?.modules).toEqual(['synthetic-module-b'])
     expect((await current.raw.readCharacter(interactionCharacterId))?.value.modules).toEqual(['synthetic-module-a'])
     expect(db.enabledModules).toEqual(['synthetic-module-b'])
