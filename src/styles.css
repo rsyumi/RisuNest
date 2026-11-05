@@ -512,6 +512,12 @@ select optgroup {
   z-index: 2000;
 }
 
+/* Menus that open at the pointer on any screen, including a z-modal one (the code block menu).
+   They stay below the app lock. */
+@utility z-modal-menu {
+  z-index: 2100;
+}
+
 /* Work dialogs that have to cover the z-[1000] ones. The update dialog covers an import that
    is already running, and the working-set recovery covers both because nothing else can be
    used until the data is read again. Both stay below z-modal. */
