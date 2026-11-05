@@ -52,9 +52,6 @@ vi.mock('../Others/ChatList.svelte', async () => ({
 vi.mock('./TransitionImage.svelte', () => ({ default: () => {} }))
 vi.mock('./BackgroundDom.svelte', () => ({ default: () => {} }))
 vi.mock('../UI/GUI/SideBarArrow.svelte', () => ({ default: () => {} }))
-vi.mock('../Setting/Pages/Module/ModuleChatMenu.svelte', () => ({
-    default: () => {},
-}))
 
 import ChatScreen from './ChatScreen.svelte'
 import { language } from '../../lang'

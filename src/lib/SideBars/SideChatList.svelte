@@ -20,6 +20,7 @@
     import { language } from "src/lang";
     import { bindPersona, chatBindingBlockedByGeneration, saveChatBinding } from 'src/ts/chatBindings.svelte'
     import Toggles from "./Toggles.svelte";
+    import ModuleScopeButton from "./ModuleScopeButton.svelte";
     import { changeChatTo } from "src/ts/globalApi.svelte";
     import { isWorkingSetCharacterStub } from "src/ts/storage/workingSetCatalog";
     import { indexSideChatListRows, orderChatsByDroppedRows, orderFoldersByDroppedIds, type DroppedChatRow } from "./sideChatListRows";
@@ -528,6 +529,7 @@
 
         {#if DBState.db.characters[$selectedCharID]?.chaId !== '§playground'}            
             <Toggles bind:chara={chara} noContainer />
+            <ModuleScopeButton />
         {/if}
     </div>
 
