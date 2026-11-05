@@ -211,7 +211,10 @@ vi.mock('../storage/persistentDataRuntime.svelte', async () => (await import('./
 vi.mock('../storage/persistentDataStoreFactory', async () => (await import('./tests/sendChatTestHarness')).persistentDataStoreFactoryModule(() => mocks.persistentStore))
 
 import type { character, Chat, Database, Message } from '../storage/database.svelte'
-import { ActiveConversationSession } from '../storage/activeConversationSession'
+import { ActiveConversationSession, cloneConversationMetadata } from '../storage/activeConversationSession'
+import { hypaMemoryV2 } from './memory/hypav2'
+import { hypaMemoryV3 } from './memory/hypav3'
+import { supaMemory } from './memory/supaMemory'
 import { SelectedConversationPromotionStaleError } from '../storage/activeWorkingSet.svelte'
 import { createLeaseStub } from '../storage/persistentDataStore.testSupport'
 import { PersistentMutationFencedError } from '../storage/saveCoordinator'
@@ -997,6 +1000,41 @@ describe('sendChat generation session integration', () => {
             mutations: [{ start: 0, deleteCount: 1 }],
         })
     })
+
+    it.each(['none', 'hypaV3', 'hypav2', 'supa'] as const)(
+        'records the prompt memory state through the active session before the provider request with %s memory', async (route) => {
+            const onMutation = vi.fn()
+            const { chat, currentCharacter } = installDatabase(makeChat(), [], onMutation)
+            chat.lastMemory = 'stale-memory-position'
+            currentCharacter.supaMemory = route !== 'none'
+            DBState.db.hypaV3 = route === 'hypaV3'
+            DBState.db.hypav2 = route === 'hypav2'
+            if (route === 'supa') DBState.db.supaModelType = 'subModel'
+            vi.mocked(hypaMemoryV3).mockImplementationOnce(async (chats, currentTokens) => ({
+                chats, currentTokens, memory: { summaries: [{ chatMemos: ['user-message'], text: 'synthetic summary' }] } as any,
+            }))
+            vi.mocked(hypaMemoryV2).mockImplementationOnce(async (chats, currentTokens) => ({
+                chats, currentTokens, memory: { chunks: [], mainChunks: [{ id: 0, text: 'synthetic summary', chatMemos: ['user-message'] }] } as any,
+            }))
+            vi.mocked(supaMemory).mockImplementationOnce(async (chats, currentTokens) => ({
+                chats, currentTokens, memory: 'synthetic summary', lastId: 'user-message',
+            }))
+            const field = ({ none: 'lastMemory', hypaV3: 'hypaV3Data', hypav2: 'hypaV2Data', supa: 'supaMemoryData' } as const)[route]
+            const before = cloneConversationMetadata(chat)[field]
+            let requestMetadata: Record<string, unknown> | undefined
+            let recordedMetadata: unknown
+            mocks.modelResponse = () => {
+                requestMetadata = cloneConversationMetadata(chat)
+                recordedMetadata = onMutation.mock.calls.at(-1)?.[0].conversation
+                return { type: 'success', result: 'answer' }
+            }
+
+            await expect(sendChat()).resolves.toBe(true)
+
+            expect(requestMetadata?.[field]).not.toEqual(before)
+            expect(recordedMetadata).toEqual(requestMetadata)
+        },
+    )
 
     it.each([
         {
