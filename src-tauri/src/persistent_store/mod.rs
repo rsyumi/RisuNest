@@ -2866,10 +2866,12 @@ impl PersistentStore {
         self.snapshot_create_keeping(reason, snapshot::KeepCount::MAX)
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_list(&self) -> StoreResult<Vec<SnapshotInfo>> {
         snapshot::list(&self.snapshots_dir)
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_delete(&self, id: &str) -> StoreResult<()> {
         snapshot_archive::Archive::open(&self.snapshots_dir)?.delete(id)
     }

@@ -71,6 +71,7 @@ mod regex_shadow;
 #[cfg(not(target_os = "android"))]
 mod renderer_recovery;
 mod server_sync;
+mod async_worker;
 mod slow_log;
 mod sqlite_open;
 mod trust_boundary;
