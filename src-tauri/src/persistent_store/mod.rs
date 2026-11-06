@@ -2853,6 +2853,7 @@ impl PersistentStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_create_keeping(
         &mut self,
         reason: &str,
