@@ -411,6 +411,15 @@ describe('renderer-lifetime native file job manager', () => {
                 },
             },
             {
+                error: new NativeFileJobError('unsupported-projection', 'synthetic contract rejection', [], undefined,
+                    { kind: 'chat', name: 'Synthetic chat', character: 'Synthetic' }),
+                expected: {
+                    state: 'failed',
+                    error: { code: 'unsupported-projection', message: 'synthetic contract rejection', recoveryRequired: false,
+                        owner: { kind: 'chat', name: 'Synthetic chat', character: 'Synthetic' } },
+                },
+            },
+            {
                 error: new TypeError('boom'),
                 expected: {
                     state: 'failed',

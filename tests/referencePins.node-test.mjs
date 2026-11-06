@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
-import { matchesSourcePin, references, sha256, verifyGeneratedContract } from '../scripts/compatibleExportContract.mjs'
+import { keepMatchingPins, matchesSourcePin, references, sha256, verifyGeneratedContract } from '../scripts/compatibleExportContract.mjs'
 
 test('source pins accept LF and CRLF but reject content changes; binary hashes remain exact', () => {
   const lf = Buffer.from('export const value = "synthetic";\n\n')
@@ -13,6 +15,28 @@ test('source pins accept LF and CRLF but reject content changes; binary hashes r
     assert(!matchesSourcePin(lf.toString().trimEnd(), expected))
   }
   assert.notEqual(sha256(lf), sha256(crlf))
+})
+
+test('regeneration keeps a committed pin of the other newline style and replaces a changed one', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'reference-pins-'))
+  try {
+    const lf = 'export const value = "synthetic";\n'
+    const crlf = (text) => text.replaceAll('\n', '\r\n')
+    writeFileSync(join(directory, 'same.ts'), lf)
+    writeFileSync(join(directory, 'changed.ts'), lf)
+    const committed = { reference: { files: {
+      'same.ts': sha256(crlf(lf)),
+      'changed.ts': sha256(crlf(lf.replace('synthetic', 'previous'))),
+    } } }
+    const generated = { target: 'pocket', reference: { files: { 'same.ts': sha256(lf), 'changed.ts': sha256(lf), 'new.ts': 'new' } } }
+    assert.deepEqual(keepMatchingPins(generated, committed, directory).reference.files, {
+      'same.ts': committed.reference.files['same.ts'],
+      'changed.ts': sha256(lf),
+      'new.ts': 'new',
+    })
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test('generated contract checks still reject revision, schema and dependency changes', () => {

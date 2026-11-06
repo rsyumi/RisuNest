@@ -87,6 +87,20 @@ pub(crate) struct NativeJobError {
     pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) item_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner: Option<FailureOwner>,
+}
+
+/// The library item whose data failed. Its name stays out of the message,
+/// which is logged.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FailureOwner {
+    pub(crate) kind: &'static str,
+    pub(crate) name: String,
+    /// The character a chat belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) character: Option<String>,
 }
 
 impl NativeJobError {
@@ -95,11 +109,18 @@ impl NativeJobError {
             code: code.to_owned(),
             message: bounded_message(message.as_ref()),
             item_kind: None,
+            owner: None,
         }
     }
 
     pub(crate) fn too_large(item_kind: &str, message: impl AsRef<str>) -> Self {
         Self { item_kind: Some(item_kind.to_owned()), ..Self::new("payload-too-large", message) }
+    }
+
+    /// Names the owner unless a nearer one is already named.
+    pub(crate) fn owned_by(mut self, owner: &FailureOwner) -> Self {
+        self.owner.get_or_insert_with(|| owner.clone());
+        self
     }
 }
 
@@ -4271,6 +4292,7 @@ pub(crate) struct RestoreOmissions {
     pub(crate) oversized_plugin_storage: u64,
     pub(crate) inlays: u64,
     pub(crate) excluded_characters: u64,
+    pub(crate) missing_assets: u64,
 }
 
 impl IncompleteRestorePreview {
@@ -4290,6 +4312,7 @@ impl IncompleteRestorePreview {
             ("oversized-plugin-storage", self.omissions.oversized_plugin_storage),
             ("skipped-backup-inlays", self.omissions.inlays),
             ("excluded-backup-characters", self.omissions.excluded_characters),
+            ("missing-backup-assets", self.omissions.missing_assets),
         ] {
             if count != 0 { warnings.push(format!("{kind}:{count}")); }
         }
@@ -4336,6 +4359,8 @@ pub(crate) struct JobFailure {
     pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) item_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner: Option<FailureOwner>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -4663,9 +4688,10 @@ impl JobControl {
     pub(crate) fn set_incomplete_restore_preview(&self, mut preview: IncompleteRestorePreview) -> Result<(), String> {
         let mut status = self.status.lock().map_err(|_| "native job mutex poisoned".to_owned())?;
         if let Some(previous) = &status.incomplete_restore_preview {
-            let inlays = preview.omissions.inlays;
+            let (inlays, assets) = (preview.omissions.inlays, preview.omissions.missing_assets);
             preview.omissions = previous.omissions.clone();
             preview.omissions.inlays = preview.omissions.inlays.saturating_add(inlays);
+            preview.omissions.missing_assets = preview.omissions.missing_assets.saturating_add(assets);
         }
         status.incomplete_restore_preview = if preview.warning_codes().is_empty() { None } else { Some(preview) };
         Ok(())
@@ -4816,7 +4842,7 @@ impl JobControl {
         let receipt=status.portable_body_retry.as_mut().ok_or("portable body owner is missing")?;
         receipt.available=!wait.portable_body_retired;
         status.state=if self.is_cancel_requested() {JobState::Cancelled} else {JobState::Failed};
-        status.error=Some(JobFailure {code:failure.code.clone(),message:bounded_message(&failure.message),item_kind:None});
+        status.error=Some(JobFailure {code:failure.code.clone(),message:bounded_message(&failure.message),item_kind:None,owner:None});
         drop(status);
         while !wait.portable_body_retry_requested && !wait.portable_body_retired {
             wait=self.wait_changed.wait(wait).map_err(|_|"native job wait mutex poisoned")?;
@@ -5535,6 +5561,7 @@ impl JobControl {
                 Some(JobFailure {
                     code: "cleanup-failed".to_owned(),
                     item_kind: None,
+                    owner: None,
                     message: bounded_message(&format!(
                         "{}; cleanup failed: {cleanup}",
                         error.message
@@ -5547,6 +5574,7 @@ impl JobControl {
                 Some(JobFailure {
                     code: "cleanup-failed".to_owned(),
                     item_kind: None,
+                    owner: None,
                     message: bounded_message(&cleanup),
                 }),
                 None,
@@ -5558,6 +5586,7 @@ impl JobControl {
                     code: error.code,
                     message: error.message,
                     item_kind: error.item_kind,
+                    owner: error.owner,
                 }),
                 None,
             ),
@@ -5651,14 +5680,14 @@ impl JobControl {
     }
 
     pub(crate) fn finish_failure(&self, code: &str, message: &str) -> Result<(), String> {
-        self.finish_failure_with_item(code, message, None)
+        self.finish_failure_with_item(code, message, None, None)
     }
 
     fn finish_native_failure(&self, error: &NativeJobError) -> Result<(), String> {
-        self.finish_failure_with_item(&error.code, &error.message, error.item_kind.as_deref())
+        self.finish_failure_with_item(&error.code, &error.message, error.item_kind.as_deref(), error.owner.clone())
     }
 
-    fn finish_failure_with_item(&self, code: &str, message: &str, item_kind: Option<&str>) -> Result<(), String> {
+    fn finish_failure_with_item(&self, code: &str, message: &str, item_kind: Option<&str>, owner: Option<FailureOwner>) -> Result<(), String> {
         if code.is_empty() || code.len() > MAX_CODE_BYTES {
             return Err("native job error code is invalid".to_owned());
         }
@@ -5687,6 +5716,7 @@ impl JobControl {
             code: code.to_owned(),
             message: bounded_message(message),
             item_kind: item_kind.map(str::to_owned),
+            owner,
         });
         status.prepared_content = None;
         status.publication_attempt = None;
@@ -8683,10 +8713,30 @@ mod tests {
         let status = serde_json::to_value(oversized.status()).unwrap();
         assert_eq!(status["error"]["code"], "payload-too-large");
         assert_eq!(status["error"]["itemKind"], "compatible-database");
+        let rejected = registry.create(JobKind::ExportCompatibleLocalBackup).unwrap();
+        rejected.start(JobPhase::WritingExport).unwrap();
+        let owner = FailureOwner { kind: "chat", name: "Synthetic chat".into(), character: Some("Synthetic".into()) };
+        rejected.finish_native_failure(&NativeJobError::new("unsupported-projection", "synthetic rejection").owned_by(&owner)).unwrap();
+        assert_eq!(serde_json::to_value(rejected.status()).unwrap()["error"]["owner"],
+            serde_json::json!({"kind":"chat","name":"Synthetic chat","character":"Synthetic"}));
         let content = registry.create(JobKind::PrepareContentImport).unwrap();
         content.start(JobPhase::ReadingSource).unwrap();
         content.finish_content_job_inner(Err(NativeJobError::too_large("card", "synthetic size limit")), Ok(()), None).unwrap();
         assert_eq!(serde_json::to_value(content.status()).unwrap()["error"]["itemKind"], "card");
+    }
+
+    #[test]
+    fn restore_preview_keeps_recorded_omissions_with_the_counts_the_staging_adds() {
+        let job = JobRegistry::default().create(JobKind::RestoreLegacyLocalBackup).unwrap();
+        job.record_restore_omission("excludedCharacters", 2).unwrap();
+        let mut staged = IncompleteRestorePreview::default();
+        staged.omissions.inlays = 1;
+        staged.omissions.missing_assets = 3;
+        job.set_incomplete_restore_preview(staged).unwrap();
+        assert_eq!(
+            job.status().incomplete_restore_preview.unwrap().warning_codes(),
+            ["skipped-backup-inlays:1", "excluded-backup-characters:2", "missing-backup-assets:3"],
+        );
     }
 
     #[test]

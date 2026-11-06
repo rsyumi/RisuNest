@@ -15,6 +15,7 @@ import {
     resolveNativeFileJobStage,
     portableBodyRetryRequest,
     retryNativePortableRestoreBodies,
+    type NativeFileJobFailureOwner,
     type NativeFileJobResult,
     type NativeFileJobStage,
     type NativeFileJobStatus,
@@ -62,6 +63,7 @@ export interface NativeFileOperationError {
     recoveryRequired: boolean
     /** The kind of a refused item that is too large to save. */
     itemKind?: string
+    owner?: NativeFileJobFailureOwner
 }
 
 export interface NativeFileOperationOutcome {
@@ -191,7 +193,8 @@ function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFile
         'message' in error && typeof error.message === 'string'
     ) {
         return { code: error.code, message: error.message, recoveryRequired: false,
-            ...('itemKind' in error && typeof error.itemKind === 'string' ? { itemKind: error.itemKind } : {}) }
+            ...('itemKind' in error && typeof error.itemKind === 'string' ? { itemKind: error.itemKind } : {}),
+            ...(error instanceof NativeFileJobError && error.owner ? { owner: error.owner } : {}) }
     }
     return {
         code: `${kind}-error`,

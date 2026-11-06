@@ -1052,6 +1052,18 @@ describe('character card additions', () => {
         expect(without && without.onboarding).toBeUndefined()
     })
 
+    it('imports a card lorebook entry without content as empty text', async () => {
+        await exportCharacterCard(plainCharacter(), 'json', { spec: 'v3' })
+        const card = exportedJson(0)
+        card.data.assets = []
+        card.data.character_book = {
+            extensions: {},
+            entries: [{ keys: ['synthetic'], content: null, extensions: {}, enabled: true, insertion_order: 100 }],
+        }
+        const imported = await importCharacterCardSpec(structuredClone(card), undefined, 'normal', {}, null, true)
+        expect(imported && imported.globalLore[0]).toMatchObject({ key: 'synthetic', content: '' })
+    })
+
     it('stops a Realm download or preview from a blocked creator before anything is downloaded', async () => {
         mocks.database.blockedRealmCreators = [{ id: 'blocked-creator', name: 'Blocked' }]
         const info = (creator: string) => ({ status: 200, json: async () => ({ id: 'synthetic-card', creator }), text: async () => '' })

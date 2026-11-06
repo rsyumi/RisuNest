@@ -635,7 +635,7 @@
           "optional": false
         },
         "hanuraiTokens": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "heightMode": {
@@ -675,11 +675,11 @@
           "optional": false
         },
         "hypaAllocatedTokens": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "hypaChunkSize": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "hypaCustomSettings": {
@@ -879,7 +879,7 @@
           "optional": false
         },
         "maxSupaChunkSize": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "memoryAlgorithmType": {
@@ -1231,7 +1231,7 @@
           "optional": true
         },
         "sdCFG": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "sdConfig": {
@@ -1243,7 +1243,7 @@
           "optional": false
         },
         "sdSteps": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "selectedPersona": {
@@ -1843,7 +1843,7 @@
       "kind": "tuple",
       "items": [
         "n5",
-        "n7"
+        "n751"
       ],
       "optional": [
         false,
@@ -2986,11 +2986,11 @@
           "optional": true
         },
         "rangeEnd": {
-          "node": "n111",
+          "node": "n822",
           "optional": false
         },
         "rangeStart": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "type": {
@@ -3071,7 +3071,7 @@
       "kind": "object",
       "fields": {
         "depth": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "name": {
@@ -4867,7 +4867,7 @@
     "n229": {
       "kind": "object",
       "fields": {},
-      "additional": "n230"
+      "additional": "n821"
     },
     "n230": {
       "kind": "union",
@@ -4888,7 +4888,7 @@
       "kind": "object",
       "fields": {
         "depth": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "prompt": {
@@ -4923,7 +4923,7 @@
       "kind": "object",
       "fields": {
         "chunk_length": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "model": {
@@ -5201,11 +5201,11 @@
           "optional": false
         },
         "scanDepth": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "tokenBudget": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         }
       },
@@ -5604,7 +5604,7 @@
       "kind": "object",
       "fields": {
         "depth": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "type": {
@@ -9849,7 +9849,7 @@
           "optional": false
         },
         "timeout": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "workflow": {
@@ -10344,11 +10344,11 @@
           "optional": false
         },
         "embeddingMaxConcurrent": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "embeddingRequestsPerMinute": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "enableSimilarityCorrection": {
@@ -10360,7 +10360,7 @@
           "optional": false
         },
         "maxChatsPerSummary": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "memoryTokensRatio": {
@@ -10376,7 +10376,7 @@
           "optional": false
         },
         "queryChatCount": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "recentMemoryRatio": {
@@ -10392,7 +10392,7 @@
           "optional": false
         },
         "summarizationMaxConcurrent": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "summarizationModel": {
@@ -10404,7 +10404,7 @@
           "optional": false
         },
         "summarizationRequestsPerMinute": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "summaryChunkSeparator": {
@@ -10639,7 +10639,7 @@
           "optional": false
         },
         "cfg_rescale": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "character_base64image": {
@@ -10655,7 +10655,7 @@
           "optional": false
         },
         "height": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "image": {
@@ -10695,7 +10695,7 @@
           "optional": false
         },
         "scale": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "sm": {
@@ -10707,7 +10707,7 @@
           "optional": false
         },
         "steps": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "strength": {
@@ -10743,7 +10743,7 @@
           "optional": true
         },
         "width": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         }
       },
@@ -11198,7 +11198,7 @@
     "n714": {
       "kind": "object",
       "fields": {},
-      "additional": "n715"
+      "additional": "n820"
     },
     "n715": {
       "kind": "union",
@@ -11303,7 +11303,7 @@
       "kind": "object",
       "fields": {
         "denoising_strength": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "enable_hr": {
@@ -11311,11 +11311,11 @@
           "optional": false
         },
         "height": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "hr_scale": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "hr_upscaler": {
@@ -11331,7 +11331,7 @@
           "optional": false
         },
         "width": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         }
       },
@@ -12098,6 +12098,32 @@
         "n34",
         "n717",
         "n718"
+      ]
+    },
+    "n820": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n5",
+        "n7"
+      ]
+    },
+    "n821": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n5",
+        "n7",
+        "n9",
+        "n10"
+      ]
+    },
+    "n822": {
+      "kind": "union",
+      "variants": [
+        "n243",
+        "n7",
+        "n112"
       ]
     }
   }

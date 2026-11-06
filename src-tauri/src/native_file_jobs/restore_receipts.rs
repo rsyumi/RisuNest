@@ -93,7 +93,7 @@ fn reconcile_matching(store: &PersistentStore, registry: &JobRegistry, job_id: O
             status.activation_revision = None;
             status.activation_authority = None;
             status.result = None;
-            status.error = Some(JobFailure { code: "activation-outcome-unresolved".into(), message: error.to_string(), item_kind: None });
+            status.error = Some(JobFailure { code: "activation-outcome-unresolved".into(), message: error.to_string(), item_kind: None, owner: None });
         } else if let Some(revision) = revision {
             status.state = JobState::Succeeded;
             status.error = None;
@@ -107,7 +107,7 @@ fn reconcile_matching(store: &PersistentStore, registry: &JobRegistry, job_id: O
             });
         } else {
             status.state = JobState::Cancelled;
-            status.error = Some(JobFailure { code: "cancelled".into(), message: "Backup preparation was interrupted before activation".into(), item_kind: None });
+            status.error = Some(JobFailure { code: "cancelled".into(), message: "Backup preparation was interrupted before activation".into(), item_kind: None, owner: None });
         }
     }
     Ok(())
@@ -190,7 +190,7 @@ mod tests {
                 status.activation_revision = None;
                 status.activation_authority = None;
                 status.result = None;
-                status.error = Some(JobFailure { code: "cancelled".into(), message: "Confirmed before activation".into(), item_kind: None });
+                status.error = Some(JobFailure { code: "cancelled".into(), message: "Confirmed before activation".into(), item_kind: None, owner: None });
             }
             *job.status.lock().unwrap() = status.clone();
             reconcile(&store, &registry).unwrap();
@@ -224,7 +224,7 @@ mod tests {
         let job = registry.lookup(&id).unwrap().unwrap();
         let mut failed = status;
         failed.state = JobState::Failed;
-        failed.error = Some(JobFailure { code: "store-error".into(), message: "Confirmed no activation".into(), item_kind: None });
+        failed.error = Some(JobFailure { code: "store-error".into(), message: "Confirmed no activation".into(), item_kind: None, owner: None });
         *job.status.lock().unwrap() = failed.clone();
         reconcile_job(&store, &registry, &id).unwrap();
         assert_eq!(serde_json::to_value(job.status()).unwrap(), serde_json::to_value(failed).unwrap());

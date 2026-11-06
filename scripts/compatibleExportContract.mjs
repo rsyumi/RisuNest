@@ -80,9 +80,16 @@ export function verifyReferenceRevision(target) {
   return rootPath;
 }
 
-// Reference declarations that the reference's own code contradicts, as
-// `Type.field` to the node the reference actually writes and reads, or
-// "nullable" for a required field it also stores null in.
+// A correction for one target, where the other does not declare the field.
+const only = (target, correction) => ({ only: target, correction });
+// A cleared number input stores null.
+const cleared = (fields) => Object.fromEntries(fields.map((field) => [field, "nullable"]));
+
+// Reference declarations that the reference's own code contradicts, as a path
+// from a declared type to the node the reference actually writes and reads, or
+// "nullable" for a required value it also stores null in. A path continues with
+// `.field`, `[]` for array items, `[N]` for a tuple item and `.*` for a
+// dictionary value, and corrects every union variant that declares it.
 const referenceCorrections = {
   // Its settings checkbox writes true, and bootstrap reads the field as truthy.
   "Database.botSettingAtStart": { kind: "scalar", type: "boolean" },
@@ -103,14 +110,111 @@ const referenceCorrections = {
       "maxContext",
       "maxResponse",
       "generationSeed",
+      "sdSteps",
+      "sdCFG",
     ].map((field) => [`Database.${field}`, "nullable"]),
   ),
+  ...Object.fromEntries(
+    ["hanuraiTokens", "hypaChunkSize", "hypaAllocatedTokens", "maxSupaChunkSize"].map(
+      (field) => [`Database.${field}`, only("risuai", "nullable")],
+    ),
+  ),
+  // The image generation inputs store null, which requests send as is.
+  ...cleared([
+    "sdConfig.width",
+    "sdConfig.height",
+    "sdConfig.denoising_strength",
+    "sdConfig.hr_scale",
+    "NAIImgConfig.width",
+    "NAIImgConfig.height",
+    "NAIImgConfig.steps",
+    "NAIImgConfig.scale",
+    "NAIImgConfig.cfg_rescale",
+    "ComfyConfig.timeout",
+  ]),
+  // The loader replaces a cleared memory preset number with the default.
+  ...cleared(
+    [
+      "maxChatsPerSummary",
+      "queryChatCount",
+      "summarizationRequestsPerMinute",
+      "summarizationMaxConcurrent",
+      "embeddingRequestsPerMinute",
+      "embeddingMaxConcurrent",
+    ].map((field) => `Database.hypaV3Presets[].settings.${field}`),
+  ),
+  // Number plugin arguments and the developer tool's number state values.
+  ...cleared(["Database.plugins[].realArg.*", "Chat.scriptstate.*"]),
+  // The bias tuple is shared by the root, presets and characters.
+  ...cleared(["character.bias[][1]"]),
+  // Prompt items are shared by the root and presets; a cleared range or cache
+  // depth is read as 0 or as no limit.
+  ...cleared([
+    "Database.promptTemplate[].rangeStart",
+    "Database.promptTemplate[].rangeEnd",
+    "Database.promptTemplate[].depth",
+  ]),
+  // Character settings: a cleared lorebook scan depth or budget falls back to
+  // the global setting, and the depth prompt and Fish Speech inputs store null.
+  ...cleared([
+    "loreSettings.scanDepth",
+    "loreSettings.tokenBudget",
+    "character.depth_prompt.depth",
+    "character.fishSpeechConfig.chunk_length",
+    "triggerscript.conditions[].depth",
+  ]),
   // Saving the preset copies a cleared maxContext or maxResponse into it.
   "botPreset.maxContext": "nullable",
   "botPreset.maxResponse": "nullable",
   // A cleared insertion order stores null, which the lorebook sort reads as 0.
   "loreBook.insertorder": "nullable",
 };
+
+/** Where a correction path ends: every field, item or dictionary value it reaches. */
+function correctionSlots(nodes, types, name) {
+  const [, type, rest] = name.match(/^([^.[]+)(.*)$/);
+  const steps = rest.match(/\.[^.[\]]+|\[\d*\]/g) ?? [];
+  if (steps.join("") !== rest || !steps.length) throw new Error(`Invalid correction path ${name}`);
+  const variants = (id) => (nodes[id].kind === "union" ? nodes[id].variants.flatMap(variants) : [id]);
+  let slots = Object.hasOwn(types, type) ? [{ get: () => types[type] }] : [];
+  for (const step of steps) {
+    const ids = new Set(slots.flatMap((slot) => variants(slot.get())));
+    slots = [...ids].flatMap((id) => {
+      const node = nodes[id];
+      if (step === ".*")
+        return node.kind === "object" && node.additional
+          ? [{ get: () => node.additional, set: (value) => (node.additional = value) }]
+          : [];
+      if (step.startsWith(".")) {
+        const field = node.kind === "object" ? node.fields[step.slice(1)] : undefined;
+        return field ? [{ get: () => field.node, set: (value) => (field.node = value) }] : [];
+      }
+      if (step === "[]")
+        return node.kind === "array"
+          ? [{ get: () => node.items, set: (value) => (node.items = value) }]
+          : [];
+      const index = Number(step.slice(1, -1));
+      return node.kind === "tuple" && index < node.items.length
+        ? [{ get: () => node.items[index], set: (value) => (node.items[index] = value) }]
+        : [];
+    });
+  }
+  return slots;
+}
+
+/**
+ * Keeps a committed source pin whose file still matches with the other newline
+ * style, so regenerating from a checkout with different line endings does not
+ * rewrite it.
+ */
+export function keepMatchingPins(contract, committed, directory) {
+  for (const [file, hash] of Object.entries(contract.reference.files)) {
+    const pinned = committed.reference?.files?.[file];
+    if (pinned && pinned !== hash && matchesSourcePin(fs.readFileSync(path.join(directory, file)), pinned))
+      contract.reference.files[file] = pinned;
+  }
+  return contract;
+}
 
 export function generateContract(target) {
   const reference = references[target];
@@ -138,14 +242,18 @@ export function generateContract(target) {
   for (const node of Object.values(nodes))
     for (const field of node.kind === "object" ? Object.values(node.fields) : [])
       if (field.optional) field.node = nullable(field.node);
-  for (const [name, correction] of Object.entries(referenceCorrections)) {
-    const [type, field] = name.split(".");
-    const declared = nodes[types[type]]?.fields[field];
-    if (!declared) throw new Error(`${target} reference no longer declares ${name}`);
-    const corrected = correction === "nullable" ? nullable(declared.node) : intern(correction);
-    if (isDeepStrictEqual(nodes[corrected], nodes[declared.node]))
-      throw new Error(`${target} reference already declares ${name} as corrected`);
-    declared.node = corrected;
+  for (const [name, entry] of Object.entries(referenceCorrections)) {
+    const { correction, only } = entry.only ? entry : { correction: entry };
+    if (only && only !== target) continue;
+    const slots = correctionSlots(nodes, types, name);
+    if (!slots.length) throw new Error(`${target} reference no longer declares ${name}`);
+    for (const slot of slots) {
+      const declared = slot.get();
+      const corrected = correction === "nullable" ? nullable(declared) : intern(correction);
+      if (isDeepStrictEqual(nodes[corrected], nodes[declared]))
+        throw new Error(`${target} reference already declares ${name} as corrected`);
+      slot.set(corrected);
+    }
   }
   for (const name of [
     "src/ts/storage/risuSave.ts",
@@ -391,7 +499,11 @@ if (
     if (check) {
       const committed = JSON.parse(fs.readFileSync(file, "utf8"));
       verifyGeneratedContract(contract, committed);
-    } else fs.writeFileSync(file, JSON.stringify(contract, null, 2) + "\n");
+    } else {
+      if (fs.existsSync(file))
+        keepMatchingPins(contract, JSON.parse(fs.readFileSync(file, "utf8")), references[target].directory);
+      fs.writeFileSync(file, JSON.stringify(contract, null, 2) + "\n");
+    }
     console.log(
       `${target}: ${Object.keys(contract.nodes).length} nodes, ${Object.keys(contract.reference.files).length} pinned sources`,
     );

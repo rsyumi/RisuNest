@@ -610,8 +610,8 @@ fn with_store_mutex_mut_admitted<T>(
 }
 
 #[track_caller]
-pub(crate) fn commit_staged_replacement(
-    app: &AppHandle,
+pub(crate) fn commit_staged_replacement<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     staging_id: &str,
     expected_revision: Option<i64>,
     binding_authority: Option<&str>,
