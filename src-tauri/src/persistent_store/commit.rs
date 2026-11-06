@@ -1313,13 +1313,12 @@ fn replacement_asset_owner_scan_is_complete(
         }
     }
     let mut complete=true;
-    root.visit("modules",|_,module| {
-        complete &= module.as_object().is_some_and(|module|module.get("assets").is_none_or(Value::is_array));
+    root.visit_member_texts("modules",|module| {
+        complete &= replacement_scan::module_assets_are_listed(module)?;
         Ok(())
     })?;
-    root.visit("personas",|_,persona| {
-        complete &= persona.as_object().is_some_and(|persona|persona.get("embeddedModule").is_none_or(|module|
-            module.as_object().is_some_and(|module|module.get("assets").is_none_or(Value::is_array))));
+    root.visit_member_texts("personas",|persona| {
+        complete &= replacement_scan::embedded_module_assets_are_listed(persona)?;
         Ok(())
     })?;
     if !complete { return Ok(false); }
@@ -1499,13 +1498,7 @@ fn replacement_owner_tuple(
                 )
                 .optional()?
                 .transpose()?;
-            Ok(match assets {
-                None | Some(replacement_scan::AdditionalAssets::Unusable) => None,
-                Some(replacement_scan::AdditionalAssets::Absent) => Some(ReplacementOwnerTuple::Absent),
-                Some(replacement_scan::AdditionalAssets::Entries(entries)) => {
-                    Some(ReplacementOwnerTuple::Present(entries))
-                }
-            })
+            Ok(listed_owner_tuple(assets))
         }
         AssetOwnerLocator::RootModuleAssets { .. } | AssetOwnerLocator::PersonaEmbeddedModuleAssets { .. } => {
             let Some(module)=owner.root_parent(root) else{return Ok(None)};
@@ -1520,19 +1513,27 @@ fn streamed_replacement_owner_tuple(
     root: &super::upstream_stream::RootSpool,
     owner: &AssetOwnerLocator,
 ) -> StoreResult<Option<ReplacementOwnerTuple>> {
-    let parent=match owner {
+    let assets=match owner {
         AssetOwnerLocator::CharacterAdditionalAssets { .. } => {
             return replacement_owner_tuple(connection,generation,&serde_json::json!({}),owner);
         }
-        AssetOwnerLocator::RootModuleAssets { module_id } => root.record_by_id("modules",module_id)?,
+        AssetOwnerLocator::RootModuleAssets { module_id } => {
+            root.read_record("modules",module_id,replacement_scan::module_assets)?
+        }
         AssetOwnerLocator::PersonaEmbeddedModuleAssets { persona_id,module_id } => {
-            root.record_by_id("personas",persona_id)?
-                .and_then(|mut persona|persona.as_object_mut()?.shift_remove("embeddedModule"))
-                .filter(|module|module.get("id").and_then(Value::as_str)==Some(module_id))
+            root.read_record("personas",persona_id,|persona|replacement_scan::embedded_module_assets(persona,module_id))?.flatten()
         }
     };
-    let Some(parent)=parent else { return Ok(None); };
-    replacement_owner_tuple_from_parent(&parent,"assets")
+    Ok(listed_owner_tuple(assets))
+}
+
+// Matches `replacement_owner_tuple_from_parent` for entries read without the parent.
+fn listed_owner_tuple(assets: Option<replacement_scan::ArrayProperty>) -> Option<ReplacementOwnerTuple> {
+    match assets {
+        None | Some(replacement_scan::ArrayProperty::Unusable) => None,
+        Some(replacement_scan::ArrayProperty::Absent) => Some(ReplacementOwnerTuple::Absent),
+        Some(replacement_scan::ArrayProperty::Entries(entries)) => Some(ReplacementOwnerTuple::Present(entries)),
+    }
 }
 
 // A malformed parent or non-array property yields no tuple, so the head is
@@ -3213,9 +3214,9 @@ fn staged_plugin_names(connection: &Connection, repository_root: &std::path::Pat
         return Ok(Vec::new());
     }
     let mut names=Vec::new();
-    root.visit("plugins",|_,entry| {
-        if let Some(Value::String(name))=entry.get("name") {
-            if !name.is_empty() { names.push(name.clone()); }
+    root.visit_member_texts("plugins",|entry| {
+        if let Some(name)=replacement_scan::record_name(entry)? {
+            if !name.is_empty() { names.push(name); }
         }
         Ok(())
     })?;
