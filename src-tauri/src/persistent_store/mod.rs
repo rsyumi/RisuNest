@@ -949,7 +949,6 @@ pub(crate) struct StagingResult {
 pub(crate) struct SnapshotInfo {
     pub(crate) id: String,
     pub(crate) reason: String,
-    pub(crate) reclaimable_bytes: u64,
     pub(crate) bytes: u64,
     pub(crate) modified_at: u64,
 }
@@ -2922,7 +2921,8 @@ impl PersistentStore {
         )?;
         let active_characters = query_count_bytes(
             &transaction,
-            "SELECT COUNT(*), COALESCE(SUM(length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
+            // octet_length reads each value's stored length instead of the value itself.
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
             [&active],
         )?;
         let trashed_count: i64 = transaction.query_row(
@@ -2979,7 +2979,7 @@ impl PersistentStore {
         drop(statement);
         transaction.commit()?;
         Ok(PersistentStorageStats {
-            snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
+            snapshot_bytes: snapshot_archive::file_bytes(&self.snapshots_dir)?,
             database_bytes,
             database_reclaimable_bytes: self.database_pages()?.iter().map(|(_, pages)| pages.free_bytes).sum(),
             asset_objects,

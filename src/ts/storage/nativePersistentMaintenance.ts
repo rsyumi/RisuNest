@@ -23,7 +23,6 @@ export type NativeCheckpointMode = 'passive' | 'truncate'
 export interface NativeSnapshotInfo {
     id: string
     reason: string
-    reclaimableBytes: number
     bytes: number
     modifiedAt: number
 }

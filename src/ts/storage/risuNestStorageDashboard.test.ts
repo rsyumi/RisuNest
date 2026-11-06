@@ -32,7 +32,6 @@ const snapshots = [
     {
         id: 'snapshot.db',
         reason: 'manual',
-        reclaimableBytes: 0,
         bytes: 2 * 1024 * 1024,
         modifiedAt: 1,
     },
@@ -58,27 +57,9 @@ const cacheUsage = (totalBytes: number) => ({
 })
 
 describe('RisuNest storage dashboard view model', () => {
-    it('counts archive storage once even when multiple snapshots restore the same large database', () => {
-        const shared = [
-            { ...snapshots[0], id: 'first', bytes: 100 * 1024 * 1024 },
-            { ...snapshots[0], id: 'second', bytes: 100 * 1024 * 1024 },
-        ]
-        const rollup = storageDashboardRollup(
-            { ...stats, snapshotBytes: 1024 },
-            shared,
-            [],
-            null,
-        )
-        expect(rollup.snapshotBytes).toBe(1024)
-        expect(rollup.cards.find((card) => card.id === 'total')?.bytes).toBe(
-            stats.databaseBytes + stats.assetBodies.bytes + 1024,
-        )
-    })
-
     it('rolls up six overlapping logical cards and formats MiB and GiB', () => {
         const rollup = storageDashboardRollup(
             stats,
-            snapshots,
             conflictBackups,
         )
 
@@ -103,7 +84,7 @@ describe('RisuNest storage dashboard view model', () => {
             missingAssetBodies: { count: 3, bytes: 1023 * 1024 * 1024 },
             inlayBodies: { count: 1, bytes: 512 * 1024 },
         }
-        const rollup = storageDashboardRollup(offloaded, [], [], null)
+        const rollup = storageDashboardRollup(offloaded, [], null)
         const card = (id: string) => rollup.cards.find((entry) => entry.id === id)?.bytes
         expect(card('media')).toBe(1024 * 1024)
         expect(card('total')).toBe(offloaded.databaseBytes + 1024 * 1024 + offloaded.snapshotBytes)
@@ -135,7 +116,7 @@ describe('RisuNest storage dashboard view model', () => {
     })
 
     it('keeps the asset storage records apart from the temporary files but in the total', () => {
-        const rollup = storageDashboardRollup(stats, [], [], {
+        const rollup = storageDashboardRollup(stats, [], {
             ...cacheUsage(3072),
             totalBytes: 3072 + 1024,
             ledgerBytes: 1024,
@@ -514,6 +495,64 @@ describe('RisuNest storage dashboard view model', () => {
         expect(dashboard.snapshot().stats?.snapshotBytes).toBe(0)
     })
 
+    it('runs a list action once its list has arrived, before the totals', async () => {
+        const deleteSnapshot = vi.fn().mockResolvedValue(undefined)
+        const deleteConflictBackup = vi.fn().mockResolvedValue(undefined)
+        const cleanupTemp = vi.fn().mockResolvedValue(cacheUsage(0))
+        const dashboard = createRisuNestStorageDashboard({
+            getStats: vi.fn(() => new Promise<typeof stats>(() => {})),
+            listSnapshots: vi.fn().mockResolvedValue(snapshots),
+            listConflictBackups: vi.fn().mockResolvedValue(conflictBackups),
+            getTemp: vi.fn().mockResolvedValue(cacheUsage(1024)),
+            getResidency: vi.fn(),
+            cleanupTemp,
+            previewGc: vi.fn(),
+            executeGc: vi.fn(),
+            deleteSnapshot,
+            deleteConflictBackup,
+            createSnapshot: vi.fn(),
+        })
+        void dashboard.load()
+        await vi.waitFor(() => expect(dashboard.snapshot().loadedSources).toHaveLength(3))
+
+        await dashboard.cleanupTemp()
+        // Both deletions reload, and the totals in this test never arrive.
+        void dashboard.deleteConflictBackup('conflict')
+        void dashboard.deleteSnapshot('snapshot.db')
+        await vi.waitFor(() => expect(deleteSnapshot).toHaveBeenCalledWith('snapshot.db'))
+        expect(deleteConflictBackup).toHaveBeenCalledWith('conflict')
+        expect(cleanupTemp).toHaveBeenCalledOnce()
+    })
+
+    it('finishes loading the other sources when a conflict backup is deleted during a load', async () => {
+        let resolveFirstList: ((value: typeof snapshots) => void) | undefined
+        const listSnapshots = vi.fn()
+            .mockImplementationOnce(() => new Promise<typeof snapshots>((resolve) => { resolveFirstList = resolve }))
+            .mockResolvedValue(snapshots)
+        const dashboard = createRisuNestStorageDashboard({
+            getStats: vi.fn().mockResolvedValue(stats),
+            listSnapshots,
+            listConflictBackups: vi.fn().mockResolvedValueOnce(conflictBackups).mockResolvedValue([]),
+            getTemp: vi.fn().mockResolvedValue(cacheUsage(1024)),
+            getResidency: vi.fn(),
+            cleanupTemp: vi.fn(),
+            previewGc: vi.fn(),
+            executeGc: vi.fn(),
+            deleteSnapshot: vi.fn(),
+            deleteConflictBackup: vi.fn().mockResolvedValue(undefined),
+            createSnapshot: vi.fn(),
+        })
+        const load = dashboard.load()
+        await vi.waitFor(() => expect(dashboard.snapshot().loadedSources).toContain('conflictBackups'))
+
+        await dashboard.deleteConflictBackup('conflict')
+        resolveFirstList?.(snapshots)
+        await load
+        await vi.waitFor(() => expect(dashboard.snapshot().loading).toBe(false))
+        expect(dashboard.snapshot()).toMatchObject({ snapshots, conflictBackups: [], loadFailed: false })
+        expect(dashboard.snapshot().loadedSources).toContain('snapshots')
+    })
+
     describe('files this device does not store', () => {
         const offloaded = { ...stats, missingAssetBodies: { count: 3, bytes: 3 * 1024 } }
         const residency = assetResidencyStatus({ remoteBytes: 3 * 1024, remoteObjects: 3, serverBytes: 3 * 1024, serverObjects: 3 })
@@ -588,6 +627,7 @@ describe('RisuNest storage dashboard view model', () => {
             const getStats = vi.fn()
                 .mockResolvedValueOnce(offloaded)
                 .mockImplementationOnce(() => new Promise<typeof stats>(() => {}))
+                .mockResolvedValue(offloaded)
             const dashboard = createRisuNestStorageDashboard({
                 getStats,
                 listSnapshots: vi.fn().mockResolvedValue([]),
