@@ -20,6 +20,9 @@ use std::{
 use uuid::Uuid;
 
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+/// The most snapshots kept, and the keep count when this device chose none.
+const MAX_SNAPSHOTS: usize = 8;
+const DEVICE_SETTINGS_KEY: &str = "risuNestDeviceSettings";
 const UNSCANNABLE_BLOCKER: &str = "record-unscannable";
 const CAS_PHYSICAL_PREFIX: &str = "assets/objects/";
 const URL_SCHEMES: [&str; 3] = ["risuasset:", "http:", "https:"];
@@ -429,14 +432,53 @@ fn create_in_archive(
     reason: &str,
 ) -> StoreResult<SnapshotCreated> {
     let started = Instant::now();
-    let (scratch, current_bytes) = capture_scratch(store, archive)?;
-    archive_scratch(archive, scratch, current_bytes, reason, started)
+    let (scratch, retention) = capture_scratch(store, archive)?;
+    archive_scratch(archive, scratch, retention, reason, started)
+}
+
+/// What the rotation after a capture keeps: the device's snapshot count, and
+/// archive bytes within `byte_budget` of the retention basis.
+pub(super) struct Retention {
+    pub(super) keep_count: usize,
+    pub(super) basis_bytes: u64,
+}
+
+/// The keep count chosen on this device. A device store that cannot be read, or
+/// a value outside 1 to `MAX_SNAPSHOTS`, keeps the full count rather than
+/// failing the snapshot.
+fn snapshot_keep_count(store: &super::PersistentStore) -> usize {
+    match store
+        .device_store()
+        .and_then(|device| device.read_setting(DEVICE_SETTINGS_KEY))
+    {
+        Ok(stored) => keep_count_from_setting(stored.as_ref()),
+        Err(error) => {
+            crate::nlog!("warn", "snapshot keep count is unavailable: {error}");
+            MAX_SNAPSHOTS
+        }
+    }
+}
+
+fn keep_count_from_setting(stored: Option<&serde_json::Value>) -> usize {
+    // The renderer stores its settings object as JSON text.
+    let parsed = match stored {
+        Some(serde_json::Value::String(text)) => serde_json::from_str(text).ok(),
+        other => other.cloned(),
+    };
+    parsed
+        .as_ref()
+        .and_then(|settings| settings.get("snapshotKeepCount"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .filter(|count| (1..=MAX_SNAPSHOTS).contains(count))
+        .unwrap_or(MAX_SNAPSHOTS)
 }
 
 pub(super) fn capture_scratch(
     store: &mut super::PersistentStore,
     archive: &Archive,
-) -> StoreResult<(super::snapshot_archive::Scratch, u64)> {
+) -> StoreResult<(super::snapshot_archive::Scratch, Retention)> {
+    let keep_count = snapshot_keep_count(store);
     let scratch = archive.scratch()?;
     let revision = store.revision()?;
     let lease = store.lww_acquire_library_backup_capture(revision)?;
@@ -466,15 +508,15 @@ pub(super) fn capture_scratch(
         Ok(current_bytes)
     })();
     let release = store.release_revision(&lease.lease);
-    let current_bytes = result?;
+    let basis_bytes = result?;
     release?;
-    Ok((scratch, current_bytes))
+    Ok((scratch, Retention { keep_count, basis_bytes }))
 }
 
 pub(super) fn archive_scratch(
     archive: &mut Archive,
     scratch: super::snapshot_archive::Scratch,
-    current_bytes: u64,
+    retention: Retention,
     reason: &str,
     started: Instant,
 ) -> StoreResult<SnapshotCreated> {
@@ -483,7 +525,7 @@ pub(super) fn archive_scratch(
     let roots = collect_asset_roots(&captured)?;
     drop(captured);
     let metadata = archive.insert(&scratch.path, revision, reason, roots)?;
-    archive.rotate(byte_budget(current_bytes), &metadata.id)?;
+    archive.rotate(retention.keep_count, byte_budget(retention.basis_bytes), &metadata.id)?;
     Ok(SnapshotCreated {
         id: metadata.id,
         revision,

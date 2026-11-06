@@ -1656,7 +1656,7 @@ pub(crate) fn pds_snapshot_create(
                     message: format!("persistent snapshot mutex poisoned: {error}"),
                 })?;
         let started = std::time::Instant::now();
-        let (mut archive, scratch, current_bytes, inventory) = {
+        let (mut archive, scratch, retention, inventory) = {
             let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
                 message: format!("persistent store mutex poisoned: {error}"),
             })?;
@@ -1665,14 +1665,14 @@ pub(crate) fn pds_snapshot_create(
             })?;
             let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
             let inventory = store.active_readers.defer_asset_inventory();
-            let (scratch, current_bytes) =
+            let (scratch, retention) =
                 super::snapshot::capture_scratch(store, &archive)?;
-            (archive, scratch, current_bytes, inventory)
+            (archive, scratch, retention, inventory)
         };
         let result = super::snapshot::archive_scratch(
             &mut archive,
             scratch,
-            current_bytes,
+            retention,
             &reason,
             started,
         );

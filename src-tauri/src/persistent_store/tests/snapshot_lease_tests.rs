@@ -1131,6 +1131,33 @@ fn ninth_snapshot_removes_the_oldest_and_leaves_eight() {
 }
 
 #[test]
+fn the_device_keep_count_bounds_rotation_and_an_invalid_count_keeps_eight() {
+    let (_directory, mut store, _) = open_fixture();
+    // Stored as the renderer stores it: the settings object as JSON text.
+    let keep = |store: &PersistentStore, count: Value| {
+        let text = json!({ "automaticSnapshotsEnabled": true, "snapshotKeepCount": count }).to_string();
+        store.device_store().unwrap().write_setting("risuNestDeviceSettings", &Value::String(text)).unwrap();
+    };
+    let mut ids = Vec::new();
+    let create = |store: &mut PersistentStore, ids: &mut Vec<String>| {
+        ids.push(store.snapshot_create("manual").unwrap().id);
+        thread::sleep(Duration::from_millis(10));
+    };
+    keep(&store, json!(2));
+    for _ in 0..3 {
+        create(&mut store, &mut ids);
+    }
+    let listed: Vec<_> = store.snapshot_list().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(listed, vec![ids[2].clone(), ids[1].clone()]);
+
+    keep(&store, json!(0));
+    for _ in 0..2 {
+        create(&mut store, &mut ids);
+    }
+    assert_eq!(store.snapshot_list().unwrap().len(), 4);
+}
+
+#[test]
 fn byte_rotation_keeps_newest_and_durable_stage_owns_rotated_source() {
     let (_directory, mut store, database)=open_fixture();
     let target=store.snapshot_create("target").unwrap();
@@ -1138,7 +1165,7 @@ fn byte_rotation_keeps_newest_and_durable_stage_owns_rotated_source() {
     store.snapshot_create("middle").unwrap();
     let latest=store.snapshot_create("latest").unwrap();
     let mut archive=Archive::open(&store.snapshots_dir).unwrap();
-    archive.rotate(0,&latest.id).unwrap();
+    archive.rotate(8,0,&latest.id).unwrap();
     let ids:Vec<_>=archive.list().unwrap().into_iter().map(|s|s.id).collect();
     assert_eq!(ids,vec![latest.id]);
     let authority=store.lww_binding_authority().unwrap();

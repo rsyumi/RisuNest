@@ -43,6 +43,7 @@ import {
     restoreNativePersistentSnapshot,
     schedulePeriodicNativeSnapshot,
 } from './nativePersistentMaintenance'
+import { updateDeviceSettings } from './deviceSettings'
 import { get } from 'svelte/store'
 import { cancelActiveNativeFileOperation, dismissNativeFileOperationOutcome, nativeFileOperation, nativeFileOperationOutcome, runSharedNativeFileOperation } from './nativeFileJobManager'
 
@@ -231,6 +232,22 @@ describe('native persistent maintenance', () => {
             ['pds_snapshot_list'],
             ['pds_message_object_sweep'],
         ]))
+    })
+
+    it('creates no periodic snapshot while automatic snapshots are off, even with none stored, and still sweeps', async () => {
+        vi.useFakeTimers()
+        vi.stubGlobal('requestIdleCallback', undefined)
+        mocks.invoke.mockResolvedValue([])
+        updateDeviceSettings({ automaticSnapshotsEnabled: false })
+        try {
+            await expect(createPeriodicNativeSnapshotIfDue()).resolves.toBeNull()
+            schedulePeriodicNativeSnapshot()
+            await vi.advanceTimersByTimeAsync(0)
+        } finally {
+            updateDeviceSettings({ automaticSnapshotsEnabled: true })
+        }
+
+        expect(mocks.invoke.mock.calls).toEqual([['pds_message_object_sweep']])
     })
 
     it('sweeps stored message objects even when the snapshot check fails', async () => {
