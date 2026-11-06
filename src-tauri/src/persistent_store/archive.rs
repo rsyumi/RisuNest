@@ -152,6 +152,25 @@ pub(super) fn read_archived_object(
         .transpose()
 }
 
+/// Hands the decompressed JSON text of the archive in `file` to `write` in pieces, until it ends
+/// or `write` returns false.
+pub(super) fn read_payload_text(
+    file: std::fs::File,
+    mut write: impl FnMut(&[u8]) -> io::Result<bool>,
+) -> StoreResult<()> {
+    let mut decoder = GzDecoder::new(BufReader::new(file)).take(MAX_DECODED_ARCHIVE_BYTES.saturating_add(1));
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = decoder.read(&mut buffer)?;
+        if decoder.limit() == 0 {
+            return validation("archived character exceeds the decoded size limit");
+        }
+        if read == 0 || !write(&buffer[..read])? {
+            return Ok(());
+        }
+    }
+}
+
 /// Brings the one stored body an archive or a restore reads (the owner manifest it lists, or the
 /// archive itself) to this device from the storage that holds it, before anything changes.
 pub(super) fn fetch_operation_body(
