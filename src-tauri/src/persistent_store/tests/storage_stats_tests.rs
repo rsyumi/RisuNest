@@ -26,7 +26,7 @@ fn storage_stats_only_counts_active_generation_rows() {
     let store = PersistentStore::open(directory.path()).expect("open store");
     store.connection.execute_batch(
         "INSERT INTO characters (generation, character_id, configured_index, recent_at, trashed, name, conversation_count, type, detail) VALUES
-         ('revision-0', 'active', 0, 0, 0, 'active', 0, 'character', '{}'),
+         ('revision-0', 'active', 0, 0, 0, 'active', 0, 'character', '\"가나\"'),
          ('revision-old', 'inactive', 0, 0, 0, 'inactive', 0, 'character', '{}');
          INSERT INTO conversations (generation, character_id, conversation_id, configured_index, recent_at, name, message_count, detail) VALUES
          ('revision-0', 'active', 'chat', 0, 0, 'chat', 3, '{}'),
@@ -41,7 +41,7 @@ fn storage_stats_only_counts_active_generation_rows() {
     ).expect("seed rows");
 
     let stats = store.storage_stats().expect("storage stats");
-    assert_eq!(stats.characters.active.count, 1);
+    assert_eq!(stats.characters.active, StorageCountBytes { count: 1, bytes: "\"가나\"".len() as u64 });
     assert_eq!(stats.conversations.count, 1);
     assert_eq!(stats.conversations.message_count, 3);
     assert_eq!(stats.plugin_storage.bytes, 7);
@@ -50,6 +50,25 @@ fn storage_stats_only_counts_active_generation_rows() {
     assert_eq!(stats.asset_bodies, StorageCountBytes { count: 0, bytes: 0 });
     assert_eq!(stats.missing_asset_bodies, StorageCountBytes { count: 1, bytes: 23 });
     assert_eq!(stats.asset_object_deletions[0].bytes, 29);
+}
+
+#[test]
+fn storage_stats_does_not_wait_for_the_snapshot_archive_lock() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = PersistentStore::open(directory.path()).expect("open store");
+    // An open archive holds its lock, as a capture or rotation in progress does.
+    let archive = crate::persistent_store::snapshot_archive::Archive::open(&store.snapshots_dir)
+        .expect("open archive");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(store.storage_stats().map(|stats| stats.snapshot_bytes));
+    });
+    let snapshot_bytes = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("storage stats waited for the snapshot archive lock")
+        .expect("storage stats");
+    assert!(snapshot_bytes > 0);
+    assert_eq!(snapshot_bytes, archive.bytes().unwrap());
 }
 
 fn put_body(store: &mut PersistentStore, key: &str, inlay: bool, bytes: &[u8]) -> String {

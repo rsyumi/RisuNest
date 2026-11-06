@@ -80,7 +80,6 @@ export function storageOffDeviceParts(
 
 export function storageDashboardRollup(
     stats: NativePersistentStorageStats,
-    _snapshots: readonly NativeSnapshotInfo[],
     conflictBackups: readonly SyncConflictBackupEntry[],
     cache: ServerSyncCacheUsage | null = null,
 ): {
@@ -210,25 +209,32 @@ export function createRisuNestStorageDashboard(
         const reloadId = ++latestReload
         pendingReloads += 1
         update({ loading: true })
-        try {
-            const sources: StorageDashboardSource[] = ['stats', 'snapshots', 'conflictBackups', 'tempUsage']
-            const results = await Promise.allSettled([
-                deps.getStats(), deps.listSnapshots(), deps.listConflictBackups(), deps.getTemp(),
-            ])
-            if (reloadId === latestReload) {
-                const next: Partial<RisuNestStorageDashboardSnapshot> = {}
-                const loaded = new Set(state.loadedSources)
-                const failed: StorageDashboardSource[] = []
-                results.forEach((result, index) => {
-                    const source = sources[index]
-                    if (result.status === 'fulfilled') {
-                        Object.assign(next, { [source]: result.value })
-                        loaded.add(source)
-                    } else failed.push(source)
+        const failed: StorageDashboardSource[] = []
+        // Each source shows as soon as it arrives, so the totals never wait for the snapshot list.
+        const settle = <K extends StorageDashboardSource>(
+            source: K,
+            request: () => Promise<NonNullable<RisuNestStorageDashboardSnapshot[K]>>,
+        ) => Promise.resolve(request()).then(
+            (value) => {
+                if (reloadId !== latestReload) return
+                update({
+                    ...({ [source]: value } as Partial<RisuNestStorageDashboardSnapshot>),
+                    loadedSources: state.loadedSources.includes(source)
+                        ? state.loadedSources
+                        : [...state.loadedSources, source],
                 })
-                update({ ...next, loadedSources: [...loaded], failedSources: failed, loadFailed: failed.length > 0 })
-                if (next.stats) loadResidency(next.stats)
-            }
+                if (source === 'stats') loadResidency(value as NativePersistentStorageStats)
+            },
+            () => { failed.push(source) },
+        )
+        try {
+            await Promise.all([
+                settle('stats', () => deps.getStats()),
+                settle('snapshots', () => deps.listSnapshots()),
+                settle('conflictBackups', () => deps.listConflictBackups()),
+                settle('tempUsage', () => deps.getTemp()),
+            ])
+            if (reloadId === latestReload) update({ failedSources: failed, loadFailed: failed.length > 0 })
         } catch {
             if (reloadId === latestReload) update({ loadFailed: true })
         } finally {

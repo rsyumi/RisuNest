@@ -32,7 +32,6 @@ const snapshots = [
     {
         id: 'snapshot.db',
         reason: 'manual',
-        reclaimableBytes: 0,
         bytes: 2 * 1024 * 1024,
         modifiedAt: 1,
     },
@@ -58,27 +57,9 @@ const cacheUsage = (totalBytes: number) => ({
 })
 
 describe('RisuNest storage dashboard view model', () => {
-    it('counts archive storage once even when multiple snapshots restore the same large database', () => {
-        const shared = [
-            { ...snapshots[0], id: 'first', bytes: 100 * 1024 * 1024 },
-            { ...snapshots[0], id: 'second', bytes: 100 * 1024 * 1024 },
-        ]
-        const rollup = storageDashboardRollup(
-            { ...stats, snapshotBytes: 1024 },
-            shared,
-            [],
-            null,
-        )
-        expect(rollup.snapshotBytes).toBe(1024)
-        expect(rollup.cards.find((card) => card.id === 'total')?.bytes).toBe(
-            stats.databaseBytes + stats.assetBodies.bytes + 1024,
-        )
-    })
-
     it('rolls up six overlapping logical cards and formats MiB and GiB', () => {
         const rollup = storageDashboardRollup(
             stats,
-            snapshots,
             conflictBackups,
         )
 
@@ -103,7 +84,7 @@ describe('RisuNest storage dashboard view model', () => {
             missingAssetBodies: { count: 3, bytes: 1023 * 1024 * 1024 },
             inlayBodies: { count: 1, bytes: 512 * 1024 },
         }
-        const rollup = storageDashboardRollup(offloaded, [], [], null)
+        const rollup = storageDashboardRollup(offloaded, [], null)
         const card = (id: string) => rollup.cards.find((entry) => entry.id === id)?.bytes
         expect(card('media')).toBe(1024 * 1024)
         expect(card('total')).toBe(offloaded.databaseBytes + 1024 * 1024 + offloaded.snapshotBytes)
@@ -135,7 +116,7 @@ describe('RisuNest storage dashboard view model', () => {
     })
 
     it('keeps the asset storage records apart from the temporary files but in the total', () => {
-        const rollup = storageDashboardRollup(stats, [], [], {
+        const rollup = storageDashboardRollup(stats, [], {
             ...cacheUsage(3072),
             totalBytes: 3072 + 1024,
             ledgerBytes: 1024,
