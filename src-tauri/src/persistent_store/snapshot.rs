@@ -965,14 +965,44 @@ fn collect_character_asset_hashes_inner(
     shared: bool,
 ) -> StoreResult<Vec<String>> {
     let mut roots = AssetRootSet::default();
+    // The unused-file cleanup cannot read an archived character's text, so a key inside longer
+    // text, such as an `<img src>` in a chat, is recorded too, as a permanent delete finds it.
+    let mut candidates = BTreeSet::new();
     let scope: [&dyn rusqlite::ToSql; 2] = [&generation, &character_id];
     for query in [
         "SELECT detail FROM characters WHERE generation = ?1 AND character_id = ?2",
         "SELECT detail FROM conversations WHERE generation = ?1 AND character_id = ?2",
         "SELECT value FROM messages WHERE generation = ?1 AND character_id = ?2",
     ] {
-        if shared {let mut statement=connection.prepare(query)?;let mut rows=statement.query(scope.as_slice())?;while let Some(row)=rows.next()?{let raw:String=row.get(0)?;let value=serde_json::from_str(&raw)?;let value=if query.contains("FROM characters"){super::lww::shared_archive_character(value)}else if query.contains("FROM conversations"){super::lww::shared_archive_conversation(value)}else{value};observe_json_value(&value,None,&mut roots);}}else{scan_json_column(connection, query, scope.as_slice(), &mut roots)?;}
-
+        let mut statement = connection.prepare(query)?;
+        let mut rows = statement.query(scope.as_slice())?;
+        while let Some(row) = rows.next()? {
+            let value = if shared {
+                let raw: String = row.get(0)?;
+                let value = serde_json::from_str(&raw)?;
+                if query.contains("FROM characters") {
+                    super::lww::shared_archive_character(value)
+                } else if query.contains("FROM conversations") {
+                    super::lww::shared_archive_conversation(value)
+                } else {
+                    value
+                }
+            } else {
+                let ScannedText::Text(encoded) = scanned_text(row, 0)? else {
+                    retain_unscannable_record(&mut roots);
+                    continue;
+                };
+                match serde_json::from_str(&encoded) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        retain_unscannable_record(&mut roots);
+                        continue;
+                    }
+                }
+            };
+            observe_json_value(&value, None, &mut roots);
+            super::asset_alias_orphans::collect_value_owned_keys(&value, &mut candidates);
+        }
     }
     scan_text_column(
         connection,
@@ -1010,12 +1040,7 @@ fn collect_character_asset_hashes_inner(
         hashes.insert(manifest_hash);
     }
 
-    let mut candidates: BTreeSet<String> = roots
-        .legacy_asset_keys
-        .iter()
-        .chain(&roots.inlay_ids)
-        .cloned()
-        .collect();
+    candidates.extend(roots.legacy_asset_keys.iter().chain(&roots.inlay_ids).cloned());
     collect_alias_key_candidates(connection, generation, character_id, &mut candidates,shared)?;
     for candidate in candidates {
         let mut statement = connection.prepare_cached(

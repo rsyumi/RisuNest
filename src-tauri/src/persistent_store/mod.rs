@@ -3018,25 +3018,34 @@ impl PersistentStore {
         let scan = cas.into_read_scan();
         // Unreferenced aliases are not holders, so their files show as the cleanup will treat them.
         let scope = asset_alias_orphans::OrphanAliasScope::Cleanup { now_ms };
-        let search = self.search_unreferenced_asset_aliases(&scope)?;
-        let labelled = match &search {
-            Some(search) => self.collect_asset_gc_roots_without_unreferenced_aliases(search, true)?,
-            None => self.collect_labelled_asset_gc_roots(false, true)?,
-        };
-        // Only the holders that are small and explainable are kept for attribution; the library
-        // itself is the default answer and copying its root set would cost as much as it holds.
-        let holders = labelled
-            .iter()
-            .filter(|(label, _)| *label != "library")
-            .map(|(label, roots)| (*label, roots.object_hashes.clone()))
-            .collect();
+        let mut search = self.search_unreferenced_asset_aliases(&scope)?;
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
-        let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote_scan(
-            &scan,
-            labelled.into_iter().map(|(_, roots)| roots),
-            |hash| residency.gc_size(hash),
-        )?;
+        let mark = |search: Option<&asset_alias_orphans::OrphanAliasSearch>| -> StoreResult<_> {
+            let labelled = match search {
+                Some(search) => self.collect_asset_gc_roots_without_unreferenced_aliases(search, true)?,
+                None => self.collect_labelled_asset_gc_roots(false, true)?,
+            };
+            // Only the holders that are small and explainable are kept for attribution; the library
+            // itself is the default answer and copying its root set would cost as much as it holds.
+            let holders: Vec<(&'static str, std::collections::BTreeSet<String>)> = labelled
+                .iter()
+                .filter(|(label, _)| *label != "library")
+                .map(|(label, roots)| (*label, roots.object_hashes.clone()))
+                .collect();
+            let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote_scan(
+                &scan,
+                labelled.into_iter().map(|(_, roots)| roots),
+                |hash| residency.gc_size(hash),
+            )?;
+            Ok((holders, marks))
+        };
+        let (mut holders, mut marks) = mark(search.as_ref())?;
+        if let Some(found) = &mut search {
+            if self.keep_aliases_archives_name(found, &marks, &scope)? {
+                (holders, marks) = mark(Some(&*found))?;
+            }
+        }
         let recent_orphan_objects = search
             .map(|search| search.orphans(&marks, &scope).1.into_iter().map(|alias| alias.object_hash).collect())
             .unwrap_or_default();
