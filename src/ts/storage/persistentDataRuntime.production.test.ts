@@ -1081,6 +1081,24 @@ describe('production persistent working-set publication', () => {
         }
     })
 
+    it.each(['replaceDatabase', 'publishCharacter', 'publishConversation'] as const)('fills the lorebook text a stored entry lacks when it installs a character (%s)', (seam) => {
+        const stored = () => ({ key: null, secondkey: null, comment: null, content: null, mode: 'normal', insertorder: 100, alwaysActive: true, selective: false })
+        const chat = (localLore: unknown[]) => ({ id: 'lore-chat', name: 'Synthetic chat', message: [], localLore })
+        const owner = (globalLore: unknown[], localLore: unknown[]) => ({ type: 'character', chaId: 'lore-owner', name: 'Owner', globalLore, chats: [chat(localLore)] })
+        const database = (characters: unknown[]) => ({ botPresetsId: 0, botPresets: [{ name: 'Active' }], characters }) as unknown as Database
+        setDatabaseLite(database(seam === 'replaceDatabase' ? [] : [owner([], [])]))
+        selectedCharID.set(-1)
+        const adapter = createProductionStateAdapter()
+        // Each seam receives entries as a store or an older writer left them.
+        if (seam === 'replaceDatabase') adapter.replaceDatabase(database([owner([stored()], [stored()])]), new Set(['lore-owner']), false)
+        else if (seam === 'publishCharacter') adapter.publishCharacter(owner([stored()], [stored()]) as never)
+        else adapter.publishConversation('lore-owner', chat([stored()]) as never)
+        const installed = getDatabase().characters[0]
+        const filled = expect.objectContaining({ key: '', secondkey: '', comment: '', content: '' })
+        expect(installed.chats[0].localLore).toEqual([filled])
+        expect(installed.globalLore).toEqual(seam === 'publishConversation' ? [] : [filled])
+    })
+
     it('preloads nested maximum plugin values from the installed plain database', async () => {
         const nestedValue = {
             list: [{ enabled: true }],

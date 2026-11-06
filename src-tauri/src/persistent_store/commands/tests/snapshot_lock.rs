@@ -152,6 +152,102 @@ fn foreground_commit_completes_while_snapshot_archive_is_blocked_and_capture_sta
 }
 
 #[test]
+fn foreground_commit_completes_while_the_capture_copies_the_library() {
+    let (_directory, app, _) = fixture();
+    let (copying_sent, copying) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let handle = app.handle().clone();
+    let snapshot_worker = std::thread::spawn(move || {
+        crate::persistent_store::snapshot::CAPTURE_COPYING.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            copying_sent.send(()).unwrap();
+            let _ = resumed.recv();
+        })));
+        pds_snapshot_create(handle.state(), "periodic".into(), None)
+    });
+    let copying = copying.recv_timeout(Duration::from_secs(5));
+    let (commit_sent, commit_received) = mpsc::channel();
+    let handle = app.handle().clone();
+    let commit_worker = std::thread::spawn(move || {
+        commit_sent.send(with_store_mut(handle.state(), |store| Ok(store.commit(&changed_root())?.revision))).unwrap();
+    });
+    let foreground = commit_received.recv_timeout(Duration::from_secs(2));
+    resume.send(()).unwrap();
+    commit_worker.join().unwrap();
+    let snapshot = snapshot_worker.join().unwrap().unwrap();
+
+    assert!(copying.is_ok());
+    assert_eq!(foreground.unwrap().unwrap(), 2);
+    // The copy holds the leased revision, not the commit made while it ran.
+    assert_eq!(snapshot.revision, 1);
+}
+
+#[test]
+fn a_capture_waits_for_a_busy_archive_without_holding_the_store() {
+    let (directory, app, _) = fixture();
+    let held = Archive::open(&directory.path().join("persistent/snapshots")).unwrap();
+    let (busy_sent, busy) = mpsc::channel();
+    let handle = app.handle().clone();
+    let snapshot_worker = std::thread::spawn(move || {
+        SNAPSHOT_ARCHIVE_BUSY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || busy_sent.send(()).unwrap())));
+        pds_snapshot_create(handle.state(), "periodic".into(), None)
+    });
+    let busy = busy.recv_timeout(Duration::from_secs(5));
+    let (commit_sent, commit_received) = mpsc::channel();
+    let handle = app.handle().clone();
+    let commit_worker = std::thread::spawn(move || {
+        commit_sent.send(with_store_mut(handle.state(), |store| Ok(store.commit(&changed_root())?.revision))).unwrap();
+    });
+    let foreground = commit_received.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    commit_worker.join().unwrap();
+    let snapshot = snapshot_worker.join().unwrap().unwrap();
+
+    assert!(busy.is_ok());
+    assert_eq!(foreground.unwrap().unwrap(), 2);
+    // The capture leases the revision once the archive is free.
+    assert_eq!(snapshot.revision, 2);
+}
+
+/// A snapshot list or delete waits for an archive another holder has without holding the store,
+/// and without keeping its async worker from other commands.
+#[test]
+fn archive_waits_leave_the_store_and_the_async_worker_to_other_commands() {
+    let (directory, app, _) = fixture();
+    let snapshot = pds_snapshot_create(app.state(), "manual".into(), None).unwrap();
+    let held = Archive::open(&directory.path().join("persistent/snapshots")).unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).build().unwrap();
+    let (started_sent, started) = mpsc::channel();
+    let (sent, handle) = (started_sent.clone(), app.handle().clone());
+    let list = runtime.spawn(async move {
+        sent.send("list").unwrap();
+        pds_snapshot_list(handle.state())
+    });
+    let list_started = started.recv_timeout(Duration::from_secs(5));
+    let handle = app.handle().clone();
+    let delete = runtime.spawn(async move {
+        started_sent.send("delete").unwrap();
+        pds_snapshot_delete(handle.state(), snapshot.id)
+    });
+    // Each task starts on a worker only after the one before it gave its worker up. A blocked
+    // worker also stops the runtime's timers, so the test waits on plain channels.
+    let delete_started = started.recv_timeout(Duration::from_secs(5));
+    let (read_sent, read_received) = mpsc::channel();
+    let handle = app.handle().clone();
+    runtime.spawn(async move { let _ = read_sent.send(with_store(handle.state(), |store| store.revision())); });
+    let read = read_received.recv_timeout(Duration::from_secs(5));
+    let waiting = !list.is_finished() && !delete.is_finished();
+    drop(held);
+
+    assert_eq!(list_started, Ok("list"));
+    assert_eq!(delete_started, Ok("delete"));
+    assert_eq!(read.unwrap().unwrap(), 1);
+    assert!(waiting);
+    runtime.block_on(list).unwrap().unwrap();
+    runtime.block_on(delete).unwrap().unwrap();
+    assert!(pds_snapshot_list(app.state()).unwrap().is_empty());
+}
+
+#[test]
 fn failed_snapshot_archive_releases_capture_and_command_guards_without_publishing() {
     let (directory, app, _) = fixture();
     let state = app.state::<PersistentStoreState>();

@@ -1289,7 +1289,7 @@
           "optional": true
         },
         "sdCFG": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "sdConfig": {
@@ -1301,7 +1301,7 @@
           "optional": false
         },
         "sdSteps": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "selectedPersona": {
@@ -1977,7 +1977,7 @@
       "kind": "tuple",
       "items": [
         "n5",
-        "n7"
+        "n879"
       ],
       "optional": [
         false,
@@ -3151,11 +3151,11 @@
           "optional": true
         },
         "rangeEnd": {
-          "node": "n112",
+          "node": "n975",
           "optional": false
         },
         "rangeStart": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "type": {
@@ -3236,7 +3236,7 @@
       "kind": "object",
       "fields": {
         "depth": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "name": {
@@ -5143,7 +5143,7 @@
     "n238": {
       "kind": "object",
       "fields": {},
-      "additional": "n239"
+      "additional": "n974"
     },
     "n239": {
       "kind": "union",
@@ -5164,7 +5164,7 @@
       "kind": "object",
       "fields": {
         "depth": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "prompt": {
@@ -5199,7 +5199,7 @@
       "kind": "object",
       "fields": {
         "chunk_length": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "model": {
@@ -5477,11 +5477,11 @@
           "optional": false
         },
         "scanDepth": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "tokenBudget": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         }
       },
@@ -5753,7 +5753,7 @@
       "kind": "object",
       "fields": {
         "depth": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "type": {
@@ -9679,7 +9679,7 @@
           "optional": false
         },
         "timeout": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "workflow": {
@@ -10131,11 +10131,11 @@
           "optional": false
         },
         "embeddingMaxConcurrent": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "embeddingRequestsPerMinute": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "enableSimilarityCorrection": {
@@ -10147,7 +10147,7 @@
           "optional": false
         },
         "maxChatsPerSummary": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "memoryTokensRatio": {
@@ -10163,7 +10163,7 @@
           "optional": false
         },
         "queryChatCount": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "recentMemoryRatio": {
@@ -10179,7 +10179,7 @@
           "optional": false
         },
         "summarizationMaxConcurrent": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "summarizationModel": {
@@ -10191,7 +10191,7 @@
           "optional": false
         },
         "summarizationRequestsPerMinute": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "summaryChunkSeparator": {
@@ -11709,7 +11709,7 @@
           "optional": false
         },
         "cfg_rescale": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "character_base64image": {
@@ -11725,7 +11725,7 @@
           "optional": false
         },
         "height": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "image": {
@@ -11765,7 +11765,7 @@
           "optional": false
         },
         "scale": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "sm": {
@@ -11777,7 +11777,7 @@
           "optional": false
         },
         "steps": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "strength": {
@@ -11813,7 +11813,7 @@
           "optional": true
         },
         "width": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         }
       },
@@ -12351,7 +12351,7 @@
     "n823": {
       "kind": "object",
       "fields": {},
-      "additional": "n824"
+      "additional": "n973"
     },
     "n824": {
       "kind": "union",
@@ -12481,7 +12481,7 @@
       "kind": "object",
       "fields": {
         "denoising_strength": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "enable_hr": {
@@ -12489,11 +12489,11 @@
           "optional": false
         },
         "height": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "hr_scale": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         },
         "hr_upscaler": {
@@ -12509,7 +12509,7 @@
           "optional": false
         },
         "width": {
-          "node": "n7",
+          "node": "n879",
           "optional": false
         }
       },
@@ -13817,6 +13817,32 @@
         "n803",
         "n804",
         "n805"
+      ]
+    },
+    "n973": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n5",
+        "n7"
+      ]
+    },
+    "n974": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n5",
+        "n7",
+        "n9",
+        "n10"
+      ]
+    },
+    "n975": {
+      "kind": "union",
+      "variants": [
+        "n252",
+        "n7",
+        "n113"
       ]
     }
   }

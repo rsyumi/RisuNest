@@ -85,7 +85,7 @@ impl ActiveReaderRegistry {
     pub(crate) fn detached_asset_roots(&self) -> StoreResult<Vec<AssetRootSet>> {
         if self.deferred_asset_inventories.load(Ordering::SeqCst) > 0 {
             return Err(StoreError::Validation {
-                message: "Asset inventory is being pinned by a local capture".into(),
+                message: super::ASSET_INVENTORY_BUSY.into(),
             });
         }
         Ok(self
@@ -417,6 +417,7 @@ pub(super) fn checkpoint(connection: &Connection, mode: CheckpointMode) -> Store
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn create(
     store: &mut super::PersistentStore,
     reason: &str,
@@ -426,7 +427,7 @@ pub(super) fn create(
     create_in_archive(store, &mut archive, reason, keep)
 }
 
-fn create_in_archive(
+pub(super) fn create_in_archive(
     store: &mut super::PersistentStore,
     archive: &mut Archive,
     reason: &str,
@@ -470,38 +471,84 @@ pub(super) fn capture_scratch(
     archive: &Archive,
     keep: KeepCount,
 ) -> StoreResult<(super::snapshot_archive::Scratch, Retention)> {
+    begin_capture(store, archive, keep)?.copy()
+}
+
+/// A capture's leased revision, taken out of the store so that copying it, which
+/// takes minutes for a large library, runs while other commands use the store.
+pub(super) struct CaptureSource {
+    scratch: super::snapshot_archive::Scratch,
+    reader: RevisionReadLease,
+    repository_root: PathBuf,
+    database_path: PathBuf,
+    keep: KeepCount,
+}
+
+/// Leases the current revision for a capture. The lease's reader leaves the store
+/// with the returned source, and the capture's asset inventory deferral keeps
+/// what it references.
+pub(super) fn begin_capture(
+    store: &mut super::PersistentStore,
+    archive: &Archive,
+    keep: KeepCount,
+) -> StoreResult<CaptureSource> {
     let scratch = archive.scratch()?;
     let revision = store.revision()?;
     let lease = store.lww_acquire_library_backup_capture(revision)?;
-    let result = (|| {
-        let units = store.lww_backup_unit_values(&lease.lease)?;
-        let (connection, target) = store.read_view(Some(&lease.lease))?;
-        let current_bytes = snapshot_retention_basis_bytes(connection)?;
-        let mut output = crate::sqlite_open::open(&scratch.path)?;
-        {
-            let backup = rusqlite::backup::Backup::new(connection, &mut output)?;
-            loop {
-                match backup.step(128)? {
-                    rusqlite::backup::StepResult::Done => break,
-                    rusqlite::backup::StepResult::More => (),
-                    _ => return Err(validation("snapshot source is busy")),
+    let reader = store
+        .revision_leases
+        .remove(&lease.lease)
+        .ok_or(StoreError::SnapshotReleased)?;
+    Ok(CaptureSource {
+        scratch,
+        reader,
+        repository_root: store.repository_root.clone(),
+        database_path: store.database_path.clone(),
+        keep,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CAPTURE_COPYING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+impl CaptureSource {
+    pub(super) fn copy(self) -> StoreResult<(super::snapshot_archive::Scratch, Retention)> {
+        let Self { scratch, reader, repository_root, database_path, keep } = self;
+        let active_readers = reader.active_readers();
+        let result = (|| {
+            let current_bytes = snapshot_retention_basis_bytes(&reader.connection)?;
+            let mut output = crate::sqlite_open::open(&scratch.path)?;
+            {
+                let backup = rusqlite::backup::Backup::new(&reader.connection, &mut output)?;
+                #[cfg(test)]
+                CAPTURE_COPYING.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+                loop {
+                    match backup.step(128)? {
+                        rusqlite::backup::StepResult::Done => break,
+                        rusqlite::backup::StepResult::More => (),
+                        _ => return Err(validation("snapshot source is busy")),
+                    }
                 }
             }
-        }
-        let tx = output.transaction()?;
-        tx.execute("DELETE FROM snapshot_original_meta", [])?;
-        tx.execute("DELETE FROM snapshot_original_units", [])?;
-        tx.execute("INSERT INTO snapshot_original_meta VALUES(1,?1,?2)", rusqlite::params![target.revision,target.generation])?;
-        for (key,value) in units {
-            tx.execute("INSERT INTO snapshot_original_units VALUES(?1,?2)", rusqlite::params![key.as_str(),serde_json::to_string(&value)?])?;
-        }
-        tx.commit()?;
-        Ok(current_bytes)
-    })();
-    let release = store.release_revision(&lease.lease);
-    let basis_bytes = result?;
-    release?;
-    Ok((scratch, Retention { keep_count: keep.0, basis_bytes }))
+            let tx = output.transaction()?;
+            tx.execute("DELETE FROM snapshot_original_meta", [])?;
+            tx.execute("DELETE FROM snapshot_original_units", [])?;
+            tx.execute("INSERT INTO snapshot_original_meta VALUES(1,?1,?2)", rusqlite::params![reader.target.revision,reader.target.generation])?;
+            super::lww::visit_backup_units(&reader, &repository_root, &crate::local_backup::NeverCancelled, &mut |key,value| {
+                tx.execute("INSERT INTO snapshot_original_units VALUES(?1,?2)", rusqlite::params![key.as_str(),serde_json::to_string(&value)?])?;
+                Ok(())
+            })?;
+            tx.commit()?;
+            Ok(current_bytes)
+        })();
+        let release = close_revision(reader)
+            .and_then(|()| super::checkpoint_after_detached_release(&database_path, &active_readers));
+        let basis_bytes = result?;
+        release?;
+        Ok((scratch, Retention { keep_count: keep.0, basis_bytes }))
+    }
 }
 
 pub(super) fn archive_scratch(

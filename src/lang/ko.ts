@@ -60,6 +60,7 @@ export const languageKorean = {
             'toggle-preset-prompt-name-unmatched':
                 '이름이 일치하지 않는 토글 프리셋 프롬프트',
             'unavailable-persona-binding': '사용할 수 없는 페르소나 연결',
+            'missing-asset-references': '파일이 없는 첨부 파일 참조',
             'unsupported-inlay-references': '지원하지 않는 인레이 참조',
             'unsupported-option-value': '지원하지 않는 설정값',
             'unsupported-structural-field': '지원하지 않는 데이터 필드',
@@ -105,6 +106,7 @@ export const languageKorean = {
             damagedPluginStorage: (count: number) => `손상된 플러그인 저장 데이터 ${count}개는 복원되지 않습니다.`,
             oversizedPluginStorage: (count: number) => `크기가 너무 큰 플러그인 저장 데이터 ${count}개는 복원되지 않습니다.`,
             inlays: (count: number) => `지원하지 않는 인레이 ${count}개는 복원되지 않습니다.`,
+            missingAssets: (count: number) => `파일이 없는 첨부 파일 참조 ${count}개는 파일 없이 복원됩니다.`,
         },
         "recovery": {
             "dismiss": '기록 삭제',
@@ -2927,6 +2929,9 @@ export const languageKorean = {
             reasonExportTooLarge: '{0} 크기가 너무 커서 내보내지 못했습니다.',
             reasonCompatibleDatabaseTooLarge: '데이터 크기가 너무 커서 호환 백업으로 내보내지 못했습니다. RisuNest 백업을 사용하세요.',
             reasonCompatibleUnsupportedValue: '대상 앱이 지원하지 않는 값이 있어 호환 백업으로 내보내지 못했습니다. RisuNest 백업을 사용하세요.',
+            failureOwners: {
+                character: '캐릭터: {0}', chat: '대화: {0}의 {1}', preset: '프리셋: {0}', module: '모듈: {0}', persona: '페르소나: {0}',
+            },
             tooLargeItems: {
                 root: '설정', preset: '프리셋', character: '캐릭터', conversation: '대화', message: '메시지', 'plugin-value': '플러그인 데이터',
                 record: '데이터 항목', backup: '백업 데이터', 'backup-entry': '백업 항목', card: '캐릭터 카드', module: '모듈', content: '카드 또는 모듈', 'owner-manifest': '추가 에셋 목록', 'compatible-database': '데이터',

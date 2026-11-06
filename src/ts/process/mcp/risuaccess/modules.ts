@@ -579,16 +579,16 @@ export class ModuleHandler extends MCPToolHandler {
 
     const entry = module.lorebook[index]
 
-    if (content !== undefined) {
+    if (content != null) {
       entry.content = content
     }
-    if (keys !== undefined) {
+    if (keys != null) {
       entry.key = alwaysActive ? '' : keys.join(',')
     }
-    if (newName !== undefined) {
+    if (newName != null) {
       entry.comment = newName
     }
-    if (alwaysActive !== undefined) {
+    if (alwaysActive != null) {
       entry.alwaysActive = alwaysActive
       if (alwaysActive) {
         entry.key = ''

@@ -302,11 +302,20 @@ for (const target of ["risuai", "pocket"]) {
                 name: "Synthetic",
                 postHistoryInstructions: null,
                 globalLore: [{ key: "합성", content: "합성 설명", activationPercent: null, insertorder: null }],
+                bias: [["합성", null]],
+                depth_prompt: { depth: null, prompt: "합성" },
+                loreSettings: { scanDepth: null, tokenBudget: null },
+                fishSpeechConfig: { chunk_length: null, normalize: false },
+                triggerscript: [{
+                  comment: "", type: "manual", effect: [],
+                  conditions: [{ type: "exists", type2: "loose", value: "", depth: null }],
+                }],
                 chats: [
                   {
                     id: "synthetic-null-chat",
                     name: "",
                     folderId: null,
+                    scriptstate: { "$합성": null },
                     message: [{ role: "user", data: "합성 입력", chatId: "m1", name: null }],
                   },
                 ],
@@ -318,30 +327,55 @@ for (const target of ["risuai", "pocket"]) {
             botPresets: [{
               name: "Synthetic preset", koboldURL: null, thinkingTokens: null, promptTemplate: null,
               maxContext: null, maxResponse: null,
+            }, {
+              name: "Synthetic prompt preset",
+              promptTemplate: [
+                { type: "chat", rangeStart: null, rangeEnd: null },
+                { type: "cache", name: "합성", depth: null, role: "all" },
+              ],
             }],
             textScreenColor: null,
             textScreenBorder: null,
             localStopStrings: null,
             promptTemplate: null,
             thinkingTokens: null,
+            bias: [["합성", null]],
+            sdConfig: { width: null, height: null, denoising_strength: null, hr_scale: null },
+            NAIImgConfig: { width: null, height: null, steps: null, scale: null, cfg_rescale: null },
+            comfyConfig: { timeout: null },
+            plugins: [{ name: "synthetic", script: "", realArg: { "합성": null } }],
+            hypaV3Presets: [{ name: "합성", settings: {} }],
             formatversion: 5,
           };
           // Cleared number settings, which the loader replaces with its defaults.
           const numbers = [
             "loreBookDepth", "loreBookToken", "autoContinueMinTokens", "requestRetrys", "genTime",
             "assetMaxDifference", "localNetworkTimeoutSec", "maxContext", "maxResponse", "generationSeed",
+            "sdSteps", "sdCFG",
+            ...(target === "risuai"
+              ? ["hanuraiTokens", "hypaChunkSize", "hypaAllocatedTokens", "maxSupaChunkSize"]
+              : []),
           ];
           for (const key of numbers) fixture[key] = null;
+          const memory = [
+            "maxChatsPerSummary", "queryChatCount", "summarizationRequestsPerMinute",
+            "summarizationMaxConcurrent", "embeddingRequestsPerMinute", "embeddingMaxConcurrent",
+          ];
+          for (const key of memory) fixture.hypaV3Presets[0].settings[key] = null;
           const nulls = (db) => {
             const [character] = db.characters;
-            const [preset] = db.botPresets;
+            const [preset, prompts] = db.botPresets;
             return [
               db.textScreenColor, db.textScreenBorder, db.localStopStrings, db.promptTemplate, db.thinkingTokens,
               db.characterOrder[0].imgFile, preset.koboldURL, preset.thinkingTokens, preset.promptTemplate,
-              preset.maxContext, preset.maxResponse,
+              preset.maxContext, preset.maxResponse, prompts.promptTemplate, db.bias, db.sdConfig,
+              db.NAIImgConfig.width, db.NAIImgConfig.height, db.NAIImgConfig.steps, db.NAIImgConfig.scale,
+              db.NAIImgConfig.cfg_rescale, db.comfyConfig.timeout, db.plugins[0].realArg,
               character.postHistoryInstructions, character.globalLore[0].activationPercent,
-              character.globalLore[0].insertorder,
-              character.chats[0].folderId, character.chats[0].message[0].name,
+              character.globalLore[0].insertorder, character.bias, character.depth_prompt,
+              character.loreSettings, character.fishSpeechConfig.chunk_length,
+              character.triggerscript[0].conditions[0].depth,
+              character.chats[0].folderId, character.chats[0].scriptstate, character.chats[0].message[0].name,
             ];
           };
           assert.equal(accepts(contract, contract.root, fixture), true);
@@ -349,6 +383,10 @@ for (const target of ["risuai", "pocket"]) {
           assert.deepEqual(plain(nulls(resaved)), nulls(fixture));
           assert.deepEqual(
             numbers.filter((key) => !Number.isFinite(resaved[key])),
+            [],
+          );
+          assert.deepEqual(
+            memory.filter((key) => !Number.isFinite(resaved.hypaV3Presets[0].settings[key])),
             [],
           );
         },

@@ -10,6 +10,7 @@ import {
     emptyNativeImportCounts,
     resolveNativeFileJobStage,
     type NativeFileJobDetail,
+    type NativeFileJobFailureOwner,
     type NativeFileJobStage,
     type NativeFileJobStatus,
     type NativeImportCounts,
@@ -241,6 +242,18 @@ describe('nativeFileJobDialogModel', () => {
         }
         expect(failureReason('payload-too-large', 'import', 'commit')).toBe(copy.reasonUnknown)
         expect(failureReason('payload-too-large')).toBe(copy.reasonUnknown)
+    })
+
+    it('names the item whose data a compatible export could not write', () => {
+        const location = (owner?: NativeFileJobFailureOwner) => buildNativeFileJobDialogModel(null, outcome({ kind: 'export', state: 'failed', error: {
+            code: 'unsupported-projection', message: 'synthetic detail', recoveryRequired: false, owner,
+        } }), 0).terminal?.location
+        expect(location({ kind: 'chat', name: 'Synthetic chat', character: 'Synthetic' }))
+            .toBe(fillTemplate(copy.failureOwners.chat, 'Synthetic', 'Synthetic chat'))
+        for (const kind of ['character', 'preset', 'module', 'persona'] as const) {
+            expect(location({ kind, name: 'Synthetic' })).toBe(fillTemplate(copy.failureOwners[kind], 'Synthetic'))
+        }
+        expect(location()).toBe('')
     })
 
     it('asks to connect sync when a bound restore cannot reach its sync target', () => {

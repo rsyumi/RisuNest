@@ -109,6 +109,9 @@
                     {#if model.terminal.reason}
                         <p class="text-textcolor2">{model.terminal.reason}</p>
                     {/if}
+                    {#if model.terminal.location}
+                        <p class="text-textcolor2 break-words">{model.terminal.location}</p>
+                    {/if}
                 </div>
             {/if}
 
