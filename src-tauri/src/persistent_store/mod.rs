@@ -950,7 +950,6 @@ pub(crate) struct StagingResult {
 pub(crate) struct SnapshotInfo {
     pub(crate) id: String,
     pub(crate) reason: String,
-    pub(crate) reclaimable_bytes: u64,
     pub(crate) bytes: u64,
     pub(crate) modified_at: u64,
 }
@@ -2854,8 +2853,17 @@ impl PersistentStore {
         }
     }
 
+    pub(crate) fn snapshot_create_keeping(
+        &mut self,
+        reason: &str,
+        keep: snapshot::KeepCount,
+    ) -> StoreResult<SnapshotCreated> {
+        snapshot::create(self, reason, keep)
+    }
+
+    #[cfg(test)]
     pub(crate) fn snapshot_create(&mut self, reason: &str) -> StoreResult<SnapshotCreated> {
-        snapshot::create(self, reason)
+        self.snapshot_create_keeping(reason, snapshot::KeepCount::MAX)
     }
 
     pub(crate) fn snapshot_list(&self) -> StoreResult<Vec<SnapshotInfo>> {
@@ -2914,7 +2922,8 @@ impl PersistentStore {
         )?;
         let active_characters = query_count_bytes(
             &transaction,
-            "SELECT COUNT(*), COALESCE(SUM(length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
+            // octet_length reads each value's stored length instead of the value itself.
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
             [&active],
         )?;
         let trashed_count: i64 = transaction.query_row(
@@ -2971,7 +2980,7 @@ impl PersistentStore {
         drop(statement);
         transaction.commit()?;
         Ok(PersistentStorageStats {
-            snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
+            snapshot_bytes: snapshot_archive::file_bytes(&self.snapshots_dir)?,
             database_bytes,
             database_reclaimable_bytes: self.database_pages()?.iter().map(|(_, pages)| pages.free_bytes).sum(),
             asset_objects,
@@ -3010,25 +3019,34 @@ impl PersistentStore {
         let scan = cas.into_read_scan();
         // Unreferenced aliases are not holders, so their files show as the cleanup will treat them.
         let scope = asset_alias_orphans::OrphanAliasScope::Cleanup { now_ms };
-        let search = self.search_unreferenced_asset_aliases(&scope)?;
-        let labelled = match &search {
-            Some(search) => self.collect_asset_gc_roots_without_unreferenced_aliases(search, true)?,
-            None => self.collect_labelled_asset_gc_roots(false, true)?,
-        };
-        // Only the holders that are small and explainable are kept for attribution; the library
-        // itself is the default answer and copying its root set would cost as much as it holds.
-        let holders = labelled
-            .iter()
-            .filter(|(label, _)| *label != "library")
-            .map(|(label, roots)| (*label, roots.object_hashes.clone()))
-            .collect();
+        let mut search = self.search_unreferenced_asset_aliases(&scope)?;
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
-        let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote_scan(
-            &scan,
-            labelled.into_iter().map(|(_, roots)| roots),
-            |hash| residency.gc_size(hash),
-        )?;
+        let mark = |search: Option<&asset_alias_orphans::OrphanAliasSearch>| -> StoreResult<_> {
+            let labelled = match search {
+                Some(search) => self.collect_asset_gc_roots_without_unreferenced_aliases(search, true)?,
+                None => self.collect_labelled_asset_gc_roots(false, true)?,
+            };
+            // Only the holders that are small and explainable are kept for attribution; the library
+            // itself is the default answer and copying its root set would cost as much as it holds.
+            let holders: Vec<(&'static str, std::collections::BTreeSet<String>)> = labelled
+                .iter()
+                .filter(|(label, _)| *label != "library")
+                .map(|(label, roots)| (*label, roots.object_hashes.clone()))
+                .collect();
+            let marks = crate::asset_repository::migration_gc::mark_asset_roots_with_remote_scan(
+                &scan,
+                labelled.into_iter().map(|(_, roots)| roots),
+                |hash| residency.gc_size(hash),
+            )?;
+            Ok((holders, marks))
+        };
+        let (mut holders, mut marks) = mark(search.as_ref())?;
+        if let Some(found) = &mut search {
+            if self.keep_aliases_archives_name(found, &marks, &scope)? {
+                (holders, marks) = mark(Some(&*found))?;
+            }
+        }
         let recent_orphan_objects = search
             .map(|search| search.orphans(&marks, &scope).1.into_iter().map(|alias| alias.object_hash).collect())
             .unwrap_or_default();

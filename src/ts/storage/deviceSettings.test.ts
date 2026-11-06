@@ -21,6 +21,8 @@ const defaults = {
     generationHistoryLimitMultiplier: 2,
     messageSendKey: 'enter',
     pluginOutputCurrentChatOnly: false,
+    automaticSnapshotsEnabled: true,
+    snapshotKeepCount: 8,
 }
 
 describe('device settings', () => {
@@ -226,6 +228,10 @@ describe('device settings', () => {
         ['a non-finite multiplier', { generationHistoryLimitMultiplier: Number.POSITIVE_INFINITY }],
         ['an unknown key', { unknownSetting: true }],
         ['an unsupported send key', { messageSendKey: 'space' }],
+        ['a keep count of zero', { snapshotKeepCount: 0 }],
+        ['a keep count above eight', { snapshotKeepCount: 9 }],
+        ['a fractional keep count', { snapshotKeepCount: 2.5 }],
+        ['a non-boolean automatic snapshot switch', { automaticSnapshotsEnabled: 'off' }],
     ])('refuses %s and keeps every stored setting', async (_name, update) => {
         const { getDeviceSettings, subscribeDeviceSettings, updateDeviceSettings } = await loadDeviceSettings()
         updateDeviceSettings({ performanceProfile: 'low-spec', nativeFileLogEnabled: false })
@@ -280,8 +286,11 @@ describe('device settings', () => {
         expect(getDeviceSettings()).toEqual(defaults)
     })
 
-    it('keeps settings stored before the plugin output history field and sends the full history', async () => {
-        const { pluginOutputCurrentChatOnly: _currentOnly, ...released } = defaults
+    it.each([
+        ['the plugin output history field', ['pluginOutputCurrentChatOnly', 'automaticSnapshotsEnabled', 'snapshotKeepCount']],
+        ['the snapshot fields', ['automaticSnapshotsEnabled', 'snapshotKeepCount']],
+    ])('keeps settings stored before %s and takes the new defaults', async (_case, added) => {
+        const released = Object.fromEntries(Object.entries(defaults).filter(([key]) => !added.includes(key)))
         localStorage.setItem('risuNestDeviceSettings', JSON.stringify({
             ...released,
             performanceProfile: 'low-spec',
@@ -294,9 +303,14 @@ describe('device settings', () => {
             generationHistoryLimitEnabled: true,
         })
 
-        updateDeviceSettings({ pluginOutputCurrentChatOnly: true })
+        updateDeviceSettings({ pluginOutputCurrentChatOnly: true, automaticSnapshotsEnabled: false, snapshotKeepCount: 3 })
         const reloaded = await loadDeviceSettings()
-        expect(reloaded.getDeviceSettings()).toMatchObject({ performanceProfile: 'low-spec', pluginOutputCurrentChatOnly: true })
+        expect(reloaded.getDeviceSettings()).toMatchObject({
+            performanceProfile: 'low-spec',
+            pluginOutputCurrentChatOnly: true,
+            automaticSnapshotsEnabled: false,
+            snapshotKeepCount: 3,
+        })
     })
 
     it('ignores a runtime schema override while applying valid settings', async () => {

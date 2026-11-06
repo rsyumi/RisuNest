@@ -1976,6 +1976,13 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        moduleScope: {
+            info: 'Global applies a module to every chat, Character to every chat with this character, and Chat to this chat only.',
+            global: 'Global',
+            character: 'Character',
+            chat: 'Chat',
+            noMatch: 'No modules match the search.',
+        },
         appLock: {
             title: 'App lock',
             enable: 'Use app lock',
@@ -2767,6 +2774,12 @@ export const languageEnglish = {
             counts: '{0} characters · {1} chats · {2} messages',
             subMetrics:
                 'Chat attachments {0} (included in images & media) · Plugin data {1}',
+            automaticSnapshots: 'Automatic snapshots',
+            automaticSnapshotsHelp:
+                'Creates a new snapshot once 24 hours have passed since the last one.',
+            snapshotKeepCount: 'Snapshots to keep',
+            snapshotKeepCountHelp:
+                'Creating a snapshot beyond this number deletes the oldest automatic snapshots first. Up to {0} snapshots can be kept.',
             createSnapshotTitle: 'Create a snapshot',
             createSnapshotHelp:
                 'Saves the current state so you can return to it later.',

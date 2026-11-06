@@ -1648,8 +1648,10 @@ pub(crate) fn pds_checkpoint(
 pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
+    keep_count: Option<u32>,
 ) -> Result<SnapshotCreated, StoreError> {
     logged("pds_snapshot_create", (|| {
+        let keep = super::snapshot::KeepCount::requested(keep_count)?;
         let _operation = state.admit_renderer_operation()?;
         let snapshot_operation =
             state
@@ -1659,7 +1661,7 @@ pub(crate) fn pds_snapshot_create(
                     message: format!("persistent snapshot mutex poisoned: {error}"),
                 })?;
         let started = std::time::Instant::now();
-        let (mut archive, scratch, current_bytes, inventory) = {
+        let (mut archive, scratch, retention, inventory) = {
             let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
                 message: format!("persistent store mutex poisoned: {error}"),
             })?;
@@ -1668,14 +1670,14 @@ pub(crate) fn pds_snapshot_create(
             })?;
             let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
             let inventory = store.active_readers.defer_asset_inventory();
-            let (scratch, current_bytes) =
-                super::snapshot::capture_scratch(store, &archive)?;
-            (archive, scratch, current_bytes, inventory)
+            let (scratch, retention) =
+                super::snapshot::capture_scratch(store, &archive, keep)?;
+            (archive, scratch, retention, inventory)
         };
         let result = super::snapshot::archive_scratch(
             &mut archive,
             scratch,
-            current_bytes,
+            retention,
             &reason,
             started,
         );
@@ -3177,23 +3179,28 @@ mod tests {
         let state = PersistentStoreState::default();
         open_renderer_persistent_store(&state, directory.path()).unwrap();
         let recorded = |at: &str| crate::native_log::global_state().tail(None).into_iter().rev()
-            .find(|entry| entry.message.ends_with(&format!(" at {at}")));
-        let (held, holding) = std::sync::mpsc::channel();
-        let waiting = std::thread::scope(|scope| {
-            let holder = scope.spawn(|| with_store_mutex(&state, |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(80));
-                Ok(())
-            }));
-            holding.recv().unwrap();
-            let at = crate::slow_log::with_test_threshold(Duration::from_millis(40), || {
-                let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
-                at
+            .filter(|entry| entry.message.ends_with(&format!(" at {at}"))).collect::<Vec<_>>();
+        let mut waiting = String::new();
+        // The second wait at the same place is counted toward a summary instead of written.
+        for _ in 0..2 {
+            let (held, holding) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let holder = scope.spawn(|| with_store_mutex(&state, |_| {
+                    held.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(80));
+                    Ok(())
+                }));
+                holding.recv().unwrap();
+                waiting = crate::slow_log::with_test_threshold(Duration::from_millis(40), || {
+                    let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
+                    at
+                });
+                holder.join().unwrap().unwrap();
             });
-            holder.join().unwrap().unwrap();
-            at
-        });
-        let entry = recorded(&waiting).unwrap();
+        }
+        let entries = recorded(&waiting);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
         assert_eq!((entry.level.as_str(), entry.target.as_str()), ("warn", "slow-operation"));
         let waited: u128 = entry.message.split(" after waiting ").nth(1)
             .and_then(|rest| rest.split(' ').next()).unwrap().parse().unwrap();
@@ -3202,7 +3209,7 @@ mod tests {
             let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
             at
         });
-        assert!(recorded(&quick).is_none());
+        assert!(recorded(&quick).is_empty());
     }
 
     #[test]
