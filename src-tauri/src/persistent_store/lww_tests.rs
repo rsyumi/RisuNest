@@ -3192,9 +3192,14 @@ fn ranges_for_one_conversation_in_one_commit_capture_once_from_their_pages() {
 }
 
 #[test]
-fn superseded_message_pages_are_collected_only_after_the_grace_period() {
-    let (_dir, mut store) = store();
-    create_conversation(&mut store, "char", "chat");
+fn superseded_message_pages_are_collected_after_the_short_grace() {
+    let (grace, short, limit) = (
+        super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS,
+        super::super::SUPERSEDED_OBJECT_GRACE_MS,
+        super::super::MESSAGE_PAGE_SWEEP_LIMIT,
+    );
+    let library = super::super::MessageObjectStore::Library;
+    let clock = || super::super::commands::current_time_ms().unwrap();
     let message = |i: usize| serde_json::json!({"chatId":format!("m-{i}"),"data":format!("synthetic-{i}")});
     let append = |store: &mut PersistentStore, start: usize, messages: Vec<Value>| {
         store.commit(&WorkingSetCommit {
@@ -3206,42 +3211,53 @@ fn superseded_message_pages_are_collected_only_after_the_grace_period() {
             ..Default::default()
         }).unwrap();
     };
-    let referenced = |store: &PersistentStore| -> BTreeSet<String> {
-        let mut hashes = store.connection.prepare("SELECT hash FROM message_page_indexes").unwrap()
-            .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<BTreeSet<_>, _>>().unwrap();
-        let body: Vec<u8> = store.connection.query_row("SELECT body FROM message_page_manifests", [], |row| row.get(0)).unwrap();
-        hashes.insert(risunest_sync_wire::hash(&body));
-        hashes
+    let objects = |store: &PersistentStore| -> BTreeSet<String> {
+        store.connection.prepare("SELECT hash FROM message_page_objects").unwrap()
+            .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<BTreeSet<_>, _>>().unwrap()
     };
-    let present = |store: &PersistentStore, hash: &str| -> bool {
-        store.connection.query_row("SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)", [hash], |row| row.get(0)).unwrap()
-    };
-    append(&mut store, 0, (0..40).map(message).collect());
-    let before = referenced(&store);
-    append(&mut store, 40, vec![message(40)]);
-    let after = referenced(&store);
-    let superseded = before.difference(&after).cloned().collect::<Vec<_>>();
-    assert!(!superseded.is_empty());
-    let now = 1_900_000_000_000i64;
-    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
-    assert!(superseded.iter().all(|hash| present(&store, hash)));
-    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS - 1, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
-    assert!(superseded.iter().all(|hash| present(&store, hash)));
-    store.sweep_message_page_objects(super::super::MessageObjectStore::Library, now + super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS, super::super::MESSAGE_PAGE_SWEEP_LIMIT).unwrap();
-    for hash in &superseded {
-        assert!(!present(&store, hash), "superseded object {hash} survived maintenance");
-        let proofs: i64 = store.connection.query_row(
-            "SELECT (SELECT count(*) FROM message_page_proofs WHERE hash=?1)+(SELECT count(*) FROM message_page_verified_objects WHERE hash=?1)",
-            [hash], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(proofs, 0);
-    }
-    assert!(after.iter().all(|hash| present(&store, hash)));
     let key = UnitKey::new(&["messages", "char", "chat"]).unwrap();
-    let value = read_unit(&store.connection, &key).unwrap().unwrap().1;
-    let UnitValue::Object { descriptor_hash, descriptor } = &value else { panic!() };
-    assert!(present(&store, descriptor_hash) && present(&store, &descriptor.object_hash));
-    super::super::message_pages::validate_manifest(&store.connection, &value).unwrap();
+    let value = |store: &PersistentStore| read_unit(&store.connection, &key).unwrap().unwrap().1;
+    let dependency_root = |store: &PersistentStore| match value(store) {
+        UnitValue::Object { descriptor, .. } => descriptor.dependency_root,
+        other => panic!("{other:?}"),
+    };
+    // A short conversation names its pages inline, a long one through a reference tree.
+    for (count, tree) in [(40, false), (4_000, true)] {
+        let (_dir, mut store) = store();
+        create_conversation(&mut store, "char", "chat");
+        append(&mut store, 0, (0..count).map(message).collect());
+        assert_eq!(dependency_root(&store).is_some(), tree, "{count} messages");
+        let settled = clock() + 2 * grace;
+        store.sweep_message_page_objects(library, settled, limit).unwrap();
+        store.sweep_message_page_objects(library, settled + grace, limit).unwrap();
+        let held = objects(&store);
+        let replaced_root = dependency_root(&store);
+
+        let before = clock();
+        append(&mut store, count, vec![message(count)]);
+        let after = clock();
+        store.sweep_message_page_objects(library, before + short - 60_000, limit).unwrap();
+        assert!(held.is_subset(&objects(&store)), "{count}: a replaced object went before its grace");
+        store.sweep_message_page_objects(library, after + short, limit).unwrap();
+        let collected = objects(&store);
+        assert!(!held.is_subset(&collected), "{count}: the write replaced nothing");
+        // The long path, which marks whatever no reference names, has nothing left to delete.
+        store.sweep_message_page_objects(library, after + short + grace, limit).unwrap();
+        store.sweep_message_page_objects(library, after + short + 2 * grace, limit).unwrap();
+        let lingering = collected.difference(&objects(&store)).cloned().collect::<Vec<_>>();
+        assert!(lingering.is_empty(), "{count}: replaced objects waited for the long grace: {lingering:?}");
+        if let Some(root) = replaced_root {
+            assert!(!collected.contains(&root), "the replaced reference tree outlived the short grace");
+        }
+        for hash in held.difference(&collected) {
+            let proofs: i64 = store.connection.query_row(
+                "SELECT (SELECT count(*) FROM message_page_proofs WHERE hash=?1)+(SELECT count(*) FROM message_page_verified_objects WHERE hash=?1)",
+                [hash], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(proofs, 0);
+        }
+        super::super::message_pages::validate_manifest(&store.connection, &value(&store)).unwrap();
+    }
 }
 
 #[test]
