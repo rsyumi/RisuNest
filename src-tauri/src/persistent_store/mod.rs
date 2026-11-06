@@ -130,6 +130,10 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ("message_page_manifests", "character_id, conversation_id, body"),
 ];
 
+/// What asset GC fails with while a capture or another snapshot operation keeps it from reading
+/// the asset inventory. Server sync reports it as `library-operation-busy`.
+pub(crate) const ASSET_INVENTORY_BUSY: &str = "Asset inventory is held by another library operation";
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "code", rename_all = "kebab-case")]
 pub(crate) enum StoreError {
@@ -3804,8 +3808,11 @@ impl PersistentStore {
                 &self.repository_root,
             )?,
         ));
+        // A snapshot delete or restore can hold the archive for minutes, so GC stops here as it
+        // does during a capture instead of keeping the store waiting.
         roots.extend(
-            snapshot_archive::Archive::open(&self.snapshots_dir)?
+            snapshot_archive::Archive::try_open(&self.snapshots_dir)?
+                .ok_or_else(|| StoreError::Validation { message: ASSET_INVENTORY_BUSY.into() })?
                 .roots()?
                 .into_iter()
                 .map(|set| ("snapshot", set)),

@@ -85,7 +85,7 @@ impl ActiveReaderRegistry {
     pub(crate) fn detached_asset_roots(&self) -> StoreResult<Vec<AssetRootSet>> {
         if self.deferred_asset_inventories.load(Ordering::SeqCst) > 0 {
             return Err(StoreError::Validation {
-                message: "Asset inventory is being pinned by a local capture".into(),
+                message: super::ASSET_INVENTORY_BUSY.into(),
             });
         }
         Ok(self

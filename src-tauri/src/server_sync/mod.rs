@@ -157,7 +157,7 @@ impl From<crate::persistent_store::StoreError> for SyncError {
             crate::persistent_store::StoreError::Store { message } => Self::caused("local-storage", 503, message),
             crate::persistent_store::StoreError::CommitBusy => Self::new("library-operation-busy", 409),
             crate::persistent_store::StoreError::Validation { message }
-                if message == "Asset inventory is being pinned by a local capture" =>
+                if message == crate::persistent_store::ASSET_INVENTORY_BUSY =>
                 Self::new("library-operation-busy", 409),
             other => Self::caused("local-validation", 409, other.to_string()),
         }
