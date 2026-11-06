@@ -1798,6 +1798,13 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        moduleScope: {
+            info: '글로벌은 모든 채팅, 캐릭터는 이 캐릭터의 모든 채팅, 채팅은 현재 채팅에 모듈을 적용합니다.',
+            global: '글로벌',
+            character: '캐릭터',
+            chat: '채팅',
+            noMatch: '검색 결과가 없습니다.',
+        },
         appLock: {
             title: '앱 잠금',
             enable: '앱 잠금 사용',
