@@ -45,6 +45,12 @@ class AppLockFacade {
         this.controller = new AppLockController(storage, createAppLockNativeAdapter())
         const controller = this.controller
         controller.subscribe((state) => { this.state = state })
+        if (typeof window !== 'undefined') {
+            const shown = () => { if (document.visibilityState === 'visible') controller.retryPendingPresentation() }
+            window.addEventListener('focus', shown)
+            window.addEventListener('pageshow', shown)
+            document.addEventListener('visibilitychange', shown)
+        }
         this.starting = (this.failureStarting ?? Promise.resolve()).then(async () => {
             controller.setBackgroundColor(this.backgroundColor)
             await controller.initialize(options.recovery)

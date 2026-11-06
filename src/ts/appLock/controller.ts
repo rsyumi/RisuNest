@@ -1,6 +1,12 @@
 import { createPinRecord, defaultAppLockRecord, lockRequiredAfterDeparture, matchesPin, readAppLockRecord, type AppLockRecord, type AppLockTiming } from './record'
 import type { AppLockLifecycle, AppLockNativeAdapter, OsAuthAvailability, OsAuthOutcome } from './native'
 
+// A refused frame asks for another one, quickly at first and then for a few more seconds.
+// After that, only a later lifecycle event or page signal asks again.
+const READINESS_RETRY_DELAYS_MS = [32, 128, 512, 1000, 2000, 4000]
+// Policy updates and frame confirmations answer within a few frames; a longer wait goes to the device log.
+const NATIVE_STALL_REPORT_MS = 3000
+
 export type PinFlow = 'unlock' | 'setup' | 'change' | 'reset'
 export type AppLockIssue = 'wrongPin' | 'mismatch' | 'nativeUnavailable'
 export interface AppLockState {
@@ -60,6 +66,10 @@ export class AppLockController {
     private policyRevision = 0
     private readinessRetryCount = 0
     private readinessRetry: ReturnType<typeof setTimeout> | null = null
+    private confirmedEpoch = -1
+    private presentingEpoch = -1
+    private confirmations = 0
+    private reportedStall = ''
     private backgroundColor = '#21252b'
     private unlisten: (() => void) | null = null
     private listening = false
@@ -221,6 +231,7 @@ export class AppLockController {
             if (this.state.record.enabled && departed !== null
                 && lockRequiredAfterDeparture(this.departureTiming, departed, snapshot.atMs)) this.requireLock()
             this.departedAtMs = null
+            this.watchPresentation(snapshot.epoch)
         }
         void this.publishPolicy()
     }
@@ -252,38 +263,32 @@ export class AppLockController {
 
     async renderLoading(): Promise<void> {
         if (!this.state.initialized || this.bootFailure) return
+        this.presentingEpoch = this.state.epoch
         if (this.bridgeFailed && this.recordRead && !this.state.record.enabled) await this.publishPolicy()
         const epoch = this.state.epoch
         const operation = this.operation
-        await this.policyTail
+        await this.watch(epoch, 'policy update', this.policyTail)
         if (!this.state.active || epoch !== this.state.epoch || operation !== this.operation) return
         let accepted = false
-        try { accepted = await this.native.ready(epoch, this.state.locked || this.state.readFailed || this.state.flow !== null) } catch { return }
+        try { accepted = await this.confirm(epoch, this.state.locked || this.state.readFailed || this.state.flow !== null) } catch { return }
         if (epoch !== this.state.epoch || operation !== this.operation) return
         if (!accepted) this.retryPresentation(epoch, operation)
-        else {
-            this.readinessRetryCount = 0
-            if (this.readinessRetry) clearTimeout(this.readinessRetry)
-            this.readinessRetry = null
-        }
+        else this.confirmed(epoch)
     }
 
     async renderBootFailure(): Promise<void> {
         if (!this.bootFailure) this.operation++
         this.bootFailure = true
-        await this.publishPolicy()
+        this.presentingEpoch = this.state.epoch
+        await this.watch(this.state.epoch, 'policy update', this.publishPolicy())
         const epoch = this.state.epoch
         const operation = this.operation
         if (!this.bootFailure || !this.state.active) return
         let accepted = false
-        try { accepted = await this.native.ready(epoch, this.bridgeFailed) } catch { return }
+        try { accepted = await this.confirm(epoch, this.bridgeFailed) } catch { return }
         if (epoch !== this.state.epoch || operation !== this.operation) return
         if (!accepted) this.retryPresentation(epoch, operation)
-        else {
-            this.readinessRetryCount = 0
-            if (this.readinessRetry) clearTimeout(this.readinessRetry)
-            this.readinessRetry = null
-        }
+        else this.confirmed(epoch)
     }
 
     resumeContent(): void {
@@ -294,22 +299,21 @@ export class AppLockController {
     }
 
     async rendered(reason: string): Promise<void> {
+        this.presentingEpoch = this.state.epoch
         if (this.bridgeFailed && this.recordRead && !this.state.record.enabled) await this.publishPolicy()
         const epoch = this.state.epoch
         const operation = this.operation
-        await this.policyTail
+        await this.watch(epoch, 'policy update', this.policyTail)
         if (this.bootFailure || !this.state.active || epoch !== this.state.epoch || operation !== this.operation) return
         const locked = this.state.locked || this.state.readFailed || this.state.flow !== null
         let accepted = false
-        try { accepted = await this.native.ready(epoch, locked) } catch { return }
+        try { accepted = await this.confirm(epoch, locked) } catch { return }
         if (epoch !== this.state.epoch || operation !== this.operation) return
         if (!accepted) {
             this.retryPresentation(epoch, operation)
             return
         }
-        this.readinessRetryCount = 0
-        if (this.readinessRetry) clearTimeout(this.readinessRetry)
-        this.readinessRetry = null
+        this.confirmed(epoch)
         if (this.state.returnPending) {
             this.update({ returnPending: false })
             void this.publishPolicy()
@@ -321,9 +325,55 @@ export class AppLockController {
         }
     }
 
+    private reportStall(epoch: number, step: string): void {
+        const report = `${epoch}:${step}`
+        if (this.disposed || this.reportedStall === report) return
+        this.reportedStall = report
+        this.native.report(`app-lock ${step} still pending after ${NATIVE_STALL_REPORT_MS} ms: epoch ${epoch}`)
+    }
+
+    /** Reports a return whose frame was never presented for confirmation. */
+    private watchPresentation(epoch: number): void {
+        setTimeout(() => {
+            if (this.state.active && this.state.epoch === epoch && this.presentingEpoch !== epoch) this.reportStall(epoch, 'frame presentation')
+        }, NATIVE_STALL_REPORT_MS)
+    }
+
+    private async watch<T>(epoch: number, step: string, wait: Promise<T>): Promise<T> {
+        const stall = setTimeout(() => this.reportStall(epoch, step), NATIVE_STALL_REPORT_MS)
+        try { return await wait } finally { clearTimeout(stall) }
+    }
+
+    private async confirm(epoch: number, locked: boolean): Promise<boolean> {
+        this.confirmations++
+        try { return await this.watch(epoch, 'frame confirmation', this.native.ready(epoch, locked)) }
+        finally { this.confirmations-- }
+    }
+
+    private confirmed(epoch: number): void {
+        this.confirmedEpoch = epoch
+        this.readinessRetryCount = 0
+        if (this.readinessRetry) clearTimeout(this.readinessRetry)
+        this.readinessRetry = null
+    }
+
+    /** Asks again for a frame the native shell has not confirmed, after a later sign that the page is shown. */
+    retryPendingPresentation(): void {
+        if (this.disposed || !this.state.initialized || this.state.nativeBusy || this.confirmations > 0
+            || (this.state.active && this.confirmedEpoch === this.state.epoch)) return
+        this.readinessRetryCount = 0
+        // The policy answer carries the current lifecycle, which also catches up a missed event.
+        void this.publishPolicy().then(() => {
+            if (this.disposed || !this.state.active || this.state.nativeBusy || this.confirmations > 0
+                || this.confirmedEpoch === this.state.epoch) return
+            this.update({ presentationRevision: this.state.presentationRevision + 1 })
+        })
+    }
+
     private retryPresentation(epoch: number, operation: number): void {
-        if (!this.state.active || this.state.nativeBusy || this.readinessRetry || this.readinessRetryCount >= 3) return
-        const delay = [32, 128, 512][this.readinessRetryCount++]
+        if (!this.state.active || this.state.nativeBusy || this.readinessRetry
+            || this.readinessRetryCount >= READINESS_RETRY_DELAYS_MS.length) return
+        const delay = READINESS_RETRY_DELAYS_MS[this.readinessRetryCount++]
         this.readinessRetry = setTimeout(() => {
             this.readinessRetry = null
             if (!this.disposed && this.state.active && epoch === this.state.epoch && operation === this.operation) {

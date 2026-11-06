@@ -127,11 +127,51 @@ pub(crate) async fn app_lock_authenticate(window: WebviewWindow, reason: String)
 #[tauri::command]
 pub(crate) async fn app_lock_set_policy(app: AppHandle, policy: CoverPolicy) -> Result<LifecycleSnapshot, String> {
     ensure_ready(&app)?;
-    platform::set_policy(&app, &policy).await
+    let result = platform::set_policy(&app, &policy).await;
+    if let Err(error) = &result { crate::nlog!("warn", "app-lock policy update failed: {error}"); }
+    result
 }
+
+// A frame confirmation waits for a platform presentation callback. One that has not answered by
+// then counts as refused, so the page presents its frame again instead of waiting on it.
+const FRAME_ANSWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[tauri::command]
 pub(crate) async fn app_lock_ready(app: AppHandle, epoch: u64, locked: bool) -> Result<bool, String> {
     ensure_ready(&app)?;
-    platform::ready(&app, epoch, locked).await
+    answer_frame(epoch, locked, platform::ready(&app, epoch, locked), FRAME_ANSWER_LIMIT).await
+}
+
+/// Each frame confirmation leaves one line in the device log with the time its platform answer took.
+async fn answer_frame(epoch: u64, locked: bool, answer: impl std::future::Future<Output = Result<bool, String>>, limit: std::time::Duration) -> Result<bool, String> {
+    let started = std::time::Instant::now();
+    let answer = tokio::time::timeout(limit, answer).await;
+    let elapsed = started.elapsed().as_millis();
+    match &answer {
+        Ok(Ok(accepted)) => crate::nlog!("info", "app-lock frame {}: epoch {epoch}, locked {locked}, {elapsed} ms",
+            if *accepted { "accepted" } else { "refused" }),
+        Ok(Err(error)) => crate::nlog!("warn", "app-lock frame confirmation failed: epoch {epoch}, locked {locked}, {elapsed} ms: {error}"),
+        Err(_) => crate::nlog!("warn", "app-lock frame unanswered: epoch {epoch}, locked {locked}, {elapsed} ms"),
+    }
+    answer.unwrap_or(Ok(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn every_frame_answer_is_logged_and_an_unanswered_frame_counts_as_refused() {
+        let limit = std::time::Duration::from_millis(5);
+        assert_eq!(answer_frame(71_001, true, async { Ok(true) }, limit).await, Ok(true));
+        assert_eq!(answer_frame(71_002, false, async { Ok(false) }, limit).await, Ok(false));
+        assert_eq!(answer_frame(71_003, false, async { Err("synthetic".to_owned()) }, limit).await, Err("synthetic".to_owned()));
+        assert_eq!(answer_frame(71_004, true, std::future::pending(), limit).await, Ok(false));
+        let entries = crate::native_log::global_state().tail(None);
+        let line = |epoch: u64| entries.iter().rev().find(|entry| entry.message.contains(&format!("epoch {epoch},"))).map(|entry| (entry.level.as_str(), entry.message.as_str()));
+        assert!(matches!(line(71_001), Some(("info", message)) if message.starts_with("app-lock frame accepted: epoch 71001, locked true")));
+        assert!(matches!(line(71_002), Some(("info", message)) if message.starts_with("app-lock frame refused: epoch 71002, locked false")));
+        assert!(matches!(line(71_003), Some(("warn", message)) if message.starts_with("app-lock frame confirmation failed: epoch 71003") && message.ends_with(": synthetic")));
+        assert!(matches!(line(71_004), Some(("warn", message)) if message.starts_with("app-lock frame unanswered: epoch 71004, locked true")));
+    }
 }

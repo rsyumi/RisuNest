@@ -36,6 +36,11 @@ fn now_ms() -> u64 {
 
 type Observer = (Retained<NSNotificationCenter>, Retained<ProtocolObject<dyn NSObjectProtocol>>);
 
+// The launch cover has no lock decision behind it. Its frame confirmation runs through async
+// commands that can wait behind other native work, so it comes off after this long even when no
+// confirmation arrives. Normal confirmations take a few frames.
+const UNCONFIRMED_COVER_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 struct State {
     app: AppHandle,
     policy: CoverPolicy,
@@ -79,11 +84,38 @@ impl State {
             self.epoch = self.epoch.wrapping_add(1);
             self.render_covers(mtm, false);
             self.emit();
+            self.limit_unconfirmed_cover();
         } else if self.prompt_inactive {
             self.prompt_inactive = false;
             self.render_covers(mtm, false);
             self.emit();
         }
+    }
+
+    /// Ends a cover whose frame was never confirmed, unless it waits for a lock decision or the PIN screen.
+    fn release_unconfirmed(&mut self, mtm: MainThreadMarker, epoch: u64) -> bool {
+        if !self.awaiting_ready || !self.active || self.epoch != epoch
+            || self.policy.installs_return_cover() || self.policy.gate_required { return false; }
+        self.awaiting_ready = false;
+        self.render_covers(mtm, false);
+        self.emit();
+        true
+    }
+
+    fn limit_unconfirmed_cover(&self) {
+        if !self.awaiting_ready || self.policy.installs_return_cover() || self.policy.gate_required { return; }
+        let app = self.app.clone();
+        let epoch = self.epoch;
+        std::thread::spawn(move || {
+            std::thread::sleep(UNCONFIRMED_COVER_LIMIT);
+            let _ = app.run_on_main_thread(move || {
+                let Some(mtm) = MainThreadMarker::new() else { return };
+                let released = STATE.with(|cell| cell.borrow_mut().as_mut().is_some_and(|state| state.release_unconfirmed(mtm, epoch)));
+                if released {
+                    crate::nlog!("warn", "app-lock cover released after {} s without a confirmed frame", UNCONFIRMED_COVER_LIMIT.as_secs());
+                }
+            });
+        });
     }
 
     fn render_covers(&mut self, mtm: MainThreadMarker, force: bool) {
@@ -243,6 +275,7 @@ pub(super) fn setup(app: &AppHandle) -> Result<(), String> {
             for (name, signal) in workspace_notifications() { state.observers.push(observe(&workspace, name, signal)); }
         }
         state.render_covers(mtm, false);
+        state.limit_unconfirmed_cover();
         *slot = Some(state);
     });
     Ok(())
