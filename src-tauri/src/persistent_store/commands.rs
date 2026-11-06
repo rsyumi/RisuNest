@@ -287,6 +287,7 @@ impl PersistentStoreState {
             state = waited.0;
         }
         drop(state);
+        super::storage_breakdown::stop();
         self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
         lock_store(&self.store).map_err(|_| renderer_gate_error())?.take();
         Ok(maintenance)
@@ -296,6 +297,7 @@ impl PersistentStoreState {
         let maintenance = self
             .try_acquire_renderer_maintenance()?
             .ok_or_else(renderer_gate_error)?;
+        super::storage_breakdown::stop();
         self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
         // No new operation can enter between draining and closing the store.
         // Reopening after the guard is released refreshes the connection after
@@ -3123,6 +3125,49 @@ mod tests {
         let maintenance = state.acquire_device_maintenance().unwrap();
         assert!(with_snapshot_directory(&state, super::super::snapshot::list).is_err());
         drop(maintenance);
+    }
+
+    /// The storage breakdown reads on a connection of its own. Maintenance ends it
+    /// before closing the store, or the reopen's truncate checkpoint finds its
+    /// snapshot still pinning the write-ahead log, as on an in-process iOS restart.
+    #[test]
+    fn maintenance_ends_a_running_storage_breakdown_before_the_store_reopens() {
+        use std::time::Duration;
+        let maintenances: [fn(&PersistentStoreState) -> StoreResult<DeviceMaintenanceGuard>; 2] = [
+            |state| state.acquire_cleanup_maintenance(Duration::from_secs(1)),
+            PersistentStoreState::acquire_device_maintenance,
+        ];
+        for maintenance in maintenances {
+            let directory = tempdir().unwrap();
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            crate::persistent_store::tests::asset_catalog_gc_tests::add_synthetic_character(&mut store, "reader", "");
+            let database = store.database_path.clone();
+            let state = PersistentStoreState::with_test_store(store);
+            // Maintenance in a parallel test also stops the breakdown, and a scan
+            // stopped before it reads drops the sender, so it starts again.
+            let started = (0..5).any(|_| {
+                let (reading, read) = std::sync::mpsc::channel();
+                super::super::storage_breakdown::start_for_test(vec![database.clone()], move |connection, _| {
+                    connection.execute_batch("BEGIN")?;
+                    connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))?;
+                    let _ = reading.send(());
+                    connection.query_row(
+                        "SELECT count(*) FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n)",
+                        [],
+                        |row| row.get::<_, i64>(0).map(|count| count.to_string()),
+                    )
+                });
+                read.recv_timeout(Duration::from_secs(30)).is_ok()
+            });
+            assert!(started, "the breakdown never held a reader");
+            let root = directory.path().to_path_buf();
+            let (reopened, reopen) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = maintenance(&state).map(drop).and_then(|()| PersistentStore::open(&root).map(drop));
+                reopened.send(result).unwrap();
+            });
+            reopen.recv_timeout(Duration::from_secs(60)).expect("maintenance waits for the breakdown").unwrap();
+        }
     }
 
     #[test]
