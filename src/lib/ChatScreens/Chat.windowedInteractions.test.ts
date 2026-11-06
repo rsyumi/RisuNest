@@ -401,6 +401,15 @@ it.each([
     await finishedEdit('module-scope')
     expect(selectedChat().modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
     expect((await savedChat())?.modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
+    // Turning a scope off and on again before the first edit is stored keeps the last choice.
+    const chatB = await scopeButton('synthetic-module-b', 'chat')
+    chatB.click()
+    chatB.click()
+    await current.svelte.tick()
+    expect(chatB.getAttribute('aria-pressed')).toBe('true')
+    await finishedEdit('module-scope')
+    await finishedEdit('module-scope')
+    expect((await savedChat())?.modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
     // Opening the menu and the chat scope read no messages; the character scope reads what the memory switch reads.
     expect(current.fullReads).toEqual(fullReadsBeforeModules)
     ;(await scopeButton('synthetic-module-a', 'character')).click()

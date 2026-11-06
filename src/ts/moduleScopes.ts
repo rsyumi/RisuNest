@@ -52,10 +52,12 @@ export function setModuleScope(scope: ModuleScope, moduleId: string, enabled: bo
         })
     }
     const target = captureChatBindingTarget()
-    if (!target || conversationMutationBlockedByGeneration(target.conversation.id)) return Promise.resolve(false)
+    if (!target) return Promise.resolve(false)
     return serialize(async () => {
         try {
             const conversation = target.conversation
+            // Checked when the edit runs, since a generation can start while it waits behind earlier edits.
+            if (conversationMutationBlockedByGeneration(conversation.id)) return false
             await updateChatBinding(conversation, { modules: withModule(conversation.modules, moduleId, enabled) })
             await saveChatBinding()
             return true

@@ -13,7 +13,7 @@ export const dataHealthNavigation = serverSyncNavigation
 export const getStartupExclusions = () => ['autoUpdate']
 export const isStartupExcluded = () => true
 export { alertStore }
-export const bookmarkListOpen = writable(false)
+export const bookmarkListOpen = writable(false), moduleScopeMenuOpen = writable(false)
 export const LoadingStatusState = { startedAt: null, text: '' }
 export const popupStore = {}, easyPanelStore = {}, popUpEditorStore = {}, loadoutModalStore = {}, onboardingModalStore = {}, irisStore = {}, customSideBarConfigDialogStore = {}
 export const hypaV3ModalOpen = writable(false), hypaV3ProgressStore = writable({ open: false })

@@ -12,8 +12,9 @@
     const text = $derived(language.risuNest.moduleScope);
     const titleId = `module-scope-title-${Math.random().toString(36).slice(2)}`;
     let search = $state('');
-    // Scope edits still being stored, shown as already made.
+    // Scope edits still being stored, shown as already made. Each click queues its edit, so the last one wins.
     let pending = $state<Record<string, boolean>>({});
+    const lastEdit: Record<string, number> = {};
 
     const character = $derived(DBState.db.characters[$selectedCharID]);
     const chat = $derived(character?.chats?.[character.chatPage]);
@@ -41,12 +42,13 @@
 
     async function toggle(scope: ModuleScope, moduleId: string, on: boolean) {
         const key = `${scope}:${moduleId}`;
-        if (key in pending) return;
+        const edit = (lastEdit[key] ?? 0) + 1;
+        lastEdit[key] = edit;
         pending[key] = !on;
         try {
             await setModuleScope(scope, moduleId, !on);
         } finally {
-            delete pending[key];
+            if (lastEdit[key] === edit) delete pending[key];
         }
     }
 
