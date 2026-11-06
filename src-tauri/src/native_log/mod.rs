@@ -733,6 +733,7 @@ pub(crate) fn native_log_tail(
     state: State<'_, NativeLogState>,
     limit: Option<usize>,
 ) -> Vec<LogEntry> {
+    crate::slow_log::summarize_repeats();
     state.tail(limit)
 }
 

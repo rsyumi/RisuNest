@@ -11,7 +11,6 @@
     import TransitionImage from "./TransitionImage.svelte";
     import BackgroundDom from "./BackgroundDom.svelte";
     import SideBarArrow from "../UI/GUI/SideBarArrow.svelte";
-    import ModuleChatMenu from "../Setting/Pages/Module/ModuleChatMenu.svelte";
     import SelectedConversationEditor from "../SideBars/SelectedConversationEditor.svelte";
     import LoadingIndicator from '../UI/GUI/LoadingIndicator.svelte';
     import { language } from '../../lang';
@@ -22,7 +21,6 @@
     const navigationBlocked = derived(navigationActivity, activity => activity !== null)
     onDestroy(restoreFocusAfterInputBlock(navigationBlocked))
     let openChatList = $state(false)
-    let openModuleList = $state(false)
 
     const wallPaper = `background: url(${defaultWallpaper})`
     const externalStyles = 
@@ -56,7 +54,7 @@
                 {/if}
             {/if}
             <div class="h-full w-2xl" style:width="{42 * (DBState.db.waifuWidth / 100)}rem" class:halfwp={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}>
-                <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList bind:openModuleList/>
+                <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList/>
             </div>
         </div>
     {:else if DBState.db.theme === 'waifuMobile'}
@@ -67,7 +65,7 @@
                 class:per33={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
                 class:h-full={!($selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none')}
             >
-                <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList bind:openModuleList/>
+                <DefaultChatScreen customStyle={`${externalStyles}backdrop-filter: blur(4px);`} bind:openChatList/>
             </div>
             {#if $selectedCharID >= 0}
                 {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
@@ -87,7 +85,7 @@
                         <ResizeBox />
                     {/if}
                 {/if}
-                <DefaultChatScreen customStyle={bgImg.length > 2 ? `${externalStyles}`: ''} bind:openChatList bind:openModuleList/>
+                <DefaultChatScreen customStyle={bgImg.length > 2 ? `${externalStyles}`: ''} bind:openChatList/>
             </div>
         </div>
     {/if}
@@ -107,20 +105,6 @@
                 <ChatList
                     close={() => {
                         openChatList = false;
-                    }}
-                />
-            </SelectedConversationEditor>
-        </div>
-    {:else if openModuleList}
-        <div class="absolute inset-0 z-40" use:backNavigationLayer={{ close: () => { openModuleList = false } }}>
-            <SelectedConversationEditor
-                close={() => {
-                    openModuleList = false;
-                }}
-            >
-                <ModuleChatMenu
-                    close={() => {
-                        openModuleList = false;
                     }}
                 />
             </SelectedConversationEditor>

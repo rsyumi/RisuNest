@@ -61,6 +61,14 @@ function recordEditsOfNextBoot() {
                 recordEdit('character-memory', actual.setCharacterMemory(...args)),
         }
     })
+    vi.doMock('src/ts/moduleScopes', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('src/ts/moduleScopes')>()
+        return {
+            ...actual,
+            setModuleScope: (...args: Parameters<typeof actual.setModuleScope>) =>
+                recordEdit('module-scope', actual.setModuleScope(...args)),
+        } satisfies typeof actual
+    })
 }
 
 // The first boot transforms the whole app graph. Paying that once here keeps it
@@ -380,6 +388,55 @@ it.each([
     expect((await current.raw.readCharacter(interactionCharacterId))?.value.supaMemory).toBe(false)
     expect(current.fullReads).toEqual(fullReadsBeforeMemory)
     expect(current.runtime.getSelectedConversationMode()).toBe(mode)
+
+    // The module menu opened from the chat list stores each scope without a complete conversation.
+    db.modules = [
+        { id: 'synthetic-module-a', name: 'Synthetic module A', description: '' },
+        { id: 'synthetic-module-b', name: 'Synthetic module B', description: '' },
+    ]
+    expect(selectedChat().modules).toBeUndefined()
+    const fullReadsBeforeModules = [...current.fullReads]
+    target.querySelector<HTMLButtonElement>('[data-module-scope-open]')!.click()
+    const scopeButton = (moduleId: string, scope: string) => vi.waitFor(() => {
+        const button = target.querySelector<HTMLButtonElement>(`[role="dialog"] [data-module-scope-row="${moduleId}"] [data-module-scope="${scope}"]`)
+        expect(button?.disabled).toBe(false)
+        return button!
+    })
+    const chatA = await scopeButton('synthetic-module-a', 'chat')
+    // Two quick taps before either is stored keep both modules.
+    chatA.click()
+    ;(await scopeButton('synthetic-module-b', 'chat')).click()
+    await finishedEdit('module-scope')
+    await finishedEdit('module-scope')
+    expect(selectedChat().modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
+    expect((await savedChat())?.modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
+    // Turning a scope off and on again before the first edit is stored keeps the last choice.
+    const chatB = await scopeButton('synthetic-module-b', 'chat')
+    chatB.click()
+    chatB.click()
+    await current.svelte.tick()
+    expect(chatB.getAttribute('aria-pressed')).toBe('true')
+    await finishedEdit('module-scope')
+    await finishedEdit('module-scope')
+    expect((await savedChat())?.modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
+    // Opening the menu and the chat scope read no messages; the character scope reads what the memory switch reads.
+    expect(current.fullReads).toEqual(fullReadsBeforeModules)
+    ;(await scopeButton('synthetic-module-a', 'character')).click()
+    await finishedEdit('module-scope')
+    const fullReadsAfterCharacterScope = [...current.fullReads]
+    ;(await scopeButton('synthetic-module-b', 'global')).click()
+    await finishedEdit('module-scope')
+    await current.svelte.tick()
+    expect(chatA.getAttribute('aria-pressed')).toBe('true')
+    expect((await scopeButton('synthetic-module-a', 'global')).getAttribute('aria-pressed')).toBe('false')
+    chatA.click()
+    await finishedEdit('module-scope')
+    expect((await savedChat())?.modules).toEqual(['synthetic-module-b'])
+    expect((await current.raw.readCharacter(interactionCharacterId))?.value.modules).toEqual(['synthetic-module-a'])
+    expect(db.enabledModules).toEqual(['synthetic-module-b'])
+    expect(current.fullReads).toEqual(fullReadsAfterCharacterScope)
+    target.querySelector<HTMLButtonElement>(`[role="dialog"] button[aria-label="${language.close}"]`)!.click()
+    await vi.waitFor(() => expect(target.querySelector('[role="dialog"]')).toBeNull())
 
     // Later edits of the same chat still save.
     expect(await current.characters.editSelectedChatList(interactionCharacterId, 'after-sidebar-toggles', (owner) => {

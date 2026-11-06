@@ -23,6 +23,16 @@
       },
       "versions": [
         {
+          "version": "1.3.0",
+          "buildVersion": "1.3.0",
+          "date": "2026-11-05T20:40:16Z",
+          "localizedDescription": "### New Features\n\n- Applied RisuAI v2026.10.292 changes.\n- Added database compaction (reclaims unused SQLite space).\n\n### Improvements\n\n- Changed module imports to leave out MCP settings.\n- Allowed plugins to replace other plugins after user confirmation.\n- Changed startup text to appear in the device language.\n- Allowed plugins to convert to WebP even in environments that do not support WebP conversion.\n- Improved restore and storage performance.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed some API requests, such as Anthropic, being rejected.\n- Fixed responses, Lua buttons, and similar work stopping after leaving the app on Android.\n- Fixed Google Translate failing with error 429 in some environments.\n- Fixed storage growing continuously when plugins repeatedly saved large data.\n- Fixed permanent character deletion failing or being reported as failed.\n- Fixed RisuAI/PocketRisu compatible exports failing with some settings.\n- Fixed some RisuAI modules failing to import.\n- Fixed lorebooks and persona descriptions loaded from Lua not reflecting changed variables.\n- Fixed Data check failing to fix some issues.\n- Fixed the code block menu being hidden behind pop-up windows.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.3.0/RisuNest-1.3.0-ios-aarch64-unsigned.ipa",
+          "size": 78597800,
+          "sha256": "e7cd1e55449170498ea7a652e5b30dae65e24d3eb5a90ee645ffe8aff5094e44",
+          "minOSVersion": "16.4"
+        },
+        {
           "version": "1.2.0",
           "buildVersion": "1.2.0",
           "date": "2026-10-27T21:21:59Z",
@@ -73,11 +83,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.2.0",
-      "versionDate": "2026-10-27T21:21:59Z",
-      "versionDescription": "### Breaking Changes\n\n- The sync data format of the Sync server and external storage changes (Sync server update required). After updating every device, switch the format in the sync settings; after the switch, only the same or newer versions can sync with each other.\n\n### New Features\n\n- Added an app lock (if you forget the PIN, you may need to restore your data from a backup).\n- Added author's note presets.\n- Added binary data support to plugin local storage (getLocalPluginStorage).\n- Added a separate permission for plugin tool calls.\n- Added a setting that sends only the current chat to plugins (reduces memory usage).\n\n### Improvements\n\n- Changed deleting a character, module, or similar item to also delete its assets.\n- Responses being generated are now kept if the app closes.\n- Added execution time limits to regex scripts and triggers, and made Lua stop properly on timeout (prevents endless loading).\n- Changed desktop downloads to ask for a save location.\n- Removed the Keep Session Alive setting (a web-only feature).\n- Changed Lua scripts to run in a Worker and CBS to run compiled.\n- Improved performance and memory usage of regex, rendering, lorebooks, storage, restores, and more.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed plugins not loading when the Sync server is unavailable.\n- Fixed messages updated by Lua scripts not re-rendering and chat variables not being saved.\n- Fixed CSS and plugins that work with the chat screen not finding chat content.\n- Fixed YouTube embeds not playing.\n- Fixed Google Translate failures and content that could disappear when translation failed.\n- Fixed issues with RisuAI account restores and PocketRisu restores.\n- Fixed RisuAI/PocketRisu compatible exports failing.\n- Fixed Separate Parameters overwriting saved values.\n- Fixed S3 and GitHub external storage sync issues.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.2.0/RisuNest-1.2.0-ios-aarch64-unsigned.ipa",
-      "size": 78466287
+      "version": "1.3.0",
+      "versionDate": "2026-11-05T20:40:16Z",
+      "versionDescription": "### New Features\n\n- Applied RisuAI v2026.10.292 changes.\n- Added database compaction (reclaims unused SQLite space).\n\n### Improvements\n\n- Changed module imports to leave out MCP settings.\n- Allowed plugins to replace other plugins after user confirmation.\n- Changed startup text to appear in the device language.\n- Allowed plugins to convert to WebP even in environments that do not support WebP conversion.\n- Improved restore and storage performance.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed some API requests, such as Anthropic, being rejected.\n- Fixed responses, Lua buttons, and similar work stopping after leaving the app on Android.\n- Fixed Google Translate failing with error 429 in some environments.\n- Fixed storage growing continuously when plugins repeatedly saved large data.\n- Fixed permanent character deletion failing or being reported as failed.\n- Fixed RisuAI/PocketRisu compatible exports failing with some settings.\n- Fixed some RisuAI modules failing to import.\n- Fixed lorebooks and persona descriptions loaded from Lua not reflecting changed variables.\n- Fixed Data check failing to fix some issues.\n- Fixed the code block menu being hidden behind pop-up windows.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.3.0/RisuNest-1.3.0-ios-aarch64-unsigned.ipa",
+      "size": 78597800
     }
   ],
   "news": []
