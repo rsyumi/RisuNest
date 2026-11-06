@@ -21,6 +21,11 @@ pub(crate) struct RootSpool {
 
 const MEMBERS_IN_ORDER: &str = "SELECT key,value FROM members WHERE field=?1 AND value IS NOT NULL
     ORDER BY array_index IS NULL,array_index,rowid";
+// Reading in index order keeps the rowid order of object members, which is the
+// order a copy is read back in, without sorting the values.
+const MEMBERS_TO_COPY: &str = "SELECT key,value,array_index FROM members WHERE field=?1
+    ORDER BY array_index IS NULL,array_index,rowid";
+const INSERT_MEMBER: &str = "INSERT INTO members(field,key,value,array_index) VALUES(?1,?2,?3,?4)";
 
 fn invalid(message: &str) -> StoreError {
     StoreError::Validation { message: message.to_owned() }
@@ -225,8 +230,16 @@ impl RootSpool {
         let Some(kind) = self.kind(from)? else { return Ok(()); };
         self.begin(to,kind)?;
         self.db.execute("UPDATE fields SET value=(SELECT value FROM fields WHERE key=?2) WHERE key=?1",params![to,from])?;
-        self.db.execute("INSERT INTO members(field,key,value,array_index)
-            SELECT ?2,key,value,array_index FROM members WHERE field=?1 ORDER BY rowid",params![from,to])?;
+        // An INSERT that selects from its own table first copies every selected
+        // value into a temporary table, so members are copied one row at a time.
+        let mut insert=self.db.prepare(INSERT_MEMBER)?;
+        let mut statement=self.db.prepare(MEMBERS_TO_COPY)?;
+        let mut rows=statement.query([from])?;
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            let column=|index: usize| row.get_ref(index).map(rusqlite::types::ToSqlOutput::Borrowed);
+            insert.execute(params![to,column(0)?,column(1)?,column(2)?])?;
+        }
         Ok(())
     }
 
@@ -508,13 +521,20 @@ mod tests {
         let mut keys=Vec::new();
         root.visit("object",|key,_| { keys.push(key.to_owned()); Ok(()) }).unwrap();
         assert_eq!(keys,["0","2","10","b","4294967295","01"]);
+        root.copy_field("object","copy").unwrap();
         let mut text=Vec::new();
         root.write_root(&mut text,false).unwrap();
-        assert_eq!(String::from_utf8(text).unwrap(),r#"{"object":{"0":"0","2":"2","10":"10","b":"b","4294967295":"4294967295","01":"01"}}"#);
-        // A sorter would hold every member value, in RAM under Android's SQLITE_TEMP_STORE=3.
-        let plan=root.db.prepare(&format!("EXPLAIN QUERY PLAN {MEMBERS_IN_ORDER}")).unwrap()
-            .query_map(["object"],|row| row.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
-        assert!(!plan.iter().any(|step| step.contains("USE TEMP B-TREE")),"{plan:?}");
+        let members=r#"{"0":"0","2":"2","10":"10","b":"b","4294967295":"4294967295","01":"01"}"#;
+        assert_eq!(String::from_utf8(text).unwrap(),format!(r#"{{"object":{members},"copy":{members}}}"#));
+        // A sorter or a temporary table would hold every member value, in RAM under
+        // Android's SQLITE_TEMP_STORE=3.
+        for sql in [MEMBERS_IN_ORDER,MEMBERS_TO_COPY,INSERT_MEMBER] {
+            let mut statement=root.db.prepare(&format!("EXPLAIN {sql}")).unwrap();
+            let unbound=vec![rusqlite::types::Null;statement.parameter_count()];
+            let opcodes=statement.query_map(rusqlite::params_from_iter(unbound),|row| row.get::<_,String>(1)).unwrap()
+                .collect::<Result<Vec<_>,_>>().unwrap();
+            assert!(!opcodes.iter().any(|opcode| opcode=="SorterOpen" || opcode=="OpenEphemeral"),"{sql}: {opcodes:?}");
+        }
     }
 
     #[test]
