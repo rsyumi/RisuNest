@@ -502,6 +502,25 @@ impl PersistentStore {
             if digest_tables(&transaction, Some(&stage.staging_id), probe)? != expected {
                 return Err(invalid("portable staging changed raw SQL values"));
             }
+            // A library saved before activation gave every embedded module an id may hold one
+            // without it, and every later root save names that module's owner by its id.
+            {
+                let mut roots = transaction.prepare(
+                    "SELECT rowid,value FROM root WHERE generation=?1 AND typeof(value)='text' AND json_valid(value)",
+                )?;
+                let roots = roots
+                    .query_map([&stage.staging_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (rowid, raw) in roots {
+                    let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+                    if value.as_object_mut().is_some_and(super::record_projection::assign_embedded_module_ids) {
+                        transaction.execute(
+                            "UPDATE root SET value=?1 WHERE rowid=?2",
+                            rusqlite::params![serde_json::to_string(&value)?, rowid],
+                        )?;
+                    }
+                }
+            }
             {
                 let mut conversations = transaction
                     .prepare("SELECT character_id,conversation_id FROM conversations WHERE generation=?1 AND message_count=0")?;

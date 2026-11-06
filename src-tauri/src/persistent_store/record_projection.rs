@@ -767,3 +767,27 @@ pub(super) fn validation<T>(message: impl Into<String>) -> StoreResult<T> {
 fn owner_id(value: &Value) -> StoreResult<&str> {
     value.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| StoreError::Validation { message: "owner identity is required".to_owned() })
 }
+
+/// Gives a persona's embedded module a fresh id when it has none its owner can be named by, as an
+/// upstream import does. Returns whether the module changed.
+pub(super) fn assign_embedded_module_id(module: &mut Value) -> bool {
+    let Some(module) = module.as_object_mut() else {
+        return false;
+    };
+    if module.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
+        return false;
+    }
+    module.insert("id".to_owned(), Value::String(uuid::Uuid::new_v4().to_string()));
+    true
+}
+
+/// [`assign_embedded_module_id`] for every persona of a root.
+pub(super) fn assign_embedded_module_ids(root: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    for persona in root.get_mut("personas").and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(module) = persona.get_mut("embeddedModule") {
+            changed |= assign_embedded_module_id(module);
+        }
+    }
+    changed
+}

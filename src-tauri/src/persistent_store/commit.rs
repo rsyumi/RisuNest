@@ -707,6 +707,8 @@ pub(super) fn replace_put_root_with_plugin_storage(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut staged_root = object(root, "Persistent root")?.clone();
+    // Every later root save names an embedded module's owner by its id.
+    super::record_projection::assign_embedded_module_ids(&mut staged_root);
     let plugin_storage_meta = staged_root.shift_remove("pluginStorageMeta");
     let plugin_storage = staged_root.shift_remove("pluginCustomStorage");
     if let Some(plugin_storage_values) = plugin_storage_values {
