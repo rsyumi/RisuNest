@@ -301,7 +301,7 @@ for (const target of ["risuai", "pocket"]) {
                 type: "character",
                 name: "Synthetic",
                 postHistoryInstructions: null,
-                globalLore: [{ key: "합성", content: "합성 설명", activationPercent: null }],
+                globalLore: [{ key: "합성", content: "합성 설명", activationPercent: null, insertorder: null }],
                 chats: [
                   {
                     id: "synthetic-null-chat",
@@ -340,6 +340,7 @@ for (const target of ["risuai", "pocket"]) {
               db.characterOrder[0].imgFile, preset.koboldURL, preset.thinkingTokens, preset.promptTemplate,
               preset.maxContext, preset.maxResponse,
               character.postHistoryInstructions, character.globalLore[0].activationPercent,
+              character.globalLore[0].insertorder,
               character.chats[0].folderId, character.chats[0].message[0].name,
             ];
           };

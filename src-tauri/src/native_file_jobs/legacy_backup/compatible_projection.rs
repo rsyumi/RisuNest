@@ -836,8 +836,12 @@ mod tests {
     #[test]
     fn compatible_projection_keeps_null_where_the_references_store_it() {
         // Both references store these nulls; thinkingTokens,
-        // postHistoryInstructions and the cleared number settings are
-        // required fields.
+        // postHistoryInstructions, the cleared number settings and a cleared
+        // lorebook insertion order are required fields.
+        let lore = json!([{
+            "key": "synthetic", "secondkey": "", "comment": "", "content": "synthetic", "mode": "normal",
+            "alwaysActive": false, "selective": false, "insertorder": null,
+        }]);
         let records = [
             ("DataBase", json!({"thinkingTokens": null, "textScreenColor": null, "textScreenBorder": null, "promptTemplate": null})),
             ("DataBase", json!({
@@ -846,8 +850,12 @@ mod tests {
                 "maxResponse": null, "generationSeed": null,
             })),
             ("botPreset", json!({"maxContext": null, "maxResponse": null})),
-            ("character", json!({"postHistoryInstructions": null})),
-            ("Chat", json!({"folderId": null})),
+            ("character", json!({"postHistoryInstructions": null, "globalLore": lore})),
+            ("Chat", json!({"folderId": null, "localLore": lore})),
+            ("DataBase", json!({
+                "loreBook": [{"name": "synthetic", "data": lore}],
+                "modules": [{"name": "synthetic", "description": "", "id": "synthetic-module", "lorebook": lore}],
+            })),
             ("Message", json!({"role": "user", "data": "synthetic", "name": null})),
         ];
         for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {

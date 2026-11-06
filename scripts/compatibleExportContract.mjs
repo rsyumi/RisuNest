@@ -108,6 +108,8 @@ const referenceCorrections = {
   // Saving the preset copies a cleared maxContext or maxResponse into it.
   "botPreset.maxContext": "nullable",
   "botPreset.maxResponse": "nullable",
+  // A cleared insertion order stores null, which the lorebook sort reads as 0.
+  "loreBook.insertorder": "nullable",
 };
 
 export function generateContract(target) {
