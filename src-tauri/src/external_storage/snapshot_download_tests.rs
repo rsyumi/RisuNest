@@ -72,7 +72,7 @@ fn fixture(provider:&DownloadProvider,count:usize)->(BTreeMap<String,RemoteObjec
     (remotes,sources,expected)
 }
 fn run(future:impl std::future::Future<Output=()>) {tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    tokio::time::timeout(std::time::Duration::from_secs(20),future).await.expect("download test deadlocked");
+    tokio::time::timeout(fake::DEADLOCK_TEST_BOUND,future).await.expect("download test deadlocked");
 });}
 
 #[test]

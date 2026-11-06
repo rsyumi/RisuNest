@@ -25,7 +25,7 @@ mod upload_concurrency_tests {
             let cache = root.path().join("cache");
             let cancel = Cancellation::default();
             let progress = PhaseProgress::silent();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (result, ()) = tokio::time::timeout(FAMILY_TEST_BOUND, async {
                 tokio::join!(
                     package_and_upload(capture, vec![], root.path(), &cache, meta, &[5; 32],
                         package_limits, None, &mut transfer, &provider, &repository, &progress, &cancel),
@@ -89,7 +89,7 @@ mod upload_concurrency_tests {
             let (capture, _) = captured_payloads(root, "remote-packaging", 1, b"synthetic record", &[&bytes]);
             let meta = metadata("remote-packaging", &capture);
             let mut transfer = journal(&root.join("remote-packaging-job"), "remote-packaging", &capture);
-            let result = tokio::time::timeout(std::time::Duration::from_secs(30),
+            let result = tokio::time::timeout(FAMILY_TEST_BOUND,
                 package_and_upload(capture, vec![], root, &root.join("remote-packaging-cache"), meta,
                     &[5; 32], limits(256 * 1024), None, &mut transfer, provider.as_ref(), &fake::repository(),
                     &PhaseProgress::silent(), &Cancellation::default())).await
@@ -115,7 +115,7 @@ mod upload_concurrency_tests {
             let repository = fake::repository();
             let progress = PhaseProgress::silent();
             let cancel = Cancellation::default();
-            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (result, ()) = tokio::time::timeout(FAMILY_TEST_BOUND, async {
                 tokio::join!(
                     package_and_upload(capture, vec![], root.path(), &cache, meta, &[5; 32],
                         package_limits, None, &mut transfer, &provider, &repository,

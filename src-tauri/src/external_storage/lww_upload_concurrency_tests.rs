@@ -84,7 +84,7 @@ fn full_publication_spools_remote_small_and_standalone_bodies_with_one_shared_sl
         connection.provider = transfer_limit::wrap(f.directory_b.path(), "receiver", connection.provider).unwrap();
         f.receiver.provider = transfer_limit::wrap(f.directory_b.path(), "receiver", f.provider.clone()).unwrap();
         let _installed = lww_residency::install_test_source_connection(f.directory_b.path(), Arc::new(connection)).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(30),
+        let result = tokio::time::timeout(crate::external_storage::fake::DEADLOCK_TEST_BOUND,
             f.receiver.publish(&mut f.b, 0.into(), &[], &Cancellation::default())).await
             .expect("full one-slot publication deadlocked").unwrap();
         assert_eq!(result.segments.0, 1);
