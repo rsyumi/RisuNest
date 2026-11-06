@@ -101,4 +101,14 @@ describe('app lock startup facade', () => {
             expect(wrote).toBe(false)
         } finally { installDeviceMarkers(null) }
     })
+
+    it('catches up a return whose event never reached the page when the page is shown again', async () => {
+        const pin = await createPinRecord('123456')
+        await appLock.initialize({ read: () => JSON.stringify({ ...defaultAppLockRecord(), enabled: true, pin }), commit: async () => {} })
+        const epoch = appLock.state.epoch
+        boundary.snapshot = { active: true, epoch: epoch + 2, atMs: 900, departedAtMs: 800 }
+        window.dispatchEvent(new Event('focus'))
+        await vi.waitFor(() => expect(appLock.state.epoch).toBe(epoch + 2))
+        expect(appLock.state.returnPending).toBe(true)
+    })
 })

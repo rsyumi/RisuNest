@@ -14,13 +14,15 @@ interface NativeDeviceBackupBootstrap {
 
 export interface DeviceMaintenanceEntryDependencies {
   reload?: () => void;
+  /** Runs once the recovery panel covers the window, which never shows library content. */
+  onPanelShown?: () => void;
 }
 
 /** The app stylesheet resets buttons to bare text, so the button carries the panel buttons' look. */
 const STARTUP_BUTTON_CLASS =
   "rounded-md border border-darkborderc bg-darkbutton px-4 py-2 text-textcolor hover:bg-selected disabled:cursor-not-allowed disabled:opacity-50";
 
-function showStartupFailure(retry: () => void): void {
+function showStartupFailure(retry: () => void, onPanelShown?: () => void): void {
   const ko = navigator.language.startsWith("ko");
   const host = document.createElement("main");
   host.setAttribute("role", "status");
@@ -49,6 +51,7 @@ function showStartupFailure(retry: () => void): void {
   host.append(panel);
   document.getElementById("preloading")?.remove();
   document.body.append(host);
+  onPanelShown?.();
 }
 
 /** Minimal startup entry, intentionally independent of settings, DBState and plugins. */
@@ -88,7 +91,7 @@ export async function deviceMaintenanceBeforeBootstrap(
     if (bootstrap.mode !== "normal")
       throw new Error("Native device restore completion is still pending");
   } catch {
-    showStartupFailure(reload);
+    showStartupFailure(reload, dependencies.onPanelShown);
     // Resolve only after a fresh native recovery decision, never import the app on failure.
     await new Promise<never>(() => {});
   }

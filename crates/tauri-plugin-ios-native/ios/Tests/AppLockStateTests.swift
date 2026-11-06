@@ -81,6 +81,52 @@ final class AppLockStateTests: XCTestCase {
         XCTAssertFalse(state.policy.enabled)
     }
 
+    func testUnconfirmedReleaseEndsOnlyCoversWithoutALockDecision() {
+        var launch = AppLockState()
+        XCTAssertTrue(launch.releaseUnconfirmed(epoch: 0))
+        XCTAssertFalse(launch.coverRequired)
+
+        var away = AppLockState()
+        XCTAssertTrue(away.depart(at: 5))
+        XCTAssertFalse(away.releaseUnconfirmed(epoch: 1))
+        XCTAssertTrue(away.becomeActive())
+        XCTAssertTrue(away.releaseUnconfirmed(epoch: 2))
+
+        var preview = AppLockState()
+        preview.policy.hideRecentsPreview = true
+        XCTAssertTrue(preview.ready(epoch: 0, locked: false))
+        XCTAssertTrue(preview.depart(at: 10))
+        XCTAssertFalse(preview.releaseUnconfirmed(epoch: 1))
+        XCTAssertTrue(preview.becomeActive())
+        XCTAssertFalse(preview.releaseUnconfirmed(epoch: 1))
+        XCTAssertTrue(preview.coverRequired)
+        XCTAssertTrue(preview.releaseUnconfirmed(epoch: 2))
+        XCTAssertFalse(preview.coverRequired)
+        XCTAssertFalse(preview.releaseUnconfirmed(epoch: 2))
+
+        var timed = AppLockState()
+        timed.policy.enabled = true
+        timed.policy.timing = "after-1m"
+        timed.policy.hideRecentsPreview = true
+        XCTAssertTrue(timed.ready(epoch: 0, locked: false))
+        XCTAssertTrue(timed.depart(at: 10))
+        XCTAssertTrue(timed.becomeActive())
+        XCTAssertFalse(timed.releaseUnconfirmed(epoch: 2))
+        XCTAssertTrue(timed.coverRequired)
+
+        var gated = AppLockState()
+        gated.policy.enabled = true
+        gated.policy.gateRequired = true
+        gated.policy.hideRecentsPreview = true
+        XCTAssertFalse(gated.releaseUnconfirmed(epoch: 0))
+        XCTAssertTrue(gated.coverRequired)
+        XCTAssertTrue(gated.ready(epoch: 0, locked: true))
+        XCTAssertTrue(gated.depart(at: 10))
+        XCTAssertTrue(gated.becomeActive())
+        XCTAssertFalse(gated.releaseUnconfirmed(epoch: 2))
+        XCTAssertTrue(gated.coverRequired)
+    }
+
     func testOneDepartureTimestampPerAwayPeriodAndSleepInclusiveInput() {
         var state = AppLockState()
         state.policy.enabled = true
