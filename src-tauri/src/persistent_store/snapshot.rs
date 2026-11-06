@@ -20,6 +20,8 @@ use std::{
 use uuid::Uuid;
 
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+/// The most snapshots kept, and the keep count when a caller names none.
+const MAX_SNAPSHOTS: usize = 8;
 const UNSCANNABLE_BLOCKER: &str = "record-unscannable";
 const CAS_PHYSICAL_PREFIX: &str = "assets/objects/";
 const URL_SCHEMES: [&str; 3] = ["risuasset:", "http:", "https:"];
@@ -418,25 +420,56 @@ pub(super) fn checkpoint(connection: &Connection, mode: CheckpointMode) -> Store
 pub(super) fn create(
     store: &mut super::PersistentStore,
     reason: &str,
+    keep: KeepCount,
 ) -> StoreResult<SnapshotCreated> {
     let mut archive = Archive::open(&store.snapshots_dir)?;
-    create_in_archive(store, &mut archive, reason)
+    create_in_archive(store, &mut archive, reason, keep)
 }
 
 fn create_in_archive(
     store: &mut super::PersistentStore,
     archive: &mut Archive,
     reason: &str,
+    keep: KeepCount,
 ) -> StoreResult<SnapshotCreated> {
     let started = Instant::now();
-    let (scratch, current_bytes) = capture_scratch(store, archive)?;
-    archive_scratch(archive, scratch, current_bytes, reason, started)
+    let (scratch, retention) = capture_scratch(store, archive, keep)?;
+    archive_scratch(archive, scratch, retention, reason, started)
+}
+
+/// How many snapshots the rotation after a capture keeps, from 1 to
+/// `MAX_SNAPSHOTS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeepCount(usize);
+
+impl KeepCount {
+    pub(crate) const MAX: Self = Self(MAX_SNAPSHOTS);
+
+    /// The count the renderer sends with a snapshot request, which is the one
+    /// the user sees. A request without one keeps the full count, and a count
+    /// out of range is refused before anything is captured.
+    pub(crate) fn requested(count: Option<u32>) -> StoreResult<Self> {
+        let Some(count) = count else { return Ok(Self::MAX) };
+        usize::try_from(count)
+            .ok()
+            .filter(|count| (1..=MAX_SNAPSHOTS).contains(count))
+            .map(Self)
+            .ok_or_else(|| validation(format!("snapshot keep count {count} is outside 1 to {MAX_SNAPSHOTS}")))
+    }
+}
+
+/// What the rotation after a capture keeps: the requested snapshot count, and
+/// archive bytes within `byte_budget` of the retention basis.
+pub(super) struct Retention {
+    pub(super) keep_count: usize,
+    pub(super) basis_bytes: u64,
 }
 
 pub(super) fn capture_scratch(
     store: &mut super::PersistentStore,
     archive: &Archive,
-) -> StoreResult<(super::snapshot_archive::Scratch, u64)> {
+    keep: KeepCount,
+) -> StoreResult<(super::snapshot_archive::Scratch, Retention)> {
     let scratch = archive.scratch()?;
     let revision = store.revision()?;
     let lease = store.lww_acquire_library_backup_capture(revision)?;
@@ -466,15 +499,15 @@ pub(super) fn capture_scratch(
         Ok(current_bytes)
     })();
     let release = store.release_revision(&lease.lease);
-    let current_bytes = result?;
+    let basis_bytes = result?;
     release?;
-    Ok((scratch, current_bytes))
+    Ok((scratch, Retention { keep_count: keep.0, basis_bytes }))
 }
 
 pub(super) fn archive_scratch(
     archive: &mut Archive,
     scratch: super::snapshot_archive::Scratch,
-    current_bytes: u64,
+    retention: Retention,
     reason: &str,
     started: Instant,
 ) -> StoreResult<SnapshotCreated> {
@@ -483,7 +516,7 @@ pub(super) fn archive_scratch(
     let roots = collect_asset_roots(&captured)?;
     drop(captured);
     let metadata = archive.insert(&scratch.path, revision, reason, roots)?;
-    archive.rotate(byte_budget(current_bytes), &metadata.id)?;
+    archive.rotate(retention.keep_count, byte_budget(retention.basis_bytes), &metadata.id)?;
     Ok(SnapshotCreated {
         id: metadata.id,
         revision,
