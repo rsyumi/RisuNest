@@ -1976,6 +1976,13 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        moduleScope: {
+            info: 'Global applies a module to every chat, Character to every chat with this character, and Chat to this chat only.',
+            global: 'Global',
+            character: 'Character',
+            chat: 'Chat',
+            noMatch: 'No modules match the search.',
+        },
         appLock: {
             title: 'App lock',
             enable: 'Use app lock',

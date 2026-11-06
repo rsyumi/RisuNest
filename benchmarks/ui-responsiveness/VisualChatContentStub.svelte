@@ -1,6 +1,5 @@
 <script lang="ts">
     export let openChatList = false
-    export let openModuleList = false
     export let customStyle = ''
 
     function recordActivation() {
@@ -17,11 +16,6 @@
         onclick={() => {
             openChatList = true
         }}>Synthetic chat list</button
-    >
-    <button
-        onclick={() => {
-            openModuleList = true
-        }}>Synthetic module list</button
     >
 </section>
 
