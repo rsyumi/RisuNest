@@ -1167,11 +1167,13 @@ export async function runScripted(code:string, arg:{
                     return
                 }
 
+                // A Lua nil name is stored as '', which also names the entry it replaces.
+                const comment = name ?? ''
                 const newLocalLoreBooks = (currentChat.localLore ?? [])
-                    .filter((book) => book.comment !== name)
+                    .filter((book) => (book.comment ?? '') !== comment)
                 newLocalLoreBooks.push({
                     alwaysActive,
-                    comment: name ?? '',
+                    comment,
                     content: content ?? '',
                     insertorder: insertOrder,
                     mode: 'normal',

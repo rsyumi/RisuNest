@@ -22,7 +22,7 @@ import {
   ConversationSessionStaleError,
 } from '../storage/activeConversationSession'
 import { createConversationOperationContext } from './conversationOperationContext'
-import type { Chat, character } from '../storage/database.svelte'
+import type { Chat, character, loreBook } from '../storage/database.svelte'
 import { DBState, ScriptDisplayRefreshPointer } from '../stores.svelte'
 import { risuChatParser } from '../parser/parser.svelte'
 import type { LuaEngine } from 'wasmoon'
@@ -1088,8 +1088,10 @@ test('publishes local lore through the conversation metadata batch', async () =>
   expect(fixture.session.version).toBe(1)
 })
 
-test('stores empty text for a nil local lore name or content', async () => {
+test('stores empty text for a nil local lore name or content and replaces it on the next upsert', async () => {
   const fixture = operationCharacterFixture('local-lore-nil')
+  // An entry an earlier upsert stored with a null name.
+  fixture.chat.localLore.push({ comment: null, content: 'stored', key: '', secondkey: '', insertorder: 100, mode: 'normal', alwaysActive: false, selective: false } as unknown as loreBook)
   installOperationCharacterFixture(fixture)
   const operationContext = createConversationOperationContext(
     fixture.session,
@@ -1099,6 +1101,7 @@ test('stores empty text for a nil local lore name or content', async () => {
   await runScripted(`
     listenEdit('editInput', function(id, value, meta)
       upsertLocalLoreBook(id, nil, nil, {})
+      upsertLocalLoreBook(id, nil, 'latest', {})
       return value
     end)
   `, {
@@ -1109,7 +1112,7 @@ test('stores empty text for a nil local lore name or content', async () => {
   })
 
   expect(operationContext.chat.localLore).toEqual([
-    expect.objectContaining({ comment: '', content: '' }),
+    expect.objectContaining({ comment: '', content: 'latest' }),
   ])
 })
 

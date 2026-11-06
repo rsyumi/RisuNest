@@ -8,6 +8,7 @@ import { saveImage, type character, type Chat, defaultSdDataFunc, type loreBook,
 import { alertAddCharacter, alertCheckboxConfirm, alertError, alertNormal, alertSelect, alertStore, alertToast, alertWait } from "./alert";
 import { language } from "../lang";
 import { isArchivedCharacter } from "./storage/workingSetCatalog";
+import { fillLorebookText } from "./storage/lorebookText";
 import { restoreArchivedCharacterWithConfirmation } from "./storage/characterArchive";
 import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile, mapSelectedFiles, fileAccept } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
@@ -762,12 +763,8 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
 }
 
 export function updateLorebooks(book:loreBook[]){
+    fillLorebookText(book)
     return book.map((v) => {
-        // Imports, plugins and scripts can store an entry without these, which
-        // the editor and the prompt builder read as strings.
-        v.key ??= ''
-        v.comment ??= ''
-        v.content ??= ''
         v.bookVersion ??= 1
         if(v.bookVersion >= 2){
             return v
