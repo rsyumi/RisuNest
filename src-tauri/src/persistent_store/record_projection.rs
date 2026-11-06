@@ -768,16 +768,33 @@ fn owner_id(value: &Value) -> StoreResult<&str> {
     value.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).ok_or_else(|| StoreError::Validation { message: "owner identity is required".to_owned() })
 }
 
-/// Gives a persona's embedded module a fresh id when it has none its owner can be named by, as an
+/// The id an embedded module without one is given. It is derived from the persona's id, so every
+/// path and every device that names the same module gives it the same id.
+pub(super) fn embedded_module_id(persona_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(b"risunest-embedded-module-id\0")
+        .chain_update(persona_id)
+        .finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid().to_string()
+}
+
+/// Gives a persona's embedded module an id when it has none its owner can be named by, as an
 /// upstream import does. Returns whether the module changed.
-pub(super) fn assign_embedded_module_id(module: &mut Value) -> bool {
+pub(super) fn assign_embedded_module_id(module: &mut Value, persona_id: Option<&str>) -> bool {
     let Some(module) = module.as_object_mut() else {
         return false;
     };
     if module.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()) {
         return false;
     }
-    module.insert("id".to_owned(), Value::String(uuid::Uuid::new_v4().to_string()));
+    let id = match persona_id.filter(|id| !id.is_empty()) {
+        Some(persona_id) => embedded_module_id(persona_id),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    module.insert("id".to_owned(), Value::String(id));
     true
 }
 
@@ -785,8 +802,9 @@ pub(super) fn assign_embedded_module_id(module: &mut Value) -> bool {
 pub(super) fn assign_embedded_module_ids(root: &mut serde_json::Map<String, Value>) -> bool {
     let mut changed = false;
     for persona in root.get_mut("personas").and_then(Value::as_array_mut).into_iter().flatten() {
+        let persona_id = persona.get("id").and_then(Value::as_str).map(str::to_owned);
         if let Some(module) = persona.get_mut("embeddedModule") {
-            changed |= assign_embedded_module_id(module);
+            changed |= assign_embedded_module_id(module, persona_id.as_deref());
         }
     }
     changed

@@ -415,12 +415,14 @@ fn new_device_replacement_matches_the_golden_state() {
     assert_eq!(golden(&store, "new-device"), NEW_DEVICE);
 }
 
-/// The active persona's embedded module carries a fresh id, so the root can be saved again.
+/// The active persona's embedded module carries the id its persona derives, whichever path and
+/// however many projections gave it one, so the root can be saved again.
 fn assert_root_saves_with_a_named_module(store: &mut PersistentStore) {
     let mut root = store.read_root(None).unwrap().value;
     let persona = root["personas"].as_array().unwrap().iter().find(|persona| persona["id"] == "persona-a").unwrap();
     let id = persona["embeddedModule"]["id"].as_str().expect("the embedded module has an id");
-    uuid::Uuid::parse_str(id).expect("the embedded module id is a fresh uuid");
+    assert_eq!(id, crate::persistent_store::record_projection::embedded_module_id("persona-a"));
+    uuid::Uuid::parse_str(id).expect("the embedded module id is a uuid");
     assert_eq!(persona["embeddedModule"]["name"], "Embedded");
     root["username"] = json!("Saved after activation");
     let revision = store.revision().unwrap();
@@ -435,7 +437,7 @@ fn idless_module() -> Value {
 }
 
 #[test]
-fn a_replacement_gives_an_embedded_module_without_an_id_a_fresh_one() {
+fn a_replacement_names_an_embedded_module_without_an_id_after_its_persona() {
     let (_directory, mut store) = seeded();
     let stage = store.replace_begin().unwrap().staging_id;
     let mut root = staged_root(&fixture());
@@ -447,7 +449,7 @@ fn a_replacement_gives_an_embedded_module_without_an_id_a_fresh_one() {
 }
 
 #[test]
-fn a_replacement_from_source_units_gives_an_embedded_module_without_an_id_a_fresh_one() {
+fn a_replacement_from_source_units_names_an_embedded_module_without_an_id_after_its_persona() {
     let (_directory, mut store) = seeded();
     let stage = build_stage(&mut store);
     let mut units = source_units();
@@ -457,10 +459,15 @@ fn a_replacement_from_source_units_gives_an_embedded_module_without_an_id_a_fres
     let request = header(&store, "embedded-module-source-units");
     store.lww_commit_replacement_units(&request, &stage, Some(&units)).unwrap();
     assert_root_saves_with_a_named_module(&mut store);
+    // The same unit projected again names the module the same way.
+    let stage = build_stage(&mut store);
+    let request = header(&store, "embedded-module-source-units-again");
+    store.lww_commit_replacement_units(&request, &stage, Some(&units)).unwrap();
+    assert_root_saves_with_a_named_module(&mut store);
 }
 
 #[test]
-fn a_target_binding_gives_an_embedded_module_without_an_id_a_fresh_one() {
+fn a_target_binding_names_an_embedded_module_without_an_id_after_its_persona() {
     let (_directory, mut store) = seeded();
     let mut incoming = binding_incoming(&store);
     incoming.push(binding_change(&["exists", "persona", "persona-a"], json!(true)));
@@ -495,7 +502,7 @@ fn a_target_binding_gives_an_embedded_module_without_an_id_a_fresh_one() {
 }
 
 #[test]
-fn a_portable_restore_gives_an_embedded_module_without_an_id_a_fresh_one() {
+fn a_portable_restore_names_an_embedded_module_without_an_id_after_its_persona() {
     // A portable backup or snapshot of such a library carries the module as it was saved.
     let (_source_directory, source, _) = open_fixture();
     let generation = active_generation(&source.connection).unwrap();
@@ -512,6 +519,17 @@ fn a_portable_restore_gives_an_embedded_module_without_an_id_a_fresh_one() {
     let stage = store.stage_portable_records(&reader, &crate::local_backup::NeverCancelled).unwrap().staging_id;
     let revision = store.revision().unwrap();
     store.replace_commit(&stage, Some(revision)).unwrap();
+    assert_root_saves_with_a_named_module(&mut store);
+
+    // Staged rows and the source unit carrying the same module name it the same way.
+    let (_directory, mut store) = seeded();
+    let stage = store.stage_portable_records(&reader, &crate::local_backup::NeverCancelled).unwrap().staging_id;
+    let units = BTreeMap::from([
+        (unit_key(&["exists", "persona", "persona-a"]).unwrap(), inline(&json!(true)).unwrap()),
+        (unit_key(&["persona", "persona-a", "embeddedModule"]).unwrap(), inline(&idless_module()).unwrap()),
+    ]);
+    let request = header(&store, "embedded-module-portable-units");
+    store.lww_commit_replacement_units(&request, &stage, Some(&units)).unwrap();
     assert_root_saves_with_a_named_module(&mut store);
 }
 

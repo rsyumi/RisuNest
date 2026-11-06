@@ -974,7 +974,7 @@ fn patch_root(v: &mut Value, p: &[String], next: Option<Value>) -> StoreResult<(
             if p[2] == "embeddedModule" {
                 // A unit written before modules had to carry an id would leave the root unsavable.
                 if let Some(module) = next.as_mut() {
-                    super::super::record_projection::assign_embedded_module_id(module);
+                    super::super::record_projection::assign_embedded_module_id(module, Some(&p[1]));
                 }
             }
             patch_array(v, "personas", "id", &p[1], Some(&p[2]), next)

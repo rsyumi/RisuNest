@@ -288,7 +288,11 @@ fn an_embedded_module_without_an_id_is_given_one_so_the_root_saves_again() {
     store.apply_repair(store.revision().unwrap(), &candidates, 10).unwrap();
     let root = store.read_root(None).unwrap().value;
     let module = &root["personas"][1]["embeddedModule"];
-    uuid::Uuid::parse_str(module["id"].as_str().expect("the module has an id")).expect("a fresh uuid");
+    // The same id activation would have given it.
+    assert_eq!(
+        module["id"].as_str().expect("the module has an id"),
+        crate::persistent_store::record_projection::embedded_module_id("persona-b")
+    );
     assert_eq!(module["name"], "Embedded");
     assert!(scan(&mut store).items.iter().all(|finding| {
         finding.locator.as_ref().is_none_or(|locator| locator.source_path != "$.embeddedModule.id")

@@ -27,7 +27,7 @@ pub(crate) enum RepairAction {
     SelectFirstPreset,
     /// Selects the first persona in place of one the root no longer holds.
     SelectFirstPersona,
-    /// Gives a persona's embedded module a fresh id, as an import does, so the root can name it.
+    /// Gives a persona's embedded module the id activation would give it, so the root can name it.
     AssignEmbeddedModuleId { persona_id: String },
     /// Removes one reference from the record that holds it: the field or entry at `source_path`,
     /// or only the inlay token named by `token`. The stored bytes stay where they are.

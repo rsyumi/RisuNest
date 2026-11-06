@@ -569,8 +569,8 @@ fn recover_orphans(transaction: &Connection, staging: &str, table: &str, now_ms:
     Ok(())
 }
 
-/// Gives the embedded module of the one persona that carries `persona_id` a fresh id when it has
-/// none the root can name it by.
+/// Gives the embedded module of the one persona that carries `persona_id` the id activation would
+/// give it when it has none the root can name it by.
 fn assign_embedded_module_id(transaction: &Connection, staging: &str, persona_id: &str) -> StoreResult<()> {
     let serialized: Option<String> = rusqlite::OptionalExtension::optional(transaction.query_row(
         "SELECT value FROM root WHERE generation=?1 AND json_valid(value)",
@@ -586,7 +586,7 @@ fn assign_embedded_module_id(transaction: &Connection, staging: &str, persona_id
     let Some(module) = root[collection][index].get_mut("embeddedModule") else {
         return Ok(());
     };
-    if super::record_projection::assign_embedded_module_id(module) {
+    if super::record_projection::assign_embedded_module_id(module, Some(persona_id)) {
         transaction.execute(
             "UPDATE root SET value=?2 WHERE generation=?1",
             rusqlite::params![staging, serde_json::to_string(&root)?],
