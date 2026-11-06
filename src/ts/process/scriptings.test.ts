@@ -3331,4 +3331,5 @@ test('expands lorebook and persona text with the variables and messages written 
     vi.mocked(loadLoreBookV3PromptFromCompatibilitySnapshot).mockReset()
     continuationRuntime.session = null
   }
-})
+  // The real parser's cold import takes about 2 s alone and longer under a full run.
+}, 30_000)
