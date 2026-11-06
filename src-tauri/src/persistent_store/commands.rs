@@ -815,8 +815,9 @@ pub(crate) fn pds_asset_gc_maintenance(
     }))
 }
 
-/// Sweeps one batch of message objects in each store, continuing from each
-/// store's cursor. It skips while device maintenance holds the renderer gate.
+/// Sweeps message objects in each store for up to the periodic budget,
+/// continuing from each store's cursor. It skips while device maintenance
+/// holds the renderer gate.
 #[tauri::command(async)]
 pub(crate) fn pds_message_object_sweep(
     app: AppHandle,
@@ -828,7 +829,7 @@ pub(crate) fn pds_message_object_sweep(
     logged(
         "pds_message_object_sweep",
         sweep_message_pages(
-            file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::OneBatch,
+            file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::For(PERIODIC_MESSAGE_SWEEP_BUDGET),
         ),
     )
 }
@@ -1839,10 +1840,19 @@ pub(crate) fn pds_asset_gc_execute(
     )
 }
 
+/// How long a periodic sweep keeps taking batches in each store. A batch takes
+/// the store between saves, so one call stops early instead of finishing a
+/// pass over a large store.
+const PERIODIC_MESSAGE_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// The pause between periodic batches, so a save waiting for the store takes
+/// it before the next batch does.
+const PERIODIC_MESSAGE_SWEEP_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// How many batches each store gets in one sweep call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SweepBudget {
-    OneBatch,
+    /// Batches until this much time has passed, at least one per store.
+    For(std::time::Duration),
     UntilWrapped,
 }
 
@@ -1859,9 +1869,10 @@ fn sweep_message_pages(
         return Ok(());
     };
     for target in [super::MessageObjectStore::Library, super::MessageObjectStore::Device] {
+        let started = std::time::Instant::now();
         let mut first = true;
         loop {
-            let Ok(_permit) = admission.file(false) else {
+            let Ok(permit) = admission.file(false) else {
                 return Ok(());
             };
             let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| if first {
@@ -1869,9 +1880,16 @@ fn sweep_message_pages(
             } else {
                 store.continue_message_page_sweep(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
             })?;
+            drop(permit);
             first = false;
-            if sweep.wrapped || budget == SweepBudget::OneBatch {
+            if sweep.wrapped {
                 break;
+            }
+            if let SweepBudget::For(limit) = budget {
+                if started.elapsed() >= limit {
+                    break;
+                }
+                std::thread::sleep(PERIODIC_MESSAGE_SWEEP_PAUSE);
             }
         }
     }
@@ -2749,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn a_periodic_sweep_visits_one_batch_per_store_and_resumes_from_the_cursor() {
+    fn a_periodic_sweep_stops_at_its_budget_and_resumes_from_the_cursor() {
         use crate::native_file_jobs::admission::Admission;
         let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
         let open = || {
@@ -2773,14 +2791,15 @@ mod tests {
             (read(&store.connection), read(store.device_store().unwrap().connection()))
         };
         let admission = Arc::new(Admission::default());
+        let spent = SweepBudget::For(std::time::Duration::ZERO);
 
         let (_periodic_directory, periodic) = open();
         assert_eq!(count(&periodic, "message_page_objects"), (limit + 1, limit + 1));
         let operation = periodic.admit_renderer_operation().unwrap();
-        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, SweepBudget::OneBatch).unwrap();
-        assert_eq!(count(&periodic, "message_page_object_marks"), (limit, limit), "a periodic sweep ran more than one batch");
+        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, spent).unwrap();
+        assert_eq!(count(&periodic, "message_page_object_marks"), (limit, limit), "a sweep past its budget took another batch");
         assert_eq!(count(&periodic, "message_page_sweep_cursor"), (1, 1));
-        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, spent).unwrap();
         assert_eq!(
             count(&periodic, "message_page_object_marks"),
             (limit + 1, limit + 1),
@@ -2788,21 +2807,24 @@ mod tests {
         );
         assert_eq!(count(&periodic, "message_page_sweep_cursor"), (0, 0));
 
-        let (_cleanup_directory, cleanup) = open();
-        let operation = cleanup.admit_renderer_operation().unwrap();
-        sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
-        assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1));
+        for budget in [SweepBudget::For(std::time::Duration::from_secs(600)), SweepBudget::UntilWrapped] {
+            let (_cleanup_directory, cleanup) = open();
+            let operation = cleanup.admit_renderer_operation().unwrap();
+            sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, budget).unwrap();
+            assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1), "a sweep within its budget left the pass unfinished");
+            assert_eq!(count(&cleanup, "message_page_sweep_cursor"), (0, 0));
+        }
 
         // Marks past their grace go first, though the cursor has passed them,
         // and count toward the same batch.
         let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
         let (_expired_directory, expired) = open();
         let operation = expired.admit_renderer_operation().unwrap();
-        sweep_message_pages(Some(&admission), &expired, &operation, 1_000, SweepBudget::OneBatch).unwrap();
-        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000, spent).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, spent).unwrap();
         assert_eq!(count(&expired, "message_page_objects"), (1, 1), "expired marks waited for the cursor");
         assert_eq!(count(&expired, "message_page_object_marks"), (0, 0), "the batch went past its limit");
-        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, spent).unwrap();
         assert_eq!(count(&expired, "message_page_object_marks"), (1, 1));
         assert_eq!(count(&expired, "message_page_sweep_cursor"), (0, 0));
     }
