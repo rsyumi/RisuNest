@@ -6,6 +6,7 @@ import type {
     NativeFileOperationState,
 } from '../storage/nativeFileJobManager'
 import type {
+    NativeFileJobFailureOwner,
     NativeFileJobResult,
     NativeFileJobStage,
     NativeFileJobStatus,
@@ -41,6 +42,8 @@ export interface NativeFileJobDialogTerminal {
     state: 'succeeded' | 'failed' | 'cancelled'
     summary: string
     reason: string
+    /** The library item whose data the export could not write. */
+    location: string
     details: string
     restarting: boolean
 }
@@ -558,6 +561,13 @@ function warningText(code: string): string {
     }
 }
 
+export function failureLocation(owner?: NativeFileJobFailureOwner): string {
+    const template = owner && Object.hasOwn(language.risuNest.importDialog.failureOwners, owner.kind)
+        ? language.risuNest.importDialog.failureOwners[owner.kind] : undefined
+    if (!owner || !template) return ''
+    return owner.kind === 'chat' ? fillTemplate(template, owner.character ?? '', owner.name) : fillTemplate(template, owner.name)
+}
+
 export function failureReason(code: string, direction: 'import' | 'export' = 'import', itemKind?: string): string {
     const copy = language.risuNest.importDialog
     switch (code) {
@@ -829,6 +839,7 @@ export function buildNativeFileJobDialogModel(
         const counts = outcome.status?.detail?.counts
         let summary: string
         let reason = ''
+        let location = ''
         if (exporting) {
             if (outcome.state === 'succeeded') {
                 summary = copy.resultExportSucceeded
@@ -839,6 +850,7 @@ export function buildNativeFileJobDialogModel(
             } else {
                 summary = copy.resultExportFailed
                 reason = failureReason(outcome.error?.code ?? '', 'export', outcome.error?.itemKind)
+                location = failureLocation(outcome.error?.owner)
             }
         } else if (outcome.state === 'succeeded') {
             summary = restarting ? copy.resultRestarting : copy.resultSucceeded
@@ -909,6 +921,7 @@ export function buildNativeFileJobDialogModel(
                 state: outcome.state,
                 summary,
                 reason,
+                location,
                 details: [
                     outcome.error ? `[${outcome.error.code}] ${outcome.error.message}` : '',
                     ...warningCodes.map((code) => `[${code}]`),

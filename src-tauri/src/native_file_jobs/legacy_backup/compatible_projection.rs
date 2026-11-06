@@ -1,6 +1,6 @@
 //! Source-generated structural contracts. Freeform dictionaries are only allowed
 //! where the reference type explicitly declares them.
-use super::{CompatibilityTarget, NativeJobError};
+use super::{CompatibilityTarget, FailureOwner, NativeJobError};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -26,6 +26,7 @@ pub(super) struct Projector {
     pub affected_conversations: BTreeMap<String, u64>,
     attributed_losses: BTreeMap<String, u64>,
     inventory: Option<HashSet<String>>,
+    source_assets: HashSet<String>,
     persona_ids: Option<HashSet<String>>,
 }
 impl Projector {
@@ -42,6 +43,7 @@ impl Projector {
             affected_conversations: BTreeMap::new(),
             attributed_losses: BTreeMap::new(),
             inventory: None,
+            source_assets: HashSet::new(),
             persona_ids: None,
         })
     }
@@ -70,6 +72,10 @@ impl Projector {
     }
     pub fn set_inventory(&mut self, names: HashSet<String>) {
         self.inventory = Some(names);
+    }
+    /// The asset keys the library holds a file for, before they are renamed for the target.
+    pub fn set_source_assets(&mut self, keys: HashSet<String>) {
+        self.source_assets = keys;
     }
     pub fn set_personas(&mut self, root: &Value) -> Result<(), NativeJobError> {
         let mut ids = HashSet::new();
@@ -130,8 +136,14 @@ impl Projector {
             }
             &external
         } else { value };
-        let (mut value, losses) =
-            project_node(&self.schema, node, value, 0).map_err(|rejection| rejection.into_error(name))?;
+        let (mut value, losses) = project_node(&self.schema, node, value, 0).map_err(|rejection| {
+            let owner = matches!(name, "Database" | "DataBase").then(|| rejection.root_owner(value)).flatten();
+            let error = rejection.into_error(name);
+            match owner {
+                Some(owner) => error.owned_by(&owner),
+                None => error,
+            }
+        })?;
         self.losses.merge(losses);
         if name == "Chat" {
             if let (Some(ids), Some(id)) = (
@@ -152,7 +164,7 @@ impl Projector {
         }
         if let Some(inventory) = &self.inventory {
             if matches!(name, "DataBase" | "character" | "botPreset") {
-                validate_asset_fields(&value, inventory)?;
+                validate_asset_fields(&value, inventory, &self.source_assets, &mut self.losses)?;
             }
             for key in ["coldstorage", "coldStoragedChats"] {
                 if let Some(value) = value.get(key) {
@@ -256,54 +268,42 @@ fn inlay_references(value: &str) -> Vec<&str> {
     }
     references
 }
-fn validate_asset_fields(value: &Value, inventory: &HashSet<String>) -> Result<(), NativeJobError> {
-    fn asset(value: &Value, inventory: &HashSet<String>) -> Result<(), NativeJobError> {
-        if let Some(path) = value.as_str().and_then(|s| s.strip_prefix("assets/")) {
-            if !inventory.contains(path) {
-                return Err(error("referenced asset is missing from target inventory"));
-            }
-        }
-        Ok(())
-    }
+/// Calls `visit` with the field name and value of each asset reference in the
+/// fields that hold one.
+pub(super) fn visit_asset_fields<E>(
+    value: &Value,
+    visit: &mut impl FnMut(&str, &Value) -> Result<(), E>,
+) -> Result<(), E> {
     match value {
         Value::Array(items) => {
             for item in items {
-                validate_asset_fields(item, inventory)?;
+                visit_asset_fields(item, visit)?;
             }
         }
         Value::Object(object) => {
             for (key, value) in object {
+                let items = value.as_array().into_iter().flatten();
                 match key.as_str() {
                     "image" | "icon" | "customBackground" | "userIcon" | "imgFile" | "img" => {
-                        asset(value, inventory)?
+                        visit(key, value)?
                     }
                     "additionalAssets" | "emotionImages" | "assets" => {
-                        if let Some(items) = value.as_array() {
-                            for tuple in items {
-                                if let Some(value) = tuple.get(1) {
-                                    asset(value, inventory)?;
-                                }
-                            }
+                        for value in items.filter_map(|tuple| tuple.get(1)) {
+                            visit(key, value)?;
                         }
                     }
                     "ccAssets" => {
-                        if let Some(items) = value.as_array() {
-                            for item in items {
-                                if let Some(value) = item.get("uri") {
-                                    asset(value, inventory)?;
-                                }
-                            }
+                        for value in items.filter_map(|item| item.get("uri")) {
+                            visit(key, value)?;
                         }
                     }
                     "vits" => {
-                        if let Some(files) = value.get("files").and_then(Value::as_object) {
-                            for value in files.values() {
-                                asset(value, inventory)?;
-                            }
+                        for value in value.get("files").and_then(Value::as_object).into_iter().flat_map(Map::values) {
+                            visit(key, value)?;
                         }
                     }
                     "modules" | "personas" | "embeddedModule" | "characterOrder" => {
-                        validate_asset_fields(value, inventory)?
+                        visit_asset_fields(value, visit)?
                     }
                     _ => {}
                 }
@@ -312,6 +312,33 @@ fn validate_asset_fields(value: &Value, inventory: &HashSet<String>) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+/// Checks asset references against the files the backup carries. A key the
+/// library holds no file for is kept as is: upstream backups leave out files
+/// they do not save, and both references show such a reference as a missing
+/// image. A key the library does hold must have been carried.
+fn validate_asset_fields(
+    value: &Value,
+    inventory: &HashSet<String>,
+    source: &HashSet<String>,
+    losses: &mut Losses,
+) -> Result<(), NativeJobError> {
+    visit_asset_fields(value, &mut |field, value| {
+        if let Some(key) = value.as_str() {
+            if let Some(path) = key.strip_prefix("assets/") {
+                if !inventory.contains(path) {
+                    if source.contains(key) {
+                        return Err(error(&format!(
+                            "referenced asset is missing from target inventory at {field}: {key}"
+                        )));
+                    }
+                    losses.add("missing-asset-references", 1);
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 fn error(message: &str) -> NativeJobError {
@@ -336,18 +363,39 @@ impl Rejection {
         let path: String = self.path.into_iter().rev().collect();
         error(&format!("{} at {root}{path}", self.message))
     }
+    /// The module or persona of the root settings that holds the rejected value.
+    fn root_owner(&self, root: &Value) -> Option<FailureOwner> {
+        let mut outer = self.path.iter().rev();
+        let (key, kind) = match outer.next()?.as_str() {
+            ".modules" => ("modules", "module"),
+            ".personas" => ("personas", "persona"),
+            _ => return None,
+        };
+        let index: usize = outer.next()?.strip_prefix('[')?.strip_suffix(']')?.parse().ok()?;
+        let name = root.get(key)?.get(index)?.get("name").and_then(Value::as_str).unwrap_or_default();
+        Some(FailureOwner { kind, name: name.to_owned(), character: None })
+    }
 }
 
 /// Values the target does not define, replaced by the closest value it accepts
 /// instead of failing a required field or dropping an optional one.
 fn fallback(
     schema: &Value,
+    parent: &str,
     key: &str,
     id: &str,
     value: &Value,
     depth: usize,
 ) -> Option<(Value, Losses)> {
+    let lore = schema["types"]["loreBook"].as_str() == Some(parent);
     let (replacement, replaced) = match (key, value) {
+        // Imports, plugins and scripts can store a lorebook entry without these
+        // values. The references' converters write "" for a missing key, comment
+        // or content, and their readers treat a missing secondary key, flag or
+        // mode like "", false or "normal".
+        ("key" | "secondkey" | "comment" | "content", Value::Null) if lore => (Value::from(""), 1),
+        ("alwaysActive" | "selective", value) if lore => (Value::Bool(truthy(value)), 1),
+        ("mode", _) if lore => (Value::from("normal"), 1),
         // Requests already send High when a model has no XHigh effort.
         ("adaptiveThinkingEffort" | "adaptive_thinking_effort", Value::String(effort))
             if effort == "xhigh" =>
@@ -361,16 +409,7 @@ fn fallback(
         }
         // A model flag the target lacks has no behavior there, so only that flag is removed.
         ("customFlags" | "flags", Value::Array(flags)) => {
-            // An optional list is a union around the array.
-            let node = &schema["nodes"][id];
-            let item = match node["kind"].as_str()? {
-                "array" => node["items"].as_str(),
-                "union" => node["variants"].as_array()?.iter().find_map(|variant| {
-                    let variant = &schema["nodes"][variant.as_str()?];
-                    (variant["kind"] == "array").then(|| variant["items"].as_str()).flatten()
-                }),
-                _ => None,
-            }?;
+            let item = array_items(schema, id)?;
             let kept: Vec<Value> = flags
                 .iter()
                 .filter(|flag| project_node(schema, item, flag, depth + 1).is_ok())
@@ -384,6 +423,46 @@ fn fallback(
     let (value, mut losses) = project_node(schema, id, &replacement, depth).ok()?;
     losses.add("unsupported-option-value", replaced);
     Some((value, losses))
+}
+
+/// The item node of a list, which an optional field wraps in a union.
+fn array_items<'a>(schema: &'a Value, id: &str) -> Option<&'a str> {
+    let node = &schema["nodes"][id];
+    match node["kind"].as_str()? {
+        "array" => node["items"].as_str(),
+        "union" => node["variants"].as_array()?.iter().find_map(|variant| {
+            let variant = &schema["nodes"][variant.as_str()?];
+            (variant["kind"] == "array").then(|| variant["items"].as_str()).flatten()
+        }),
+        _ => None,
+    }
+}
+
+/// An optional list without the entries the target rejects, so one entry does
+/// not drop the others.
+fn supported_items(schema: &Value, id: &str, value: &Value, depth: usize) -> Option<(Value, Losses)> {
+    let items = value.as_array()?;
+    let item = array_items(schema, id)?;
+    let kept: Vec<Value> = items
+        .iter()
+        .filter(|entry| project_node(schema, item, entry, depth + 1).is_ok())
+        .cloned()
+        .collect();
+    let dropped = (items.len() - kept.len()) as u64;
+    let (value, mut losses) = project_node(schema, id, &Value::Array(kept), depth).ok()?;
+    losses.add("unsupported-option-value", dropped);
+    Some((value, losses))
+}
+
+/// JavaScript truthiness, which every reference reader applies to a lorebook flag.
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
 }
 
 fn project_node(
@@ -444,19 +523,22 @@ fn project_node(
                 if let Some(child) = child {
                     let projected = project_node(schema, child, value, depth + 1).or_else(|rejection| {
                         field
-                            .and_then(|_| fallback(schema, key, child, value, depth + 1))
+                            .and_then(|_| fallback(schema, id, key, child, value, depth + 1))
                             .ok_or(rejection)
                     });
+                    let optional = field.is_some_and(|f| f["optional"].as_bool() == Some(true));
+                    let projected = match projected {
+                        Err(_) if optional => supported_items(schema, child, value, depth + 1).ok_or(None),
+                        projected => projected.map_err(Some),
+                    };
                     match projected {
                         Ok((value, child_losses)) => {
                             out.insert(key.clone(), value);
                             losses.merge(child_losses);
                         }
-                        Err(_) if field.is_some_and(|f| f["optional"].as_bool() == Some(true)) => {
-                            losses.add("unsupported-option-value", 1)
-                        }
+                        Err(None) => losses.add("unsupported-option-value", 1),
                         // Dictionary keys are user data, so the path names only declared fields.
-                        Err(rejection) => {
+                        Err(Some(rejection)) => {
                             return Err(rejection.at(if field.is_some() {
                                 format!(".{key}")
                             } else {
@@ -836,13 +918,39 @@ mod tests {
     #[test]
     fn compatible_projection_keeps_null_where_the_references_store_it() {
         // Both references store these nulls; thinkingTokens,
-        // postHistoryInstructions, the cleared number settings and a cleared
-        // lorebook insertion order are required fields.
+        // postHistoryInstructions, the cleared number settings and inputs and a
+        // cleared lorebook insertion order are required fields.
         let lore = json!([{
             "key": "synthetic", "secondkey": "", "comment": "", "content": "synthetic", "mode": "normal",
             "alwaysActive": false, "selective": false, "insertorder": null,
         }]);
+        let bias = json!([["synthetic", null]]);
+        let prompts = json!([
+            {"type": "chat", "rangeStart": null, "rangeEnd": null},
+            {"type": "cache", "name": "synthetic", "depth": null, "role": "all"},
+        ]);
         let records = [
+            ("DataBase", json!({
+                "sdSteps": null, "sdCFG": null,
+                "sdConfig": {"width": null, "height": null, "denoising_strength": null, "hr_scale": null},
+                "NAIImgConfig": {"width": null, "height": null, "steps": null, "scale": null, "cfg_rescale": null},
+                "comfyConfig": {"timeout": null},
+                "hypaV3Presets": [{"name": "synthetic", "settings": {
+                    "maxChatsPerSummary": null, "queryChatCount": null, "summarizationRequestsPerMinute": null,
+                    "summarizationMaxConcurrent": null, "embeddingRequestsPerMinute": null, "embeddingMaxConcurrent": null,
+                }}],
+                "plugins": [{"name": "synthetic", "realArg": {"synthetic": null}}],
+                "bias": bias, "promptTemplate": prompts,
+            })),
+            ("botPreset", json!({"bias": bias, "promptTemplate": prompts})),
+            ("character", json!({
+                "bias": bias, "depth_prompt": {"depth": null, "prompt": "synthetic"},
+                "loreSettings": {"scanDepth": null, "tokenBudget": null}, "fishSpeechConfig": {"chunk_length": null},
+                "triggerscript": [{"comment": "", "type": "manual", "effect": [], "conditions": [
+                    {"type": "exists", "type2": "loose", "value": "", "depth": null},
+                ]}],
+            })),
+            ("Chat", json!({"scriptstate": {"$synthetic": null}})),
             ("DataBase", json!({"thinkingTokens": null, "textScreenColor": null, "textScreenBorder": null, "promptTemplate": null})),
             ("DataBase", json!({
                 "loreBookDepth": null, "loreBookToken": null, "autoContinueMinTokens": null, "requestRetrys": null,
@@ -858,12 +966,56 @@ mod tests {
             })),
             ("Message", json!({"role": "user", "data": "synthetic", "name": null})),
         ];
+        // Only RisuAI declares these memory settings.
+        let risuai = ("DataBase", json!({
+            "hanuraiTokens": null, "hypaChunkSize": null, "hypaAllocatedTokens": null, "maxSupaChunkSize": null,
+        }));
         for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
             let mut projector = Projector::new(target).unwrap();
-            for (name, value) in &records {
+            let extra = (target == CompatibilityTarget::RisuAi).then_some(&risuai);
+            for (name, value) in records.iter().chain(extra) {
                 assert_eq!(projector.project(name, value).map_err(|error| error.message), Ok(value.clone()));
             }
             assert!(projector.losses.0.is_empty());
+        }
+    }
+
+    #[test]
+    fn compatible_projection_fills_lorebook_values_the_references_never_store() {
+        let entry = json!({
+            "key": null, "secondkey": null, "comment": null, "content": null,
+            "alwaysActive": null, "selective": 1, "mode": null, "insertorder": 100,
+        });
+        let filled = json!({
+            "key": "", "secondkey": "", "comment": "", "content": "",
+            "alwaysActive": false, "selective": true, "mode": "normal", "insertorder": 100,
+        });
+        for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
+            let mut projector = Projector::new(target).unwrap();
+            let character = projector.project("character", &json!({"globalLore": [entry]})).unwrap();
+            assert_eq!(character["globalLore"], json!([filled]));
+            assert_eq!(projector.losses.0, BTreeMap::from([("unsupported-option-value".to_owned(), 7)]));
+            // The same names outside a lorebook entry are not filled.
+            let script = json!({"customscript": [{"comment": null, "in": "", "out": "", "type": "editinput"}]});
+            assert!(projector.project("character", &script).is_err());
+        }
+    }
+
+    #[test]
+    fn compatible_projection_keeps_the_supported_entries_of_an_optional_list() {
+        let entry = |insertorder: Value| json!({
+            "key": "", "secondkey": "", "comment": "", "content": "",
+            "alwaysActive": false, "selective": false, "mode": "normal", "insertorder": insertorder,
+        });
+        for target in [CompatibilityTarget::RisuAi, CompatibilityTarget::PocketRisu] {
+            let mut projector = Projector::new(target).unwrap();
+            let lorebook = json!([entry(json!(1)), entry(json!("first")), entry(json!(2))]);
+            let module = json!({"id": "module", "name": "Synthetic", "description": "", "lorebook": lorebook});
+            let root = projector.project("DataBase", &json!({"modules": [module]})).unwrap();
+            assert_eq!(root["modules"][0]["lorebook"], json!([entry(json!(1)), entry(json!(2))]));
+            assert_eq!(projector.losses.0, BTreeMap::from([("unsupported-option-value".to_owned(), 1)]));
+            // A required list still fails as a whole.
+            assert!(projector.project("character", &json!({"globalLore": lorebook})).is_err());
         }
     }
 
@@ -946,12 +1098,17 @@ mod tests {
     }
 
     #[test]
-    fn compatible_inventory_rejects_missing_references_and_reports_risuai_inlay_loss() {
+    fn compatible_inventory_keeps_dangling_asset_references_and_rejects_missing_payloads() {
         let mut projector = Projector::new(CompatibilityTarget::PocketRisu).unwrap();
         projector.set_inventory(HashSet::new());
-        assert!(projector
-            .project("character", &json!({"image":"assets/missing.png"}))
-            .is_err());
+        // The library holds no file for these keys, so they stay as the source has them.
+        let dangling = json!({"image":"assets/missing.png","emotionImages":[["joy","assets/missing.webp"]]});
+        assert_eq!(projector.project("character", &dangling).unwrap(), dangling);
+        assert_eq!(projector.losses.0["missing-asset-references"], 2);
+        // A file the library holds must reach the backup.
+        projector.set_source_assets(HashSet::from(["assets/missing.png".to_owned()]));
+        let error = projector.project("character", &json!({"image":"assets/missing.png"})).unwrap_err();
+        assert!(error.message.ends_with(" at image: assets/missing.png"), "{}", error.message);
         assert!(projector
             .project(
                 "Message",

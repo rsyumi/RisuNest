@@ -1,6 +1,6 @@
 use super::{
-    restore, ImportCounts, JobControl, JobDetail, JobPhase, JobProgress, JobResultSummary,
-    JobStage, NativeJobError, OpenedJobSource, StageUnit,
+    restore, FailureOwner, ImportCounts, JobControl, JobDetail, JobPhase, JobProgress,
+    JobResultSummary, JobStage, NativeJobError, OpenedJobSource, StageUnit,
 };
 use crate::asset_repository::job_pins::{
     CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
@@ -413,6 +413,7 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
         }
         let sink = LegacyReplacementSink {
             app: self.app.clone(),
+            asset_keys: payloads.asset_aliases.iter().map(|alias| alias.key.clone()).collect(),
             payloads,
             durable: Mutex::new(durable),
             incomplete: Mutex::new(super::IncompleteRestorePreview::default()),
@@ -446,15 +447,17 @@ impl StrictLocalBackupDatabaseRestore for LegacyDatabaseRestore<'_> {
     }
 }
 
-struct LegacyReplacementSink {
+struct LegacyReplacementSink<R: tauri::Runtime = tauri::Wry> {
     activation_pending: std::sync::atomic::AtomicBool,
-    app: AppHandle,
+    app: AppHandle<R>,
     payloads: PreparedLegacyRestorePayloads,
+    /// The asset keys the backup carries a file for.
+    asset_keys: HashSet<String>,
     durable: Mutex<DurableCasJob>,
     incomplete: Mutex<super::IncompleteRestorePreview>,
 }
 
-impl restore::ReplacementSink for LegacyReplacementSink {
+impl<R: tauri::Runtime> restore::ReplacementSink for LegacyReplacementSink<R> {
     fn prepare_activation_receipt(&self, staging_id: &str, job: &JobControl, result: &JobResultSummary) -> StoreResult<Option<String>> {
         crate::persistent_store::commands::with_store(self.app.state(), |store| super::restore_receipts::prepare(store, job, staging_id, result))
     }
@@ -475,18 +478,23 @@ impl restore::ReplacementSink for LegacyReplacementSink {
     }
 
     fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()> {
+        self.add_missing_assets(missing_asset_references(root, &self.asset_keys))?;
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_put_upstream_root(staging_id, root)
         })
     }
 
     fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()> {
+        for preset in presets {
+            self.add_missing_assets(missing_asset_references(preset, &self.asset_keys))?;
+        }
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_put_upstream_presets(staging_id, presets)
         })
     }
 
     fn put_legacy_root(&self, staging_id: &str, root: &crate::persistent_store::upstream_stream::RootSpool) -> StoreResult<()> {
+        self.add_missing_assets(missing_root_asset_references(root, &self.asset_keys)?)?;
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_put_upstream_stream(staging_id, root)
         })
@@ -505,6 +513,9 @@ impl restore::ReplacementSink for LegacyReplacementSink {
     }
 
     fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()> {
+        // Counted here, on the characters as staged: a cold stub carries its
+        // fields only after expansion, and a prepared character can still be excluded.
+        self.add_missing_assets(characters.iter().map(|character| missing_asset_references(character, &self.asset_keys)).sum())?;
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_add_characters(staging_id, characters)
         })
@@ -530,6 +541,7 @@ impl restore::ReplacementSink for LegacyReplacementSink {
     }
 
     fn put_character_detail(&self, staging_id: &str, detail: &Value, conversation_count: i64) -> StoreResult<()> {
+        self.add_missing_assets(missing_asset_references(detail, &self.asset_keys))?;
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_put_character_detail(staging_id, detail, conversation_count)
         })
@@ -599,7 +611,15 @@ impl restore::ReplacementSink for LegacyReplacementSink {
     }
 }
 
-impl LegacyReplacementSink {
+impl<R: tauri::Runtime> LegacyReplacementSink<R> {
+    fn add_missing_assets(&self, missing: u64) -> StoreResult<()> {
+        if missing > 0 {
+            let mut preview = self.incomplete.lock().map_err(|error| crate::persistent_store::StoreError::Store { message: error.to_string() })?;
+            preview.omissions.missing_assets = preview.omissions.missing_assets.saturating_add(missing);
+        }
+        Ok(())
+    }
+
     fn release_durable(&self, outcome: CasReleaseOutcome) -> StoreResult<()> {
         self.durable
             .lock()
@@ -611,13 +631,46 @@ impl LegacyReplacementSink {
     }
 }
 
-impl Drop for LegacyReplacementSink {
+impl<R: tauri::Runtime> Drop for LegacyReplacementSink<R> {
     fn drop(&mut self) {
         if self.activation_pending.load(std::sync::atomic::Ordering::Acquire) { return; }
         if let Ok(durable) = self.durable.get_mut() {
             let _ = durable.release(CasReleaseOutcome::Aborted);
         }
     }
+}
+
+/// The asset references in `value` the backup carries no file for. RisuAI
+/// leaves out files it does not keep, and the reference is restored as it is.
+fn missing_asset_references(value: &Value, carried: &HashSet<String>) -> u64 {
+    let mut missing = 0;
+    let _ = compatible_projection::visit_asset_fields(value, &mut |_, value| {
+        if value.as_str().is_some_and(|key| key.starts_with("assets/") && !carried.contains(key)) {
+            missing += 1;
+        }
+        Ok::<(), std::convert::Infallible>(())
+    });
+    missing
+}
+
+/// The same count for the root fields of a streamed database.
+fn missing_root_asset_references(
+    root: &crate::persistent_store::upstream_stream::RootSpool,
+    carried: &HashSet<String>,
+) -> StoreResult<u64> {
+    let mut missing = 0;
+    for key in ["customBackground", "userIcon"] {
+        if let Some(value) = root.scalar(key)? {
+            missing += missing_asset_references(&Value::Object(Map::from_iter([(key.to_owned(), value)])), carried);
+        }
+    }
+    for key in ["personas", "modules", "characterOrder", "botPresets"] {
+        root.visit(key, |_, member| {
+            missing += missing_asset_references(&member, carried);
+            Ok(())
+        })?;
+    }
+    Ok(missing)
 }
 
 fn local_backup_error(error: LocalBackupError) -> NativeJobError {
@@ -1555,6 +1608,79 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn counts_asset_references_the_backup_carries_no_file_for() {
+        use serde_json::json;
+        let carried = HashSet::from(["assets/carried.png".to_owned()]);
+        let character = json!({
+            "image": "assets/carried.png",
+            "emotionImages": [["joy", "assets/gone-joy.png"]],
+            "additionalAssets": [["extra", "assets/gone-extra.png", "png"]],
+            "ccAssets": [{"uri": "assets/gone-cc.png"}, {"uri": "embeded://card.png"}],
+            "vits": {"files": {"voice": "assets/gone-voice.bin"}},
+            "firstMessage": "assets/gone-in-text.png",
+        });
+        assert_eq!(missing_asset_references(&character, &carried), 4);
+        let root = crate::persistent_store::upstream_stream::RootSpool::new(Default::default()).unwrap();
+        for (key, value) in [
+            ("customBackground", json!("assets/gone-background.png")),
+            ("userIcon", json!("assets/carried.png")),
+            ("personas", json!([{"icon": "assets/gone-persona.png"}])),
+            ("modules", json!([{"assets": [["module", "assets/gone-module.png", "png"]]}])),
+            ("characterOrder", json!(["character", {"img": "assets/gone-folder.png"}])),
+            ("botPresets", json!([{"image": "assets/gone-preset.png"}])),
+            ("mainPrompt", json!("assets/gone-in-text.png")),
+        ] {
+            root.put(key, Some(&value)).unwrap();
+        }
+        assert_eq!(missing_root_asset_references(&root, &carried).unwrap(), 5);
+    }
+
+    #[test]
+    fn restore_counts_the_missing_assets_of_the_characters_it_stages() {
+        use restore::ReplacementSink as _;
+        use serde_json::json;
+        let directory = tempfile::tempdir().unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.manage(crate::persistent_store::commands::PersistentStoreState::with_test_store(
+            PersistentStore::open(&directory.path().join("store")).unwrap(),
+        ));
+        // The archived character's assets exist only in its cold payload.
+        let archived = directory.path().join("archived.json");
+        fs::write(&archived, serde_json::to_vec(&json!({"character": {
+            "chaId": "archived", "name": "Archived", "chats": [],
+            "additionalAssets": [["extra", "assets/archived.png", "png"], ["second", "assets/archived-second.png", "png"]],
+        }})).unwrap()).unwrap();
+        let sink = LegacyReplacementSink {
+            activation_pending: std::sync::atomic::AtomicBool::new(false),
+            app: app.handle().clone(),
+            payloads: PreparedLegacyRestorePayloads {
+                asset_aliases: Vec::new(),
+                invalid_inlays: Vec::new(),
+                skipped_inlays: 0,
+                cold_payloads: HashMap::from([("archived".to_owned(), archived)]),
+                unavailable_cold_payloads: HashMap::new(),
+            },
+            asset_keys: HashSet::new(),
+            durable: Mutex::new(DurableCasJob::begin(
+                directory.path(),
+                "synthetic-job",
+                CasJobKind::LocalBackupRestore,
+                crate::asset_repository::job_pins::CasJobOwner::for_test(),
+                0,
+            ).unwrap()),
+            incomplete: Mutex::new(Default::default()),
+        };
+        let staging = sink.begin().unwrap().staging_id;
+        let staged = sink.prepare_character(json!({"chaId": "archived", "name": "Archived", "chats": [], "coldstorage": "archived"})).unwrap();
+        // The restore excludes a character after preparing it and never stages it.
+        sink.prepare_character(json!({"chaId": "excluded", "name": "Excluded", "chats": [], "image": "assets/excluded.png"})).unwrap();
+        sink.add_characters(&staging, &[staged]).unwrap();
+        assert_eq!(sink.incomplete_restore_preview().unwrap().omissions.missing_assets, 2);
+    }
 
     #[test]
     fn prepares_asset_inlay_and_cold_payloads_without_mutating_live_aliases() {

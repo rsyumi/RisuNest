@@ -1580,7 +1580,7 @@ function convertCharbook(arg:{
     loreExt = charbook.extensions
 
     for(const book of charbook.entries){
-        let content = book.content
+        let content = book.content ?? ''
 
         if(book.use_regex && !book.keys?.[0]?.startsWith('/')){
             book.use_regex = false

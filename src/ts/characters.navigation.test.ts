@@ -159,6 +159,7 @@ import {
     selectCharImg,
     addCharEmotion,
     addingEmotion,
+    updateLorebooks,
 } from './characters'
 import { beginMobileBackgroundTask } from './mobileBackgroundTask'
 import { createMetadataOnlySelectedConversation } from './storage/selectedConversationLifecycle'
@@ -188,6 +189,16 @@ async function markForDisplayRecovery(...marked: DisplayRecoveryTarget[]) {
     await installDisplayRecovery(recoveryStore({ working: [], marked }, { commitAtOnce: true }).store)
     onTestFinished(() => installDisplayRecovery(null))
 }
+
+describe('lorebook format update', () => {
+    it('gives an entry without a key, name or content empty text', () => {
+        const [entry] = updateLorebooks([{
+            key: null, comment: null, content: null, secondkey: '', insertorder: 100,
+            mode: 'normal', alwaysActive: false, selective: false,
+        }])
+        expect(entry).toMatchObject({ key: '', comment: '', content: '', bookVersion: 2 })
+    })
+})
 
 describe('runtime chat identity', () => {
     it('keeps a newer portrait when the gallery selection changed while the picker was open', async () => {

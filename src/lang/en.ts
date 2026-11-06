@@ -63,6 +63,7 @@ export const languageEnglish = {
             'toggle-preset-prompt-name-unmatched':
                 'Toggle preset prompts without matching names',
             'unavailable-persona-binding': 'Unavailable persona bindings',
+            'missing-asset-references': 'Attachment references without a file',
             'unsupported-inlay-references': 'Unsupported inlay references',
             'unsupported-option-value': 'Unsupported setting values',
             'unsupported-structural-field': 'Unsupported data fields',
@@ -108,6 +109,7 @@ export const languageEnglish = {
             damagedPluginStorage: (count: number) => `Damaged plugin storage (${count}) will not be restored.`,
             oversizedPluginStorage: (count: number) => `Oversized plugin storage (${count}) will not be restored.`,
             inlays: (count: number) => `Unsupported inlay entries (${count}) will not be restored.`,
+            missingAssets: (count: number) => `Attachment references without a file (${count}) will be restored without the file.`,
         },
         "recovery": {
             "dismiss": 'Dismiss attempt',
@@ -3103,6 +3105,9 @@ export const languageEnglish = {
             reasonExportTooLarge: '{0} is too large to export.',
             reasonCompatibleDatabaseTooLarge: 'The data is too large to export as a compatible backup. Use a RisuNest backup.',
             reasonCompatibleUnsupportedValue: 'The data contains a value the target app does not support, so it could not be exported as a compatible backup. Use a RisuNest backup.',
+            failureOwners: {
+                character: 'Character: {0}', chat: 'Chat: {1} of {0}', preset: 'Preset: {0}', module: 'Module: {0}', persona: 'Persona: {0}',
+            },
             tooLargeItems: {
                 root: 'Settings data', preset: 'A preset', character: 'A character', conversation: 'A chat', message: 'A message', 'plugin-value': 'Plugin data',
                 record: 'A data item', backup: 'Backup data', 'backup-entry': 'A backup entry', card: 'The character card', module: 'The module', content: 'The card or module', 'owner-manifest': 'The additional asset list', 'compatible-database': 'The data',
