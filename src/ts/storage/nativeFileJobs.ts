@@ -526,7 +526,16 @@ export interface NativeFileJobStatus {
         code: string
         message: string
         itemKind?: string
+        owner?: NativeFileJobFailureOwner
     }
+}
+
+/** The library item whose data a compatible export could not write. */
+export interface NativeFileJobFailureOwner {
+    kind: 'character' | 'chat' | 'preset' | 'module' | 'persona'
+    name: string
+    /** The character a chat belongs to. */
+    character?: string
 }
 
 export interface NativePortableSelection {
@@ -613,7 +622,7 @@ export interface NativeIncompleteRestorePreview {
     unavailableColdKeys: string[]
     characterNames: string[]
     invalidInlays: string[]
-    omissions?: Partial<Record<'data' | 'remote' | 'missing' | 'values' | 'pluginStorage' | 'damagedPluginStorage' | 'oversizedPluginStorage' | 'inlays' | 'excludedCharacters', number>>
+    omissions?: Partial<Record<'data' | 'remote' | 'missing' | 'values' | 'pluginStorage' | 'damagedPluginStorage' | 'oversizedPluginStorage' | 'inlays' | 'excludedCharacters' | 'missingAssets', number>>
 }
 
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
@@ -727,6 +736,7 @@ export class NativeFileJobError extends Error {
         message: string,
         readonly warningCodes: string[] = [],
         readonly itemKind?: string,
+        readonly owner?: NativeFileJobFailureOwner,
     ) {
         super(message)
         this.name = 'NativeFileJobError'
@@ -1598,7 +1608,7 @@ async function runNativeReplacementRestore(
                         if (preview?.unavailableColdKeys.length) warnings.push(language.errors.coldStorageIncompleteRestoreConfirm(preview.characterNames.join(', '), preview.unavailableColdKeys.length, 0))
                         if (preview?.invalidInlays.length) warnings.push(language.portableBackup.invalidInlaysConfirm(preview.invalidInlays.length))
                         if (preview?.omissions) {
-                            for (const key of ['data', 'remote', 'missing', 'values', 'pluginStorage', 'damagedPluginStorage', 'oversizedPluginStorage', 'inlays', 'excludedCharacters'] as const) {
+                            for (const key of ['data', 'remote', 'missing', 'values', 'pluginStorage', 'damagedPluginStorage', 'oversizedPluginStorage', 'inlays', 'excludedCharacters', 'missingAssets'] as const) {
                                 const count = preview.omissions[key] ?? 0
                                 if (count > 0) warnings.push(language.portableBackup.omittedRestoreData[key](count))
                             }
@@ -2297,7 +2307,7 @@ async function runNativeManagedExportToDestination(
             throw new NativeFileJobError(
                 terminal.error?.code ?? 'export-failed',
                 terminal.error?.message ?? `${spec.operation} failed`,
-                [], terminal.error?.itemKind,
+                [], terminal.error?.itemKind, terminal.error?.owner,
             )
         }
         if (!terminal.result) {

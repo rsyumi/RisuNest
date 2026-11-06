@@ -1088,6 +1088,31 @@ test('publishes local lore through the conversation metadata batch', async () =>
   expect(fixture.session.version).toBe(1)
 })
 
+test('stores empty text for a nil local lore name or content', async () => {
+  const fixture = operationCharacterFixture('local-lore-nil')
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+
+  await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      upsertLocalLoreBook(id, nil, nil, {})
+      return value
+    end)
+  `, {
+    char: fixture.char,
+    data: 'input',
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(operationContext.chat.localLore).toEqual([
+    expect.objectContaining({ comment: '', content: '' }),
+  ])
+})
+
 test('keeps local lore partial-error semantics inside the original owner', async () => {
   const fixture = operationCharacterFixture('local-lore-partial')
   installOperationCharacterFixture(fixture)

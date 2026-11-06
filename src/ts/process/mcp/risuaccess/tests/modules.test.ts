@@ -171,6 +171,18 @@ test('retrieves fields of a lorebook', async () => {
   expect(await instance.handle('risu-get-module-lorebook', { id: 'A', names: ['0', '2', '99'] })).toMatchSnapshot()
 })
 
+test('treats null lorebook arguments as not given', async () => {
+  const instance = new ModuleHandler()
+  const { alertConfirm } = await import('src/ts/alert')
+  vi.mocked(alertConfirm).mockResolvedValue(true)
+  DBState.db.modules = [{ ...makeModule('A'), lorebook: [makeLorebook('0')] }]
+
+  await instance.handle('risu-set-module-lorebook', {
+    id: 'A', name: '0', content: null, keys: null, newName: null, alwaysActive: null,
+  })
+  expect(DBState.db.modules[0].lorebook).toEqual([makeLorebook('0')])
+})
+
 test('lists all regex scripts of a module', async () => {
   const instance = new ModuleHandler()
 

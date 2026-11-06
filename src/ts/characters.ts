@@ -763,6 +763,11 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
 
 export function updateLorebooks(book:loreBook[]){
     return book.map((v) => {
+        // Imports, plugins and scripts can store an entry without these, which
+        // the editor and the prompt builder read as strings.
+        v.key ??= ''
+        v.comment ??= ''
+        v.content ??= ''
         v.bookVersion ??= 1
         if(v.bookVersion >= 2){
             return v

@@ -1171,8 +1171,8 @@ export async function runScripted(code:string, arg:{
                     .filter((book) => book.comment !== name)
                 newLocalLoreBooks.push({
                     alwaysActive,
-                    comment: name,
-                    content: content,
+                    comment: name ?? '',
+                    content: content ?? '',
                     insertorder: insertOrder,
                     mode: 'normal',
                     key,
