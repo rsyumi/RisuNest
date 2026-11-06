@@ -43,13 +43,24 @@ export const monacoDriver = {
         probe.style.backgroundColor = 'var(--risu-theme-darkbg)'
         const theme = getComputedStyle(probe).backgroundColor
         probe.remove()
-        const lineTop = root.getBoundingClientRect().top + editor.getTopForLineNumber(lineNumber) - editor.getScrollTop()
+        const origin = root.getBoundingClientRect()
+        const box = input.getBoundingClientRect()
+        const lineTop = origin.top + editor.getTopForLineNumber(lineNumber) - editor.getScrollTop()
+        // Where the textarea draws its caret, laid out like its own text, against the end of the composition in the line.
+        const textBefore = input.value.slice(0, input.selectionEnd)
+        const mirror = document.body.appendChild(document.createElement('span'))
+        Object.assign(mirror.style, { position: 'absolute', whiteSpace: 'pre', fontFamily: style.fontFamily, fontSize: style.fontSize, fontWeight: style.fontWeight, letterSpacing: style.letterSpacing, tabSize: style.tabSize })
+        mirror.textContent = textBefore.slice(textBefore.lastIndexOf('\n') + 1)
+        const inputCaret = box.left + mirror.getBoundingClientRect().width - input.scrollLeft
+        mirror.remove()
+        const lineCaret = editor.getScrolledVisiblePosition(editor.getPosition()!)!
         return {
             composing: input.classList.contains('ime-input'),
             themeBackground: theme !== 'rgba(0, 0, 0, 0)' && style.backgroundColor === theme,
             fontMatchesLine: style.fontFamily === getComputedStyle(root.querySelector('.view-line span span')!).fontFamily,
             visible: style.opacity !== '0',
-            onLine: Math.abs(input.getBoundingClientRect().top - lineTop) < 1,
+            onLine: Math.abs(box.top - lineTop) < 1,
+            caretAligned: Math.abs(inputCaret - (origin.left + lineCaret.left)) < 2 && Math.abs(box.top - (origin.top + lineCaret.top)) < 1,
         }
     },
     // For each wrapped row but the last: the width it leaves free before the wrapping column, the width

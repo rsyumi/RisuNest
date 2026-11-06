@@ -59,7 +59,9 @@
             lineNumbers: 'on',
             scrollBeyondLastLine: false,
             fontSize: 14,
-            fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+            // Lines render in the app font. Monaco measures with this font the line text it hides in front of
+            // a composition, so the composition textarea lines up with the line only when they match.
+            fontFamily: getComputedStyle(container).getPropertyValue('--risu-font-family').trim() || "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
             padding: { top: 8, bottom: 8 },
             renderLineHighlight: 'gutter',
             overviewRulerBorder: false,
@@ -75,14 +77,34 @@
             value = newValue;
             onchange?.(newValue);
         });
-        // Monaco stops moving its composition textarea once the composed line leaves the viewport,
-        // and leaves it in place on a line that wraps, where it shows a sliver of the line's text.
+        // Monaco shows a composition in its textarea, anchored to the line text from after the last tab before
+        // the selection to the line end, as computed below when the composition starts. It moves the textarea
+        // only while that text sits on one row and the row is in view; otherwise the textarea stays where it
+        // was and shows a sliver of the line's text.
+        let compositionAnchor: { lineNumber: number; fromLineStart: number; fromLineEnd: number } | null = null;
+        const anchorComposition = () => {
+            const input = container.querySelector<HTMLTextAreaElement>('textarea.inputarea');
+            const selection = editor.getSelection();
+            const model = editor.getModel();
+            if (!input || !selection || !model) return;
+            const textBefore = input.value.slice(0, Math.min(input.selectionStart, input.selectionEnd));
+            const lineBefore = textBefore.slice(textBefore.lastIndexOf('\n') + 1);
+            const lineAfter = input.value.slice(Math.max(input.selectionStart, input.selectionEnd)).split('\n', 1)[0];
+            const tabAfter = lineAfter.indexOf('\t');
+            const columnsAfter = model.getLineMaxColumn(selection.endLineNumber) - selection.endColumn;
+            compositionAnchor = {
+                lineNumber: selection.startLineNumber,
+                fromLineStart: selection.startColumn - 1 - Math.min(selection.startColumn - 1, lineBefore.length - lineBefore.lastIndexOf('\t') - 1),
+                fromLineEnd: columnsAfter - Math.min(columnsAfter, tabAfter === -1 ? lineAfter.length : lineAfter.length - tabAfter - 1),
+            };
+        };
         const trackCompositionLine = () => {
             const position = editor.getPosition();
             const visible = position && editor.getScrolledVisiblePosition(position);
             const model = editor.getModel();
-            const wrapped = !!position && !!model && editor.getTopForPosition(position.lineNumber, 1) !== editor.getTopForPosition(position.lineNumber, model.getLineMaxColumn(position.lineNumber));
-            compositionHidden = !visible || visible.top + visible.height <= 0 || visible.top >= editor.getLayoutInfo().height || wrapped;
+            const anchor = compositionAnchor;
+            const split = !!anchor && !!model && editor.getTopForPosition(anchor.lineNumber, anchor.fromLineStart + 1) !== editor.getTopForPosition(anchor.lineNumber, model.getLineMaxColumn(anchor.lineNumber) - anchor.fromLineEnd);
+            compositionHidden = !visible || visible.top + visible.height <= 0 || visible.top >= editor.getLayoutInfo().height || split;
         };
         let compositionFrame: number | undefined;
         const scheduleCompositionLine = () => {
@@ -95,11 +117,21 @@
         };
         const scrollSubscription = editor.onDidScrollChange(scheduleCompositionLine);
         const cursorSubscription = editor.onDidChangeCursorPosition(scheduleCompositionLine);
+        // Monaco has just anchored the textarea from the same textarea content and selection.
+        const compositionStartSubscription = editor.onDidCompositionStart(() => {
+            anchorComposition();
+            scheduleCompositionLine();
+        });
+        const compositionEndSubscription = editor.onDidCompositionEnd(() => {
+            compositionAnchor = null;
+        });
         onready?.(editor);
 
         return () => {
             scrollSubscription.dispose();
             cursorSubscription.dispose();
+            compositionStartSubscription.dispose();
+            compositionEndSubscription.dispose();
             if (compositionFrame !== undefined) cancelAnimationFrame(compositionFrame);
             editor.dispose();
         };
@@ -123,7 +155,7 @@
 <div bind:this={container} class="w-full h-full" class:composition-hidden={compositionHidden}></div>
 
 <style>
-    /* The app font reaches the rendered lines but not the composition textarea, whose font Monaco sets inline. */
+    /* Monaco sets the composition textarea font inline with its own fallback fonts; use exactly the lines' font. */
     div :global(.monaco-editor .inputarea.ime-input) {
         font-family: var(--risu-font-family) !important;
     }
