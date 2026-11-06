@@ -56,11 +56,11 @@
     // Restoring restarts the app, so the flag only ever clears on cancel or failure.
     let restoringSnapshot: string | null = $state(null)
     let requestingCompaction = $state(false)
+    // The snapshot list is not part of the totals, so they show without it.
     let rollup = $derived(
-        view.stats && view.loadedSources.length === 4
+        view.stats && view.loadedSources.includes('conflictBackups') && view.loadedSources.includes('tempUsage')
             ? storageDashboardRollup(
                   view.stats,
-                  view.snapshots,
                   view.conflictBackups,
                   view.tempUsage,
               )
