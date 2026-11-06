@@ -1714,7 +1714,14 @@ pub(crate) fn pds_storage_stats(
 ) -> Result<PersistentStorageStats, StoreError> {
     logged(
         "pds_storage_stats",
-        with_store(state, PersistentStore::storage_stats),
+        with_store(state, |store| {
+            let stats = store.storage_stats()?;
+            super::storage_breakdown::log_once(vec![
+                store.database_path.clone(),
+                store.database_path.with_file_name(super::device_store::DEVICE_DATABASE_FILE),
+            ]);
+            Ok(stats)
+        }),
     )
 }
 
