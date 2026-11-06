@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::panic::Location;
-use std::sync::{LazyLock, LockResult, Mutex, MutexGuard, PoisonError};
+use std::sync::{LazyLock, LockResult, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant, SystemTime};
 
 const TARGET: &str = "slow-operation";
@@ -201,6 +201,7 @@ impl<T> std::ops::DerefMut for TimedGuard<'_, T> {
 }
 
 /// Locks `mutex` like `Mutex::lock`, naming the caller in the record of a long wait or hold.
+/// A wait for a held lock leaves the async worker to other tasks.
 #[track_caller]
 pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> LockResult<TimedGuard<'a, T>> {
     let location = Location::caller();
@@ -209,7 +210,12 @@ pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> LockResult
         guard,
         _timing: LockTiming { name, location, requested, acquired: Instant::now() },
     };
-    match mutex.lock() {
+    let locked = match mutex.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Err(poisoned),
+        Err(TryLockError::WouldBlock) => crate::async_worker::blocking(|| mutex.lock()),
+    };
+    match locked {
         Ok(guard) => Ok(timed(guard)),
         Err(poisoned) => Err(PoisonError::new(timed(poisoned.into_inner()))),
     }
@@ -327,6 +333,28 @@ mod tests {
             ["job store was slow 1 more time over 2 s, longest wait 1300 ms, longest hold 6 ms"],
         );
         assert!(repeats.note("pull".into(), "pull once more".into(), Measure::Stage { took: Duration::from_secs(5) }, at(window + 3_100)).is_empty());
+    }
+
+    #[test]
+    fn a_wait_for_a_held_lock_leaves_the_async_worker_to_other_tasks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).build().unwrap();
+        let mutex = std::sync::Arc::new(Mutex::new(0));
+        let held = mutex.lock().unwrap();
+        let (started_sent, started) = std::sync::mpsc::channel();
+        let waiting = std::sync::Arc::clone(&mutex);
+        let waiter = runtime.spawn(async move {
+            started_sent.send(()).unwrap();
+            *lock(&waiting, "synthetic").unwrap() + 1
+        });
+        // The waiter is on the only worker, so another task runs only if the wait gives it up.
+        // A blocked worker also stops the runtime's timers, so the test waits on a plain channel.
+        started.recv().unwrap();
+        let (ran_sent, ran) = std::sync::mpsc::channel();
+        runtime.spawn(async move { let _ = ran_sent.send(7); });
+        let other = ran.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        assert_eq!(other, Ok(7));
+        assert_eq!(runtime.block_on(waiter).unwrap(), 1);
     }
 
     #[test]

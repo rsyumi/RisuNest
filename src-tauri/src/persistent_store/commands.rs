@@ -541,7 +541,6 @@ impl RendererOperationGuard {
     }
 }
 
-#[cfg(any(target_os = "android", test))]
 fn with_snapshot_directory<T>(
     state: &PersistentStoreState,
     operation: impl FnOnce(&Path) -> StoreResult<T>,
@@ -559,7 +558,7 @@ fn with_snapshot_directory<T>(
             .snapshots_dir
             .clone()
     };
-    // Archive owns its cross-process lock; listing does not need the live database.
+    // The archive owns its cross-process lock; a snapshot list or delete does not need the live database.
     operation(&directory)
 }
 
@@ -1644,13 +1643,19 @@ pub(crate) fn pds_checkpoint(
     logged("pds_checkpoint", with_store(state, |store| store.checkpoint_or_passive(mode)))
 }
 
+#[cfg(test)]
+thread_local! {
+    static CAPTURE_ARCHIVE_BUSY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
     keep_count: Option<u32>,
 ) -> Result<SnapshotCreated, StoreError> {
-    logged("pds_snapshot_create", (|| {
+    // A capture of a large library runs for minutes, so it leaves the async worker to other commands.
+    logged("pds_snapshot_create", crate::async_worker::blocking(|| {
         let keep = super::snapshot::KeepCount::requested(keep_count)?;
         let _operation = state.admit_renderer_operation()?;
         let snapshot_operation =
@@ -1661,45 +1666,44 @@ pub(crate) fn pds_snapshot_create(
                     message: format!("persistent snapshot mutex poisoned: {error}"),
                 })?;
         let started = std::time::Instant::now();
-        let (mut archive, scratch, retention, inventory) = {
-            let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
-                message: format!("persistent store mutex poisoned: {error}"),
-            })?;
-            let store = store.as_mut().ok_or_else(|| StoreError::Validation {
-                message: "persistent store has not been opened".to_owned(),
-            })?;
-            let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
-            let inventory = store.active_readers.defer_asset_inventory();
-            let (scratch, retention) =
-                super::snapshot::capture_scratch(store, &archive, keep)?;
-            (archive, scratch, retention, inventory)
+        let (mut archive, source, inventory) = loop {
+            let directory = {
+                let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
+                    message: format!("persistent store mutex poisoned: {error}"),
+                })?;
+                let store = store.as_mut().ok_or_else(|| StoreError::Validation {
+                    message: "persistent store has not been opened".to_owned(),
+                })?;
+                match super::snapshot_archive::Archive::try_open(&store.snapshots_dir)? {
+                    Some(archive) => {
+                        let inventory = store.active_readers.defer_asset_inventory();
+                        let source = super::snapshot::begin_capture(store, &archive, keep)?;
+                        break (archive, source, inventory);
+                    }
+                    None => store.snapshots_dir.clone(),
+                }
+            };
+            // A snapshot list or delete holds the archive without the store, so wait for it here.
+            #[cfg(test)]
+            CAPTURE_ARCHIVE_BUSY.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+            drop(super::snapshot_archive::Archive::open(&directory)?);
         };
-        let result = super::snapshot::archive_scratch(
-            &mut archive,
-            scratch,
-            retention,
-            &reason,
-            started,
-        );
+        // The store is free again while the leased revision is copied and archived.
+        let result = source.copy().and_then(|(scratch, retention)| {
+            super::snapshot::archive_scratch(&mut archive, scratch, retention, &reason, started)
+        });
         drop(inventory);
         drop(archive);
         drop(snapshot_operation);
         result
-    })())
+    }))
 }
 
 #[tauri::command(async)]
 pub(crate) fn pds_snapshot_list(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<SnapshotInfo>, StoreError> {
-    #[cfg(target_os = "android")]
-    {
-        logged("pds_snapshot_list", with_snapshot_directory(&state, super::snapshot::list))
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        logged("pds_snapshot_list", with_store(state, PersistentStore::snapshot_list))
-    }
+    logged("pds_snapshot_list", with_snapshot_directory(&state, super::snapshot::list))
 }
 
 #[tauri::command(async)]
@@ -1707,9 +1711,14 @@ pub(crate) fn pds_snapshot_delete(
     state: State<'_, PersistentStoreState>,
     id: String,
 ) -> Result<(), StoreError> {
+    // Removing a snapshot's unshared pages scans the whole archive.
     logged(
         "pds_snapshot_delete",
-        with_store(state, |store| store.snapshot_delete(&id)),
+        crate::async_worker::blocking(|| {
+            with_snapshot_directory(&state, |directory| {
+                super::snapshot_archive::Archive::open(directory)?.delete(&id)
+            })
+        }),
     )
 }
 

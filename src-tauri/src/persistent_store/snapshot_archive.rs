@@ -54,17 +54,21 @@ impl Drop for Scratch {
 
 impl Archive {
     pub fn open(directory: &Path) -> StoreResult<Self> {
-        fs::create_dir_all(directory)?;
-        reject_link(directory)?;
-        let lock_path = directory.join("archive.lock");
-        reject_link_if_present(&lock_path)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
+        let lock = lock_file(directory)?;
         lock_archive(&lock)?;
+        Self::open_locked(directory, lock)
+    }
+
+    /// Opens the archive when no other holder has it, without waiting.
+    pub fn try_open(directory: &Path) -> StoreResult<Option<Self>> {
+        let lock = lock_file(directory)?;
+        if !try_lock_archive(&lock)? {
+            return Ok(None);
+        }
+        Self::open_locked(directory, lock).map(Some)
+    }
+
+    fn open_locked(directory: &Path, lock: File) -> StoreResult<Self> {
         // Earlier RisuNest recovery formats are neither migrated nor removed.
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
@@ -359,19 +363,64 @@ fn is_scratch_name(name: &str) -> bool {
         .is_some_and(|id| validate_id(id).is_ok())
 }
 
-#[cfg(not(target_os = "android"))]
+fn lock_file(directory: &Path) -> StoreResult<File> {
+    fs::create_dir_all(directory)?;
+    reject_link(directory)?;
+    let lock_path = directory.join("archive.lock");
+    reject_link_if_present(&lock_path)?;
+    Ok(OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?)
+}
+
+/// Another holder can keep the archive for minutes, so a wait for it leaves the
+/// async worker to other tasks.
 fn lock_archive(file: &File) -> std::io::Result<()> {
+    if try_lock_archive(file)? {
+        return Ok(());
+    }
+    crate::async_worker::blocking(|| wait_for_archive(file))
+}
+
+#[cfg(not(target_os = "android"))]
+fn try_lock_archive(file: &File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn wait_for_archive(file: &File) -> std::io::Result<()> {
     file.lock()
 }
 
 #[cfg(target_os = "android")]
-fn lock_archive(file: &File) -> std::io::Result<()> {
+fn try_lock_archive(file: &File) -> std::io::Result<bool> {
+    match flock(file, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn wait_for_archive(file: &File) -> std::io::Result<()> {
+    flock(file, libc::LOCK_EX)
+}
+
+#[cfg(target_os = "android")]
+fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // std::fs::File::lock is unsupported on Android. Closing the owned file
     // releases flock, including after process termination.
     loop {
         // SAFETY: file owns a live descriptor for the duration of this call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
