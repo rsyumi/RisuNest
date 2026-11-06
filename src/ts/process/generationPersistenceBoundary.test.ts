@@ -4,6 +4,8 @@ import type { Chat, Database } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import { createPersistentDataRuntime, capturePersistentRoot, capturePersistentPresets } from '../storage/persistentDataRuntime'
 import { applyGenerationResponse } from './generationResponseApplication'
+import { bindWindowedGenerationController } from './generationConversationOperation'
+import { cloneConversationMetadata } from '../storage/activeConversationSession'
 import { createMutationGatedPersistentDataStore } from '../storage/mutationGatedPersistentDataStore'
 import { createStorageMutationGate } from '../storage/storageMutationGate'
 import { prepareSummaryAwareGeneration } from './summaryAwareGenerationPreparation'
@@ -253,12 +255,13 @@ function applyCheckpointedResponse(conversation: CompleteConversation, response:
     callbacks?: Partial<GenerationResponseCallbacks>
     mode?: 'off' | 'balanced' | 'strong'
     abortSignal?: AbortSignal
+    continueGeneration?: boolean
     isOwnerCurrent?(): boolean
     flush?(): Promise<boolean>
     clock?: ReturnType<typeof virtualClock>
 } = {}) {
     return applyGenerationResponse({
-        response, abortSignal: options.abortSignal ?? new AbortController().signal, continueGeneration: false,
+        response, abortSignal: options.abortSignal ?? new AbortController().signal, continueGeneration: options.continueGeneration ?? false,
         sayingCharacterId: 'owner', ownerCharacterId: 'owner', generationId: 'generated', generationInfo: {} as any, promptInfo: {} as any,
         removeIncompleteResponse: () => false, streamingDisplayOptimizationMode: () => options.mode ?? 'off', ttsAutoSpeech: () => true,
         operation: {
@@ -460,4 +463,110 @@ it.each(['abort', 'ownership loss'] as const)('stops streamed checkpoints at %s'
     expect(response).toBeNull()
     expect(requests).toEqual([2100])
     expect(clock.pending).toBe(0)
+})
+
+it.each(['append', 'continue', 'abort'] as const)('keeps the session out of compatibility mode when saves land around the streaming state (%s)', async (ending) => {
+    const conversation = await openCompleteConversation({ capture: true })
+    const session = () => conversation.runtime.getActiveConversationSession()!
+    // A start trigger's variable leaves a metadata event pending before the response.
+    session().updateChatVariables(new Map([['mood', 'calm']]))
+    const saves: Array<{ fallback: boolean, unacknowledged: number, streaming: boolean | undefined }> = []
+    const save = async () => {
+        await conversation.runtime.flushPendingData('synthetic-save')
+        saves.push({
+            fallback: session().residencyFallbackActive,
+            unacknowledged: session().version - session().persistedVersion,
+            streaming: conversation.chat().isStreaming,
+        })
+    }
+    const abort = new AbortController()
+    let reads = 0
+    const stream = new ReadableStream({
+        async pull(controller) {
+            reads++
+            if (reads === 1) {
+                // Between the response append and the first streamed edit.
+                await save()
+                controller.enqueue({ 0: 'Partial' })
+            } else if (ending === 'abort') {
+                abort.abort()
+            } else {
+                controller.enqueue({ 0: 'Partial answer' })
+                controller.close()
+            }
+        },
+    }, { highWaterMark: 0 })
+    const response = await applyCheckpointedResponse(conversation, { type: 'streaming', result: stream }, {
+        abortSignal: abort.signal,
+        continueGeneration: ending === 'continue',
+        callbacks: { runOutputTrigger: async () => { await save(); return null } },
+    })
+    response?.release()
+    await save()
+
+    expect(response === null).toBe(ending === 'abort')
+    expect(saves.map(({ streaming }) => streaming)).toEqual(ending === 'abort' ? [true, false] : [true, false, false])
+    expect(saves.every(({ fallback, unacknowledged }) => !fallback && unacknowledged === 0)).toBe(true)
+    expect(conversation.backgroundErrors).toEqual([])
+})
+
+it('clears the streaming state of a windowed conversation when its stream is stopped', async () => {
+    const store = new IndexedDbPersistentDataStore(`windowed-stop-${crypto.randomUUID()}`, indexedDB, IDBKeyRange)
+    const database = syntheticConversationDatabase()
+    await store.open()
+    await store.replaceFromDatabase(database)
+    let current = structuredClone(database)
+    const runtime = createPersistentDataRuntime({
+        store, clock: { setTimeout: () => Symbol('owned-clock'), clearTimeout: () => {} },
+        state: {
+            captureRoot: () => capturePersistentRoot(current),
+            capturePresets: () => capturePersistentPresets(current),
+            captureSelectedCharacter: () => current.characters[0],
+            captureCharacter: id => current.characters.find(character => character.chaId === id) ?? null,
+            getSelectedCharacterId: () => current.characters[0].chaId,
+            getSelectedConversationId: () => current.characters[0].chats[0].id,
+            replaceDatabase: replacement => { current = replacement },
+            publishCharacter: character => { current.characters[0] = character },
+            publishConversation: (_owner, chat) => { current.characters[0].chats[0] = chat },
+            canUseWindowedSelectedConversation: () => true,
+        },
+        prepareDatabase: async candidate => structuredClone(candidate),
+    })
+    await runtime.initializeActiveWorkingSet(database)
+    expect(await runtime.activateCharacter('owner')).toBe(true)
+    const target = runtime.captureSelectedConversationTarget()!
+    const authority = runtime.captureSelectedConversationAuthority()!
+    const windowChat = { ...cloneConversationMetadata(current.characters[0].chats[0]), message: [] } as Chat
+    const controller = runtime.captureWindowedConversationMutationController(target, windowChat, authority.totalMessages)!
+    onTestFinished(bindWindowedGenerationController(windowChat, controller))
+    const abort = new AbortController()
+    let reads = 0
+    const applying = applyGenerationResponse({
+        response: { type: 'streaming', result: new ReadableStream({
+            pull(controller) {
+                if (++reads === 1) controller.enqueue({ 0: 'Partial' })
+                else abort.abort()
+            },
+        }, { highWaterMark: 0 }) },
+        abortSignal: abort.signal, continueGeneration: false,
+        sayingCharacterId: 'owner', ownerCharacterId: 'owner', generationId: 'generated', generationInfo: {} as any, promptInfo: {} as any,
+        removeIncompleteResponse: () => false, streamingDisplayOptimizationMode: () => 'off', ttsAutoSpeech: () => false,
+        operation: {
+            getCurrentSession: () => null, getTargetChat: () => windowChat,
+            isOwnerCurrent: () => true, publishTargetChat: () => {},
+            invalidateSession: () => {}, incrementReloadKeys: () => {},
+        },
+        callbacks: {
+            reformatContent: value => value, processOutput: async value => ({ data: value, emoChanged: false }),
+            runCurrentChatParser: value => value, runInlay: text => ({ text }), runOutputTrigger: async () => null,
+            runOutputListeners: async () => {}, speak: async () => {}, trimIncompleteResponse: value => value,
+            markResponseApplied: () => {}, onProviderFailure: message => { throw new Error(message) },
+        },
+    })
+
+    expect(await applying).toBeNull()
+    expect(current.characters[0].chats[0].isStreaming).not.toBe(true)
+    await runtime.flushPendingData('windowed-stop')
+    expect(runtime.getSelectedConversationMode()).toBe('windowed')
+    expect((await store.readConversation('owner', 'chat'))?.value.message.map(message => message.data)).toEqual(['Prompt', 'Partial'])
 })
