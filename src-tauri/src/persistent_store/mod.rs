@@ -50,6 +50,7 @@ pub(crate) mod server_sync_projection;
 mod repair;
 mod snapshot;
 mod snapshot_archive;
+mod storage_breakdown;
 pub(crate) mod sync_selection;
 
 pub(crate) use asset_object_catalog::{AssetObjectCatalog, AssetObjectCatalogPage};
