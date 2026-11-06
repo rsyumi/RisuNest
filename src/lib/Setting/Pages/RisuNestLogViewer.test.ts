@@ -22,6 +22,7 @@ const commands = vi.hoisted(() => ({
     native_log_tail: vi.fn(),
     native_log_file_path: vi.fn(),
     native_log_set_file_enabled: vi.fn(),
+    native_log_file_read: vi.fn(),
 }))
 
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({
@@ -54,6 +55,8 @@ describe('RisuNestLogViewer', () => {
         commands.native_log_tail.mockReset()
         commands.native_log_file_path.mockReset()
         commands.native_log_set_file_enabled.mockReset()
+        commands.native_log_file_read.mockReset()
+        commands.native_log_file_read.mockResolvedValue({ entries: [], older: null })
         dialogs = []
         wrappedDialogs = []
         unsubscribeAlerts = alertStore.subscribe(dialog => {
@@ -407,4 +410,113 @@ describe('RisuNestLogViewer', () => {
         expect(getDeviceSettings().nativeFileLogEnabled).toBe(true)
     })
 
+    describe('saved log', () => {
+        const newestPage = {
+            entries: [
+                { tsMs: 10_000, level: 'info', target: 'app-start', message: 'RisuNest 9.9.9' },
+                { tsMs: 11_000, level: 'warn', target: 'slow-operation', message: 'current run warning' },
+            ],
+            older: { file: 'current', before: 120 },
+        }
+        const olderPage = {
+            entries: [
+                { tsMs: 0, level: '', target: '', message: 'unsplit line' },
+                { tsMs: 5_000, level: 'error', target: 'native-command', message: 'previous run failure\nsecond line' },
+            ],
+            older: null,
+        }
+
+        function shownRows() {
+            return [...target.querySelectorAll('[data-saved-log-entry], [data-saved-log-run]')].map((row) => ({
+                run: row.hasAttribute('data-saved-log-run'),
+                text: row.textContent!.replace(/\s+/g, ' ').trim(),
+            }))
+        }
+
+        function button(selector: string) {
+            return target.querySelector<HTMLButtonElement>(selector)!
+        }
+
+        it('shows the newest page first and pages back into the previous run', async () => {
+            commands.native_log_file_read.mockImplementation(async (args?: Record<string, unknown>) => args?.before === 120 ? olderPage : newestPage)
+            await render()
+            expect(target.querySelector('[data-saved-log]')).toBeNull()
+
+            button('[data-view-saved-log]').click()
+            await settleAction()
+
+            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: null })
+            expect(button('[data-view-saved-log]').textContent).toContain(language.close)
+            expect(button('[data-view-saved-log]').getAttribute('aria-expanded')).toBe('true')
+            const rows = shownRows()
+            expect(rows.map((row) => row.run)).toEqual([false, true])
+            expect(rows[0].text).toContain('warn slow-operation current run warning')
+            expect(rows[1].text).toContain(`${strings.appStarted} RisuNest 9.9.9`)
+            expect(button('[data-saved-log-newer]').disabled).toBe(true)
+
+            button('[data-saved-log-older]').click()
+            await settleAction()
+
+            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: 120 })
+            expect(shownRows().map((row) => row.text)).toEqual([
+                expect.stringContaining('error native-command previous run failure second line'),
+                'unsplit line',
+            ])
+            expect(button('[data-saved-log-older]').disabled).toBe(true)
+
+            button('[data-saved-log-newer]').click()
+            await settleAction()
+            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: null })
+            expect(shownRows()[0].text).toContain('current run warning')
+
+            button('[data-view-saved-log]').click()
+            await tick()
+            expect(target.querySelector('[data-saved-log]')).toBeNull()
+            expect(button('[data-view-saved-log]').textContent).toContain(strings.viewLog)
+        })
+
+        it('copies the page on screen, or the newest page while the viewer is closed', async () => {
+            commands.native_log_file_read.mockImplementation(async (args?: Record<string, unknown>) => args?.before === 120 ? olderPage : newestPage)
+            await render()
+
+            button('[data-copy-saved-log]').click()
+            await settleAction()
+            expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+                header + '[1970-01-01T00:00:11.000Z] [warn] [slow-operation] current run warning\n[1970-01-01T00:00:10.000Z] [info] [app-start] RisuNest 9.9.9',
+            )
+
+            button('[data-view-saved-log]').click()
+            await settleAction()
+            button('[data-saved-log-older]').click()
+            await settleAction()
+            const reads = commands.native_log_file_read.mock.calls.length
+            button('[data-copy-saved-log]').click()
+            await settleAction()
+
+            expect(commands.native_log_file_read).toHaveBeenCalledTimes(reads)
+            expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+                header + '[1970-01-01T00:00:05.000Z] [error] [native-command] previous run failure\nsecond line\nunsplit line',
+            )
+        })
+
+        it('shows the empty state and localized failure copy without raw details', async () => {
+            await render()
+            button('[data-view-saved-log]').click()
+            await settleAction()
+            expect(target.querySelector('[data-saved-log]')!.textContent).toContain(strings.savedLogEmpty)
+            button('[data-copy-saved-log]').click()
+            await settleAction()
+            expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(strings.savedLogEmpty)
+
+            button('[data-view-saved-log]').click()
+            await tick()
+            commands.native_log_file_read.mockRejectedValueOnce(new Error('saved log command detail'))
+            button('[data-view-saved-log]').click()
+            await settleAction()
+
+            expect(target.querySelector('[data-saved-log]')).toBeNull()
+            expect(target.textContent).toContain(strings.actionFailed)
+            expect(target.textContent).not.toContain('saved log command detail')
+        })
+    })
 })
