@@ -202,7 +202,7 @@ fn snapshot_restore_stages_large_message_manifests_and_archive_metadata() {
     use risunest_sync_wire::{descriptor::RecordDescriptor,unit::{UnitKey,UnitValue}};
     let (_directory,mut store,database)=open_fixture();
     let mut archive=Archive::open(&store.snapshots_dir).unwrap();
-    let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive).unwrap();
+    let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive,super::super::snapshot::KeepCount::MAX).unwrap();
     let source=Connection::open(&scratch.path).unwrap();
     source.execute_batch("BEGIN").unwrap();
     let (mut units,mut bodies,large)=super::super::external_capture::large_metadata_fixture();
@@ -252,7 +252,7 @@ fn snapshot_restore_rejects_damaged_large_units_and_oversized_reference_pages() 
         let revision=store.revision().unwrap();
         let clock=serde_json::to_value(store.lww_clock_state().unwrap()).unwrap();
         let mut archive=Archive::open(&store.snapshots_dir).unwrap();
-        let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive).unwrap();
+        let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive,super::super::snapshot::KeepCount::MAX).unwrap();
         let source=Connection::open(&scratch.path).unwrap();
         let key=UnitKey::new(&["record","plugins","synthetic-snapshot-plugin"]).unwrap();
         let encoded:String=source.query_row("SELECT value FROM snapshot_original_units WHERE key=?1",[key.as_str()],|row|row.get(0)).unwrap();
@@ -1138,7 +1138,7 @@ fn byte_rotation_keeps_newest_and_durable_stage_owns_rotated_source() {
     store.snapshot_create("middle").unwrap();
     let latest=store.snapshot_create("latest").unwrap();
     let mut archive=Archive::open(&store.snapshots_dir).unwrap();
-    archive.rotate(0,&latest.id).unwrap();
+    archive.rotate(8,0,&latest.id).unwrap();
     let ids:Vec<_>=archive.list().unwrap().into_iter().map(|s|s.id).collect();
     assert_eq!(ids,vec![latest.id]);
     let authority=store.lww_binding_authority().unwrap();

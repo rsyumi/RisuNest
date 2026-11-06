@@ -568,7 +568,7 @@ pub(super) fn put_unit(
     version: &str,
     publish: Option<DecimalU64>,
 ) -> StoreResult<()> {
-    let superseded = superseded_plugin_objects(db, key, value)?;
+    let superseded = superseded_objects(db, key, value)?;
     if !superseded.is_empty() {
         let since = super::commands::current_time_ms()?
             .saturating_sub(super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS - super::SUPERSEDED_OBJECT_GRACE_MS);
@@ -597,27 +597,24 @@ pub(super) fn put_unit(
     }
     Ok(())
 }
-/// Objects the stored value of a plugin key names and `value` does not. Plugin
-/// values are rewritten in whole, often, so these wait a short grace instead
-/// of the one for objects whose last reference is unknown.
-fn superseded_plugin_objects(db: &Connection, key: &UnitKey, value: &UnitValue) -> StoreResult<Vec<String>> {
-    if !matches!(key.components()[0].as_str(), "plugin" | "plugin-local") {
+/// Objects the stored value of a plugin or messages key names and `value` does
+/// not. Plugin values are rewritten in whole, and a conversation's last page,
+/// manifest and descriptor on every message, so these wait a short grace
+/// instead of the one for objects whose last reference is unknown. Nothing is
+/// marked when the stored value or a tree node of either value cannot be read,
+/// since a sweep finds those objects later.
+fn superseded_objects(db: &Connection, key: &UnitKey, value: &UnitValue) -> StoreResult<Vec<String>> {
+    if !matches!(key.components()[0].as_str(), "plugin" | "plugin-local" | "messages") {
         return Ok(Vec::new());
     }
-    let Some((_, UnitValue::Object { descriptor_hash, descriptor })) = read_unit(db, key)? else {
+    let Ok(Some((_, previous @ UnitValue::Object { .. }))) = read_unit(db, key) else {
         return Ok(Vec::new());
     };
-    let mut hashes: BTreeSet<String> = [descriptor_hash, descriptor.object_hash].into_iter()
-        .chain(descriptor.dependencies)
-        .collect();
-    if let UnitValue::Object { descriptor_hash, descriptor } = value {
-        hashes.remove(descriptor_hash);
-        hashes.remove(&descriptor.object_hash);
-        for hash in &descriptor.dependencies {
-            hashes.remove(hash);
-        }
-    }
-    Ok(hashes.into_iter().collect())
+    let named = |value| super::message_pages::named_objects(db, value);
+    let (Some(previous), Some(current)) = (named(&previous)?, named(value)?) else {
+        return Ok(Vec::new());
+    };
+    Ok(previous.difference(&current).cloned().collect())
 }
 fn parent_keys(key: &UnitKey) -> StoreResult<Vec<UnitKey>> {
     let c = key.components();
@@ -1081,6 +1078,13 @@ impl PersistentStore {
 
     pub(crate) fn lww_verified_object_present(&self, hash: &str) -> StoreResult<bool> {
         super::message_pages::retained_object_present(&self.connection, hash)
+    }
+    /// Like `lww_verified_object_present`, but a marked body that is still here
+    /// is kept instead of reported missing. A reused control catalog lists the
+    /// pages a later value replaced, which that write marked, and fetching them
+    /// again would store the same bytes.
+    pub(crate) fn lww_keep_verified_object(&self, hash: &str) -> StoreResult<bool> {
+        super::message_pages::keep_verified_object(&self.connection, hash)
     }
     /// The bodies a new value of `key` most likely shares bytes with: the value
     /// this device holds and the one last published under `binding`.

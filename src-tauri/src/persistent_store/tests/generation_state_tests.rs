@@ -470,7 +470,7 @@ fn accounting_preserves_snapshot_retention_basis() {
     let expected = pages.saturating_sub(retired);
     let captured = {
         let archive = super::super::snapshot_archive::Archive::open(&store.snapshots_dir).unwrap();
-        snapshot::capture_scratch(&mut store, &archive).unwrap().1
+        snapshot::capture_scratch(&mut store, &archive, snapshot::KeepCount::MAX).unwrap().1.basis_bytes
     };
     assert_eq!(captured, expected);
     assert_eq!(snapshot::byte_budget(captured), expected.saturating_mul(4).max(512 * 1024 * 1024));

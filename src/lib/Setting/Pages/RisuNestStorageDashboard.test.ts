@@ -46,6 +46,7 @@ vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSuppor
 import RisuNestStorageDashboard from './RisuNestStorageDashboard.svelte'
 import { assetResidencyStatus } from 'src/ts/storage/sync/serverAssetResidency.testSupport'
 import { languageEnglish } from 'src/lang/en'
+import { getDeviceSettings, updateDeviceSettings } from 'src/ts/storage/deviceSettings'
 
 const syncText = languageEnglish.risuNest.serverSync
 const stats = {
@@ -86,12 +87,36 @@ describe('RisuNestStorageDashboard', () => {
     })
 
     it('localizes snapshot reasons without exposing unknown tokens', async () => {
-        maintenance.listNativePersistentSnapshots.mockResolvedValueOnce(['manual', 'periodic', 'data-health-repair', 'synthetic-unknown'].map((reason, index) => ({ id: `snapshot-${index}`, reason, bytes: 1, reclaimableBytes: 0, modifiedAt: 1 })))
+        maintenance.listNativePersistentSnapshots.mockResolvedValueOnce(['manual', 'periodic', 'data-health-repair', 'synthetic-unknown'].map((reason, index) => ({ id: `snapshot-${index}`, reason, bytes: 1, modifiedAt: 1 })))
         const target = setup()
         await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list="snapshots"] [data-storage-backup-row]')).toHaveLength(4))
         expect(target.textContent).toContain(languageEnglish.risuNest.storage.snapshotReasons.dataHealthRepair)
         expect(target.textContent).not.toContain('synthetic-unknown')
         expect(target.textContent).not.toContain('data-health-repair')
+    })
+
+    it('stores the automatic snapshot switch and a keep count from one to eight', async () => {
+        const strings = languageEnglish.risuNest.storage
+        const target = setup()
+        const toggle = target.querySelector<HTMLInputElement>('[data-storage-setting="automatic-snapshots"] input[type="checkbox"]')!
+        const count = target.querySelector<HTMLInputElement>('[data-storage-setting="snapshot-keep-count"] input')!
+        expect(target.textContent).toContain(strings.snapshotKeepCountHelp.replace('{0}', '8'))
+        try {
+            expect(toggle.checked).toBe(true)
+            toggle.click()
+            await tick()
+            expect(getDeviceSettings().automaticSnapshotsEnabled).toBe(false)
+            for (const [typed, stored] of [['12', 8], ['0', 1], ['3', 3]] as const) {
+                count.value = typed
+                count.dispatchEvent(new Event('input', { bubbles: true }))
+                count.dispatchEvent(new Event('change', { bubbles: true }))
+                await tick()
+                expect(getDeviceSettings().snapshotKeepCount).toBe(stored)
+                expect(count.value).toBe(String(stored))
+            }
+        } finally {
+            updateDeviceSettings({ automaticSnapshotsEnabled: true, snapshotKeepCount: 8 })
+        }
     })
 
     it('describes a blocked temporary file cleanup without exposing the reason token', async () => {
@@ -104,19 +129,21 @@ describe('RisuNestStorageDashboard', () => {
 
     function setup(
         statsPromise: Promise<typeof stats> = Promise.resolve(stats),
+        snapshotsPromise: Promise<unknown[]> = Promise.resolve([
+            {
+                id: 'snapshot.db',
+                reason: 'manual',
+                bytes: 1024,
+                modifiedAt: 1,
+            },
+        ]),
     ): HTMLElement {
         maintenance.getNativePersistentStorageStats.mockImplementation(
             () => statsPromise,
         )
-        maintenance.listNativePersistentSnapshots.mockResolvedValue([
-            {
-                id: 'snapshot.db',
-                reason: 'manual',
-                reclaimableBytes: 0,
-                bytes: 1024,
-                modifiedAt: 1,
-            },
-        ])
+        maintenance.listNativePersistentSnapshots.mockImplementation(
+            () => snapshotsPromise,
+        )
         server.getServerSyncCacheUsage.mockResolvedValue({
             totalBytes: 1024 + 2048,
             cacheBytes: 1024,
@@ -255,9 +282,20 @@ describe('RisuNestStorageDashboard', () => {
         expect(target.querySelector('[data-storage-summary-placeholder]')).toBeNull()
     })
 
+    it('shows the totals while the snapshot list is still loading', async () => {
+        let resolveSnapshots: ((value: unknown[]) => void) | undefined
+        const target = setup(Promise.resolve(stats), new Promise((resolve) => { resolveSnapshots = resolve }))
+
+        await vi.waitFor(() => expect(target.querySelector('[data-storage-summary]')).not.toBeNull())
+        expect(target.querySelector('[data-storage-backup-list="snapshots"]')).toBeNull()
+
+        resolveSnapshots?.([{ id: 'snapshot.db', reason: 'manual', bytes: 1024, modifiedAt: 1 }])
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list="snapshots"] [data-storage-backup-row]')).toHaveLength(1))
+    })
+
     it('summarizes each backup list with its count and size and keeps delete beside the row text', async () => {
         const target = setup()
-        await vi.waitFor(() => expect(target.textContent).toContain('Snapshots'))
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list] > summary')).toHaveLength(3))
 
         const summaries = [...target.querySelectorAll<HTMLElement>('[data-storage-backup-list] > summary')]
         expect(summaries.map((summary) => summary.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
@@ -488,7 +526,7 @@ describe('RisuNestStorageDashboard', () => {
         const target = setup()
         const selected: string[] = []
         maintenance.restoreNativePersistentSnapshot.mockImplementation(async (actions) => {
-            const chosen = await actions.choose([{ id: 'snapshot.db', reason: 'manual', reclaimableBytes: 0, bytes: 1024, modifiedAt: 1 }])
+            const chosen = await actions.choose([{ id: 'snapshot.db', reason: 'manual', bytes: 1024, modifiedAt: 1 }])
             expect(chosen).toBe('snapshot.db')
             expect(actions).not.toHaveProperty('confirm')
             expect(actions).not.toHaveProperty('restart')

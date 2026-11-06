@@ -1588,6 +1588,44 @@ pub(super) fn mark_unreferenced<'a>(db: &Connection, hashes: impl IntoIterator<I
     Ok(())
 }
 
+/// The objects `value` names in `db`: its descriptor, its object, its
+/// dependencies with the nodes and leaves of its dependency tree, and the nodes
+/// of its relation tree, the same set a sweep roots for it. `None` when a tree
+/// node is missing or unreadable here, since what it names is then unknown.
+pub(super) fn named_objects(db: &Connection, value: &UnitValue) -> StoreResult<Option<std::collections::BTreeSet<String>>> {
+    use risunest_sync_wire::descriptor::ReferencePage;
+    use std::collections::BTreeSet;
+    let mut named = BTreeSet::new();
+    let UnitValue::Object { descriptor_hash, descriptor } = value else {
+        return Ok(Some(named));
+    };
+    named.insert(descriptor_hash.clone());
+    named.insert(descriptor.object_hash.clone());
+    named.extend(descriptor.dependencies.iter().cloned());
+    let mut visited = BTreeSet::new();
+    for (root, relations) in [(&descriptor.dependency_root, false), (&descriptor.relation_root, true)] {
+        let mut pending: Vec<String> = root.iter().cloned().collect();
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            let Ok(Some(body)) = object_body(db, &node) else {
+                return Ok(None);
+            };
+            let Ok(page) = risunest_sync_wire::canonical::decode::<ReferencePage>(&body, risunest_sync_wire::MAX_METADATA_BYTES) else {
+                return Ok(None);
+            };
+            named.insert(node);
+            match page {
+                ReferencePage::Branches { children } => pending.extend(children),
+                ReferencePage::Objects { hashes } if !relations => named.extend(hashes),
+                _ => {}
+            }
+        }
+    }
+    Ok(Some(named))
+}
+
 /// A marked object may be collected soon, so callers that would otherwise skip
 /// fetching it treat it as absent and put it again, which clears the mark.
 pub(super) fn retained_object_present(db: &Connection, hash: &str) -> StoreResult<bool> {
@@ -1597,6 +1635,14 @@ pub(super) fn retained_object_present(db: &Connection, hash: &str) -> StoreResul
             [hash],
             |row| row.get::<_, bool>(0),
         )?)
+}
+
+/// Whether `db` holds a verified body for `hash`, clearing a mark on it first
+/// so that a sweep keeps it from now on, as storing it again would.
+pub(super) fn keep_verified_object(db: &Connection, hash: &str) -> StoreResult<bool> {
+    risunest_sync_wire::validate_hash(hash).map_err(codec_error)?;
+    db.execute("DELETE FROM message_page_object_marks WHERE hash=?1", [hash])?;
+    verified_object_present(db, hash)
 }
 
 fn sql_u64(value: i64, index: usize) -> rusqlite::Result<u64> {

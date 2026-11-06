@@ -2,7 +2,7 @@ import { get } from 'svelte/store'
 import { DBState, selectedCharID } from './stores.svelte'
 import { alertError } from './alert'
 import { backgroundErrorMessage } from './storage/backgroundErrorMessage'
-import { mutatePersistentCharacterDetail } from './storage/persistentDataRuntime.svelte'
+import { mutateCharacterDetailFields } from './storage/persistentDataRuntime.svelte'
 import {
     captureChatBindingTarget,
     conversationMutationBlockedByGeneration,
@@ -39,7 +39,7 @@ export function setModuleScope(scope: ModuleScope, moduleId: string, enabled: bo
         if (!owner) return Promise.resolve(false)
         return serialize(async () => {
             try {
-                const saved = await mutatePersistentCharacterDetail(owner.chaId, 'toggle-character-module', ({ character }) => {
+                const saved = await mutateCharacterDetailFields(owner.chaId, 'toggle-character-module', ({ character }) => {
                     character.modules = withModule(character.modules, moduleId, enabled)
                 })
                 // A character outside the persistent store keeps the in-memory write.

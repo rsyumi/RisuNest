@@ -34,7 +34,7 @@ vi.mock('src/ts/chatBindings.svelte', async () => {
         },
     }
 })
-vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({ mutatePersistentCharacterDetail: async () => false }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({ mutateCharacterDetailFields: async () => false }))
 vi.mock('src/ts/util', () => ({
     parseToggleSyntax: () => [{ type: syntax.type, key: 'example', value: 'Example toggle', options: ['A', 'B'] }],
 }))

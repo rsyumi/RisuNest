@@ -2597,6 +2597,12 @@ export const languageKorean = {
             counts: '캐릭터 {0}개 · 대화 {1}개 · 메시지 {2}개',
             subMetrics:
                 '채팅 첨부 {0} (이미지·미디어에 포함) · 플러그인 데이터 {1}',
+            automaticSnapshots: '자동 스냅샷',
+            automaticSnapshotsHelp:
+                '마지막 스냅샷을 만든 지 24시간이 지나면 새 스냅샷을 만듭니다.',
+            snapshotKeepCount: '스냅샷 보관 개수',
+            snapshotKeepCountHelp:
+                '스냅샷을 만들 때 이 개수를 넘으면 오래된 자동 스냅샷부터 삭제하며, 최대 {0}개까지 보관할 수 있습니다.',
             createSnapshotTitle: '스냅샷 만들기',
             createSnapshotHelp:
                 '지금 상태를 스냅샷으로 저장합니다.',

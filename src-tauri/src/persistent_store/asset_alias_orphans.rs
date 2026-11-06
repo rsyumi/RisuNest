@@ -132,17 +132,23 @@ impl PersistentStore {
         &mut self,
         scope: &OrphanAliasScope<'_>,
     ) -> StoreResult<Vec<UnreferencedAlias>> {
-        let Some(search) = self.search_unreferenced_asset_aliases(scope)? else {
+        let Some(mut search) = self.search_unreferenced_asset_aliases(scope)? else {
             return Ok(Vec::new());
         };
         if search.unreferenced.is_empty() {
             return Ok(Vec::new());
         }
-        let roots = self.collect_asset_gc_roots_without_unreferenced_aliases(&search, false)?;
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
         let residency = crate::server_sync::residency::Residency::open(&self.repository_root)
             .map_err(|error| std::io::Error::other(error.code))?;
-        let marks = mark_asset_roots_with_remote(&cas, roots.into_iter().map(|(_, roots)| roots), |hash| residency.gc_size(hash))?;
+        let mark = |search: &OrphanAliasSearch| -> StoreResult<AssetGcMarks> {
+            let roots = self.collect_asset_gc_roots_without_unreferenced_aliases(search, false)?;
+            Ok(mark_asset_roots_with_remote(&cas, roots.into_iter().map(|(_, roots)| roots), |hash| residency.gc_size(hash))?)
+        };
+        let mut marks = mark(&search)?;
+        if self.keep_aliases_archives_name(&mut search, &marks, scope)? {
+            marks = mark(&search)?;
+        }
         let (orphans, _) = search.orphans(&marks, scope);
         if orphans.is_empty() {
             return Ok(Vec::new());
@@ -173,6 +179,72 @@ impl PersistentStore {
             },
         )?;
         Ok(orphans)
+    }
+
+    /// Takes out of `search` the aliases the unused-file cleanup would delete now that an archived
+    /// character's text names, and returns whether it took out any; the roots then have to be
+    /// marked again. Archives written before their records listed the keys inside longer text,
+    /// such as an `<img src>` in a chat, name those only in their payload.
+    pub(crate) fn keep_aliases_archives_name(
+        &self,
+        search: &mut OrphanAliasSearch,
+        marks: &AssetGcMarks,
+        scope: &OrphanAliasScope<'_>,
+    ) -> StoreResult<bool> {
+        // A permanent delete runs after every delete with the store held, so it reads no payload.
+        if !matches!(scope, OrphanAliasScope::Cleanup { .. }) {
+            return Ok(false);
+        }
+        // An alias still within the grace is checked once the grace has passed.
+        let candidates = search.orphans(marks, scope).0.into_iter().map(|alias| alias.key).collect::<BTreeSet<_>>();
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let mut matcher = AssetKeyMatcher::new(candidates.iter().cloned());
+        let kept = if self.observe_archive_payloads(&mut matcher)? {
+            let unreferenced = matcher.unreferenced().collect::<BTreeSet<_>>();
+            candidates.difference(&unreferenced).cloned().collect()
+        } else {
+            // A payload this device cannot read could name any of them.
+            candidates
+        };
+        if kept.is_empty() {
+            return Ok(false);
+        }
+        search.unreferenced.retain(|alias| !kept.contains(&alias.key));
+        Ok(true)
+    }
+
+    /// Feeds the payload of every archived character, the one a restore reads, to `matcher`.
+    /// Returns false when one is not held on this device or cannot be read.
+    fn observe_archive_payloads(&self, matcher: &mut AssetKeyMatcher) -> StoreResult<bool> {
+        let generation = super::active_generation(&self.connection)?;
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        let mut statement = self.connection.prepare(
+            "SELECT archived_object FROM characters WHERE generation = ?1 AND archived_object IS NOT NULL",
+        )?;
+        let mut rows = statement.query([generation])?;
+        while let Some(row) = rows.next()? {
+            if matcher.is_complete() {
+                break;
+            }
+            let ValueRef::Text(record) = row.get_ref(0)? else { return Ok(false) };
+            let Ok(archived) = serde_json::from_slice::<super::archive::ArchivedObject>(record) else {
+                return Ok(false);
+            };
+            let Some(file) = cas.open_object(&archived.object_hash)? else { return Ok(false) };
+            let mut output = TextWriter { stream: matcher.stream(false), held: Vec::new() };
+            let read = super::archive::read_payload_text(file, |bytes| {
+                io::Write::write_all(&mut output, bytes)?;
+                Ok(!output.stream.matcher.is_complete())
+            });
+            // A read that stopped once every key was found can end inside a character.
+            if read.is_err() || !output.held.is_empty() && !output.stream.matcher.is_complete() {
+                return Ok(false);
+            }
+            output.stream.finish();
+        }
+        Ok(true)
     }
 
     /// Marks every key `matcher` finds in the active generation, its owner manifests, the stored
@@ -763,6 +835,17 @@ fn collect_owned_keys(text: &str, keys: &mut BTreeSet<String>) {
             keys.extend(owned_key(&format!("{OWNED_ASSET_KEY_PREFIX}{}", &body[..end])));
         }
         rest = &body[end..];
+    }
+}
+
+/// Adds the owned keys every string in `value` names, as `collect_owned_keys` finds them.
+pub(super) fn collect_value_owned_keys(value: &serde_json::Value, keys: &mut BTreeSet<String>) {
+    match value {
+        // Most strings name no key, and `owned_key` copies the whole string.
+        serde_json::Value::String(text) if text.contains(ANCHOR) => collect_owned_keys(text, keys),
+        serde_json::Value::Array(values) => values.iter().for_each(|value| collect_value_owned_keys(value, keys)),
+        serde_json::Value::Object(values) => values.values().for_each(|value| collect_value_owned_keys(value, keys)),
+        _ => {}
     }
 }
 

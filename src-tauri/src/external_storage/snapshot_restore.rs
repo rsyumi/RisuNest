@@ -2055,7 +2055,7 @@ pub(crate) async fn admit_data_catalogs(
         }
         if let Some(known)=store.external_lww_verified_data_catalog(target,catalog).map_err(corrupt)? {
             let mut complete=true;
-            for hash in &known {if !store.lww_verified_object_present(hash).map_err(corrupt)? {complete=false;break;}}
+            for hash in &known {if !store.lww_keep_verified_object(hash).map_err(corrupt)? {complete=false;break;}}
             if complete {hashes.extend(known);continue;}
         }
         let remote=RemoteObject::from_stored(catalog,repository)?;

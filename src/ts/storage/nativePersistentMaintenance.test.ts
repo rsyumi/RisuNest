@@ -43,6 +43,7 @@ import {
     restoreNativePersistentSnapshot,
     schedulePeriodicNativeSnapshot,
 } from './nativePersistentMaintenance'
+import { updateDeviceSettings } from './deviceSettings'
 import { get } from 'svelte/store'
 import { cancelActiveNativeFileOperation, dismissNativeFileOperationOutcome, nativeFileOperation, nativeFileOperationOutcome, runSharedNativeFileOperation } from './nativeFileJobManager'
 
@@ -55,6 +56,7 @@ describe('native persistent maintenance', () => {
             end: vi.fn(async () => {}),
         }
         mocks.os = 'android'
+        updateDeviceSettings({ snapshotKeepCount: 3 })
         try {
             await previewNativeDataHealthRepair(['repair'], 123)
             await applyNativeDataHealthRepair(['repair'], true, 7, 123)
@@ -63,11 +65,12 @@ describe('native persistent maintenance', () => {
         } finally {
             mocks.os = 'windows'
             delete window.RisuBackgroundTasks
+            updateDeviceSettings({ snapshotKeepCount: 8 })
         }
         expect(held).toEqual(Array(3).fill('maintenance'))
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_data_health_repair_preview', { selection: ['repair'], expectedScannedAt: 123 }],
-            ['pds_data_health_repair_apply', { selection: ['repair'], snapshot: true, expectedRevision: 7, expectedScannedAt: 123 }],
+            ['pds_data_health_repair_apply', { selection: ['repair'], snapshot: true, keepCount: 3, expectedRevision: 7, expectedScannedAt: 123 }],
             ['pds_data_health_undo', { journalId: 'journal', expectedRevision: 8 }],
             ['pds_data_health_complete_intent', { finding: 2, expectedRevision: 9, expectedScannedAt: 123 }],
         ])
@@ -110,7 +113,7 @@ describe('native persistent maintenance', () => {
         expect(mocks.snapshotRestore).toHaveBeenCalledOnce()
         expect(mocks.snapshotRestore.mock.calls[0].slice(0, 2)).toEqual([mocks.runtime, {snapshotId:'ab18b8a5-f45c-46ba-bbf9-74b2cae87717'}])
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_snapshot_create', { reason: 'periodic' }],
+            ['pds_snapshot_create', { reason: 'periodic', keepCount: 8 }],
             ['pds_snapshot_list'],
             ['native_snapshot_restore_bodies_start',{stagingId:'stage',activationRevision:'8',bindingAuthority:'0'}],
             ['native_snapshot_restore_bodies_status',{receipt:bodyReceipt}],
@@ -127,6 +130,7 @@ describe('native persistent maintenance', () => {
             end: vi.fn(async () => {}),
         }
         mocks.os = 'android'
+        updateDeviceSettings({ snapshotKeepCount: 3 })
         try {
             await getNativePersistentStorageStats()
             await deleteNativePersistentSnapshot('ab18b8a5-f45c-46ba-bbf9-74b2cae87717')
@@ -146,6 +150,7 @@ describe('native persistent maintenance', () => {
         } finally {
             mocks.os = 'windows'
             delete window.RisuBackgroundTasks
+            updateDeviceSettings({ snapshotKeepCount: 8 })
         }
 
         expect(mocks.invoke.mock.calls).toEqual([
@@ -153,9 +158,9 @@ describe('native persistent maintenance', () => {
             ['pds_snapshot_delete', { id: 'ab18b8a5-f45c-46ba-bbf9-74b2cae87717' }],
             ['pds_asset_gc_preview'],
             ['pds_snapshot_list'],
-            ['pds_snapshot_create', { reason: 'periodic' }],
+            ['pds_snapshot_create', { reason: 'periodic', keepCount: 3 }],
             ['pds_asset_gc_execute'],
-            ['pds_snapshot_create', { reason: 'manual' }],
+            ['pds_snapshot_create', { reason: 'manual', keepCount: 3 }],
             ['pds_data_health_scan'],
             ['pds_data_health_deep_scan', { resume: true }],
         ])
@@ -182,7 +187,7 @@ describe('native persistent maintenance', () => {
             expect(result).toEqual(due ? created : null)
             expect(mocks.invoke.mock.calls).toEqual(
                 due
-                    ? [['pds_snapshot_list'], ['pds_snapshot_create', { reason: 'periodic' }]]
+                    ? [['pds_snapshot_list'], ['pds_snapshot_create', { reason: 'periodic', keepCount: 8 }]]
                     : [['pds_snapshot_list']],
             )
         },
@@ -205,6 +210,7 @@ describe('native persistent maintenance', () => {
         await expect(createPeriodicNativeSnapshotIfDue(now)).resolves.toEqual(created)
         expect(mocks.invoke).toHaveBeenLastCalledWith('pds_snapshot_create', {
             reason: 'periodic',
+            keepCount: 8,
         })
     })
 
@@ -231,6 +237,35 @@ describe('native persistent maintenance', () => {
             ['pds_snapshot_list'],
             ['pds_message_object_sweep'],
         ]))
+    })
+
+    it('creates no periodic snapshot while automatic snapshots are off, even with none stored or once turned off during the check, and still sweeps', async () => {
+        vi.useFakeTimers()
+        vi.stubGlobal('requestIdleCallback', undefined)
+        mocks.invoke.mockResolvedValue([])
+        updateDeviceSettings({ automaticSnapshotsEnabled: false })
+        try {
+            await expect(createPeriodicNativeSnapshotIfDue()).resolves.toBeNull()
+            schedulePeriodicNativeSnapshot()
+            await vi.advanceTimersByTimeAsync(0)
+        } finally {
+            updateDeviceSettings({ automaticSnapshotsEnabled: true })
+        }
+
+        expect(mocks.invoke.mock.calls).toEqual([['pds_message_object_sweep']])
+
+        mocks.invoke.mockReset()
+        let answer!: (snapshots: unknown[]) => void
+        mocks.invoke.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve }))
+        const due = createPeriodicNativeSnapshotIfDue()
+        updateDeviceSettings({ automaticSnapshotsEnabled: false })
+        try {
+            answer([])
+            await expect(due).resolves.toBeNull()
+        } finally {
+            updateDeviceSettings({ automaticSnapshotsEnabled: true })
+        }
+        expect(mocks.invoke.mock.calls).toEqual([['pds_snapshot_list']])
     })
 
     it('sweeps stored message objects even when the snapshot check fails', async () => {
