@@ -419,11 +419,11 @@ it.each([
     await finishedEdit('module-scope')
     await finishedEdit('module-scope')
     expect((await savedChat())?.modules).toEqual(['synthetic-module-a', 'synthetic-module-b'])
-    // Opening the menu and the chat scope read no messages; the character scope reads what the memory switch reads.
+    // Opening the menu and every scope read no messages.
     expect(current.fullReads).toEqual(fullReadsBeforeModules)
     ;(await scopeButton('synthetic-module-a', 'character')).click()
     await finishedEdit('module-scope')
-    const fullReadsAfterCharacterScope = [...current.fullReads]
+    expect(current.fullReads).toEqual(fullReadsBeforeModules)
     ;(await scopeButton('synthetic-module-b', 'global')).click()
     await finishedEdit('module-scope')
     await current.svelte.tick()
@@ -434,7 +434,7 @@ it.each([
     expect((await savedChat())?.modules).toEqual(['synthetic-module-b'])
     expect((await current.raw.readCharacter(interactionCharacterId))?.value.modules).toEqual(['synthetic-module-a'])
     expect(db.enabledModules).toEqual(['synthetic-module-b'])
-    expect(current.fullReads).toEqual(fullReadsAfterCharacterScope)
+    expect(current.fullReads).toEqual(fullReadsBeforeModules)
     target.querySelector<HTMLButtonElement>(`[role="dialog"] button[aria-label="${language.close}"]`)!.click()
     await vi.waitFor(() => expect(target.querySelector('[role="dialog"]')).toBeNull())
 
