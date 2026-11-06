@@ -2,7 +2,7 @@ import { expect, it, vi } from 'vitest'
 import { captureRoot, deferred, makeDatabase, SaveCoordinator } from './saveCoordinator.testSupport'
 import { createStoreStub } from './persistentDataStore.testSupport'
 import type { CharacterDetail, WorkingSetCommit } from './persistentDataStore'
-import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
+import { WindowedConversationRequiresCompatibilityError, type WindowedConversationPersistenceAuthority } from './saveCoordinator'
 import type { character } from './database.svelte'
 
 // The stored character record. Any conversation read is an unexpected call on the stub.
@@ -160,6 +160,29 @@ it('keeps a field edited in memory while the commit waits, and the next save sto
     expect(stored()?.name).toBe('Later edit')
     expect(selected.name).toBe('Later edit')
     expect(coordinator.hasPendingPersistenceWork).toBe(false)
+})
+
+it('keeps a field of the windowed selection edited while the commit waits as unsaved work', async () => {
+    const { coordinator, commit, holdNextCommit, selected, stored } = makeWindowedSelection()
+    const hold = holdNextCommit()
+    const mutation = coordinator.mutateCharacterDetailFields('char-a', 'rename', ({ character }) => {
+        character.name = 'Earlier explicit edit'
+    }, () => selected)
+    await hold.entered
+    selected.name = 'Later edit'
+    coordinator.markPersistentDataDirty(1)
+    hold.release()
+    expect(await mutation).toBe(true)
+    expect(selected.name).toBe('Later edit')
+    expect(stored()?.name).toBe('Earlier explicit edit')
+    expect(coordinator.hasPendingPersistenceWork).toBe(true)
+
+    // As for any direct edit of a windowed selection, the save takes the complete conversation,
+    // which this fixture does not provide. Had the later edit been overwritten, nothing would be left to save.
+    await expect(coordinator.flushPendingData('store-later-edit'))
+        .rejects.toThrow(WindowedConversationRequiresCompatibilityError)
+    expect(commit).toHaveBeenCalledOnce()
+    expect(selected.name).toBe('Later edit')
 })
 
 it('shows the committed field while keeping an edit of another field made during the commit', async () => {
