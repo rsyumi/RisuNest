@@ -488,7 +488,7 @@ export interface PersistentDataRuntime {
         characterId: string,
         reason: string,
         mutate: import('./saveCoordinator').CharacterDetailFieldsMutation,
-        publish: (committedPatch: import('./characterDetailPatch').CharacterDetailPatch) => void,
+        readResident: import('./saveCoordinator').ResidentCharacterRecord,
     ): Promise<boolean>
     mutatePersistentCharacterDetail(
         characterId: string,
@@ -1614,8 +1614,8 @@ export function createPersistentDataRuntime(
             ),
         expirePersistentTrash: (now) => coordinator.expirePersistentTrash(now),
         // A windowed selection is not promoted: the mutation reads no conversation.
-        mutateCharacterDetailFields: (characterId, reason, mutate, publish) =>
-            coordinator.mutateCharacterDetailFields(characterId, reason, mutate, publish),
+        mutateCharacterDetailFields: (characterId, reason, mutate, readResident) =>
+            coordinator.mutateCharacterDetailFields(characterId, reason, mutate, readResident),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             withCompleteCharacter(characterId, () => coordinator.mutatePersistentCharacterDetail(
                 characterId,

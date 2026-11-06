@@ -1,6 +1,5 @@
 import { expect, it, vi } from 'vitest'
-import { captureRoot, makeDatabase, SaveCoordinator } from './saveCoordinator.testSupport'
-import { applyCharacterDetailPatch, type CharacterDetailPatch } from './characterDetailPatch'
+import { captureRoot, deferred, makeDatabase, SaveCoordinator } from './saveCoordinator.testSupport'
 import { createStoreStub } from './persistentDataStore.testSupport'
 import type { CharacterDetail, WorkingSetCommit } from './persistentDataStore'
 import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
@@ -10,7 +9,11 @@ import type { character } from './database.svelte'
 function makeStoredCharacter(initial: CharacterDetail) {
     let revision = 2
     let detail: CharacterDetail | null = structuredClone(initial)
+    let beforeNextCommit: (() => Promise<void>) | undefined
     const commit = vi.fn(async (input: WorkingSetCommit) => {
+        const wait = beforeNextCommit
+        beforeNextCommit = undefined
+        await wait?.()
         for (const mutation of input.unitMutations ?? []) {
             const [kind, id, field] = JSON.parse(mutation.key) as string[]
             if (kind !== 'character' || id !== detail?.chaId) throw new Error(`Unexpected unit ${mutation.key}`)
@@ -22,7 +25,17 @@ function makeStoredCharacter(initial: CharacterDetail) {
     })
     const readCharacter = vi.fn(async (id: string) => detail?.chaId === id ? { revision, value: structuredClone(detail) } : null)
     const store = createStoreStub({ commit, readCharacter })
-    return { commit, readCharacter, store, stored: () => detail, remove: () => { detail = null } }
+    // Holds the next commit until released, so a test can edit memory while it waits.
+    const holdNextCommit = () => {
+        const entered = deferred<void>()
+        const held = deferred<void>()
+        beforeNextCommit = async () => {
+            entered.resolve()
+            await held.promise
+        }
+        return { entered: entered.promise, release: () => held.resolve() }
+    }
+    return { commit, readCharacter, store, holdNextCommit, stored: () => detail, remove: () => { detail = null } }
 }
 
 function makeWindowedSelection() {
@@ -65,6 +78,9 @@ function makeCompleteSelection() {
     const coordinator = new SaveCoordinator({
         store: storage.store,
         captureRoot: () => captureRoot(database),
+        // As in the app, a flush stores each resident character's changed fields.
+        captureCharacters: () => database.characters,
+        captureCharacter: (id) => database.characters.find((value) => value.chaId === id) ?? null,
         captureSelectedCharacter: () => selected,
         replaceDatabase: () => undefined,
     })
@@ -74,17 +90,16 @@ function makeCompleteSelection() {
 
 it('stores a field of the windowed selected character without reading its conversation and leaves the selection clean', async () => {
     const { coordinator, commit, selected, stored, authority } = makeWindowedSelection()
-    const publish = vi.fn((patch: CharacterDetailPatch) => { applyCharacterDetailPatch(selected, patch) })
     expect(await coordinator.mutateCharacterDetailFields('char-a', 'toggle-memory', ({ character }) => {
         character.supaMemory = true
         character.modules = [...character.modules!, 'module-b']
-    }, publish)).toBe(true)
+    }, () => selected)).toBe(true)
 
     expect(commit).toHaveBeenCalledExactlyOnceWith({ expectedRevision: 2, unitMutations: [
         { key: JSON.stringify(['character', 'char-a', 'modules']), type: 'set', value: ['module-a', 'module-b'] },
         { key: JSON.stringify(['character', 'char-a', 'supaMemory']), type: 'set', value: true },
     ] })
-    expect(publish).toHaveBeenCalledExactlyOnceWith({ modules: ['module-a', 'module-b'], supaMemory: true })
+    expect(selected).toMatchObject({ supaMemory: true, modules: ['module-a', 'module-b'] })
     expect(stored()).toMatchObject({ supaMemory: true, modules: ['module-a', 'module-b'] })
     expect(authority().storeRevision).toBe(3)
     // The published value is the selection's own copy.
@@ -100,9 +115,8 @@ it('stores a field of the windowed selected character without reading its conver
 
 it('removes a field and stores later edits of the same windowed selection in turn', async () => {
     const { coordinator, commit, selected, stored } = makeWindowedSelection()
-    const publish = (patch: CharacterDetailPatch) => { applyCharacterDetailPatch(selected, patch) }
-    await coordinator.mutateCharacterDetailFields('char-a', 'set-memory', ({ character }) => { character.supaMemory = true }, publish)
-    await coordinator.mutateCharacterDetailFields('char-a', 'clear-modules', ({ character }) => { delete character.modules }, publish)
+    await coordinator.mutateCharacterDetailFields('char-a', 'set-memory', ({ character }) => { character.supaMemory = true }, () => selected)
+    await coordinator.mutateCharacterDetailFields('char-a', 'clear-modules', ({ character }) => { delete character.modules }, () => selected)
     expect(commit.mock.calls.map(([input]) => input)).toEqual([
         { expectedRevision: 2, unitMutations: [{ key: JSON.stringify(['character', 'char-a', 'supaMemory']), type: 'set', value: true }] },
         { expectedRevision: 3, unitMutations: [{ key: JSON.stringify(['character', 'char-a', 'modules']), type: 'delete' }] },
@@ -116,11 +130,9 @@ it('removes a field and stores later edits of the same windowed selection in tur
 
 it('stores a field of a complete selected character and advances its baseline', async () => {
     const { coordinator, commit, selected, stored } = makeCompleteSelection()
-    const publish = vi.fn((patch: CharacterDetailPatch) => { applyCharacterDetailPatch(selected, patch) })
     expect(await coordinator.mutateCharacterDetailFields('char-a', 'toggle-memory', ({ character }) => {
         character.supaMemory = true
-    }, publish)).toBe(true)
-    expect(publish).toHaveBeenCalledExactlyOnceWith({ supaMemory: true })
+    }, () => selected)).toBe(true)
     expect(selected.supaMemory).toBe(true)
     expect(stored()?.supaMemory).toBe(true)
     await coordinator.flushPendingData('verify-clean-detail')
@@ -128,36 +140,76 @@ it('stores a field of a complete selected character and advances its baseline', 
     expect(coordinator.hasPendingPersistenceWork).toBe(false)
 })
 
-it('commits and publishes nothing when the stored record already holds the change', async () => {
-    const { coordinator, commit } = makeCompleteSelection()
-    const publish = vi.fn()
+it('keeps a field edited in memory while the commit waits, and the next save stores that edit', async () => {
+    const { coordinator, commit, holdNextCommit, selected, stored } = makeCompleteSelection()
+    const hold = holdNextCommit()
+    const mutation = coordinator.mutateCharacterDetailFields('char-a', 'rename', ({ character }) => {
+        character.name = 'Earlier explicit edit'
+    }, () => selected)
+    await hold.entered
+    selected.name = 'Later edit'
+    coordinator.markPersistentDataDirty(1)
+    hold.release()
+    expect(await mutation).toBe(true)
+    expect(selected.name).toBe('Later edit')
+    expect(stored()?.name).toBe('Earlier explicit edit')
+    expect(coordinator.hasPendingPersistenceWork).toBe(true)
+
+    await coordinator.flushPendingData('store-later-edit')
+    expect(commit).toHaveBeenCalledTimes(2)
+    expect(stored()?.name).toBe('Later edit')
+    expect(selected.name).toBe('Later edit')
+    expect(coordinator.hasPendingPersistenceWork).toBe(false)
+})
+
+it('shows the committed field while keeping an edit of another field made during the commit', async () => {
+    const { coordinator, holdNextCommit, selected, stored } = makeCompleteSelection()
+    const hold = holdNextCommit()
+    const mutation = coordinator.mutateCharacterDetailFields('char-a', 'toggle-memory', ({ character }) => {
+        character.supaMemory = true
+    }, () => selected)
+    await hold.entered
+    selected.name = 'Renamed meanwhile'
+    coordinator.markPersistentDataDirty(1)
+    hold.release()
+    expect(await mutation).toBe(true)
+    expect(selected).toMatchObject({ supaMemory: true, name: 'Renamed meanwhile' })
+
+    await coordinator.flushPendingData('store-other-edit')
+    expect(stored()).toMatchObject({ supaMemory: true, name: 'Renamed meanwhile' })
+    expect(coordinator.hasPendingPersistenceWork).toBe(false)
+})
+
+it('commits and changes nothing when the stored record already holds the change', async () => {
+    const { coordinator, commit, selected } = makeCompleteSelection()
+    const before = structuredClone(selected)
     expect(await coordinator.mutateCharacterDetailFields('char-a', 'same-name', ({ character }) => {
         character.name = 'Alpha'
-    }, publish)).toBe(true)
+    }, () => selected)).toBe(true)
     expect(commit).not.toHaveBeenCalled()
-    expect(publish).not.toHaveBeenCalled()
+    expect(selected).toEqual(before)
 })
 
 it('resolves false for a character the store does not hold', async () => {
-    const { coordinator, commit, remove } = makeCompleteSelection()
+    const { coordinator, commit, remove, selected } = makeCompleteSelection()
     remove()
+    const before = structuredClone(selected)
     const mutate = vi.fn()
-    const publish = vi.fn()
-    expect(await coordinator.mutateCharacterDetailFields('char-a', 'missing', mutate, publish)).toBe(false)
+    expect(await coordinator.mutateCharacterDetailFields('char-a', 'missing', mutate, () => selected)).toBe(false)
     expect(mutate).not.toHaveBeenCalled()
     expect(commit).not.toHaveBeenCalled()
-    expect(publish).not.toHaveBeenCalled()
+    expect(selected).toEqual(before)
 })
 
 it('refuses an edit of the chat folders or identity before committing', async () => {
-    const { coordinator, commit } = makeWindowedSelection()
-    const publish = vi.fn()
+    const { coordinator, commit, selected } = makeWindowedSelection()
     await expect(coordinator.mutateCharacterDetailFields('char-a', 'folders', ({ character }) => {
         character.chatFolders = [{ id: 'folder', name: 'Folder', folded: false }]
-    }, publish)).rejects.toThrow(TypeError)
+    }, () => selected)).rejects.toThrow(TypeError)
     await expect(coordinator.mutateCharacterDetailFields('char-a', 'identity', ({ character }) => {
         character.chaId = 'char-b'
-    }, publish)).rejects.toThrow(TypeError)
+    }, () => selected)).rejects.toThrow(TypeError)
     expect(commit).not.toHaveBeenCalled()
-    expect(publish).not.toHaveBeenCalled()
+    expect(selected).not.toHaveProperty('chatFolders')
+    expect(selected.chaId).toBe('char-a')
 })

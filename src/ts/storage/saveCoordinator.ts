@@ -34,7 +34,12 @@ import {
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import { applyConversationBindingPatch, conversationBindingHolds, type ConversationBindingPatch } from './conversationBinding'
-import { applyCharacterDetailPatch, type CharacterDetailPatch } from './characterDetailPatch'
+import {
+    applyCharacterDetailPatch,
+    captureCharacterDetailFields,
+    unchangedCharacterDetailPatch,
+    type CharacterDetailPatch,
+} from './characterDetailPatch'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
     ActiveConversationMutationEvent,
@@ -679,6 +684,9 @@ export type PersistentCharacterDetailMutation = (
 
 /** Edits the stored record of a character, which holds no chats. Its chat folders stay as they are. */
 export type CharacterDetailFieldsMutation = (state: { character: CharacterDetail }) => void | Promise<void>
+
+/** The in-memory record of a character that shows its committed fields, or undefined when none holds them. */
+export type ResidentCharacterRecord = () => object | undefined
 
 export type PersistentCompleteCharacterMutation = (
     character: CompleteCharacter,
@@ -2001,20 +2009,23 @@ export class SaveCoordinator {
     /**
      * Commits fields of a character's own record (everything outside its chats) by reading and
      * writing only that record, so a windowed selected conversation keeps its messages unread. The
-     * baseline advances by the committed fields only and the caller publishes the same fields to the
-     * in-memory record, as for a conversation binding. Resolves false when the store holds no such
+     * baseline advances by the committed fields only, and the in-memory record takes each committed
+     * field it still holds as it was when the mutation started. A field edited in memory meanwhile
+     * keeps that edit, which the next save stores. Resolves false when the store holds no such
      * character, and true once the change is stored or nothing differs from the stored record.
      */
     mutateCharacterDetailFields(
         characterId: string,
         reason: string,
         mutate: CharacterDetailFieldsMutation,
-        publish: (committedPatch: CharacterDetailPatch) => void,
+        readResident: ResidentCharacterRecord,
     ): Promise<boolean> {
         this.assertInitialized()
         this.assertPersistentMutationAllowed()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
+            const residentAtStart = readResident()
+            const fieldsAtStart = residentAtStart ? captureCharacterDetailFields(residentAtStart) : null
             const revision = this.revision
             const stored = await this.dependencies.store.readCharacter(characterId)
             if (!stored) return false
@@ -2055,7 +2066,12 @@ export class SaveCoordinator {
                 this.materializedBaselines.set(characterId, applyCharacterDetailPatch({ ...materialized }, clonePatch()))
             }
             // The UI must not share nested values with the persisted baselines.
-            publish(clonePatch())
+            const resident = readResident()
+            if (resident) {
+                applyCharacterDetailPatch(resident, fieldsAtStart
+                    ? unchangedCharacterDetailPatch(clonePatch(), resident, fieldsAtStart)
+                    : clonePatch())
+            }
             this.dependencies.onStorageOnlyRevision?.(committed.revision)
             this.dependencies.onLocalRevision?.(committed.revision)
             await this.finishExplicitCommit(committed.revision)
