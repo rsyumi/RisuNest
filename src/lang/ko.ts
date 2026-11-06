@@ -3057,6 +3057,13 @@ export const languageKorean = {
             fileLog: '오류 로그를 파일로 저장',
             fileLogHelp: 'API 키 같은 비밀 정보는 가려서 기록합니다.',
             logEmpty: '기록된 오류가 없습니다.',
+            savedLogTitle: '저장된 오류 로그',
+            savedLogHelp: '앱을 다시 시작하기 전의 기록을 포함해 파일에 저장된 오류 로그를 볼 수 있습니다.',
+            savedLogEmpty: '저장된 오류가 없습니다.',
+            savedLogList: '저장된 오류 로그 항목',
+            appStarted: '앱 시작',
+            newerPage: '이전 페이지',
+            olderPage: '다음 페이지',
             actionFailed:
                 '지금은 진단 기능을 사용할 수 없습니다. 앱을 다시 시작한 뒤 다시 시도하세요.',
         },

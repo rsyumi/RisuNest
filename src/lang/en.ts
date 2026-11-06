@@ -3236,6 +3236,13 @@ export const languageEnglish = {
             fileLogHelp:
                 'Secrets such as API keys are masked before being written.',
             logEmpty: 'No errors recorded.',
+            savedLogTitle: 'Saved error log',
+            savedLogHelp: 'View the error log saved to the file, including entries from before the app restarted.',
+            savedLogEmpty: 'No errors saved.',
+            savedLogList: 'Saved error log entries',
+            appStarted: 'App started',
+            newerPage: 'Previous page',
+            olderPage: 'Next page',
             actionFailed:
                 'Diagnostics are unavailable right now. Restart the app and try again.',
         },

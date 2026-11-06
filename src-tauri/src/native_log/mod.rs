@@ -7,8 +7,18 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
+pub(crate) mod file_page;
+
 pub(crate) const RING_CAPACITY: usize = 1_000;
 pub(crate) const FILE_ROTATE_BYTES: usize = 2 * 1024 * 1024;
+/// Longest message kept per entry, so one entry cannot outgrow the file bound.
+pub(crate) const MAX_MESSAGE_CHARS: usize = 4096;
+pub(crate) const LOG_FILE_NAME: &str = "risunest.log";
+pub(crate) const PREVIOUS_LOG_FILE_NAME: &str = "risunest.log.1";
+/// Target of the line that marks where one app process's lines begin in the file.
+pub(crate) const RUN_START_TARGET: &str = "app-start";
+#[cfg(any(desktop, test))]
+const STARTUP_DIAGNOSTIC_ROTATE_BYTES: u64 = 64 * 1024;
 pub(crate) const FILE_LOG_DISABLED_MARKER: &str = "file-log.enabled";
 pub(crate) const NATIVE_LOG_FILE_PATH_UNAVAILABLE: &str = "native-log-file-path-unavailable";
 pub(crate) const NATIVE_LOG_FILE_UPDATE_FAILED: &str = "native-log-file-update-failed";
@@ -50,7 +60,17 @@ impl NativeLogState {
     }
 
     pub(crate) fn configure_file_path(&self, root: impl AsRef<Path>) {
-        let root = root.as_ref().join("logs");
+        self.configure(root.as_ref(), None);
+    }
+
+    /// Configures the file like [`Self::configure_file_path`] for the app
+    /// process, first writing the line that starts this run in the file.
+    pub(crate) fn configure_file_path_for_run(&self, root: impl AsRef<Path>, version: &str) {
+        self.configure(root.as_ref(), Some(version));
+    }
+
+    fn configure(&self, root: &Path, run_version: Option<&str>) {
+        let root = root.join("logs");
         let _ = create_private_dir_all(&root);
         tighten_known_files(&root);
         if let Ok(mut inner) = self.0.lock() {
@@ -59,10 +79,26 @@ impl NativeLogState {
             }
             inner.root = Some(root);
             let pending = std::mem::take(&mut inner.pending_file_entries);
+            if let Some(version) = run_version {
+                // Lines recorded before the file was known belong to this run, so the
+                // start line goes first and is dated no later than any of them.
+                let now = now_ms();
+                let start = LogEntry {
+                    ts_ms: pending.front().map_or(now, |entry| entry.ts_ms.min(now)),
+                    level: "info".to_owned(),
+                    target: RUN_START_TARGET.to_owned(),
+                    message: mask(&format!("RisuNest {version}")),
+                };
+                write_file(&inner, &start);
+            }
             for entry in pending {
                 write_file(&inner, &entry);
             }
         }
+    }
+
+    fn root(&self) -> Option<PathBuf> {
+        self.0.lock().ok().and_then(|inner| inner.root.clone())
     }
 
     pub(crate) fn record(&self, level: &str, target: &str, message: impl AsRef<str>) {
@@ -79,14 +115,15 @@ impl NativeLogState {
     }
 
     fn record_inner(&self, level: &str, target: &str, message: &str, write_to_file: bool) {
+        let mut message = mask(message);
+        if let Some((cut, _)) = message.char_indices().nth(MAX_MESSAGE_CHARS) {
+            message.truncate(cut);
+        }
         let entry = LogEntry {
-            ts_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis())
-                .unwrap_or_default(),
+            ts_ms: now_ms(),
             level: level.to_owned(),
             target: target.to_owned(),
-            message: mask(message),
+            message,
         };
         if let Ok(mut inner) = self.0.lock() {
             if inner.entries.len() == RING_CAPACITY {
@@ -131,7 +168,7 @@ impl NativeLogState {
             .ok()
             .and_then(|inner| inner.root.clone())
             .unwrap_or_default()
-            .join("risunest.log")
+            .join(LOG_FILE_NAME)
     }
 
     pub(crate) fn file_enabled(&self) -> bool {
@@ -174,25 +211,57 @@ fn write_file(inner: &Inner, entry: &LogEntry) {
     if root.join(FILE_LOG_DISABLED_MARKER).exists() {
         return;
     }
-    let path = root.join("risunest.log");
-    if fs::metadata(&path)
-        .map(|metadata| metadata.len() > FILE_ROTATE_BYTES as u64)
-        .unwrap_or(false)
-    {
-        let rotated = path.with_extension("log.1");
-        let _ = fs::remove_file(&rotated);
-        if fs::rename(&path, &rotated).is_ok() {
-            tighten_file(&rotated);
-        }
+    let path = root.join(LOG_FILE_NAME);
+    let rotation = rotate_past(&path, FILE_ROTATE_BYTES as u64);
+    if rotation == Rotation::Rotated {
+        tighten_file(&root.join(PREVIOUS_LOG_FILE_NAME));
     }
-    let Ok(mut file) = open_private_append(&path) else {
+    // A log that cannot be moved aside starts over instead of growing past the bound.
+    let Ok(mut file) = open_private_log(&path, rotation == Rotation::Failed) else {
         return;
     };
-    let _ = writeln!(
-        file,
-        "{} [{}] {}: {}",
+    // One write per line, so a reader never sees half of one.
+    let _ = file.write_all(file_line(entry).as_bytes());
+}
+
+fn file_line(entry: &LogEntry) -> String {
+    format!(
+        "{} [{}] {}: {}\n",
         entry.ts_ms, entry.level, entry.target, entry.message
-    );
+    )
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rotation {
+    Kept,
+    Rotated,
+    Failed,
+}
+
+/// Moves a log that has grown past `limit` to its `.1` sibling, replacing the
+/// older one, so the two together stay within twice the limit and two lines.
+fn rotate_past(path: &Path, limit: u64) -> Rotation {
+    if !fs::metadata(path)
+        .map(|metadata| metadata.len() > limit)
+        .unwrap_or(false)
+    {
+        return Rotation::Kept;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    let rotated = path.with_file_name(name);
+    let _ = fs::remove_file(&rotated);
+    match fs::rename(path, &rotated) {
+        Ok(()) => Rotation::Rotated,
+        Err(_) => Rotation::Failed,
+    }
 }
 
 pub(crate) fn mask(message: &str) -> String {
@@ -411,9 +480,14 @@ fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)
 }
 
-fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
+fn open_private_log(path: &Path, truncate: bool) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true);
+    if truncate {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -438,7 +512,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 fn tighten_known_files(root: &Path) {
-    for name in ["risunest.log", "risunest.log.1", FILE_LOG_DISABLED_MARKER] {
+    for name in [LOG_FILE_NAME, PREVIOUS_LOG_FILE_NAME, FILE_LOG_DISABLED_MARKER] {
         let path = root.join(name);
         if path.exists() {
             tighten_file(&path);
@@ -688,8 +762,15 @@ fn platform_startup_diagnostic(message: &str) {
 #[cfg(any(desktop, test))]
 fn append_startup_diagnostic(path: &Path, message: &str) {
     let line: String = format_console_line("error", "startup", message).chars().take(4096).collect();
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
+    let mut options = OpenOptions::new();
+    options.create(true);
+    if rotate_past(path, STARTUP_DIAGNOSTIC_ROTATE_BYTES) == Rotation::Failed {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    if let Ok(mut file) = options.open(path) {
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -748,7 +829,7 @@ fn file_path_for_command(state: &NativeLogState) -> Result<String, String> {
         .lock()
         .ok()
         .and_then(|inner| inner.root.clone())
-        .map(|root| root.join("risunest.log"))
+        .map(|root| root.join(LOG_FILE_NAME))
     else {
         state.record_ring_only(
             "error",
