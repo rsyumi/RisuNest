@@ -157,6 +157,7 @@ fn claim_library<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<crate::native_
         .server()
         .map_err(|code| SyncError::new(code, 409))
 }
+#[track_caller]
 fn with_status_store<R: tauri::Runtime, T>(app: &AppHandle<R>, operation: impl FnOnce(&PersistentStore) -> Result<T>) -> Result<T> {
     if app.state::<ServerSyncCommandState>().cleanup_closed.load(Ordering::Acquire) {
         return Err(SyncError::new("cleanup-pending", 409));
@@ -165,6 +166,9 @@ fn with_status_store<R: tauri::Runtime, T>(app: &AppHandle<R>, operation: impl F
         .map_err(|error| SyncError::caused("local-store-unavailable", 503, error.to_string()))?
 }
 
+/// Opens a connection for one sync command. A slow wait for the renderer store
+/// is recorded with the command that asked for it.
+#[track_caller]
 fn job_store<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PersistentStore> {
     with_store_mut(app.state(), |store| store.open_native_job_store())
         .map_err(|error| SyncError::caused("local-store-unavailable", 503, error.to_string()))
