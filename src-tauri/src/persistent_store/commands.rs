@@ -3103,23 +3103,28 @@ mod tests {
         let state = PersistentStoreState::default();
         open_renderer_persistent_store(&state, directory.path()).unwrap();
         let recorded = |at: &str| crate::native_log::global_state().tail(None).into_iter().rev()
-            .find(|entry| entry.message.ends_with(&format!(" at {at}")));
-        let (held, holding) = std::sync::mpsc::channel();
-        let waiting = std::thread::scope(|scope| {
-            let holder = scope.spawn(|| with_store_mutex(&state, |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(80));
-                Ok(())
-            }));
-            holding.recv().unwrap();
-            let at = crate::slow_log::with_test_threshold(Duration::from_millis(40), || {
-                let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
-                at
+            .filter(|entry| entry.message.ends_with(&format!(" at {at}"))).collect::<Vec<_>>();
+        let mut waiting = String::new();
+        // The second wait at the same place is counted toward a summary instead of written.
+        for _ in 0..2 {
+            let (held, holding) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let holder = scope.spawn(|| with_store_mutex(&state, |_| {
+                    held.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(80));
+                    Ok(())
+                }));
+                holding.recv().unwrap();
+                waiting = crate::slow_log::with_test_threshold(Duration::from_millis(40), || {
+                    let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
+                    at
+                });
+                holder.join().unwrap().unwrap();
             });
-            holder.join().unwrap().unwrap();
-            at
-        });
-        let entry = recorded(&waiting).unwrap();
+        }
+        let entries = recorded(&waiting);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
         assert_eq!((entry.level.as_str(), entry.target.as_str()), ("warn", "slow-operation"));
         let waited: u128 = entry.message.split(" after waiting ").nth(1)
             .and_then(|rest| rest.split(' ').next()).unwrap().parse().unwrap();
@@ -3128,7 +3133,7 @@ mod tests {
             let at = format!("{}:{}", file!(), line!()); with_store_mutex(&state, |_| Ok(())).unwrap();
             at
         });
-        assert!(recorded(&quick).is_none());
+        assert!(recorded(&quick).is_empty());
     }
 
     #[test]
