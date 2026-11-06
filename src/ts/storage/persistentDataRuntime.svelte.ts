@@ -31,8 +31,10 @@ import type {
     DataRevision,
     PluginStorageMutation,
 } from './persistentDataStore'
+import { applyCharacterDetailPatch } from './characterDetailPatch'
 import type {
     CharacterAdditionRequest,
+    CharacterDetailFieldsMutation,
     PersistentCharacterDetailMutation,
     PersistentCompleteCharacterMutation,
     PersistentCompleteCharacterUpsert,
@@ -673,6 +675,25 @@ export const mutatePersistentCharacterDetail = (
     characterId,
     reason,
     mutate,
+)
+/**
+ * Edits fields of a character's own record (outside its chats) without reading any of its
+ * conversations, then writes the stored fields to the in-memory character. Resolves false when
+ * the store holds no such character.
+ */
+export const mutateCharacterDetailFields = (
+    characterId: string,
+    reason: string,
+    mutate: CharacterDetailFieldsMutation,
+): Promise<boolean> => getPersistentDataRuntime().mutateCharacterDetailFields(
+    characterId,
+    reason,
+    mutate,
+    (committedPatch) => {
+        const current = getDatabase().characters.find((value) => value.chaId === characterId)
+        // A stub holds only catalog fields; it takes the rest from the store when it is loaded.
+        if (current && !isWorkingSetCharacterStub(current)) applyCharacterDetailPatch(current, committedPatch)
+    },
 )
 export const deletePersistentCharacter = (
     characterId: string,

@@ -34,6 +34,7 @@ import {
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import { applyConversationBindingPatch, conversationBindingHolds, type ConversationBindingPatch } from './conversationBinding'
+import { applyCharacterDetailPatch, type CharacterDetailPatch } from './characterDetailPatch'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
     ActiveConversationMutationEvent,
@@ -675,6 +676,9 @@ export interface PersistentSelectedConversation {
 export type PersistentCharacterDetailMutation = (
     state: PersistentCharacterMutationState,
 ) => void | { delete: true } | Promise<void | { delete: true }>
+
+/** Edits the stored record of a character, which holds no chats. Its chat folders stay as they are. */
+export type CharacterDetailFieldsMutation = (state: { character: CharacterDetail }) => void | Promise<void>
 
 export type PersistentCompleteCharacterMutation = (
     character: CompleteCharacter,
@@ -1992,6 +1996,71 @@ export class SaveCoordinator {
                 this.currentRevision = error.actualRevision
             }
         }
+    }
+
+    /**
+     * Commits fields of a character's own record (everything outside its chats) by reading and
+     * writing only that record, so a windowed selected conversation keeps its messages unread. The
+     * baseline advances by the committed fields only and the caller publishes the same fields to the
+     * in-memory record, as for a conversation binding. Resolves false when the store holds no such
+     * character, and true once the change is stored or nothing differs from the stored record.
+     */
+    mutateCharacterDetailFields(
+        characterId: string,
+        reason: string,
+        mutate: CharacterDetailFieldsMutation,
+        publish: (committedPatch: CharacterDetailPatch) => void,
+    ): Promise<boolean> {
+        this.assertInitialized()
+        this.assertPersistentMutationAllowed()
+        return this.enqueue(async () => {
+            await this.flushIterations(reason, true)
+            const revision = this.revision
+            const stored = await this.dependencies.store.readCharacter(characterId)
+            if (!stored) return false
+            this.assertReadRevision(revision, stored.revision)
+            if (stored.value.chaId !== characterId) {
+                throw new Error(`Character ${characterId} returned mismatched detail`)
+            }
+            const character = canonicalClone(stored.value)
+            await mutate({ character })
+            // Folders belong to the conversation order unit, which this write does not touch.
+            const fixedFields = new Set(['chats', 'chaId', 'chatFolders'])
+            for (const field of fixedFields) {
+                if (canonicalJson({ value: (character as unknown as Record<string, unknown>)[field] }) !==
+                    canonicalJson({ value: (stored.value as unknown as Record<string, unknown>)[field] })) {
+                    throw new TypeError('A character detail mutation cannot change its identity, chats or chat folders')
+                }
+            }
+            const changes = diffFields(['character', characterId], stored.value, character, fixedFields)
+            if (!changes.length) return true
+            const committed = await this.commitRoutine({ expectedRevision: this.revision, unitMutations: changes })
+            this.currentRevision = committed.revision
+            const clonePatch = (): CharacterDetailPatch => Object.fromEntries(changes.map((change) => [
+                (JSON.parse(change.key) as string[])[2],
+                change.type === 'set' ? canonicalClone(change.value) : undefined,
+            ]))
+            // Advance only these fields in the baselines; concurrent unrelated edits remain dirty.
+            if (this.windowedCharacterBaseline?.authority.characterId === characterId) {
+                const baseline = this.windowedCharacterBaseline
+                applyCharacterDetailPatch(baseline.shell, clonePatch())
+                baseline.shellCanonical = canonicalJson(baseline.shell)
+            } else if (this.characterBaselineId === characterId && this.characterBaseline) {
+                const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+                applyCharacterDetailPatch(baseline, clonePatch())
+                this.characterBaseline = canonicalJson(baseline)
+            }
+            const materialized = this.materializedBaselines.get(characterId)
+            if (materialized) {
+                this.materializedBaselines.set(characterId, applyCharacterDetailPatch({ ...materialized }, clonePatch()))
+            }
+            // The UI must not share nested values with the persisted baselines.
+            publish(clonePatch())
+            this.dependencies.onStorageOnlyRevision?.(committed.revision)
+            this.dependencies.onLocalRevision?.(committed.revision)
+            await this.finishExplicitCommit(committed.revision)
+            return true
+        })
     }
 
     mutatePersistentCharacterDetail(

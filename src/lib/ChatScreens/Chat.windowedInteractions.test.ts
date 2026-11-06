@@ -366,11 +366,20 @@ it.each([
     expect((await savedChat())?.savedToggleValues).toEqual({ toggle_probe: '0' })
     await vi.waitFor(() => expect(save().disabled).toBe(true))
 
+    // The memory switch stores the character's own record without reading the conversation.
+    const fullReadsBeforeMemory = [...current.fullReads]
     await toggleSwitch(language.ToggleHypaMemory)
     await finishedEdit('character-memory')
     expect(current.selected().supaMemory).toBe(true)
     await current.runtime.flushPendingData('sidebar-memory-toggle')
     expect((await current.raw.readCharacter(interactionCharacterId))?.value.supaMemory).toBe(true)
+    await toggleSwitch(language.ToggleHypaMemory)
+    await finishedEdit('character-memory')
+    expect(current.selected().supaMemory).toBe(false)
+    await current.runtime.flushPendingData('sidebar-memory-toggle-off')
+    expect((await current.raw.readCharacter(interactionCharacterId))?.value.supaMemory).toBe(false)
+    expect(current.fullReads).toEqual(fullReadsBeforeMemory)
+    expect(current.runtime.getSelectedConversationMode()).toBe(mode)
 
     // Later edits of the same chat still save.
     expect(await current.characters.editSelectedChatList(interactionCharacterId, 'after-sidebar-toggles', (owner) => {
