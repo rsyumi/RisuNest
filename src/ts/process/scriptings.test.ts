@@ -98,6 +98,15 @@ vi.mock('./luaRuntime', async (importOriginal) => {
     },
   }
 })
+vi.mock('./luaWorkerExecutor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./luaWorkerExecutor')>()
+  class LuaWorkerExecutor extends actual.LuaWorkerExecutor {
+    constructor(...[timeout, ...rest]: ConstructorParameters<typeof actual.LuaWorkerExecutor>) {
+      super(engineFunctionTimeout.ms ?? timeout, ...rest)
+    }
+  }
+  return { ...actual, LuaWorkerExecutor }
+})
 
 let runScripted: typeof import('./scriptings').runScripted
 let jsonLuaSource = ''
