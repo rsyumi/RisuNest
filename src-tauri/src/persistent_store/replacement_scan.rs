@@ -13,30 +13,91 @@ use std::fmt;
 
 /// Whether `text` is an object whose `additionalAssets`, when present, is an array.
 pub(super) fn additional_assets_are_listed(text: &str) -> StoreResult<bool> {
-    let property = read(text, Property { name: "additionalAssets", value: IsArray })?;
+    let property = read(text, false, Property { name: "additionalAssets", value: IsArray })?;
     Ok(matches!(property, Some(None | Some(true))))
 }
 
-/// The `additionalAssets` of a stored character detail.
+/// One array property of a stored object.
 #[derive(Debug, PartialEq)]
-pub(super) enum AdditionalAssets {
+pub(super) enum ArrayProperty {
     Absent,
     Entries(Vec<Value>),
-    /// The detail is not an object, or the property is not an array.
+    /// The value is not an object, or the property is not an array.
     Unusable,
 }
 
 /// Decodes only the `additionalAssets` of a stored character detail into values.
-pub(super) fn additional_assets(text: &str) -> StoreResult<AdditionalAssets> {
-    Ok(match read(text, Property { name: "additionalAssets", value: Entries })? {
-        Some(None) => AdditionalAssets::Absent,
-        Some(Some(Some(entries))) => AdditionalAssets::Entries(entries),
-        None | Some(Some(None)) => AdditionalAssets::Unusable,
+pub(super) fn additional_assets(text: &str) -> StoreResult<ArrayProperty> {
+    array_property(text, false, "additionalAssets")
+}
+
+fn array_property(text: &str, unbounded_depth: bool, name: &'static str) -> StoreResult<ArrayProperty> {
+    Ok(match read(text, unbounded_depth, Property { name, value: Entries })? {
+        Some(None) => ArrayProperty::Absent,
+        Some(Some(Some(entries))) => ArrayProperty::Entries(entries),
+        None | Some(Some(None)) => ArrayProperty::Unusable,
     })
 }
 
-fn read<'de, S: DeserializeSeed<'de>>(text: &'de str, seed: S) -> StoreResult<S::Value> {
+// Root members follow: the root spool decodes them without a depth limit, so
+// these readers have none either.
+
+/// Checks that `text` decodes as a value, without keeping it.
+pub(super) fn check_value(text: &str) -> StoreResult<()> {
+    read(text, true, Skip)
+}
+
+/// Whether a root record's `id` is the string `id`.
+pub(super) fn record_id_is(text: &str, id: &str) -> StoreResult<bool> {
+    let found = read(text, true, Property { name: "id", value: Text })?;
+    Ok(matches!(found, Some(Some(Some(found))) if found == id))
+}
+
+/// A root record's `name` when it is a string.
+pub(super) fn record_name(text: &str) -> StoreResult<Option<String>> {
+    Ok(match read(text, true, Property { name: "name", value: Text })? {
+        Some(Some(Some(name))) => Some(name.into_owned()),
+        _ => None,
+    })
+}
+
+/// Whether a root module is an object whose `assets`, when present, is an array.
+pub(super) fn module_assets_are_listed(text: &str) -> StoreResult<bool> {
+    let property = read(text, true, Property { name: "assets", value: IsArray })?;
+    Ok(matches!(property, Some(None | Some(true))))
+}
+
+/// Whether a persona is an object whose `embeddedModule`, when present, is an
+/// object whose `assets`, when present, is an array.
+pub(super) fn embedded_module_assets_are_listed(text: &str) -> StoreResult<bool> {
+    let module = Property { name: "assets", value: IsArray };
+    let property = read(text, true, Property { name: "embeddedModule", value: module })?;
+    Ok(matches!(property, Some(None | Some(Some(None | Some(true))))))
+}
+
+/// Decodes only the `assets` of a root module into values.
+pub(super) fn module_assets(text: &str) -> StoreResult<ArrayProperty> {
+    array_property(text, true, "assets")
+}
+
+/// Decodes only the `assets` of a persona's `embeddedModule` into values, or
+/// `None` when the persona embeds no module object whose `id` is `module_id`.
+pub(super) fn embedded_module_assets(text: &str, module_id: &str) -> StoreResult<Option<ArrayProperty>> {
+    Ok(match read(text, true, Property { name: "embeddedModule", value: EmbeddedModule })? {
+        Some(Some(Some((Some(id), assets)))) if id == module_id => Some(match assets {
+            None => ArrayProperty::Absent,
+            Some(Some(entries)) => ArrayProperty::Entries(entries),
+            Some(None) => ArrayProperty::Unusable,
+        }),
+        _ => None,
+    })
+}
+
+fn read<'de, S: DeserializeSeed<'de>>(text: &'de str, unbounded_depth: bool, seed: S) -> StoreResult<S::Value> {
     let mut decoder = serde_json::Deserializer::from_str(text);
+    if unbounded_depth {
+        decoder.disable_recursion_limit();
+    }
     let value = seed.deserialize(&mut decoder)?;
     decoder.end()?;
     Ok(value)
@@ -48,13 +109,7 @@ pub(super) fn observe_alias_references(
     unbounded_depth: bool,
     references: &mut BTreeSet<String>,
 ) -> StoreResult<()> {
-    let mut decoder = serde_json::Deserializer::from_str(text);
-    if unbounded_depth {
-        decoder.disable_recursion_limit();
-    }
-    let found = References.deserialize(&mut decoder)?;
-    decoder.end()?;
-    references.extend(found);
+    references.extend(read(text, unbounded_depth, References)?);
     Ok(())
 }
 
@@ -207,9 +262,79 @@ impl<'de> Visitor<'de> for Entries {
     }
 }
 
+/// A string, or `None` for any other value.
+#[derive(Clone, Copy)]
+struct Text;
+
+impl<'de> DeserializeSeed<'de> for Text {
+    type Value = Option<Cow<'de, str>>;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Text {
+    type Value = Option<Cow<'de, str>>;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    scalars!(None);
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(Some(Cow::Borrowed(value)))
+    }
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Some(Cow::Owned(value.to_owned())))
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, values: A) -> Result<Self::Value, A::Error> {
+        Skip.visit_seq(values).map(|()| None)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, entries: A) -> Result<Self::Value, A::Error> {
+        Skip.visit_map(entries).map(|()| None)
+    }
+}
+
+/// A module's `id` and `assets` entries, or `None` when the value is not an object.
+#[derive(Clone, Copy)]
+struct EmbeddedModule;
+
+type ModuleProperties<'de> = (Option<Cow<'de, str>>, Option<Option<Vec<Value>>>);
+
+impl<'de> DeserializeSeed<'de> for EmbeddedModule {
+    type Value = Option<ModuleProperties<'de>>;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for EmbeddedModule {
+    type Value = Option<ModuleProperties<'de>>;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    scalars!(None);
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, values: A) -> Result<Self::Value, A::Error> {
+        Skip.visit_seq(values).map(|()| None)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Self::Value, A::Error> {
+        let (mut id, mut assets) = (None, None);
+        while let Some(key) = entries.next_key_seed(Key)? {
+            match key.as_ref() {
+                "id" => id = entries.next_value_seed(Text)?,
+                "assets" => assets = Some(entries.next_value_seed(Entries)?),
+                _ => entries.next_value_seed(Skip)?,
+            }
+        }
+        Ok(Some((id, assets)))
+    }
+}
+
 /// One property of an object, decoded by `value` while every other value is
 /// skipped. `None` when the value is not an object, `Some(None)` when the
 /// property is absent.
+#[derive(Clone, Copy)]
 struct Property<S> {
     name: &'static str,
     value: S,
@@ -375,12 +500,85 @@ mod tests {
             assert!(additional_assets(text).is_err(), "{text}");
             assert!(references(text).is_err(), "{text}");
         }
+        for text in [
+            r#"{"a":1} trailing"#, r#"{"a":"#, "", r#"{"a":1e400}"#, r#"{"a":"\ud800"}"#,
+            r#"{"id":"m","assets":[1e400]}"#, r#"{"embeddedModule":{"id":"m","assets":["\ud800"]}}"#,
+        ] {
+            assert!(check_value(text).is_err(), "{text}");
+            assert!(record_id_is(text, "m").is_err(), "{text}");
+            assert!(record_name(text).is_err(), "{text}");
+            assert!(module_assets_are_listed(text).is_err(), "{text}");
+            assert!(embedded_module_assets_are_listed(text).is_err(), "{text}");
+            assert!(module_assets(text).is_err(), "{text}");
+            assert!(embedded_module_assets(text, "m").is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn root_member_readers_follow_the_value_the_spool_decodes() {
+        use serde::Deserialize;
+        fn parse(text: &str) -> Value {
+            let mut decoder = serde_json::Deserializer::from_str(text);
+            decoder.disable_recursion_limit();
+            let value = Value::deserialize(&mut decoder).unwrap();
+            decoder.end().unwrap();
+            value
+        }
+        fn listed(parent: &Value) -> bool {
+            parent.as_object().is_some_and(|parent| parent.get("assets").is_none_or(Value::is_array))
+        }
+        fn entries(parent: &Value) -> ArrayProperty {
+            let Some(parent) = parent.as_object() else { return ArrayProperty::Unusable };
+            match parent.get("assets") {
+                None => ArrayProperty::Absent,
+                Some(Value::Array(entries)) => ArrayProperty::Entries(entries.clone()),
+                Some(_) => ArrayProperty::Unusable,
+            }
+        }
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        let texts = [
+            r#"{"id":"m","assets":[["a","assets/a.png","png"],{"k":1,"k":2}]}"#.to_owned(),
+            r#"{"id":"m","assets":{}}"#.into(),
+            r#"{"id":"m","assets":null}"#.into(),
+            r#"{"id":"m"}"#.into(),
+            r#"{"id":"stale","id":"m","assets":{},"assets":[1]}"#.into(),
+            r#"{"id":"m","id":7}"#.into(),
+            r#"{"id":"m","nested":{"id":"x","assets":{},"embeddedModule":7}}"#.into(),
+            r#"{"embeddedModule":null}"#.into(),
+            r#"{"embeddedModule":{"id":"m","assets":[]}}"#.into(),
+            r#"{"embeddedModule":{"id":"m","id":"n","assets":[1]}}"#.into(),
+            r#"{"embeddedModule":{"id":"m","assets":[],"assets":{}}}"#.into(),
+            r#"{"embeddedModule":{"assets":[]},"embeddedModule":{"id":"m"}}"#.into(),
+            r#"{"embeddedModule":["m"]}"#.into(),
+            r#"{"embeddedModule":{"id":"m","assets":"x"}}"#.into(),
+            "[]".into(),
+            r#""m""#.into(),
+            "null".into(),
+            format!(r#"{{"id":"m","assets":[{deep}],"embeddedModule":{{"id":"m","assets":[{deep}]}}}}"#),
+        ];
+        for text in &texts {
+            let value = parse(text);
+            check_value(text).unwrap();
+            assert_eq!(record_id_is(text, "m").unwrap(), value.get("id").and_then(Value::as_str) == Some("m"), "{text}");
+            assert_eq!(module_assets_are_listed(text).unwrap(), listed(&value), "{text}");
+            assert_eq!(
+                embedded_module_assets_are_listed(text).unwrap(),
+                value.as_object().is_some_and(|persona| persona.get("embeddedModule").is_none_or(listed)),
+                "{text}"
+            );
+            assert_eq!(module_assets(text).unwrap(), entries(&value), "{text}");
+            assert_eq!(
+                embedded_module_assets(text, "m").unwrap(),
+                value.get("embeddedModule").filter(|module| module.get("id").and_then(Value::as_str) == Some("m")).map(entries),
+                "{text}"
+            );
+        }
     }
 
     #[test]
     fn additional_assets_entries_follow_the_parsed_detail() {
         use serde_json::json;
-        use AdditionalAssets::{Absent, Entries, Unusable};
+        use ArrayProperty::{Absent, Entries, Unusable};
         for (text, expected) in [
             (r#"{"name":"x","nested":{"additionalAssets":[1]}}"#, Absent),
             (

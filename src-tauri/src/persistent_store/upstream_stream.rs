@@ -1,7 +1,8 @@
-use super::{commit, PersistentStore, StoreError, StoreResult};
+use super::{commit, replacement_scan, PersistentStore, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::fmt;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -79,11 +80,28 @@ impl RootSpool {
         Ok(root)
     }
 
-    pub(super) fn record_by_id(&self, field: &str, id: &str) -> StoreResult<Option<Value>> {
+    /// Reads the first record of an array field whose `id` is `id`. The id is
+    /// read as a parse keeps it, so a repeated key matches by its last value.
+    pub(super) fn read_record<T>(&self, field: &str, id: &str, read: impl FnOnce(&str) -> StoreResult<T>) -> StoreResult<Option<T>> {
         if self.kind(field)? != Some(FieldKind::Array) { return Ok(None); }
-        let raw: Option<String>=self.db.query_row("SELECT value FROM members WHERE field=?1 AND json_extract(value,'$.id')=?2 ORDER BY rowid LIMIT 1",
-            params![field,id],|r|r.get(0)).optional()?;
-        raw.map(|raw|decode(&raw)).transpose()
+        let mut statement=self.db.prepare(MEMBERS_IN_ORDER)?;
+        let mut rows=statement.query([field])?;
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            let text=row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            if replacement_scan::record_id_is(text,id)? { return read(text).map(Some); }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn visit_member_texts(&self, field: &str, mut visit: impl FnMut(&str) -> StoreResult<()>) -> StoreResult<()> {
+        let mut statement=self.db.prepare(MEMBERS_IN_ORDER)?;
+        let mut rows=statement.query([field])?;
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            visit(row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?)?;
+        }
+        Ok(())
     }
 
     pub(super) fn visit_value_texts(&self, mut visit: impl FnMut(&str) -> StoreResult<()>) -> StoreResult<()> {
@@ -137,9 +155,22 @@ impl RootSpool {
     pub(crate) fn put_member(&self, field: &str, key: &str, value: Option<&Value>) -> StoreResult<()> {
         self.check_cancelled()?;
         let raw = value.map(serde_json::to_string).transpose()?;
+        self.put_member_text(field,key,raw.as_deref())
+    }
+
+    fn put_member_text(&self, field: &str, key: &str, raw: Option<&str>) -> StoreResult<()> {
         self.db.execute("INSERT INTO members(field,key,value,array_index) VALUES(?1,?2,?3,?4)
             ON CONFLICT(field,key) DO UPDATE SET value=excluded.value",params![field,key,raw,array_index(key)])?;
         Ok(())
+    }
+
+    /// Keeps a stored member's text as written instead of decoding and
+    /// serializing it again. Spools read from storage are never written back,
+    /// and their readers decode what they need from this text.
+    fn put_stored_member(&self, field: &str, key: &str, raw: &str) -> StoreResult<()> {
+        self.check_cancelled()?;
+        replacement_scan::check_value(raw)?;
+        self.put_member_text(field,key,Some(raw))
     }
 
     pub(crate) fn member(&self, field: &str, key: &str) -> StoreResult<Option<Value>> {
@@ -393,16 +424,16 @@ impl<'de> Visitor<'de> for StoredFieldSeed<'_> {
     fn visit_seq<A:SeqAccess<'de>>(self,mut sequence:A)->Result<(),A::Error> {
         self.root.begin(self.key,FieldKind::Array).map_err(de::Error::custom)?;
         let mut index=0u64;
-        while let Some(value)=sequence.next_element::<Value>()? {
-            self.root.put_member(self.key,&index.to_string(),Some(&value)).map_err(de::Error::custom)?;
+        while let Some(value)=sequence.next_element::<Box<RawValue>>()? {
+            self.root.put_stored_member(self.key,&index.to_string(),value.get()).map_err(de::Error::custom)?;
             index+=1;
         }
         Ok(())
     }
     fn visit_map<A:MapAccess<'de>>(self,mut map:A)->Result<(),A::Error> {
         self.root.begin(self.key,FieldKind::Object).map_err(de::Error::custom)?;
-        while let Some((key,value))=map.next_entry::<String,Value>()? {
-            self.root.put_member(self.key,&key,Some(&value)).map_err(de::Error::custom)?;
+        while let Some((key,value))=map.next_entry::<String,Box<RawValue>>()? {
+            self.root.put_stored_member(self.key,&key,value.get()).map_err(de::Error::custom)?;
         }
         Ok(())
     }
@@ -502,7 +533,7 @@ mod tests {
         assert_eq!(streamed.read_root(None).unwrap().value,before);
         assert_eq!(streamed.revision().unwrap(),0);
         let replay=RootSpool::from_stored(&streamed.connection,second.path(),&b).unwrap();
-        assert_eq!(replay.record_by_id("personas","persona-two").unwrap().unwrap()["name"],"edited");
+        assert_eq!(replay.read_record("personas","persona-two",decode).unwrap().unwrap()["name"],"edited");
         let scratch=replay._file.as_ref().unwrap().path().to_path_buf();
         assert!(scratch.starts_with(second.path().join("external-storage").join("scratch")),"{scratch:?}");
         drop(replay);
@@ -534,6 +565,40 @@ mod tests {
             let opcodes=statement.query_map(rusqlite::params_from_iter(unbound),|row| row.get::<_,String>(1)).unwrap()
                 .collect::<Result<Vec<_>,_>>().unwrap();
             assert!(!opcodes.iter().any(|opcode| opcode=="SorterOpen" || opcode=="OpenEphemeral"),"{sql}: {opcodes:?}");
+        }
+    }
+
+    #[test]
+    fn stored_root_members_read_as_a_parse_of_the_stored_text() {
+        let directory=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(directory.path()).unwrap();
+        let stage=store.replace_begin().unwrap().staging_id;
+        let read=|stored: &str| {
+            store.connection.execute("UPDATE root SET value=?2 WHERE generation=?1",params![stage,stored]).unwrap();
+            RootSpool::from_stored(&store.connection,directory.path(),&stage)
+        };
+        let deep=format!("{}\"assets/deep.png\"{}","[".repeat(200),"]".repeat(200));
+        let stored=[
+            r#"{"modules":[ {"id":"stale" , "id":"m","n":1.50,"s":"é🙂"} , {"id":"m","second":true} ],"#,
+            r#""globalChatVariables":{"deep":"#, &deep, r#","repeated":{"k":1,"k":2},"empty":null},"username":"x"}"#,
+        ].concat();
+        let parsed=decode(&stored).unwrap();
+        let root=read(&stored).unwrap();
+        let mut modules=Vec::new();
+        root.visit("modules",|_,value| { modules.push(value); Ok(()) }).unwrap();
+        assert_eq!(Value::from(modules),parsed["modules"]);
+        let mut variables=Map::new();
+        root.visit("globalChatVariables",|key,value| { variables.insert(key.to_owned(),value); Ok(()) }).unwrap();
+        assert_eq!(Value::from(variables),parsed["globalChatVariables"]);
+        assert_eq!(root.read_record("modules","m",decode).unwrap(),Some(parsed["modules"][0].clone()));
+        assert_eq!(root.read_record("modules","stale",decode).unwrap(),None);
+        drop(root);
+        for stored in [
+            r#"{"modules":[1e400]}"#, r#"{"modules":["\ud800"]}"#,
+            r#"{"globalChatVariables":{"a":[1e400]}}"#, r#"{"globalChatVariables":{"a":"\ud800"}}"#,
+        ] {
+            assert!(decode(stored).is_err(),"{stored}");
+            assert!(read(stored).is_err(),"{stored}");
         }
     }
 
@@ -646,5 +711,11 @@ mod tests {
             store.replace_put_root(&stage,&json!({"plugins":value})).unwrap();
             assert!(commit::staged_plugin_preview(&store.connection,directory.path(),&stage).is_err());
         }
+        store.replace_put_root(&stage,&json!({"plugins":[{"name":"A"},{"name":""},"B",{"name":7},null,{"nested":{"name":"C"}}]})).unwrap();
+        assert_eq!(commit::staged_plugin_preview(&store.connection,directory.path(),&stage).unwrap().plugin_names,["A"]);
+        // A parse keeps the last of repeated keys.
+        store.connection.execute("UPDATE root SET value=?2 WHERE generation=?1",
+            params![stage,r#"{"plugins":[{"name":"stale","name":"D"},{"name":"E","name":7}]}"#]).unwrap();
+        assert_eq!(commit::staged_plugin_preview(&store.connection,directory.path(),&stage).unwrap().plugin_names,["D"]);
     }
 }
