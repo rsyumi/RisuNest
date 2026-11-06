@@ -287,6 +287,7 @@ impl PersistentStoreState {
             state = waited.0;
         }
         drop(state);
+        super::storage_breakdown::stop();
         self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
         lock_store(&self.store).map_err(|_| renderer_gate_error())?.take();
         Ok(maintenance)
@@ -296,6 +297,7 @@ impl PersistentStoreState {
         let maintenance = self
             .try_acquire_renderer_maintenance()?
             .ok_or_else(renderer_gate_error)?;
+        super::storage_breakdown::stop();
         self.status_store.lock().map_err(|_| renderer_gate_error())?.take();
         // No new operation can enter between draining and closing the store.
         // Reopening after the guard is released refreshes the connection after
@@ -815,8 +817,9 @@ pub(crate) fn pds_asset_gc_maintenance(
     }))
 }
 
-/// Sweeps one batch of message objects in each store, continuing from each
-/// store's cursor. It skips while device maintenance holds the renderer gate.
+/// Sweeps message objects in each store for up to the periodic budget,
+/// continuing from each store's cursor. It skips while device maintenance
+/// holds the renderer gate.
 #[tauri::command(async)]
 pub(crate) fn pds_message_object_sweep(
     app: AppHandle,
@@ -828,7 +831,7 @@ pub(crate) fn pds_message_object_sweep(
     logged(
         "pds_message_object_sweep",
         sweep_message_pages(
-            file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::OneBatch,
+            file_admission(&app).as_ref(), &state, &operation_guard, current_time_ms()?, SweepBudget::For(PERIODIC_MESSAGE_SWEEP_BUDGET),
         ),
     )
 }
@@ -1716,7 +1719,14 @@ pub(crate) fn pds_storage_stats(
 ) -> Result<PersistentStorageStats, StoreError> {
     logged(
         "pds_storage_stats",
-        with_store(state, PersistentStore::storage_stats),
+        with_store(state, |store| {
+            let stats = store.storage_stats()?;
+            super::storage_breakdown::log_once(vec![
+                store.database_path.clone(),
+                store.database_path.with_file_name(super::device_store::DEVICE_DATABASE_FILE),
+            ]);
+            Ok(stats)
+        }),
     )
 }
 
@@ -1834,10 +1844,19 @@ pub(crate) fn pds_asset_gc_execute(
     )
 }
 
+/// How long a periodic sweep keeps taking batches in each store. A batch takes
+/// the store between saves, so one call stops early instead of finishing a
+/// pass over a large store.
+const PERIODIC_MESSAGE_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// The pause between periodic batches, so a save waiting for the store takes
+/// it before the next batch does.
+const PERIODIC_MESSAGE_SWEEP_PAUSE: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// How many batches each store gets in one sweep call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SweepBudget {
-    OneBatch,
+    /// Batches until this much time has passed, at least one per store.
+    For(std::time::Duration),
     UntilWrapped,
 }
 
@@ -1854,9 +1873,10 @@ fn sweep_message_pages(
         return Ok(());
     };
     for target in [super::MessageObjectStore::Library, super::MessageObjectStore::Device] {
+        let started = std::time::Instant::now();
         let mut first = true;
         loop {
-            let Ok(_permit) = admission.file(false) else {
+            let Ok(permit) = admission.file(false) else {
                 return Ok(());
             };
             let sweep = with_store_mutex_mut_admitted(state, operation_guard, |store| if first {
@@ -1864,9 +1884,16 @@ fn sweep_message_pages(
             } else {
                 store.continue_message_page_sweep(target, now, super::MESSAGE_PAGE_SWEEP_LIMIT)
             })?;
+            drop(permit);
             first = false;
-            if sweep.wrapped || budget == SweepBudget::OneBatch {
+            if sweep.wrapped {
                 break;
+            }
+            if let SweepBudget::For(limit) = budget {
+                if started.elapsed() >= limit {
+                    break;
+                }
+                std::thread::sleep(PERIODIC_MESSAGE_SWEEP_PAUSE);
             }
         }
     }
@@ -2744,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn a_periodic_sweep_visits_one_batch_per_store_and_resumes_from_the_cursor() {
+    fn a_periodic_sweep_stops_at_its_budget_and_resumes_from_the_cursor() {
         use crate::native_file_jobs::admission::Admission;
         let limit = super::super::MESSAGE_PAGE_SWEEP_LIMIT;
         let open = || {
@@ -2768,14 +2795,15 @@ mod tests {
             (read(&store.connection), read(store.device_store().unwrap().connection()))
         };
         let admission = Arc::new(Admission::default());
+        let spent = SweepBudget::For(std::time::Duration::ZERO);
 
         let (_periodic_directory, periodic) = open();
         assert_eq!(count(&periodic, "message_page_objects"), (limit + 1, limit + 1));
         let operation = periodic.admit_renderer_operation().unwrap();
-        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, SweepBudget::OneBatch).unwrap();
-        assert_eq!(count(&periodic, "message_page_object_marks"), (limit, limit), "a periodic sweep ran more than one batch");
+        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, spent).unwrap();
+        assert_eq!(count(&periodic, "message_page_object_marks"), (limit, limit), "a sweep past its budget took another batch");
         assert_eq!(count(&periodic, "message_page_sweep_cursor"), (1, 1));
-        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &periodic, &operation, 1_000, spent).unwrap();
         assert_eq!(
             count(&periodic, "message_page_object_marks"),
             (limit + 1, limit + 1),
@@ -2783,21 +2811,24 @@ mod tests {
         );
         assert_eq!(count(&periodic, "message_page_sweep_cursor"), (0, 0));
 
-        let (_cleanup_directory, cleanup) = open();
-        let operation = cleanup.admit_renderer_operation().unwrap();
-        sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, SweepBudget::UntilWrapped).unwrap();
-        assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1));
+        for budget in [SweepBudget::For(std::time::Duration::from_secs(600)), SweepBudget::UntilWrapped] {
+            let (_cleanup_directory, cleanup) = open();
+            let operation = cleanup.admit_renderer_operation().unwrap();
+            sweep_message_pages(Some(&admission), &cleanup, &operation, 1_000, budget).unwrap();
+            assert_eq!(count(&cleanup, "message_page_object_marks"), (limit + 1, limit + 1), "a sweep within its budget left the pass unfinished");
+            assert_eq!(count(&cleanup, "message_page_sweep_cursor"), (0, 0));
+        }
 
         // Marks past their grace go first, though the cursor has passed them,
         // and count toward the same batch.
         let grace = super::super::ASSET_GC_PRODUCT_MINIMUM_GRACE_MS;
         let (_expired_directory, expired) = open();
         let operation = expired.admit_renderer_operation().unwrap();
-        sweep_message_pages(Some(&admission), &expired, &operation, 1_000, SweepBudget::OneBatch).unwrap();
-        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000, spent).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, spent).unwrap();
         assert_eq!(count(&expired, "message_page_objects"), (1, 1), "expired marks waited for the cursor");
         assert_eq!(count(&expired, "message_page_object_marks"), (0, 0), "the batch went past its limit");
-        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, SweepBudget::OneBatch).unwrap();
+        sweep_message_pages(Some(&admission), &expired, &operation, 1_000 + grace, spent).unwrap();
         assert_eq!(count(&expired, "message_page_object_marks"), (1, 1));
         assert_eq!(count(&expired, "message_page_sweep_cursor"), (0, 0));
     }
@@ -3096,6 +3127,49 @@ mod tests {
         let maintenance = state.acquire_device_maintenance().unwrap();
         assert!(with_snapshot_directory(&state, super::super::snapshot::list).is_err());
         drop(maintenance);
+    }
+
+    /// The storage breakdown reads on a connection of its own. Maintenance ends it
+    /// before closing the store, or the reopen's truncate checkpoint finds its
+    /// snapshot still pinning the write-ahead log, as on an in-process iOS restart.
+    #[test]
+    fn maintenance_ends_a_running_storage_breakdown_before_the_store_reopens() {
+        use std::time::Duration;
+        let maintenances: [fn(&PersistentStoreState) -> StoreResult<DeviceMaintenanceGuard>; 2] = [
+            |state| state.acquire_cleanup_maintenance(Duration::from_secs(1)),
+            PersistentStoreState::acquire_device_maintenance,
+        ];
+        for maintenance in maintenances {
+            let directory = tempdir().unwrap();
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            crate::persistent_store::tests::asset_catalog_gc_tests::add_synthetic_character(&mut store, "reader", "");
+            let database = store.database_path.clone();
+            let state = PersistentStoreState::with_test_store(store);
+            // Maintenance in a parallel test also stops the breakdown, and a scan
+            // stopped before it reads drops the sender, so it starts again.
+            let started = (0..5).any(|_| {
+                let (reading, read) = std::sync::mpsc::channel();
+                super::super::storage_breakdown::start_for_test(vec![database.clone()], move |connection, _| {
+                    connection.execute_batch("BEGIN")?;
+                    connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))?;
+                    let _ = reading.send(());
+                    connection.query_row(
+                        "SELECT count(*) FROM (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n)",
+                        [],
+                        |row| row.get::<_, i64>(0).map(|count| count.to_string()),
+                    )
+                });
+                read.recv_timeout(Duration::from_secs(30)).is_ok()
+            });
+            assert!(started, "the breakdown never held a reader");
+            let root = directory.path().to_path_buf();
+            let (reopened, reopen) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = maintenance(&state).map(drop).and_then(|()| PersistentStore::open(&root).map(drop));
+                reopened.send(result).unwrap();
+            });
+            reopen.recv_timeout(Duration::from_secs(60)).expect("maintenance waits for the breakdown").unwrap();
+        }
     }
 
     #[test]
