@@ -1645,7 +1645,38 @@ pub(crate) fn pds_checkpoint(
 
 #[cfg(test)]
 thread_local! {
-    static CAPTURE_ARCHIVE_BUSY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static SNAPSHOT_ARCHIVE_BUSY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `operation` with the store and its snapshot archive. A snapshot list or delete holds the
+/// archive without the store, so a busy archive is waited for after the store is released.
+fn with_store_and_snapshot_archive<T>(
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+    operation: impl FnOnce(&mut PersistentStore, super::snapshot_archive::Archive) -> StoreResult<T>,
+) -> StoreResult<T> {
+    if !operation_guard.belongs_to(state) {
+        return Err(StoreError::Validation {
+            message: "renderer operation permit belongs to another persistent store".to_owned(),
+        });
+    }
+    loop {
+        let directory = {
+            let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
+                message: format!("persistent store mutex poisoned: {error}"),
+            })?;
+            let store = store.as_mut().ok_or_else(|| StoreError::Validation {
+                message: "persistent store has not been opened".to_owned(),
+            })?;
+            match super::snapshot_archive::Archive::try_open(&store.snapshots_dir)? {
+                Some(archive) => return operation(store, archive),
+                None => store.snapshots_dir.clone(),
+            }
+        };
+        #[cfg(test)]
+        SNAPSHOT_ARCHIVE_BUSY.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+        drop(super::snapshot_archive::Archive::open(&directory)?);
+    }
 }
 
 #[tauri::command(async)]
@@ -1657,7 +1688,7 @@ pub(crate) fn pds_snapshot_create(
     // A capture of a large library runs for minutes, so it leaves the async worker to other commands.
     logged("pds_snapshot_create", crate::async_worker::blocking(|| {
         let keep = super::snapshot::KeepCount::requested(keep_count)?;
-        let _operation = state.admit_renderer_operation()?;
+        let operation = state.admit_renderer_operation()?;
         let snapshot_operation =
             state
                 .snapshot_operations
@@ -1666,28 +1697,12 @@ pub(crate) fn pds_snapshot_create(
                     message: format!("persistent snapshot mutex poisoned: {error}"),
                 })?;
         let started = std::time::Instant::now();
-        let (mut archive, source, inventory) = loop {
-            let directory = {
-                let mut store = lock_store(&state.store).map_err(|error| StoreError::Store {
-                    message: format!("persistent store mutex poisoned: {error}"),
-                })?;
-                let store = store.as_mut().ok_or_else(|| StoreError::Validation {
-                    message: "persistent store has not been opened".to_owned(),
-                })?;
-                match super::snapshot_archive::Archive::try_open(&store.snapshots_dir)? {
-                    Some(archive) => {
-                        let inventory = store.active_readers.defer_asset_inventory();
-                        let source = super::snapshot::begin_capture(store, &archive, keep)?;
-                        break (archive, source, inventory);
-                    }
-                    None => store.snapshots_dir.clone(),
-                }
-            };
-            // A snapshot list or delete holds the archive without the store, so wait for it here.
-            #[cfg(test)]
-            CAPTURE_ARCHIVE_BUSY.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
-            drop(super::snapshot_archive::Archive::open(&directory)?);
-        };
+        let (mut archive, source, inventory) =
+            with_store_and_snapshot_archive(&state, &operation, |store, archive| {
+                let inventory = store.active_readers.defer_asset_inventory();
+                let source = super::snapshot::begin_capture(store, &archive, keep)?;
+                Ok((archive, source, inventory))
+            })?;
         // The store is free again while the leased revision is copied and archived.
         let result = source.copy().and_then(|(scratch, retention)| {
             super::snapshot::archive_scratch(&mut archive, scratch, retention, &reason, started)
@@ -1695,6 +1710,7 @@ pub(crate) fn pds_snapshot_create(
         drop(inventory);
         drop(archive);
         drop(snapshot_operation);
+        drop(operation);
         result
     }))
 }

@@ -188,7 +188,7 @@ fn a_capture_waits_for_a_busy_archive_without_holding_the_store() {
     let (busy_sent, busy) = mpsc::channel();
     let handle = app.handle().clone();
     let snapshot_worker = std::thread::spawn(move || {
-        CAPTURE_ARCHIVE_BUSY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || busy_sent.send(()).unwrap())));
+        SNAPSHOT_ARCHIVE_BUSY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || busy_sent.send(()).unwrap())));
         pds_snapshot_create(handle.state(), "periodic".into(), None)
     });
     let busy = busy.recv_timeout(Duration::from_secs(5));

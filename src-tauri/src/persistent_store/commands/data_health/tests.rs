@@ -2,7 +2,7 @@ use super::*;
 use crate::data_health::{codes, result_path, Severity};
 use crate::local_backup::NeverCancelled;
 use crate::persistent_store::{active_generation, PersistentStore};
-use crate::persistent_store::commands::{with_store_mutex, with_store_mutex_mut};
+use crate::persistent_store::commands::{with_store_mutex, with_store_mutex_mut, SNAPSHOT_ARCHIVE_BUSY};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::sync::Mutex;
@@ -350,8 +350,26 @@ fn the_repair_keeps_a_snapshot_of_the_library_it_was_selected_against() {
     }
     let diagnosis = last_result(&state).unwrap().unwrap();
     let keep_one = KeepCount::requested(Some(1)).unwrap();
-    let applied = apply_repair(&state, &health, &selection, Some(keep_one), diagnosis.revision, diagnosis.scanned_at).unwrap();
-    let kept = applied.snapshot.expect("a snapshot was asked for");
+    let snapshots = with_store_mutex_mut(&state, |store| Ok(store.snapshots_dir.clone())).unwrap();
+    // A snapshot list or delete can hold the archive; the repair waits for it without the store.
+    let (busy, read, applied) = std::thread::scope(|scope| {
+        let held = crate::persistent_store::snapshot_archive::Archive::open(&snapshots).unwrap();
+        let (busy_sent, busy) = std::sync::mpsc::channel();
+        let (state, health, selection) = (&state, &health, &selection);
+        let repair = scope.spawn(move || {
+            SNAPSHOT_ARCHIVE_BUSY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || busy_sent.send(()).unwrap())));
+            apply_repair(state, health, selection, Some(keep_one), diagnosis.revision, diagnosis.scanned_at)
+        });
+        let busy = busy.recv_timeout(std::time::Duration::from_secs(5));
+        let (read_sent, read) = std::sync::mpsc::channel();
+        scope.spawn(move || read_sent.send(with_store_mutex_mut(state, |store| store.revision())).unwrap());
+        let read = read.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        (busy, read, repair.join().unwrap())
+    });
+    assert!(busy.is_ok());
+    assert_eq!(read.unwrap().unwrap(), diagnosis.revision);
+    let kept = applied.unwrap().snapshot.expect("a snapshot was asked for");
     let guard = state.admit_renderer_operation().unwrap();
     let listed = with_store_mutex_admitted(&state, &guard, |store| store.snapshot_list()).unwrap();
     let listed: Vec<_> = listed.into_iter().map(|snapshot| snapshot.id).collect();

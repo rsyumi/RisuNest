@@ -3,8 +3,8 @@
 //! screen can show the last diagnosis and a deep scan can resume after a restart.
 
 use super::{
-    current_time_ms, with_store_mutex_admitted, with_store_mutex_mut_admitted,
-    PersistentStoreState, RendererOperationGuard,
+    current_time_ms, with_store_and_snapshot_archive, with_store_mutex_admitted,
+    with_store_mutex_mut_admitted, PersistentStoreState, RendererOperationGuard,
 };
 use crate::data_health::journal;
 use crate::data_health::repair::{self, RepairAction, RepairCandidate, RepairPreview};
@@ -493,8 +493,14 @@ fn apply_repair(
     // against rather than the repaired one.
     let snapshot = match snapshot {
         Some(keep) => Some(
-            with_store_mutex_mut_admitted(state, &operation_guard, |store| {
-                store.snapshot_create_keeping("data-health-repair", keep)
+            with_store_and_snapshot_archive(state, &operation_guard, |store, mut archive| {
+                store.lww_recover_intents()?;
+                crate::persistent_store::snapshot::create_in_archive(
+                    store,
+                    &mut archive,
+                    "data-health-repair",
+                    keep,
+                )
             })?
             .id,
         ),

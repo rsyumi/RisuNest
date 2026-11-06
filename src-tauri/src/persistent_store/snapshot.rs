@@ -417,6 +417,7 @@ pub(super) fn checkpoint(connection: &Connection, mode: CheckpointMode) -> Store
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn create(
     store: &mut super::PersistentStore,
     reason: &str,
@@ -426,7 +427,7 @@ pub(super) fn create(
     create_in_archive(store, &mut archive, reason, keep)
 }
 
-fn create_in_archive(
+pub(super) fn create_in_archive(
     store: &mut super::PersistentStore,
     archive: &mut Archive,
     reason: &str,
