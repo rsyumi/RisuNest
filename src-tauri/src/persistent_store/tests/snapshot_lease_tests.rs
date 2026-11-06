@@ -202,7 +202,7 @@ fn snapshot_restore_stages_large_message_manifests_and_archive_metadata() {
     use risunest_sync_wire::{descriptor::RecordDescriptor,unit::{UnitKey,UnitValue}};
     let (_directory,mut store,database)=open_fixture();
     let mut archive=Archive::open(&store.snapshots_dir).unwrap();
-    let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive).unwrap();
+    let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive,super::super::snapshot::KeepCount::MAX).unwrap();
     let source=Connection::open(&scratch.path).unwrap();
     source.execute_batch("BEGIN").unwrap();
     let (mut units,mut bodies,large)=super::super::external_capture::large_metadata_fixture();
@@ -252,7 +252,7 @@ fn snapshot_restore_rejects_damaged_large_units_and_oversized_reference_pages() 
         let revision=store.revision().unwrap();
         let clock=serde_json::to_value(store.lww_clock_state().unwrap()).unwrap();
         let mut archive=Archive::open(&store.snapshots_dir).unwrap();
-        let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive).unwrap();
+        let (scratch,_)=super::super::snapshot::capture_scratch(&mut store,&archive,super::super::snapshot::KeepCount::MAX).unwrap();
         let source=Connection::open(&scratch.path).unwrap();
         let key=UnitKey::new(&["record","plugins","synthetic-snapshot-plugin"]).unwrap();
         let encoded:String=source.query_row("SELECT value FROM snapshot_original_units WHERE key=?1",[key.as_str()],|row|row.get(0)).unwrap();
@@ -1128,33 +1128,6 @@ fn ninth_snapshot_removes_the_oldest_and_leaves_eight() {
             "ok"
         );
     }
-}
-
-#[test]
-fn the_device_keep_count_bounds_rotation_and_an_invalid_count_keeps_eight() {
-    let (_directory, mut store, _) = open_fixture();
-    // Stored as the renderer stores it: the settings object as JSON text.
-    let keep = |store: &PersistentStore, count: Value| {
-        let text = json!({ "automaticSnapshotsEnabled": true, "snapshotKeepCount": count }).to_string();
-        store.device_store().unwrap().write_setting("risuNestDeviceSettings", &Value::String(text)).unwrap();
-    };
-    let mut ids = Vec::new();
-    let create = |store: &mut PersistentStore, ids: &mut Vec<String>| {
-        ids.push(store.snapshot_create("manual").unwrap().id);
-        thread::sleep(Duration::from_millis(10));
-    };
-    keep(&store, json!(2));
-    for _ in 0..3 {
-        create(&mut store, &mut ids);
-    }
-    let listed: Vec<_> = store.snapshot_list().unwrap().into_iter().map(|s| s.id).collect();
-    assert_eq!(listed, vec![ids[2].clone(), ids[1].clone()]);
-
-    keep(&store, json!(0));
-    for _ in 0..2 {
-        create(&mut store, &mut ids);
-    }
-    assert_eq!(store.snapshot_list().unwrap().len(), 4);
 }
 
 #[test]

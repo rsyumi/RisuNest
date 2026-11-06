@@ -5,7 +5,7 @@ import { isTauriIOS, isTauriMobile } from '../platform'
 import { NativeFileJobError, runNativeSnapshotRestore, type NativeFileJobStatus, type NativeSnapshotBodiesStarted, type NativeSnapshotBodyResult, type NativeSnapshotRestoreActivation } from './nativeFileJobs'
 import { nativeFileOperationOutcomeShown, runSharedNativeFileOperation, waitForSnapshotBodyOutcomeDismissal } from './nativeFileJobManager'
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
-import { flushDeviceSettings, getDeviceSettings } from './deviceSettings'
+import { getDeviceSettings } from './deviceSettings'
 import type {
     DataHealthResult,
     RepairApplied,
@@ -116,15 +116,14 @@ function runUserMaintenance<T>(command: string, args?: Record<string, unknown>):
     return runWithMobileBackgroundTask('maintenance', () => args === undefined ? invoke<T>(command) : invoke<T>(command, args), undefined, true)
 }
 
-// The native rotation reads the keep count from the device store, so a change
-// still on its way there lands before the snapshot is taken.
-async function settleDeviceSettings(): Promise<void> {
-    await flushDeviceSettings().catch(() => undefined)
+// Every snapshot request carries the keep count this device shows, which the
+// native rotation applies.
+function snapshotKeepCount(): number {
+    return getDeviceSettings().snapshotKeepCount
 }
 
-export async function createNativePersistentSnapshot(reason: string): Promise<NativeSnapshotCreated> {
-    await settleDeviceSettings()
-    return runUserMaintenance('pds_snapshot_create', { reason })
+export function createNativePersistentSnapshot(reason: string): Promise<NativeSnapshotCreated> {
+    return runUserMaintenance('pds_snapshot_create', { reason, keepCount: snapshotKeepCount() })
 }
 
 export function listNativePersistentSnapshots(): Promise<NativeSnapshotInfo[]> {
@@ -176,14 +175,13 @@ export function previewNativeDataHealthRepair(selection: string[], expectedScann
     return invoke('pds_data_health_repair_preview', { selection, expectedScannedAt })
 }
 
-export async function applyNativeDataHealthRepair(
+export function applyNativeDataHealthRepair(
     selection: string[],
     snapshot: boolean,
     expectedRevision: number,
     expectedScannedAt: number,
 ): Promise<RepairApplied> {
-    if (snapshot) await settleDeviceSettings()
-    return runUserMaintenance('pds_data_health_repair_apply', { selection, snapshot, expectedRevision, expectedScannedAt })
+    return runUserMaintenance('pds_data_health_repair_apply', { selection, snapshot, keepCount: snapshotKeepCount(), expectedRevision, expectedScannedAt })
 }
 
 export function discardNativeDataHealthIntent(
@@ -364,9 +362,11 @@ export async function createPeriodicNativeSnapshotIfDue(
         newestModifiedAt <= now
         && now - newestModifiedAt < PERIODIC_SNAPSHOT_INTERVAL_MS
     ) return null
-    await settleDeviceSettings()
+    // The switch may have been turned off while the list was read.
+    const settings = getDeviceSettings()
+    if (!settings.automaticSnapshotsEnabled) return null
     // Periodic work runs only while the app is visible, so it holds nothing.
-    return invoke<NativeSnapshotCreated>('pds_snapshot_create', { reason: 'periodic' })
+    return invoke<NativeSnapshotCreated>('pds_snapshot_create', { reason: 'periodic', keepCount: settings.snapshotKeepCount })
 }
 
 export function sweepNativeMessageObjects(): Promise<void> {

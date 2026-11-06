@@ -2853,8 +2853,17 @@ impl PersistentStore {
         }
     }
 
+    pub(crate) fn snapshot_create_keeping(
+        &mut self,
+        reason: &str,
+        keep: snapshot::KeepCount,
+    ) -> StoreResult<SnapshotCreated> {
+        snapshot::create(self, reason, keep)
+    }
+
+    #[cfg(test)]
     pub(crate) fn snapshot_create(&mut self, reason: &str) -> StoreResult<SnapshotCreated> {
-        snapshot::create(self, reason)
+        self.snapshot_create_keeping(reason, snapshot::KeepCount::MAX)
     }
 
     pub(crate) fn snapshot_list(&self) -> StoreResult<Vec<SnapshotInfo>> {

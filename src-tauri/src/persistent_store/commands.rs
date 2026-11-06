@@ -1645,8 +1645,10 @@ pub(crate) fn pds_checkpoint(
 pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
+    keep_count: Option<u32>,
 ) -> Result<SnapshotCreated, StoreError> {
     logged("pds_snapshot_create", (|| {
+        let keep = super::snapshot::KeepCount::requested(keep_count)?;
         let _operation = state.admit_renderer_operation()?;
         let snapshot_operation =
             state
@@ -1666,7 +1668,7 @@ pub(crate) fn pds_snapshot_create(
             let archive = super::snapshot_archive::Archive::open(&store.snapshots_dir)?;
             let inventory = store.active_readers.defer_asset_inventory();
             let (scratch, retention) =
-                super::snapshot::capture_scratch(store, &archive)?;
+                super::snapshot::capture_scratch(store, &archive, keep)?;
             (archive, scratch, retention, inventory)
         };
         let result = super::snapshot::archive_scratch(

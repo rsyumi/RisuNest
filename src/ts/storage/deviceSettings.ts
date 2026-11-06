@@ -20,7 +20,7 @@ export interface RisuNestDeviceSettings {
     messageSendKey: MessageSendKey
     pluginOutputCurrentChatOnly: boolean
     automaticSnapshotsEnabled: boolean
-    /** Read natively when a snapshot is created; see `snapshot_keep_count` in Rust. */
+    /** Sent with every snapshot request; see `KeepCount` in Rust. */
     snapshotKeepCount: number
 }
 
