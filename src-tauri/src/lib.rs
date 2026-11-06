@@ -71,6 +71,7 @@ mod regex_shadow;
 #[cfg(not(target_os = "android"))]
 mod renderer_recovery;
 mod server_sync;
+mod slow_log;
 mod sqlite_open;
 mod trust_boundary;
 #[cfg(test)]
@@ -602,6 +603,7 @@ fn builder_with_main_window(
             );
             setup_native_log_state.configure_file_path(&app_data_dir);
             app.manage(setup_native_log_state.clone());
+            slow_log::start_stall_watch();
             app.manage(app_cleanup::CleanupState::initialize(app.handle())?);
             app.manage(native_file_jobs::NativeFileJobState::initialize(
                 app_data_dir.join("native-file-jobs"),

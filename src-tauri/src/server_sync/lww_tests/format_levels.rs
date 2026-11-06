@@ -143,6 +143,9 @@ fn a_lost_race_for_an_empty_library_follows_the_level_its_refusal_reports() {
             router.layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| async move {
                     if request.headers().contains_key(PRECONDITION_HEADER) {
+                        // Read the push before refusing it, as the Sync server does; an unread body
+                        // can reset the connection before the client reads the refusal.
+                        axum::body::to_bytes(request.into_body(), MAX_METADATA_BYTES).await.unwrap();
                         return axum::response::Response::builder()
                             .status(409)
                             .header(HEADER, level)

@@ -4140,6 +4140,7 @@ mod tests {
         let (release, released) = mpsc::sync_channel(1);
         let (completed, completion) = mpsc::sync_channel(1);
         let (built, mut packs) = tokio::sync::mpsc::channel(2);
+        let spawned = Instant::now();
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || {
                 let _hook = BoundaryHook::install(move || {
@@ -4154,7 +4155,10 @@ mod tests {
                     &PhaseProgress::silent(), &worker_cancel);
                 completed.send(outcome.err().map(|error| error.kind)).unwrap();
             });
-            arrival.recv_timeout(Duration::from_secs(10)).expect("first carried chunk did not finish");
+            // The worker first queues for the process-wide CPU permit, which concurrent tests
+            // can hold for seconds, so this bound only turns a deadlock into a failure.
+            arrival.recv_timeout(Duration::from_secs(300)).unwrap_or_else(|error| panic!(
+                "first carried chunk did not finish: {error} after {} ms", spawned.elapsed().as_millis()));
             let stopped_at = Instant::now();
             cancel.cancel();
             release.send(()).unwrap();

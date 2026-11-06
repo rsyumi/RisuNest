@@ -4,7 +4,7 @@ import { registerGeneratingConversation } from '../storage/generatingConversatio
 import { openGenerationRequestPhase } from './generationRequestPhase'
 import { noteGenerationMessage, noteGenerationStarted } from './generationEnd'
 import { boundedGenerationFallbackReason } from './boundedGenerationAdmission'
-import { generationDiagnostics, type GenerationDiagnosticAdmission, type GenerationDiagnosticFallback, type GenerationDiagnosticOutcome, type GenerationDiagnosticPhase, type GenerationDiagnosticPhaseDetails, type GenerationDiagnosticTrace, type GenerationSavePath } from '../generationDiagnostics'
+import { generationDiagnostics, type GenerationDiagnosticAdmission, type GenerationDiagnosticFallback, type GenerationDiagnosticOutcome, type GenerationDiagnosticPhase, type GenerationDiagnosticPhaseDetails, type GenerationDiagnosticTrace, type GenerationFailureReason, type GenerationSavePath } from '../generationDiagnostics'
 import { get, writable } from "svelte/store";
 import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, setCurrentChat, type Message } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
@@ -69,7 +69,7 @@ import {
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
-import { ensureCurrentConversationMessageIds } from '../conversationMutations'
+import { ensureCurrentConversationMessageIds, writeConversationMetadata } from '../conversationMutations'
 import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
@@ -232,9 +232,16 @@ interface GenerationCompletionLifecycle {
     diagnostics: GenerationDiagnosticTrace
     admission: GenerationDiagnosticAdmission
     diagnosticOutcome?: GenerationDiagnosticOutcome
+    /** Why the open phase is failing; recorded only with a failed exit. */
+    diagnosticReason?: GenerationFailureReason
     enterDiagnosticPhase(phase: GenerationDiagnosticPhase, details?: GenerationDiagnosticPhaseDetails): void
     finishDiagnosticPhase(outcome?: GenerationDiagnosticOutcome): void
     savePath(): GenerationSavePath
+}
+
+function preparationFailed(lifecycle: GenerationCompletionLifecycle, reason: GenerationFailureReason): false {
+    lifecycle.diagnosticReason = reason
+    return false
 }
 
 function diagnosticFallback(reason: string | null): GenerationDiagnosticFallback {
@@ -766,7 +773,9 @@ export async function sendChat(arg:{
             diagnostics.phase(phase, 'enter', details)
         },
         finishDiagnosticPhase(outcome = 'ok') {
-            if (activeDiagnosticPhase) diagnostics.phase(activeDiagnosticPhase, 'exit', { outcome })
+            if (activeDiagnosticPhase) diagnostics.phase(activeDiagnosticPhase, 'exit', {
+                outcome, reason: outcome === 'failed' ? lifecycle.diagnosticReason : undefined,
+            })
             activeDiagnosticPhase = null
         },
         savePath() {
@@ -821,6 +830,7 @@ export async function sendChat(arg:{
         lifecycle.diagnosticOutcome ??= result ? 'ok' : 'failed'
         return lifecycle.isTargetCurrent() && result
     } catch (error) {
+        lifecycle.diagnosticReason ??= error instanceof PersistentMutationFencedError ? 'fenced' : 'error'
         if (generationSignal?.signal?.aborted || arg.signal?.aborted) {
             generationReturned = true
             return false
@@ -1210,7 +1220,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     if (interactionAuthority) {
         if (interactionAuthority.characterId !== nowChatroom.chaId
             || interactionAuthority.conversationId !== nowChatroom.chats[nowChatroom.chatPage]?.id
-            || !recordSelectedCharacterLastInteraction(interactionAuthority, nowChatroom.lastInteraction, interactionTime)) return false
+            || !recordSelectedCharacterLastInteraction(interactionAuthority, nowChatroom.lastInteraction, interactionTime)) return preparationFailed(lifecycle, 'conversation-changed')
         nowChatroom.lastInteraction = interactionTime
     } else if (characterDetailWritable()) {
         nowChatroom.lastInteraction = interactionTime
@@ -1224,7 +1234,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             nowChatroom.chaId,
             historyWindow ? nowChatroom.chats[selectedChat] : selectedConversation,
         )
-    ) return false
+    ) return preparationFailed(lifecycle, 'conversation-changed')
     if (!boundedChat) {
         ensureCurrentConversationMessageIds(
             nowChatroom,
@@ -1839,7 +1849,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         if (!historyWindow) setCurrentChat(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            return false
+            return preparationFailed(lifecycle, 'trigger-stop')
         }
     }
 
@@ -2117,6 +2127,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
     
+    // A session-owned chat records memory state through its session, so the save covers it.
+    const writeChatMetadata = (chat: Chat, values: Partial<Omit<Chat, 'message'>>) =>
+        writeConversationMetadata(nowChatroom, chat, getActiveConversationSession(), values)
+    const writeMemoryMetadata = (values: Partial<Omit<Chat, 'message'>>) => {
+        writeChatMetadata(currentChat, values)
+        writeChatMetadata(DBState.db.characters[selectedChar].chats[selectedChat], values)
+    }
     if(nowChatroom.supaMemory && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypav2 || DBState.db.hypaV3)){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
         chatProcessStage.set(2)
@@ -2129,7 +2146,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             })
 
             if(hn === false){
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
 
             chats = hn.chats
@@ -2142,12 +2159,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                 if (abortSignal.aborted) return false
                 console.log(sp)
                 throwError(sp.error)
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
-            currentChat.hypaV2Data = sp.memory ?? currentChat.hypaV2Data
-            DBState.db.characters[selectedChar].chats[selectedChat].hypaV2Data = currentChat.hypaV2Data
+            writeMemoryMetadata({ hypaV2Data: sp.memory ?? currentChat.hypaV2Data })
 
             currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
             console.log("[Expected to be updated] chat's HypaV2Data: ", currentChat.hypaV2Data)
@@ -2173,29 +2189,29 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             if(sp.error){
                 // Save new summary
                 if (sp.memory) {
-                    currentChat.hypaV3Data = sp.memory
                     if (conversationResources.windowedController) {
+                        currentChat.hypaV3Data = sp.memory
                         if (!conversationResources.windowedController.applyRange(
                             0, 0, [], 'update-metadata',
                         )) throw new PersistentMutationFencedError()
                     } else {
-                        DBState.db.characters[selectedChar].chats[selectedChat].hypaV3Data = currentChat.hypaV3Data
+                        writeMemoryMetadata({ hypaV3Data: sp.memory })
                     }
                 }
                 if (abortSignal.aborted) return false
                 console.log(sp)
                 throwError(sp.error)
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
-            currentChat.hypaV3Data = sp.memory ?? currentChat.hypaV3Data
             if (conversationResources.windowedController) {
+                currentChat.hypaV3Data = sp.memory ?? currentChat.hypaV3Data
                 if (!conversationResources.windowedController.applyRange(
                     0, 0, [], 'update-metadata',
                 )) throw new PersistentMutationFencedError()
             } else {
-                DBState.db.characters[selectedChar].chats[selectedChat].hypaV3Data = currentChat.hypaV3Data
+                writeMemoryMetadata({ hypaV3Data: sp.memory ?? currentChat.hypaV3Data })
                 currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
             }
             if (abortSignal.aborted) return false
@@ -2207,14 +2223,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             })
             if(sp.error){
                 throwError(sp.error)
-                return false
+                return preparationFailed(lifecycle, 'memory-failed')
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
-            currentChat.supaMemoryData = sp.memory ?? currentChat.supaMemoryData
-            DBState.db.characters[selectedChar].chats[selectedChat].supaMemoryData = currentChat.supaMemoryData
+            writeMemoryMetadata({ supaMemoryData: sp.memory ?? currentChat.supaMemoryData })
             console.log(currentChat.supaMemoryData)
-            currentChat.lastMemory = sp.lastId ?? currentChat.lastMemory;
+            writeChatMetadata(currentChat, { lastMemory: sp.lastId ?? currentChat.lastMemory })
         }
         stageTimings.stage2Duration = Date.now() - stageTimings.stage2Start
         chatProcessStage.set(1)
@@ -2225,13 +2240,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             if(chats.length <= 1){
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
 
-                return false
+                return preparationFailed(lifecycle, 'token-limit')
             }
 
             currentTokens -= await tokenizer.tokenizeChat(chats[0])
             chats.splice(0, 1)
         }
-        currentChat.lastMemory = chats[0].memo
+        writeChatMetadata(currentChat, { lastMemory: chats[0].memo })
     }
 
     let biases:[string,number][] = DBState.db.bias.concat(currentChar.bias).map((v) => {
@@ -2590,7 +2605,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
-                return false
+                return preparationFailed(lifecycle, 'token-limit')
             }
             if(formated[pointer].removable){
                 inputTokens -= await tokenizer.tokenizeChat(formated[pointer])

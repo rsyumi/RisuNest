@@ -521,3 +521,105 @@ fn appended_plugin_storage_batches_stage_like_the_whole_root() {
         ("plugin_storage", "ordinal"),
     ]);
 }
+
+#[test]
+fn database_only_replacement_drops_forwarded_aliases_that_no_staged_value_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let aliases = [
+        ("asset", "assets/root.bin"), ("asset", "assets/preset.bin"), ("asset", "assets/character.bin"),
+        ("asset", "assets/conversation.bin"), ("inlay", "message-inlay"), ("asset", "assets/key-only.bin"),
+        ("asset", "assets/unnamed.bin"),
+    ]
+    .map(|(kind, key)| AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("ab".repeat(32)),
+        kind: kind.to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: key.to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: (kind == "inlay").then(|| "image".to_owned()),
+        width: None,
+        height: None,
+        metadata: json!({}),
+    });
+    let initial = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&initial, &json!({})).unwrap();
+    store.replace_put_asset_aliases(&initial, &aliases).unwrap();
+    store.replace_commit(&initial, Some(0)).unwrap();
+    let character = json!({
+        "type": "character", "chaId": "named", "name": "Synthetic",
+        "emotionImages": [["happy", "assets/character.bin"]],
+        "notes": { "assets/key-only.bin": true },
+        "chats": [{
+            "id": "chat", "name": "Chat", "extra": { "background": "assets/conversation.bin" },
+            "message": [{ "role": "user", "data": "see {{inlay::message-inlay}}", "chatId": "m1" }]
+        }]
+    });
+    let all = aliases.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>();
+    // A character whose additionalAssets is not an array leaves the scan incomplete.
+    for (additional_assets, kept) in [(json!({}), all.clone()), (json!([]), all[..5].to_vec())] {
+        let revision = store.revision().unwrap();
+        let stage = store.replace_begin().unwrap().staging_id;
+        store.replace_put_root(&stage, &json!({ "activeAsset": "assets/root.bin" })).unwrap();
+        store.replace_put_presets(&stage, &[json!({ "id": "preset", "name": "Preset", "mainPrompt": "assets/preset.bin" })]).unwrap();
+        let mut character = character.clone();
+        character["additionalAssets"] = additional_assets;
+        store.replace_add_characters(&stage, &[character]).unwrap();
+        store.replace_preserve_repositories(&stage, Some(revision)).unwrap();
+        store.replace_commit(&stage, Some(revision)).unwrap();
+        let surviving = aliases
+            .iter()
+            .filter(|alias| store.read_asset_alias(&alias.kind, &alias.key, None).unwrap().is_some())
+            .map(|alias| alias.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(surviving, kept);
+    }
+}
+
+#[test]
+fn database_only_replacement_keeps_character_owner_heads_only_for_unchanged_assets() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = PersistentStore::open(directory.path()).unwrap();
+    let character = |id: &str, assets: Option<Value>| {
+        let mut character = json!({ "type": "character", "chaId": id, "name": id, "chats": [] });
+        if let Some(assets) = assets { character["additionalAssets"] = assets; }
+        character
+    };
+    let owner = |id: &str| AssetOwnerLocator::CharacterAdditionalAssets { character_id: id.to_owned() };
+    let heads = [
+        ("kept", AssetOwnerHead::present(owner("kept"), "11".repeat(32), 1)),
+        ("changed", AssetOwnerHead::present(owner("changed"), "22".repeat(32), 1)),
+        ("absent", AssetOwnerHead::absent(owner("absent"))),
+        ("malformed", AssetOwnerHead::absent(owner("malformed"))),
+    ];
+    let initial = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&initial, &json!({})).unwrap();
+    store.replace_add_characters(&initial, &[
+        character("kept", Some(json!([["a", "assets/a", "bin"]]))),
+        character("changed", Some(json!([["b", "assets/b", "bin"]]))),
+        character("absent", None),
+        character("malformed", None),
+    ]).unwrap();
+    store.replace_put_asset_owner_heads(&initial, &heads.clone().map(|(_, head)| head)).unwrap();
+    store.replace_commit(&initial, Some(0)).unwrap();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage, &json!({})).unwrap();
+    let mut kept = character("kept", Some(json!([["a", "assets/a", "bin"]])));
+    kept["name"] = json!("Renamed");
+    store.replace_add_characters(&stage, &[
+        kept,
+        character("changed", Some(json!([["c", "assets/c", "bin"]]))),
+        character("absent", None),
+        character("malformed", Some(json!({}))),
+    ]).unwrap();
+    store.replace_preserve_repositories(&stage, Some(1)).unwrap();
+    store.replace_commit(&stage, Some(1)).unwrap();
+    let retained = heads
+        .iter()
+        .filter(|(_, head)| store.read_asset_owner_head(&head.owner, None).unwrap().is_some_and(|stored| stored.value == *head))
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    assert_eq!(retained, ["kept", "absent"]);
+}

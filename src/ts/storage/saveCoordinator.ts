@@ -34,6 +34,12 @@ import {
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 import { applyConversationBindingPatch, conversationBindingHolds, type ConversationBindingPatch } from './conversationBinding'
+import {
+    applyCharacterDetailPatch,
+    captureCharacterDetailFields,
+    unchangedCharacterDetailPatch,
+    type CharacterDetailPatch,
+} from './characterDetailPatch'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
 import type {
     ActiveConversationMutationEvent,
@@ -265,6 +271,65 @@ interface PendingCharacterAddition {
 interface PendingConversationMutation {
     event: ActiveConversationMutationEvent
     recordedAt: number
+    /** The session version of every recorded event this entry carries, in order. */
+    versions: number[]
+    /** Running flushes whose captured list holds this entry; nothing folds into a captured entry. */
+    captures: number
+}
+
+/**
+ * Folds a later event into `target` when it only rewrites messages that the last range of
+ * `target` inserted and keeps the message count, so a streamed reply keeps one entry with its
+ * latest content and metadata. Returns false, leaving `target` unchanged, when it does not apply.
+ */
+function foldConversationMutation(
+    target: PendingConversationMutation,
+    next: ActiveConversationMutationEvent,
+    versions: readonly number[],
+): boolean {
+    const event = target.event
+    const last = event.mutations.at(-1)
+    const range = next.mutations.length === 1 ? next.mutations[0] : undefined
+    if (
+        target.captures !== 0 ||
+        !last ||
+        !range ||
+        event.characterId !== next.characterId ||
+        event.conversationId !== next.conversationId ||
+        event.sessionToken !== next.sessionToken ||
+        next.previousVersion !== event.sessionVersion ||
+        range.completeOwner ||
+        event.mutations.some((mutation) => mutation.completeOwner) ||
+        range.deleteCount !== range.messages.length ||
+        range.start < last.start ||
+        range.start + range.deleteCount > last.start + last.messages.length ||
+        // A replacement without lastDate keeps the stored recency, so an earlier lastDate must still be written.
+        (event.conversation.lastDate != null && !Number.isSafeInteger(next.conversation.lastDate))
+    )
+        return false
+    const messages = last.messages.slice()
+    replaceArrayRange(messages, range.start - last.start, range.deleteCount, range.messages)
+    const { displayVariableUpdate, variableUpdate, ...rest } = event
+    target.event = {
+        ...rest,
+        ...(displayVariableUpdate && next.displayVariableUpdate ? { displayVariableUpdate } : {}),
+        ...(variableUpdate && next.variableUpdate
+            ? { variableUpdate: {
+                ...(variableUpdate.origin === next.variableUpdate.origin && variableUpdate.origin ? { origin: variableUpdate.origin } : {}),
+                keys: [...new Set([...variableUpdate.keys, ...next.variableUpdate.keys])],
+            } }
+            : {}),
+        sessionVersion: next.sessionVersion,
+        commands: [...new Set([...event.commands, ...next.commands])],
+        mutations: [...event.mutations.slice(0, -1), { ...last, messages, sessionVersion: next.sessionVersion }],
+        conversation: next.conversation,
+    }
+    for (const version of versions) target.versions.push(version)
+    return true
+}
+
+function releaseConversationMutationCaptures(held: PendingConversationMutation[]): void {
+    for (const pending of held.splice(0)) pending.captures -= 1
 }
 
 interface PendingWindowedActivationChange {
@@ -616,6 +681,12 @@ export interface PersistentSelectedConversation {
 export type PersistentCharacterDetailMutation = (
     state: PersistentCharacterMutationState,
 ) => void | { delete: true } | Promise<void | { delete: true }>
+
+/** Edits the stored record of a character, which holds no chats. Its chat folders stay as they are. */
+export type CharacterDetailFieldsMutation = (state: { character: CharacterDetail }) => void | Promise<void>
+
+/** The in-memory record of a character that shows its committed fields, or undefined when none holds them. */
+export type ResidentCharacterRecord = () => object | undefined
 
 export type PersistentCompleteCharacterMutation = (
     character: CompleteCharacter,
@@ -1234,7 +1305,32 @@ export class SaveCoordinator {
 
         const detached = safeStructuredClone(event)
         this.markPersistentDataDirty(estimatedBytes)
-        this.pendingConversationMutations.push({ event: detached, recordedAt: this.currentTime() })
+        const newest = this.pendingConversationMutations.at(-1)
+        if (newest && foldConversationMutation(newest, detached, [detached.sessionVersion])) return
+        this.pendingConversationMutations.push({
+            event: detached,
+            recordedAt: this.currentTime(),
+            versions: [detached.sessionVersion],
+            captures: 0,
+        })
+    }
+
+    /** Folds adjacent uncaptured entries, so retries after a failed save do not pile up entries. */
+    private foldPendingConversationMutations(): void {
+        const folded: PendingConversationMutation[] = []
+        for (const pending of this.pendingConversationMutations) {
+            const previous = folded.at(-1)
+            if (
+                previous &&
+                pending.captures === 0 &&
+                foldConversationMutation(previous, pending.event, pending.versions)
+            )
+                continue
+            folded.push(pending)
+        }
+        if (folded.length !== this.pendingConversationMutations.length) {
+            this.pendingConversationMutations = folded
+        }
     }
 
     /**
@@ -1366,7 +1462,10 @@ export class SaveCoordinator {
     get pendingConversationMutationDiagnostics(): { pendingEvents: number; unacknowledgedMs?: number } {
         const oldest = this.pendingConversationMutations[0]
         return {
-            pendingEvents: this.pendingConversationMutations.length,
+            pendingEvents: this.pendingConversationMutations.reduce(
+                (count, pending) => count + pending.versions.length,
+                0,
+            ),
             unacknowledgedMs: oldest ? Math.max(0, this.currentTime() - oldest.recordedAt) : undefined,
         }
     }
@@ -1905,6 +2004,79 @@ export class SaveCoordinator {
                 this.currentRevision = error.actualRevision
             }
         }
+    }
+
+    /**
+     * Commits fields of a character's own record (everything outside its chats) by reading and
+     * writing only that record, so a windowed selected conversation keeps its messages unread. The
+     * baseline advances by the committed fields only, and the in-memory record takes each committed
+     * field it still holds as it was when the mutation started. A field edited in memory meanwhile
+     * keeps that edit, which the next save stores. Resolves false when the store holds no such
+     * character, and true once the change is stored or nothing differs from the stored record.
+     */
+    mutateCharacterDetailFields(
+        characterId: string,
+        reason: string,
+        mutate: CharacterDetailFieldsMutation,
+        readResident: ResidentCharacterRecord,
+    ): Promise<boolean> {
+        this.assertInitialized()
+        this.assertPersistentMutationAllowed()
+        return this.enqueue(async () => {
+            await this.flushIterations(reason, true)
+            const residentAtStart = readResident()
+            const fieldsAtStart = residentAtStart ? captureCharacterDetailFields(residentAtStart) : null
+            const revision = this.revision
+            const stored = await this.dependencies.store.readCharacter(characterId)
+            if (!stored) return false
+            this.assertReadRevision(revision, stored.revision)
+            if (stored.value.chaId !== characterId) {
+                throw new Error(`Character ${characterId} returned mismatched detail`)
+            }
+            const character = canonicalClone(stored.value)
+            await mutate({ character })
+            // Folders belong to the conversation order unit, which this write does not touch.
+            const fixedFields = new Set(['chats', 'chaId', 'chatFolders'])
+            for (const field of fixedFields) {
+                if (canonicalJson({ value: (character as unknown as Record<string, unknown>)[field] }) !==
+                    canonicalJson({ value: (stored.value as unknown as Record<string, unknown>)[field] })) {
+                    throw new TypeError('A character detail mutation cannot change its identity, chats or chat folders')
+                }
+            }
+            const changes = diffFields(['character', characterId], stored.value, character, fixedFields)
+            if (!changes.length) return true
+            const committed = await this.commitRoutine({ expectedRevision: this.revision, unitMutations: changes })
+            this.currentRevision = committed.revision
+            const clonePatch = (): CharacterDetailPatch => Object.fromEntries(changes.map((change) => [
+                (JSON.parse(change.key) as string[])[2],
+                change.type === 'set' ? canonicalClone(change.value) : undefined,
+            ]))
+            // Advance only these fields in the baselines; concurrent unrelated edits remain dirty.
+            if (this.windowedCharacterBaseline?.authority.characterId === characterId) {
+                const baseline = this.windowedCharacterBaseline
+                applyCharacterDetailPatch(baseline.shell, clonePatch())
+                baseline.shellCanonical = canonicalJson(baseline.shell)
+            } else if (this.characterBaselineId === characterId && this.characterBaseline) {
+                const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+                applyCharacterDetailPatch(baseline, clonePatch())
+                this.characterBaseline = canonicalJson(baseline)
+            }
+            const materialized = this.materializedBaselines.get(characterId)
+            if (materialized) {
+                this.materializedBaselines.set(characterId, applyCharacterDetailPatch({ ...materialized }, clonePatch()))
+            }
+            // The UI must not share nested values with the persisted baselines.
+            const resident = readResident()
+            if (resident) {
+                applyCharacterDetailPatch(resident, fieldsAtStart
+                    ? unchangedCharacterDetailPatch(clonePatch(), resident, fieldsAtStart)
+                    : clonePatch())
+            }
+            this.dependencies.onStorageOnlyRevision?.(committed.revision)
+            this.dependencies.onLocalRevision?.(committed.revision)
+            await this.finishExplicitCommit(committed.revision)
+            return true
+        })
     }
 
     mutatePersistentCharacterDetail(
@@ -2880,13 +3052,21 @@ export class SaveCoordinator {
 
     private async flushIterations(reason: string, publishOfficial: boolean): Promise<void> {
         const localState = { settled: true }
+        const capturedConversationMutations: PendingConversationMutation[] = []
         try {
-            await this.flushIterationsUntilIdle(reason, publishOfficial, localState)
+            await this.flushIterationsUntilIdle(
+                reason,
+                publishOfficial,
+                localState,
+                capturedConversationMutations,
+            )
         } catch (error) {
             if (!localState.settled && !(error instanceof PersistentMutationFencedError)) {
                 this.setLocalSaveFailure(error)
             }
             throw error
+        } finally {
+            releaseConversationMutationCaptures(capturedConversationMutations)
         }
     }
 
@@ -2894,6 +3074,7 @@ export class SaveCoordinator {
         _reason: string,
         publishOfficial: boolean,
         localState: { settled: boolean },
+        capturedConversationMutations: PendingConversationMutation[],
     ): Promise<void> {
         if (this.committedRefreshRevision !== null) throw new PersistentMutationFencedError()
         if (this.destructiveReplacementFence) publishOfficial = false
@@ -2905,12 +3086,19 @@ export class SaveCoordinator {
         }
         while (true) {
             localState.settled = false
+            // The previous pass no longer reads its entries, so they may fold again.
+            releaseConversationMutationCaptures(capturedConversationMutations)
             if (this.pendingCharacterAddition && !this.pendingCharacterAddition.locallyAdded) {
                 await this.commitPendingCharacterAddition(publishOfficial)
             }
             const generation = this.dirtyGeneration
             const captured = this.capture()
+            this.foldPendingConversationMutations()
             const pendingConversationMutations = [...this.pendingConversationMutations]
+            for (const pending of pendingConversationMutations) {
+                pending.captures += 1
+                capturedConversationMutations.push(pending)
+            }
             const windowedCapture = this.requireMatchingWindowedCapture(captured)
             let yieldedAfterCapture = windowedCapture !== null
             const selectionSwitched =
@@ -4425,16 +4613,18 @@ export class SaveCoordinator {
             (pending) => !persistedSet.has(pending),
         )
         for (const pending of persisted) {
-            try {
-                this.dependencies.onConversationMutationPersisted?.({
-                    characterId: pending.event.characterId,
-                    conversationId: pending.event.conversationId,
-                    sessionToken: pending.event.sessionToken,
-                    sessionVersion: pending.event.sessionVersion,
-                    revision,
-                })
-            } catch (error) {
-                this.reportBackgroundError(error)
+            for (const sessionVersion of pending.versions) {
+                try {
+                    this.dependencies.onConversationMutationPersisted?.({
+                        characterId: pending.event.characterId,
+                        conversationId: pending.event.conversationId,
+                        sessionToken: pending.event.sessionToken,
+                        sessionVersion,
+                        revision,
+                    })
+                } catch (error) {
+                    this.reportBackgroundError(error)
+                }
             }
         }
     }
@@ -4448,16 +4638,18 @@ export class SaveCoordinator {
             (pending) => !persistedSet.has(pending),
         )
         for (const pending of persisted) {
-            try {
-                this.dependencies.onConversationMutationFallbackPersisted?.({
-                    characterId: pending.event.characterId,
-                    conversationId: pending.event.conversationId,
-                    sessionToken: pending.event.sessionToken,
-                    sessionVersion: pending.event.sessionVersion,
-                    revision,
-                })
-            } catch (error) {
-                this.reportBackgroundError(error)
+            for (const sessionVersion of pending.versions) {
+                try {
+                    this.dependencies.onConversationMutationFallbackPersisted?.({
+                        characterId: pending.event.characterId,
+                        conversationId: pending.event.conversationId,
+                        sessionToken: pending.event.sessionToken,
+                        sessionVersion,
+                        revision,
+                    })
+                } catch (error) {
+                    this.reportBackgroundError(error)
+                }
             }
         }
     }

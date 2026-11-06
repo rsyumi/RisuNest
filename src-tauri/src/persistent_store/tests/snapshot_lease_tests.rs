@@ -881,7 +881,7 @@ fn checkpoints_accept_both_documented_modes() {
 }
 
 #[test]
-fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
+fn active_lease_turns_truncate_into_passive_and_final_release_truncates_the_wal() {
     let (directory, mut store, _) = open_fixture();
     store
         .connection
@@ -891,27 +891,28 @@ fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
     store
         .set_app_kv("device-backup-commit:after-lease", &json!(true))
         .expect("append WAL frame after lease");
-    store
-        .checkpoint(CheckpointMode::Passive)
-        .expect("passive checkpoint with active lease");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
 
     let started = std::time::Instant::now();
-    let error = store
+    store
         .checkpoint(CheckpointMode::Truncate)
-        .expect_err("truncate must reject an active lease");
+        .expect("truncate request under an active lease checkpoints passively");
     // Far above scheduler/disk jitter, comfortably below the 5s SQLite busy timeout:
-    // proves the call rejected promptly instead of waiting out the busy handler.
+    // proves the call returned promptly instead of waiting out the busy handler.
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(matches!(
-        error,
-        StoreError::Store { message } if message.contains("active read lease")
-    ));
+    assert!(fs::metadata(&wal_path).expect("read leased WAL").len() > 0);
+    assert_eq!(
+        store
+            .read_root(Some(&lease.lease))
+            .expect("lease stays pinned after the checkpoint")
+            .revision,
+        1
+    );
 
     store
         .release_revision(&lease.lease)
         .expect("release final lease and truncate WAL");
-    let database_path = directory.path().join("persistent/persistent.sqlite");
-    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
 }
 
@@ -974,7 +975,7 @@ fn attached_export_can_leave_the_store_lock_and_restore_the_same_lease() {
 }
 
 #[test]
-fn detached_export_reader_rejects_truncate_until_it_is_released() {
+fn detached_export_reader_keeps_truncate_passive_until_it_is_released() {
     let (directory, mut store, _) = open_fixture();
     store
         .connection
@@ -986,24 +987,21 @@ fn detached_export_reader_rejects_truncate_until_it_is_released() {
     store
         .set_app_kv("device-backup-commit:after-detached-export", &json!(true))
         .expect("append WAL frame after detached reader");
+    let database_path = directory.path().join("persistent/persistent.sqlite");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
 
     let started = std::time::Instant::now();
-    let error = store
+    store
         .checkpoint(CheckpointMode::Truncate)
-        .expect_err("truncate must reject a detached export reader");
+        .expect("truncate request beside a detached export reader checkpoints passively");
     // Far above scheduler/disk jitter, comfortably below the 5s SQLite busy timeout.
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(matches!(
-        error,
-        StoreError::Store { message } if message.contains("active read lease")
-    ));
+    assert!(fs::metadata(&wal_path).expect("read leased WAL").len() > 0);
 
     let reader = prepared.take_reader().expect("take detached export reader");
     prepared
         .release(reader)
         .expect("release detached export reader");
-    let database_path = directory.path().join("persistent/persistent.sqlite");
-    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
     assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
 }
 

@@ -63,7 +63,7 @@ test('real markdown and Lua editors retain editing, find, undo and save with a r
     expect(errors).toEqual([])
 })
 
-test('an IME composition covers its line in the line font and hides while the line is scrolled out', async ({ page, browserName }) => {
+test('an IME composition covers its text in the line font and hides while that text is scrolled out or wraps', async ({ page, browserName }) => {
     test.skip(browserName !== 'chromium', 'Composes through the Chromium DevTools protocol')
     await page.goto('/monaco.html')
     await page.waitForFunction(() => !!window.monacoDriver)
@@ -78,7 +78,7 @@ test('an IME composition covers its line in the line font and hides while the li
     const composition = (line: number) => page.evaluate(line => window.monacoDriver.composition(line), line)
 
     await compose('ㅇ', '아', '안')
-    await expect.poll(() => composition(12)).toEqual({ composing: true, themeBackground: true, fontMatchesLine: true, visible: true, onLine: true })
+    await expect.poll(() => composition(12)).toEqual({ composing: true, themeBackground: true, fontMatchesLine: true, visible: true, onLine: true, caretAligned: true })
     await page.evaluate(() => window.monacoDriver.scrollBy(600))
     await expect.poll(() => composition(12)).toMatchObject({ composing: true, visible: false })
     await page.evaluate(() => window.monacoDriver.scrollBy(-600))
@@ -91,4 +91,39 @@ test('an IME composition covers its line in the line font and hides while the li
     await page.evaluate(line => window.monacoDriver.moveTo(line, 1), line)
     await compose('ㄱ', '가')
     await expect.poll(() => composition(line)).toMatchObject({ composing: true, visible: true, onLine: true })
+    await cdp.send('Input.insertText', { text: '가' })
+
+    // Monaco leaves the textarea in place when the line text it anchors to wraps, so only the line shows the composition.
+    const prose = '테스트입니다. 테스트. '.repeat(30)
+    await page.evaluate(text => window.monacoDriver.place(text, 1, text.indexOf('\n') + 1), `${prose}\nnext`)
+    await compose('ㅇ', '아', '안')
+    await expect.poll(() => composition(1)).toMatchObject({ composing: true, visible: false })
+    await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value?.split('\n')[0])).toBe(`${prose}안`)
+    await cdp.send('Input.insertText', { text: '안' })
+    await expect.poll(() => composition(1)).toMatchObject({ composing: false })
+    expect(await page.evaluate(() => window.monacoDriver.state().value)).toBe(`${prose}안\nnext`)
+
+    // After a tab it anchors to the text from the tab on, which fits on the last row, and scrolls the line
+    // text before it out of the textarea. The longer line above keeps the textarea wider than this line.
+    const tabbed = `${'테스트입니다. 테스트. '.repeat(12)}\t끝 `
+    await page.evaluate(([text, line]) => window.monacoDriver.place(text, 2, line.length + 1), [`${prose}\n${tabbed}\nnext`, tabbed])
+    await compose('ㅇ')
+    await expect.poll(() => composition(2)).toMatchObject({ composing: true, visible: true, caretAligned: true })
+    await cdp.send('Input.insertText', { text: 'ㅇ' })
+    await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value?.split('\n')[1])).toBe(`${tabbed}ㅇ`)
+})
+
+test('wrapped prose fills each row until the next word no longer fits', async ({ page }) => {
+    await page.goto('/monaco.html')
+    await page.waitForFunction(() => !!window.monacoDriver)
+    await page.evaluate(() => window.monacoDriver.open('markdown'))
+    await expect(page.locator('#editor textarea.inputarea')).toBeFocused()
+    await page.evaluate(text => window.monacoDriver.place(text, 1, 1), `${'테스트입니다. 테스트. '.repeat(40)}\nnext`)
+    await expect.poll(() => page.evaluate(() => window.monacoDriver.wrapping(1).length)).toBeGreaterThan(1)
+    for (const row of await page.evaluate(() => window.monacoDriver.wrapping(1))) {
+        expect(row.overflow).toBeLessThanOrEqual(0)
+        expect(row.free).toBeLessThan(row.nextWord + 1)
+        // Korean words move to the next row whole.
+        expect(row.endsWithSpace).toBe(true)
+    }
 })

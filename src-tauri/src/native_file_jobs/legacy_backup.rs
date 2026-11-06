@@ -567,7 +567,7 @@ impl restore::ReplacementSink for LegacyReplacementSink {
         })
     }
 
-    fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
+    fn commit(&self, staging_id: &str, expected_revision: i64, binding_authority: Option<&str>) -> StoreResult<RevisionResult> {
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_put_asset_aliases(staging_id, &self.payloads.asset_aliases)?;
             self.durable
@@ -582,6 +582,7 @@ impl restore::ReplacementSink for LegacyReplacementSink {
             &self.app,
             staging_id,
             Some(expected_revision),
+            binding_authority,
         );
         if committed.is_ok() {
             self.release_durable(CasReleaseOutcome::Committed)?;

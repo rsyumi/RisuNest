@@ -378,43 +378,41 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `activity stop requests a lifecycle flush`() {
-    val reasons = mutableListOf<String>()
-    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+  fun `activity start and stop reach the page`() {
+    val events = mutableListOf<Pair<String, Int?>>()
+    val dispatcher = LifecycleFlushDispatcher { reason, trimLevel -> events.add(reason to trimLevel) }
 
     dispatcher.onStop()
+    dispatcher.onStart()
 
-    assertEquals(listOf("stop"), reasons)
+    assertEquals(listOf("stop" to null, "start" to null), events)
   }
 
   @Test
   fun `trim memory below UI hidden does not request a lifecycle flush`() {
-    val reasons = mutableListOf<String>()
-    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+    val events = mutableListOf<Pair<String, Int?>>()
+    val dispatcher = LifecycleFlushDispatcher { reason, trimLevel -> events.add(reason to trimLevel) }
 
     dispatcher.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN - 1)
 
-    assertEquals(emptyList<String>(), reasons)
+    assertEquals(emptyList<Pair<String, Int?>>(), events)
   }
 
   @Test
-  fun `trim memory at UI hidden requests a lifecycle flush`() {
-    val reasons = mutableListOf<String>()
-    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+  fun `trim memory at or above UI hidden requests a lifecycle flush with its level`() {
+    val events = mutableListOf<Pair<String, Int?>>()
+    val dispatcher = LifecycleFlushDispatcher { reason, trimLevel -> events.add(reason to trimLevel) }
 
     dispatcher.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN)
-
-    assertEquals(listOf("trim-memory"), reasons)
-  }
-
-  @Test
-  fun `trim memory above UI hidden requests a lifecycle flush`() {
-    val reasons = mutableListOf<String>()
-    val dispatcher = LifecycleFlushDispatcher(reasons::add)
-
     dispatcher.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN + 1)
 
-    assertEquals(listOf("trim-memory"), reasons)
+    assertEquals(
+      listOf(
+        "trim-memory" to ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN,
+        "trim-memory" to ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN + 1,
+      ),
+      events,
+    )
   }
 
   @Test

@@ -483,6 +483,13 @@ export interface PersistentDataRuntime {
         publish: (committedPatch: import('./conversationBinding').ConversationBindingPatch) => void,
         expected?: import('./conversationBinding').ConversationBindingPatch,
     ): Promise<void>
+    /** Edits fields of a character's own record without reading its conversations; see `SaveCoordinator.mutateCharacterDetailFields`. */
+    mutateCharacterDetailFields(
+        characterId: string,
+        reason: string,
+        mutate: import('./saveCoordinator').CharacterDetailFieldsMutation,
+        readResident: import('./saveCoordinator').ResidentCharacterRecord,
+    ): Promise<boolean>
     mutatePersistentCharacterDetail(
         characterId: string,
         reason: string,
@@ -1606,6 +1613,9 @@ export function createPersistentDataRuntime(
                 expected,
             ),
         expirePersistentTrash: (now) => coordinator.expirePersistentTrash(now),
+        // A windowed selection is not promoted: the mutation reads no conversation.
+        mutateCharacterDetailFields: (characterId, reason, mutate, readResident) =>
+            coordinator.mutateCharacterDetailFields(characterId, reason, mutate, readResident),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             withCompleteCharacter(characterId, () => coordinator.mutatePersistentCharacterDetail(
                 characterId,

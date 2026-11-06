@@ -2,7 +2,7 @@
   "name": "risunest-sync-manager-gui",
   "private": true,
   "packageManager": "pnpm@10.34.5",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "scripts": {
     "dev:agent": "vite --mode agent --host 127.0.0.1 --port 14320 --strictPort",

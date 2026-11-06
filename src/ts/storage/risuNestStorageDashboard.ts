@@ -80,7 +80,6 @@ export function storageOffDeviceParts(
 
 export function storageDashboardRollup(
     stats: NativePersistentStorageStats,
-    _snapshots: readonly NativeSnapshotInfo[],
     conflictBackups: readonly SyncConflictBackupEntry[],
     cache: ServerSyncCacheUsage | null = null,
 ): {
@@ -186,16 +185,22 @@ export function createRisuNestStorageDashboard(
         )
     }
     const publishBusy = () => update({ busy: [...activeActions] })
-    const invalidatePendingReloads = () => {
-        if (pendingReloads === 0) return
+    /** Returns whether a pending reload was set aside. */
+    const invalidatePendingReloads = (): boolean => {
+        if (pendingReloads === 0) return false
         latestReload += 1
         update({ loadFailed: true })
+        return true
     }
     const run = async <T>(
         busy: string,
         action: () => Promise<T>,
+        // An action on one list can run as soon as that list is shown, before the totals.
+        source?: StorageDashboardSource,
     ): Promise<T | undefined> => {
-        if (activeActions.has(busy) || (state.loading && !state.stats))
+        const ready = !(state.loading && !state.stats)
+            || (source !== undefined && state.loadedSources.includes(source))
+        if (activeActions.has(busy) || !ready)
             return undefined
         activeActions.add(busy)
         publishBusy()
@@ -210,25 +215,32 @@ export function createRisuNestStorageDashboard(
         const reloadId = ++latestReload
         pendingReloads += 1
         update({ loading: true })
-        try {
-            const sources: StorageDashboardSource[] = ['stats', 'snapshots', 'conflictBackups', 'tempUsage']
-            const results = await Promise.allSettled([
-                deps.getStats(), deps.listSnapshots(), deps.listConflictBackups(), deps.getTemp(),
-            ])
-            if (reloadId === latestReload) {
-                const next: Partial<RisuNestStorageDashboardSnapshot> = {}
-                const loaded = new Set(state.loadedSources)
-                const failed: StorageDashboardSource[] = []
-                results.forEach((result, index) => {
-                    const source = sources[index]
-                    if (result.status === 'fulfilled') {
-                        Object.assign(next, { [source]: result.value })
-                        loaded.add(source)
-                    } else failed.push(source)
+        const failed: StorageDashboardSource[] = []
+        // Each source shows as soon as it arrives, so the totals never wait for the snapshot list.
+        const settle = <K extends StorageDashboardSource>(
+            source: K,
+            request: () => Promise<NonNullable<RisuNestStorageDashboardSnapshot[K]>>,
+        ) => Promise.resolve(request()).then(
+            (value) => {
+                if (reloadId !== latestReload) return
+                update({
+                    ...({ [source]: value } as Partial<RisuNestStorageDashboardSnapshot>),
+                    loadedSources: state.loadedSources.includes(source)
+                        ? state.loadedSources
+                        : [...state.loadedSources, source],
                 })
-                update({ ...next, loadedSources: [...loaded], failedSources: failed, loadFailed: failed.length > 0 })
-                if (next.stats) loadResidency(next.stats)
-            }
+                if (source === 'stats') loadResidency(value as NativePersistentStorageStats)
+            },
+            () => { failed.push(source) },
+        )
+        try {
+            await Promise.all([
+                settle('stats', () => deps.getStats()),
+                settle('snapshots', () => deps.listSnapshots()),
+                settle('conflictBackups', () => deps.listConflictBackups()),
+                settle('tempUsage', () => deps.getTemp()),
+            ])
+            if (reloadId === latestReload) update({ failedSources: failed, loadFailed: failed.length > 0 })
         } catch {
             if (reloadId === latestReload) update({ loadFailed: true })
         } finally {
@@ -264,7 +276,7 @@ export function createRisuNestStorageDashboard(
                 const tempUsage = await deps.getTemp()
                 update({ tempUsage })
                 return tempUsage
-            })
+            }, 'tempUsage')
         },
         async previewGc() {
             return run('preview-gc', async () => {
@@ -291,18 +303,20 @@ export function createRisuNestStorageDashboard(
                     ),
                 })
                 await reload()
-            })
+            }, 'snapshots')
         },
         async deleteConflictBackup(id: string) {
             return run(`delete-conflict-backup:${id}`, async () => {
                 await deps.deleteConflictBackup(id)
-                invalidatePendingReloads()
+                const setAside = invalidatePendingReloads()
                 update({
                     conflictBackups: state.conflictBackups.filter(
                         (backup) => backup.id !== id,
                     ),
                 })
-            })
+                // The reload set aside may not have delivered every source yet.
+                if (setAside) await reload()
+            }, 'conflictBackups')
         },
         async createSnapshot() {
             return run('create-snapshot', async () => {

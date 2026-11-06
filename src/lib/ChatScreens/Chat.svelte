@@ -15,6 +15,7 @@
     import { risuChatParser } from "src/ts/process/scripts"
     import { DisplayReadRecord, recordChatVariableReads, registerDisplayRow } from 'src/ts/process/scriptVariableReads'
     import { rebuildScriptDisplayRow } from 'src/ts/process/scriptDisplayRefresh'
+    import { holdScriptRun } from 'src/ts/process/generationBackground'
     import { runTrigger } from 'src/ts/process/triggers'
     import { sayTTS } from "src/ts/process/tts"
     import { DBState, ReloadChatPointer, CurrentTriggerIdStore, popupStore } from 'src/ts/stores.svelte'
@@ -1001,34 +1002,36 @@
             currentChat: ReturnType<typeof getCurrentChat>,
         ) => Promise<{ chat: ReturnType<typeof getCurrentChat> } | null | undefined>,
     ) {
-        if (selectedConversationOperations) {
-            try {
-                await selectedConversationOperations.withCompleteSelectedConversation(
-                    'manual-chat-trigger',
-                    async (context) => {
-                        const authority = context.requireCurrent()
+        await holdScriptRun(async () => {
+            if (selectedConversationOperations) {
+                try {
+                    await selectedConversationOperations.withCompleteSelectedConversation(
+                        'manual-chat-trigger',
+                        async (context) => {
+                            const authority = context.requireCurrent()
 
-                        const triggerResult = await runManualTrigger(
-                            authority.character,
-                            authority.conversation,
-                        )
-                        context.requireCurrent()
-                        if (triggerResult) setCurrentChat(triggerResult.chat)
-                        if (triggerResult) rebuildScriptDisplayRow(idx)
-                    },
-                )
-            } catch (error) {
-                if (!(error instanceof SelectedConversationPromotionStaleError)) throw error
+                            const triggerResult = await runManualTrigger(
+                                authority.character,
+                                authority.conversation,
+                            )
+                            context.requireCurrent()
+                            if (triggerResult) setCurrentChat(triggerResult.chat)
+                            if (triggerResult) rebuildScriptDisplayRow(idx)
+                        },
+                    )
+                } catch (error) {
+                    if (!(error instanceof SelectedConversationPromotionStaleError)) throw error
+                }
+            } else {
+                const currentChar = getCurrentCharacter()
+                if(!currentChar) return
+                const triggerResult = await runManualTrigger(currentChar, getCurrentChat())
+                if(triggerResult) {
+                    setCurrentChat(triggerResult.chat)
+                    rebuildScriptDisplayRow(idx)
+                }
             }
-        } else {
-            const currentChar = getCurrentCharacter()
-            if(!currentChar) return
-            const triggerResult = await runManualTrigger(currentChar, getCurrentChat())
-            if(triggerResult) {
-                setCurrentChat(triggerResult.chat)
-                rebuildScriptDisplayRow(idx)
-            }
-        }
+        })
     }
 
     let isBookmarked = $derived(

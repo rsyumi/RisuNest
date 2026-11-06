@@ -1,6 +1,7 @@
-import type {
-    ActiveConversationSession,
-    ConversationPosition,
+import {
+    cloneConversationMetadata,
+    type ActiveConversationSession,
+    type ConversationPosition,
 } from './storage/activeConversationSession'
 import type { Chat, Database, Message } from './storage/database.svelte'
 import { v4 } from 'uuid'
@@ -153,6 +154,32 @@ export function ensureCurrentConversationMessageIds(
         return { ...message, chatId: id }
     })
     return assigned
+}
+
+/**
+ * Sets metadata fields of a conversation. When the active session owns the conversation the
+ * write commits through it, so the save records the change with the session's evidence.
+ */
+export function writeConversationMetadata(
+    character: ConversationCharacter,
+    conversation: Chat,
+    candidateSession: ActiveConversationSession | null,
+    values: Partial<Omit<Chat, 'message'>>,
+): void {
+    const record = conversation as unknown as Record<string, unknown>
+    const changes = Object.entries(values).filter(([key, value]) => !Object.is(record[key], value))
+    if (changes.length === 0) return
+    const session = getMatchingConversationSession(character, conversation, candidateSession)
+    if (!session) {
+        for (const [key, value] of changes) record[key] = value
+        return
+    }
+    const expectedMetadata = cloneConversationMetadata(conversation)
+    session.applyOperation({
+        expectedVersion: session.version,
+        expectedMetadata,
+        metadata: { ...expectedMetadata, ...Object.fromEntries(changes) },
+    })
 }
 
 export function appendConversationComment(

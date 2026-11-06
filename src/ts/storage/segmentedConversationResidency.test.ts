@@ -25,17 +25,46 @@ describe('production conversation mutation residency', () => {
 
     it('preserves strict structural mutations and rebases later edits across acknowledgement', () => {
         const residency = createResidency({ totalMessages: 3 })
+        const pin = residency.pinRange(1, 2, 'viewport')
         residency.recordReplaceRange({ start: 1, deleteCount: 1, messages: [message('A'), message('B')], sessionVersion: 1 })
         residency.recordReplaceRange({ start: 2, deleteCount: 1, messages: [message('C')], sessionVersion: 2 })
         expect(residency.totalMessages).toBe(4)
         expect(residency.readRange(1, 2)).toEqual([message('A'), message('C')])
+        // The edit inside the inserted range folds into it, releasing the superseded payload.
+        expect(residency.pinCount('dirty')).toBe(1)
+        expect(residency.residentBytes).toBe(2)
         residency.acknowledgePersisted(1, 8)
-        expect(residency.pendingMutations).toEqual([{ start: 2, deleteCount: 1, messages: [message('C')], sessionVersion: 2 }])
+        expect(residency.totalMessages).toBe(4)
+        expect(residency.persistentTotalMessages).toBe(4)
+        expect(residency.pendingMutations).toEqual([
+            { start: 1, deleteCount: 2, messages: [message('A'), message('C')], sessionVersion: 2 },
+        ])
+        expect(residency.readRange(1, 2)).toEqual([message('A'), message('C')])
         expect(() => residency.recordReplaceRange({ start: 5, deleteCount: 0, messages: [], sessionVersion: 3 })).toThrow()
         expect(residency.sessionVersion).toBe(2)
         residency.acknowledgePersisted(2, 9)
+        expect(residency.persistentTotalMessages).toBe(4)
         expect(residency.pendingMutations).toEqual([])
+        expect(residency.residentIntervals).toEqual([
+            { startIndex: 1, endIndex: 3, byteSize: 2, messages: [message('A'), message('C')] },
+        ])
+        pin.release()
         expect(residency.residentBytes).toBe(0)
+    })
+
+    it('records count-preserving edits outside the newest unsaved range separately', () => {
+        const residency = createResidency({ totalMessages: 4 })
+        residency.recordReplaceRange({ start: 2, deleteCount: 1, messages: [message('A')], sessionVersion: 1 })
+        residency.recordReplaceRange({ start: 1, deleteCount: 1, messages: [message('B')], sessionVersion: 2 })
+        residency.recordReplaceRange({ start: 2, deleteCount: 1, messages: [message('C')], sessionVersion: 3 })
+        expect(residency.pendingMutations).toEqual([
+            { start: 2, deleteCount: 1, messages: [message('A')], sessionVersion: 1 },
+            { start: 1, deleteCount: 1, messages: [message('B')], sessionVersion: 2 },
+            { start: 2, deleteCount: 1, messages: [message('C')], sessionVersion: 3 },
+        ])
+        residency.acknowledgePersisted(2, 8)
+        expect(residency.persistentTotalMessages).toBe(4)
+        expect(residency.readRange(1, 2)).toEqual([message('B'), message('C')])
     })
 
     it('preserves mutation and pin state when replacement measurement fails', () => {
@@ -147,9 +176,9 @@ describe('production conversation mutation residency', () => {
         })
         const secondSave = residency.beginPersistence(2)
 
-        expect(residency.pinCount('dirty')).toBe(2)
+        expect(residency.pinCount('dirty')).toBe(1)
         expect(residency.pinCount('pending-save')).toBe(2)
-        expect(residency.residentBytes).toBe(2)
+        expect(residency.residentBytes).toBe(1)
 
         secondSave.acknowledge(9)
         expect(() => firstSave.acknowledge(8)).not.toThrow()

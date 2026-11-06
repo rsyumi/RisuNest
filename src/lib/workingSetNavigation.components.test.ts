@@ -14,6 +14,7 @@ vi.mock('@lucide/svelte', () => Object.fromEntries([
     'ArrowLeft', 'MenuIcon', 'ShellIcon', 'Settings', 'ListIcon', 'LayoutGridIcon',
     'FolderIcon', 'FolderOpenIcon', 'HomeIcon', 'WrenchIcon', 'User2Icon',
     'DownloadIcon', 'PencilIcon', 'HardDriveUploadIcon', 'TrashIcon', 'SplitIcon', 'FolderPlusIcon', 'BookmarkCheckIcon',
+    'PackageIcon', 'ChevronRightIcon',
 ].map((name) => [name, () => {}])))
 
 vi.mock('src/ts/stores.svelte', async () => {
@@ -27,7 +28,7 @@ vi.mock('src/ts/stores.svelte', async () => {
         botMakerMode: writable(false), sideBarClosing: writable(false), sideBarStore: writable(false),
         OpenRealmStore: writable(false), SizeStore: writable({ w: 1200, h: 800 }),
         QuickSettings: { open: false }, additionalHamburgerMenu: [], alertStore: writable(null),
-        bookmarkListOpen: writable(false),
+        bookmarkListOpen: writable(false), moduleScopeMenuOpen: writable(false),
     }
 })
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({

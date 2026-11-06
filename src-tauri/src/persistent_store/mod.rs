@@ -40,6 +40,7 @@ mod preservation;
 mod query;
 mod record_apply;
 mod record_projection;
+mod replacement_scan;
 mod schema;
 #[cfg(test)]
 mod schema_contract_tests;
@@ -948,7 +949,6 @@ pub(crate) struct StagingResult {
 pub(crate) struct SnapshotInfo {
     pub(crate) id: String,
     pub(crate) reason: String,
-    pub(crate) reclaimable_bytes: u64,
     pub(crate) bytes: u64,
     pub(crate) modified_at: u64,
 }
@@ -2450,8 +2450,23 @@ impl PersistentStore {
         &mut self,
         prepared: PreparedReplaceCommit,
     ) -> StoreResult<RevisionResult> {
+        self.finish_prepared_replace_under(prepared, None)
+    }
+
+    /// Commits under `binding_authority` when the caller already recorded one for
+    /// this staging, so a binding switch since then fails with
+    /// `binding-authority-changed` instead of committing under another authority.
+    pub(crate) fn finish_prepared_replace_under(
+        &mut self,
+        prepared: PreparedReplaceCommit,
+        binding_authority: Option<&str>,
+    ) -> StoreResult<RevisionResult> {
         self.lww_prepared_replacement_revision(&prepared.staging_id, Some(prepared.revision))?;
-        let header=lww::Header{binding_authority:self.lww_binding_authority()?,request_id:prepared.staging_id.clone()};
+        let binding_authority = match binding_authority {
+            Some(authority) => risunest_sync_wire::stamp::DecimalU64::try_from(authority.to_owned()).map_err(lww::error)?,
+            None => self.lww_binding_authority()?,
+        };
+        let header=lww::Header{binding_authority,request_id:prepared.staging_id.clone()};
         self.lww_commit_replacement(&header,&prepared.staging_id)
     }
 
@@ -2816,13 +2831,25 @@ impl PersistentStore {
     }
 
     pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> StoreResult<()> {
-        if mode == CheckpointMode::Truncate && self.active_readers.active_count() > 0 {
-            return Err(StoreError::Store {
-                message: "truncate checkpoint cannot run while an active read lease pins the WAL"
-                    .to_owned(),
-            });
-        }
+        // A truncate would wait out the busy timeout behind an active read lease. The
+        // committed frames stay in the WAL, so a passive checkpoint is all that can run.
+        let mode = if mode == CheckpointMode::Truncate && self.active_readers.active_count() > 0 {
+            CheckpointMode::Passive
+        } else {
+            mode
+        };
         snapshot::checkpoint(&self.connection, mode)
+    }
+
+    /// A save path's checkpoint: a truncate kept busy by a reader outside the lease
+    /// registry still leaves every commit in the WAL, so it checkpoints passively.
+    pub(crate) fn checkpoint_or_passive(&self, mode: CheckpointMode) -> StoreResult<()> {
+        match self.checkpoint(mode) {
+            Err(error) if mode == CheckpointMode::Truncate && checkpoint_was_busy(&error) => {
+                snapshot::checkpoint(&self.connection, CheckpointMode::Passive)
+            }
+            result => result,
+        }
     }
 
     pub(crate) fn snapshot_create(&mut self, reason: &str) -> StoreResult<SnapshotCreated> {
@@ -2885,7 +2912,8 @@ impl PersistentStore {
         )?;
         let active_characters = query_count_bytes(
             &transaction,
-            "SELECT COUNT(*), COALESCE(SUM(length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
+            // octet_length reads each value's stored length instead of the value itself.
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(detail)), 0) FROM characters WHERE generation = ?1 AND trashed = 0",
             [&active],
         )?;
         let trashed_count: i64 = transaction.query_row(
@@ -2942,7 +2970,7 @@ impl PersistentStore {
         drop(statement);
         transaction.commit()?;
         Ok(PersistentStorageStats {
-            snapshot_bytes: snapshot_archive::Archive::open(&self.snapshots_dir)?.bytes()?,
+            snapshot_bytes: snapshot_archive::file_bytes(&self.snapshots_dir)?,
             database_bytes,
             database_reclaimable_bytes: self.database_pages()?.iter().map(|(_, pages)| pages.free_bytes).sum(),
             asset_objects,

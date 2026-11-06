@@ -86,7 +86,7 @@ describe('RisuNestStorageDashboard', () => {
     })
 
     it('localizes snapshot reasons without exposing unknown tokens', async () => {
-        maintenance.listNativePersistentSnapshots.mockResolvedValueOnce(['manual', 'periodic', 'data-health-repair', 'synthetic-unknown'].map((reason, index) => ({ id: `snapshot-${index}`, reason, bytes: 1, reclaimableBytes: 0, modifiedAt: 1 })))
+        maintenance.listNativePersistentSnapshots.mockResolvedValueOnce(['manual', 'periodic', 'data-health-repair', 'synthetic-unknown'].map((reason, index) => ({ id: `snapshot-${index}`, reason, bytes: 1, modifiedAt: 1 })))
         const target = setup()
         await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list="snapshots"] [data-storage-backup-row]')).toHaveLength(4))
         expect(target.textContent).toContain(languageEnglish.risuNest.storage.snapshotReasons.dataHealthRepair)
@@ -104,19 +104,21 @@ describe('RisuNestStorageDashboard', () => {
 
     function setup(
         statsPromise: Promise<typeof stats> = Promise.resolve(stats),
+        snapshotsPromise: Promise<unknown[]> = Promise.resolve([
+            {
+                id: 'snapshot.db',
+                reason: 'manual',
+                bytes: 1024,
+                modifiedAt: 1,
+            },
+        ]),
     ): HTMLElement {
         maintenance.getNativePersistentStorageStats.mockImplementation(
             () => statsPromise,
         )
-        maintenance.listNativePersistentSnapshots.mockResolvedValue([
-            {
-                id: 'snapshot.db',
-                reason: 'manual',
-                reclaimableBytes: 0,
-                bytes: 1024,
-                modifiedAt: 1,
-            },
-        ])
+        maintenance.listNativePersistentSnapshots.mockImplementation(
+            () => snapshotsPromise,
+        )
         server.getServerSyncCacheUsage.mockResolvedValue({
             totalBytes: 1024 + 2048,
             cacheBytes: 1024,
@@ -253,6 +255,17 @@ describe('RisuNestStorageDashboard', () => {
         resolveStats?.(stats)
         await vi.waitFor(() => expect(target.textContent).toContain('Total data'))
         expect(target.querySelector('[data-storage-summary-placeholder]')).toBeNull()
+    })
+
+    it('shows the totals while the snapshot list is still loading', async () => {
+        let resolveSnapshots: ((value: unknown[]) => void) | undefined
+        const target = setup(Promise.resolve(stats), new Promise((resolve) => { resolveSnapshots = resolve }))
+
+        await vi.waitFor(() => expect(target.querySelector('[data-storage-summary]')).not.toBeNull())
+        expect(target.querySelector('[data-storage-backup-list="snapshots"]')).toBeNull()
+
+        resolveSnapshots?.([{ id: 'snapshot.db', reason: 'manual', bytes: 1024, modifiedAt: 1 }])
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-storage-backup-list="snapshots"] [data-storage-backup-row]')).toHaveLength(1))
     })
 
     it('summarizes each backup list with its count and size and keeps delete beside the row text', async () => {
@@ -488,7 +501,7 @@ describe('RisuNestStorageDashboard', () => {
         const target = setup()
         const selected: string[] = []
         maintenance.restoreNativePersistentSnapshot.mockImplementation(async (actions) => {
-            const chosen = await actions.choose([{ id: 'snapshot.db', reason: 'manual', reclaimableBytes: 0, bytes: 1024, modifiedAt: 1 }])
+            const chosen = await actions.choose([{ id: 'snapshot.db', reason: 'manual', bytes: 1024, modifiedAt: 1 }])
             expect(chosen).toBe('snapshot.db')
             expect(actions).not.toHaveProperty('confirm')
             expect(actions).not.toHaveProperty('restart')

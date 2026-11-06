@@ -290,7 +290,17 @@ fn stage_entry(
     cancellation: &dyn CancellationProbe,
     observer: &dyn LocalBackupParseObserver,
 ) -> Result<StagedLocalBackupEntry, LocalBackupError> {
-    let staged_path = staging_directory.join(format!("{}.entry", uuid::Uuid::new_v4()));
+    // Android's ext4 has no directory index, so a single directory holding every entry makes
+    // each create and lookup scan all earlier entries.
+    let name = uuid::Uuid::new_v4().to_string();
+    let shard = staging_directory.join(&name[..2]);
+    match fs::create_dir(&shard) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+            return Err(LocalBackupError::io(error));
+        }
+        _ => {}
+    }
+    let staged_path = shard.join(format!("{name}.entry"));
     let mut guard = IncompleteFile::new(staged_path.clone());
     let mut output = OpenOptions::new()
         .create_new(true)
@@ -830,6 +840,36 @@ mod tests {
             .expect("staged payload"),
             b"opaque-asset"
         );
+    }
+
+    #[test]
+    fn spreads_staged_entries_over_subdirectories() {
+        let names = (0..512).map(|index| format!("assets/{index}.bin")).collect::<Vec<_>>();
+        let mut entries = names
+            .iter()
+            .map(|name| (name.as_bytes(), b"asset".as_slice()))
+            .collect::<Vec<_>>();
+        entries.push((b"database.risudat", b"db"));
+        let directory = tempfile::tempdir().expect("temporary job root");
+
+        let report = parse_legacy_local_backup_v1(
+            &mut Cursor::new(archive(&entries)),
+            directory.path(),
+            PayloadTarget::JobStaging,
+            &mut RestoreSpy::default(),
+            &NeverCancelled,
+        )
+        .expect("parse backup");
+
+        assert_eq!(report.entries.len(), entries.len());
+        let staging = directory.path().join("local-backup-v1");
+        let mut largest = 0;
+        for shard in fs::read_dir(&staging).expect("staging directory") {
+            let shard = shard.expect("staging entry");
+            assert!(shard.file_type().expect("entry type").is_dir(), "an entry was staged in the root");
+            largest = largest.max(fs::read_dir(shard.path()).expect("shard").count());
+        }
+        assert!(largest < entries.len() / 4, "one directory holds {largest} of {} entries", entries.len());
     }
 
     #[test]

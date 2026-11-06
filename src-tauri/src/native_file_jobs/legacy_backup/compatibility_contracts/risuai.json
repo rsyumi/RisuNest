@@ -131,7 +131,7 @@
           "optional": false
         },
         "assetMaxDifference": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "assetWidth": {
@@ -147,7 +147,7 @@
           "optional": false
         },
         "autoContinueMinTokens": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "autofillRequestUrl": {
@@ -575,11 +575,11 @@
           "optional": true
         },
         "generationSeed": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "genTime": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "globalChatVariables": {
@@ -835,7 +835,7 @@
           "optional": false
         },
         "localNetworkTimeoutSec": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "localStopStrings": {
@@ -851,7 +851,7 @@
           "optional": false
         },
         "loreBookDepth": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "loreBookPage": {
@@ -859,7 +859,7 @@
           "optional": false
         },
         "loreBookToken": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "mainPrompt": {
@@ -871,11 +871,11 @@
           "optional": false
         },
         "maxContext": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "maxResponse": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "maxSupaChunkSize": {
@@ -1203,7 +1203,7 @@
           "optional": false
         },
         "requestRetrys": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "returnCSSError": {
@@ -2028,11 +2028,11 @@
           "optional": false
         },
         "maxContext": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "maxResponse": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "min_p": {
@@ -4455,7 +4455,7 @@
           "optional": true
         },
         "insertorder": {
-          "node": "n7",
+          "node": "n751",
           "optional": false
         },
         "key": {

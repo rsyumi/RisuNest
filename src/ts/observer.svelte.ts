@@ -31,7 +31,7 @@ function nodeObserve(
                 menu.id = 'code-contextmenu'
                 menu.setAttribute(
                     'class',
-                    'fixed z-50 min-w-[160px] py-2 bg-gray-800 rounded-lg border border-gray-700',
+                    'fixed z-modal-menu min-w-[160px] py-2 bg-gray-800 rounded-lg border border-gray-700',
                 )
 
                 const copyOption = document.createElement('div')

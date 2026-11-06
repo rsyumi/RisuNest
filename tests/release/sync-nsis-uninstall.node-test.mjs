@@ -767,13 +767,27 @@ SectionEnd
     assert.equal(existsSync(retry), false);
     assert.equal(spawnSync('reg.exe', ['query', `HKCU\\${key}`], { windowsHide: true }).status, 1);
     assert.equal(runNsis(directory, join(directory, 'installer.exe'), ['/S', `/D=${location}`]).status, 0);
-    mkdirSync(retry); writeFileSync(join(retry, 'complete'), 'true');
-    assert.equal(runNsis(directory, installed, ['/S', `_?=${location.toUpperCase()}`]).status, 0, 'in-place removal leaves its image for the caller');
-    assert.equal(existsSync(installed), true);
-    assert.equal(existsSync(location), true);
-    assert.equal(existsSync(retry), false);
-    assert.equal(spawnSync('reg.exe', ['query', `HKCU\\${key}`], { windowsHide: true }).status, 1);
-    assert.equal(runNsis(directory, join(directory, 'installer.exe'), ['/S', `/D=${location}`]).status, 0);
+    // The launched image and _?= may spell the same folder differently.
+    const shortName = path => spawnSync('cmd.exe', ['/d', '/c', `for %I in ("${path}") do @echo %~sI`], { encoding: 'utf8', windowsHide: true, windowsVerbatimArguments: true }).stdout.trim();
+    const inPlaceRuns = [
+      [installed, location.toUpperCase()],
+      [installed, `${directory}\\\\installed`],
+      [`${location}\\.\\uninstall.exe`, location],
+    ];
+    const shortLocation = shortName(location);
+    if (shortLocation && shortLocation.toLowerCase() !== location.toLowerCase()) {
+      inPlaceRuns.push([installed, shortLocation], [shortName(installed), location]);
+    }
+    for (const [image, instdir] of inPlaceRuns) {
+      const run = `${image} _?=${instdir}`;
+      mkdirSync(retry); writeFileSync(join(retry, 'complete'), 'true');
+      assert.equal(runNsis(directory, image, ['/S', `_?=${instdir}`]).status, 0, `in-place removal leaves its image for the caller (${run})`);
+      assert.equal(existsSync(installed), true, run);
+      assert.equal(existsSync(location), true, run);
+      assert.equal(existsSync(retry), false, run);
+      assert.equal(spawnSync('reg.exe', ['query', `HKCU\\${key}`], { windowsHide: true }).status, 1, run);
+      assert.equal(runNsis(directory, join(directory, 'installer.exe'), ['/S', `/D=${location}`]).status, 0);
+    }
     mkdirSync(retry); writeFileSync(join(retry, 'complete'), 'true');
     const registryDeletionDenied = deny => {
       const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `

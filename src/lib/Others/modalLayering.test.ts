@@ -38,7 +38,8 @@ const observer = readFileSync('src/ts/observer.svelte.ts', 'utf8')
  * the update dialog and `z-work-dialog-recovery` for the working-set recovery. In-screen
  * layers such as chat overlay buttons, context menus, drag ghosts, and the text area stack
  * keep their local z-index so their internal ordering (for example the z-100 autocomplete
- * above the z-50 editor) survives.
+ * above the z-50 editor) survives. The code block menu is appended to the body and opens over
+ * whichever screen holds the code, so it sits on `z-modal-menu` above the modals.
  */
 const modalSources: Record<string, string> = {
     'AlertComp.svelte': alertComp,
@@ -66,7 +67,6 @@ const inScreenSources: Record<string, string> = {
     'UI/PromptDataItem.svelte': promptDataItem,
     'UI/GUI/TextAreaInput.svelte': textAreaInput,
     'ProTools/EasyPanel.svelte': easyPanel,
-    'ts/observer.svelte.ts': observer,
 }
 
 const workDialogSources: Record<string, string> = {
@@ -84,6 +84,12 @@ const styles = readFileSync(join(process.cwd(), 'src', 'styles.css'), 'utf8')
 
 function count(source: string, token: string): number {
     return source.split(token).length - 1
+}
+
+function utilityZIndex(name: string): number {
+    const match = styles.match(new RegExp(`@utility ${name} \\{\\s*z-index: (\\d+);\\s*\\}`))
+    expect(match, name).not.toBeNull()
+    return Number(match![1])
 }
 
 describe('modal layering', () => {
@@ -121,6 +127,14 @@ describe('modal layering', () => {
             expect(count(source, 'z-modal'), name).toBe(0)
         }
         expect(count(textAreaInput, 'z-100')).toBe(1)
+    })
+
+    it('opens the code block menu above the modals and below the app lock', () => {
+        const menuLayer = utilityZIndex('z-modal-menu')
+        expect(menuLayer).toBeGreaterThan(utilityZIndex('z-modal'))
+        expect(menuLayer).toBeLessThan(utilityZIndex('z-app-lock'))
+        expect(count(observer, 'z-modal-menu')).toBe(1)
+        expect(/\bz-50\b/.test(observer)).toBe(false)
     })
 
     it('keeps work dialogs below the modal layer', () => {
