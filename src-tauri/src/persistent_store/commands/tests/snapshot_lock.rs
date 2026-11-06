@@ -63,7 +63,7 @@ fn foreground_commit_completes_while_snapshot_archive_is_blocked_and_capture_sta
     let (snapshot_sent, snapshot_received) = mpsc::channel();
     let handle = app.handle().clone();
     let snapshot_worker = std::thread::spawn(move || {
-        snapshot_sent.send(pds_snapshot_create(handle.state(), "periodic".into())).unwrap();
+        snapshot_sent.send(pds_snapshot_create(handle.state(), "periodic".into(), None)).unwrap();
     });
     let deadline = Instant::now() + Duration::from_secs(1);
     while !readers.asset_inventory_deferred() && Instant::now() < deadline {
@@ -163,11 +163,37 @@ fn failed_snapshot_archive_releases_capture_and_command_guards_without_publishin
     ).unwrap();
     drop(archive);
 
-    assert!(pds_snapshot_create(app.state(), "periodic".into()).is_err());
+    assert!(pds_snapshot_create(app.state(), "periodic".into(), None).is_err());
     assert!(!readers.asset_inventory_deferred());
     assert!(state.snapshot_operations.try_lock().is_ok());
     assert!(state.acquire_device_maintenance().is_ok());
     assert!(fs::read_dir(directory.path().join("persistent/snapshots")).unwrap()
         .all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with("capture-")));
     assert!(Archive::open(&directory.path().join("persistent/snapshots")).unwrap().list().unwrap().is_empty());
+}
+
+#[test]
+fn the_command_keeps_the_count_it_is_sent_and_refuses_one_out_of_range() {
+    let (directory, app, _) = fixture();
+    let snapshots = directory.path().join("persistent/snapshots");
+    let listed = || -> Vec<String> {
+        Archive::open(&snapshots).unwrap().list().unwrap().into_iter().map(|snapshot| snapshot.id).collect()
+    };
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(pds_snapshot_create(app.state(), "manual".into(), Some(2)).unwrap().id);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(listed(), vec![ids[2].clone(), ids[1].clone()]);
+
+    for count in [0, 9] {
+        assert!(matches!(
+            pds_snapshot_create(app.state(), "manual".into(), Some(count)),
+            Err(StoreError::Validation { .. })
+        ));
+    }
+    assert_eq!(listed().len(), 2, "a refused count captures nothing");
+
+    pds_snapshot_create(app.state(), "manual".into(), None).unwrap();
+    assert_eq!(listed().len(), 3, "a request without a count keeps the full count");
 }

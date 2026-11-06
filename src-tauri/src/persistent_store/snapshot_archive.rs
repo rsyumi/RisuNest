@@ -329,10 +329,10 @@ impl Archive {
         Ok(())
     }
 
-    pub fn rotate(&mut self, byte_budget: u64, protected: &str) -> StoreResult<()> {
+    pub fn rotate(&mut self, keep_count: usize, byte_budget: u64, protected: &str) -> StoreResult<()> {
         loop {
             let snapshots = self.list()?;
-            if snapshots.len() <= 8 && self.bytes()? <= byte_budget {
+            if snapshots.len() <= keep_count && self.bytes()? <= byte_budget {
                 break;
             }
             let Some(oldest) = snapshots
@@ -522,10 +522,10 @@ mod tests {
         for _ in 0..7 {
             latest = archive.insert(&source.path, 1, "manual", AssetRootSet::default()).unwrap().id;
         }
-        archive.rotate(u64::MAX, &latest).unwrap();
+        archive.rotate(8, u64::MAX, &latest).unwrap();
         assert!(archive.metadata(&periodic.id).is_err());
         assert!(archive.metadata(&manual.id).is_ok());
-        archive.rotate(1, &latest).unwrap();
+        archive.rotate(8, 1, &latest).unwrap();
         let kept = archive.list().unwrap();
         assert_eq!(kept.len(), 1);
         assert!(!kept.iter().any(|item| item.id == manual.id));

@@ -2774,6 +2774,12 @@ export const languageEnglish = {
             counts: '{0} characters · {1} chats · {2} messages',
             subMetrics:
                 'Chat attachments {0} (included in images & media) · Plugin data {1}',
+            automaticSnapshots: 'Automatic snapshots',
+            automaticSnapshotsHelp:
+                'Creates a new snapshot once 24 hours have passed since the last one.',
+            snapshotKeepCount: 'Snapshots to keep',
+            snapshotKeepCountHelp:
+                'Creating a snapshot beyond this number deletes the oldest automatic snapshots first. Up to {0} snapshots can be kept.',
             createSnapshotTitle: 'Create a snapshot',
             createSnapshotHelp:
                 'Saves the current state so you can return to it later.',
