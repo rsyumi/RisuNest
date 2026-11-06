@@ -23,6 +23,12 @@ pub(crate) struct RepairCandidate {
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub(crate) enum RepairAction {
     SelectFirstConversation { character_id: String },
+    /// Selects the first preset in place of one the root no longer holds.
+    SelectFirstPreset,
+    /// Selects the first persona in place of one the root no longer holds.
+    SelectFirstPersona,
+    /// Gives a persona's embedded module a fresh id, as an import does, so the root can name it.
+    AssignEmbeddedModuleId { persona_id: String },
     /// Removes one reference from the record that holds it: the field or entry at `source_path`,
     /// or only the inlay token named by `token`. The stored bytes stay where they are.
     DropReference {
@@ -51,6 +57,8 @@ impl RepairAction {
     pub(crate) fn subject(&self) -> &str {
         match self {
             Self::SelectFirstConversation { .. } => "character",
+            Self::SelectFirstPreset | Self::SelectFirstPersona => "root",
+            Self::AssignEmbeddedModuleId { .. } => "persona",
             Self::DropReference { owner, .. } => &owner.kind,
             Self::DropAlias { kind, .. } | Self::AdoptStoredPayload { kind, .. } => kind,
             Self::NormalizeRecords { table }
@@ -78,6 +86,9 @@ fn candidate(
 fn action_id(action: &RepairAction) -> String {
     match action {
         RepairAction::SelectFirstConversation { .. } => "select-first-conversation".to_owned(),
+        RepairAction::SelectFirstPreset => "select-first-preset".to_owned(),
+        RepairAction::SelectFirstPersona => "select-first-persona".to_owned(),
+        RepairAction::AssignEmbeddedModuleId { .. } => "assign-embedded-module-id".to_owned(),
         RepairAction::DropReference { .. } => "drop-reference".to_owned(),
         RepairAction::DropAlias { .. } => "drop-alias".to_owned(),
         RepairAction::AdoptStoredPayload { .. } => "adopt-stored-payload".to_owned(),
@@ -144,13 +155,9 @@ fn record_candidates(index: usize, finding: &Finding) -> Vec<RepairCandidate> {
 /// rebuilt on save, so its references are left to the reader.
 const EDITABLE_OWNERS: &[&str] = &["root", "preset", "plugin-storage", "character", "conversation"];
 
-/// Fields that removing cannot answer. The reference graph reports the selected preset and
-/// persona, and a loadout's preset and persona, even when they are absent, and an embedded
-/// module's id names it.
+/// Fields that removing cannot answer. The reference graph reports a loadout's preset and
+/// persona even when they are absent.
 const KEPT_FIELDS: &[(&str, &str)] = &[
-    ("root", "$.botPresetsId"),
-    ("root", "$.selectedPersona"),
-    ("persona", "$.embeddedModule.id"),
     ("loadout", "$.presetName"),
     ("loadout", "$.personaId"),
 ];
@@ -254,6 +261,20 @@ pub(crate) fn plan(result: &ScanResult) -> Vec<RepairCandidate> {
                     candidates.push(candidate(index, RepairAction::SelectFirstConversation {
                         character_id: finding.owner.id.clone(),
                     }, true, false));
+                    continue;
+                }
+                // The reference graph reports these even when they are absent, so removing them
+                // answers nothing and only a value does.
+                let created = match (finding.owner.kind.as_str(), locator.source_path.as_str()) {
+                    ("root", "$.botPresetsId") => Some(Some(RepairAction::SelectFirstPreset)),
+                    ("root", "$.selectedPersona") => Some(Some(RepairAction::SelectFirstPersona)),
+                    ("persona", "$.embeddedModule.id") => Some(locator.sole_entry.then(|| {
+                        RepairAction::AssignEmbeddedModuleId { persona_id: finding.owner.id.clone() }
+                    })),
+                    _ => None,
+                };
+                if let Some(action) = created {
+                    candidates.extend(action.map(|action| candidate(index, action, true, false)));
                     continue;
                 }
                 let Some((owner, source_path, token)) = reference_removal(finding, locator) else {
