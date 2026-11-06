@@ -1,4 +1,5 @@
 pub(crate) mod archive;
+mod archive_asset_names;
 pub(crate) mod author_note;
 mod asset_alias_orphans;
 pub(crate) mod gallery;

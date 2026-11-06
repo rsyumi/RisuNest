@@ -1,3 +1,4 @@
+mod archive_names;
 pub(crate) mod data_health;
 pub(crate) mod gallery;
 pub(crate) mod image_geometry;
@@ -431,6 +432,7 @@ fn start_retired_purge<R: tauri::Runtime>(app: &AppHandle<R>, state: &Persistent
         .name("pds-retired-purge".to_owned())
         .spawn(move || {
             let state = app.state::<PersistentStoreState>();
+            archive_names::record_held(&state);
             loop {
                 let pause = match logged(
                     "pds_retired_purge",
@@ -1771,6 +1773,7 @@ fn pds_asset_gc_preview_all(
     state: &PersistentStoreState,
     operation_guard: &RendererOperationGuard,
 ) -> Result<AssetGcMaintenanceResult, StoreError> {
+    archive_names::record_before_cleanup(state, operation_guard);
     let now = current_time_ms()?;
     // Preview roots are scoped to this invocation. Deletion always collects fresh roots.
     let preview = with_store_mutex_admitted(state, operation_guard, |store| {
@@ -4061,6 +4064,70 @@ mod tests {
         assert!(cas.stat_object(&purged).unwrap().is_none());
         assert_eq!(alias_object(&store, "assets/recent.png"), Some(recent.clone()));
         assert!(cas.stat_object(&recent).unwrap().is_some());
+    }
+
+    /// What an archive from an earlier release names is recorded without holding the store: after
+    /// the store opens for a payload this device holds, and before the unused-file preview for
+    /// one only the Sync server holds, which the preview then judges by its record.
+    #[test]
+    fn archive_names_are_recorded_after_opening_and_before_the_cleanup_preview() {
+        use crate::persistent_store::archive_asset_names::recorded;
+        use crate::persistent_store::tests::asset_catalog_gc_tests::{add_synthetic_character, alias_object, as_older_archive, backdate_alias};
+        use crate::server_sync::{lww_tests::put_asset, residency::{test_remote, AssetPolicy}};
+        use std::time::{Duration, Instant};
+
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let (held, remote, orphan) = {
+            let mut store = PersistentStore::open(root).unwrap();
+            for key in ["assets/held.png", "assets/remote.png", "assets/orphan.png"] {
+                put_asset(&mut store, key, format!("synthetic body of {key}").as_bytes());
+            }
+            for name in ["held", "remote"] {
+                add_synthetic_character(&mut store, name, &format!(r#"<img src="assets/{name}.png">"#));
+                store.archive_character(name, store.revision().unwrap(), 10).unwrap();
+            }
+            let held = as_older_archive(&store, "held", &["assets/held.png"]).object_hash;
+            let remote = as_older_archive(&store, "remote", &["assets/remote.png"]).object_hash;
+            for key in ["assets/held.png", "assets/remote.png", "assets/orphan.png"] {
+                backdate_alias(&store, key, 1_000);
+            }
+            store.device_store().unwrap().set_asset_residency_policy(AssetPolicy::Remote).unwrap();
+            (held, remote, alias_object(&store, "assets/orphan.png").unwrap())
+        };
+        test_remote::keep_only_on_server(root, &remote);
+        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        app.manage(crate::app_paths::AppPaths {
+            data: root.to_owned(),
+            webview: None,
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            cleanup_control: root.join("cleanup"),
+            tauri_derived: Vec::new(),
+            install: None,
+            integration: None,
+        });
+        app.manage(PersistentStoreState::default());
+        open_for_renderer(app.handle(), &app.state()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !recorded(root, &held) {
+            assert!(Instant::now() < deadline, "the held archive was not recorded after the store opened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!recorded(root, &remote));
+        assert_eq!(test_remote::fetched(root), 0);
+
+        let state = app.state::<PersistentStoreState>();
+        let operation_guard = state.admit_renderer_operation().unwrap();
+        let preview = pds_asset_gc_preview_all(&state, &operation_guard).unwrap();
+        assert_eq!(test_remote::fetched(root), 1);
+        assert!(recorded(root, &remote));
+        let deletable = preview.candidates.iter()
+            .filter(|candidate| candidate.state == "deletable")
+            .map(|candidate| candidate.object_hash.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(deletable, [orphan.as_str()]);
     }
 
     /// A permanent delete removes at once the aliases only the deleted owner used, once no

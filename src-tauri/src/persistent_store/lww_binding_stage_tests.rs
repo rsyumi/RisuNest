@@ -190,6 +190,47 @@ fn archive_alias_and_reference_controls_stage_without_reading_any_large_dependen
     assert!(store.read_character("archived",None).is_err());
 }
 
+/// A bound archive restores from the payload its unit shares, which this device recorded when it
+/// wrote that payload, so the unused-file cleanup decides from the record while the payload is
+/// only on the server.
+#[test]
+fn a_bound_archive_finds_the_record_of_the_payload_its_unit_shares() {
+    use crate::persistent_store::{archive::read_archived_object, asset_alias_orphans::OrphanAliasScope};
+    use crate::server_sync::{lww_tests::put_asset, residency::test_remote};
+    let dir = tempfile::tempdir().unwrap(); let mut store = PersistentStore::open(dir.path()).unwrap();
+    let html = put_asset(&mut store, "assets/html.png", b"synthetic html body").object_hash.unwrap();
+    put_asset(&mut store, "assets/orphan.png", b"synthetic orphan body");
+    store.commit(&WorkingSetCommit {
+        expected_revision: store.revision().unwrap(),
+        add_character: Some(json!({"chaId":"archived","type":"character","name":"Synthetic","image":"","desc":"<img src=\"assets/html.png\">","chats":[],"lastInteraction":500})),
+        ..Default::default()
+    }).unwrap();
+    store.archive_character("archived", store.revision().unwrap(), 10).unwrap();
+    let mut archived = read_archived_object(&store.connection, &active_generation(&store.connection).unwrap(), "archived").unwrap().unwrap();
+    assert_ne!(archived.shared_object_hash, archived.object_hash);
+    // The unit an older release sent lists no key inside the text.
+    archived.shared_asset_hashes.retain(|hash| *hash != html);
+    let mut archive = change(&["archive","archived"], Value::Null); archive.value = projection::archive_value(&store.connection, &archived).unwrap();
+    let mut incoming = vec![change(&["exists","character","archived"], json!(true)), change(&["character","archived","name"], json!("archive-name")), archive];
+    for key in ["assets/html.png", "assets/orphan.png"] {
+        let mut alias = change(&["asset", key], Value::Null);
+        alias.value = read_unit(&store.connection, &alias.key).unwrap().unwrap().1;
+        incoming.push(alias);
+    }
+    let (header, inspection) = context(&store); let stage = store.lww_stage_binding_units(&header, &inspection, &incoming, 7.into()).unwrap();
+    activate(&mut store, &header, &inspection, &stage);
+    let bound = read_archived_object(&store.connection, &active_generation(&store.connection).unwrap(), "archived").unwrap().unwrap();
+    assert_eq!(bound.object_hash, archived.shared_object_hash);
+
+    // The library the binding replaced holds its objects until it is purged in the background.
+    while store.purge_retired_batch(256).unwrap() {}
+    test_remote::keep_only_on_server(dir.path(), &bound.object_hash);
+    let now = crate::persistent_store::device_store::now_ms().unwrap();
+    let deleted = store.delete_orphaned_asset_aliases(&OrphanAliasScope::Cleanup { now_ms: now }).unwrap();
+    assert_eq!(deleted.into_iter().map(|alias| alias.key).collect::<Vec<_>>(), ["assets/orphan.png"]);
+    assert_eq!(test_remote::fetched(dir.path()), 0);
+}
+
 #[test]
 fn admission_failure_leaves_active_state_and_staging_tables_untouched() {
     let dir=tempfile::tempdir().unwrap(); let mut store=PersistentStore::open(dir.path()).unwrap();
