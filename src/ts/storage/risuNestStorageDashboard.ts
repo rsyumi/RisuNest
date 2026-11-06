@@ -185,16 +185,22 @@ export function createRisuNestStorageDashboard(
         )
     }
     const publishBusy = () => update({ busy: [...activeActions] })
-    const invalidatePendingReloads = () => {
-        if (pendingReloads === 0) return
+    /** Returns whether a pending reload was set aside. */
+    const invalidatePendingReloads = (): boolean => {
+        if (pendingReloads === 0) return false
         latestReload += 1
         update({ loadFailed: true })
+        return true
     }
     const run = async <T>(
         busy: string,
         action: () => Promise<T>,
+        // An action on one list can run as soon as that list is shown, before the totals.
+        source?: StorageDashboardSource,
     ): Promise<T | undefined> => {
-        if (activeActions.has(busy) || (state.loading && !state.stats))
+        const ready = !(state.loading && !state.stats)
+            || (source !== undefined && state.loadedSources.includes(source))
+        if (activeActions.has(busy) || !ready)
             return undefined
         activeActions.add(busy)
         publishBusy()
@@ -270,7 +276,7 @@ export function createRisuNestStorageDashboard(
                 const tempUsage = await deps.getTemp()
                 update({ tempUsage })
                 return tempUsage
-            })
+            }, 'tempUsage')
         },
         async previewGc() {
             return run('preview-gc', async () => {
@@ -297,18 +303,20 @@ export function createRisuNestStorageDashboard(
                     ),
                 })
                 await reload()
-            })
+            }, 'snapshots')
         },
         async deleteConflictBackup(id: string) {
             return run(`delete-conflict-backup:${id}`, async () => {
                 await deps.deleteConflictBackup(id)
-                invalidatePendingReloads()
+                const setAside = invalidatePendingReloads()
                 update({
                     conflictBackups: state.conflictBackups.filter(
                         (backup) => backup.id !== id,
                     ),
                 })
-            })
+                // The reload set aside may not have delivered every source yet.
+                if (setAside) await reload()
+            }, 'conflictBackups')
         },
         async createSnapshot() {
             return run('create-snapshot', async () => {
