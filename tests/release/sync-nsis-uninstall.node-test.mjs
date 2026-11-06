@@ -762,6 +762,11 @@ SectionEnd
       assert.equal(registration.status, 0);
       assert.ok(registration.stdout.includes(installed), 'Apps registration retains the same retry executable');
     } finally { await releaseLock(); }
+    // NSIS drops `/` from `_?=`, so this names a folder that does not exist.
+    assert.equal(runNsis(directory, active, ['/S', `_?=${directory}/installed`]).status, 1, 'a folder without the installation fails the removal');
+    assert.equal(existsSync(installed), true);
+    assert.equal(readFileSync(join(retry, 'complete'), 'utf8'), 'true');
+    assert.equal(spawnSync('reg.exe', ['query', `HKCU\\${key}`], { windowsHide: true }).status, 0, 'Apps registration remains');
     assert.equal(runNsis(directory, active, ['/S', `_?=${location}`]).status, 0);
     assert.equal(existsSync(installed), false);
     assert.equal(existsSync(retry), false);

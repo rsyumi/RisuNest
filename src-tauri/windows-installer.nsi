@@ -1072,6 +1072,13 @@ Section Uninstall
     !else
       !define RISUNEST_UNINSTALL_REG_ROOT HKCU
     !endif
+    ; NSIS drops `/` from `_?=`, so $INSTDIR can name a folder that does not
+    ; exist. Deleting there removes nothing and sets no error, so require the
+    ; uninstaller this teardown removes before touching the registration.
+    ${IfNot} ${FileExists} "$INSTDIR\uninstall.exe"
+      SetErrorLevel 1
+      Abort "removal-uninstaller-missing"
+    ${EndIf}
     ClearErrors
     DeleteRegKey ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}"
     ${If} ${Errors}

@@ -32,7 +32,7 @@ fn standalone_hydration_transfers_four_bodies_and_publishes_each_identity_once()
             let mut completed=Vec::new();let unavailable=hydrate_registered_many(&root,&copied,&BTreeSet::new(),None,&||Ok(()),&mut |hash,_|completed.push(hash.to_owned())).unwrap();
             assert!(unavailable.is_empty());completed
         });
-        tokio::time::timeout(std::time::Duration::from_secs(20),async {
+        tokio::time::timeout(fake::DEADLOCK_TEST_BOUND,async {
             provider.started(4).await;assert_eq!(provider.peak(),4);
             for id in ["body-3","body-2","body-1","body-0"] {provider.release(id);}
             let completed=task.await.unwrap();assert_eq!(completed.len(),6);assert_eq!(completed.into_iter().collect::<BTreeSet<_>>(),hashes.into_iter().collect());
@@ -65,7 +65,7 @@ fn wrapped_remote_source_spooling_and_hydration_finish_with_one_body_slot() {
         assert_eq!(std::fs::read(spool.path()).unwrap(),b"synthetic standalone hydration 0");
         assert_eq!(downloaded.load(std::sync::atomic::Ordering::Relaxed),sources[0].body.byte_length.0,"reading plaintext must not count as another download");
         let root=f.directory_b.path().to_owned();let hashes=sources.iter().map(|s|s.hash.clone()).collect::<Vec<_>>();
-        tokio::time::timeout(std::time::Duration::from_secs(20),tokio::task::spawn_blocking(move ||hydrate_registered_many(&root,&hashes,&BTreeSet::new(),None,&||Ok(()),&mut |_,_|{}))).await.expect("one-slot hydration deadlocked").unwrap().unwrap();
+        tokio::time::timeout(fake::DEADLOCK_TEST_BOUND,tokio::task::spawn_blocking(move ||hydrate_registered_many(&root,&hashes,&BTreeSet::new(),None,&||Ok(()),&mut |_,_|{}))).await.expect("one-slot hydration deadlocked").unwrap().unwrap();
         assert_eq!(provider.peak(),1);
     });
 }
@@ -81,7 +81,7 @@ fn standalone_hydration_settles_successful_siblings_before_returning_a_download_
             let mut completed=Vec::new();let result=hydrate_registered_many(&root,&hashes,&BTreeSet::new(),None,&||Ok(()),&mut |hash,_|completed.push(hash.to_owned()));
             (result,completed)
         });
-        tokio::time::timeout(std::time::Duration::from_secs(20),async {
+        tokio::time::timeout(fake::DEADLOCK_TEST_BOUND,async {
             provider.started(4).await;provider.release("body-1");provider.completed(1).await;
             for id in ["body-0","body-2","body-3"] {provider.release(id);}
             let (result,completed)=task.await.unwrap();assert!(result.is_err());
