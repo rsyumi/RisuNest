@@ -69,7 +69,7 @@ import {
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
-import { ensureCurrentConversationMessageIds } from '../conversationMutations'
+import { ensureCurrentConversationMessageIds, writeConversationMetadata } from '../conversationMutations'
 import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
@@ -2127,6 +2127,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
     
+    // A session-owned chat records memory state through its session, so the save covers it.
+    const writeChatMetadata = (chat: Chat, values: Partial<Omit<Chat, 'message'>>) =>
+        writeConversationMetadata(nowChatroom, chat, getActiveConversationSession(), values)
+    const writeMemoryMetadata = (values: Partial<Omit<Chat, 'message'>>) => {
+        writeChatMetadata(currentChat, values)
+        writeChatMetadata(DBState.db.characters[selectedChar].chats[selectedChat], values)
+    }
     if(nowChatroom.supaMemory && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypav2 || DBState.db.hypaV3)){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
         chatProcessStage.set(2)
@@ -2156,8 +2163,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
-            currentChat.hypaV2Data = sp.memory ?? currentChat.hypaV2Data
-            DBState.db.characters[selectedChar].chats[selectedChat].hypaV2Data = currentChat.hypaV2Data
+            writeMemoryMetadata({ hypaV2Data: sp.memory ?? currentChat.hypaV2Data })
 
             currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
             console.log("[Expected to be updated] chat's HypaV2Data: ", currentChat.hypaV2Data)
@@ -2183,13 +2189,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             if(sp.error){
                 // Save new summary
                 if (sp.memory) {
-                    currentChat.hypaV3Data = sp.memory
                     if (conversationResources.windowedController) {
+                        currentChat.hypaV3Data = sp.memory
                         if (!conversationResources.windowedController.applyRange(
                             0, 0, [], 'update-metadata',
                         )) throw new PersistentMutationFencedError()
                     } else {
-                        DBState.db.characters[selectedChar].chats[selectedChat].hypaV3Data = currentChat.hypaV3Data
+                        writeMemoryMetadata({ hypaV3Data: sp.memory })
                     }
                 }
                 if (abortSignal.aborted) return false
@@ -2199,13 +2205,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
-            currentChat.hypaV3Data = sp.memory ?? currentChat.hypaV3Data
             if (conversationResources.windowedController) {
+                currentChat.hypaV3Data = sp.memory ?? currentChat.hypaV3Data
                 if (!conversationResources.windowedController.applyRange(
                     0, 0, [], 'update-metadata',
                 )) throw new PersistentMutationFencedError()
             } else {
-                DBState.db.characters[selectedChar].chats[selectedChat].hypaV3Data = currentChat.hypaV3Data
+                writeMemoryMetadata({ hypaV3Data: sp.memory ?? currentChat.hypaV3Data })
                 currentChat = DBState.db.characters[selectedChar].chats[selectedChat];
             }
             if (abortSignal.aborted) return false
@@ -2221,10 +2227,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             }
             chats = sp.chats
             currentTokens = sp.currentTokens
-            currentChat.supaMemoryData = sp.memory ?? currentChat.supaMemoryData
-            DBState.db.characters[selectedChar].chats[selectedChat].supaMemoryData = currentChat.supaMemoryData
+            writeMemoryMetadata({ supaMemoryData: sp.memory ?? currentChat.supaMemoryData })
             console.log(currentChat.supaMemoryData)
-            currentChat.lastMemory = sp.lastId ?? currentChat.lastMemory;
+            writeChatMetadata(currentChat, { lastMemory: sp.lastId ?? currentChat.lastMemory })
         }
         stageTimings.stage2Duration = Date.now() - stageTimings.stage2Start
         chatProcessStage.set(1)
@@ -2241,7 +2246,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
             currentTokens -= await tokenizer.tokenizeChat(chats[0])
             chats.splice(0, 1)
         }
-        currentChat.lastMemory = chats[0].memo
+        writeChatMetadata(currentChat, { lastMemory: chats[0].memo })
     }
 
     let biases:[string,number][] = DBState.db.bias.concat(currentChar.bias).map((v) => {
