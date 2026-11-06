@@ -1270,7 +1270,7 @@ fn a_repair_finds_its_entry_in_the_root_again_when_applied() {
         .unwrap();
     store.replace_commit(&staging, Some(0)).unwrap();
     stored_alias(&mut store, 9);
-    // The root selects no preset or persona, and removing a selection cannot answer that.
+    // The root selects no preset or persona, which selecting the first answers, not a removal.
     let selected = diagnosed_candidates(&mut store, |action| matches!(action, RepairAction::DropReference { .. }));
     assert_eq!(selected.len(), 2, "{selected:?}");
     let revision = store.revision().unwrap();

@@ -265,6 +265,9 @@
         'adopt-stored-payload': strings.actionAdoptStoredPayload,
         'normalize-records': strings.actionNormalizeRecords,
         'select-first-conversation': strings.actionSelectFirstConversation,
+        'select-first-preset': strings.actionSelectFirstPreset,
+        'select-first-persona': strings.actionSelectFirstPersona,
+        'assign-embedded-module-id': strings.actionAssignEmbeddedModuleId,
         'keep-single-record': strings.actionKeepSingleRecord,
         'recover-orphans': strings.actionRecoverOrphans,
     }

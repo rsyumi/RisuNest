@@ -969,7 +969,16 @@ fn patch_root(v: &mut Value, p: &[String], next: Option<Value>) -> StoreResult<(
             let field = v.as_object_mut().ok_or_else(|| error("invalid-root"))?.entry(map).or_insert(json!({}));
             patch(field, &p[1], next)
         }
-        "persona" => patch_array(v, "personas", "id", &p[1], Some(&p[2]), next),
+        "persona" => {
+            let mut next = next;
+            if p[2] == "embeddedModule" {
+                // A unit written before modules had to carry an id would leave the root unsavable.
+                if let Some(module) = next.as_mut() {
+                    super::super::record_projection::assign_embedded_module_id(module, Some(&p[1]));
+                }
+            }
+            patch_array(v, "personas", "id", &p[1], Some(&p[2]), next)
+        }
         "record" => patch_array(v, &p[1], if p[1] == "plugins" { "name" } else { "id" }, &p[2], None, next),
         _ => Err(error("unit-not-editable")),
     }
