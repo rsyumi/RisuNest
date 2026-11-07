@@ -98,6 +98,7 @@ fn add(
     out.insert(unit_key(parts)?, unit_value(db, value)?);
     Ok(())
 }
+#[cfg(test)]
 fn fields(
     db: &Connection,
     out: &mut BTreeMap<UnitKey, UnitValue>,
@@ -257,13 +258,14 @@ fn capture_preset(
     id: &str,
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
-    if let Some(value) = text_value(
+    if let Some(text) = stored_text(
         db,
         "SELECT value FROM bot_presets WHERE generation=?1 AND preset_id=?2",
         params![generation, id],
     )? {
+        let document = Document::parse(&text, Depth::Limited)?;
         add(db, out, &["exists", "preset", id], &json!(true))?;
-        fields(db, out, &["preset", id], &value, PRESET_FIELDS)?;
+        stored_fields(db, out, &["preset", id], document.value().object()?.as_ref(), PRESET_FIELDS)?;
     }
     Ok(())
 }
@@ -669,7 +671,11 @@ fn capture_key(
             _ => capture_root(db, generation, out)?,
         },
         "plugin" => {
-            if let Some(value)=text_value(db,"SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[1],p[2]])? {out.insert(key.clone(),unit_value(db,&value)?);}
+            if let Some(text)=stored_text(db,"SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[1],p[2]])? {
+                let mut canonical=Vec::new();
+                Document::parse(&text,Depth::Limited)?.value().write_canonical(&mut canonical)?;
+                out.insert(key.clone(),canonical_unit_value(db,canonical)?);
+            }
         }
         "asset" | "inlay" => {
             let alias = super::super::query::read_asset_alias(
@@ -824,7 +830,7 @@ pub(in crate::persistent_store) fn capture_all(
     let tx = db.transaction()?;
     let mut out = BTreeMap::new();
     value_reference::capture_root(&tx, generation, &mut out)?;
-    capture_presets(&tx, generation, &mut out)?;
+    value_reference::capture_presets(&tx, generation, &mut out)?;
     let ids: Vec<String> = {
         let mut s = tx.prepare("SELECT character_id FROM characters WHERE generation=?1")?;
         let v = s
@@ -844,12 +850,7 @@ pub(in crate::persistent_store) fn capture_all(
         v
     };
     for (owner, key) in plugins {
-        capture_key(
-            &tx,
-            generation,
-            &unit_key(&["plugin", &owner, &key])?,
-            &mut out,
-        )?;
+        value_reference::capture_plugin(&tx, generation, &owner, &key, &mut out)?;
     }
     let owners: Vec<String> = {
         let mut q = tx.prepare("SELECT DISTINCT owner FROM plugin_storage WHERE generation=?1")?;
@@ -1094,6 +1095,39 @@ pub(in crate::persistent_store) mod value_reference {
                     &json!({"ids":ids,"folders":value.get("chatFolders").cloned().unwrap_or(json!([]))}),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    pub(in crate::persistent_store) fn capture_presets(
+        db: &Connection,
+        generation: &str,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        let ids: Vec<String> = {
+            let mut s = db.prepare("SELECT preset_id FROM bot_presets WHERE generation=?1 ORDER BY configured_index,preset_id")?;
+            let v = s.query_map([generation], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            v
+        };
+        for id in &ids {
+            if let Some(value) = text_value(db, "SELECT value FROM bot_presets WHERE generation=?1 AND preset_id=?2", params![generation, id])? {
+                add(db, out, &["exists", "preset", id], &json!(true))?;
+                fields(db, out, &["preset", id], &value, PRESET_FIELDS)?;
+            }
+        }
+        add(db, out, &["order", "presets"], &json!(ids))?;
+        Ok(())
+    }
+
+    pub(in crate::persistent_store) fn capture_plugin(
+        db: &Connection,
+        generation: &str,
+        owner: &str,
+        key: &str,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        if let Some(value) = text_value(db, "SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3", params![generation, owner, key])? {
+            out.insert(unit_key(&["plugin", owner, key])?, unit_value(db, &value)?);
         }
         Ok(())
     }

@@ -36,6 +36,8 @@ pub(super) fn incremental_commit<T>(
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 use super::held_binary::HeldBinaries;
+use super::stored_json::{self, Depth, Document, Object, Raw};
+use std::borrow::Cow;
 
 pub(super) fn apply_root_mutations(
     mut root: Value,
@@ -1801,11 +1803,7 @@ pub(super) fn put_plugin_storage_map(
     first_ordinal: i64,
 ) -> StoreResult<()> {
     for (offset, (key, value)) in values.iter().enumerate() {
-        let owner = sidecar_owner(meta, key);
-        // The staging identity names this import, so a plugin that starts once
-        // afterwards can take a value the save left without an owner.
-        let import_batch = plugin_owner::is_unowned(owner)
-            .then(|| carried.get(key.as_str()).map(String::as_str).unwrap_or(generation));
+        let (owner, import_batch) = imported_plugin_owner(generation, key, meta, carried);
         put_plugin_storage(
             transaction,
             generation,
@@ -1817,6 +1815,38 @@ pub(super) fn put_plugin_storage_map(
         )?;
     }
     Ok(())
+}
+
+/// `put_plugin_storage_map` of one value stored as `text`, written from it.
+pub(super) fn put_plugin_storage_text(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    key: &str,
+    text: &str,
+    meta: Option<&Map<String, Value>>,
+    carried: &HashMap<String, String>,
+    ordinal: i64,
+) -> StoreResult<()> {
+    let (owner, import_batch) = imported_plugin_owner(generation, key, meta, carried);
+    let mut value = Vec::new();
+    Document::parse(text, Depth::Unlimited)?.value().write_json(&mut value)?;
+    put_plugin_storage_json(transaction, generation, owner, key, &stored_json::text(value)?, Some(ordinal), import_batch)
+}
+
+/// The owner of an imported plugin value, and the import batch that holds it
+/// when it has none.
+fn imported_plugin_owner<'a>(
+    generation: &'a str,
+    key: &str,
+    meta: Option<&'a Map<String, Value>>,
+    carried: &'a HashMap<String, String>,
+) -> (&'a str, Option<&'a str>) {
+    let owner = sidecar_owner(meta, key);
+    // The staging identity names this import, so a plugin that starts once
+    // afterwards can take a value the save left without an owner.
+    let import_batch = plugin_owner::is_unowned(owner)
+        .then(|| carried.get(key).map(String::as_str).unwrap_or(generation));
+    (owner, import_batch)
 }
 
 fn sidecar_owner<'a>(meta: Option<&'a Map<String, Value>>, key: &str) -> &'a str {
@@ -1838,10 +1868,22 @@ fn put_plugin_storage(
     ordinal: Option<i64>,
     import_batch: Option<&str>,
 ) -> StoreResult<()> {
+    put_plugin_storage_json(transaction, generation, owner, key, &serde_json::to_string(value)?, ordinal, import_batch)
+}
+
+/// `put_plugin_storage` of the value `serde_json::to_string` writes as `serialized`.
+fn put_plugin_storage_json(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    owner: &str,
+    key: &str,
+    serialized: &str,
+    ordinal: Option<i64>,
+    import_batch: Option<&str>,
+) -> StoreResult<()> {
     if !plugin_owner::validate_owner(owner) {
         return Err(validation("plugin storage owner is invalid"));
     }
-    let serialized = serde_json::to_string(value)?;
     transaction.execute(
         "INSERT INTO plugin_storage
              (generation, owner, storage_key, byte_size, ordinal, value, import_batch_id)
@@ -1922,18 +1964,18 @@ pub(super) fn replace_presets(
     put_preset_rows(transaction, generation, presets, 0)
 }
 
+const PUT_PRESET: &str = "INSERT INTO bot_presets (generation, preset_id, configured_index, name, image, value)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+     ON CONFLICT(generation,preset_id) DO UPDATE SET configured_index=excluded.configured_index,
+         name=excluded.name,image=excluded.image,value=excluded.value";
+
 pub(super) fn put_preset_rows(
     transaction: &Transaction<'_>,
     generation: &str,
     presets: &[Value],
     first_index: i64,
 ) -> StoreResult<()> {
-    let mut statement = transaction.prepare_cached(
-        "INSERT INTO bot_presets (generation, preset_id, configured_index, name, image, value)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(generation,preset_id) DO UPDATE SET configured_index=excluded.configured_index,
-             name=excluded.name,image=excluded.image,value=excluded.value",
-    )?;
+    let mut statement = transaction.prepare_cached(PUT_PRESET)?;
     for (offset, preset) in presets.iter().enumerate() {
         statement.execute(params![
             generation,
@@ -1948,6 +1990,29 @@ pub(super) fn put_preset_rows(
         ])?;
     }
     Ok(())
+}
+
+/// `put_preset_rows` of one preset stored as `text`, written from it.
+pub(super) fn put_preset_text(transaction: &Transaction<'_>, generation: &str, text: &str, index: i64) -> StoreResult<()> {
+    let document = Document::parse(text, Depth::Unlimited)?;
+    let preset = document.value().object()?;
+    let id = stored_string(preset.as_ref(), "id")?.filter(|id| !id.is_empty()).ok_or_else(|| requires("Preset", "id"))?;
+    let mut value = Vec::new();
+    document.value().write_json(&mut value)?;
+    transaction.prepare_cached(PUT_PRESET)?.execute(params![
+        generation,
+        id,
+        index,
+        stored_string(preset.as_ref(), "name")?.unwrap_or_default(),
+        stored_string(preset.as_ref(), "image")?,
+        stored_json::text(value)?,
+    ])?;
+    Ok(())
+}
+
+/// The string a stored record holds as `name`, or `None` for any other value.
+fn stored_string<'a>(record: Option<&Object<'a>>, name: &str) -> StoreResult<Option<Cow<'a, str>>> {
+    Ok(record.and_then(|record| record.get(name)).map(Raw::as_str).transpose()?.flatten())
 }
 
 pub(super) fn require_staging(connection: &Connection, staging_id: &str) -> StoreResult<()> {
@@ -2822,7 +2887,11 @@ fn required_string<'a>(value: &'a Value, key: &str, context: &str) -> StoreResul
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| validation(format!("{context} requires {key}")))
+        .ok_or_else(|| requires(context, key))
+}
+
+fn requires(context: &str, key: &str) -> StoreError {
+    validation(format!("{context} requires {key}"))
 }
 
 fn validation(message: impl Into<String>) -> StoreError {

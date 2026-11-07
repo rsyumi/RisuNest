@@ -872,9 +872,13 @@ fn replacement_units_of_converted_binaries_equal_the_parsed_library() {
             "explicitGlobalChatVariables": {"toggle_binary": binary(10), "plain": "\u{d55c}"},
             "protectedPresetValues": {"seperateModels": {"memory": "model"}, "fallbackModels": [binary(5)]},
             "characterOrder": ["char-binary", {"name": "folder", "data": []}],
+            "pluginCustomStorage": {"binary": {"blob": binary(30_000)}, "small": binary(10)},
+            "pluginStorageMeta": {"binary": {"plugin": "synthetic-plugin"}},
         }))
         .unwrap();
-    store.replace_put_presets(&stage, &[]).unwrap();
+    store
+        .replace_put_presets(&stage, &[json!({"id": "preset-binary", "name": "Preset", "NAISettings": {"blob": binary(30_000)}, "temperature": 0.5})])
+        .unwrap();
     store
         .replace_add_characters(&stage, &[json!({
             "type": "character",
@@ -894,6 +898,8 @@ fn replacement_units_of_converted_binaries_equal_the_parsed_library() {
     assert!(matches!(value(&["persona", "persona", "embeddedModule"]), Some(UnitValue::Object { .. })));
     assert!(matches!(value(&["character", "char-binary", "extentions"]), Some(UnitValue::Object { .. })));
     assert!(matches!(value(&["conversation", "char-binary", "chat", "scriptstate"]), Some(UnitValue::Object { .. })));
+    assert!(matches!(value(&["preset", "preset-binary", "NAISettings"]), Some(UnitValue::Object { .. })));
+    assert!(matches!(value(&["plugin", "synthetic-plugin", "binary"]), Some(UnitValue::Object { .. })));
     assert_eq!(merged, whole);
 }
 

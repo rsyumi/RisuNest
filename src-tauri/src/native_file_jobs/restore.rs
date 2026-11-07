@@ -1033,10 +1033,7 @@ fn prepare_legacy_root(root: &RootSpool, excluded: &HashSet<String>) -> StoreRes
             root.rename_member("protectedPresetValues",from,to)?;
         }
     }
-    root.visit("botPresets",|key,mut value| {
-        upstream_import::prepare_presets(std::slice::from_mut(&mut value));
-        root.put_member("botPresets",key,Some(&value))
-    })?;
+    root.rename_object_members("botPresets",&upstream_import::MESSAGE_NAME_SETTINGS)?;
     Ok(())
 }
 
@@ -6378,17 +6375,23 @@ pub(super) mod tests {
     }
 
     fn character_rows_digest(store: &PersistentStore) -> (Vec<i64>, String) {
+        rows_digest(store, &[
+            "SELECT character_id,configured_index,recent_at,trashed,name,image,conversation_count,type,creator_notes,trash_time,detail FROM characters WHERE generation={active} ORDER BY character_id",
+            "SELECT character_id,conversation_id,configured_index,recent_at,name,message_count,detail FROM conversations WHERE generation={active} ORDER BY character_id,conversation_id",
+            "SELECT character_id,conversation_id,message_index,message_id,value,canonical_hash,canonical_size FROM messages WHERE generation={active} ORDER BY character_id,conversation_id,message_index",
+            "SELECT key,value FROM lww_units ORDER BY key",
+        ])
+    }
+
+    /// The row counts and a digest of what `queries` select, with `{active}`
+    /// naming the active generation.
+    fn rows_digest(store: &PersistentStore, queries: &[&str]) -> (Vec<i64>, String) {
         let rows = store.library_rows();
         let active = "(SELECT json_extract(value,'$') FROM meta WHERE key='activeGeneration')";
         let mut counts = Vec::new();
         let mut digest = Sha256::new();
-        for sql in [
-            format!("SELECT character_id,configured_index,recent_at,trashed,name,image,conversation_count,type,creator_notes,trash_time,detail FROM characters WHERE generation={active} ORDER BY character_id"),
-            format!("SELECT character_id,conversation_id,configured_index,recent_at,name,message_count,detail FROM conversations WHERE generation={active} ORDER BY character_id,conversation_id"),
-            format!("SELECT character_id,conversation_id,message_index,message_id,value,canonical_hash,canonical_size FROM messages WHERE generation={active} ORDER BY character_id,conversation_id,message_index"),
-            "SELECT key,value FROM lww_units ORDER BY key".to_owned(),
-        ] {
-            let mut statement = rows.prepare(&sql).unwrap();
+        for sql in queries {
+            let mut statement = rows.prepare(&sql.replace("{active}", active)).unwrap();
             let columns = statement.column_count();
             let mut query = statement.query([]).unwrap();
             let mut count = 0;
@@ -6465,6 +6468,103 @@ pub(super) mod tests {
         assert_eq!(
             character_rows_digest(&sink.store.lock().unwrap()),
             (vec![2, 2, 4, 21], "8b39b35cfb23c4228cf48707378ad39bd5924fb6bfdd2c24a4efcfc8c9ad7b70".to_owned())
+        );
+    }
+
+    #[test]
+    fn preset_settings_renamed_in_member_texts_are_written_as_the_renamed_values() {
+        let presets = [
+            r#"{"id":"a","groupTemplate":"t","x":1}"#,
+            r#"{"messageNameTemplate":"old","groupTemplate":"t","groupOtherBotRole":"r","namedMessageRole":"stale","z":0}"#,
+            r#"{"groupOtherBotRole":"r","groupTemplate":{"blob":{"0":1,"1":2}},"a":[]}"#,
+            r#"{"groupTemplate":1,"b":0,"groupTemplate":2,"messageNameTemplate":3}"#,
+            r#"{"namedMessageRole":"kept","groupOtherBotRole":null}"#,
+            r#"{"id":"plain"}"#,
+            r#"[{"groupTemplate":"t"}]"#,
+            r#""groupTemplate""#,
+            r#"{"$serde_json::private::RawValue":"{\"groupTemplate\":\"t\",\"n\":-0}"}"#,
+            "{ \"a\" : -0 , \"groupTemplate\" : 1e21 , \"b\":\"\\u00e9\\n\" }",
+        ];
+        let spool = || {
+            let root = RootSpool::new(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))).unwrap();
+            root.begin("presets", FieldKind::Array).unwrap();
+            for (index, preset) in presets.iter().enumerate() {
+                root.put_member_json("presets", &index.to_string(), Some(preset)).unwrap();
+            }
+            root
+        };
+        let text = |root: &RootSpool| {
+            let mut out = Vec::new();
+            root.write_root(&mut out, false).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let parsed = spool();
+        parsed.visit("presets", |key, mut value| {
+            upstream_import::prepare_presets(std::slice::from_mut(&mut value));
+            parsed.put_member("presets", key, Some(&value))
+        }).unwrap();
+        let renamed = spool();
+        renamed.rename_object_members("presets", &upstream_import::MESSAGE_NAME_SETTINGS).unwrap();
+        assert_eq!(text(&renamed), text(&parsed));
+    }
+
+    #[test]
+    fn restoring_presets_and_plugin_storage_with_binaries_keeps_their_stored_rows() {
+        // Binaries in presets, one with the upstream setting names restore
+        // renames, and in owned and unowned plugin storage.
+        let binary = |length: usize, seed: usize| MessagePackValue::Binary((0..length).map(|index| ((index * 7 + seed) % 256) as u8).collect());
+        let text = |value: &str| MessagePackValue::from(value);
+        let map = |entries: Vec<(&str, MessagePackValue)>| {
+            MessagePackValue::Map(entries.into_iter().map(|(key, value)| (text(key), value)).collect())
+        };
+        let database = map(vec![
+            ("username", text("Synthetic")),
+            ("characters", MessagePackValue::Array(vec![])),
+            ("botPresets", MessagePackValue::Array(vec![
+                map(vec![
+                    ("id", text("preset-binary")),
+                    ("name", text("Preset \"one\"")),
+                    ("namedMessageRole", text("stale")),
+                    ("NAISettings", map(vec![("blob", binary(30_000, 1))])),
+                    ("groupTemplate", text("{{char}}")),
+                    ("groupOtherBotRole", text("assistant")),
+                    ("image", text("preset.png")),
+                ]),
+                map(vec![("id", text("preset-plain")), ("binary", binary(100, 2)), ("temperature", MessagePackValue::from(0.5))]),
+            ])),
+            ("botPresetsId", MessagePackValue::from(1)),
+            ("pluginCustomStorage", map(vec![
+                ("owned", map(vec![("blob", binary(30_000, 3))])),
+                ("unowned", binary(64, 4)),
+                ("plain", text("\u{d55c}\n")),
+            ])),
+            ("pluginStorageMeta", map(vec![("owned", map(vec![("plugin", text("synthetic-plugin"))]))])),
+        ]);
+        let (directory, sink) = fixture();
+        let source = directory.path().join("presets.risudat");
+        fs::write(&source, legacy_wire(7, &super::legacy_stream_tests::messagepack_bytes(&database))).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_risu_save(&source, 1, &job, &sink).unwrap();
+        let store = sink.store.lock().unwrap();
+        let preset: String = store.library_rows().query_row(
+            "SELECT value FROM bot_presets WHERE preset_id='preset-binary'
+             AND generation=(SELECT json_extract(value,'$') FROM meta WHERE key='activeGeneration')",
+            [], |row| row.get(0),
+        ).unwrap();
+        let preset: Value = serde_json::from_str(&preset).unwrap();
+        let keys: Vec<&str> = preset.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["id", "name", "namedMessageRole", "NAISettings", "image", "messageNameTemplate"]);
+        assert_eq!((&preset["namedMessageRole"], &preset["messageNameTemplate"]), (&json!("assistant"), &json!("{{char}}")));
+        // Digests of what this restore stored while presets and plugin storage
+        // were staged as values. A change to them changes stored rows.
+        assert_eq!(
+            rows_digest(&store, &[
+                "SELECT preset_id,configured_index,name,image,value FROM bot_presets WHERE generation={active} ORDER BY configured_index",
+                "SELECT owner,storage_key,byte_size,ordinal,value,import_batch_id IS NULL FROM plugin_storage WHERE generation={active} ORDER BY owner,storage_key",
+                "SELECT value FROM root WHERE generation={active}",
+                "SELECT key,value FROM lww_units ORDER BY key",
+            ]),
+            (vec![2, 3, 1, 18], "5a98cbd7ba91c885a2020ffb61a2d0bad88c84bb7bedc60760cc704f361b8a04".to_owned())
         );
     }
 
