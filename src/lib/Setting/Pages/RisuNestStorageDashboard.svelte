@@ -154,14 +154,21 @@
         return ""
     }
 
+    // Another operation holding the library refused the action; it works once that operation ends.
+    const refusedAsBusy = (error: unknown): boolean =>
+        typeof error === 'object' && error !== null && 'code' in error
+        && (error.code === 'library-operation-busy' || error.code === 'commit-busy')
+
     function showActionError(error: unknown, fallback = strings.actionFailed): void {
-        void error
-        alertError(fallback)
+        alertError(refusedAsBusy(error) ? language.risuNest.importDialog.reasonBusy : fallback)
     }
 
     // Creating a snapshot or reading an image fails on the same damage the data check names.
     async function showStorageFailure(error: unknown): Promise<void> {
-        void error
+        if (refusedAsBusy(error)) {
+            showActionError(error)
+            return
+        }
         if (await alertConfirm(`${strings.actionFailed} ${language.risuNest.dataHealth.openResult}`))
             openDataHealthScreen()
     }

@@ -298,7 +298,8 @@ impl Diagnostics {
                 let code = match error {
                     StoreError::RevisionConflict { .. } => "revision-conflict",
                     StoreError::SnapshotReleased => "snapshot-released", StoreError::RawBodyUnavailable => "raw-body-unavailable",
-                    StoreError::CommitBusy => "commit-busy", StoreError::CommitDecode { .. } => "commit-decode",
+                    StoreError::CommitBusy => "commit-busy", StoreError::AssetInventoryBusy => "library-operation-busy",
+                    StoreError::CommitDecode { .. } => "commit-decode",
                     StoreError::Committed { .. } => "committed", StoreError::Validation { .. } => "validation",
                     StoreError::SchemaMismatch { .. } => "schema-mismatch", StoreError::Store { .. } => "store-error",
                 };
