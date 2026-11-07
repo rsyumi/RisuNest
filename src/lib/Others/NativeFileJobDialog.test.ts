@@ -132,13 +132,18 @@ describe('file operation error details', () => {
         await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith(report))
     })
 
-    it('lists each file of a batch that was not imported with its reason', async () => {
+    it('lists each file of a batch that was not imported, with its reason when it has one', async () => {
         const io = { code: 'source-read-failed', message: 'synthetic file failure', recoveryRequired: false }
         const refused = { code: 'unsupported-source', message: 'synthetic refusal', recoveryRequired: false }
         nativeFileOperationOutcome.set({
             kind: 'import', format: 'content', state: 'failed', startedAt: 0, finishedAt: 1,
             observedStages: [], warningCodes: [], partialWritesPossible: false, error: io,
-            batch: { total: 3, imported: 1, failures: [{ name: 'first.png', error: io }, { name: 'program.exe', error: refused }] },
+            batch: {
+                total: 4,
+                imported: 1,
+                failures: [{ name: 'first.png', error: io }, { name: 'program.exe', error: refused }],
+                declined: ['locked.png'],
+            },
         })
         target = document.createElement('div')
         document.body.append(target)
@@ -149,6 +154,7 @@ describe('file operation error details', () => {
         expect(rows).toEqual([
             ['first.png', failureReason('source-read-failed', 'import')],
             ['program.exe', failureReason('unsupported-source', 'import')],
+            ['locked.png'],
         ])
     })
 })

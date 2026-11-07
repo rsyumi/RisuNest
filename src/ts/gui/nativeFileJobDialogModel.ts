@@ -44,7 +44,7 @@ export interface NativeFileJobDialogTerminal {
     reason: string
     /** The library item whose data the export could not write. */
     location: string
-    /** Files of a batch that were not imported, with why. */
+    /** Files of a batch that were not imported, with why; a declined file has no reason of its own here. */
     failedFiles: { name: string; reason: string }[]
     details: string
     restarting: boolean
@@ -892,10 +892,10 @@ export function buildNativeFileJobDialogModel(
             if (outcome.state === 'cancelled' && batch.imported > 0) {
                 summary = fillTemplate(copy.resultBatchCancelled, batch.imported, batch.total)
             } else if (outcome.state === 'succeeded' && batch.imported < batch.total) {
-                // The files not counted were declined or refused with their own message.
+                // Only declined files are left; the converter or the user's own refusal already gave the reason.
                 summary = fillTemplate(copy.resultBatchPartial, batch.imported, batch.total)
             } else if (outcome.state === 'failed' && !outcome.error?.recoveryRequired && batch.failures.length > 0) {
-                summary = fillTemplate(copy.resultBatchFailed, batch.failures.length, batch.total)
+                summary = fillTemplate(copy.resultBatchFailed, batch.failures.length + batch.declined.length, batch.total)
                 reason = ''
             }
         }
@@ -945,10 +945,13 @@ export function buildNativeFileJobDialogModel(
                 summary,
                 reason,
                 location,
-                failedFiles: batch?.failures.map(failure => ({
-                    name: failure.name,
-                    reason: failureReason(failure.error.code, 'import', failure.error.itemKind),
-                })) ?? [],
+                failedFiles: batch ? [
+                    ...batch.failures.map(failure => ({
+                        name: failure.name,
+                        reason: failureReason(failure.error.code, 'import', failure.error.itemKind),
+                    })),
+                    ...batch.declined.map(name => ({ name, reason: '' })),
+                ] : [],
                 details: [
                     ...(batch?.failures.map(failure => `${failure.name}: [${failure.error.code}] ${failure.error.message}`) ?? []),
                     outcome.error && !batch?.failures.some(failure => failure.error === outcome.error)

@@ -364,7 +364,7 @@ describe('character card additions', () => {
             format: 'content',
             state: 'failed',
             error: failure,
-            batch: { total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }] },
+            batch: { total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [] },
         })])
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
