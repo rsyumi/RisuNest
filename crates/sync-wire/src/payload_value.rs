@@ -67,19 +67,35 @@ pub fn is_canonical(bytes: &[u8]) -> bool {
     let mut compare = Compare(bytes);
     write(&value, &mut compare, 0).is_ok() && compare.0.is_empty()
 }
+/// Objects and arrays at this depth or deeper are not encoded.
+pub const DEPTH_LIMIT: usize = 127;
+/// A JavaScript array index: the decimal text of an integer below `u32::MAX`
+/// without a sign or leading zeros.
 fn array_index(key: &str) -> Option<u32> {
-    let value = key.parse::<u32>().ok()?;
-    (value < u32::MAX && value.to_string() == key).then_some(value)
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 10 || (bytes[0] == b'0' && bytes.len() > 1) || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let value = key.parse::<u64>().ok()?;
+    (value < u64::from(u32::MAX)).then_some(value as u32)
 }
-fn key_order(a: &str, b: &str) -> Ordering {
+/// The order of object keys in an encoding: array indexes by value, then the
+/// other keys by UTF-16 code units, as JavaScript orders own properties.
+pub fn key_order(a: &str, b: &str) -> Ordering {
     match (array_index(a), array_index(b)) {
         (Some(a), Some(b)) => a.cmp(&b), (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater, _ => a.encode_utf16().cmp(b.encode_utf16()),
     }
 }
+/// Writes a number as JavaScript prints it, with `-0` as `0`.
+pub fn write_number(number: f64, out: &mut impl Write) -> Result<()> {
+    if !number.is_finite() { return Err(WireError("unsupported-payload-number")); }
+    out.write_all(ryu_js::Buffer::new().format(if number == 0.0 { 0.0 } else { number }).as_bytes())
+        .map_err(|_| WireError("invalid-payload-json"))
+}
 fn write(value: &Value, out: &mut impl Write, depth: usize) -> Result<()> {
     let io = |_| WireError("invalid-payload-json");
-    if matches!(value, Value::Object(_) | Value::Array(_)) && depth >= 127 {
+    if matches!(value, Value::Object(_) | Value::Array(_)) && depth >= DEPTH_LIMIT {
         return Err(WireError("invalid-payload-json"));
     }
     match value {
@@ -103,10 +119,31 @@ fn write(value: &Value, out: &mut impl Write, depth: usize) -> Result<()> {
             out.write_all(b"]").map_err(io)?;
         }
         Value::Number(number) => {
-            let number = number.as_f64().filter(|v| v.is_finite()).ok_or(WireError("unsupported-payload-number"))?;
-            out.write_all(ryu_js::Buffer::new().format(if number == 0.0 { 0.0 } else { number }).as_bytes()).map_err(io)?;
+            write_number(number.as_f64().ok_or(WireError("unsupported-payload-number"))?, out)?;
         }
         _ => serde_json::to_writer(out, value).map_err(|_| WireError("invalid-payload-json"))?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_index_reads_the_keys_a_decimal_round_trip_reads() {
+        fn round_trip(key: &str) -> Option<u32> {
+            let value = key.parse::<u32>().ok()?;
+            (value < u32::MAX && value.to_string() == key).then_some(value)
+        }
+        let mut keys: Vec<String> = [
+            "", "0", "00", "01", "1", "9", "10", "+1", "-0", "-1", " 1", "1 ", "1.0", "1e3", "0x1",
+            "4294967294", "4294967295", "4294967296", "04294967294", "9999999999", "99999999999",
+            "18446744073709551615", "18446744073709551616", "\u{0661}", "１", "a", "id",
+        ].iter().map(|key| (*key).to_owned()).collect();
+        keys.extend((0..2_000u32).map(|index| index.to_string()));
+        for key in &keys {
+            assert_eq!(array_index(key), round_trip(key), "{key:?}");
+        }
+    }
 }

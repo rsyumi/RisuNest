@@ -91,8 +91,11 @@ pub(super) fn inline(value: &Value) -> StoreResult<UnitValue> {
 /// content object. The choice depends only on the bytes, so equal values have
 /// equal units on every device.
 pub(super) fn unit_value(db: &Connection, value: &Value) -> StoreResult<UnitValue> {
+    canonical_unit_value(db, wire(risunest_sync_wire::payload_value::encode(value))?)
+}
+/// `unit_value` of the value whose `payload_value` encoding is `canonical`.
+pub(super) fn canonical_unit_value(db: &Connection, canonical: Vec<u8>) -> StoreResult<UnitValue> {
     use base64::Engine;
-    let canonical = wire(risunest_sync_wire::payload_value::encode(value))?;
     if canonical.len() <= MAX_INLINE_UNIT_BYTES {
         return Ok(UnitValue::Inline {
             bytes: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(canonical),

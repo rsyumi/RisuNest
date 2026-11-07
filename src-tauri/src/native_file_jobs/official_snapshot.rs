@@ -2,6 +2,7 @@ use risunest_network_log::reqwest::RequestBuilderExt;
 use super::official_assets::{ColdSource, SpoolLimits};
 use super::{restore, ImportCounts, IncompleteRestorePreview, JobControl, JobDetail, JobKind, JobPhase, JobProgress, JobResultSummary, JobStage, JobState, NativeJobError, OpenedJobSource, StageUnit};
 use crate::persistent_store::commit::StagedPluginPreview;
+use crate::persistent_store::held_binary::HeldBinaries;
 use crate::persistent_store::upstream_stream::RootSpool;
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
@@ -131,6 +132,10 @@ impl restore::ReplacementSink for OfficialSink<'_> {
 
     fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()> {
         self.inner.add_characters(staging_id, characters)
+    }
+
+    fn add_characters_with_binaries(&self, staging_id: &str, characters: &[Value], binaries: &HeldBinaries) -> StoreResult<()> {
+        self.inner.add_characters_with_binaries(staging_id, characters, binaries)
     }
 
     fn prepare_character(&self, character: Value) -> StoreResult<Value> {

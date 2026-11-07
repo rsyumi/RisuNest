@@ -23,7 +23,7 @@ const delay = (milliseconds) =>
 const args = runnerOptions(process.argv.slice(2));
 for (const name of Object.keys(args))
   assert.ok(
-    ["adb", "aapt", "adb-port", "serial", "avd", "apk", "output", "health", "peer", "exchange", "legacy-mb", "legacy-encoding", "legacy-entries", "plugin-values", "sync-server"].includes(name),
+    ["adb", "aapt", "adb-port", "serial", "avd", "apk", "output", "health", "peer", "exchange", "legacy-mb", "legacy-encoding", "legacy-binary-bytes", "legacy-entries", "plugin-values", "sync-server"].includes(name),
     "Unsupported runner option",
   );
 const android = androidTarget(args);
@@ -593,7 +593,7 @@ async function main() {
     }
     return;
   }
-  if (args['legacy-mb'] || args['legacy-encoding']) {
+  if (args['legacy-mb'] || args['legacy-encoding'] || args['legacy-binary-bytes']) {
     const measurement = await measureLegacyRestore({ args, client, run, pid, packageName, output,
       apkSha256: sha256, environment });
     completed = measurement.success;

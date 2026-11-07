@@ -24,6 +24,11 @@ For the Android entry-count axis, build the synthetic agent APK using
 required explicit emulator, APK, ADB and recent health-summary arguments.
 This uses an app-owned synthetic file and does not exercise a document provider.
 
+The Android decoded-size axis takes `--legacy-mb=100|300|600` and
+`--legacy-encoding=raw|gzip` instead. Add `--legacy-binary-bytes=<n>`, at most
+262,144, to give each synthetic character a MessagePack `bin` field of that many
+bytes within the same decoded size; the run then also verifies one restored field.
+
 Measure database, attachment and record sizes separately:
 
 ```text
