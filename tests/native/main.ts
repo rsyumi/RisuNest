@@ -1,6 +1,7 @@
 import { runContractScenarios, verifyContractReadback } from './contractScenarios'
 import { endsByNativeExit, runNativeExitPhase, verifySessionEndReadback } from './lifecycleScenarios'
 import { invoke } from '@tauri-apps/api/core'
+import { failureRecord } from '../../benchmarks/failureRecord'
 import { Buffer } from 'buffer'
 import { SqlitePersistentDataStore } from '../../src/ts/storage/sqlitePersistentDataStore'
 import { RevisionConflictError } from '../../src/ts/storage/persistentDataStore'
@@ -8,6 +9,8 @@ import { stableSelectionRoot } from '../../src/ts/storage/persistentSelectionBou
 import type { Database } from '../../src/ts/storage/database.svelte'
 
 globalThis.Buffer = Buffer
+// The window error handlers the native side injects record the cause chain through this.
+Object.assign(window, { __boundaryFailureRecord: failureRecord })
 
 const fixture = {
     username: '', botPresets: [], botPresetsId: 0, pluginCustomStorage: {},
@@ -121,5 +124,5 @@ try {
     if (blockedRequests.length) throw new Error(`Unexpected blocked resources: ${blockedRequests.join(', ')}`)
     await invoke('boundary_finish', { report: { ...phase, cases, success: true, ...(measurements ? { measurements } : {}) } })
 } catch (error) {
-    await invoke('boundary_finish', { report: { ...phase, cases, success: false, error: String(error) } })
+    await invoke('boundary_finish', { report: { ...phase, cases, success: false, error: String(error), failure: failureRecord(error) } })
 }

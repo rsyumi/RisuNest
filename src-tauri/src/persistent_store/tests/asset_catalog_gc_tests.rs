@@ -2152,6 +2152,61 @@ fn a_permanent_delete_keeps_the_aliases_an_older_archive_names_in_its_text() {
     assert!(alias_object(&store, "assets/shared.png").is_some());
 }
 
+/// The unused-file cleanup deletes the records of payloads no archive points at any more, after
+/// its own work and in one transaction, and keeps both payloads of every archive, one written just
+/// before it included. A deletion that fails keeps every record and leaves the cleanup's result.
+#[test]
+fn unused_file_cleanup_deletes_the_records_of_payloads_no_archive_points_at() {
+    use crate::server_sync::lww_tests::put_asset;
+    use super::super::archive::read_archived_object;
+    use super::super::archive_asset_names::{connection, recorded};
+    use super::super::asset_alias_orphans::OrphanAliasScope;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut store = PersistentStore::open(root).unwrap();
+    for key in ["assets/restored.png", "assets/kept.png", "assets/late.png", "assets/orphan.png"] {
+        put_asset(&mut store, key, format!("synthetic body of {key}").as_bytes());
+    }
+    let archive = |store: &mut PersistentStore, id: &str| {
+        add_synthetic_character(store, id, &format!(r#"<img src="assets/{id}.png">"#));
+        store.archive_character(id, store.revision().unwrap(), 10).unwrap();
+        let generation = super::active_generation(&store.connection).unwrap();
+        let archived = read_archived_object(&store.connection, &generation, id).unwrap().unwrap();
+        assert_ne!(archived.object_hash, archived.shared_object_hash);
+        [archived.object_hash, archived.shared_object_hash]
+    };
+    let restored = archive(&mut store, "restored");
+    let kept = archive(&mut store, "kept");
+    store.restore_character("restored", store.revision().unwrap()).unwrap();
+    let late = archive(&mut store, "late");
+    backdate_alias(&store, "assets/orphan.png", 1_000);
+    let cleanup = OrphanAliasScope::Cleanup { now_ms: super::super::device_store::now_ms().unwrap() };
+    let all_recorded = |hashes: &[&[String; 2]]| for hash in hashes.iter().copied().flatten() {
+        assert!(recorded(root, hash), "{hash} must stay recorded");
+    };
+    all_recorded(&[&restored, &kept, &late]);
+
+    // The second deletion fails, so the first is rolled back too.
+    let records = connection(root);
+    records.execute_batch(&format!(
+        "CREATE TRIGGER synthetic_refusal BEFORE DELETE ON archive_asset_names WHEN old.hash = '{}'
+         BEGIN SELECT RAISE(ABORT, 'synthetic refusal'); END;",
+        restored.iter().max().unwrap(),
+    )).unwrap();
+    let deleted = store.delete_orphaned_asset_aliases(&cleanup).unwrap();
+    assert_eq!(deleted.into_iter().map(|alias| alias.key).collect::<Vec<_>>(), ["assets/orphan.png"]);
+    all_recorded(&[&restored, &kept, &late]);
+    records.execute_batch("DROP TRIGGER synthetic_refusal").unwrap();
+
+    // A cleanup that finds nothing to delete still deletes the records.
+    assert!(store.delete_orphaned_asset_aliases(&cleanup).unwrap().is_empty());
+    for hash in &restored {
+        assert!(!recorded(root, hash), "{hash} must be deleted");
+    }
+    all_recorded(&[&kept, &late]);
+}
+
 /// A record belongs to its payload, so a snapshot restore that brings back an earlier archive of a
 /// character finds what that archive names, not what the later one named.
 #[test]
@@ -2183,6 +2238,9 @@ fn a_snapshot_restore_finds_the_record_of_the_archive_it_brings_back() {
     assert_ne!(archived(&store).object_hash, first.object_hash);
 
     let stage = store.snapshot_restore_stage(&snapshot.id, "archive-names-restore").unwrap();
+    // The staged library points at the first archive again, so a cleanup meanwhile keeps its record.
+    let now = super::super::device_store::now_ms().unwrap();
+    store.delete_orphaned_asset_aliases(&super::super::asset_alias_orphans::OrphanAliasScope::Cleanup { now_ms: now }).unwrap();
     let authority = store.lww_binding_authority().unwrap();
     store.snapshot_restore_activate(&stage.staging_id, store.revision().unwrap(), authority).unwrap();
     assert_eq!(archived(&store).object_hash, first.object_hash);

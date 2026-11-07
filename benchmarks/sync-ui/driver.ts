@@ -1,5 +1,6 @@
 import { tick } from "svelte";
 import { get } from "svelte/store";
+import { failureRecord, type FailureEntry, type FailureRecord } from "../failureRecord";
 
 /** Drives the product Sync settings like a user. Records structure only, never codes, tokens or bodies. */
 export type SyncLabel = "sync-env" | "sync-result";
@@ -7,8 +8,8 @@ export type SyncReport = (stage: string, result: Record<string, unknown>) => Pro
 
 export class SyncStepError extends Error {
   readonly detail: Record<string, unknown>;
-  constructor(label: SyncLabel, step: string, message: string, detail: Record<string, unknown> = {}) {
-    super(`${label} ${step}: ${message}`);
+  constructor(label: SyncLabel, step: string, message: string, detail: Record<string, unknown> = {}, options?: ErrorOptions) {
+    super(`${label} ${step}: ${message}`, options);
     this.detail = { label, step, ...detail };
   }
 }
@@ -36,6 +37,17 @@ export const redact = (text: string) => text.replace(/[A-Za-z0-9_+/=-]{32,}/g, "
 // Bundle frames name the chunk and position, which a rebuild of the same snapshot maps back to source.
 const frames = (stack: string | undefined) => (stack ?? "").split(/\r?\n/).slice(0, 4)
   .map((frame) => frame.trim().replace(/[A-Za-z0-9_-]{32,}/g, "<redacted>").slice(0, 200)).filter(Boolean);
+
+/** The failure record of `error`, with the message and stack of it and of each cause redacted. */
+export function syncFailureRecord(error: unknown): FailureRecord {
+  const redacted = (entry: FailureEntry): FailureEntry => ({
+    ...entry,
+    message: redact(entry.message),
+    ...(entry.stack ? { stack: frames(entry.stack).join("\n") } : {}),
+  });
+  const record = failureRecord(error);
+  return { ...record, ...redacted(record), ...(record.causes ? { causes: record.causes.map(redacted) } : {}) };
+}
 
 // The shape of a field, never its value.
 const shapeOf = (owner: unknown, field: string) => {
@@ -75,7 +87,7 @@ export class SyncDriver {
     } catch (error) {
       const failure = error instanceof SyncStepError ? error
         : new SyncStepError(label, name, error instanceof Error ? redact(error.message) : "failed",
-          { errorName: error instanceof Error ? error.name : typeof error });
+          { errorName: error instanceof Error ? error.name : typeof error }, { cause: error });
       failure.detail.consoleErrors = this.errors.slice(-8);
       failure.detail.characterOrder = { ...(await this.orderShapes()), events: this.orderEvents };
       throw failure;

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { REALM_BLOCKED_URL_PATTERNS } from "../../scripts/realmBlocklist.mjs";
+import { evaluationErrorText } from "../support/cdpException.mjs";
 import { sharedCargoTarget } from "../../scripts/testNative.mjs";
 import { measureEntryCount } from "../legacy-restore/entry-count.mjs";
 import { measurePluginValue } from './plugin-value-driver.mjs';
@@ -121,10 +122,12 @@ async function evaluate(page, expression) {
     userGesture: true,
   });
   if (result.exceptionDetails) {
-    throw new Error(
+    throw new Error(await evaluationErrorText(
+      (method, params) => page.call(method, params),
+      result.exceptionDetails,
       result.exceptionDetails.exception?.description ??
         "synthetic-evaluation-failed",
-    );
+    ));
   }
   return result.result.value;
 }

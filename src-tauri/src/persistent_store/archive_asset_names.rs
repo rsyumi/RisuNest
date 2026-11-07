@@ -4,7 +4,8 @@
 //!
 //! A record belongs to the payload's object hash, so it describes those bytes wherever they are
 //! referenced from. A payload another version or another device wrote has its own hash and has
-//! no record until this device reads it.
+//! no record until this device reads it. The unused-file cleanup deletes the records of payloads
+//! no archive points at any more; one that comes back is read again.
 
 use super::asset_alias_orphans::{key_forms, AssetKeyMatcher, ANCHOR};
 use super::{PersistentStore, StoreError, StoreResult};
@@ -320,6 +321,38 @@ pub(super) fn record_payload(
     Ok(names)
 }
 
+/// Deletes, in one transaction, the records there are before `references` runs whose payloads it
+/// does not name, and returns how many. A record written while it runs stays. `references`
+/// returns `None` when it cannot tell, and then every record stays.
+fn prune(root: &Path, references: impl FnOnce() -> StoreResult<Option<BTreeSet<String>>>) -> StoreResult<usize> {
+    if !root.join("persistent").join(FILE_NAME).exists() {
+        return Ok(0);
+    }
+    let mut db = open(root)?;
+    let recorded = {
+        let mut statement = db.prepare("SELECT hash FROM archive_asset_names")?;
+        let hashes = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<BTreeSet<_>, _>>()?;
+        hashes
+    };
+    if recorded.is_empty() {
+        return Ok(0);
+    }
+    let Some(references) = references()? else { return Ok(0) };
+    let unused = recorded.difference(&references).collect::<Vec<_>>();
+    if unused.is_empty() {
+        return Ok(0);
+    }
+    let transaction = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut delete = transaction.prepare("DELETE FROM archive_asset_names WHERE hash = ?1")?;
+        for hash in &unused {
+            delete.execute([hash])?;
+        }
+    }
+    transaction.commit()?;
+    Ok(unused.len())
+}
+
 /// What the archives of the active generation name, as far as their records tell.
 pub(super) struct ArchiveNameRecords {
     pub(super) names: ArchiveNames,
@@ -335,6 +368,12 @@ pub(crate) struct ArchiveNameFill {
     policy: AssetPolicy,
 }
 
+/// The archive in an `archived_object` value, or `None` when it cannot be read.
+fn archived_object(value: rusqlite::types::ValueRef<'_>) -> Option<super::archive::ArchivedObject> {
+    let rusqlite::types::ValueRef::Text(record) = value else { return None };
+    serde_json::from_slice(record).ok()
+}
+
 impl PersistentStore {
     /// The payload of every archived character of the active generation, the one a restore reads.
     /// `None` when an archive row cannot be read.
@@ -346,16 +385,39 @@ impl PersistentStore {
         let mut rows = statement.query([generation])?;
         let mut hashes = BTreeSet::new();
         while let Some(row) = rows.next()? {
-            let rusqlite::types::ValueRef::Text(record) = row.get_ref(0)? else { return Ok(None) };
-            let Ok(archived) = serde_json::from_slice::<super::archive::ArchivedObject>(record) else {
-                return Ok(None);
-            };
+            let Some(archived) = archived_object(row.get_ref(0)?) else { return Ok(None) };
             if validate_hash(&archived.object_hash).is_err() {
                 return Ok(None);
             }
             hashes.insert(archived.object_hash);
         }
         Ok(Some(hashes))
+    }
+
+    /// Both payloads of every archived character the library holds, in any generation, as the
+    /// asset cleanup keeps their objects: a staged library becomes the active one, and a binding
+    /// activation points an archive at its shared payload. `None` when an archive row cannot be
+    /// read.
+    fn archived_payload_references(&self) -> StoreResult<Option<BTreeSet<String>>> {
+        let mut statement =
+            self.connection.prepare("SELECT archived_object FROM characters WHERE archived_object IS NOT NULL")?;
+        let mut rows = statement.query([])?;
+        let mut hashes = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            let Some(archived) = archived_object(row.get_ref(0)?) else { return Ok(None) };
+            hashes.extend([archived.object_hash, archived.shared_object_hash]);
+        }
+        Ok(Some(hashes))
+    }
+
+    /// Deletes the records of payloads no archive points at any more. The unused-file cleanup calls
+    /// this while it holds the store, which every archive write needs too, so no archive can be
+    /// written between looking at the archives and deleting. A failure keeps every record and is
+    /// only logged.
+    pub(super) fn prune_archive_name_records(&self) {
+        if let Err(error) = prune(&self.repository_root, || self.archived_payload_references()) {
+            crate::nlog!("warn", "Unused archive asset name records were not deleted: {error}");
+        }
     }
 
     /// The records of the active generation's archives. `None` when an archive row or the records
@@ -478,6 +540,12 @@ pub(crate) fn recorded(root: &Path, hash: &str) -> bool {
     !read(root, &BTreeSet::from([hash.to_owned()])).unwrap().is_empty()
 }
 
+/// A connection to the records, to change them as a test needs.
+#[cfg(test)]
+pub(crate) fn connection(root: &Path) -> Connection {
+    open(root).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +641,33 @@ mod tests {
         assert!(read(directory.path(), &BTreeSet::from(["bad".to_owned()])).is_err());
         open(directory.path()).unwrap().execute_batch("PRAGMA user_version=2").unwrap();
         assert!(matches!(read(directory.path(), &hashes), Err(StoreError::SchemaMismatch { .. })));
+    }
+
+    /// Pruning deletes only records that existed before it looked at the archives, so one the
+    /// background pass writes meanwhile stays, and deletes nothing when an archive is unreadable.
+    #[test]
+    fn pruning_keeps_records_written_while_it_runs_and_every_record_when_it_cannot_tell() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("persistent")).unwrap();
+        let [kept, unused, written] = ["a", "b", "c"].map(|digit| digit.repeat(64));
+        for hash in [&kept, &unused] {
+            write(root, hash, &scanned("assets/a.png", 4)).unwrap();
+        }
+        let present = || {
+            let all = BTreeSet::from([kept.clone(), unused.clone(), written.clone()]);
+            read(root, &all).unwrap().into_keys().collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(prune(root, || Ok(None)).unwrap(), 0);
+        assert_eq!(present(), BTreeSet::from([kept.clone(), unused.clone()]));
+
+        let removed = prune(root, || {
+            write(root, &written, &ArchiveNames::default())?;
+            Ok(Some(BTreeSet::from([kept.clone()])))
+        })
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(present(), BTreeSet::from([kept.clone(), written.clone()]));
     }
 }

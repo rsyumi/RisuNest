@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { SyncDriver, SyncStepError, redact } from "../sync-ui/driver";
+import { SyncDriver, SyncStepError, redact, syncFailureRecord } from "../sync-ui/driver";
 import { webDavAfterRelaunch, webDavBackupRestore, type WebDavInput } from "../sync-ui/externalStorage";
 import { webDavSyncAfterRelaunch, webDavSyncPublish } from "../sync-ui/externalSync";
 import { backupFileAfterRelaunch, backupFileRestore } from "../sync-ui/portableBackup";
@@ -53,7 +53,7 @@ export async function externalStorageContract(phase: ExternalPhase) {
   } catch (error) {
     const detail = error instanceof SyncStepError ? error.detail : { label: "sync-result", step: "unknown" };
     const message = error instanceof Error ? redact(error.message) : "failed";
-    await report("failure", { passed: false, message, detail }).catch(() => {});
+    await report("failure", { passed: false, ...syncFailureRecord(error), message, detail }).catch(() => {});
     overlay.textContent = `sync-result:failed:${JSON.stringify({ phase, ...detail, message })}`;
   }
 }

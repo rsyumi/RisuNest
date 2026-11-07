@@ -25,8 +25,13 @@ vi.mock("@tauri-apps/plugin-fs", () => ({
 }));
 vi.mock("@tauri-apps/plugin-os", () => ({ platform: () => "ios" }));
 vi.mock("../../src/ts/storage/nativePaths", () => ({ nativeDataPath: async () => "/synthetic/ios-bench" }));
+// A failed Sync step also reads the product library's shape, which these records leave unavailable.
+vi.mock("../../src/ts/stores.svelte", () => ({}));
 
 import { guard, initialize } from "./contracts";
+import { externalStorageContract } from "./externalStorageContracts";
+import { syncContract } from "./syncContracts";
+import type { FailureRecord } from "../failureRecord";
 
 const owner = "io.github.rsyumi.risunest.ios.bench:legacy-restore-v1";
 
@@ -113,5 +118,45 @@ describe("iOS synthetic profile ownership", () => {
     expect(native.writeFile).not.toHaveBeenCalled();
     expect(native.invoke).not.toHaveBeenCalled();
     expect(native.revision).toBe(9);
+  });
+});
+
+describe("iOS Sync contract failure record", () => {
+  const secret = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd";
+  const container = "0C6B1F2E-4A5B-4C3D-9E8F-112233445566";
+  const path = `/private/var/mobile/Containers/Data/Application/${container}/Library`;
+
+  it.each([
+    ["sync-restart", () => syncContract("sync-restart")],
+    ["external-storage-restart", () => externalStorageContract("external-storage-restart")],
+  ])("%s records the cause chain of a failed step with paths and secrets redacted", async (_phase, run) => {
+    const reports: { stage: string; result: FailureRecord }[] = [];
+    native.invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "ios_bench_sync_input" || command === "ios_bench_external_input") {
+        return { marker: "synthetic-marker", before: "synthetic-before" };
+      }
+      if (command === "pds_open") {
+        throw new Error("synthetic open failure", { cause: new Error(`refused ${secret} at ${path}`) });
+      }
+      if (command === "ios_bench_report") {
+        reports.push(args as { stage: string; result: FailureRecord });
+        return;
+      }
+      throw new Error(`Unexpected synthetic command: ${command}`);
+    });
+    const consoleError = console.error;
+    try {
+      await run();
+    } finally {
+      console.error = consoleError;
+    }
+    const failure = reports.find((report) => report.stage === "failure")?.result;
+    expect(failure?.causes?.map(({ name, message }) => ({ name, message }))).toEqual([
+      { name: "Error", message: "synthetic open failure" },
+      { name: "Error", message: "refused <redacted> at <redacted>" },
+    ]);
+    expect(failure?.causes?.[1].stack).toMatch(/^Error: refused <redacted> at /);
+    expect(JSON.stringify(reports)).not.toContain(secret);
+    expect(JSON.stringify(reports)).not.toContain(container);
   });
 });

@@ -5,6 +5,7 @@ import {mkdir, readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {androidTarget, runnerOptions} from '../support/androidTarget.mjs';
+import {evaluationErrorText} from '../support/cdpException.mjs';
 import {REALM_BLOCKED_URL_PATTERNS} from '../../scripts/realmBlocklist.mjs';
 
 const options = runnerOptions(process.argv.slice(2));
@@ -68,7 +69,7 @@ async function connect() {
   });
   const evaluate = async (expression) => {
     const result=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});
-    assert.ok(!result.exceptionDetails, result.exceptionDetails?.exception?.description ?? 'Synthetic page evaluation failed');
+    if (result.exceptionDetails) assert.ok(false, await evaluationErrorText(call, result.exceptionDetails, result.exceptionDetails.exception?.description ?? 'Synthetic page evaluation failed'));
     return result.result.value;
   };
   await call('Network.enable');

@@ -128,11 +128,20 @@ impl PersistentStore {
 
     /// Deletes the aliases `scope` finds orphaned in one commit, returning them. Nothing is
     /// deleted while any root cannot be read, and a library or device plugin value that changed
-    /// since the search returns busy.
+    /// since the search returns busy. The unused-file cleanup then deletes the archive name
+    /// records no archive needs any more.
     pub(crate) fn delete_orphaned_asset_aliases(
         &mut self,
         scope: &OrphanAliasScope<'_>,
     ) -> StoreResult<Vec<UnreferencedAlias>> {
+        let deleted = self.delete_orphans(scope)?;
+        if matches!(scope, OrphanAliasScope::Cleanup { .. }) {
+            self.prune_archive_name_records();
+        }
+        Ok(deleted)
+    }
+
+    fn delete_orphans(&mut self, scope: &OrphanAliasScope<'_>) -> StoreResult<Vec<UnreferencedAlias>> {
         let Some(mut search) = self.search_unreferenced_asset_aliases(scope)? else {
             return Ok(Vec::new());
         };
