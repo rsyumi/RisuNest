@@ -456,7 +456,7 @@ fn project_record(
             while let Some(row) = rows.next()? {
                 check(probe)?;
                 let value: String = row.get(0)?;
-                bodies.push(risunest_sync_wire::payload_value::canonicalize(value.as_bytes()).map_err(codec_error)?);
+                bodies.push(super::stored_json::canonicalize(&value).map_err(codec_error)?);
             }
             let hashes = bodies.iter().map(|body| risunest_external_storage_format::message_pages::MessageHash::from_bytes(body)).collect();
             let result = risunest_external_storage_format::message_pages::repage::<StoreError>(
