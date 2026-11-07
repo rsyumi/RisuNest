@@ -35,6 +35,7 @@ pub(super) fn incremental_commit<T>(
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
+use super::held_binary::HeldBinaries;
 
 pub(super) fn apply_root_mutations(
     mut root: Value,
@@ -817,6 +818,16 @@ pub(super) fn replace_add_characters(
     staging_id: &str,
     characters: &[Value],
 ) -> StoreResult<()> {
+    replace_add_characters_with_binaries(connection, staging_id, characters, &HeldBinaries::default())
+}
+
+/// Stages characters whose `bin` values `binaries` holds behind placeholders.
+pub(super) fn replace_add_characters_with_binaries(
+    connection: &mut Connection,
+    staging_id: &str,
+    characters: &[Value],
+    binaries: &HeldBinaries,
+) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut configured_index: i64 = transaction.query_row(
@@ -832,7 +843,7 @@ pub(super) fn replace_add_characters(
                 "Persistent data import requires unique character IDs",
             ));
         }
-        put_full_character(&transaction, staging_id, character, configured_index)?;
+        put_full_character(&transaction, staging_id, character, configured_index, binaries)?;
         page_staged_conversations(&transaction, staging_id, character_id)?;
         configured_index += 1;
     }
@@ -866,6 +877,7 @@ pub(super) fn replace_put_character_detail(
         None,
         configured_index,
         conversation_count,
+        &HeldBinaries::default(),
     )?;
     transaction.commit()?;
     Ok(())
@@ -906,7 +918,7 @@ pub(super) fn replace_put_conversation_row(
         recent_at,
         name,
         message_count,
-        detail,
+        &serde_json::to_string(detail)?,
     )?;
     page_staged_conversation(&transaction, staging_id, character_id, conversation_id)?;
     transaction.commit()?;
@@ -962,6 +974,7 @@ pub(super) fn replace_add_conversation_messages(
         conversation_id,
         start,
         messages,
+        &HeldBinaries::default(),
     )?;
     page_staged_conversation(&transaction, staging_id, character_id, conversation_id)?;
     transaction.commit()?;
@@ -2046,6 +2059,7 @@ pub(super) fn put_character_detail(
         None,
         configured_index,
         conversation_count,
+        &HeldBinaries::default(),
     )
 }
 
@@ -2072,7 +2086,7 @@ fn replace_character(
     };
 
     delete_character_contents(transaction, generation, character_id)?;
-    put_full_character(transaction, generation, character, configured_index)
+    put_full_character(transaction, generation, character, configured_index, &HeldBinaries::default())
 }
 
 fn put_full_character(
@@ -2080,12 +2094,13 @@ fn put_full_character(
     generation: &str,
     character: &Value,
     configured_index: i64,
+    binaries: &HeldBinaries,
 ) -> StoreResult<()> {
     let character_id = required_string(character, "chaId", "Character")?;
     let chats = character
         .get("chats")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
     put_character_records(
         transaction,
@@ -2094,6 +2109,7 @@ fn put_full_character(
         Some("chats"),
         configured_index,
         chats.len() as i64,
+        binaries,
     )?;
     for (index, conversation) in chats.iter().enumerate() {
         put_conversation(
@@ -2102,6 +2118,7 @@ fn put_full_character(
             character_id,
             conversation,
             index as i64,
+            binaries,
         )?;
     }
     Ok(())
@@ -2114,6 +2131,7 @@ fn put_character_records(
     omitted: Option<&str>,
     configured_index: i64,
     conversation_count: i64,
+    binaries: &HeldBinaries,
 ) -> StoreResult<()> {
     let object = object(detail, "Character detail")?;
     let character_id = required_string(detail, "chaId", "Character detail")?;
@@ -2158,7 +2176,7 @@ fn put_character_records(
             character_type,
             creator_notes,
             trash_time,
-            serde_json::to_string(&WithoutField(object, omitted))?,
+            serde_json::to_string(&WithoutField(object, omitted, binaries))?,
         ],
     )?;
     Ok(())
@@ -2170,6 +2188,7 @@ fn put_conversation(
     character_id: &str,
     conversation: &Value,
     configured_index: i64,
+    binaries: &HeldBinaries,
 ) -> StoreResult<()> {
     let object = object(conversation, "Conversation")?;
     let conversation_id = required_string(conversation, "id", "Conversation")?;
@@ -2177,13 +2196,12 @@ fn put_conversation(
     let messages = object
         .get("message")
         .and_then(Value::as_array)
-        .cloned()
+        .map(Vec::as_slice)
         .unwrap_or_default();
     let recent_at = conversation_recent_at(
         conversation,
         messages.last().and_then(|message| message.get("time")),
     );
-    let detail = without_field(conversation, "message")?;
     put_conversation_record(
         transaction,
         generation,
@@ -2193,7 +2211,7 @@ fn put_conversation(
         recent_at,
         name,
         messages.len() as i64,
-        &detail,
+        &serde_json::to_string(&WithoutField(object, Some("message"), binaries))?,
     )?;
     insert_messages(
         transaction,
@@ -2201,7 +2219,8 @@ fn put_conversation(
         character_id,
         conversation_id,
         0,
-        &messages,
+        messages,
+        binaries,
     )
 }
 
@@ -2223,7 +2242,7 @@ fn put_conversation_record(
     recent_at: i64,
     name: &str,
     message_count: i64,
-    detail: &Value,
+    detail: &str,
 ) -> StoreResult<()> {
     transaction.execute(
         "INSERT INTO conversations (
@@ -2244,7 +2263,7 @@ fn put_conversation_record(
             recent_at,
             name,
             message_count,
-            serde_json::to_string(detail)?,
+            detail,
         ],
     )?;
     Ok(())
@@ -2257,6 +2276,7 @@ fn insert_messages(
     conversation_id: &str,
     start: i64,
     messages: &[Value],
+    binaries: &HeldBinaries,
 ) -> StoreResult<()> {
     let mut statement = transaction.prepare_cached(
         "INSERT INTO messages (
@@ -2264,7 +2284,7 @@ fn insert_messages(
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for (offset, message) in messages.iter().enumerate() {
-        let canonical = risunest_sync_wire::payload_value::encode(message).map_err(super::lww::error)?;
+        let canonical = binaries.canonical(message)?;
         let message_id = message.get("chatId").and_then(Value::as_str);
         statement.execute(params![
             generation,
@@ -2272,7 +2292,7 @@ fn insert_messages(
             conversation_id,
             start + offset as i64,
             message_id,
-            serde_json::to_string(message)?,
+            binaries.json(message)?,
             {
                 #[cfg(test)]
                 crate::persistent_store::hash_work::observe("native_message_insert", canonical.len());
@@ -2426,6 +2446,7 @@ pub(super) fn apply_conversation_mutation(
                     character_id,
                     &Value::Object(value),
                     configured_index,
+                    &HeldBinaries::default(),
                 )?;
                 refresh_character_summary(transaction, generation, character_id)?;
                 return Ok(());
@@ -2475,6 +2496,7 @@ pub(super) fn apply_conversation_mutation(
                 conversation_id,
                 start,
                 messages,
+                &HeldBinaries::default(),
             )?;
 
             let stored_detail: Value;
@@ -2499,7 +2521,7 @@ pub(super) fn apply_conversation_mutation(
                 recent_at,
                 name,
                 old_count + delta,
-                detail,
+                &serde_json::to_string(detail)?,
             )?;
             refresh_character_summary(transaction, generation, character_id)?;
 
@@ -2749,18 +2771,15 @@ pub(super) fn set_active(
     Ok(())
 }
 
-fn without_field(value: &Value, field: &str) -> StoreResult<Value> {
-    let mut object = object(value, "JSON object")?.clone();
-    object.shift_remove(field);
-    Ok(Value::Object(object))
-}
-
-// Serializes the same text as `without_field` without copying the object.
-struct WithoutField<'a>(&'a Map<String, Value>, Option<&'a str>);
+// Serializes an object without one of its fields, and with the bytes behind
+// its placeholders, without copying it.
+struct WithoutField<'a>(&'a Map<String, Value>, Option<&'a str>, &'a HeldBinaries);
 
 impl Serialize for WithoutField<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_map(self.0.iter().filter(|(key, _)| Some(key.as_str()) != self.1))
+        serializer.collect_map(self.0.iter()
+            .filter(|(key, _)| Some(key.as_str()) != self.1)
+            .map(|(key, value)| (key, self.2.expanded(value))))
     }
 }
 
@@ -2778,15 +2797,9 @@ mod ordered_removal_tests {
             "c": 3,
         });
 
-        let result = without_field(&value, "removed").unwrap();
-        let keys = result
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+        let result = WithoutField(value.as_object().unwrap(), Some("removed"), &HeldBinaries::default());
 
-        assert_eq!(keys, ["a", "b", "c"]);
+        assert_eq!(serde_json::to_string(&result).unwrap(), r#"{"a":1,"b":2,"c":3}"#);
     }
 }
 

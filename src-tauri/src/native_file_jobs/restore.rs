@@ -10,6 +10,7 @@ use super::{
     NativeJobError, OpenedJobSource, StageUnit,
 };
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
+use crate::persistent_store::held_binary::HeldBinaries;
 use crate::persistent_store::upstream_stream::{FieldKind, RootSpool};
 use flate2::bufread::GzDecoder;
 use rmpv::Value as MessagePackValue;
@@ -70,6 +71,11 @@ pub(crate) trait ReplacementSink: Send + Sync {
         Err(StoreError::Store { message: "streamed legacy root staging is unavailable".into() })
     }
     fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()>;
+    /// Stages characters whose `bin` values `binaries` holds behind placeholders.
+    fn add_characters_with_binaries(&self, staging_id: &str, characters: &[Value], binaries: &HeldBinaries) -> StoreResult<()> {
+        let characters = characters.iter().map(|character| binaries.expand(character)).collect::<StoreResult<Vec<_>>>()?;
+        self.add_characters(staging_id, &characters)
+    }
     fn prepare_character(&self, character: Value) -> StoreResult<Value> {
         Ok(character)
     }
@@ -787,6 +793,7 @@ fn stream_legacy_characters<S: TrackedSource>(
     let mut retained = 0;
     let mut batch = Vec::new();
     let mut batch_bytes = 0u64;
+    let mut binaries = HeldBinaries::new(&uuid::Uuid::new_v4().to_string());
     let mut character_ids = HashSet::new();
     for index in 0..total {
         if job.is_cancel_requested() {
@@ -796,28 +803,36 @@ fn stream_legacy_characters<S: TrackedSource>(
         let packed = rmpv::decode::read_value_with_max_depth(input, LEGACY_CHARACTER_DEPTH)
             .map_err(|error| messagepack_error(error, job))?;
         let bytes = (decoded_position(input) - start).saturating_add(binary_json_growth(&packed));
-        let mut character = match messagepack_to_json(packed, job)? {
-            JsonSlot::Value(value) => value,
-            JsonSlot::Undefined => Value::Null,
+        let held = binaries.next_index();
+        let mut character = match messagepack_to_converted(packed, job)? {
+            Some(value) => value.into_held_character(&mut binaries)?,
+            None => Value::Null,
         };
         if upstream_import::exclude_record(&character, excluded) {
             job.record_restore_omission("excludedCharacters", 1).map_err(|error| job_error(job, error))?;
+            binaries.truncate(held);
             continue;
         }
         character = sink.prepare_character(character).map_err(store_error)?;
         if !sink.expands_cold_payloads() { omit_unavailable_cold(&mut character, job)?; }
         if upstream_import::exclude_record(&character, excluded) {
             job.record_restore_omission("excludedCharacters", 1).map_err(|error| job_error(job, error))?;
+            binaries.truncate(held);
             continue;
         }
-        if !prepare_legacy_character(&mut character, &mut character_ids) { continue; }
+        if !prepare_legacy_character(&mut character, &mut character_ids) {
+            binaries.truncate(held);
+            continue;
+        }
         retained += 1;
         pocket_features::character(&mut character, &format!("character:{index}"));
         assign_legacy_chat_ids(std::slice::from_mut(&mut character));
         if !batch.is_empty() && batch_bytes.saturating_add(bytes) > CHARACTER_BATCH_BYTES as u64 {
-            sink.add_characters(staging_id, &batch)
+            sink.add_characters_with_binaries(staging_id, &batch, &binaries)
                 .map_err(store_error)?;
             batch.clear();
+            // This character's bytes stay for the next batch.
+            binaries.release_before(held);
             batch_bytes = 0;
         }
         batch.push(character);
@@ -827,14 +842,15 @@ fn stream_legacy_characters<S: TrackedSource>(
             .inner
             .report_counts(|counts| counts.characters = retained)?;
         if batch.len() >= CHARACTER_BATCH_COUNT {
-            sink.add_characters(staging_id, &batch)
+            sink.add_characters_with_binaries(staging_id, &batch, &binaries)
                 .map_err(store_error)?;
             batch.clear();
+            binaries.release_before(binaries.next_index());
             batch_bytes = 0;
         }
     }
     if !batch.is_empty() {
-        sink.add_characters(staging_id, &batch)
+        sink.add_characters_with_binaries(staging_id, &batch, &binaries)
             .map_err(store_error)?;
     }
     Ok(retained)
@@ -1051,6 +1067,54 @@ impl Converted {
                 .map(|(key, value)| (key, value.into_value())).collect()),
         }
     }
+
+    /// The value of a staged character, with each `bin` held in `binaries`
+    /// behind a placeholder. Restore fills in fields of the character and of
+    /// each chat, so a `bin` that is the character or a chat is expanded.
+    fn into_held_character(self, binaries: &mut HeldBinaries) -> Result<Value, NativeJobError> {
+        let Self::Object(members) = self else {
+            return Ok(self.into_value());
+        };
+        let mut character = Map::with_capacity(members.len());
+        for (key, value) in members {
+            let value = match (key.as_str(), value) {
+                ("chats", Self::Array(chats)) => Value::Array(chats.into_iter()
+                    .map(|chat| match chat {
+                        Self::Binary(_) => Ok(chat.into_value()),
+                        chat => chat.into_held(binaries),
+                    })
+                    .collect::<Result<_, _>>()?),
+                (_, value) => value.into_held(binaries)?,
+            };
+            insert_held_member(&mut character, key, value, binaries)?;
+        }
+        Ok(Value::Object(character))
+    }
+
+    fn into_held(self, binaries: &mut HeldBinaries) -> Result<Value, NativeJobError> {
+        Ok(match self {
+            Self::Json(value) => value,
+            Self::Binary(bytes) => binaries.hold(bytes),
+            Self::Array(values) => Value::Array(values.into_iter()
+                .map(|value| value.into_held(binaries)).collect::<Result<_, _>>()?),
+            Self::Object(members) => {
+                let mut object = Map::with_capacity(members.len());
+                for (key, value) in members {
+                    let value = value.into_held(binaries)?;
+                    insert_held_member(&mut object, key, value, binaries)?;
+                }
+                Value::Object(object)
+            }
+        })
+    }
+}
+
+fn insert_held_member(object: &mut Map<String, Value>, key: String, value: Value, binaries: &HeldBinaries) -> Result<(), NativeJobError> {
+    if binaries.is_placeholder_key(&key) {
+        return Err(invalid("legacy MessagePack object key is reserved"));
+    }
+    object.insert(key, value);
+    Ok(())
 }
 
 impl serde::Serialize for Converted {
@@ -3331,6 +3395,19 @@ pub(super) mod tests {
                 .lock()
                 .unwrap()
                 .replace_add_characters(staging_id, characters)
+        }
+
+        fn add_characters_with_binaries(&self, staging_id: &str, characters: &[Value], binaries: &HeldBinaries) -> StoreResult<()> {
+            self.full_character_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_character_batches {
+                return Err(crate::persistent_store::StoreError::Store {
+                    message: "simulated disk full".to_owned(),
+                });
+            }
+            self.store
+                .lock()
+                .unwrap()
+                .replace_add_characters_with_binaries(staging_id, characters, binaries)
         }
 
         fn supports_incremental_characters(&self) -> bool {
@@ -6300,6 +6377,127 @@ pub(super) mod tests {
         );
     }
 
+    fn character_rows_digest(store: &PersistentStore) -> (Vec<i64>, String) {
+        let rows = store.library_rows();
+        let active = "(SELECT json_extract(value,'$') FROM meta WHERE key='activeGeneration')";
+        let mut counts = Vec::new();
+        let mut digest = Sha256::new();
+        for sql in [
+            format!("SELECT character_id,configured_index,recent_at,trashed,name,image,conversation_count,type,creator_notes,trash_time,detail FROM characters WHERE generation={active} ORDER BY character_id"),
+            format!("SELECT character_id,conversation_id,configured_index,recent_at,name,message_count,detail FROM conversations WHERE generation={active} ORDER BY character_id,conversation_id"),
+            format!("SELECT character_id,conversation_id,message_index,message_id,value,canonical_hash,canonical_size FROM messages WHERE generation={active} ORDER BY character_id,conversation_id,message_index"),
+            "SELECT key,value FROM lww_units ORDER BY key".to_owned(),
+        ] {
+            let mut statement = rows.prepare(&sql).unwrap();
+            let columns = statement.column_count();
+            let mut query = statement.query([]).unwrap();
+            let mut count = 0;
+            while let Some(row) = query.next().unwrap() {
+                for index in 0..columns {
+                    digest.update(format!("{:?}", row.get::<_, rusqlite::types::Value>(index).unwrap()).as_bytes());
+                    digest.update([0]);
+                }
+                digest.update([1]);
+                count += 1;
+            }
+            digest.update([2]);
+            counts.push(count);
+        }
+        (counts, hex::encode(digest.finalize()))
+    }
+
+    #[test]
+    fn restoring_characters_with_binaries_keeps_their_stored_rows() {
+        // Binaries in a character's fields, a chat's fields and toggles, and
+        // messages, including one whose swipes copy it into each variant, in
+        // two characters on either side of a batch closed by its byte bound.
+        let binary = |length: usize, seed: usize| MessagePackValue::Binary((0..length).map(|index| ((index * 7 + seed) % 256) as u8).collect());
+        let text = |value: &str| MessagePackValue::from(value);
+        let map = |entries: Vec<(&str, MessagePackValue)>| {
+            MessagePackValue::Map(entries.into_iter().map(|(key, value)| (text(key), value)).collect())
+        };
+        let array = MessagePackValue::Array;
+        let first = map(vec![
+            ("type", text("character")),
+            ("chaId", text("pinned-first")),
+            ("name", text("Synthetic")),
+            ("binary", binary(30_000, 1)),
+            ("extentions", map(vec![("blob", binary(100, 2))])),
+            ("additionalAssets", array(vec![array(vec![text("asset"), binary(20, 3), text("png")])])),
+            ("modules", array(vec![binary(10, 4)])),
+            ("chats", array(vec![map(vec![
+                ("id", text("chat")),
+                ("name", text("Chat")),
+                ("hypaV3Data", map(vec![("blob", binary(40, 5))])),
+                ("savedToggleValues", binary(8, 6)),
+                ("message", array(vec![
+                    map(vec![("role", text("user")), ("data", text("hello")), ("blob", binary(30_000, 7)), ("time", MessagePackValue::from(5))]),
+                    map(vec![("role", text("char")), ("data", text("a")), ("swipes", array(vec![text("a"), text("b")])), ("swipeId", MessagePackValue::from(0)), ("blob", binary(50, 8))]),
+                    binary(12, 9),
+                ])),
+            ])])),
+        ]);
+        let second = map(vec![
+            ("type", text("character")),
+            ("chaId", text("pinned-second")),
+            ("name", text("Second")),
+            ("binary", binary(64, 10)),
+            ("filler", text(&"x".repeat(CHARACTER_BATCH_BYTES + 1))),
+            ("chats", array(vec![map(vec![
+                ("id", text("chat")),
+                ("name", text("Chat")),
+                ("message", array(vec![map(vec![("data", text("x")), ("blob", binary(16, 11))])])),
+            ])])),
+        ]);
+        let database = map(vec![
+            ("username", text("Synthetic")),
+            ("characters", array(vec![first, second])),
+            ("characterOrder", array(vec![text("pinned-first"), text("pinned-second")])),
+        ]);
+        let (directory, sink) = fixture();
+        let source = directory.path().join("characters.risudat");
+        fs::write(&source, legacy_wire(7, &super::legacy_stream_tests::messagepack_bytes(&database))).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_risu_save(&source, 1, &job, &sink).unwrap();
+        assert_eq!(sink.full_character_calls.load(Ordering::Acquire), 2);
+        // Digests of what this restore stored while characters were staged as
+        // values. A change to them changes stored rows.
+        assert_eq!(
+            character_rows_digest(&sink.store.lock().unwrap()),
+            (vec![2, 2, 4, 21], "8b39b35cfb23c4228cf48707378ad39bd5924fb6bfdd2c24a4efcfc8c9ad7b70".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_binary_character_or_chat_is_staged_as_the_object_it_converts_to() {
+        // Restore fills in the ID and name of such a record, so it is expanded
+        // before that happens.
+        let binary = |length: usize| MessagePackValue::Binary((0..length).map(|index| (index * 7 % 256) as u8).collect());
+        let text = |value: &str| MessagePackValue::from(value);
+        let map = |entries: Vec<(&str, MessagePackValue)>| {
+            MessagePackValue::Map(entries.into_iter().map(|(key, value)| (text(key), value)).collect())
+        };
+        let database = map(vec![
+            ("username", text("Synthetic")),
+            ("characters", MessagePackValue::Array(vec![
+                binary(5),
+                map(vec![("type", text("character")), ("chaId", text("holder")), ("name", text("Holder")), ("chats", MessagePackValue::Array(vec![binary(3)]))]),
+            ])),
+        ]);
+        let (directory, sink) = fixture();
+        let source = directory.path().join("records.risudat");
+        fs::write(&source, legacy_wire(7, &super::legacy_stream_tests::messagepack_bytes(&database))).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_risu_save(&source, 1, &job, &sink).unwrap();
+        let store = sink.store.lock().unwrap();
+        let rows = store.library_rows();
+        let active = "(SELECT json_extract(value,'$') FROM meta WHERE key='activeGeneration')";
+        let (character, detail): (String, String) = rows.query_row(&format!("SELECT character_id,detail FROM characters WHERE generation={active} AND character_id<>'holder'"), [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(detail, format!(r#"{{"0":0,"1":7,"2":14,"3":21,"4":28,"chaId":"{character}","name":""}}"#));
+        let (chat, detail): (String, String) = rows.query_row(&format!("SELECT conversation_id,detail FROM conversations WHERE generation={active} AND character_id='holder'"), [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(detail, format!(r#"{{"0":0,"1":7,"2":14,"id":"{chat}","name":""}}"#));
+    }
+
     #[test]
     fn binaries_kept_as_bytes_convert_and_serialize_as_converted_values() {
         let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
@@ -6353,6 +6551,39 @@ pub(super) mod tests {
                 (Err(expected), Err(actual)) => assert_eq!(actual, expected),
                 _ => panic!("the conversions differ"),
             }
+        }
+    }
+
+    #[test]
+    fn converting_a_character_holds_its_binaries_beside_it() {
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        let text = |value: &str| MessagePackValue::from(value);
+        let binary = |length: usize| MessagePackValue::Binary((0..length).map(|index| (index * 7 % 256) as u8).collect());
+        let map = |entries: Vec<(&str, MessagePackValue)>| {
+            MessagePackValue::Map(entries.into_iter().map(|(key, value)| (text(key), value)).collect())
+        };
+        let character = map(vec![
+            ("chaId", text("held")),
+            ("binary", binary(5)),
+            ("nested", MessagePackValue::Array(vec![map(vec![("x", binary(3))])])),
+            ("chats", MessagePackValue::Array(vec![binary(2), map(vec![("id", text("chat")), ("blob", binary(4))])])),
+        ]);
+        let JsonSlot::Value(expected) = messagepack_to_json_reference(character.clone(), &job).unwrap() else { unreachable!() };
+        let mut binaries = HeldBinaries::new("fixed");
+        let held = messagepack_to_converted(character, &job).unwrap().unwrap().into_held_character(&mut binaries).unwrap();
+        assert_eq!(binaries.expand(&held).unwrap(), expected);
+        // Every binary stays bytes except the chat that is one, which restore fills in.
+        assert_eq!(binaries.next_index(), 3);
+        assert_eq!(held["chats"][0], expected["chats"][0]);
+        // A source object that holds the placeholder key fails the conversion.
+        let key = held["binary"].as_object().unwrap().keys().next().unwrap();
+        for value in [
+            MessagePackValue::Map(vec![(text(key), MessagePackValue::from(0))]),
+            map(vec![("chaId", text("source")), ("field", MessagePackValue::Map(vec![(text(key), MessagePackValue::from(0))]))]),
+            map(vec![("chats", MessagePackValue::Array(vec![MessagePackValue::Map(vec![(text(key), MessagePackValue::from(0))])]))]),
+        ] {
+            let converted = messagepack_to_converted(value, &job).unwrap().unwrap();
+            assert!(converted.into_held_character(&mut binaries).is_err());
         }
     }
 }

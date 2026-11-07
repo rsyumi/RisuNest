@@ -14,6 +14,7 @@ use crate::local_backup::{
     StrictLocalBackupDatabaseRestore,
 };
 use crate::persistent_store::export::{self, destination};
+use crate::persistent_store::held_binary::HeldBinaries;
 use crate::persistent_store::{
     AssetAlias, AssetOwnerHead, AssetOwnerLocator, PersistentStore,
     RevisionResult, StagingResult, StoreResult,
@@ -518,6 +519,14 @@ impl<R: tauri::Runtime> restore::ReplacementSink for LegacyReplacementSink<R> {
         self.add_missing_assets(characters.iter().map(|character| missing_asset_references(character, &self.asset_keys)).sum())?;
         crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
             store.replace_add_characters(staging_id, characters)
+        })
+    }
+
+    fn add_characters_with_binaries(&self, staging_id: &str, characters: &[Value], binaries: &HeldBinaries) -> StoreResult<()> {
+        // A placeholder holds no string, as the object it stands for holds none.
+        self.add_missing_assets(characters.iter().map(|character| missing_asset_references(character, &self.asset_keys)).sum())?;
+        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
+            store.replace_add_characters_with_binaries(staging_id, characters, binaries)
         })
     }
 

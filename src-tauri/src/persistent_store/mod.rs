@@ -9,6 +9,7 @@ pub(crate) mod commands;
 pub(crate) mod commit;
 pub(crate) mod compaction;
 pub(crate) mod content_capture;
+pub(crate) mod held_binary;
 mod message_pages;
 #[cfg(test)]
 mod message_pages_copied_database_tests;
@@ -2334,6 +2335,16 @@ impl PersistentStore {
         characters: &[Value],
     ) -> StoreResult<()> {
         commit::replace_add_characters(&mut self.connection, staging_id, characters)
+    }
+
+    /// Stages characters whose `bin` values `binaries` holds behind placeholders.
+    pub(crate) fn replace_add_characters_with_binaries(
+        &mut self,
+        staging_id: &str,
+        characters: &[Value],
+        binaries: &held_binary::HeldBinaries,
+    ) -> StoreResult<()> {
+        commit::replace_add_characters_with_binaries(&mut self.connection, staging_id, characters, binaries)
     }
 
     pub(crate) fn replace_put_character_detail(
