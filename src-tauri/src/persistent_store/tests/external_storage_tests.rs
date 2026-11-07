@@ -665,8 +665,9 @@ fn a_transfer_capture_serves_local_recovery_only_once_it_is_completed() {
     assert_eq!(crate::server_sync::residency::test_remote::fetched(root), 1);
     // The conflict store is the external root's own, not one nested in it.
     let external = root.join("external-storage");
-    assert!(!external.join("objects").join("content.sqlite").exists());
-    assert!(!external.join("objects").join("objects").exists());
+    assert!(external.join("content.sqlite").is_file());
+    assert!(!external.join("content-files").join("content.sqlite").exists());
+    assert!(!external.join("content-files").join("content-files").exists());
 }
 
 /// Flips one byte of a held payload, keeping its length.

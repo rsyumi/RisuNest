@@ -1,7 +1,7 @@
 use super::*;
 use crate::external_storage::{
     capture::{CaptureCatalog, DurableCaptureReference},
-    content_store::ContentStore,
+    content_store::{file_location, ContentStore},
 };
 use crate::persistent_store::{
     content_capture::ContentCaptureSink,
@@ -164,9 +164,10 @@ fn an_owner_that_cannot_be_read_defers_the_pass() {
         written(&store, "abandoned", &[b"garbage"]);
         match damage {
             "catalog" => fs::write(&path, b"synthetic-corrupt-catalog").unwrap(),
-            _ => fs::remove_file(
-                store.repository_root.join("external-storage/objects").join(hex::encode(hash(&big))),
-            )
+            _ => fs::remove_file(file_location(
+                &store.repository_root.join("external-storage"),
+                &hex::encode(hash(&big)),
+            ))
             .unwrap(),
         }
         assert_eq!(
@@ -178,6 +179,27 @@ fn an_owner_that_cannot_be_read_defers_the_pass() {
     }
 }
 
+/// Bodies an earlier version left in the flat directory are kept and removed
+/// by the same marks as the bodies in subdirectories.
+#[test]
+fn file_bodies_in_the_flat_directory_and_in_shards_are_collected_alike() {
+    let (_directory, mut store) = empty_store();
+    let external = store.repository_root.join("external-storage");
+    let bodies = [large(4), large(5), large(6), large(7)];
+    let (kept, kept_path) = written(&store, "kept", &[&bodies[0], &bodies[1]]);
+    written(&store, "dropped", &[&bodies[2], &bodies[3]]);
+    register(&store, &kept, &kept_path);
+    let flat = external.join("objects");
+    fs::create_dir(&flat).unwrap();
+    for body in [&bodies[1], &bodies[3]] {
+        let digest = hex::encode(hash(body));
+        fs::rename(file_location(&external, &digest), flat.join(&digest)).unwrap();
+    }
+    assert_eq!(collected(&mut store).file_bodies, 2);
+    assert!(held(&store, &bodies[0]) && held(&store, &bodies[1]));
+    assert!(!held(&store, &bodies[2]) && !held(&store, &bodies[3]));
+    assert!(flat.join(hex::encode(hash(&bodies[1]))).is_file());
+}
 
 #[test]
 fn a_pass_stops_at_its_removal_bound_and_the_next_one_finishes() {

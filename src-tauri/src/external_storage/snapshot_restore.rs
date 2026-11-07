@@ -289,6 +289,26 @@ fn ensure_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Creates the subdirectory a staging object is placed in the first time one
+/// is needed, and makes its entry durable when the placement is.
+fn ensure_parent(destination: &Path, durability: Durability) -> Result<()> {
+    let parent = destination.parent().expect("a staging object has a directory");
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !crate::trust_boundary::is_link_like(&metadata) => {
+            return Ok(())
+        }
+        Ok(_) => return Err(corrupt("snapshot staging directory is a link")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(transient(error)),
+    }
+    ensure_directory(parent)?;
+    if durability == Durability::Durable {
+        if let Some(above) = parent.parent() {
+            crate::trust_boundary::sync_directory(above).map_err(transient)?;
+        }
+    }
+    Ok(())
+}
 pub(crate) fn verify_body_file(path:&Path,length:u64,sha256:&str)->Result<bool> {verify(path,length,sha256)}
 fn verify(path: &Path, length: u64, sha256: &str) -> Result<bool> {
     let mut file = match crate::trust_boundary::open_regular_source(path) {
@@ -951,9 +971,17 @@ fn resolve_entries_in(
                 (None, held.then(|| ObjectSource::Captured(digest.clone())))
             }
             wire::CatalogEntryKind::Object => {
-                let destination = object_root.join(&digest);
+                // Spread over subdirectories: a directory without an index
+                // scans every entry it holds for each create and lookup.
+                let destination = object_root.join(&digest[..2]).join(&digest);
                 let mut source = verify(&destination, entry.byte_length, &digest)?
                     .then(|| ObjectSource::File(destination.clone()));
+                if source.is_none() {
+                    // What an earlier version placed before it was interrupted.
+                    let flat = object_root.join(&digest);
+                    source = verify(&flat, entry.byte_length, &digest)?
+                        .then(|| ObjectSource::File(flat));
+                }
                 if source.is_none() {
                     if let Some(cas) = library.as_ref() {
                         source = library_body(cas, &digest, entry.byte_length, prove)?;
@@ -1184,6 +1212,7 @@ fn place_whole(
         }
         return placement.content()?.put(digest, &bytes).map_err(corrupt);
     };
+    ensure_parent(destination, placement.durability)?;
     let partial = destination.with_extension("partial");
     if partial.exists() {
         fs::remove_file(&partial).map_err(transient)?;
@@ -1362,6 +1391,7 @@ fn finish_assemblies(staging_root: &Path, pending: &[Pending], durability: Durab
         }
         match file {
             Some(destination) => {
+                ensure_parent(destination, durability)?;
                 publish_verified_with(&path, destination, entry.byte_length, digest, durability)?
             }
             None => fs::remove_file(&path).map_err(transient)?,

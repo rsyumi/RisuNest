@@ -81,8 +81,7 @@ impl PersistentStore {
         if let Some(mut content) = ContentStore::open_existing(&root)? {
             collection.database_bodies = sweep_database(&mut content, &marked.database, budget)?;
             budget -= collection.database_bodies;
-            collection.file_bodies =
-                sweep_files(content.object_directory(), &marked.files, budget)?;
+            collection.file_bodies = content.remove_unnamed_files(&marked.files, budget)?;
             budget -= collection.file_bodies;
         }
         collection.capture_directories =
@@ -159,44 +158,6 @@ fn sweep_database(
     for batch in unmarked.chunks(PAGE) {
         let batch: Vec<&str> = batch.iter().map(String::as_str).collect();
         removed += content.delete(&batch)?;
-    }
-    Ok(removed)
-}
-
-fn is_digest(name: &str) -> bool {
-    crate::trust_boundary::is_lower_hex_256(name)
-}
-
-fn sweep_files(objects: &Path, marked: &BTreeSet<String>, budget: usize) -> StoreResult<usize> {
-    let entries = match fs::read_dir(objects) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error.into()),
-    };
-    let mut removed = 0;
-    for entry in entries {
-        if removed == budget {
-            break;
-        }
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        // A partial file is a body a capture was writing, and none is.
-        let collectable = (is_digest(&name) && !marked.contains(&name))
-            || (name.starts_with(".capture-") && name.ends_with(".partial"));
-        if !collectable {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if !metadata.is_file() || crate::trust_boundary::is_link_like(&metadata) {
-            continue;
-        }
-        fs::remove_file(entry.path())?;
-        removed += 1;
-    }
-    if removed > 0 {
-        crate::trust_boundary::sync_directory(objects)?;
     }
     Ok(removed)
 }
