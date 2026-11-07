@@ -8,6 +8,7 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
+import { evaluationErrorText } from '../support/cdpException.mjs'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_FIXTURE_BYTES = 64 * 1024 * 1024
@@ -322,9 +323,13 @@ async function evaluate(client, expression) {
         userGesture: true,
     })
     if (response.exceptionDetails) {
-        throw new Error(response.exceptionDetails.exception?.description
-            ?? response.exceptionDetails.text
-            ?? 'Runtime evaluation failed')
+        throw new Error(await evaluationErrorText(
+            (method, params) => client.call(method, params),
+            response.exceptionDetails,
+            response.exceptionDetails.exception?.description
+                ?? response.exceptionDetails.text
+                ?? 'Runtime evaluation failed',
+        ))
     }
     return response.result.value
 }

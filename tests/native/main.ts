@@ -9,6 +9,8 @@ import { stableSelectionRoot } from '../../src/ts/storage/persistentSelectionBou
 import type { Database } from '../../src/ts/storage/database.svelte'
 
 globalThis.Buffer = Buffer
+// The window error handlers the native side injects record the cause chain through this.
+Object.assign(window, { __boundaryFailureRecord: failureRecord })
 
 const fixture = {
     username: '', botPresets: [], botPresetsId: 0, pluginCustomStorage: {},

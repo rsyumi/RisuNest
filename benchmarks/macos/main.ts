@@ -12,6 +12,7 @@ import { createNativeTokenizerBenchmarkSeam } from "../tokenizer/nativeTokenizer
 import { persistence, reload, regex, guard, check, pause } from "./contracts";
 import { showNativeHarness } from "../nativeAppLock";
 import { failureRecord } from "../failureRecord";
+import { SyncStepError, syncFailureRecord } from "../sync-ui/driver";
 
 const report = (stage: string, result: unknown) =>
   invoke("macos_bench_report", { stage, result });
@@ -665,7 +666,8 @@ async function main() {
 }
 void main().catch(async (error) => {
   await report("failure", {
-    ...failureRecord(error),
+    // A Sync step keeps the error it wraps, which is redacted as the step's own message is.
+    ...(error instanceof SyncStepError ? syncFailureRecord(error) : failureRecord(error)),
     message:
       error instanceof Error
         ? error.message
