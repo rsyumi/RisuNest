@@ -501,10 +501,17 @@ pub(crate) enum SpoolCleanup {
     Removed { objects: u64, bytes: u64 },
 }
 
-/// Runs once a release left a capture without consumers. Collection never
-/// fails the cleanup that released the bodies; what it leaves, a later one
-/// takes.
-fn collect_released(store: &mut crate::persistent_store::PersistentStore) {
+/// Runs once a release left a backup's capture without consumers, which is
+/// when the captures it superseded may be unneeded. Other jobs own no capture,
+/// so their release frees nothing. Collection never fails the cleanup that
+/// released the bodies; what it leaves, a later one takes.
+fn collect_released(
+    store: &mut crate::persistent_store::PersistentStore,
+    job: &crate::persistent_store::external_runtime::ExternalJob,
+) {
+    if job.role != "backup" || job.capture_id.is_empty() {
+        return;
+    }
     if let Err(error) = store.collect_released_captures() {
         crate::nlog!("warn", "Released external content was not collected: {error}");
     }
@@ -608,13 +615,16 @@ impl TransferJournal {
                         if !matches!(job.phase.as_str(), "complete" | "cancelled") {
                             return Ok(SpoolCleanup::Retained);
                         }
-                        store.release_external_capture(&job.capture_id, &job.id).map_err(storage)?
+                        let released = store
+                            .release_external_capture(&job.capture_id, &job.id)
+                            .map_err(storage)?;
+                        if released {
+                            collect_released(store, &job);
+                        }
+                        released
                     }
                     None => store.external_job_has_no_capture_owner(job_id).map_err(storage)?,
                 };
-                if released {
-                    collect_released(store);
-                }
                 return Ok(if released {
                     SpoolCleanup::Removed { objects: 0, bytes: 0 }
                 } else {
@@ -1161,7 +1171,7 @@ impl TransferJournal {
         if !store.release_external_capture(&job.capture_id, &job.id).map_err(storage)? {
             return Ok(SpoolCleanup::Retained);
         }
-        collect_released(store);
+        collect_released(store, &job);
         if crate::trust_boundary::is_link_like(
             &std::fs::symlink_metadata(&self.directory).map_err(storage)?,
         ) {

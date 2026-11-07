@@ -517,6 +517,42 @@ fn a_release_whose_collection_cannot_run_still_succeeds() {
     assert!(files.iter().all(|path| path.is_file()));
 }
 
+/// Only a backup's release collects. The cleanup of a job that owns no
+/// capture, such as a restore or a history pin, leaves what a pass would take
+/// for the next backup's release.
+#[test]
+fn a_job_without_a_capture_settles_without_a_pass() {
+    let (_directory, mut store) = empty_store();
+    set_root(&mut store, 1);
+    let (first, _) = back_up(&mut store, "connection", "first");
+    finish(&mut store, "first");
+    set_root(&mut store, 2);
+    back_up(&mut store, "connection", "second");
+    finish(&mut store, "second");
+
+    released(&mut store, "restore");
+    let identity = store.external_identity().unwrap();
+    store
+        .external_prepare_pin_history(&crate::persistent_store::external_storage_state::PinHistoryIntent {
+            job_id: "history",
+            connection_id: "connection",
+            repository_id: "format-repository",
+            snapshot_id: "snapshot",
+            snapshot_reference: "synthetic-snapshot",
+            point_id: "history",
+            logical_revision: 1,
+            created_at_ms: 1_000,
+            identity: &identity,
+        })
+        .unwrap();
+    store.external_finish_pin_history("history", "observation").unwrap();
+    released(&mut store, "history");
+    assert!(capture_directory(&store, &first).join("capture.sqlite").is_file());
+
+    released(&mut store, "second");
+    assert!(!capture_directory(&store, &first).exists());
+}
+
 /// An opened store collects what releases before it left, including more
 /// captures than one step removes.
 #[test]
