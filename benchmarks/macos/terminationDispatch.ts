@@ -8,6 +8,7 @@ import { SqlitePersistentDataStore } from "../../src/ts/storage/sqlitePersistent
 import { createSyncExitCoordinator, type SyncExitDrainResult } from "../../src/ts/storage/syncExitCoordinator";
 import { configureSyncExitCoordinator } from "../../src/ts/storage/syncExitProduction";
 import { check, pause } from "./contracts";
+import { failureRecord } from "../failureRecord";
 
 const report = (stage: string, result: unknown) => invoke("macos_bench_report", { stage, result });
 
@@ -120,7 +121,7 @@ export async function terminationDispatch(phase: string) {
       await report("session-dispatch-renderer-response", { ...snapshot(), exit });
       await invoke("macos_exit_response", { token, exit });
     },
-    reportError: error => { void report("failure", { stage: "renderer", message: String(error) }); },
+    reportError: error => { void report("failure", { stage: "renderer", ...failureRecord(error), message: String(error) }); },
   });
   await listen<MacosExitRequest>("risu-macos-exit-requested", ({ payload }) => {
     rendererRequests++;
@@ -129,7 +130,7 @@ export async function terminationDispatch(phase: string) {
     void report("session-dispatch-renderer-request", {
       ...snapshot(), sessionEnd: payload.sessionEnd,
       hasDeadline: typeof payload.deadlineUnixMillis === "number" && Number.isFinite(payload.deadlineUnixMillis),
-    }).then(() => handler(payload)).catch(error => report("failure", { message: String(error) }));
+    }).then(() => handler(payload)).catch(error => report("failure", { ...failureRecord(error), message: String(error) }));
   });
   await invoke("macos_bench_main_thread_settled");
   await invoke("macos_lifecycle_ready");

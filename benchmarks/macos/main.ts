@@ -11,6 +11,7 @@ import corpus from "../tokenizer/native-tokenizer-corpus.json";
 import { createNativeTokenizerBenchmarkSeam } from "../tokenizer/nativeTokenizerBenchmark";
 import { persistence, reload, regex, guard, check, pause } from "./contracts";
 import { showNativeHarness } from "../nativeAppLock";
+import { failureRecord } from "../failureRecord";
 
 const report = (stage: string, result: unknown) =>
   invoke("macos_bench_report", { stage, result });
@@ -567,7 +568,7 @@ async function main() {
           passed: true, revision: saved.revision, conversationId, marker: nativeMarker,
         });
       } catch (error) {
-        await report("failure", { passed: false, message: String(error), detail: failureDetail(error) });
+        await report("failure", { passed: false, ...failureRecord(error), message: String(error), detail: failureDetail(error) });
         throw error;
       }
     };
@@ -664,13 +665,13 @@ async function main() {
 }
 void main().catch(async (error) => {
   await report("failure", {
+    ...failureRecord(error),
     message:
       error instanceof Error
         ? error.message
         : typeof error === "string"
           ? error
           : JSON.stringify(error),
-    stack: error instanceof Error ? error.stack : undefined,
     detail: failureDetail(error),
   });
   // The controller records the failure and terminates this isolated process.

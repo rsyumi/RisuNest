@@ -1,6 +1,7 @@
 import { runContractScenarios, verifyContractReadback } from './contractScenarios'
 import { endsByNativeExit, runNativeExitPhase, verifySessionEndReadback } from './lifecycleScenarios'
 import { invoke } from '@tauri-apps/api/core'
+import { failureRecord } from '../../benchmarks/failureRecord'
 import { Buffer } from 'buffer'
 import { SqlitePersistentDataStore } from '../../src/ts/storage/sqlitePersistentDataStore'
 import { RevisionConflictError } from '../../src/ts/storage/persistentDataStore'
@@ -121,5 +122,5 @@ try {
     if (blockedRequests.length) throw new Error(`Unexpected blocked resources: ${blockedRequests.join(', ')}`)
     await invoke('boundary_finish', { report: { ...phase, cases, success: true, ...(measurements ? { measurements } : {}) } })
 } catch (error) {
-    await invoke('boundary_finish', { report: { ...phase, cases, success: false, error: String(error) } })
+    await invoke('boundary_finish', { report: { ...phase, cases, success: false, error: String(error), failure: failureRecord(error) } })
 }
