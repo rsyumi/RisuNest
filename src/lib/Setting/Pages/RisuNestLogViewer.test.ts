@@ -235,16 +235,21 @@ describe('RisuNestLogViewer', () => {
     })
 
     it('says the clipboard refused a copy instead of confirming it', async () => {
-        commands.native_log_tail.mockResolvedValueOnce([{ tsMs: 1_000, level: 'error', target: 'native', message: 'refused' }])
+        commands.native_log_tail.mockResolvedValue([{ tsMs: 1_000, level: 'error', target: 'native', message: 'refused' }])
         Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn(async () => { throw new Error('denied') }) } })
-        Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn(() => false) })
+        Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn().mockReturnValueOnce(true).mockReturnValue(false) })
         await render()
+
+        target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
+        await settleAction()
+        expect(toasts).toEqual([language.copied])
 
         target.querySelector<HTMLButtonElement>('[data-copy-log]')!.click()
         await settleAction()
 
         expect(target.querySelector('[role="alert"]')!.textContent).toBe(language.risuNest.networkLog.clipboardDenied)
-        expect(toasts).toEqual([])
+        expect(toasts).toEqual([language.copied])
+        expect(document.querySelector('[role="status"].sr-only')!.textContent).toBe('')
     })
 
     it('ignores a stale view result when a newer view finishes first', async () => {
@@ -567,6 +572,13 @@ describe('RisuNestLogViewer', () => {
             expect(commands.native_log_file_export).toHaveBeenCalledWith({ destination: '/synthetic/saved.txt' })
             expect(toasts).toEqual([strings.savedLogSaved])
             expect(target.querySelector('[role="alert"]')).toBeNull()
+            await vi.waitFor(() => expect(document.querySelector('[role="status"].sr-only')!.textContent).toBe(strings.savedLogSaved))
+
+            vi.mocked(save).mockResolvedValueOnce('/synthetic/saved.txt')
+            commands.native_log_file_export.mockRejectedValueOnce('native-log-file-export-failed')
+            button('[data-save-saved-log]').click()
+            await vi.waitFor(() => expect(target.querySelector('[role="alert"]')?.textContent).toBe(strings.saveFailed))
+            expect(document.querySelector('[role="status"].sr-only')!.textContent).toBe('')
         })
 
         it('reports nothing to save without asking for a file, and safe copy for a failed save', async () => {

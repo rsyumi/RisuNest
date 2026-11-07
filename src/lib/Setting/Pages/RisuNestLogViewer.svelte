@@ -232,6 +232,7 @@
     /** Copies `text` and confirms it, or shows that the clipboard refused it. */
     async function copyText(text: string, current: () => boolean, showError: (message: string) => void) {
         let copied: boolean
+        announcement = ''
         try {
             copied = await writeClipboard(text, current)
         } catch {
@@ -341,6 +342,7 @@
         saving = true
         savedError = ''
         savedNotice = ''
+        announcement = ''
         try {
             const outcome = await saveNativeLogFile()
             if (outcome === 'saved') acknowledge(language.risuNest.diag.savedLogSaved)
