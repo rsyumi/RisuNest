@@ -1,7 +1,7 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte'
+    import { onDestroy, onMount, tick } from 'svelte'
     import { language } from 'src/lang'
-    import { alertMd } from 'src/ts/alertQueue'
+    import { alertMd, alertStore } from 'src/ts/alertQueue'
     import { loadDiagnosticInfo, formatDiagnosticLog } from 'src/ts/diagnostics'
     import { consoleLog, type ConsoleLogEntry } from 'src/ts/consoleLog'
     import SettingGroup from '../RisuNest/SettingGroup.svelte'
@@ -14,6 +14,7 @@
         NATIVE_LOG_NEWEST_PAGE,
         NATIVE_LOG_RUN_START_TARGET,
         readNativeLogFilePage,
+        saveNativeLogFile,
         setNativeLogFileEnabled,
         type NativeLogEntry,
         type NativeLogFileCursor,
@@ -45,8 +46,14 @@
     /** Cursors of the newer pages, the nearest last. */
     let savedNewer = $state<NativeLogFileCursor[]>([])
     let savedError = $state('')
+    /** A status under the saved log row, such as nothing to save. */
+    let savedNotice = $state('')
+    let saving = $state(false)
     let savedRequest = 0
     let savedList = $state<HTMLElement>()
+    let savedPanel = $state<HTMLElement>()
+    /** Spoken copy of the toast that confirms a copy or a save. */
+    let announcement = $state('')
 
     type SavedRow =
         | { kind: 'date', key: string, label: string }
@@ -190,7 +197,7 @@
             // The button is free again once the log is read; a slow clipboard
             // write is serialized below, so a repeat request cannot reorder it.
             pending = null
-            await writeClipboard(text, () => request === copyRequest && (kind !== 'console' || revision === consoleRevision))
+            await copyText(text, () => request === copyRequest && (kind !== 'console' || revision === consoleRevision), (message) => { errorMessage = message })
         } catch {
             if (request === copyRequest) errorMessage = language.risuNest.diag.actionFailed
         } finally {
@@ -198,13 +205,14 @@
         }
     }
 
-    async function writeClipboard(text: string, current: () => boolean) {
+    /** Resolves true once `text` is on the clipboard, or false when a newer request replaced it first. */
+    async function writeClipboard(text: string, current: () => boolean): Promise<boolean> {
         const pendingWrite = clipboardWriteQueue.then(async () => {
-            if (!current()) return
+            if (!current()) return false
             try {
                 await navigator.clipboard.writeText(text)
             } catch {
-                if (!current()) return
+                if (!current()) return false
                 const textarea = document.createElement('textarea')
                 textarea.value = text
                 document.body.appendChild(textarea)
@@ -215,15 +223,53 @@
                     document.body.removeChild(textarea)
                 }
             }
+            return true
         })
-        clipboardWriteQueue = pendingWrite.catch(() => undefined)
-        await pendingWrite
+        clipboardWriteQueue = pendingWrite.then(() => undefined, () => undefined)
+        return pendingWrite
+    }
+
+    /** Copies `text` and confirms it, or shows that the clipboard refused it. */
+    async function copyText(text: string, current: () => boolean, showError: (message: string) => void) {
+        let copied: boolean
+        try {
+            copied = await writeClipboard(text, current)
+        } catch {
+            if (current()) showError(language.risuNest.networkLog.clipboardDenied)
+            return
+        }
+        if (copied) acknowledge(language.copied)
+    }
+
+    /** Confirms a finished copy or save with a toast, and speaks it for screen readers. */
+    function acknowledge(message: string) {
+        alertStore.set({ type: 'toast', msg: message })
+        announcement = ''
+        void tick().then(() => { announcement = message })
+    }
+
+    /**
+     * Runs a button's action and, when the button had the focus, keeps the focus there. A busy or
+     * finished control is disabled, which drops the focus; it returns to the button, or to `fallback`
+     * when the button stays unavailable.
+     */
+    async function keepFocus(event: MouseEvent, action: () => Promise<unknown>, fallback?: () => HTMLElement | null | undefined) {
+        const button = event.currentTarget as HTMLButtonElement
+        const focused = document.activeElement === button
+        await action()
+        if (!focused) return
+        await tick()
+        const active = document.activeElement
+        if (active && active !== document.body && active !== button) return
+        const next = button.isConnected && !button.disabled ? button : fallback?.()
+        if (next && next !== active) next.focus()
     }
 
     /** Shows one page of the saved log; `newer` holds the cursors to page back up. */
     async function showSavedPage(cursor: NativeLogFileCursor, newer: NativeLogFileCursor[], action: 'savedView' | 'savedPage') {
         const request = ++savedRequest
         pending = action
+        savedNotice = ''
         try {
             const page = await readNativeLogFilePage(cursor)
             if (request !== savedRequest) return
@@ -241,7 +287,7 @@
         }
     }
 
-    function toggleSavedLog() {
+    async function toggleSavedLog() {
         if (savedOpen) {
             savedRequest++
             savedOpen = false
@@ -249,22 +295,28 @@
             if (pending === 'savedPage' || pending === 'savedView') pending = null
             return
         }
-        void showSavedPage(NATIVE_LOG_NEWEST_PAGE, [], 'savedView')
+        await showSavedPage(NATIVE_LOG_NEWEST_PAGE, [], 'savedView')
     }
 
-    function showOlderSavedPage() {
-        if (savedOlder) void showSavedPage(savedOlder, [...savedNewer, savedCursor], 'savedPage')
+    async function showOlderSavedPage() {
+        if (savedOlder) await showSavedPage(savedOlder, [...savedNewer, savedCursor], 'savedPage')
     }
 
-    function showNewerSavedPage() {
+    async function showNewerSavedPage() {
         const cursor = savedNewer.at(-1)
-        if (cursor) void showSavedPage(cursor, savedNewer.slice(0, -1), 'savedPage')
+        if (cursor) await showSavedPage(cursor, savedNewer.slice(0, -1), 'savedPage')
+    }
+
+    /** The other paging button, for the focus when the pressed one has reached the end. */
+    function pagingButton(direction: 'newer' | 'older') {
+        return savedPanel?.querySelector<HTMLButtonElement>(`[data-saved-log-${direction}]`)
     }
 
     /** Copies the page on screen, or the newest page while the viewer is closed. */
     async function copySavedLog() {
         const request = ++copyRequest
         pending = 'savedCopy'
+        savedNotice = ''
         try {
             const shown = savedOpen ? savedEntries : null
             const [logEntries, info] = await Promise.all([
@@ -275,11 +327,30 @@
             savedError = ''
             const text = formatDiagnosticLog(info, formatSavedLog(logEntries)) || language.risuNest.diag.savedLogEmpty
             pending = null
-            await writeClipboard(text, () => request === copyRequest)
+            await copyText(text, () => request === copyRequest, (message) => { savedError = message })
         } catch {
             if (request === copyRequest) savedError = language.risuNest.diag.actionFailed
         } finally {
             if (request === copyRequest) pending = null
+        }
+    }
+
+    /** Saves the whole saved log to a file the user picks. */
+    async function saveSavedLog() {
+        if (saving) return
+        saving = true
+        savedError = ''
+        savedNotice = ''
+        try {
+            const outcome = await saveNativeLogFile()
+            if (outcome === 'saved') acknowledge(language.risuNest.diag.savedLogSaved)
+            else if (outcome === 'empty') savedNotice = language.risuNest.diag.savedLogEmpty
+        } catch (error) {
+            savedError = error === 'native-log-file-invalid-destination'
+                ? language.risuNest.diag.saveDestinationInvalid
+                : language.risuNest.diag.saveFailed
+        } finally {
+            saving = false
         }
     }
 
@@ -318,13 +389,13 @@
             {#if errorMessage}
                 <p class="mt-1 text-sm text-danger-400" role="alert" aria-live="assertive">{errorMessage}</p>
             {:else if logLoaded && entries.length === 0}
-                <p class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</p>
+                <p class="mt-1 text-sm muted" role="status" aria-live="polite">{language.risuNest.diag.logEmpty}</p>
             {/if}
         {/snippet}
-        <SettingButton data-view-log busy={pending === 'view'} onclick={() => void viewLog()}>
+        <SettingButton data-view-log busy={pending === 'view'} onclick={(event) => void keepFocus(event, () => viewLog())}>
             {language.risuNest.diag.viewLog}
         </SettingButton>
-        <SettingButton data-copy-log variant="secondary" busy={pending === 'copy'} onclick={() => void copyLog()}>
+        <SettingButton data-copy-log variant="secondary" busy={pending === 'copy'} onclick={(event) => void keepFocus(event, () => copyLog())}>
             {language.risuNest.diag.copyLog}
         </SettingButton>
     </SettingRow>
@@ -333,50 +404,57 @@
             {#snippet below()}
                 {#if savedError}
                     <p class="mt-1 text-sm text-danger-400" role="alert" aria-live="assertive">{savedError}</p>
+                {:else if savedNotice}
+                    <p class="mt-1 text-sm muted" role="status" aria-live="polite" data-saved-log-notice>{savedNotice}</p>
                 {/if}
             {/snippet}
             <SettingButton
                 data-view-saved-log
                 aria-expanded={savedOpen}
-                aria-controls="risunest-saved-log"
+                aria-controls={savedOpen ? 'risunest-saved-log' : undefined}
                 busy={pending === 'savedView'}
-                onclick={toggleSavedLog}
+                onclick={(event) => void keepFocus(event, toggleSavedLog)}
             >
                 {savedOpen ? language.close : language.risuNest.diag.viewLog}
             </SettingButton>
-            <SettingButton data-copy-saved-log variant="secondary" busy={pending === 'savedCopy'} onclick={() => void copySavedLog()}>
+            <SettingButton data-copy-saved-log variant="secondary" busy={pending === 'savedCopy'} onclick={(event) => void keepFocus(event, copySavedLog)}>
                 {language.risuNest.diag.copyLog}
+            </SettingButton>
+            <SettingButton data-save-saved-log variant="secondary" busy={saving} onclick={(event) => void keepFocus(event, saveSavedLog)}>
+                {language.risuNest.diag.saveLog}
             </SettingButton>
         </SettingRow>
         {#if savedOpen}
-            <div id="risunest-saved-log" class="saved-log mx-4 mb-4 overflow-hidden rounded-md border border-darkborderc bg-bgcolor" data-saved-log>
+            <div bind:this={savedPanel} id="risunest-saved-log" class="saved-log mx-4 mb-4 overflow-hidden rounded-md border border-darkborderc bg-bgcolor" data-saved-log>
                 {#if savedEntries.length === 0}
-                    <p class="px-3 py-6 text-center text-sm text-textcolor2" role="status">{language.risuNest.diag.savedLogEmpty}</p>
+                    <p class="px-3 py-6 text-center text-sm muted" role="status">{language.risuNest.diag.savedLogEmpty}</p>
                 {:else}
                     <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-darkborderc/55 px-3 py-2">
-                        <span class="min-w-0 mono text-xs text-textcolor2" data-saved-log-range>{savedRange()}</span>
+                        <span class="min-w-0 mono text-xs muted" aria-live="polite" data-saved-log-range>{savedRange()}</span>
                         {#if savedOlder || savedNewer.length > 0}
                             <div class="ml-auto flex gap-1.5">
-                                <SettingButton data-saved-log-newer size="sm" variant="secondary" disabled={savedNewer.length === 0 || pending === 'savedPage'} onclick={showNewerSavedPage}>
+                                <SettingButton data-saved-log-newer size="sm" variant="secondary" disabled={savedNewer.length === 0 || pending === 'savedPage'} onclick={(event) => void keepFocus(event, showNewerSavedPage, () => pagingButton('older'))}>
                                     {language.risuNest.diag.newerPage}
                                 </SettingButton>
-                                <SettingButton data-saved-log-older size="sm" variant="secondary" disabled={!savedOlder || pending === 'savedPage'} onclick={showOlderSavedPage}>
+                                <SettingButton data-saved-log-older size="sm" variant="secondary" disabled={!savedOlder || pending === 'savedPage'} onclick={(event) => void keepFocus(event, showOlderSavedPage, () => pagingButton('newer'))}>
                                     {language.risuNest.diag.olderPage}
                                 </SettingButton>
                             </div>
                         {/if}
                     </div>
+                    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
                     <ol
                         bind:this={savedList}
-                        class="max-h-[min(28rem,60vh)] overflow-y-auto"
+                        tabindex="0"
+                        class="max-h-[min(28rem,60vh)] overflow-y-auto focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected focus-visible:ring-inset"
                         aria-label={language.risuNest.diag.savedLogList}
                         aria-busy={pending === 'savedPage' ? 'true' : undefined}
                     >
                         {#each savedRows as row (row.key)}
                             {#if row.kind === 'date'}
-                                <li class="date sticky top-0 z-10 border-b border-darkborderc/40 px-3 py-1 text-[11px] font-medium text-textcolor2" data-saved-log-date>{row.label}</li>
+                                <li class="date sticky top-0 z-10 border-b border-darkborderc/40 px-3 py-1 text-[11px] font-medium muted" data-saved-log-date>{row.label}</li>
                             {:else if row.kind === 'run'}
-                                <li class="run flex items-center gap-2.5 px-3 py-2 text-[11px] text-textcolor2" data-saved-log-run>
+                                <li class="run flex items-center gap-2.5 px-3 py-2 text-[11px] muted" data-saved-log-run>
                                     <span class="rule h-px min-w-3 flex-1" aria-hidden="true"></span>
                                     <span class="shrink-0 font-semibold text-textcolor">{language.risuNest.diag.appStarted}</span>
                                     <span class="min-w-0 truncate mono">{row.entry.message}</span>
@@ -385,14 +463,14 @@
                                 </li>
                             {:else if row.entry.level}
                                 <li class="entry" data-tone={levelTone(row.entry.level)} data-saved-log-entry>
-                                    <time class="time mono text-[11px] text-textcolor2" datetime={new Date(row.entry.tsMs).toISOString()}>{clockTime(row.entry.tsMs)}</time>
+                                    <time class="time mono text-[11px] muted" datetime={new Date(row.entry.tsMs).toISOString()}>{clockTime(row.entry.tsMs)}</time>
                                     <span class="level mono text-[11px]">{row.entry.level}</span>
-                                    <span class="target min-w-0 mono text-[11px] break-all text-textcolor2">{row.entry.target}</span>
+                                    <span class="target min-w-0 mono text-[11px] break-all muted">{row.entry.target}</span>
                                     <p class="message min-w-0 mono text-xs leading-relaxed whitespace-pre-wrap text-textcolor">{row.entry.message}</p>
                                 </li>
                             {:else}
                                 <li class="entry raw" data-saved-log-entry>
-                                    <p class="message min-w-0 mono text-xs leading-relaxed whitespace-pre-wrap text-textcolor2">{row.entry.message}</p>
+                                    <p class="message min-w-0 mono text-xs leading-relaxed whitespace-pre-wrap muted">{row.entry.message}</p>
                                 </li>
                             {/if}
                         {/each}
@@ -402,10 +480,10 @@
         {/if}
     </div>
     <SettingRow label={language.risuNest.diag.consoleTitle} help={language.risuNest.diag.consoleHelp}>
-        <SettingButton data-view-console-log busy={pending === 'consoleView'} onclick={() => void viewLog('console')}>
+        <SettingButton data-view-console-log busy={pending === 'consoleView'} onclick={(event) => void keepFocus(event, () => viewLog('console'))}>
             {language.risuNest.diag.viewLog}
         </SettingButton>
-        <SettingButton data-copy-console-log variant="secondary" busy={pending === 'consoleCopy'} onclick={() => void copyLog('console')}>
+        <SettingButton data-copy-console-log variant="secondary" busy={pending === 'consoleCopy'} onclick={(event) => void keepFocus(event, () => copyLog('console'))}>
             {language.risuNest.diag.copyLog}
         </SettingButton>
         <SettingButton data-clear-console-log variant="secondary" onclick={clearConsole}>
@@ -415,7 +493,7 @@
     <SettingRow inline label={language.risuNest.diag.fileLog} help={language.risuNest.diag.fileLogHelp}>
         {#snippet below()}
             {#if fileLogEnabled && fileLogPath}
-                <code class="mt-1 block text-xs break-all text-textcolor2" role="status" aria-live="polite">{fileLogPath}</code>
+                <code class="mt-1 block text-xs break-all muted" role="status" aria-live="polite">{fileLogPath}</code>
             {/if}
         {/snippet}
         <SettingToggle
@@ -426,11 +504,16 @@
         />
     </SettingRow>
 </SettingGroup>
+<p class="sr-only" role="status" aria-live="polite">{announcement}</p>
 
 <style>
     /* The app font is set on every element, so the log text names its own. */
     .mono {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    /* The settings help text color, which stays readable at small sizes on the default themes. */
+    .muted {
+        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
     }
     .saved-log .date {
         background: var(--risu-theme-bgcolor);
@@ -441,6 +524,15 @@
     }
     .saved-log .rule {
         background: var(--risu-theme-darkborderc);
+    }
+    /* The header and a date row already draw the line above the row that follows them. */
+    .saved-log ol > li:first-child,
+    .saved-log .date + li {
+        border-top-color: transparent;
+    }
+    /* The row before a date row draws the line, so a date row stuck to the top adds none. */
+    .saved-log li:has(+ .date) {
+        border-bottom: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 40%, transparent);
     }
     /* Narrow panels put time, level and target on one line and the message under them. */
     .entry {
@@ -480,7 +572,7 @@
         border-left-color: var(--risu-theme-draculared);
     }
     .entry[data-tone='error'] .level {
-        color: var(--risu-theme-draculared);
+        color: color-mix(in srgb, var(--risu-theme-draculared) 75%, var(--risu-theme-textcolor));
         font-weight: 600;
     }
     .entry[data-tone='warn'] {
@@ -491,6 +583,6 @@
         font-weight: 600;
     }
     .entry[data-tone='info'] .level {
-        color: var(--risu-theme-textcolor2);
+        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
     }
 </style>

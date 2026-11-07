@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
+pub(crate) mod file_export;
 pub(crate) mod file_page;
 
 pub(crate) const RING_CAPACITY: usize = 1_000;

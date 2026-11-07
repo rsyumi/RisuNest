@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import type { NativeExportResult } from './storage/nativeExportFile'
 
 export interface NativeLogEntry {
     tsMs: number
@@ -39,6 +40,41 @@ export async function readNativeLogFilePage(
     invokeCommand: NativeLogInvoke = invoke,
 ): Promise<NativeLogFilePage> {
     return (await invokeCommand('native_log_file_read', { file: cursor.file, before: cursor.before })) as NativeLogFilePage
+}
+
+/** Refusal from `native_log_file_export` when neither log file holds anything. */
+export const NATIVE_LOG_FILE_EMPTY = 'native-log-file-empty'
+
+/** The saved log file name: the product name and the time it was saved. */
+export function nativeLogFileName(now = Date.now()): string {
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-').replace(/-\d{3}Z$/, 'Z')
+    return `risunest-error-log-${stamp}.txt`
+}
+
+export type NativeLogFileSave = 'saved' | 'cancelled' | 'empty'
+
+/**
+ * Saves the whole saved log, the previous file and then the current one, as one file the user picks.
+ * The log is copied natively; nothing is asked for when there is nothing to save.
+ */
+export async function saveNativeLogFile(
+    now = Date.now(),
+    invokeCommand: NativeLogInvoke = invoke,
+): Promise<NativeLogFileSave> {
+    const newest = await readNativeLogFilePage(NATIVE_LOG_NEWEST_PAGE, invokeCommand)
+    if (newest.entries.length === 0) return 'empty'
+    const { saveNativeExportFile } = await import('./storage/nativeExportFile')
+    try {
+        const saved = await saveNativeExportFile(
+            nativeLogFileName(now),
+            [{ name: 'Text', extensions: ['txt'] }],
+            async (destination) => (await invokeCommand('native_log_file_export', { destination })) as NativeExportResult,
+        )
+        return saved ? 'saved' : 'cancelled'
+    } catch (error) {
+        if (error === NATIVE_LOG_FILE_EMPTY) return 'empty'
+        throw error
+    }
 }
 
 export async function recordNativeLogError(

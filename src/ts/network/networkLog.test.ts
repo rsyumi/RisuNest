@@ -79,6 +79,11 @@ describe('network log viewer', () => {
             expect(await downloadNetworkLog('synthetic')).toBe(true)
             expect(native[platform]).toHaveBeenCalledWith(expect.objectContaining({ sourcePath: 'synthetic-handoff', suggestedName: 'network-synthetic.json' }))
             expect(native.invoke).toHaveBeenLastCalledWith('native_download_handoff_cleanup', { path: 'synthetic-handoff' })
+
+            native.invoke.mockResolvedValueOnce({ path: 'synthetic-handoff', bytes: 123 }).mockResolvedValueOnce(undefined)
+            native[platform].mockResolvedValueOnce({ bytes: 100 })
+            await expect(downloadNetworkLog('synthetic')).rejects.toThrow('native-export-incomplete')
+            expect(native.invoke).toHaveBeenLastCalledWith('native_download_handoff_cleanup', { path: 'synthetic-handoff' })
         })
     }
     it('cleans a cancelled mobile export', async () => {
