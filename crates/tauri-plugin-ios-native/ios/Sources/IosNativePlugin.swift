@@ -12,7 +12,7 @@ private struct ProgressArgs: Decodable { let id: String; let completed: Int64; l
 private struct TaskProgress { let completed: Int64; let total: Int64 }
 private struct OpenedArgs: Decodable { let urls: [String] }
 private struct PathArgs: Decodable { let path: String }
-private struct PickFilesArgs: Decodable { let multiple: Bool }
+private struct PickFilesArgs: Decodable { let multiple: Bool; let partial: Bool? }
 private struct PortableSourceArgs: Decodable { let token: String; let jobId: String? }
 private struct BackupSourceCopyArgs: Decodable { let token: String; let onProgress: Channel? }
 private struct PortableSourceFormatArgs: Decodable { let token: String; let format: String }
@@ -40,6 +40,8 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
     private var pickerCall: Invoke?
     private var portablePicker = false
     private var fileBatchPicker = false
+    /// Reports each file that cannot be staged instead of failing the whole pick.
+    private var filePartialPicker = false
     private let portableSources = PortableSourceCustody.shared
     private var sourceOwner = UUID().uuidString
     private var sourceOwnerLoaded = false
@@ -539,7 +541,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
         invoke.reject(error.localizedDescription)
     }
 
-    private func present(_ picker: UIDocumentPickerViewController, invoke: Invoke, multiple: Bool = false, batch: Bool = false) {
+    private func present(_ picker: UIDocumentPickerViewController, invoke: Invoke, multiple: Bool = false, batch: Bool = false, partial: Bool = false) {
         guard pickerCall == nil else { invoke.reject("A file picker is already open"); return }
         guard let controller = webView?.window?.rootViewController else {
             failPreparation(invoke, folder: exportCopy?.deletingLastPathComponent(), error: CocoaError(.featureUnsupported)); return
@@ -548,6 +550,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
         while let child = presenter.presentedViewController { presenter = child }
         pickerCall = invoke
         fileBatchPicker = batch
+        filePartialPicker = partial
         picker.delegate = self
         picker.allowsMultipleSelection = multiple
         presenter.present(picker, animated: true)
@@ -571,7 +574,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
             self.rewritablePicker = false
             self.portablePicker = false
             self.present(UIDocumentPickerViewController(forOpeningContentTypes: [.data], asCopy: false),
-                         invoke: invoke, multiple: args.multiple, batch: true)
+                         invoke: invoke, multiple: args.multiple, batch: true, partial: args.partial ?? false)
         }
     }
 
@@ -824,13 +827,18 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
             return
         }
         let batch = fileBatchPicker
+        let partial = filePartialPicker
         fileQueue.async {
             var staged: [[String: Any]] = []
+            var failures: [[String: Any]] = []
             do {
                 for source in batch ? urls : [url] {
-                    staged.append(try self.stageFile(source))
+                    do { staged.append(try self.stageFile(source)) }
+                    catch let error where partial {
+                        failures.append(["name": source.lastPathComponent, "message": error.localizedDescription])
+                    }
                 }
-                let result: [String: Any] = batch ? ["cancelled": false, "files": staged] : staged[0]
+                let result: [String: Any] = batch ? ["cancelled": false, "files": staged, "failures": failures] : staged[0]
                 DispatchQueue.main.async { self.finishPicker(result) }
             } catch {
                 var message = error.localizedDescription

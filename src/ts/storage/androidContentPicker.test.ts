@@ -3,10 +3,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
     invoke: vi.fn(), discard: vi.fn(), character: vi.fn(), module: vi.fn(), pick: vi.fn(),
     controller: new AbortController(), events: [] as string[],
+    beginBatch: vi.fn(), beginBatchItem: vi.fn(), recordBatchItem: vi.fn(),
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
-vi.mock('./androidSafBridge', () => ({ pickAndroidContentSource: mocks.pick }))
-vi.mock('./nativeFileJobs', () => ({ syntheticNativeFileJobStatus: vi.fn() }))
+vi.mock('./androidSafBridge', async original => ({
+    ...await original<typeof import('./androidSafBridge')>(), pickAndroidContentSources: mocks.pick,
+}))
+vi.mock('./nativeFileJobs', async original => ({
+    ...await original<typeof import('./nativeFileJobs')>(), syntheticNativeFileJobStatus: vi.fn(),
+}))
 vi.mock('./nativeFileJobManager', () => ({
     // Holds the background task as the manager does: from the start, or once a picker-first operation protects itself.
     runSharedNativeFileOperation: async (_kind: string, _key: string, run: Function, options?: { protectAfterPicker?: boolean }) => {
@@ -16,6 +21,7 @@ vi.mock('./nativeFileJobManager', () => ({
         return run({
             signal: mocks.controller.signal, setSource: vi.fn(), onStatus: vi.fn(),
             protect: () => { if (options?.protectAfterPicker) hold() },
+            beginBatch: mocks.beginBatch, beginBatchItem: mocks.beginBatchItem, recordBatchItem: mocks.recordBatchItem,
         })
     },
 }))
@@ -31,10 +37,8 @@ beforeEach(() => {
     mocks.controller = new AbortController()
     mocks.events.length = 0
     mocks.character.mockResolvedValue(0)
-    mocks.pick.mockImplementation(async (options) => {
-        options.onSource(source)
-        return { type: 'androidSpool', token: source.token }
-    })
+    mocks.module.mockResolvedValue(true)
+    mocks.pick.mockResolvedValue({ sources: [source], failures: [] })
     Object.assign(window, { RisuSafBridge: { discardSource: mocks.discard } })
 })
 
@@ -135,15 +139,13 @@ describe('Android content picker background hold', () => {
         })
         const picked = (copying: boolean) => async (options: {
             onProgress(progress: { copiedBytes: number; totalBytes: number }): void
-            onSource(file: typeof source): void
         }) => {
             mocks.events.push('picker open')
             if (copying) {
                 options.onProgress({ copiedBytes: 1, totalBytes: source.bytes })
                 mocks.events.push('copying')
             }
-            options.onSource(source)
-            return { type: 'androidSpool', token: source.token }
+            return { sources: [source], failures: [] }
         }
 
         mocks.pick.mockImplementationOnce(async () => {
@@ -163,5 +165,51 @@ describe('Android content picker background hold', () => {
         mocks.pick.mockImplementationOnce(picked(false))
         await importAndroidContentFromPicker('character')
         expect(mocks.events).toEqual(['picker open', 'hold', 'import'])
+    })
+})
+
+describe('Android multi-file content picker', () => {
+    const first = { token: 'first-token', displayName: 'first.json', bytes: 10 }
+    const second = { token: 'second-token', displayName: 'second.json', bytes: 20 }
+
+    it('imports every picked file in one operation and lists the refused and failed files', async () => {
+        const error = new Error('synthetic conversion failure')
+        mocks.invoke.mockResolvedValue(encoded('{}'))
+        mocks.character.mockRejectedValueOnce(error).mockResolvedValueOnce(0)
+        mocks.pick.mockResolvedValue({ sources: [first, second], failures: [{ displayName: 'program.exe', code: 'unsupported-source' }] })
+        await expect(importAndroidContentFromPicker('character')).resolves.toBe('imported-character')
+        expect(mocks.beginBatch).toHaveBeenCalledWith(3)
+        expect(mocks.recordBatchItem.mock.calls).toEqual([
+            ['program.exe', { error: expect.objectContaining({ code: 'unsupported-source' }) }],
+            ['first.json', { error }],
+            ['second.json', { imported: true }],
+        ])
+        expect(mocks.discard.mock.calls).toEqual([[first.token], [second.token]])
+    })
+
+    it('lists every refused file when none of the picked files can be imported', async () => {
+        mocks.pick.mockResolvedValue({ sources: [], failures: [
+            { displayName: 'program.exe', code: 'unsupported-source' },
+            { displayName: 'notes.txt', code: 'unsupported-source' },
+        ] })
+        await expect(importAndroidContentFromPicker('character')).resolves.toBeNull()
+        expect(mocks.beginBatch).toHaveBeenCalledWith(2)
+        expect(mocks.recordBatchItem.mock.calls).toEqual([
+            ['program.exe', { error: expect.objectContaining({ code: 'unsupported-source' }) }],
+            ['notes.txt', { error: expect.objectContaining({ code: 'unsupported-source' }) }],
+        ])
+        expect(mocks.character).not.toHaveBeenCalled()
+    })
+
+    it('stops a batch on cancellation and discards the files it did not import', async () => {
+        mocks.invoke.mockResolvedValue(encoded('{}'))
+        mocks.character.mockImplementationOnce(async () => {
+            mocks.controller.abort()
+            throw new DOMException('cancelled', 'AbortError')
+        })
+        mocks.pick.mockResolvedValue({ sources: [first, second], failures: [] })
+        await expect(importAndroidContentFromPicker('character')).rejects.toMatchObject({ name: 'AbortError' })
+        expect(mocks.character).toHaveBeenCalledOnce()
+        expect(mocks.discard.mock.calls).toEqual([[first.token], [second.token]])
     })
 })

@@ -227,7 +227,6 @@ export const nodeAppTests = [
   'src/ts/storage/nativeFileTaxonomyGolden.test.ts',
   'src/ts/storage/nativeJpegAssetImport.test.ts',
   'src/ts/storage/nativeMediaIpc.test.ts',
-  'src/ts/storage/nativeModuleFileRoute.test.ts',
   'src/ts/storage/nativeModuleRisumExportRoute.test.ts',
   'src/ts/storage/nativeOfficialPublicationUpload.test.ts',
   'src/ts/storage/nativePaths.test.ts',

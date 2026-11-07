@@ -279,18 +279,52 @@ interface AndroidSafSourcePickerConfig {
     custody?: boolean
 }
 
+type AndroidSpoolDiscard = (source: AndroidSpoolReady) => unknown
+
+function acceptsSpool(config: AndroidSafSourcePickerConfig, source: AndroidSpoolReady): boolean {
+    const extensions = Array.isArray(config.acceptExtension) ? config.acceptExtension : [config.acceptExtension]
+    return extensions.some(ext => source.displayName.toLocaleLowerCase('en-US').endsWith(ext))
+}
+
 function pickAndroidSpoolSource(
     config: AndroidSafSourcePickerConfig,
     options: AndroidSafSourcePickerOptions,
     dependencies: AndroidSafSourcePickerDependencies,
 ): Promise<NativeFileJobSource | null> {
+    return receiveAndroidSpoolBatch(config, options, dependencies, async (batch, discard) => {
+        const failure = batch.failures[0]
+        if (failure) throw new AndroidSafSourceError(failure.code, `${failure.displayName}: ${failure.code}`)
+        const source = batch.ready[0]
+        if (!source) return null
+        if (!acceptsSpool(config, source)) {
+            await Promise.resolve().then(() => discard(source)).catch(() => false)
+            throw new AndroidSafSourceError('unsupported-format', `${source.displayName}: unsupported-format`)
+        }
+        options.onSource?.({
+            displayName: source.displayName,
+            bytes: source.bytes,
+        })
+        if (config.custody && source.sourceType !== 'androidSeekable' && source.sourceType !== 'androidSpool') {
+            await Promise.resolve().then(() => discard(source)).catch(() => false)
+            throw new AndroidSafSourceError('source-reselect-required', 'Backup source custody is unavailable')
+        }
+        return { type: config.custody ? source.sourceType! : 'androidSpool', token: source.token }
+    })
+}
+
+function receiveAndroidSpoolBatch<T>(
+    config: AndroidSafSourcePickerConfig,
+    options: AndroidSafSourcePickerOptions,
+    dependencies: AndroidSafSourcePickerDependencies,
+    accept: (batch: AndroidSpoolBatch, discard: AndroidSpoolDiscard) => Promise<T>,
+): Promise<T> {
     if (options.signal?.aborted) {
         return Promise.reject(
             new DOMException(config.cancelMessage, 'AbortError'),
         )
     }
     const requestId = dependencies.createRequestId()
-    return withLibraryFileSelection(() => new Promise((resolve, reject) => {
+    return withLibraryFileSelection(() => new Promise<T>((resolve, reject) => {
         let settled = false
         let receiving = false
         let aborted = false
@@ -353,53 +387,10 @@ function pickAndroidSpoolSource(
                 )
                 return
             }
-            const failure = batch.failures[0]
-            if (failure) {
-                finish(() =>
-                    reject(
-                        new AndroidSafSourceError(
-                            failure.code,
-                            `${failure.displayName}: ${failure.code}`,
-                        ),
-                    ),
-                )
-                return
-            }
-            const source = batch.ready[0]
-            if (!source) {
-                finish(() => resolve(null))
-                return
-            }
-            if (
-                !(
-                    Array.isArray(config.acceptExtension)
-                        ? config.acceptExtension
-                        : [config.acceptExtension]
-                ).some((ext) =>
-                    source.displayName.toLocaleLowerCase('en-US').endsWith(ext),
-                )
-            ) {
-                await Promise.resolve().then(() => discard(source)).catch(() => false)
-                finish(() =>
-                    reject(
-                        new AndroidSafSourceError(
-                            'unsupported-format',
-                            `${source.displayName}: unsupported-format`,
-                        ),
-                    ),
-                )
-                return
-            }
-            options.onSource?.({
-                displayName: source.displayName,
-                bytes: source.bytes,
-            })
-            if (config.custody && source.sourceType !== 'androidSeekable' && source.sourceType !== 'androidSpool') {
-                await Promise.resolve().then(() => discard(source)).catch(() => false)
-                finish(() => reject(new AndroidSafSourceError('source-reselect-required', 'Backup source custody is unavailable')))
-                return
-            }
-            finish(() => resolve({ type: config.custody ? source.sourceType! : 'androidSpool', token: source.token }))
+            await accept(batch, discard).then(
+                value => finish(() => resolve(value)),
+                error => finish(() => reject(error)),
+            )
         }
         const onProgress = (event: Event) => {
             const progress = (event as CustomEvent<AndroidSafProgress>).detail
@@ -849,28 +840,46 @@ export function copyNativeExportToAndroidSaf(
     }))
 }
 
-export function pickAndroidContentSource(
+export interface AndroidContentSources {
+    sources: AndroidSpoolReady[]
+    /** Picked files that cannot be imported; the picked files that can are still returned. */
+    failures: AndroidSpoolFailure[]
+}
+
+export function pickAndroidContentSources(
     options: AndroidSafContentSourcePickerOptions,
     dependencies: AndroidSafSourcePickerDependencies = productionDependencies,
-): Promise<NativeFileJobSource | null> {
-    return pickAndroidSpoolSource(
-        {
-            eventName: 'risu-android-content-source-picked',
-            pickMethod: 'pickContentSource',
-            pickerUnavailableMessage: 'Android content picker is unavailable',
-            acceptExtension: [
-                '.json',
-                '.png',
-                '.charx',
-                '.jpg',
-                '.jpeg',
-                '.risum',
-                '.lorebook',
-            ],
-            cancelMessage: 'Android content selection was cancelled',
-            importDestination: options.destination,
-        },
-        options,
-        dependencies,
-    )
+): Promise<AndroidContentSources | null> {
+    const config: AndroidSafSourcePickerConfig = {
+        eventName: 'risu-android-content-source-picked',
+        pickMethod: 'pickContentSource',
+        pickerUnavailableMessage: 'Android content picker is unavailable',
+        acceptExtension: [
+            '.json',
+            '.png',
+            '.charx',
+            '.jpg',
+            '.jpeg',
+            '.risum',
+            '.lorebook',
+        ],
+        cancelMessage: 'Android content selection was cancelled',
+        importDestination: options.destination,
+    }
+    return receiveAndroidSpoolBatch(config, options, dependencies, async (batch, discard) => {
+        const sources: AndroidSpoolReady[] = []
+        const failures = [...batch.failures]
+        for (const source of batch.ready) {
+            if (acceptsSpool(config, source)) {
+                sources.push(source)
+                continue
+            }
+            await Promise.resolve().then(() => discard(source)).catch(() => false)
+            failures.push({ displayName: source.displayName, code: 'unsupported-format' })
+        }
+        // A single refused file keeps the single-file failure; several are listed together.
+        if (sources.length || failures.length > 1) return { sources, failures }
+        if (!failures.length) return null
+        throw new AndroidSafSourceError(failures[0].code, `${failures[0].displayName}: ${failures[0].code}`)
+    })
 }

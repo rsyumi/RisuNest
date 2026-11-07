@@ -3065,6 +3065,8 @@ export const languageEnglish = {
             currentItem: 'Current: {0}',
             itemsOf: '{0} / {1}',
             itemsCount: '{0} items',
+            batchFile: 'File {0} of {1}',
+            batchFiles: '{0} files',
             countCharacters: 'Characters',
             countPresets: 'Presets',
             countAssets: 'Assets',
@@ -3084,6 +3086,9 @@ export const languageEnglish = {
             resultCancelledPartial:
                 'Import cancelled. Some attachments that were already saved may remain.',
             resultFailed: 'Import failed. Your existing data is unchanged.',
+            resultBatchFailed: 'Could not import {0} of {1} files.',
+            resultBatchCancelled: 'Import cancelled. {0} of {1} files were imported.',
+            resultBatchPartial: '{0} of {1} files were imported.',
             resultFailedAfterCommit:
                 'The data was imported, but the screen could not be refreshed. Select Refresh screen before making more changes.',
             resultActivationUnresolved: 'The restore result could not be confirmed. Select Refresh screen to check it before making more changes.',
