@@ -653,6 +653,7 @@ pub(crate) fn open_for_renderer<R: tauri::Runtime>(
                 crate::nlog!("warn", "Asset journals await cleanup after the store opened: {error}");
             }
         }
+        crate::external_storage::leftovers::collect_released_content_later(app);
     }
     Ok(opened)
 }

@@ -310,3 +310,290 @@ fn measures_a_pass_over_a_library_sized_capture() {
         pass.saturating_sub(mark).as_millis(),
     );
 }
+
+/// A root large enough to be kept as a file body, different for each value.
+fn set_root(store: &mut PersistentStore, value: i64) {
+    store
+        .commit(&WorkingSetCommit {
+            root_mutations: Some(vec![RootMutation::Set {
+                key: "synthetic".into(),
+                value: json!(format!("{value}{}", "x".repeat(70 * 1024))),
+            }]),
+            ..empty_working_set_commit(store.revision().unwrap())
+        })
+        .unwrap();
+}
+
+/// What a backup job does before its upload: capture the library through a
+/// lease, as the product does, and hold the capture for the job. Returns the
+/// capture and the bodies it names.
+fn back_up(
+    store: &mut PersistentStore,
+    connection: &str,
+    job: &str,
+) -> (String, std::collections::BTreeSet<String>) {
+    let probe = crate::local_backup::NeverCancelled;
+    let hydration = store.hydrate_external_capture_dependencies(connection, &probe).unwrap();
+    let (lease, prepared) = store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    let sections = crate::external_storage::sections::capture_prepared_backup_sections(
+        &prepared,
+        &store.repository_root.join(format!("sections-{job}")),
+        &crate::external_storage::contract::Cancellation::default(),
+    )
+    .unwrap();
+    let capture = store
+        .capture_external_library_from_lease_with_sections(
+            connection,
+            &hydration,
+            &lease.lease,
+            sections,
+            &probe,
+        )
+        .unwrap();
+    store
+        .external_prepare_backup(job, connection, "format-repository", &capture.id, &format!("point-{job}"))
+        .unwrap();
+    let mut statement = capture
+        .catalog
+        .db
+        .prepare("SELECT hash FROM records UNION SELECT hash FROM generated")
+        .unwrap();
+    let bodies = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(statement);
+    (capture.id.clone(), bodies)
+}
+
+fn finish(store: &mut PersistentStore, job: &str) {
+    store
+        .external_finish_backup(job, &format!("point-{job}"), "snapshot", "observation")
+        .unwrap();
+}
+
+/// The cleanup a job runs once its worker has ended.
+fn release(
+    store: &mut PersistentStore,
+    job: &str,
+) -> crate::external_storage::contract::Result<crate::external_storage::journal::SpoolCleanup> {
+    let directory = store.repository_root.join("jobs").join(job);
+    crate::external_storage::journal::TransferJournal::cleanup_terminal_spools_at(
+        &directory,
+        job,
+        store,
+        "format-repository",
+    )
+}
+
+/// The transfer journal an uploading job keeps, which its cleanup reopens.
+fn keep_journal(store: &PersistentStore, job: &str) {
+    let owner = store.external_job(job).unwrap().unwrap();
+    crate::external_storage::journal::TransferJournal::open(
+        &store.repository_root.join("jobs").join(job),
+        crate::external_storage::journal::JobIdentity {
+            job_id: owner.id,
+            connection_id: owner.connection_id,
+            repository_id: "repository".into(),
+            capture_id: owner.capture_id,
+            capture: owner.identity,
+        },
+    )
+    .unwrap();
+}
+
+fn released(store: &mut PersistentStore, job: &str) {
+    assert_eq!(
+        release(store, job).unwrap(),
+        crate::external_storage::journal::SpoolCleanup::Removed { objects: 0, bytes: 0 },
+    );
+}
+
+fn capture_directory(store: &PersistentStore, capture: &str) -> std::path::PathBuf {
+    store.repository_root.join("external-storage").join("captures").join(capture)
+}
+
+fn holds(store: &PersistentStore, digest: &str) -> bool {
+    ContentStore::open_existing(&store.repository_root.join("external-storage"))
+        .unwrap()
+        .unwrap()
+        .stat(digest)
+        .unwrap()
+        .is_some()
+}
+
+/// A finished backup collects what only the backup before it named. Its own
+/// capture stays, since the connection's next backup follows on from it.
+#[test]
+fn a_finished_backup_collects_what_only_the_backup_before_it_named() {
+    let (_directory, mut store) = empty_store();
+    let external = store.repository_root.join("external-storage");
+    set_root(&mut store, 1);
+    let (first, first_bodies) = back_up(&mut store, "connection", "first");
+    finish(&mut store, "first");
+    released(&mut store, "first");
+    assert!(capture_directory(&store, &first).join("capture.sqlite").is_file());
+    assert!(first_bodies.iter().all(|digest| holds(&store, digest)));
+
+    set_root(&mut store, 2);
+    let (second, second_bodies) = back_up(&mut store, "connection", "second");
+    keep_journal(&store, "second");
+    finish(&mut store, "second");
+    released(&mut store, "second");
+    assert!(!capture_directory(&store, &first).exists());
+    assert!(capture_directory(&store, &second).join("capture.sqlite").is_file());
+    assert!(second_bodies.iter().all(|digest| holds(&store, digest)));
+    let only_first: Vec<_> = first_bodies.difference(&second_bodies).collect();
+    assert!(only_first.iter().any(|digest| {
+        let path = file_location(&external, digest);
+        path.parent().is_some_and(Path::is_dir) && !path.exists()
+    }));
+    assert!(only_first.iter().all(|digest| !holds(&store, digest)));
+}
+
+/// A backup still uploading keeps its capture even after a library
+/// replacement made its connection start over, and the newest finished
+/// capture of each connection stays.
+#[test]
+fn a_release_keeps_what_a_running_backup_or_the_newest_capture_names() {
+    let (_directory, mut store) = empty_store();
+    set_root(&mut store, 1);
+    let (first, _) = back_up(&mut store, "connection-a", "first");
+    finish(&mut store, "first");
+    released(&mut store, "first");
+    set_root(&mut store, 2);
+    let (running, running_bodies) = back_up(&mut store, "connection-b", "running");
+    store
+        .connection
+        .execute("UPDATE content_change_consumers SET rebuild_required=1", [])
+        .unwrap();
+    set_root(&mut store, 3);
+    let (newest, newest_bodies) = back_up(&mut store, "connection-a", "newest");
+    finish(&mut store, "newest");
+    released(&mut store, "newest");
+
+    assert!(!capture_directory(&store, &first).exists());
+    for (capture, bodies) in [(&running, &running_bodies), (&newest, &newest_bodies)] {
+        assert!(capture_directory(&store, capture).join("capture.sqlite").is_file());
+        assert!(bodies.iter().all(|digest| holds(&store, digest)));
+    }
+}
+
+/// While a capture writes, a release leaves every capture and body and still
+/// succeeds; the next release collects them. A collection that fails does not
+/// fail the release either.
+#[test]
+fn a_release_whose_collection_cannot_run_still_succeeds() {
+    let (_directory, mut store) = empty_store();
+    let external = store.repository_root.join("external-storage");
+    set_root(&mut store, 1);
+    let (first, first_bodies) = back_up(&mut store, "connection", "first");
+    finish(&mut store, "first");
+    released(&mut store, "first");
+    set_root(&mut store, 2);
+    let (_, second_bodies) = back_up(&mut store, "connection", "second");
+    finish(&mut store, "second");
+
+    let writing = store.active_readers.defer_asset_inventory();
+    released(&mut store, "second");
+    assert!(capture_directory(&store, &first).join("capture.sqlite").is_file());
+    assert!(first_bodies.iter().all(|digest| holds(&store, digest)));
+    drop(writing);
+    released(&mut store, "second");
+    assert!(!capture_directory(&store, &first).exists());
+
+    // Once the connection is gone nothing names the second capture, and a
+    // store that cannot be opened fails the pass.
+    store.external_prepare_connection_removal("connection").unwrap();
+    let files: Vec<_> = second_bodies
+        .iter()
+        .map(|digest| file_location(&external, digest))
+        .filter(|path| path.is_file())
+        .collect();
+    assert!(!files.is_empty());
+    fs::write(external.join("content.sqlite"), b"synthetic-unreadable-store").unwrap();
+    released(&mut store, "second");
+    assert!(files.iter().all(|path| path.is_file()));
+}
+
+/// An opened store collects what releases before it left, including more
+/// captures than one step removes.
+#[test]
+fn an_opened_store_collects_what_earlier_releases_left() {
+    use tauri::Manager;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut captures = Vec::new();
+    {
+        let mut store = PersistentStore::open(root).unwrap();
+        for index in 0..18 {
+            set_root(&mut store, index);
+            let job = format!("job-{index}");
+            captures.push(back_up(&mut store, "connection", &job).0);
+            finish(&mut store, &job);
+        }
+    }
+    let newest = captures.pop().unwrap();
+    let external = root.join("external-storage").join("captures");
+    assert!(captures.iter().all(|capture| external.join(capture).is_dir()));
+
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    app.manage(crate::app_paths::AppPaths {
+        data: root.to_owned(),
+        webview: None,
+        logs: root.join("logs"),
+        cache: root.join("cache"),
+        cleanup_control: root.join("cleanup"),
+        tauri_derived: Vec::new(),
+        install: None,
+        integration: None,
+    });
+    app.manage(crate::persistent_store::commands::PersistentStoreState::default());
+    app.manage(crate::external_storage::job_store::JobCommandState::default());
+    app.manage(crate::native_file_jobs::NativeFileJobState::initialize(root.join("native-file-jobs")));
+    crate::persistent_store::commands::open_for_renderer(app.handle(), &app.state()).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while captures.iter().any(|capture| external.join(capture).exists()) {
+        assert!(std::time::Instant::now() < deadline, "released captures stayed after the store opened");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(external.join(&newest).join("capture.sqlite").is_file());
+}
+
+/// A backup capture takes its hold on collection only while no pass sweeps,
+/// so a sweep that began before it cannot remove the bodies it writes.
+#[test]
+fn a_backup_capture_waits_for_a_running_sweep_before_it_writes() {
+    let (_directory, mut store) = empty_store();
+    set_root(&mut store, 1);
+    let (lease, _) = store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
+    let readers = Arc::clone(&store.active_readers);
+    let sweep = crate::asset_repository::coordinator::lock_repository_mutation().unwrap();
+    let (prepared_sender, prepared) = std::sync::mpsc::channel();
+    let (finish_sender, finished) = std::sync::mpsc::channel::<()>();
+    let (store, lease) = (&mut store, &lease.lease);
+    // The test's side owns the sender, so a failed assertion ends the capture
+    // thread instead of leaving it waiting, and the lock is released before
+    // any assertion so a failure does not poison it.
+    thread::scope(move |scope| {
+        scope.spawn(move || {
+            let capture = store.prepare_content_capture_from_lease("capture", "connection", lease);
+            prepared_sender.send(()).unwrap();
+            let _ = finished.recv();
+            drop(capture);
+        });
+        // Nothing shows that the capture is waiting, so it is given time to
+        // finish if it does not wait.
+        let waited = prepared.recv_timeout(Duration::from_millis(500)).is_err();
+        let deferred_during_sweep = readers.asset_inventory_deferred();
+        drop(sweep);
+        assert!(waited && !deferred_during_sweep);
+        prepared.recv().unwrap();
+        assert!(readers.asset_inventory_deferred());
+        finish_sender.send(()).unwrap();
+    });
+}

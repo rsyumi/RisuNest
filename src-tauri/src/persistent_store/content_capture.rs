@@ -153,7 +153,12 @@ impl PersistentStore {
         {
             return Err(missing_source("matching capture lease authority"));
         }
-        let inventory = self.active_readers.defer_asset_inventory();
+        // Under the lock a collection sweeps under, so no sweep runs while
+        // this capture writes its bodies.
+        let inventory = {
+            let _repository = crate::asset_repository::coordinator::lock_repository_mutation()?;
+            self.active_readers.defer_asset_inventory()
+        };
         let reader = self.revision_leases.remove(lease)
             .ok_or_else(|| missing_source("capture lease"))?;
         Ok(PreparedContentCapture {

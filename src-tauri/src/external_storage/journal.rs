@@ -501,6 +501,15 @@ pub(crate) enum SpoolCleanup {
     Removed { objects: u64, bytes: u64 },
 }
 
+/// Runs once a release left a capture without consumers. Collection never
+/// fails the cleanup that released the bodies; what it leaves, a later one
+/// takes.
+fn collect_released(store: &mut crate::persistent_store::PersistentStore) {
+    if let Err(error) = store.collect_released_captures() {
+        crate::nlog!("warn", "Released external content was not collected: {error}");
+    }
+}
+
 pub(crate) struct TransferJournal {
     db: Connection,
     directory: PathBuf,
@@ -603,6 +612,9 @@ impl TransferJournal {
                     }
                     None => store.external_job_has_no_capture_owner(job_id).map_err(storage)?,
                 };
+                if released {
+                    collect_released(store);
+                }
                 return Ok(if released {
                     SpoolCleanup::Removed { objects: 0, bytes: 0 }
                 } else {
@@ -1149,6 +1161,7 @@ impl TransferJournal {
         if !store.release_external_capture(&job.capture_id, &job.id).map_err(storage)? {
             return Ok(SpoolCleanup::Retained);
         }
+        collect_released(store);
         if crate::trust_boundary::is_link_like(
             &std::fs::symlink_metadata(&self.directory).map_err(storage)?,
         ) {

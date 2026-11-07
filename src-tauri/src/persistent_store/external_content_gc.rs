@@ -98,6 +98,27 @@ impl PersistentStore {
         }
     }
 
+    /// One bounded step of reclaiming what finished jobs released: the capture
+    /// registrations no job holds and no consumer continues from, then, once
+    /// none of them is left, one pass. A capture that is writing defers the
+    /// whole step, so it changes nothing. True when the step removed
+    /// something, so another may find more.
+    pub(crate) fn collect_released_captures(&mut self) -> StoreResult<bool> {
+        if self.active_readers.asset_inventory_deferred() {
+            return Ok(false);
+        }
+        let released = self.cleanup_capture_cache("")?;
+        if released >= super::external_capture::GC_DELETE_LIMIT {
+            return Ok(true);
+        }
+        Ok(match self.collect_external_content()? {
+            CollectionOutcome::Deferred => released > 0,
+            CollectionOutcome::Collected(collection) => {
+                released > 0 || collection != ContentCollection::default()
+            }
+        })
+    }
+
     fn content_owners(&self) -> StoreResult<Owners> {
         Ok(Owners {
             captures: registered_references(&self.connection, &self.repository_root)?,
