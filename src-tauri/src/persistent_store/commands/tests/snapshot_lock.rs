@@ -74,7 +74,7 @@ fn foreground_commit_completes_while_snapshot_archive_is_blocked_and_capture_sta
     let handle = app.handle().clone();
     let commit_worker = std::thread::spawn(move || {
         let result = with_store_mut(handle.state(), |store| {
-            let gc_refused = matches!(store.prepare_asset_gc_delete_marks(), Err(StoreError::Validation { .. }));
+            let gc_refused = matches!(store.prepare_asset_gc_delete_marks(), Err(StoreError::AssetInventoryBusy));
             let result = store.commit(&changed_root())?;
             store.connection.execute("DELETE FROM asset_aliases", [])?;
             Ok((result.revision, gc_refused))

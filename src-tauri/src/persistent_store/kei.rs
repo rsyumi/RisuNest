@@ -750,6 +750,7 @@ fn store_error(error: StoreError) -> NativeJobError {
         StoreError::Committed { .. } | StoreError::RawBodyUnavailable | StoreError::CommitBusy
         | StoreError::SnapshotReleased | StoreError::SchemaMismatch { .. } => NativeJobError::new("store-error", error.to_string()),
         StoreError::CommitDecode { .. } | StoreError::Validation { .. } => NativeJobError::new("invalid-input", error.to_string()),
+        StoreError::AssetInventoryBusy => NativeJobError::new("library-operation-busy", error.to_string()),
         StoreError::Store { .. } => NativeJobError::new("transport-failed", error.to_string()),
     }
 }

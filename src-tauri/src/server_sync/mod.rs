@@ -155,10 +155,7 @@ impl From<crate::persistent_store::StoreError> for SyncError {
             }
             crate::persistent_store::StoreError::Validation { message } if matches!(message.as_str(), "accepted-clock-correction-required" | "incoming-clock-skew" | "clock-skew" | "equal-stamp-integrity" | "writer-collision" | "binding-authority-changed") => Self::new(message,409),
             crate::persistent_store::StoreError::Store { message } => Self::caused("local-storage", 503, message),
-            crate::persistent_store::StoreError::CommitBusy => Self::new("library-operation-busy", 409),
-            crate::persistent_store::StoreError::Validation { message }
-                if message == crate::persistent_store::ASSET_INVENTORY_BUSY =>
-                Self::new("library-operation-busy", 409),
+            crate::persistent_store::StoreError::CommitBusy | crate::persistent_store::StoreError::AssetInventoryBusy => Self::new("library-operation-busy", 409),
             other => Self::caused("local-validation", 409, other.to_string()),
         }
     }

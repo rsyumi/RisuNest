@@ -84,9 +84,7 @@ impl ActiveReaderRegistry {
 
     pub(crate) fn detached_asset_roots(&self) -> StoreResult<Vec<AssetRootSet>> {
         if self.deferred_asset_inventories.load(Ordering::SeqCst) > 0 {
-            return Err(StoreError::Validation {
-                message: super::ASSET_INVENTORY_BUSY.into(),
-            });
+            return Err(StoreError::AssetInventoryBusy);
         }
         Ok(self
             .detached_asset_roots
