@@ -132,6 +132,7 @@ diagnostic_path = out / f'{args.phase}-diagnostics.jsonl'
 receipt_path = out / 'owned-process-receipt.json'
 profile_id = hashlib.sha256(str(profile).encode()).hexdigest()
 owned_processes = {}
+app_processes = {}
 primary_error = None
 current_stage = 'driver-start'
 
@@ -171,11 +172,32 @@ def process_snapshot(event):
                 identities.append({'pid': pid, 'starttime': expected_start, 'status': 'pid-reused'})
             else:
                 owned_processes[pid] = identity['starttime']
+                if identity['isBenchmarkBinary']:
+                    app_processes[pid] = identity['starttime']
                 identities.append(identity)
         diagnostic(event, driverReturncode=driver.poll(), processes=identities,
                    omittedProcesses=max(0, len(candidates) - 64))
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         diagnostic('process-snapshot-error', sourceEvent=event, errorType=type(error).__name__)
+
+def process_present(pid, starttime):
+    try:
+        text = Path(f'/proc/{pid}/stat').read_text()
+        return int(text[text.rfind(')') + 2:].split()[19]) == starttime
+    except (OSError, ValueError, IndexError):
+        return False
+
+def wait_for_app_exit(timeout=30):
+    # The main thread of a killed app can exit while another thread finishes uninterruptible
+    # disk I/O; until the last one does, the process keeps its files and the profile's startup lock.
+    deadline = time.monotonic() + timeout
+    while any(process_present(pid, starttime) for pid, starttime in app_processes.items()):
+        if time.monotonic() > deadline:
+            diagnostic('app-exit-timeout')
+            return RuntimeError('The synthetic app process did not exit after its session ended')
+        time.sleep(0.05)
+    diagnostic('app-exit-complete')
+    return None
 
 def inspect_seed_receipt():
     if args.phase != 'appearance-app' or not receipt_path.exists():
@@ -462,6 +484,9 @@ finally:
         driver.kill()
         driver.wait()
     process_snapshot('driver-cleanup-return')
+    exit_error = wait_for_app_exit()
     log.close()
     if capture_error is not None and primary_error is None:
         raise capture_error
+    if exit_error is not None and primary_error is None:
+        raise exit_error
