@@ -866,9 +866,9 @@ fn decode_legacy_non_map<B: Read>(
     let packed = rmpv::decode::read_value(&mut marker.as_slice().chain(&mut *input))
         .map_err(|error| messagepack_error(error, job))?;
     require_legacy_end(input, job)?;
-    match messagepack_to_json(packed, job)? {
-        JsonSlot::Value(_) => Ok(LegacyDatabase::NotAnObject),
-        JsonSlot::Undefined => Err(invalid("legacy MessagePack database cannot be undefined")),
+    match messagepack_to_converted(packed, job)? {
+        Some(_) => Ok(LegacyDatabase::NotAnObject),
+        None => Err(invalid("legacy MessagePack database cannot be undefined")),
     }
 }
 
@@ -1037,14 +1037,16 @@ fn prepare_legacy_root(root: &RootSpool, excluded: &HashSet<String>) -> StoreRes
     Ok(())
 }
 
+#[cfg(test)]
 enum JsonSlot {
     Value(Value),
     Undefined,
 }
 
 /// A converted MessagePack value whose binaries are still bytes. It converts
-/// to, and serializes as, the value `messagepack_to_json` gives, without the
-/// object per binary that costs about a hundred and fifty bytes per byte.
+/// to, and serializes as, the value `messagepack_to_json_reference` gives,
+/// without the object per binary that costs about a hundred and fifty bytes per
+/// byte.
 enum Converted {
     Json(Value),
     Binary(Vec<u8>),
@@ -1234,6 +1236,7 @@ fn binary_json_growth(value: &MessagePackValue) -> u64 {
     }
 }
 
+#[cfg(test)]
 fn messagepack_to_json(value: MessagePackValue, job: &JobControl) -> Result<JsonSlot, NativeJobError> {
     Ok(match messagepack_to_converted(value, job)? {
         Some(value) => JsonSlot::Value(value.into_value()),
