@@ -10,6 +10,7 @@
         type NetworkLogSettings, type NetworkLogListing, type NetworkLogRecord,
         type LogBodyPage, type LogSide, type LogObservation, type LogArrivals,
     } from 'src/ts/network/networkLog'
+    import { exportMayLeavePartialFile } from 'src/ts/storage/nativeExportFile'
 
     const t = language.risuNest.networkLog
     const budgets = [128, 256, 512, 1024, 2048, 4096, 8192]
@@ -72,7 +73,9 @@
     async function action(work: () => Promise<unknown>) {
         if (busy) return
         busy = true; error = ''; notice = ''
-        try { await work() } catch (value) { error = reason(value) } finally { busy = false }
+        try { await work() } catch (value) {
+            error = exportMayLeavePartialFile(value) ? `${reason(value)} ${language.screenshotPartialDestinationMayRemain}` : reason(value)
+        } finally { busy = false }
     }
     async function configure(patch: Partial<NetworkLogSettings>) {
         if (!settings) return

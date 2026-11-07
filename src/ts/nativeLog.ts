@@ -63,7 +63,7 @@ export async function saveNativeLogFile(
 ): Promise<NativeLogFileSave> {
     const newest = await readNativeLogFilePage(NATIVE_LOG_NEWEST_PAGE, invokeCommand)
     if (newest.entries.length === 0) return 'empty'
-    const { saveNativeExportFile } = await import('./storage/nativeExportFile')
+    const { saveNativeExportFile, nativeExportErrorCode, exportMayLeavePartialFile } = await import('./storage/nativeExportFile')
     try {
         const saved = await saveNativeExportFile(
             nativeLogFileName(now),
@@ -72,7 +72,7 @@ export async function saveNativeLogFile(
         )
         return saved ? 'saved' : 'cancelled'
     } catch (error) {
-        if (error === NATIVE_LOG_FILE_EMPTY) return 'empty'
+        if (nativeExportErrorCode(error) === NATIVE_LOG_FILE_EMPTY && !exportMayLeavePartialFile(error)) return 'empty'
         throw error
     }
 }

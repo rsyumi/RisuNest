@@ -40,6 +40,7 @@ import { language } from 'src/lang'
 import RisuNestLogViewer from './RisuNestLogViewer.svelte'
 import { alertStore } from 'src/ts/alertQueue'
 import { save } from '@tauri-apps/plugin-dialog'
+import { NativeExportError } from 'src/ts/storage/nativeExportFile'
 
 const strings = language.risuNest.diag
 
@@ -603,6 +604,15 @@ describe('RisuNestLogViewer', () => {
                 expect(target.textContent).toContain(shown)
                 expect(target.textContent).not.toContain(failure)
             }
+            // A refusal after an Android destination was picked carries the warning that part of a file may remain.
+            const saves = commands.native_log_file_export.mock.calls.length
+            commands.native_log_file_export.mockRejectedValueOnce(Object.assign(
+                new NativeExportError('native-log-file-empty'), { warningCodes: ['partial-destination-may-remain'] },
+            ))
+            button('[data-save-saved-log]').click()
+            await vi.waitFor(() => expect(commands.native_log_file_export).toHaveBeenCalledTimes(saves + 1))
+            await settleAction()
+            expect(target.querySelector('[role="alert"]')?.textContent).toBe(`${strings.saveFailed} ${language.screenshotPartialDestinationMayRemain}`)
             expect(toasts).toEqual([])
         })
 

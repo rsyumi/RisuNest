@@ -24,6 +24,7 @@
         subscribeDeviceSettings,
         updateDeviceSettings,
     } from 'src/ts/storage/deviceSettings'
+    import { exportMayLeavePartialFile, nativeExportErrorCode } from 'src/ts/storage/nativeExportFile'
 
     let entries = $state<NativeLogEntry[]>([])
     let logLoaded = $state(false)
@@ -348,9 +349,12 @@
             if (outcome === 'saved') acknowledge(language.risuNest.diag.savedLogSaved)
             else if (outcome === 'empty') savedNotice = language.risuNest.diag.savedLogEmpty
         } catch (error) {
-            savedError = error === 'native-log-file-invalid-destination'
+            const message = nativeExportErrorCode(error) === 'native-log-file-invalid-destination'
                 ? language.risuNest.networkLog.destinationInvalid
                 : language.risuNest.diag.saveFailed
+            savedError = exportMayLeavePartialFile(error)
+                ? `${message} ${language.screenshotPartialDestinationMayRemain}`
+                : message
         } finally {
             saving = false
         }
