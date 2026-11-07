@@ -1,4 +1,5 @@
 import { showNativeHarness } from "../nativeAppLock";
+import { failureRecord } from "../failureRecord";
 import { runUnicodePersistenceProbe, verifyUnicodePersistenceProbe } from "../unicodePersistenceProbe";
 import { invoke } from "@tauri-apps/api/core";
 import { getIdentifier } from "@tauri-apps/api/app";
@@ -462,5 +463,5 @@ async function appLock(phase: string) {
 }
 
 Object.assign(window, {
-  __RISUNEST_LINUX_BENCHMARK__: { persistence, reload, regex, startupAppearance, app, appRestart, streaming, appLock },
+  __RISUNEST_LINUX_BENCHMARK__: { persistence, reload, regex, startupAppearance, app, appRestart, streaming, appLock, failureRecord },
 });

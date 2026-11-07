@@ -303,7 +303,7 @@ try:
         operation = f"{args.phase}()"
     current_stage = 'operation'
     diagnostic('operation-enter')
-    execute(f"window.__linuxResult=null; window.__RISUNEST_LINUX_BENCHMARK__.{operation}.then(result=>window.__linuxResult={{result}},error=>window.__linuxResult={{error:String(error)}})")
+    execute(f"const benchmark=window.__RISUNEST_LINUX_BENCHMARK__; window.__linuxResult=null; benchmark.{operation}.then(result=>window.__linuxResult={{result}},error=>window.__linuxResult={{error:JSON.stringify(benchmark.failureRecord(error))}})")
     if args.phase.startswith('app-lock-'):
         current_stage = 'app-lock-ready'
         deadline = time.monotonic() + 120
