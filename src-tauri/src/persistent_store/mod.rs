@@ -131,10 +131,6 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ("message_page_manifests", "character_id, conversation_id, body"),
 ];
 
-/// What asset GC fails with while a capture or another snapshot operation keeps it from reading
-/// the asset inventory. Server sync reports it as `library-operation-busy`.
-pub(crate) const ASSET_INVENTORY_BUSY: &str = "Asset inventory is held by another library operation";
-
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "code", rename_all = "kebab-case")]
 pub(crate) enum StoreError {
@@ -145,6 +141,10 @@ pub(crate) enum StoreError {
     SnapshotReleased,
     RawBodyUnavailable,
     CommitBusy,
+    /// A capture or another snapshot operation keeps asset GC from reading the asset
+    /// inventory. The renderer and server sync both report it as busy.
+    #[serde(rename = "library-operation-busy")]
+    AssetInventoryBusy,
     CommitDecode { message: String },
     Committed { revision: i64, message: String },
     Validation {
@@ -174,6 +174,7 @@ impl std::fmt::Display for StoreError {
             }
             Self::RawBodyUnavailable => formatter.write_str("raw commit body unavailable"),
             Self::CommitBusy => formatter.write_str("previous commit is still finishing"),
+            Self::AssetInventoryBusy => formatter.write_str("asset inventory is held by another library operation"),
             Self::Committed { message, .. } | Self::CommitDecode { message } | Self::Validation { message } | Self::SchemaMismatch { message } | Self::Store { message } => formatter.write_str(message),
         }
     }
@@ -188,6 +189,7 @@ impl crate::native_log::CommandFailure for StoreError {
             Self::SnapshotReleased => "snapshot-released",
             Self::RawBodyUnavailable => "raw-body-unavailable",
             Self::CommitBusy => "commit-busy",
+            Self::AssetInventoryBusy => "library-operation-busy",
             Self::CommitDecode { .. } => "commit-decode",
             Self::Committed { .. } => "committed",
             Self::Validation { .. } => "validation",
@@ -201,7 +203,7 @@ impl crate::native_log::CommandFailure for StoreError {
     }
     fn expected(&self) -> bool {
         match self {
-            Self::RevisionConflict { .. } | Self::CommitBusy | Self::SnapshotReleased => true,
+            Self::RevisionConflict { .. } | Self::CommitBusy | Self::AssetInventoryBusy | Self::SnapshotReleased => true,
             Self::Validation { message } => {
                 message == crate::data_health::CANCELLED
                     || message == archive::ARCHIVE_CANCELLED_MESSAGE
@@ -3813,7 +3815,7 @@ impl PersistentStore {
         // does during a capture instead of keeping the store waiting.
         roots.extend(
             snapshot_archive::Archive::try_open(&self.snapshots_dir)?
-                .ok_or_else(|| StoreError::Validation { message: ASSET_INVENTORY_BUSY.into() })?
+                .ok_or(StoreError::AssetInventoryBusy)?
                 .roots()?
                 .into_iter()
                 .map(|set| ("snapshot", set)),

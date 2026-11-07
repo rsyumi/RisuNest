@@ -657,6 +657,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     ActivityResultContracts.OpenDocument(),
     ::onLegacyBackupSourceSelected,
   )
+  private val contentSourcePicker = registerForActivityResult(
+    ActivityResultContracts.OpenMultipleDocuments(),
+    ::onDocumentSourcesSelected,
+  )
   private var notificationPermissionResult: CompletableDeferred<Boolean>? = null
   private val postNotificationsPermissionLauncher = registerForActivityResult(
     ActivityResultContracts.RequestPermission(),
@@ -1388,7 +1392,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             importDestination = importDestination,
           )
           launchSafSourcePicker(
-            launch = { legacyBackupSourcePicker.launch(arrayOf("*/*")) },
+            launch = {
+              if (content) contentSourcePicker.launch(arrayOf("*/*"))
+              else legacyBackupSourcePicker.launch(arrayOf("*/*"))
+            },
             onFailure = {
               pendingLegacyBackupSource = null
               safSourceCancellations.remove(requestId, cancellation)
@@ -1767,10 +1774,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     lifecycleWebView?.evaluateJavascript(androidBackupSourcePickedScript(requestId, batch), null)
   }
 
-  private fun onLegacyBackupSourceSelected(uri: Uri?) {
+  private fun onLegacyBackupSourceSelected(uri: Uri?) = onDocumentSourcesSelected(listOfNotNull(uri))
+
+  private fun onDocumentSourcesSelected(uris: List<Uri>) {
     val pending = pendingLegacyBackupSource ?: return
     pendingLegacyBackupSource = null
-    if (uri == null) {
+    if (uris.isEmpty()) {
       finishLegacyBackupSourcePick(pending, SafSpoolBatch(emptyList(), emptyList()))
       return
     }
@@ -1778,23 +1787,23 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       val copyContext = currentCoroutineContext()
       val batch = try {
         val store = safSpoolStore()
-        val source = withContext(Dispatchers.IO) {
+        val sources = withContext(Dispatchers.IO) {
           store.cleanupStale()
-          val (displayName, totalBytes) = runCatching { resolveSourceMetadata(uri) }
-            .getOrElse {
-              safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
-            }
-          contentResolverSource(uri, displayName, totalBytes)
+          uris.map { uri ->
+            val (displayName, totalBytes) = runCatching { resolveSourceMetadata(uri) }
+              .getOrElse {
+                safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
+              }
+            contentResolverSource(uri, displayName, totalBytes)
+          }
         }
-        if (!(if (pending.content) isNativeContentSource(source.displayName) else source.displayName.endsWith(".bin", ignoreCase = true))) {
-          SafSpoolBatch(
-            emptyList(),
-            listOf(SafSpoolFailure(source.displayName, "unsupported-source")),
-          )
+        val (supported, unsupported) = partitionDocumentSources(sources, pending.content)
+        if (supported.isEmpty()) {
+          SafSpoolBatch(emptyList(), unsupported)
         } else {
           spoolOpenedFilesOnIo(
             store,
-            listOf(source),
+            supported,
             importDestination = pending.importDestination,
             isCancelled = { pending.cancellation.get() || !copyContext.isActive },
             onProgress = { progress ->
@@ -1810,7 +1819,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
                 },
               )
             },
-          )
+          ).let { spooled -> SafSpoolBatch(spooled.ready, unsupported + spooled.failures) }
         }
       } catch (error: Exception) {
         SafSpoolBatch(

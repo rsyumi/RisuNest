@@ -25,7 +25,10 @@ import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_SITE_URL } from "./realmEnd
 import { registerOpenedFileListeners } from "./openedFiles"
 import { type DeviceMarkerStorage } from './storage/deviceMarkers'
 import { importDesktopNativeCharacterPathInOperation } from './storage/nativeCharacterImportOperation'
-import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
+import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
+import { importContentBatch } from './storage/contentImportBatch'
+import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from './storage/nativeFileJobManager'
+import { NativeFileJobError, type NativeFileJobOptions, type NativeFileJobSource } from './storage/nativeFileJobs'
 import {
     decodePreparedNativePngCardMetadata,
     type PreparedNativePngCardMetadata,
@@ -125,42 +128,18 @@ export async function importCharacter() {
             const selected = await open({ multiple: true, directory: false })
             const paths =
                 typeof selected === 'string' ? [selected] : (selected ?? [])
-            const importErrors: Array<string | Error> = []
-            for (const path of paths) {
-                try {
-                    const result = await importDesktopNativeCharacterPathInOperation(path, {
-                        readDesktopPath: readFile,
-                        nativeEnabled: () => nativeCharacterContentImportEnabled,
-                        nativeImport: importPreparedNativeCharacterContent,
-                        legacyImport: async ({ name, data }) => {
-                            const importedIndex = await importCharacterProcess({
-                                name,
-                                data,
-                            })
-                            return typeof importedIndex === 'number'
-                                ? (getDatabase().characters[importedIndex]?.chaId ??
-                                      null)
-                                : null
-                        },
-                    })
-                    if (result.kind === 'imported') {
-                        checkCharOrder()
-                        lastImportedCharacterId = result.value
-                    }
-
-                } catch (error) {
-                    importErrors.push(error instanceof Error ? error : String(error))
-                }
-            }
-            const firstImportError = importErrors[0]
-            if (firstImportError && importErrors.length === 1) alertError(firstImportError)
-            if (importErrors.length > 1) {
-                alertError(new AggregateError(
-                    importErrors,
-                    `Failed to import ${importErrors.length} of ${paths.length} selected character files`,
-                ))
-            }
-            return lastImportedCharacterId
+            if (!paths.length) return null
+            return await runSharedNativeFileOperation(
+                'import',
+                'content-picker',
+                (context) => importContentBatch(
+                    context,
+                    paths,
+                    (path) => ({ name: path.split(/[\\/]/).at(-1) || path }),
+                    (path) => importDesktopCharacterPath(path, context),
+                ),
+                { presentation: 'dialog', format: 'content' },
+            )
         }
 
         const files = await selectFileByDom(['*'], 'multiple')
@@ -180,13 +159,33 @@ export async function importCharacter() {
         }
         return lastImportedCharacterId
     } catch (error) {
-        if (isTauriIOS || isTauriAndroid) {
+        if (isTauri) {
             // The picker import shows how it ended, so only a failure to start is reported here.
             const { presentFileOperationError } = await import('./storage/fileOperationErrorPresentation')
             presentFileOperationError('import', error, callStartedAt)
         } else alertError(error)
         return null
     }
+}
+
+async function importDesktopCharacterPath(path: string, context: SharedNativeFileOperationContext): Promise<string | null> {
+    const outcome = await importDesktopNativeCharacterPath(path, {
+        readDesktopPath: readFile,
+        nativeEnabled: () => nativeCharacterContentImportEnabled,
+        nativeImport: (input) => importPreparedNativeCharacterContent(input, { signal: context.signal, onStatus: context.onStatus }),
+        legacyImport: async ({ name, data }) => {
+            const importedIndex = await importCharacterProcess({ name, data })
+            return typeof importedIndex === 'number'
+                ? (getDatabase().characters[importedIndex]?.chaId ?? null)
+                : null
+        },
+    })
+    if (outcome.kind === 'destination-required') {
+        throw new NativeFileJobError('destination-required', language.risuNest.importDialog.reasonPlainJpeg)
+    }
+    if (outcome.kind !== 'imported') return null
+    checkCharOrder()
+    return outcome.value
 }
 
 export async function importCharacterProcess<T extends boolean = false>(f: {

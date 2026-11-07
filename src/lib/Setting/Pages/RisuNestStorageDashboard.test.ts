@@ -558,6 +558,41 @@ describe('RisuNestStorageDashboard', () => {
         expect(alerts.alertError).not.toHaveBeenCalledWith(languageEnglish.risuNest.storage.actionFailed)
     })
 
+    const retryLater = languageEnglish.risuNest.importDialog.reasonBusy
+    const offerDataCheck = `${languageEnglish.risuNest.storage.actionFailed} ${languageEnglish.risuNest.dataHealth.openResult}`
+    it.each([
+        ['library-operation-busy', [], [retryLater]],
+        ['commit-busy', [], [retryLater]],
+        ['validation', [offerDataCheck], []],
+    ])('offers the data check only when the unused file search fails for a reason other than a busy library (%s)', async (code, confirms, errors) => {
+        const target = setup()
+        maintenance.previewNativePersistentAssetGc.mockRejectedValue({ code })
+        alerts.alertConfirm.mockResolvedValue(false)
+        await vi.waitFor(() => expect(exact(target, 'Find')).toBeDefined())
+
+        exact(target, 'Find')!.click()
+
+        await vi.waitFor(() => expect(alerts.alertConfirm.mock.calls.length + alerts.alertError.mock.calls.length).toBe(1))
+        expect(alerts.alertConfirm.mock.calls.map(([message]) => message)).toEqual(confirms)
+        expect(alerts.alertError.mock.calls.map(([message]) => message)).toEqual(errors)
+    })
+
+    it('asks for a retry when another operation holds the library as the unused files are deleted', async () => {
+        const target = setup()
+        maintenance.previewNativePersistentAssetGc.mockResolvedValue({ candidateCount: 1, candidateBytes: 1024, deletedCount: 0, deletedBytes: 0, blockers: [] })
+        core.invoke.mockRejectedValueOnce({ code: 'library-operation-busy' })
+        alerts.alertConfirm.mockResolvedValue(true)
+        await vi.waitFor(() => expect(exact(target, 'Find')).toBeDefined())
+        exact(target, 'Find')!.click()
+        await vi.waitFor(() => expect(exact(target, 'Delete now')).toBeDefined())
+
+        exact(target, 'Delete now')!.click()
+
+        await vi.waitFor(() => expect(alerts.alertError).toHaveBeenCalledExactlyOnceWith(retryLater))
+        expect(core.invoke).toHaveBeenCalledExactlyOnceWith('pds_asset_delete_orphaned_aliases', { expectedRevision: 1, owner: null })
+        expect(maintenance.executeNativePersistentAssetGc).not.toHaveBeenCalled()
+    })
+
     it('marks a running action busy on its button instead of swapping the label', async () => {
         const target = setup()
         let finish: ((value: { id: string; revision: number; bytes: number; durationMs: number }) => void) | undefined

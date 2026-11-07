@@ -3,6 +3,7 @@ package io.github.rsyumi.risunest
 import android.content.ComponentCallbacks2
 import android.os.Build
 import androidx.core.view.WindowInsetsCompat
+import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -44,6 +45,27 @@ class MainActivityBehaviorTest {
     }
     assertEquals(false, isNativeContentSource("database.risudat"))
     assertEquals(false, isNativeContentSource("program.exe"))
+  }
+
+  @Test
+  fun `a multi-file pick keeps the files of the picked kind and refuses each other file`() {
+    fun source(name: String) = object : SafInputSource {
+      override val displayName = name
+      override val totalBytes: Long? = null
+      override fun open() = ByteArrayInputStream(ByteArray(0))
+    }
+    val picked = listOf(source("card.png"), source("notes.txt"), source("module.risum"), source("backup.bin"))
+
+    val (content, contentRefused) = partitionDocumentSources(picked, content = true)
+    assertEquals(listOf("card.png", "module.risum"), content.map { it.displayName })
+    assertEquals(
+      listOf(SafSpoolFailure("notes.txt", "unsupported-source"), SafSpoolFailure("backup.bin", "unsupported-source")),
+      contentRefused,
+    )
+
+    val (backup, backupRefused) = partitionDocumentSources(picked, content = false)
+    assertEquals(listOf("backup.bin"), backup.map { it.displayName })
+    assertEquals(listOf("card.png", "notes.txt", "module.risum"), backupRefused.map { it.displayName })
   }
 
   @Test

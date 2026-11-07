@@ -3151,6 +3151,7 @@ impl NativeFileJobTask {
 fn native_store_error(error: crate::persistent_store::StoreError) -> NativeJobError {
     let code = match error {
         crate::persistent_store::StoreError::RevisionConflict { .. } => "revision-conflict",
+        crate::persistent_store::StoreError::AssetInventoryBusy => "library-operation-busy",
         crate::persistent_store::StoreError::CommitDecode { .. } | crate::persistent_store::StoreError::Validation { .. } => "invalid-input",
         crate::persistent_store::StoreError::Committed { .. } | crate::persistent_store::StoreError::RawBodyUnavailable | crate::persistent_store::StoreError::CommitBusy | crate::persistent_store::StoreError::SnapshotReleased
         | crate::persistent_store::StoreError::SchemaMismatch { .. } | crate::persistent_store::StoreError::Store { .. } => "store-error",

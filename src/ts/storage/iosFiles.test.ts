@@ -7,7 +7,7 @@ vi.mock('@tauri-apps/api/core', async original => ({ ...(await original<typeof i
 } satisfies typeof import('@tauri-apps/api/core')))
 vi.mock('../alert', () => ({ alertError, waitAlert }))
 vi.mock('../gui/nativeFileJobDialogModel', () => ({ failureReason: (code: string) => `reason:${code}` }))
-import { exportIOSFile, pickIOSFile, getIOSPublication, pickIOSBackupSource, materializeIOSBackupSource, reportInterruptedIOSBackupSources } from './iosFiles'
+import { exportIOSFile, pickIOSFile, pickIOSFiles, getIOSPublication, pickIOSBackupSource, materializeIOSBackupSource, reportInterruptedIOSBackupSources } from './iosFiles'
 import { isLibraryFileOperationReserved } from './libraryFileOperation'
 beforeEach(() => {
     mockIPC(() => undefined)
@@ -214,6 +214,32 @@ describe('iOS file publication', () => {
             { path: '/staged/file' },
         )
     })
+    it('opens one picker for several files, returns the files it could not copy, and cleans every staged copy on cancellation', async () => {
+        const files = [
+            { path: '/staged/first', name: 'first.charx', bytes: 1 },
+            { path: '/staged/second', name: 'second.png', bytes: 2 },
+        ]
+        invoke.mockImplementation(async (command) => command.endsWith('pick_files') ? { cancelled: false, files } : undefined)
+        await expect(pickIOSFiles()).resolves.toEqual({ files, failures: [] })
+        expect(invoke).toHaveBeenCalledExactlyOnceWith('plugin:ios-native|pick_files', { multiple: true, partial: true })
+
+        const failures = [{ name: 'cloud.charx', message: 'synthetic download failure' }]
+        invoke.mockImplementation(async () => ({ cancelled: false, files: [], failures }))
+        await expect(pickIOSFiles()).resolves.toEqual({ files: [], failures })
+
+        invoke.mockClear()
+        const controller = new AbortController()
+        invoke.mockImplementation(async (command) => {
+            if (!command.endsWith('pick_files')) return undefined
+            controller.abort()
+            return { cancelled: false, files }
+        })
+        await expect(pickIOSFiles(controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+        expect(invoke.mock.calls.slice(1)).toEqual([
+            ['plugin:ios-native|discard_file', { path: '/staged/first' }],
+            ['plugin:ios-native|discard_file', { path: '/staged/second' }],
+        ])
+    })
     it('keeps a completed publication successful after a late abort', async () => {
         const controller = new AbortController()
         invoke.mockImplementation(async () => {
@@ -248,6 +274,7 @@ describe('iOS file publication', () => {
 type IOSFiles = typeof import('./iosFiles')
 const stagedCalls: [string, string, (files: IOSFiles, signal?: AbortSignal) => Promise<unknown>, unknown][] = [
     ['pickIOSFile', 'pick_file', (files, signal) => files.pickIOSFile(signal), { cancelled: true }],
+    ['pickIOSFiles', 'pick_files', (files, signal) => files.pickIOSFiles(signal), { cancelled: true }],
     ['exportIOSFile', 'export_file', (files, signal) => files.exportIOSFile({ sourcePath: '/owned/file', suggestedName: 'backup.risunest', requestId: 'caller-owned', signal }), { cancelled: false, bytes: 42 }],
     ['materializeIOSBackupSource', 'materialize_backup_source', (files, signal) => files.materializeIOSBackupSource('source', { signal }), { path: '/owned/copied.risudat', name: 'copied.risudat', bytes: 42 }],
     ['pickRewritableIOSFile', 'pick_rewritable_file', files => files.pickRewritableIOSFile('translated.po'), { cancelled: true }],
@@ -276,7 +303,7 @@ describe('iOS data root handover', () => {
         await pending
         expect(invoke.mock.calls.map(([name]) => name)).toEqual([`plugin:ios-native|${command}`])
     })
-    it.each(stagedCalls.slice(0, 3))('%s sends nothing when cancelled while the data root is pending', async (_name, _command, run, reply) => {
+    it.each(stagedCalls.slice(0, 4))('%s sends nothing when cancelled while the data root is pending', async (_name, _command, run, reply) => {
         const { files, deliver } = await beforeDataRoot(reply)
         const controller = new AbortController()
         const pending = run(files, controller.signal)

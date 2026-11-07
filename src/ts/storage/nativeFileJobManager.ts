@@ -53,6 +53,23 @@ export interface NativeFileOperationState {
     cancelRequested: boolean
     partialWritesPossible: boolean
     waitingForSync?: boolean
+    batch?: NativeFileOperationBatch
+}
+
+export interface NativeFileOperationBatchFailure {
+    name: string
+    error: NativeFileOperationError
+}
+
+/** Several files imported one after another in one operation. */
+export interface NativeFileOperationBatch {
+    /** One-based position of the file in progress; 0 before the first starts. */
+    index: number
+    total: number
+    imported: number
+    failures: NativeFileOperationBatchFailure[]
+    /** Warnings of the files already finished. */
+    warningCodes: string[]
 }
 
 export type NativeFileOperationOutcomeState = 'succeeded' | 'failed' | 'cancelled'
@@ -81,6 +98,7 @@ export interface NativeFileOperationOutcome {
     warningCodes: string[]
     partialWritesPossible: boolean
     interruption?: 'background-expired'
+    batch?: Omit<NativeFileOperationBatch, 'index' | 'warningCodes'>
 }
 
 export interface SharedNativeFileOperationContext {
@@ -92,6 +110,12 @@ export interface SharedNativeFileOperationContext {
     releaseLibraryAfterPortableAdoption(receipt: NativeFileJobStatus): Promise<void>
     /** With `protectAfterPicker`, begins the background task once the picker has returned. */
     protect(): void
+    /** Makes this a batch of `total` files, reported together in one outcome. */
+    beginBatch(total: number): void
+    /** Starts the batch file at the one-based `index`; its progress replaces the previous file's. */
+    beginBatchItem(index: number, source: NativeFileOperationSource): void
+    /** Records how one batch file ended; a failed file does not stop the batch. */
+    recordBatchItem(name: string, result: { imported: boolean } | { error: unknown }): void
 }
 
 export interface SharedNativeFileOperationOptions {
@@ -208,7 +232,10 @@ function outcomeFromSettlement(
     settlement: Settlement,
     finishedAt: number,
 ): NativeFileOperationOutcome | null {
-    const statusWarnings = state.status?.result?.warningCodes ?? []
+    const statusWarnings = mergeWarningCodes(state.batch?.warningCodes ?? [], state.status?.result?.warningCodes ?? [])
+    const batch = state.batch
+        ? { total: state.batch.total, imported: state.batch.imported, failures: state.batch.failures }
+        : undefined
     const base = {
         kind: state.kind,
         ...(state.format ? { format: state.format } : {}),
@@ -219,6 +246,7 @@ function outcomeFromSettlement(
         observedStages: state.observedStages,
         ...(state.status?.result ? { result: state.status.result } : {}),
         partialWritesPossible: state.partialWritesPossible,
+        ...(batch ? { batch } : {}),
     }
     if ('error' in settlement) {
         const warningCodes = mergeWarningCodes(statusWarnings, stringWarningCodes(settlement.error))
@@ -234,6 +262,12 @@ function outcomeFromSettlement(
             error: outcomeError(state.kind, settlement.error),
             warningCodes,
         }
+    }
+    if (batch) {
+        // A batch reports its files, whatever value the last one returned.
+        const warningCodes = mergeWarningCodes(stringWarningCodes(settlement.value), statusWarnings)
+        if (batch.failures.length) return { ...base, state: 'failed', error: batch.failures[0].error, warningCodes }
+        return batch.imported ? { ...base, state: 'succeeded', warningCodes } : null
     }
     if (settlement.value && typeof settlement.value === 'object' && 'kind' in settlement.value
         && ['missing', 'unchanged', 'kept-local'].includes(String(settlement.value.kind))) return null
@@ -387,6 +421,25 @@ function runSharedNativeFileOperationWithAdmission<T>(
             releaseAdmission()
         },
         protect: () => {},
+        beginBatch: total => {
+            if (activeController === controller) updateActiveState({ batch: { index: 0, total, imported: 0, failures: [], warningCodes: [] } })
+        },
+        beginBatchItem: (index, source) => {
+            const batch = activeController === controller ? activeState?.batch : undefined
+            if (!batch) return
+            const finished = activeState?.status?.result?.warningCodes ?? []
+            updateActiveState({
+                source, status: undefined, observedStages: [],
+                batch: { ...batch, index, warningCodes: mergeWarningCodes(batch.warningCodes, finished) },
+            })
+        },
+        recordBatchItem: (name, result) => {
+            const batch = activeController === controller ? activeState?.batch : undefined
+            if (!batch) return
+            updateActiveState({ batch: 'error' in result
+                ? { ...batch, failures: [...batch.failures, { name, error: outcomeError(kind, result.error) }] }
+                : { ...batch, imported: batch.imported + (result.imported ? 1 : 0) } })
+        },
     }
     let taskSignal = controller.signal
     let finalized = false

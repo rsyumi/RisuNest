@@ -2888,6 +2888,8 @@ export const languageKorean = {
             currentItem: '현재: {0}',
             itemsOf: '{0} / {1}',
             itemsCount: '{0}개 항목',
+            batchFile: '파일 {0} / {1}',
+            batchFiles: '파일 {0}개',
             countCharacters: '캐릭터',
             countPresets: '프리셋',
             countAssets: '에셋',
@@ -2907,6 +2909,9 @@ export const languageKorean = {
                 '가져오기를 취소했습니다. 이미 저장된 첨부 파일 일부가 남아 있을 수 있습니다.',
             resultFailed:
                 '가져오기에 실패했습니다. 기존 데이터는 그대로입니다.',
+            resultBatchFailed: '파일 {1}개 중 {0}개를 가져오지 못했습니다.',
+            resultBatchCancelled: '가져오기를 취소했습니다. 파일 {1}개 중 {0}개를 가져왔습니다.',
+            resultBatchPartial: '파일 {1}개 중 {0}개를 가져왔습니다.',
             resultFailedAfterCommit:
                 '데이터는 가져왔지만 화면을 새로 고치지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해주세요.',
             resultActivationUnresolved: '복원 결과를 확인하지 못했습니다. 다른 변경을 하기 전에 화면 새로 고침을 선택해 결과를 확인해주세요.',
