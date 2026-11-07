@@ -592,7 +592,7 @@ describe('RisuNestLogViewer', () => {
             vi.mocked(save).mockResolvedValue('/synthetic/saved.txt')
             for (const [failure, shown] of [
                 ['native-log-file-empty', strings.savedLogEmpty],
-                ['native-log-file-invalid-destination', strings.saveDestinationInvalid],
+                ['native-log-file-invalid-destination', language.risuNest.networkLog.destinationInvalid],
                 ['native-log-file-export-failed', strings.saveFailed],
             ]) {
                 const saves = commands.native_log_file_export.mock.calls.length

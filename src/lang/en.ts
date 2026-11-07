@@ -3261,7 +3261,6 @@ export const languageEnglish = {
             saveLog: 'Save',
             savedLogSaved: 'Error log saved.',
             saveFailed: 'Could not save the error log.',
-            saveDestinationInvalid: 'Choose another destination.',
             savedLogList: 'Saved error log entries',
             appStarted: 'App started',
             newerPage: 'Previous page',

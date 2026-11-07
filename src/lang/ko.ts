@@ -3082,7 +3082,6 @@ export const languageKorean = {
             saveLog: '저장',
             savedLogSaved: '오류 로그를 저장했습니다.',
             saveFailed: '오류 로그를 저장하지 못했습니다.',
-            saveDestinationInvalid: '다른 저장 위치를 선택해주세요.',
             savedLogList: '저장된 오류 로그 항목',
             appStarted: '앱 시작',
             newerPage: '이전 페이지',

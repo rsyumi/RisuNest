@@ -349,7 +349,7 @@
             else if (outcome === 'empty') savedNotice = language.risuNest.diag.savedLogEmpty
         } catch (error) {
             savedError = error === 'native-log-file-invalid-destination'
-                ? language.risuNest.diag.saveDestinationInvalid
+                ? language.risuNest.networkLog.destinationInvalid
                 : language.risuNest.diag.saveFailed
         } finally {
             saving = false
