@@ -701,6 +701,11 @@ fn builder_with_main_window(
                     device_backup
                         .attach_maintenance_guard(guard)
                         .map_err(|error| format!("device maintenance guard failed: {error}"))?;
+                } else {
+                    external_storage::content_store::move_flat_files_later(
+                        app.handle(),
+                        app_data_dir.join("external-storage"),
+                    );
                 }
                 app.state::<native_media::ipc::NativeMediaIpcState>()
                     .configure(app_data_dir.join("native-media-ipc"))?;

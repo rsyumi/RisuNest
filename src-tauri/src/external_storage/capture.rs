@@ -1054,7 +1054,6 @@ mod tests {
     fn capture_object_publication_never_replaces_an_existing_identity() {
         let root = tempfile::tempdir().expect("create capture root");
         let capture_directory = root.path().join("capture");
-        let object_directory = root.path().join("objects");
         let mut catalog = CaptureCatalog::create(&capture_directory, root.path(), None)
             .expect("create capture catalog");
         // Above the threshold, so publication still goes through the shared
@@ -1062,6 +1061,8 @@ mod tests {
         let payload = vec![7u8; super::super::content_store::SMALL_OBJECT_BYTES + 1];
         let payload = payload.as_slice();
         let expected = hex::encode(hash(payload));
+        let published = super::super::content_store::file_location(root.path(), &expected);
+        let object_directory = published.parent().unwrap();
 
         catalog
             .content
@@ -1072,10 +1073,10 @@ mod tests {
             .put(&expected, payload)
             .expect("deduplicate capture object");
         assert_eq!(
-            fs::read(object_directory.join(&expected)).expect("read published object"),
+            fs::read(&published).expect("read published object"),
             payload
         );
-        assert!(fs::read_dir(&object_directory)
+        assert!(fs::read_dir(object_directory)
             .expect("list object directory")
             .all(|entry| !entry
                 .expect("read object entry")
@@ -1103,7 +1104,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let external = root.path().join("external-storage");
         let capture_directory = external.join("captures/conflict");
-        let object_directory = external.join("objects");
         let mut catalog = CaptureCatalog::create(&capture_directory, &external, None)
             .unwrap();
         let identity = identity();
@@ -1132,7 +1132,7 @@ mod tests {
         assert!(roots.content_objects.contains(&record_hash));
         assert!(roots
             .logical_records
-            .contains(&object_directory.join(&generated_hash).canonicalize().unwrap()));
+            .contains(&super::super::content_store::file_location(&external, &generated_hash).canonicalize().unwrap()));
         assert!(roots.assets.object_hashes.contains(&asset_hash));
 
         // A body that no longer matches its identity is found by the pass that
