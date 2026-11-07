@@ -5,7 +5,9 @@
 //!
 //! Every result matches the value its decoder reads: the text is checked as a
 //! parse checks it, a repeated object key keeps its first position and its last
-//! value, and numbers are read as the parse reads them.
+//! value, and numbers are read as the parse reads them. `canonicalize` reads a
+//! text as `payload_value::canonicalize` does instead, where a repeated key
+//! fails and the raw value token is an ordinary key.
 
 use super::{lww, StoreError, StoreResult};
 use risunest_sync_wire::payload_value;
@@ -40,7 +42,7 @@ pub(super) struct Document<'a> {
 impl<'a> Document<'a> {
     pub(super) fn parse(text: &'a str, depth: Depth) -> StoreResult<Self> {
         let token = Cell::new(false);
-        match read_with(text, depth, Check { token: &token }) {
+        match read_with(text, depth, Check { token: Some(&token) }) {
             Ok(()) => Ok(Self { text: Cow::Borrowed(text) }),
             // Such an object decodes to the value its string holds. Writing the
             // decoded value gives a text without one that decodes the same.
@@ -53,8 +55,13 @@ impl<'a> Document<'a> {
     }
 
     pub(super) fn value(&self) -> Raw<'_> {
-        Raw(self.text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r')))
+        Raw(trim(&self.text))
     }
+}
+
+/// A checked text without the whitespace around its value.
+fn trim(text: &str) -> &str {
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
 }
 
 /// One value of a `Document`.
@@ -88,7 +95,7 @@ impl<'a> Raw<'a> {
         if self.first() != b'{' {
             return Ok(None);
         }
-        read(self.0, Members).map(Some)
+        read(self.0, Members { distinct: false }).map(Some)
     }
 
     /// The elements of an array, or `None` for any other value.
@@ -128,7 +135,7 @@ impl<'a> Object<'a> {
 /// Appends what `payload_value::encode` writes for an object of `members`,
 /// whose keys must be distinct.
 pub(super) fn write_canonical_object<'k, 'r>(members: impl IntoIterator<Item = (&'k str, Raw<'r>)>, out: &mut Vec<u8>) -> StoreResult<()> {
-    canonical_members(members.into_iter().collect(), out, 0)
+    canonical_members(members.into_iter().collect(), out, 0, Mode::Canonical)
 }
 
 /// Appends what serde_json writes for an object of `members`, whose keys must
@@ -169,6 +176,20 @@ pub(super) fn text(out: Vec<u8>) -> StoreResult<String> {
     String::from_utf8(out).map_err(|_| invalid_payload())
 }
 
+/// What `payload_value::canonicalize` returns for `text`, without building the
+/// value it parses.
+pub(super) fn canonicalize(text: &str) -> risunest_sync_wire::Result<Vec<u8>> {
+    let canonical = || -> StoreResult<Vec<u8>> {
+        read_with(text, Depth::Limited, Check { token: None })?;
+        let mut out = Vec::new();
+        write(Raw(trim(text)), &mut out, 0, Mode::Strict)?;
+        Ok(out)
+    };
+    // `payload_value::canonicalize` rejects every text it cannot encode with
+    // this error.
+    canonical().map_err(|_| risunest_sync_wire::WireError("invalid-payload-json"))
+}
+
 fn invalid_payload() -> StoreError {
     lww::error(risunest_sync_wire::WireError("invalid-payload-json"))
 }
@@ -192,6 +213,8 @@ fn read_with<'a, S: DeserializeSeed<'a>>(text: &'a str, depth: Depth, seed: S) -
 enum Mode {
     Canonical,
     Json,
+    /// `Canonical`, failing at a repeated object key.
+    Strict,
 }
 
 #[derive(Default)]
@@ -222,12 +245,13 @@ fn write(value: Raw<'_>, out: &mut Vec<u8>, depth: usize, mode: Mode) -> StoreRe
             Abort::Unordered => out.truncate(start),
         },
     }
-    if let Some(object) = value.object()? {
+    if value.first() == b'{' {
+        let object = read(value.0, Members { distinct: mode == Mode::Strict })?;
         let members: Vec<_> = object.members().collect();
-        if mode == Mode::Canonical {
-            return canonical_members(members, out, depth);
+        if mode == Mode::Json {
+            return write_json_object(members, out, |_, member, out| write(member, out, depth + 1, mode));
         }
-        write_json_object(members, out, |_, member, out| write(member, out, depth + 1, mode))
+        canonical_members(members, out, depth, mode)
     } else {
         out.push(b'[');
         for (index, element) in value.elements()?.into_iter().flatten().enumerate() {
@@ -241,7 +265,7 @@ fn write(value: Raw<'_>, out: &mut Vec<u8>, depth: usize, mode: Mode) -> StoreRe
     }
 }
 
-fn canonical_members(mut members: Vec<(&str, Raw<'_>)>, out: &mut Vec<u8>, depth: usize) -> StoreResult<()> {
+fn canonical_members(mut members: Vec<(&str, Raw<'_>)>, out: &mut Vec<u8>, depth: usize, mode: Mode) -> StoreResult<()> {
     if depth >= payload_value::DEPTH_LIMIT {
         return Err(invalid_payload());
     }
@@ -253,16 +277,16 @@ fn canonical_members(mut members: Vec<(&str, Raw<'_>)>, out: &mut Vec<u8>, depth
         }
         serde_json::to_writer(&mut *out, key)?;
         out.push(b':');
-        write(member, out, depth + 1, Mode::Canonical)?;
+        write(member, out, depth + 1, mode)?;
     }
     out.push(b'}');
     Ok(())
 }
 
-/// Checks a text as a `Value` parse would, and notes an object whose first key
-/// is the raw value token.
+/// Checks a text as a parse would. With `token`, it stops at and notes an object
+/// whose first key is the raw value token, which a `Value` parse reads apart.
 struct Check<'c> {
-    token: &'c Cell<bool>,
+    token: Option<&'c Cell<bool>>,
 }
 
 impl<'de> DeserializeSeed<'de> for Check<'_> {
@@ -302,8 +326,8 @@ impl<'de> Visitor<'de> for Check<'_> {
     fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<(), A::Error> {
         let mut first = true;
         while let Some(key) = entries.next_key_seed(Key)? {
-            if first && key == RAW_VALUE_TOKEN {
-                self.token.set(true);
+            if let Some(token) = self.token.filter(|_| first && key == RAW_VALUE_TOKEN) {
+                token.set(true);
                 return Err(de::Error::custom("raw value token"));
             }
             first = false;
@@ -332,7 +356,7 @@ impl Inline<'_, '_> {
 
     fn number<E: de::Error>(self, number: f64, json: impl serde::Serialize) -> Result<(), E> {
         match self.mode {
-            Mode::Canonical => payload_value::write_number(number, &mut *self.out)
+            Mode::Canonical | Mode::Strict => payload_value::write_number(number, &mut *self.out)
                 .map_err(|error| self.fail(Abort::Failed(lww::error(error)))),
             Mode::Json => serde_json::to_writer(&mut *self.out, &json).map_err(|error| self.fail(Abort::Failed(error.into()))),
         }
@@ -343,7 +367,7 @@ impl Inline<'_, '_> {
     }
 
     fn enter<E: de::Error>(&self) -> Result<(), E> {
-        if self.mode == Mode::Canonical && self.depth >= payload_value::DEPTH_LIMIT {
+        if self.mode != Mode::Json && self.depth >= payload_value::DEPTH_LIMIT {
             return Err(self.fail(Abort::Failed(invalid_payload())));
         }
         Ok(())
@@ -452,7 +476,11 @@ impl<'de> DeserializeSeed<'de> for Text {
     }
 }
 
-struct Members;
+/// Reads an object's members. With `distinct`, a repeated key fails as it fails
+/// `payload_value::parse`.
+struct Members {
+    distinct: bool,
+}
 
 impl<'de> DeserializeSeed<'de> for Members {
     type Value = Object<'de>;
@@ -472,6 +500,7 @@ impl<'de> Visitor<'de> for Members {
         while let Some(key) = entries.next_key_seed(Key)? {
             let value = Raw(entries.next_value::<&'de RawValue>()?.get());
             match positions.get(&key) {
+                Some(_) if self.distinct => return Err(de::Error::custom("duplicate-key")),
                 Some(&position) => members[position].1 = value,
                 None => {
                     positions.insert(key.clone(), members.len());
@@ -556,8 +585,8 @@ mod tests {
         format!("{}0{}", open.repeat(depth), close.repeat(depth))
     }
 
-    #[test]
-    fn writes_what_the_parsed_value_writes() {
+    /// Texts whose encodings differ from them, and texts a parse rejects.
+    fn edge_texts() -> Vec<String> {
         let binary = (0..300).map(|index| format!("\"{index}\":{}", index % 256)).collect::<Vec<_>>().join(",");
         let shuffled = (0..300).rev().map(|index| format!("\"{index}\":{}", index % 256)).collect::<Vec<_>>().join(",");
         let mut texts: Vec<String> = vec![
@@ -611,7 +640,12 @@ mod tests {
             texts.push(nested(depth, "[", "]"));
             texts.push(nested(depth, "{\"a\":", "}"));
         }
-        for text in &texts {
+        texts
+    }
+
+    #[test]
+    fn writes_what_the_parsed_value_writes() {
+        for text in &edge_texts() {
             assert_same(text);
         }
     }
@@ -675,6 +709,48 @@ mod tests {
             let mut text = String::new();
             generator.value(0, &mut text);
             assert_same(&text);
+        }
+    }
+
+    fn assert_canonicalizes(text: &str) {
+        assert_eq!(canonicalize(text), payload_value::canonicalize(text.as_bytes()), "{text}");
+    }
+
+    #[test]
+    fn canonicalizes_as_the_strict_parse_does() {
+        let binary = (0..65_536).map(|index| format!("\"{index}\":{}", index % 256)).collect::<Vec<_>>().join(",");
+        let mut texts = edge_texts();
+        texts.extend([
+            // Repeated keys: among ascending keys, spelled with an escape, and
+            // under objects and arrays in and out of key order.
+            r#"{"0":1,"1":2,"1":3}"#.to_owned(),
+            r#"{"a":1,"\u0061":2}"#.to_owned(),
+            r#"[{"b":1},{"a":{"x":1,"x":1}}]"#.to_owned(),
+            r#"{"z":{"a":1,"a":2},"a":0}"#.to_owned(),
+            r#"{"z":0,"a":{"0":1,"0":2}}"#.to_owned(),
+            r#"{"a":{"b":[{"c":1,"c":1}]},"b":1}"#.to_owned(),
+            // Other texts a parse rejects.
+            String::new(),
+            " \n".to_owned(),
+            "NaN".to_owned(),
+            "undefined".to_owned(),
+            "[1,]".to_owned(),
+            "\"\u{1}\"".to_owned(),
+            r#"{"a":1}}"#.to_owned(),
+            r#"["\ud800\u0041"]"#.to_owned(),
+            format!("{{\"b\":0,\"a\":{}}}", nested(100_000, "[", "]")),
+            // A converted binary, alone and under keys out of order.
+            format!("{{{binary}}}"),
+            format!("{{\"role\":\"user\",\"blob\":{{{binary}}},\"data\":\"x\"}}"),
+        ]);
+        for text in &texts {
+            assert_canonicalizes(text);
+        }
+        let mut generator = Generator(0xca70);
+        for _ in 0..3000 {
+            let mut text = String::new();
+            generator.value(0, &mut text);
+            assert_canonicalizes(&text);
         }
     }
 

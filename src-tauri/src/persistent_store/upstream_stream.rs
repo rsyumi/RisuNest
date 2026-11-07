@@ -1,4 +1,4 @@
-use super::stored_json::{self, Depth, Document, Object};
+use super::stored_json::{self, Depth, Document, Object, Raw};
 use super::{commit, replacement_scan, PersistentStore, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -214,6 +214,33 @@ impl RootSpool {
             visit(&key, decode(&raw)?)?;
         }
         Ok(())
+    }
+
+    /// Writes each member of `field` as `put_member` writes it after, in a
+    /// member that is an object, the value of each `from` key in turn moves to
+    /// `to` as `shift_remove` and `insert` move it: in place of an existing
+    /// `to`, otherwise after the last member.
+    pub(crate) fn rename_object_members(&self, field: &str, renames: &[(&str, &str)]) -> StoreResult<()> {
+        self.visit_texts(field,|key,text| {
+            let document = Document::parse(text, Depth::Unlimited)?;
+            let mut out = Vec::new();
+            match document.value().object()? {
+                Some(object) => {
+                    let mut members: Vec<(&str, Raw<'_>)> = object.members().collect();
+                    for (from,to) in renames {
+                        let Some(index) = members.iter().position(|(name,_)| name == from) else { continue; };
+                        let (_,value) = members.remove(index);
+                        match members.iter_mut().find(|(name,_)| name == to) {
+                            Some(member) => member.1 = value,
+                            None => members.push((to,value)),
+                        }
+                    }
+                    stored_json::write_json_object(members, &mut out, |_,member,out| member.write_json(out))?;
+                }
+                None => document.value().write_json(&mut out)?,
+            }
+            self.put_member_json(field,key,Some(stored_json::text(out)?.as_str()))
+        })
     }
 
     /// `visit` of each member's text, which is not decoded.
@@ -608,22 +635,23 @@ impl PersistentStore {
         let tx=self.connection.transaction()?;
         commit::require_staging(&tx,staging_id)?;
         tx.execute("DELETE FROM bot_presets WHERE generation=?1",[staging_id])?;
+        // Presets and plugin values are written from their text, which may
+        // hold a converted binary.
         let mut preset_index=0;
-        root.visit("botPresets",|_,preset| {
-            commit::put_preset_rows(&tx,staging_id,&[preset],preset_index)?;
+        root.visit_texts("botPresets",|_,preset| {
+            commit::put_preset_text(&tx,staging_id,preset,preset_index)?;
             preset_index+=1;
             Ok(())
         })?;
         tx.execute("DELETE FROM plugin_storage WHERE generation=?1",[staging_id])?;
         let carried=commit::carried_plugin_import_batches(&tx)?;
         let mut ordinal=0;
-        root.visit("pluginCustomStorage",|key,value| {
-            let mut values=Map::new(); values.insert(key.to_owned(),value);
+        root.visit_texts("pluginCustomStorage",|key,value| {
             let mut meta=Map::new();
             if root.kind("pluginStorageMeta")? == Some(FieldKind::Object) {
                 if let Some(value)=root.member("pluginStorageMeta",key)? { meta.insert(key.to_owned(),value); }
             }
-            commit::put_plugin_storage_map(&tx,staging_id,&values,Some(&meta),&carried,ordinal)?;
+            commit::put_plugin_storage_text(&tx,staging_id,key,value,Some(&meta),&carried,ordinal)?;
             ordinal+=1;
             Ok(())
         })?;
@@ -657,15 +685,19 @@ mod tests {
 
     #[test]
     fn streamed_root_matches_upstream_identity_mirrors_and_plugin_ownership() {
+        // A converted binary is an object with one member per byte.
+        let binary=Value::Object((0..300).map(|index| (index.to_string(),json!(index%256))).collect());
         let fixture=json!({
             "botPresetsId":1,"selectedPersona":1,"temperature":0.8,"NAIsettings":{"synthetic":true},
             "username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],
             "personas":[{"id":"persona-one","name":"one"},{"id":"persona-two","name":"stale","embeddedModule":{"id":"embedded","assets":[]}}],
             "modules":[{"id":"module"}],"loadouts":[{"id":"loadout"}],"customModels":[{"id":"model"}],
             "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},
-            "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]}],
-            "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value"},
-            "pluginStorageMeta":{"shared":{"plugin":"synthetic-plugin"}}
+            "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]},
+                {"name":"Binary \"preset\"\n","id":"preset-binary","image":"preset.png","NAISettings":{"blob":binary,"n":-0.0}}],
+            "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value","binary":{"blob":binary,"text":"\u{d55c}\n"},"owned-binary":binary,
+                "spaced":{"b":1,"a":-0.0,"c":"\u{e9}"}},
+            "pluginStorageMeta":{"shared":{"plugin":"synthetic-plugin"},"owned-binary":{"plugin":"synthetic-plugin"}}
         });
         let first=tempfile::tempdir().unwrap(); let second=tempfile::tempdir().unwrap();
         let mut old=PersistentStore::open(first.path()).unwrap(); let mut streamed=PersistentStore::open(second.path()).unwrap();
@@ -674,8 +706,19 @@ mod tests {
         old.replace_put_upstream_root(&a,&fixture).unwrap();
         old.replace_put_upstream_presets(&a,fixture["botPresets"].as_array().unwrap()).unwrap();
         let root=spool(&fixture);
+        // A member's text is written as its value is written.
+        root.put_member_json("pluginCustomStorage","spaced",Some(" { \"b\" : 1 , \"a\" : -0.0 , \"c\" : \"\\u00e9\" } ")).unwrap();
         streamed.replace_put_upstream_stream(&b,&root).unwrap();
         assert_eq!(streamed.materialize_staging(&b).unwrap(),old.materialize_staging(&a).unwrap());
+        for sql in [
+            "SELECT preset_id,configured_index,name,image,value FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
+            "SELECT owner,storage_key,byte_size,ordinal,value,import_batch_id=?1 FROM plugin_storage WHERE generation=?1 ORDER BY owner,storage_key",
+        ] {
+            let rows=|store:&PersistentStore,stage:&str| store.connection.prepare(sql).unwrap()
+                .query_map([stage],|row| (0..row.as_ref().column_count()).map(|index| row.get::<_,rusqlite::types::Value>(index)).collect::<Result<Vec<_>,_>>())
+                .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+            assert_eq!(rows(&streamed,&b),rows(&old,&a),"{sql}");
+        }
         let (kind,valid):(String,bool)=streamed.connection.query_row("SELECT typeof(value),json_valid(value) FROM root WHERE generation=?1",[&b],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(kind,"text"); assert!(valid);
         assert_eq!(streamed.read_root(None).unwrap().value,before);
