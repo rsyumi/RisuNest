@@ -5,11 +5,13 @@ import path from 'node:path';
 export async function measureLegacyRestore({ args, client, run, pid, packageName, output, apkSha256, environment }) {
   const megabytes = Number(args['legacy-mb']);
   const encoding = args['legacy-encoding'];
+  const binaryBytes = Number(args['legacy-binary-bytes'] ?? 0);
   assert.ok([100, 300, 600].includes(megabytes) && ['raw', 'gzip'].includes(encoding), 'Explicit legacy MB and encoding required');
+  assert.ok(Number.isSafeInteger(binaryBytes) && binaryBytes >= 0, 'Legacy binary bytes must be a whole number');
   assert.ok(!args.peer, 'Legacy memory cases require a fresh synthetic process');
   const records = [];
   const decodedBytes = megabytes * 1_000_000;
-  let latest = { phase: 'preparing', decodedBytes, encoding };
+  let latest = { phase: 'preparing', decodedBytes, encoding, binaryBytes };
   let peakRssBytes = null;
   let restoreBaselineBytes = null;
   let restoreResidentMaxBytes = null;
@@ -29,7 +31,7 @@ export async function measureLegacyRestore({ args, client, run, pid, packageName
     processExited, processKillConfirmed: null, events: records });
   await mkdir(path.dirname(output), { recursive: true });
   await writeFile(output, JSON.stringify(report(), null, 2));
-  await client.evaluate(`void globalThis.__legacyRestoreMeasurement.start(${megabytes}, ${JSON.stringify(encoding)})`, false);
+  await client.evaluate(`void globalThis.__legacyRestoreMeasurement.start(${megabytes}, ${JSON.stringify(encoding)}, ${binaryBytes})`, false);
   const deadline = Date.now() + 25 * 60_000;
   let lastPhase;
   while (Date.now() < deadline) {
