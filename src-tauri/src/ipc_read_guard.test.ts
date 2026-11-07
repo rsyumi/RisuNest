@@ -11,6 +11,7 @@ const fixtureNames = ["core.js", "ipc-protocol.js", "process-ipc-message-fn.js"]
 const fixture = (name: string) => readFileSync(`${fixtureDir}/${name}`, "utf8");
 const guard = readFileSync("src-tauri/src/ipc_read_guard.js", "utf8");
 const iosIpc = readFileSync("src-tauri/src/ios_ipc.js", "utf8");
+const desktopLifecycle = readFileSync("src-tauri/src/desktop_lifecycle.js", "utf8");
 const channelCommand = "plugin:__TAURI_CHANNEL__|fetch";
 
 type Os = "android" | "windows" | "macos" | "ios";
@@ -36,7 +37,7 @@ function render(source: string, os: Os) {
 function setup(
   os: Os,
   nativeFetch: (input: unknown, init?: RequestInit) => Promise<NativeResponse>,
-  { withGuard = true } = {},
+  { withGuard = true, entryScript = "" } = {},
 ) {
   const fetch = vi.fn(nativeFetch);
   const postMessage = vi.fn();
@@ -54,11 +55,15 @@ function setup(
   context.__TAURI_INTERNALS__ = {};
   const guardForTarget = guard.replace("__RISUNEST_ANDROID__", String(os === "android"));
   // The invoke script is Tauri's IPC protocol followed by the appended scripts
-  // in builder order: the guard on every target, then the iOS body encoder.
+  // in builder order, joined without a separator: the guard on every target,
+  // then the iOS body encoder or the desktop lifecycle bridge, then whatever an
+  // alternative entry appends to the product builder.
   const invokeScript = [
     render(fixture("ipc-protocol.js"), os),
     ...(withGuard ? [guardForTarget] : []),
     ...(os === "ios" ? [iosIpc] : []),
+    ...(os === "windows" ? [desktopLifecycle] : []),
+    entryScript,
   ].join("");
   runInNewContext(render(fixture("core.js"), os), context);
   runInNewContext(invokeScript, context);
@@ -265,5 +270,13 @@ describe("IPC read guard", () => {
     expect(init?.body).toBeInstanceOf(Uint8Array);
     expect(new TextDecoder().decode(init?.body as Uint8Array)).toBe(JSON.stringify({ text: "é" }));
     expect(json).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the desktop lifecycle bridge when an entry appends a script after it", () => {
+    const { context } = setup("windows", async () => nativeResponse("application/json", "null"), {
+      entryScript: "(() => { window.entryScriptRan = true })();",
+    });
+    expect(context.entryScriptRan).toBe(true);
+    expect(context.RisuLifecycleBridge.onFlushComplete).toBeTypeOf("function");
   });
 });
