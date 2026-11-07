@@ -409,8 +409,9 @@ fn capture_conversation(
     before: bool,
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
-    if let Some(value)=text_value(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
-        add(db,out,&["exists","conversation",char_id,id],&json!(true))?;fields(db,out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
+    if let Some(text)=stored_text(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
+        let document=Document::parse(&text,Depth::Limited)?;
+        add(db,out,&["exists","conversation",char_id,id],&json!(true))?;stored_fields(db,out,&["conversation",char_id,id],document.value().object()?.as_ref(),CONVERSATION_FIELDS)?;
         let unchanged=edits.is_some_and(<[_]>::is_empty)||edits.is_none()&&out.contains_key(&unit_key(&["messages",char_id,id])?);
         let manifest=if before || unchanged {super::super::message_pages::current_manifest(db,generation,char_id,id)?}else{super::super::message_pages::capture_manifest(db,generation,char_id,id,edits)?};
         out.insert(unit_key(&["messages",char_id,id])?,manifest);
@@ -1093,6 +1094,24 @@ pub(in crate::persistent_store) mod value_reference {
                     &json!({"ids":ids,"folders":value.get("chatFolders").cloned().unwrap_or(json!([]))}),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn capture_conversation(
+        db: &Transaction<'_>,
+        generation: &str,
+        char_id: &str,
+        id: &str,
+        edits: Option<&[crate::persistent_store::message_pages::MessageEdit]>,
+        before: bool,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        if let Some(value)=text_value(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
+            add(db,out,&["exists","conversation",char_id,id],&json!(true))?;fields(db,out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
+            let unchanged=edits.is_some_and(<[_]>::is_empty)||edits.is_none()&&out.contains_key(&unit_key(&["messages",char_id,id])?);
+            let manifest=if before || unchanged {crate::persistent_store::message_pages::current_manifest(db,generation,char_id,id)?}else{crate::persistent_store::message_pages::capture_manifest(db,generation,char_id,id,edits)?};
+            out.insert(unit_key(&["messages",char_id,id])?,manifest);
         }
         Ok(())
     }

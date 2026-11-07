@@ -882,7 +882,8 @@ fn replacement_units_of_converted_binaries_equal_the_parsed_library() {
             "name": "Binary",
             "extentions": {"blob": binary(30_000)},
             "chatFolders": [{"id": "folder", "name": "Folder"}],
-            "chats": [{"id": "chat", "name": "Chat", "message": [{"role": "user", "data": "synthetic", "chatId": "m1"}]}],
+            "chats": [{"id": "chat", "name": "Chat", "scriptstate": {"blob": binary(30_000)},
+                "message": [{"role": "user", "data": "synthetic", "chatId": "m1"}]}],
         })])
         .unwrap();
     store.replace_preserve_repositories(&stage, None).unwrap();
@@ -892,6 +893,7 @@ fn replacement_units_of_converted_binaries_equal_the_parsed_library() {
     assert!(matches!(value(&["record", "modules", "module-small"]), Some(UnitValue::Inline { .. })));
     assert!(matches!(value(&["persona", "persona", "embeddedModule"]), Some(UnitValue::Object { .. })));
     assert!(matches!(value(&["character", "char-binary", "extentions"]), Some(UnitValue::Object { .. })));
+    assert!(matches!(value(&["conversation", "char-binary", "chat", "scriptstate"]), Some(UnitValue::Object { .. })));
     assert_eq!(merged, whole);
 }
 
