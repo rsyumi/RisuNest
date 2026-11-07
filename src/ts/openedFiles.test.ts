@@ -188,23 +188,84 @@ describe('opened file delivery', () => {
         expect(imported).toEqual(['/cache/opened_files/2-0-preset.risup'])
     })
 
-    it('takes the desktop launch arguments and re-takes them on every notification', async () => {
-        mocks.invoke
-            .mockImplementationOnce(async (_command: string) => ['C:\\cards\\first.charx'])
-            .mockImplementationOnce(async (_command: string) => ['C:\\cards\\second.risup'])
-        const { imported, importFile } = importerSpy()
+    it('takes the desktop launch arguments and re-takes them once the notifications settle', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+        try {
+            let pending = ['C:\\cards\\first.charx']
+            mocks.invoke.mockImplementation(async () => {
+                const files = pending
+                pending = []
+                return files
+            })
+            const { imported, importFile } = importerSpy()
+            const importBatch = vi.fn(async (_paths: string[]) => {})
 
-        registerOpenedFileListeners(importFile)
+            registerOpenedFileListeners(importFile, undefined, { accepts: path => path.endsWith('.charx'), importBatch })
+            await flush()
+
+            expect(mocks.invoke).toHaveBeenCalledWith(OPENED_FILES_TAKE_COMMAND)
+            expect(mocks.listen).toHaveBeenCalledWith(OPENED_FILES_EVENT, expect.any(Function))
+            expect(imported).toEqual(['C:\\cards\\first.charx'])
+
+            // Explorer starts one process per selected file, so one selection arrives as several notifications.
+            for (const file of ['C:\\cards\\second.charx', 'C:\\cards\\third.charx']) {
+                pending.push(file)
+                mocks.listeners[0]?.({ payload: { files: [file] } })
+                await vi.advanceTimersByTimeAsync(api.DESKTOP_OPENED_FILES_SETTLE_MS - 1)
+            }
+            expect(mocks.invoke).toHaveBeenCalledTimes(1)
+            await vi.advanceTimersByTimeAsync(1)
+            await flush()
+
+            expect(mocks.invoke).toHaveBeenCalledTimes(2)
+            expect(importBatch).toHaveBeenCalledExactlyOnceWith(['C:\\cards\\second.charx', 'C:\\cards\\third.charx'])
+            expect(imported).toEqual(['C:\\cards\\first.charx'])
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('imports two or more opened characters or modules in one batch after the other files', async () => {
+        const order: string[] = []
+        const importFile = vi.fn(async (name: string) => { order.push(`file:${name}`) })
+        const importPath = vi.fn(async (path: string) => {
+            order.push(`path:${path}`)
+            return path.endsWith('.risunest')
+        })
+        const importBatch = vi.fn(async (paths: string[]) => { order.push(`batch:${paths.join(',')}`) })
+        registerOpenedFileListeners(importFile, importPath, {
+            accepts: path => /\.(charx|risum)$/.test(path),
+            importBatch,
+        })
+
+        await consumeOpenedFiles(['a.charx', 'backup.risunest', 'preset.risup', 'b.risum'])
+        // A single character keeps its own import.
+        await consumeOpenedFiles(['c.charx', 'other.risup'])
+
+        expect(order).toEqual([
+            'path:backup.risunest',
+            'path:preset.risup', 'file:preset.risup',
+            'batch:a.charx,b.risum',
+            'path:c.charx', 'file:c.charx',
+            'path:other.risup', 'file:other.risup',
+        ])
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('discards each staged iOS file of a batch once, also when the batch throws', async () => {
+        mocks.ios = true
+        mocks.invoke.mockImplementation(async command =>
+            command.endsWith('take_opened_files') ? { files: [] } : undefined)
+        const importBatch = vi.fn(async (_paths: string[]) => { throw new Error('synthetic batch failure') })
+        registerOpenedFileListeners(vi.fn(), vi.fn(async () => true), { accepts: path => path.endsWith('.charx'), importBatch })
         await flush()
 
-        expect(mocks.invoke).toHaveBeenCalledWith(OPENED_FILES_TAKE_COMMAND)
-        expect(mocks.listen).toHaveBeenCalledWith(OPENED_FILES_EVENT, expect.any(Function))
+        await consumeOpenedFiles(['/staged/first.charx', '/staged/second.charx'])
 
-        mocks.listeners[0]?.({ payload: { files: ['C:\\cards\\second.risup'] } })
-        await flush()
-
-        expect(imported).toEqual(['C:\\cards\\first.charx', 'C:\\cards\\second.risup'])
-        expect(mocks.invoke).toHaveBeenCalledTimes(2)
+        expect(importBatch).toHaveBeenCalledExactlyOnceWith(['/staged/first.charx', '/staged/second.charx'])
+        expect(mocks.invoke.mock.calls.filter(([command]) => command.endsWith('discard_file'))
+            .map(([, args]) => args)).toEqual([{ path: '/staged/first.charx' }, { path: '/staged/second.charx' }])
+        expect(mocks.alertError).toHaveBeenCalledOnce()
     })
 
     it('imports files queued while the desktop subscription is still being established', async () => {

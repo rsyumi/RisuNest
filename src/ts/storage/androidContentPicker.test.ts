@@ -12,23 +12,34 @@ vi.mock('./androidSafBridge', async original => ({
 vi.mock('./nativeFileJobs', async original => ({
     ...await original<typeof import('./nativeFileJobs')>(), syntheticNativeFileJobStatus: vi.fn(),
 }))
-vi.mock('./nativeFileJobManager', () => ({
+vi.mock('./nativeFileJobManager', () => {
     // Holds the background task as the manager does: from the start, or once a picker-first operation protects itself.
-    runSharedNativeFileOperation: async (_kind: string, _key: string, run: Function, options?: { protectAfterPicker?: boolean }) => {
+    const run = async (operation: Function, options?: { protectAfterPicker?: boolean }) => {
         let held = false
         const hold = () => { if (!held) { held = true; mocks.events.push('hold') } }
         if (!options?.protectAfterPicker) hold()
-        return run({
+        return operation({
             signal: mocks.controller.signal, setSource: vi.fn(), onStatus: vi.fn(),
             protect: () => { if (options?.protectAfterPicker) hold() },
             beginBatch: mocks.beginBatch, beginBatchItem: mocks.beginBatchItem, recordBatchItem: mocks.recordBatchItem,
         })
-    },
-}))
+    }
+    return {
+        runSharedNativeFileOperation: (_kind: string, _key: string, operation: Function, options?: { protectAfterPicker?: boolean }) =>
+            run(operation, options),
+        runExternalAndroidNativeFileOperation: (_kind: string, operation: Function, options?: { protectAfterPicker?: boolean }) =>
+            run(operation, options),
+    }
+})
 vi.mock('../characterCards', () => ({ importCharacterProcess: mocks.character }))
 vi.mock('../process/modules', () => ({ importModuleData: mocks.module }))
 vi.mock('./database.svelte', () => ({ getDatabase: () => ({ characters: [{ chaId: 'imported-character' }] }) }))
-import { importAndroidContentFromPicker, importReplayedAndroidContentSpool } from './androidContentPicker'
+import { NativeFileJobError } from './nativeFileJobs'
+import {
+    importAndroidContentFromPicker,
+    importOpenedAndroidContentSpools,
+    importReplayedAndroidContentSpool,
+} from './androidContentPicker'
 
 const source = { token: 'synthetic-token', displayName: 'synthetic.json', bytes: 100 }
 const encoded = (text: string) => new TextEncoder().encode(text).buffer
@@ -199,6 +210,52 @@ describe('Android multi-file content picker', () => {
             ['notes.txt', { error: expect.objectContaining({ code: 'unsupported-source' }) }],
         ])
         expect(mocks.character).not.toHaveBeenCalled()
+    })
+
+    it('imports shared JSON and native spools in one operation and lists the files that failed', async () => {
+        const card = { token: 'card-token', displayName: 'card.json', bytes: 10 }
+        const book = { token: 'book-token', displayName: 'book.lorebook', bytes: 10 }
+        const charx = { token: 'charx-token', displayName: 'card.charx', bytes: 30 }
+        const photo = { token: 'photo-token', displayName: 'photo.jpg', bytes: 40 }
+        const plainJpeg = new NativeFileJobError('destination-required', 'synthetic plain JPEG')
+        mocks.invoke.mockImplementation(async (_command: string, args: { token: string }) =>
+            encoded(JSON.stringify(args.token === book.token ? { entries: {} } : { spec: 'chara_card_v2', data: {} })))
+        const importPrepared = vi.fn(async (source: typeof charx) => {
+            if (source === photo) throw plainJpeg
+            return 'native-character'
+        })
+
+        await expect(importOpenedAndroidContentSpools(
+            [card, charx, photo, book],
+            [{ displayName: 'broken.png', code: 'source-copy-failed' }],
+            importPrepared,
+        )).resolves.toBe('module')
+
+        expect(mocks.beginBatch).toHaveBeenCalledWith(5)
+        expect(mocks.recordBatchItem.mock.calls).toEqual([
+            ['broken.png', { error: expect.objectContaining({ code: 'source-copy-failed' }) }],
+            ['card.json', { imported: true }],
+            ['card.charx', { imported: true }],
+            ['photo.jpg', { error: plainJpeg }],
+            ['book.lorebook', { imported: true }],
+        ])
+        expect(mocks.character).toHaveBeenCalledOnce()
+        expect(mocks.module).toHaveBeenCalledOnce()
+        expect(importPrepared.mock.calls.map(([source]) => source)).toEqual([charx, photo])
+        expect(mocks.discard.mock.calls).toEqual([[card.token], [book.token]])
+    })
+
+    it('stops a shared batch on cancellation and discards the spools it did not import', async () => {
+        const charx = { token: 'charx-token', displayName: 'card.charx', bytes: 30 }
+        const importPrepared = vi.fn(async () => {
+            mocks.controller.abort()
+            throw new DOMException('cancelled', 'AbortError')
+        })
+        await expect(importOpenedAndroidContentSpools([charx, first, second], [], importPrepared))
+            .rejects.toMatchObject({ name: 'AbortError' })
+        expect(importPrepared).toHaveBeenCalledOnce()
+        expect(mocks.character).not.toHaveBeenCalled()
+        expect(mocks.discard.mock.calls).toEqual([[first.token], [second.token]])
     })
 
     it('stops a batch on cancellation and discards the files it did not import', async () => {

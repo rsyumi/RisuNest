@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => ({
     nativeDesktopResult: { kind: 'cancelled' } as unknown,
     importDesktopNativeCharacterFromPicker: vi.fn(),
     importDesktopNativeCharacterPath: vi.fn(),
+    importModuleContent: vi.fn(),
     desktopPickerPaths: [] as string[],
     openDesktopPicker: vi.fn(async () => mocks.desktopPickerPaths),
     exportNativeCharacterCharxFromPicker: vi.fn(),
@@ -144,6 +145,7 @@ vi.mock('./process/processzip', () => ({
 }))
 vi.mock('./process/modules', () => ({
     exportModuleLegacy: vi.fn(async () => new Uint8Array([111, 0, 0, 0, 0, 0])),
+    importPreparedNativeModuleContent: mocks.importModuleContent,
     readModule: vi.fn(),
 }))
 vi.mock('@tauri-apps/plugin-fs', () => ({ readFile: vi.fn() }))
@@ -366,6 +368,37 @@ describe('character card additions', () => {
             error: failure,
             batch: { total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }] },
         })])
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('imports several files a desktop file association opened in one batched outcome', async () => {
+        const { consumeOpenedFiles } = await import('./openedFiles')
+        await characterURLImport()
+        mocks.importDesktopNativeCharacterPath
+            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'opened-card' })
+            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'single-card' })
+        mocks.importModuleContent.mockResolvedValue({ kind: 'imported', value: 'opened-module' })
+        dismissNativeFileOperationOutcome()
+        const outcomes: NativeFileOperationOutcome[] = []
+        const unsubscribe = nativeFileOperationOutcome.subscribe(outcome => {
+            if (outcome) outcomes.push(outcome)
+        })
+        try {
+            await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\book.risum'])
+            await consumeOpenedFiles(['C:\\opened\\single.charx'])
+        } finally {
+            unsubscribe()
+        }
+
+        expect(mocks.importModuleContent).toHaveBeenCalledExactlyOnceWith(
+            { source: { type: 'desktopPath', path: 'C:\\opened\\book.risum' }, displayName: 'book.risum' },
+            { signal: expect.any(AbortSignal), onStatus: expect.any(Function) },
+        )
+        expect(outcomes).toEqual([
+            expect.objectContaining({ state: 'succeeded', batch: { total: 2, imported: 2, failures: [] } }),
+            expect.objectContaining({ state: 'succeeded', source: { name: 'single.charx' } }),
+        ])
+        expect(outcomes[1]).not.toHaveProperty('batch')
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 
