@@ -923,3 +923,120 @@ fn saved_lines_parse_back_into_the_entries_that_wrote_them() {
     assert_eq!(page.entries[4].target, "lookalike");
     assert_eq!(page.entries[4].message, "continued\nthird");
 }
+
+fn exported(state: &NativeLogState) -> Vec<u8> {
+    let mut output = Vec::new();
+    let log = state.open_whole_log().unwrap();
+    let bytes = log.copy_to(&mut output).unwrap();
+    assert_eq!(bytes, output.len() as u64);
+    output
+}
+
+fn file_text(entries: &[LogEntry]) -> Vec<u8> {
+    entries.iter().map(file_line).collect::<String>().into_bytes()
+}
+
+#[test]
+fn the_whole_saved_log_is_the_previous_file_then_the_current_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let previous = synthetic_entries("previous", 30);
+    let current = synthetic_entries("current", 20);
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+
+    let log = state.open_whole_log().unwrap();
+    // A line written after the save starts is not part of it.
+    state.record("info", "later", "written while saving");
+    let mut output = Vec::new();
+    log.copy_to(&mut output).unwrap();
+
+    assert_eq!(output, [file_text(&previous), file_text(&current)].concat());
+}
+
+#[test]
+fn the_whole_saved_log_is_the_one_file_that_exists_or_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    assert_eq!(state.open_whole_log().unwrap().bytes(), 0);
+    assert_eq!(exported(&state), b"");
+
+    let current = synthetic_entries("current", 5);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+    assert_eq!(exported(&state), file_text(&current));
+
+    let previous = synthetic_entries("previous", 5);
+    fs::remove_file(logs.join(LOG_FILE_NAME)).unwrap();
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    assert_eq!(exported(&state), file_text(&previous));
+    fs::write(logs.join(LOG_FILE_NAME), b"").unwrap();
+    assert_eq!(state.open_whole_log().unwrap().bytes(), file_text(&previous).len() as u64);
+    assert_eq!(exported(&state), file_text(&previous));
+
+    assert_eq!(
+        NativeLogState::for_tests().open_whole_log().err(),
+        Some(NATIVE_LOG_FILE_PATH_UNAVAILABLE)
+    );
+}
+
+#[test]
+fn a_rotation_during_the_save_keeps_the_files_it_opened() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let previous = synthetic_entries("previous", 50);
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    let current = [file_text(&synthetic_entries("current", 50)), vec![b'x'; FILE_ROTATE_BYTES], b"\n".to_vec()].concat();
+    fs::write(logs.join(LOG_FILE_NAME), &current).unwrap();
+
+    let log = state.open_whole_log().unwrap();
+    state.record("info", "rotation", "first line of the next file");
+    assert_eq!(fs::read(logs.join(PREVIOUS_LOG_FILE_NAME)).unwrap(), current);
+    let mut output = Vec::new();
+    log.copy_to(&mut output).unwrap();
+
+    assert!(output == [file_text(&previous), current].concat(), "{} bytes", output.len());
+}
+
+#[test]
+fn a_file_that_ends_mid_line_does_not_join_the_next_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    fs::write(logs.join(PREVIOUS_LOG_FILE_NAME), b"1700000000000 [error] cut: interrupted").unwrap();
+    let current = synthetic_entries("current", 2);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+
+    let output = exported(&state);
+
+    assert_eq!(output, [b"1700000000000 [error] cut: interrupted\n".to_vec(), file_text(&current)].concat());
+    assert_eq!(file_page::parse_entries(&output).len(), 3);
+}
+
+#[test]
+fn the_whole_saved_log_is_copied_a_bounded_piece_at_a_time() {
+    struct Pieces { bytes: usize, largest: usize }
+    impl std::io::Write for Pieces {
+        fn write(&mut self, piece: &[u8]) -> std::io::Result<usize> {
+            self.bytes += piece.len();
+            self.largest = self.largest.max(piece.len());
+            Ok(piece.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let size = 3 * file_export::COPY_BUFFER_BYTES + 17;
+    fs::write(logs.join(PREVIOUS_LOG_FILE_NAME), vec![b'p'; size]).unwrap();
+    fs::write(logs.join(LOG_FILE_NAME), vec![b'c'; size]).unwrap();
+
+    let mut pieces = Pieces { bytes: 0, largest: 0 };
+    state.open_whole_log().unwrap().copy_to(&mut pieces).unwrap();
+
+    // The previous file ends mid-line, so one newline joins the two.
+    assert_eq!(pieces.bytes, 2 * size + 1);
+    assert!(pieces.largest <= file_export::COPY_BUFFER_BYTES, "{}", pieces.largest);
+}

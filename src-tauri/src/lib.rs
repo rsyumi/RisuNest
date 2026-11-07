@@ -908,6 +908,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         generation_diagnostics::native_generation_diagnostic,
         native_log::native_log_file_path,
         native_log::file_page::native_log_file_read,
+        native_log::file_export::native_log_file_export,
         native_log::native_log_set_file_enabled,
         native_tokenizer::tokenize_batch,
         native_media::native_media_encode_inlay_image,
