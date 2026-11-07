@@ -852,6 +852,49 @@ fn merged_replacement_changes_equal_whole_library_maps() {
     }
 }
 
+#[test]
+fn replacement_units_of_converted_binaries_equal_the_parsed_library() {
+    // A converted Uint8Array is an object with one member per byte.
+    let binary = |length: usize| Value::Object((0..length).map(|index| (index.to_string(), json!(index % 256))).collect());
+    let (_directory, mut store) = seeded();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store
+        .replace_put_root(&stage, &json!({
+            "username": "Binary",
+            "modules": [
+                {"id": "module-large", "name": "Large", "binary": binary(30_000)},
+                {"id": "module-small", "binary": binary(100), "configured_index": 1},
+            ],
+            "plugins": [{"name": "plugin", "script": "\"quoted\"\n"}],
+            "loadouts": [{"id": "loadout", "binary": binary(20)}],
+            "customModels": [{"id": "model", "binary": binary(30_000)}],
+            "personas": [{"id": "persona", "name": "Persona", "embeddedModule": {"id": "embedded", "binary": binary(30_000)}}],
+            "explicitGlobalChatVariables": {"toggle_binary": binary(10), "plain": "\u{d55c}"},
+            "protectedPresetValues": {"seperateModels": {"memory": "model"}, "fallbackModels": [binary(5)]},
+            "characterOrder": ["char-binary", {"name": "folder", "data": []}],
+        }))
+        .unwrap();
+    store.replace_put_presets(&stage, &[]).unwrap();
+    store
+        .replace_add_characters(&stage, &[json!({
+            "type": "character",
+            "chaId": "char-binary",
+            "name": "Binary",
+            "extentions": {"blob": binary(30_000)},
+            "chatFolders": [{"id": "folder", "name": "Folder"}],
+            "chats": [{"id": "chat", "name": "Chat", "message": [{"role": "user", "data": "synthetic", "chatId": "m1"}]}],
+        })])
+        .unwrap();
+    store.replace_preserve_repositories(&stage, None).unwrap();
+    let [merged, whole] = store.replacement_change_sets(&stage, None).unwrap();
+    let value = |parts: &[&str]| merged.0.iter().find(|(key, _)| *key == unit_key(parts).unwrap()).map(|(_, value)| value.clone());
+    assert!(matches!(value(&["record", "modules", "module-large"]), Some(UnitValue::Object { .. })));
+    assert!(matches!(value(&["record", "modules", "module-small"]), Some(UnitValue::Inline { .. })));
+    assert!(matches!(value(&["persona", "persona", "embeddedModule"]), Some(UnitValue::Object { .. })));
+    assert!(matches!(value(&["character", "char-binary", "extentions"]), Some(UnitValue::Object { .. })));
+    assert_eq!(merged, whole);
+}
+
 fn intent_rows(store: &PersistentStore, request_id: &str) -> i64 {
     store
         .device_store()

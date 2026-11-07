@@ -6063,4 +6063,62 @@ pub(super) mod tests {
         released_signal.notify_all();
         assert_eq!(worker.join().unwrap().unwrap().revision, 2);
     }
+
+    #[test]
+    fn restoring_converted_binaries_keeps_the_stored_root_and_unit_values() {
+        // Binaries past the inline unit bound and within it, in several root
+        // records, a persona's module and a character.
+        let binary = |length: usize| MessagePackValue::Binary((0..length).map(|index| (index % 256) as u8).collect());
+        let text = |value: &str| MessagePackValue::from(value);
+        let map = |entries: Vec<(&str, MessagePackValue)>| {
+            MessagePackValue::Map(entries.into_iter().map(|(key, value)| (text(key), value)).collect())
+        };
+        let module = |id: &str, length: usize| map(vec![("id", text(id)), ("name", text("Synthetic")), ("assets", MessagePackValue::Array(vec![])), ("binary", binary(length))]);
+        let database = map(vec![
+            ("username", text("Synthetic")),
+            ("userIcon", binary(50)),
+            ("customBinary", binary(30_000)),
+            ("globalChatVariables", map(vec![("blob", binary(20))])),
+            ("modules", MessagePackValue::Array(vec![module("module-large", 30_000), module("module-small", 100), module("module-second", 30_000)])),
+            ("personas", MessagePackValue::Array(vec![map(vec![("id", text("persona")), ("name", text("Synthetic")), ("embeddedModule", module("embedded", 30_000))])])),
+            ("characters", MessagePackValue::Array(vec![map(vec![
+                ("type", text("character")),
+                ("chaId", text("character")),
+                ("name", text("Synthetic")),
+                ("extentions", map(vec![("blob", binary(100))])),
+                ("chatFolders", MessagePackValue::Array(vec![map(vec![("id", text("folder")), ("name", text("Folder"))])])),
+                ("chats", MessagePackValue::Array(vec![map(vec![("id", text("chat")), ("name", text("Chat")), ("message", MessagePackValue::Array(vec![]))])])),
+            ])])),
+            ("characterOrder", MessagePackValue::Array(vec![text("character")])),
+        ]);
+        let (directory, sink) = fixture();
+        let source = directory.path().join("binaries.risudat");
+        fs::write(&source, legacy_wire(7, &super::legacy_stream_tests::messagepack_bytes(&database))).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_risu_save(&source, 1, &job, &sink).unwrap();
+        let store = sink.store.lock().unwrap();
+        let rows = store.library_rows();
+        let root: String = rows.query_row("SELECT value FROM root WHERE generation=(SELECT json_extract(value,'$') FROM meta WHERE key='activeGeneration')", [], |row| row.get(0)).unwrap();
+        let units: Vec<(String, String)> = rows.prepare("SELECT key,value FROM lww_units ORDER BY key").unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(units.iter().any(|(key, value)| key.contains("module-large") && value.contains("\"object\"")));
+        assert!(units.iter().any(|(key, value)| key.contains("module-small") && value.contains("\"inline\"")));
+        let mut digest = Sha256::new();
+        for (key, value) in &units {
+            digest.update(key.as_bytes());
+            digest.update([0]);
+            digest.update(value.as_bytes());
+            digest.update([1]);
+        }
+        // Digests of what this restore stored before stored text was read one
+        // record at a time. A change to them changes stored values.
+        assert_eq!(
+            (hex::encode(Sha256::digest(root.as_bytes())), units.len(), hex::encode(digest.finalize())),
+            (
+                "c0dd8ab1780897c4d02b17778f1a8e42ee2596e0431113a4905fbf376e190fae".to_owned(),
+                24,
+                "52e5b9888db57ec9f664409a490cefceff0e5d113bb6d4e986b3c7edaf6a0651".to_owned(),
+            )
+        );
+    }
 }

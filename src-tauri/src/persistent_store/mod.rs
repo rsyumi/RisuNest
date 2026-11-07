@@ -42,6 +42,7 @@ mod query;
 mod record_apply;
 mod record_projection;
 mod replacement_scan;
+mod stored_json;
 mod schema;
 #[cfg(test)]
 mod schema_contract_tests;

@@ -3561,3 +3561,80 @@ fn released_reader_rejects_guarded_gallery_intents_without_changing_ordinary_com
         }
     }
 }
+
+/// Stored roots with converted binaries, repeated keys, escapes, numbers that
+/// a parse rewrites, and the shapes a root rewrite leaves alone.
+fn stored_roots() -> Vec<String> {
+    let binary = (0..40).map(|index| format!("\"{index}\":{}", index % 256)).collect::<Vec<_>>().join(",");
+    vec![
+        format!(
+            r#"{{"username":"aé\n","modules":[{{"id":"m2","binary":{{{binary}}}}},{{"name":"x"}},{{"id":"m1","configured_index":3,"binary":{{{binary}}},"id":"m3"}},7],
+            "plugins":[{{"name":"p2"}},{{"name":"p1","script":"\"x\""}}],"personas":[{{"id":"b","embeddedModule":{{"id":"e","binary":{{{binary}}}}}}},{{"id":"a"}}],
+            "characterOrder":["c2",{{"folder":"f","data":["c1"]}}],"localOnly":{{"binary":{{{binary}}}}},"n":-0,"f":1E5,"x":1,"x":[2]}}"#
+        ),
+        r#"{"username":"only","modules":{"id":"m1"},"loadouts":[{"id":"l2"},{"id":"l1"}],"localOnly":1}"#.into(),
+        r#"{"$serde_json::private::RawValue":"{\"modules\":[{\"id\":\"m2\"},{\"id\":\"m1\"}],\"characterOrder\":[]}"}"#.into(),
+        "{}".into(),
+        "[]".into(),
+    ]
+}
+
+#[test]
+fn root_rewrites_write_what_the_parsed_root_writes() {
+    let (_dir, mut store) = store();
+    let active = active_generation(&store.connection).unwrap();
+    let active = active.as_str();
+    let staged = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&staged, &serde_json::json!({})).unwrap();
+    let db = &store.connection;
+    let set = |generation: &str, text: &str| {
+        db.execute("UPDATE root SET value=?2 WHERE generation=?1", params![generation, text]).unwrap();
+    };
+    let get = |generation: &str| -> String {
+        db.query_row("SELECT value FROM root WHERE generation=?1", [generation], |r| r.get(0)).unwrap()
+    };
+    let order = serde_json::json!(["c1", {"folder": "g", "data": ["c2"]}, "\u{d55c}"]);
+    let ids: Vec<String> = ["m1", "m2", "m3", "p1", "a", "b", "l1"].map(String::from).into();
+    let roots = stored_roots();
+    for text in &roots {
+        type Rewrite<'a> = Box<dyn Fn(bool) -> StoreResult<()> + 'a>;
+        let mut rewrites: Vec<Rewrite<'_>> = vec![Box::new(|text: bool| {
+            if text {
+                projection::set_character_order(db, active, &order)
+            } else {
+                projection::value_reference::set_character_order(db, active, &order)
+            }
+        })];
+        for collection in ["modules", "plugins", "personas", "loadouts"] {
+            let ids = &ids;
+            rewrites.push(Box::new(move |text: bool| {
+                if text {
+                    projection::sort_root_records(db, active, collection, ids)
+                } else {
+                    projection::value_reference::sort_root_records(db, active, collection, ids)
+                }
+            }));
+        }
+        for (index, rewrite) in rewrites.iter().enumerate() {
+            let run = |text_rewrite: bool| {
+                set(active, text);
+                let result = rewrite(text_rewrite);
+                (result, get(active))
+            };
+            assert_eq!(run(true), run(false), "{index} {text}");
+        }
+        for next in &roots {
+            let run = |text_rewrite: bool| {
+                set(active, text);
+                set(&staged, next);
+                let result = if text_rewrite {
+                    projection::preserve_local_root(db, active, &staged)
+                } else {
+                    projection::value_reference::preserve_local_root(db, active, &staged)
+                };
+                (result, get(&staged))
+            };
+            assert_eq!(run(true), run(false), "{text} {next}");
+        }
+    }
+}
