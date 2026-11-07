@@ -235,8 +235,7 @@ async function processCommand(command:string, pipe:string, conversationOperation
             const selectedChar = get(selectedCharID)
             const char = db.characters[selectedChar]
             const chat = char.chats[char.chatPage]
-            chat.scriptstate = chat.scriptstate ?? {}
-            pipe = (chat.scriptstate['$' + namedArg['key']]).toString() ?? 'null'
+            pipe = chat.scriptstate?.['$' + namedArg['key']]?.toString() ?? 'null'
             return pipe
         }
         case 'test_lorebook':{

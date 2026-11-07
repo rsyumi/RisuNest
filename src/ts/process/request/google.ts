@@ -672,7 +672,8 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
             saveSignature: arg.saveSignatures ?? false
         }) 
 
-        f.body.pipeTo(transtream.writable)
+        // A failed or stopped body reaches the reader through transtream.
+        f.body.pipeTo(transtream.writable).catch(() => {})
 
         return {
             type: 'streaming',
@@ -1254,7 +1255,8 @@ function wrapToolStream(
                             modelInfo: arg.modelInfo,
                             saveSignature: arg.saveSignatures ?? false
                         })
-                        resRec.body.pipeTo(transtream.writable)
+                        // A failed or stopped body reaches the reader through transtream.
+                        resRec.body.pipeTo(transtream.writable).catch(() => {})
 
                         reader = transtream.readable.getReader()
 
