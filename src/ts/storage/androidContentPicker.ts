@@ -1,9 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 import {
-    pickAndroidContentSource,
+    AndroidSafSourceError,
+    pickAndroidContentSources,
     type AndroidSafJavascriptBridge,
     type AndroidSpoolReady,
 } from './androidSafBridge'
+import { importContentBatch } from './contentImportBatch'
 import {
     runSharedNativeFileOperation,
     type SharedNativeFileOperationContext,
@@ -17,16 +19,9 @@ export function importAndroidContentFromPicker(
         'import',
         'content-picker',
         async (context) => {
-            let displayName = ''
-            let sourceBytes = 0
-            const source = await pickAndroidContentSource({
+            const picked = await pickAndroidContentSources({
                 destination,
                 signal: context.signal,
-                onSource: (file) => {
-                    displayName = file.displayName
-                    sourceBytes = file.bytes
-                    context.setSource({ name: displayName, bytes: file.bytes })
-                },
                 onProgress: (progress) => {
                     // Copying starts once the picker returns, so the copy is the first protected work.
                     context.protect()
@@ -43,21 +38,37 @@ export function importAndroidContentFromPicker(
                     )
                 },
             })
-            if (!source || source.type !== 'androidSpool') return null
+            if (!picked) return null
             context.protect()
-            return consumeAndroidContentSpool(
-                {
-                    token: source.token,
-                    displayName,
-                    bytes: sourceBytes,
-                    importDestination: destination,
-                },
-                destination,
+            return importContentBatch(
                 context,
+                picked.sources,
+                (source) => ({ name: source.displayName, bytes: source.bytes }),
+                (source) => consumeAndroidContentSpool(
+                    { ...source, importDestination: destination },
+                    destination,
+                    context,
+                ),
+                {
+                    failures: picked.failures.map((failure) => ({
+                        name: failure.displayName,
+                        error: new AndroidSafSourceError(failure.code, `${failure.displayName}: ${failure.code}`),
+                    })),
+                    releaseUnstarted: (source) => discardContentSpool(source.token),
+                },
             )
         },
         { presentation: 'dialog', format: 'content', protectAfterPicker: true },
     )
+}
+
+async function discardContentSpool(token: string): Promise<void> {
+    const bridge = (
+        window as Window & {
+            RisuSafBridge?: AndroidSafJavascriptBridge
+        }
+    ).RisuSafBridge
+    await bridge?.discardSource?.(token)
 }
 
 export function importReplayedAndroidContentSpool(
@@ -107,8 +118,7 @@ async function consumeAndroidContentSpool(
             )
             if (destination === 'module' || moduleJson) {
                 const { importModuleData } = await import('../process/modules')
-                await importModuleData({ name: displayName, data, ...(parsedJson && { parsedJson }) })
-                return 'module'
+                return await importModuleData({ name: displayName, data, ...(parsedJson && { parsedJson }) }) ? 'module' : null
             }
             const { importCharacterProcess } = await import('../characterCards')
             const { getDatabase } = await import('./database.svelte')
@@ -142,13 +152,6 @@ async function consumeAndroidContentSpool(
         return result.kind === 'imported' ? result.value : null
     } finally {
         // A native job consumes the spool. Metadata-only imports release their ready spool here.
-        if (/\.(json|lorebook)$/i.test(displayName)) {
-            const bridge = (
-                window as Window & {
-                    RisuSafBridge?: AndroidSafJavascriptBridge
-                }
-            ).RisuSafBridge
-            await bridge?.discardSource?.(source.token)
-        }
+        if (/\.(json|lorebook)$/i.test(displayName)) await discardContentSpool(source.token)
     }
 }

@@ -19,7 +19,6 @@ vi.mock('../stores.svelte', () => ({
 }))
 vi.mock('../interchangeability', () => ({}))
 vi.mock('../characterCards', () => ({}))
-vi.mock('../storage/nativeModuleFileRoute', () => ({}))
 
 import { getCurrentCharacter, getCurrentChat, getDatabase } from '../storage/database.svelte'
 import { checkPersonaBinded } from '../util'

@@ -35,7 +35,6 @@ vi.mock('../alert', () => ({}))
 vi.mock('../process/lorebook.svelte', () => ({}))
 vi.mock('../interchangeability', () => ({}))
 vi.mock('../rpack/rpack_js', () => ({}))
-vi.mock('../storage/nativeModuleFileRoute', () => ({}))
 vi.mock('src/lib/UI/PopupList.svelte', () => ({ default: {} }))
 
 import { DBState, selectedCharID } from '../stores.svelte'

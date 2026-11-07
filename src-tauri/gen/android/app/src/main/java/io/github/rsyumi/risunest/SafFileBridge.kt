@@ -1105,5 +1105,16 @@ internal fun jsonString(value: String): String = buildString {
 internal fun isNativeContentSource(name: String): Boolean =
   listOf(".json", ".png", ".charx", ".jpg", ".jpeg", ".risum", ".lorebook").any { name.endsWith(it, ignoreCase = true) }
 
+/** Splits picked documents into those to copy and a refusal for each file of another type. */
+internal fun <T : SafInputSource> partitionDocumentSources(
+  sources: List<T>,
+  content: Boolean,
+): Pair<List<T>, List<SafSpoolFailure>> {
+  val (supported, unsupported) = sources.partition {
+    if (content) isNativeContentSource(it.displayName) else it.displayName.endsWith(".bin", ignoreCase = true)
+  }
+  return supported to unsupported.map { SafSpoolFailure(it.displayName, "unsupported-source") }
+}
+
 internal fun androidContentSourcePickedScript(requestId: String, batch: SafSpoolBatch): String =
   sourcePickedScript("risu-android-content-source-picked", requestId, batch)

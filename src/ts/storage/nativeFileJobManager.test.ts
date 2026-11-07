@@ -465,6 +465,67 @@ describe('renderer-lifetime native file job manager', () => {
         })
     })
 
+    it('reports a batch of files in one outcome, whatever the last file returned', async () => {
+        const finished = status({
+            state: 'succeeded',
+            phase: 'complete',
+            result: {
+                revision: 7, sourceBytes: 128, sourceFingerprintKind: 'whole-file-sha256' as const, sourceSha256: 'abc',
+                characterCount: 1, presetCount: 0, warningCodes: ['cleanup-failed'],
+            },
+        })
+        const failure = new NativeFileJobError('unsupported-format', 'not a card')
+        dismissNativeFileOperationOutcome()
+        await expect(runSharedNativeFileOperation('import', 'content-picker', async context => {
+            context.beginBatch(3)
+            context.beginBatchItem(1, { name: 'first.charx', bytes: 128 })
+            context.onStatus(finished)
+            context.recordBatchItem('first.charx', { imported: true })
+            context.beginBatchItem(2, { name: 'broken.charx' })
+            const running = get(nativeFileOperation)
+            expect(running?.source).toEqual({ name: 'broken.charx' })
+            expect(running?.status).toBeUndefined()
+            expect(running?.observedStages).toEqual([])
+            expect(running?.batch).toMatchObject({ index: 2, total: 3, imported: 1 })
+            context.recordBatchItem('broken.charx', { error: failure })
+            context.beginBatchItem(3, { name: 'declined.charx' })
+            context.recordBatchItem('declined.charx', { imported: false })
+            return null
+        }, { presentation: 'dialog', format: 'content' })).resolves.toBeNull()
+        const error = { code: 'unsupported-format', message: 'not a card', recoveryRequired: false }
+        expect(get(nativeFileOperationOutcome)).toMatchObject({
+            state: 'failed',
+            error,
+            warningCodes: ['cleanup-failed'],
+            batch: { total: 3, imported: 1, failures: [{ name: 'broken.charx', error }] },
+        })
+
+        dismissNativeFileOperationOutcome()
+        await runSharedNativeFileOperation('import', 'content-picker', async context => {
+            context.beginBatch(2)
+            context.recordBatchItem('first.charx', { imported: true })
+            context.recordBatchItem('declined.charx', { imported: false })
+            return null
+        }, { presentation: 'dialog', format: 'content' })
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ state: 'succeeded', batch: { total: 2, imported: 1, failures: [] } })
+
+        dismissNativeFileOperationOutcome()
+        await runSharedNativeFileOperation('import', 'content-picker', async context => {
+            context.beginBatch(2)
+            context.recordBatchItem('first.charx', { imported: false })
+            context.recordBatchItem('second.charx', { imported: false })
+            return null
+        }, { presentation: 'dialog', format: 'content' })
+        expect(get(nativeFileOperationOutcome)).toBeNull()
+
+        await expect(runSharedNativeFileOperation('import', 'content-picker', async context => {
+            context.beginBatch(2)
+            context.recordBatchItem('first.charx', { imported: true })
+            throw new DOMException('cancelled', 'AbortError')
+        }, { presentation: 'dialog', format: 'content' })).rejects.toBeInstanceOf(DOMException)
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ state: 'cancelled', batch: { total: 2, imported: 1 } })
+    })
+
     it('clears a stale outcome when the next dialog operation starts', async () => {
         await runSharedNativeFileOperation(
             'import',

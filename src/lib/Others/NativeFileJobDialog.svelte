@@ -112,6 +112,16 @@
                     {#if model.terminal.location}
                         <p class="text-textcolor2 break-words">{model.terminal.location}</p>
                     {/if}
+                    {#if model.terminal.failedFiles.length > 0}
+                        <ul class="mt-1 flex max-h-40 flex-col gap-1 overflow-y-auto" data-testid="native-file-job-failed-files">
+                            {#each model.terminal.failedFiles as file, index (index)}
+                                <li class="flex flex-col">
+                                    <span class="truncate">{file.name}</span>
+                                    <span class="text-textcolor2">{file.reason}</span>
+                                </li>
+                            {/each}
+                        </ul>
+                    {/if}
                 </div>
             {/if}
 

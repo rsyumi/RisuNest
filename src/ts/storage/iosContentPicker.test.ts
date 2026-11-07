@@ -3,11 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
     pick: vi.fn(), discard: vi.fn(), read: vi.fn(),
     character: vi.fn(), module: vi.fn(), jsonCharacter: vi.fn(), jsonModule: vi.fn(),
-    run: vi.fn(), source: vi.fn(), status: vi.fn(),
+    run: vi.fn(), source: vi.fn(), status: vi.fn(), beginBatch: vi.fn(), beginBatchItem: vi.fn(), recordBatchItem: vi.fn(),
     controller: undefined as AbortController | undefined,
 }))
 vi.mock('./iosFiles', () => ({
-    pickIOSFile: mocks.pick, discardIOSFile: mocks.discard,
+    pickIOSFiles: mocks.pick, discardIOSFile: mocks.discard,
     exportIOSFile: vi.fn(), getIOSPublication: vi.fn(),
 }))
 vi.mock('@tauri-apps/plugin-fs', () => ({ readFile: mocks.read }))
@@ -27,19 +27,21 @@ describe('iOS native content picker', () => {
     beforeEach(() => {
         vi.resetAllMocks()
         mocks.controller = new AbortController()
-        mocks.pick.mockResolvedValue(picked)
+        mocks.pick.mockResolvedValue({ files: [picked], failures: [] })
         mocks.discard.mockResolvedValue(undefined)
         mocks.character.mockResolvedValue({ kind: 'imported', value: 'native-character' })
         mocks.module.mockResolvedValue({ kind: 'imported', value: 'native-module' })
         mocks.jsonCharacter.mockResolvedValue(0)
+        mocks.jsonModule.mockResolvedValue(true)
         mocks.read.mockResolvedValue(new TextEncoder().encode('{}'))
         mocks.run.mockImplementation(async (_kind, _key, operation) => operation({
             signal: mocks.controller!.signal, onStatus: mocks.status, setSource: mocks.source,
+            beginBatch: mocks.beginBatch, beginBatchItem: mocks.beginBatchItem, recordBatchItem: mocks.recordBatchItem,
         }))
     })
 
     it.each(['card.png', 'card.charx', 'card.jpeg'])('passes %s as an owned native path and cleans it only after activation', async name => {
-        mocks.pick.mockResolvedValue({ ...picked, name, bytes: 1024 ** 3 })
+        mocks.pick.mockResolvedValue({ files: [{ ...picked, name, bytes: 1024 ** 3 }], failures: [] })
         mocks.character.mockImplementation(async (input, options) => {
             expect(mocks.discard).not.toHaveBeenCalled()
             expect(input).toEqual({ source: { type: 'desktopPath', path: picked.path }, displayName: name })
@@ -57,7 +59,7 @@ describe('iOS native content picker', () => {
 
     it.each([['module', 'source.risum'], ['module', 'source.charx'], ['character', 'source.RISUM']] as const)
     ('routes %s / %s to prepared module activation', async (destination, name) => {
-        mocks.pick.mockResolvedValue({ ...picked, name })
+        mocks.pick.mockResolvedValue({ files: [{ ...picked, name }], failures: [] })
         await expect(importIOSContentFromPicker(destination)).resolves.toBe('native-module')
         expect(mocks.module).toHaveBeenCalledOnce()
         expect(mocks.character).not.toHaveBeenCalled()
@@ -66,7 +68,7 @@ describe('iOS native content picker', () => {
     })
 
     it.each(['character', 'module'] as const)('preserves the %s JSON compatibility path', async destination => {
-        mocks.pick.mockResolvedValue({ ...picked, name: 'source.JSON' })
+        mocks.pick.mockResolvedValue({ files: [{ ...picked, name: 'source.JSON' }], failures: [] })
         await expect(importIOSContentFromPicker(destination)).resolves.toBe(destination === 'character' ? 'json-character' : 'module')
         expect(mocks.read).toHaveBeenCalledWith(picked.path)
         expect(destination === 'character' ? mocks.jsonCharacter : mocks.jsonModule).toHaveBeenCalledOnce()
@@ -76,7 +78,7 @@ describe('iOS native content picker', () => {
     })
 
     it('rejects oversized metadata before reading it into the renderer', async () => {
-        mocks.pick.mockResolvedValue({ ...picked, name: 'large.json', bytes: 128 * 1024 * 1024 + 1 })
+        mocks.pick.mockResolvedValue({ files: [{ ...picked, name: 'large.json', bytes: 128 * 1024 * 1024 + 1 }], failures: [] })
         await expect(importIOSContentFromPicker('character')).rejects.toMatchObject({ code: 'source-too-large' })
         expect(mocks.read).not.toHaveBeenCalled()
         expect(mocks.discard).toHaveBeenCalledOnce()
@@ -93,7 +95,7 @@ describe('iOS native content picker', () => {
     it('discards a source when cancellation arrives just after the picker', async () => {
         mocks.pick.mockImplementation(async () => {
             mocks.controller!.abort()
-            return picked
+            return { files: [picked], failures: [] }
         })
         await expect(importIOSContentFromPicker('character')).rejects.toMatchObject({ name: 'AbortError' })
         expect(mocks.character).not.toHaveBeenCalled()
@@ -121,5 +123,45 @@ describe('iOS native content picker', () => {
         } finally {
             warning.mockRestore()
         }
+    })
+
+    it('imports every picked file in one operation and lists a file that failed', async () => {
+        const broken = { path: '/synthetic/ios-file-staging/broken', name: 'broken.charx', bytes: 20 }
+        const error = new Error('synthetic unsupported content')
+        mocks.pick.mockResolvedValue({ files: [broken, picked], failures: [] })
+        mocks.character.mockRejectedValueOnce(error)
+        await expect(importIOSContentFromPicker('character')).resolves.toBe('native-character')
+        expect(mocks.run).toHaveBeenCalledOnce()
+        expect(mocks.beginBatch).toHaveBeenCalledWith(2)
+        expect(mocks.recordBatchItem.mock.calls).toEqual([
+            ['broken.charx', { error }],
+            ['card.charx', { imported: true }],
+        ])
+        expect(mocks.discard.mock.calls).toEqual([[broken.path], [picked.path]])
+    })
+
+    it('lists a file that could not be copied and keeps a single copy failure as the failure', async () => {
+        mocks.pick.mockResolvedValue({ files: [picked], failures: [{ name: 'cloud.charx', message: 'synthetic download failure' }] })
+        await expect(importIOSContentFromPicker('character')).resolves.toBe('native-character')
+        expect(mocks.beginBatch).toHaveBeenCalledWith(2)
+        expect(mocks.recordBatchItem.mock.calls).toEqual([
+            ['cloud.charx', { error: expect.objectContaining({ code: 'source-copy-failed', message: 'cloud.charx: synthetic download failure' }) }],
+            ['card.charx', { imported: true }],
+        ])
+
+        mocks.pick.mockResolvedValue({ files: [], failures: [{ name: 'cloud.charx', message: 'synthetic download failure' }] })
+        await expect(importIOSContentFromPicker('character')).rejects.toMatchObject({ code: 'source-copy-failed' })
+    })
+
+    it('stops a batch on cancellation and removes the files it did not import', async () => {
+        const second = { path: '/synthetic/ios-file-staging/second', name: 'second.charx', bytes: 20 }
+        mocks.pick.mockResolvedValue({ files: [picked, second], failures: [] })
+        mocks.character.mockImplementationOnce(async () => {
+            mocks.controller!.abort()
+            throw new DOMException('cancelled', 'AbortError')
+        })
+        await expect(importIOSContentFromPicker('character')).rejects.toMatchObject({ name: 'AbortError' })
+        expect(mocks.character).toHaveBeenCalledOnce()
+        expect(mocks.discard.mock.calls).toEqual([[picked.path], [second.path]])
     })
 })
