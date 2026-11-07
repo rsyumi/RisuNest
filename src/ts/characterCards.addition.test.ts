@@ -395,7 +395,7 @@ describe('character card additions', () => {
             { signal: expect.any(AbortSignal), onStatus: expect.any(Function) },
         )
         expect(outcomes).toEqual([
-            expect.objectContaining({ state: 'succeeded', batch: { total: 2, imported: 2, failures: [] } }),
+            expect.objectContaining({ state: 'succeeded', batch: { total: 2, imported: 2, failures: [], declined: [] } }),
             expect.objectContaining({ state: 'succeeded', source: { name: 'single.charx' } }),
         ])
         expect(outcomes[1]).not.toHaveProperty('batch')
