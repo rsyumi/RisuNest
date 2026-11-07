@@ -18,7 +18,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -733,19 +733,29 @@ fn stream_legacy_root_entry<S: TrackedSource>(
             } else { index.to_string() };
             let packed = rmpv::decode::read_value_with_max_depth(input,LEGACY_ROOT_ENTRY_DEPTH-2)
                 .map_err(|error|messagepack_error(error,job))?;
-            let value = match messagepack_to_json(packed, job)? {
-                JsonSlot::Value(value) => Some(value),
-                JsonSlot::Undefined if kind == FieldKind::Array => Some(Value::Null),
-                JsonSlot::Undefined => None,
+            let value = match messagepack_to_converted(packed, job)? {
+                Some(value) => Some(value),
+                None if kind == FieldKind::Array => Some(Converted::Json(Value::Null)),
+                None => None,
             };
-            root.put_member(key,&member,value.as_ref()).map_err(|error|legacy_staging_error(job,error))?;
+            let text = value.as_ref().map(serde_json::to_string).transpose()
+                .map_err(|error|legacy_staging_error(job,error.into()))?;
+            root.put_member_json(key,&member,text.as_deref()).map_err(|error|legacy_staging_error(job,error))?;
         }
     } else {
         let prefix = [marker.to_u8()];
         let packed = rmpv::decode::read_value_with_max_depth(&mut prefix.as_slice().chain(&mut *input),LEGACY_ROOT_ENTRY_DEPTH)
             .map_err(|error|messagepack_error(error,job))?;
-        let value = match messagepack_to_json(packed, job)? { JsonSlot::Value(value)=>Some(value), JsonSlot::Undefined=>None };
-        root.put(key,value.as_ref()).map_err(|error|legacy_staging_error(job,error))?;
+        match messagepack_to_converted(packed, job)? {
+            // A converted binary is an object field with a member per byte.
+            Some(Converted::Binary(bytes)) => {
+                root.begin(key,FieldKind::Object).map_err(|error|legacy_staging_error(job,error))?;
+                for (index,byte) in bytes.iter().enumerate() {
+                    root.put_member_json(key,&index.to_string(),Some(byte.to_string().as_str())).map_err(|error|legacy_staging_error(job,error))?;
+                }
+            }
+            value => root.put(key,value.map(Converted::into_value).as_ref()).map_err(|error|legacy_staging_error(job,error))?,
+        }
     }
     Ok(())
 }
@@ -1019,6 +1029,61 @@ enum JsonSlot {
     Undefined,
 }
 
+/// A converted MessagePack value whose binaries are still bytes. It converts
+/// to, and serializes as, the value `messagepack_to_json` gives, without the
+/// object per binary that costs about a hundred and fifty bytes per byte.
+enum Converted {
+    Json(Value),
+    Binary(Vec<u8>),
+    Array(Vec<Converted>),
+    /// Members with distinct keys, in order.
+    Object(Vec<(String, Converted)>),
+}
+
+impl Converted {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Json(value) => value,
+            Self::Binary(bytes) => Value::Object(bytes.into_iter().enumerate()
+                .map(|(index, byte)| (index.to_string(), Value::from(byte))).collect()),
+            Self::Array(values) => Value::Array(values.into_iter().map(Self::into_value).collect()),
+            Self::Object(members) => Value::Object(members.into_iter()
+                .map(|(key, value)| (key, value.into_value())).collect()),
+        }
+    }
+}
+
+impl serde::Serialize for Converted {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self {
+            Self::Json(value) => value.serialize(serializer),
+            Self::Binary(bytes) => {
+                // An index key is written as the decimal text the member's key holds.
+                let mut map = serializer.serialize_map(Some(bytes.len()))?;
+                for (index, byte) in bytes.iter().enumerate() {
+                    map.serialize_entry(&index, byte)?;
+                }
+                map.end()
+            }
+            Self::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(value)?;
+                }
+                sequence.end()
+            }
+            Self::Object(members) => {
+                let mut map = serializer.serialize_map(Some(members.len()))?;
+                for (key, value) in members {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
 // PocketRisu and upstream RisuAI assign absent/duplicate chat IDs when loading
 // legacy saves, and PocketRisu skips chat entries that are not objects. Do that
 // before staging; the persistent store remains strict.
@@ -1109,6 +1174,118 @@ fn binary_json_growth(value: &MessagePackValue) -> u64 {
 }
 
 fn messagepack_to_json(value: MessagePackValue, job: &JobControl) -> Result<JsonSlot, NativeJobError> {
+    Ok(match messagepack_to_converted(value, job)? {
+        Some(value) => JsonSlot::Value(value.into_value()),
+        None => JsonSlot::Undefined,
+    })
+}
+
+/// `None` is a value JavaScript reads as undefined.
+fn messagepack_to_converted(value: MessagePackValue, job: &JobControl) -> Result<Option<Converted>, NativeJobError> {
+    let json = |value: Value| Ok(Some(Converted::Json(value)));
+    match value {
+        MessagePackValue::Nil => json(Value::Null),
+        MessagePackValue::Boolean(value) => json(Value::Bool(value)),
+        MessagePackValue::Integer(value) => {
+            let number = if let Some(value) = value.as_i64() {
+                js_number(value as f64)
+            } else if let Some(value) = value.as_u64() {
+                js_number(value as f64)
+            } else {
+                return Err(corrupt("invalid legacy MessagePack integer"));
+            };
+            json(number)
+        }
+        MessagePackValue::F32(value) => json(js_number(value as f64)),
+        MessagePackValue::F64(value) => json(js_number(value)),
+        MessagePackValue::String(value) => value
+            .into_str()
+            .map(|value| Some(Converted::Json(Value::String(value))))
+            .ok_or_else(|| corrupt("invalid UTF-8 legacy MessagePack string")),
+        MessagePackValue::Binary(bytes) => Ok(Some(Converted::Binary(bytes))),
+        MessagePackValue::Array(values) => {
+            let mut output = Vec::with_capacity(values.len());
+            for value in values {
+                output.push(messagepack_to_converted(value, job)?.unwrap_or(Converted::Json(Value::Null)));
+            }
+            Ok(Some(Converted::Array(output)))
+        }
+        MessagePackValue::Map(entries) => messagepack_map_to_converted(entries, job),
+        MessagePackValue::Ext(kind, bytes) if kind == 0 && bytes == [0] => Ok(None),
+        MessagePackValue::Ext(-1, bytes) if bytes == [0xff] => json(Value::Null),
+        MessagePackValue::Ext(-1, bytes) => {
+            match timestamp_to_iso(&bytes) {
+                Ok(value) => json(Value::String(value)),
+                Err(error) if error.code == "unsupported-format" => {
+                    job.record_restore_omission("values", 1).map_err(|error| job_error(job, error))?;
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        MessagePackValue::Ext(_, _) => {
+            job.record_restore_omission("values", 1).map_err(|error| job_error(job, error))?;
+            Ok(None)
+        }
+    }
+}
+
+fn messagepack_map_to_converted(
+    entries: Vec<(MessagePackValue, MessagePackValue)>,
+    job: &JobControl,
+) -> Result<Option<Converted>, NativeJobError> {
+    let mut indexed = BTreeMap::<u32, (String, Option<Converted>)>::new();
+    // Other keys keep their first position and their last value, as object
+    // properties do.
+    let mut ordinary = Vec::<(String, Converted)>::new();
+    let mut positions = HashMap::<String, usize>::new();
+    let mut undefined = HashSet::new();
+    for (key, value) in entries {
+        let key = key
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| invalid("legacy MessagePack object keys must be strings"))?;
+        let key = if key == "__proto__" {
+            "__proto_".to_owned()
+        } else {
+            key
+        };
+        let value = messagepack_to_converted(value, job)?;
+        if let Some(index) = javascript_array_index(&key) {
+            indexed.insert(index, (key, value));
+            continue;
+        }
+        let value = match value {
+            Some(value) => {
+                undefined.remove(&key);
+                value
+            }
+            None => {
+                undefined.insert(key.clone());
+                Converted::Json(Value::Null)
+            }
+        };
+        match positions.get(&key) {
+            Some(&position) => ordinary[position].1 = value,
+            None => {
+                positions.insert(key.clone(), ordinary.len());
+                ordinary.push((key, value));
+            }
+        }
+    }
+    ordinary.retain(|(key, _)| !undefined.contains(key));
+    let mut output: Vec<_> = indexed
+        .into_values()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect();
+    output.extend(ordinary);
+    Ok(Some(Converted::Object(output)))
+}
+
+/// The conversion as it was made into values, before binaries stayed bytes.
+/// Tests compare both.
+#[cfg(test)]
+fn messagepack_to_json_reference(value: MessagePackValue, job: &JobControl) -> Result<JsonSlot, NativeJobError> {
     match value {
         MessagePackValue::Nil => Ok(JsonSlot::Value(Value::Null)),
         MessagePackValue::Boolean(value) => Ok(JsonSlot::Value(Value::Bool(value))),
@@ -1133,14 +1310,14 @@ fn messagepack_to_json(value: MessagePackValue, job: &JobControl) -> Result<Json
         MessagePackValue::Array(values) => {
             let mut output = Vec::with_capacity(values.len());
             for value in values {
-                output.push(match messagepack_to_json(value, job)? {
+                output.push(match messagepack_to_json_reference(value, job)? {
                     JsonSlot::Value(value) => value,
                     JsonSlot::Undefined => Value::Null,
                 });
             }
             Ok(JsonSlot::Value(Value::Array(output)))
         }
-        MessagePackValue::Map(entries) => messagepack_map_to_json(entries, job),
+        MessagePackValue::Map(entries) => messagepack_map_to_json_reference(entries, job),
         MessagePackValue::Ext(kind, bytes) if kind == 0 && bytes == [0] => Ok(JsonSlot::Undefined),
         MessagePackValue::Ext(-1, bytes) if bytes == [0xff] => Ok(JsonSlot::Value(Value::Null)),
         MessagePackValue::Ext(-1, bytes) => {
@@ -1160,7 +1337,8 @@ fn messagepack_to_json(value: MessagePackValue, job: &JobControl) -> Result<Json
     }
 }
 
-fn messagepack_map_to_json(
+#[cfg(test)]
+fn messagepack_map_to_json_reference(
     entries: Vec<(MessagePackValue, MessagePackValue)>,
     job: &JobControl,
 ) -> Result<JsonSlot, NativeJobError> {
@@ -1177,7 +1355,7 @@ fn messagepack_map_to_json(
         } else {
             key
         };
-        let value = messagepack_to_json(value, job)?;
+        let value = messagepack_to_json_reference(value, job)?;
         if let Some(index) = javascript_array_index(&key) {
             indexed.insert(
                 index,
@@ -6120,5 +6298,61 @@ pub(super) mod tests {
                 "52e5b9888db57ec9f664409a490cefceff0e5d113bb6d4e986b3c7edaf6a0651".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn binaries_kept_as_bytes_convert_and_serialize_as_converted_values() {
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        let text = |value: &str| MessagePackValue::from(value);
+        let binary = |length: usize| MessagePackValue::Binary((0..length).map(|index| (index * 7 % 256) as u8).collect());
+        let undefined = || MessagePackValue::Ext(0, vec![0]);
+        let mut values: Vec<_> = [0, 1, 9, 10, 99, 100, 1_023, 1_024, 65_536].into_iter().map(binary).collect();
+        values.extend([
+            MessagePackValue::Map(vec![
+                (text("b"), binary(3)),
+                (text("1"), binary(2)),
+                (text("0"), text("zero")),
+                (text("b"), undefined()),
+                (text("a"), undefined()),
+                (text("a"), binary(1)),
+                (text("c"), binary(1)),
+                (text("c"), undefined()),
+                (text("10"), undefined()),
+                (text("__proto__"), binary(2)),
+                (text("01"), MessagePackValue::from(1.5)),
+                (text("4294967295"), MessagePackValue::Nil),
+                (text("nested"), MessagePackValue::Array(vec![
+                    binary(4),
+                    undefined(),
+                    MessagePackValue::Map(vec![(text("x"), binary(2)), (text("\u{d55c}\n"), MessagePackValue::Boolean(true))]),
+                    MessagePackValue::Ext(-1, vec![0xff]),
+                    MessagePackValue::Ext(5, vec![1]),
+                ])),
+                (text("numbers"), MessagePackValue::Array(vec![
+                    MessagePackValue::from(-0.0f64),
+                    MessagePackValue::from(u64::MAX),
+                    MessagePackValue::from(i64::MIN),
+                    MessagePackValue::F32(1.5),
+                    MessagePackValue::from(f64::NAN),
+                    MessagePackValue::from(1e21),
+                ])),
+            ]),
+            MessagePackValue::Array(vec![MessagePackValue::Map(vec![]), MessagePackValue::Array(vec![]), binary(0)]),
+            undefined(),
+            MessagePackValue::Map(vec![(MessagePackValue::from(1), text("x"))]),
+        ]);
+        for value in values {
+            let expected = messagepack_to_json_reference(value.clone(), &job);
+            match (expected, messagepack_to_converted(value, &job)) {
+                (Ok(JsonSlot::Value(expected)), Ok(Some(converted))) => {
+                    let expected = serde_json::to_string(&expected).unwrap();
+                    assert_eq!(serde_json::to_string(&converted).unwrap(), expected);
+                    assert_eq!(serde_json::to_string(&converted.into_value()).unwrap(), expected);
+                }
+                (Ok(JsonSlot::Undefined), Ok(None)) => {}
+                (Err(expected), Err(actual)) => assert_eq!(actual, expected),
+                _ => panic!("the conversions differ"),
+            }
+        }
     }
 }
