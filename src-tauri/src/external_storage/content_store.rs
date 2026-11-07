@@ -675,10 +675,15 @@ pub(crate) fn move_flat_files(root: &Path, limit: usize) -> Result<bool> {
         }
     }
     let mut touched = BTreeSet::new();
+    // Whether this step changed what the next listing shows.
+    let mut progress = !partials.is_empty();
     for digest in &bodies {
         let source = flat.join(digest);
         match fs::symlink_metadata(&source) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                progress = true;
+                continue;
+            }
             Err(error) => return Err(error.into()),
             Ok(metadata) if !metadata.is_file() || is_link_like(&metadata) => {
                 kept = true;
@@ -690,6 +695,7 @@ pub(crate) fn move_flat_files(root: &Path, limit: usize) -> Result<bool> {
         let directory = ensure_shard(&files, &target)?;
         if move_body(&source, &target, digest)? {
             touched.insert(directory);
+            progress = true;
         } else {
             kept = true;
         }
@@ -705,10 +711,11 @@ pub(crate) fn move_flat_files(root: &Path, limit: usize) -> Result<bool> {
     if !bodies.is_empty() || !partials.is_empty() {
         sync_directory(&flat)?;
     }
-    if more {
+    // A step that left every entry where it was would list them again.
+    if more && progress {
         return Ok(true);
     }
-    if kept {
+    if kept || more {
         return Ok(false);
     }
     match fs::remove_dir(&flat) {
@@ -761,8 +768,13 @@ fn move_body(source: &Path, target: &Path, digest: &str) -> Result<bool> {
 /// Startup does not wait for it, and readers find a body in either place.
 pub(crate) fn move_flat_files_later(app: &tauri::AppHandle, root: PathBuf) {
     use tauri::Manager as _;
-    if !matches!(flat_directory(&root), Ok(Some(_))) {
-        return;
+    match flat_directory(&root) {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => {
+            crate::nlog!("warn", "External content files were not moved: {error}");
+            return;
+        }
     }
     let app = app.clone();
     let spawned = std::thread::Builder::new()
@@ -775,7 +787,12 @@ pub(crate) fn move_flat_files_later(app: &tauri::AppHandle, root: PathBuf) {
                 };
                 match move_flat_files(&root, FLAT_MOVE_BATCH) {
                     Ok(true) => {}
-                    Ok(false) => return,
+                    Ok(false) => {
+                        if matches!(flat_directory(&root), Ok(Some(_))) {
+                            crate::nlog!("warn", "Some external content files were not moved");
+                        }
+                        return;
+                    }
                     Err(error) => {
                         crate::nlog!("warn", "External content files were not moved: {error}");
                         return;
@@ -1098,6 +1115,16 @@ mod tests {
         fs::create_dir(&flat).unwrap();
         assert!(!move_flat_files(root.path(), 100).unwrap());
         assert!(!flat.exists());
+
+        // A step that leaves every entry where it was ends the move instead
+        // of listing the same entries again.
+        for bytes in flat_store(root.path(), 30..32) {
+            let path = file_location(root.path(), &digest(&bytes));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"synthetic damage").unwrap();
+        }
+        assert!(!move_flat_files(root.path(), 1).unwrap());
+        assert!(flat.exists());
     }
 
     /// The move takes a body to its shard between the look there and the
