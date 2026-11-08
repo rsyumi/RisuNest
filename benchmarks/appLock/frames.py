@@ -117,8 +117,10 @@ def contrast(pixels):
     return max(luminance) - min(luminance)
 
 
-def assess(video, baseline, ready, locked, expect_exposure=False, frame_exact=True, scan_from=1):
+def assess(video, baseline, ready, locked, expect_exposure=False, frame_exact=True, scan_from=1,
+           return_from=None, maximum_gap=None):
     # Without frame-exact capture, exposure is judged on the frames the recorder wrote and the keypad on the last one.
+    # The recording must still hold the return: a frame before the keypad from return_from on, and no gap over maximum_gap.
     timing = cadence(video) if frame_exact else {**frame_timing(video)[2], 'frameExact': False}
     width, height, data = rgb_image(baseline)
     marker = find_marker(width, height, data)
@@ -145,39 +147,49 @@ def assess(video, baseline, ready, locked, expect_exposure=False, frame_exact=Tr
                     break
         if hits:
             stripe_rows[count] = hits
-    last = None
-    if not frame_exact:
-        for last in frames(video, [0, 0, int(info['width']), int(info['height'])]):
-            pass
-        if last is None:
-            raise RuntimeError('Recording has no decodable frame')
     scale = marker[2] / ready['marker']['width']
     origin_x = marker[0] - ready['marker']['x'] * scale
     origin_y = marker[1] - ready['marker']['y'] * scale
-    visible_keys = 0
+    key_crops = []
     for key in locked['keys']:
         left = int((origin_x + (key['x'] + key['width'] * .25) * scale) * sx)
         top = int((origin_y + (key['y'] + key['height'] * .25) * scale) * sy)
         key_crop = [left, top, int(key['width'] * scale * sx * .5), int(key['height'] * scale * sy * .5)]
         if left < 0 or top < 0 or left + key_crop[2] > int(info['width']) or top + key_crop[3] > int(info['height']):
             raise RuntimeError('Shared keypad falls outside the captured viewport')
-        if frame_exact:
-            if sum(contrast(pixels) > 60 for pixels in frames(video, key_crop, tail=.35)) >= 3:
-                visible_keys += 1
-            continue
-        video_width = int(info['width'])
-        pixels = b''.join(last[((key_crop[1] + row) * video_width + key_crop[0]) * 3:
-                               ((key_crop[1] + row) * video_width + key_crop[0] + key_crop[2]) * 3]
-                          for row in range(key_crop[3]))
-        if contrast(pixels) > 60:
-            visible_keys += 1
+        key_crops.append(key_crop)
+    video_width = int(info['width'])
+
+    def keys_shown(frame):
+        return sum(contrast(b''.join(frame[((y + row) * video_width + x) * 3:((y + row) * video_width + x + w) * 3]
+                                     for row in range(h))) > 60 for x, y, w, h in key_crops)
+
+    before_keypad = []
+    if frame_exact:
+        visible_keys = sum(sum(contrast(pixels) > 60 for pixels in frames(video, key_crop, tail=.35)) >= 3
+                           for key_crop in key_crops)
+    else:
+        last = None
+        for index, last in enumerate(frames(video, [0, 0, video_width, int(info['height'])]), 1):
+            if return_from is not None and index >= return_from and keys_shown(last) < 7:
+                before_keypad.append(index)
+        if last is None:
+            raise RuntimeError('Recording has no decodable frame')
+        visible_keys = keys_shown(last)
     result = {**timing, 'decodedFrames': count, 'scannedFromFrame': scan_from, 'exposureFrames': exposures,
               'stripeRowsByFrame': stripe_rows, 'visibleKeypadKeys': visible_keys,
+              'returnFromFrame': return_from, 'returnFramesBeforeKeypad': before_keypad,
               'baselineMarker': marker, 'mutation': expect_exposure, 'retained': locked['retained'],
               'blockedAfterReturnMs': locked['blockedAfterReturnMs']}
     video.with_suffix('.frames.json').write_text(json.dumps(result, indent=2))
+    if maximum_gap is not None and (timing['maximumFrameGapSeconds'] is None or timing['maximumFrameGapSeconds'] > maximum_gap):
+        raise RuntimeError(f'Recording left a gap longer than {maximum_gap} s in the return')
+    if return_from is not None and return_from > count:
+        raise RuntimeError('Recording ended before the return')
     if visible_keys < 7:
         raise RuntimeError('Final native frames do not show the shared PIN keypad')
+    if return_from is not None and not before_keypad:
+        raise RuntimeError('Recording shows no return frame before the PIN keypad')
     if bool(exposures) != expect_exposure:
         raise RuntimeError('Mutation did not expose retained content' if expect_exposure else 'Retained content appeared in native return frames')
     return result
@@ -237,7 +249,8 @@ def run_macos(app, artifacts, capture_input, start_capture, finish_capture, acti
                 completed_capture, capture = capture, None
                 finish_capture(completed_capture, require_display_cadence=False)
                 video = completed_capture['video']
-                outcomes.append(assess(video, baseline, ready, locked, phase.endswith('mutant'), frame_exact=False))
+                # The capture starts after departure and its frame gaps stay near 0.1 s, so a longer gap means part of the return went unrecorded.
+                outcomes.append(assess(video, baseline, ready, locked, phase.endswith('mutant'), frame_exact=False, maximum_gap=.5))
             finally:
                 try:
                     if capture is not None:
@@ -341,16 +354,16 @@ def run_ios_phase(device, identifier, container, artifacts, phase, departure_scr
         stop_simulator_recorder(recorder)
         timing['recorderStoppedSeconds'] = time.monotonic() - started
         times, gaps, _ = frame_timing(video)
-        departed, decoded = departure_frames(video, departure_screen)
+        departed, _ = departure_frames(video, departure_screen)
         video.with_suffix('.frame-timestamps.json').write_text(json.dumps({
             'frames': len(times), 'maximumFrameGapSeconds': max(gaps, default=None),
             'gapsOver40ms': sum(gap > .04 for gap in gaps), 'departureScreenFrames': departed, 'times': times}, indent=2))
         # Frames before the departure screen show the retained page on purpose; the return is everything after it.
+        # The recorder writes only display changes, so the return is judged by its states rather than its frame gaps.
         if not departed:
             raise RuntimeError('Recording never showed the departure screen')
-        if departed[-1] == decoded:
-            raise RuntimeError('Recording ended before the return')
-        return assess(video, baseline, ready, locked, phase.endswith('mutant'), frame_exact=False, scan_from=departed[0])
+        return assess(video, baseline, ready, locked, phase.endswith('mutant'), frame_exact=False,
+                      scan_from=departed[0], return_from=departed[-1] + 1)
     finally:
         (artifacts / (phase + '-timing.json')).write_text(json.dumps(timing, indent=2))
         (artifacts / (phase + '.jsonl')).write_text(report.read_text())
