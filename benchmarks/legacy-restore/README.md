@@ -29,6 +29,14 @@ The Android decoded-size axis takes `--legacy-mb=100|300|600` and
 262,144, to give each synthetic character a MessagePack `bin` field of that many
 bytes within the same decoded size; the run then also verifies one restored field.
 
+With `--legacy-fixture=host` the host writes the raw fixture, pushes it into the
+app's files and drives the restore through the app's commands, so the installed
+APK's in-app harness only has to start. This measures an APK built before a
+measurement option existed. Add `--legacy-single-binary-bytes=<n>`, from 65,536
+to 268,435,456, to restore the smallest fixture with one `bin` of that many bytes
+in its last character instead of a decoded-size case; the run then checks that
+the character was restored, not the binary's bytes.
+
 Measure database, attachment and record sizes separately:
 
 ```text

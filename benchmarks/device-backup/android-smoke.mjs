@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { measureLegacyRestore } from "../legacy-restore/android-measure.mjs";
+import { measureHostLegacyRestore } from "../legacy-restore/android-host-measure.mjs";
 import { measureEntryCount } from "../legacy-restore/entry-count.mjs";
 import { measurePluginValue } from './plugin-value-driver.mjs';
 import { measurePluginSync, syntheticPluginSyncServer } from './plugin-sync-driver.mjs';
@@ -23,7 +24,7 @@ const delay = (milliseconds) =>
 const args = runnerOptions(process.argv.slice(2));
 for (const name of Object.keys(args))
   assert.ok(
-    ["adb", "aapt", "adb-port", "serial", "avd", "apk", "output", "health", "peer", "exchange", "legacy-mb", "legacy-encoding", "legacy-binary-bytes", "legacy-entries", "plugin-values", "sync-server"].includes(name),
+    ["adb", "aapt", "adb-port", "serial", "avd", "apk", "output", "health", "peer", "exchange", "legacy-mb", "legacy-encoding", "legacy-binary-bytes", "legacy-fixture", "legacy-single-binary-bytes", "legacy-entries", "plugin-values", "sync-server"].includes(name),
     "Unsupported runner option",
   );
 const android = androidTarget(args);
@@ -591,6 +592,16 @@ async function main() {
     } finally {
       for (const file of ownedSources) await run(['shell', 'run-as', packageName, 'rm', '-f', file], 10_000, true);
     }
+    return;
+  }
+  if (args['legacy-fixture'] !== undefined || args['legacy-single-binary-bytes'] !== undefined) {
+    assert.equal(args['legacy-fixture'], 'host', 'Use --legacy-fixture=host');
+    const measurement = await measureHostLegacyRestore({ args, client, run, pid, packageName, output,
+      apkSha256: sha256, environment });
+    completed = measurement.success;
+    console.log(JSON.stringify({ success: measurement.success, phase: measurement.phase, outcome: measurement.outcome ?? null,
+      code: measurement.code ?? null, elapsedMs: measurement.elapsedMs ?? null, processExited: measurement.processExited, output }));
+    if (!completed) process.exitCode = 1;
     return;
   }
   if (args['legacy-mb'] || args['legacy-encoding'] || args['legacy-binary-bytes']) {
