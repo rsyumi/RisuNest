@@ -39,10 +39,10 @@
                 <span class="min-w-0 flex-auto text-sm">{label}</span>
             </span>
             {#if detail}
-                <span class="text-xs text-textcolor2 tabular-nums">{detail}</span>
+                <span class="text-xs text-subtext tabular-nums">{detail}</span>
             {/if}
             {#if percent !== null}
-                <span class="text-xs text-textcolor2 tabular-nums">{percent}%</span>
+                <span class="text-xs text-subtext tabular-nums">{percent}%</span>
             {/if}
         </div>
         {#if trailing}{@render trailing()}{/if}

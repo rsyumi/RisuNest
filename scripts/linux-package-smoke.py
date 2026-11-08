@@ -41,6 +41,7 @@ base = f'http://127.0.0.1:{port}'
 log = (out / f'{args.phase}-driver.log').open('w')
 driver = subprocess.Popen(['WebKitWebDriver', '--host=127.0.0.1', f'--port={port}'], stdout=log, stderr=log)
 session = None
+completed = False
 
 def call(method, route, payload=None):
     request = urllib.request.Request(base + route, data=None if payload is None else json.dumps(payload).encode(), method=method, headers={'Content-Type':'application/json'})
@@ -61,6 +62,40 @@ def native(command, payload=None):
     if 'error' in result:
         raise RuntimeError(result['error'])
     return result.get('value')
+
+def start_time(pid):
+    text = Path(f'/proc/{pid}/stat').read_text()
+    return int(text[text.rfind(')') + 2:].split()[19])
+
+def descendants(pid):
+    children = set()
+    try:
+        for task in Path(f'/proc/{pid}/task').iterdir():
+            try:
+                children.update(int(child) for child in (task / 'children').read_text().split())
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return []
+    return [nested for child in children for nested in [child, *descendants(child)]]
+
+def app_processes():
+    binary = Path(args.binary).resolve()
+    found = {}
+    for pid in descendants(driver.pid):
+        try:
+            executable = Path(os.readlink(f'/proc/{pid}/exe'))
+            if executable == binary or executable.name.lower() == 'risunest':
+                found[pid] = start_time(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+def present(pid, starttime):
+    try:
+        return start_time(pid) == starttime
+    except (OSError, ValueError, IndexError):
+        return False
 
 def wait(script):
     for attempt in range(160):
@@ -156,7 +191,10 @@ try:
     result['fileUrlDelivery'] = True
     (out / f'{args.phase}.json').write_text(json.dumps(result, indent=2))
     print(json.dumps(result))
+    completed = True
 finally:
+    # The next phase opens the same profile, which the app holds until its last thread exits.
+    owned = app_processes()
     if session:
         try:
             call('DELETE', f'/session/{session}')
@@ -168,4 +206,9 @@ finally:
     except subprocess.TimeoutExpired:
         driver.kill()
         driver.wait()
+    deadline = time.monotonic() + 30
+    while any(present(pid, starttime) for pid, starttime in owned.items()) and time.monotonic() < deadline:
+        time.sleep(0.05)
     log.close()
+    if completed and any(present(pid, starttime) for pid, starttime in owned.items()):
+        raise RuntimeError('The synthetic app process did not exit after its session ended')

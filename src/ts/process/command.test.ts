@@ -168,6 +168,23 @@ describe('processMultiCommand conversation mutations', () => {
         }
     })
 
+    it('reads a missing /getvar variable as null without writing the session-owned conversation', async () => {
+        const character = mocks.database!.characters[0]
+        const conversation = character.chats[0]
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        mocks.session = session
+
+        await expect(processMultiCommand('/getvar key=missing')).resolves.toBe('null')
+
+        expect(conversation).not.toHaveProperty('scriptstate')
+        expect(session.version).toBe(0)
+    })
+
     it('writes /setvar to the selected conversation when no session owns it', async () => {
         const conversation = mocks.database!.characters[0].chats[0]
 

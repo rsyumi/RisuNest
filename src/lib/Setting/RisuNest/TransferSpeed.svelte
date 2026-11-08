@@ -36,6 +36,6 @@
 {/if}
 
 <style>
-    .speed { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 0 0.75rem; margin-left: auto; color: var(--risu-theme-textcolor2); font-size: 12px; line-height: 18px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .speed { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 0 0.75rem; margin-left: auto; color: var(--color-subtext); font-size: 12px; line-height: 18px; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .rate { display: inline-flex; align-items: center; gap: 3px; }
 </style>

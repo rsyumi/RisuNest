@@ -2,6 +2,7 @@
   "extends": "../tsconfig.json",
   "include": [
     "./harnessConfig.ts",
+    "./failureRecord*.ts",
     "./generation-memory/**/*.ts",
     "./generation-send/**/*.ts",
     "./tokenizer/*.ts",

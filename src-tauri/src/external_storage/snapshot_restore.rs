@@ -289,6 +289,26 @@ fn ensure_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Creates the subdirectory a staging object is placed in the first time one
+/// is needed, and makes its entry durable when the placement is.
+fn ensure_parent(destination: &Path, durability: Durability) -> Result<()> {
+    let parent = destination.parent().expect("a staging object has a directory");
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !crate::trust_boundary::is_link_like(&metadata) => {
+            return Ok(())
+        }
+        Ok(_) => return Err(corrupt("snapshot staging directory is a link")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(transient(error)),
+    }
+    ensure_directory(parent)?;
+    if durability == Durability::Durable {
+        if let Some(above) = parent.parent() {
+            crate::trust_boundary::sync_directory(above).map_err(transient)?;
+        }
+    }
+    Ok(())
+}
 pub(crate) fn verify_body_file(path:&Path,length:u64,sha256:&str)->Result<bool> {verify(path,length,sha256)}
 fn verify(path: &Path, length: u64, sha256: &str) -> Result<bool> {
     let mut file = match crate::trust_boundary::open_regular_source(path) {
@@ -951,9 +971,17 @@ fn resolve_entries_in(
                 (None, held.then(|| ObjectSource::Captured(digest.clone())))
             }
             wire::CatalogEntryKind::Object => {
-                let destination = object_root.join(&digest);
+                // Spread over subdirectories: a directory without an index
+                // scans every entry it holds for each create and lookup.
+                let destination = object_root.join(&digest[..2]).join(&digest);
                 let mut source = verify(&destination, entry.byte_length, &digest)?
                     .then(|| ObjectSource::File(destination.clone()));
+                if source.is_none() {
+                    // What an earlier version placed before it was interrupted.
+                    let flat = object_root.join(&digest);
+                    source = verify(&flat, entry.byte_length, &digest)?
+                        .then(|| ObjectSource::File(flat));
+                }
                 if source.is_none() {
                     if let Some(cas) = library.as_ref() {
                         source = library_body(cas, &digest, entry.byte_length, prove)?;
@@ -1184,6 +1212,7 @@ fn place_whole(
         }
         return placement.content()?.put(digest, &bytes).map_err(corrupt);
     };
+    ensure_parent(destination, placement.durability)?;
     let partial = destination.with_extension("partial");
     if partial.exists() {
         fs::remove_file(&partial).map_err(transient)?;
@@ -1362,6 +1391,7 @@ fn finish_assemblies(staging_root: &Path, pending: &[Pending], durability: Durab
         }
         match file {
             Some(destination) => {
+                ensure_parent(destination, durability)?;
                 publish_verified_with(&path, destination, entry.byte_length, digest, durability)?
             }
             None => fs::remove_file(&path).map_err(transient)?,
@@ -2135,12 +2165,15 @@ async fn download_packed_body_files_with<O:std::borrow::Borrow<wire::StoredObjec
     let content=(durability==Durability::Durable).then(||content_store(staging_root)).transpose()?;
     let mut plan=resolve_entries_in(entries,staging_root,content.as_ref(),None,cancel)?;
     for resolved in &mut plan {
-        let destination=staging_root.join(format!("{}.payload",resolved.digest));
+        // Android's ext4 has no directory index, so bodies are spread over subdirectories.
+        let destination=staging_root.join(&resolved.digest[..2]).join(format!("{}.payload",resolved.digest));
+        ensure_directory(destination.parent().expect("payload shard"))?;
         if resolved.source.is_none() && verify(&destination,resolved.entry.byte_length,&resolved.digest)? {
             resolved.source=Some(ObjectSource::File(destination.clone()));
         }
         resolved.destination=Some(destination);
     }
+    if durability==Durability::Durable {crate::trust_boundary::sync_directory(staging_root).map_err(transient)?;}
     let (_,objects)=turn_over_packs_with(plan,&packs,root_key,staging_root,provider,repository,&PhaseProgress::silent(),durability,cancel).await?;
     objects.into_iter().map(|(hash,object)|match object.source {ObjectSource::File(path)=>Ok((hash,path)),_=>Err(corrupt("body source"))}).collect()
 }
@@ -2167,6 +2200,36 @@ pub(crate) async fn download_packed_body_file_observed(
     match &body.source { ObjectSource::File(path)=>Ok(path.clone()), _=>Err(corrupt("body source")) }
 }
 
+/// Android's ext4 has no directory index, so a single directory holding every
+/// body makes each create and lookup scan all earlier bodies. Bodies are spread
+/// over subdirectories named by the first two digits of their hash.
+fn restore_body_path(directory:&Path,hash:&str)->Result<PathBuf> {
+    risunest_sync_wire::validate_hash(hash).map_err(corrupt)?;
+    Ok(directory.join("assembly").join(&hash[..2]).join(format!("{hash}.stage")))
+}
+
+/// Moves the bodies an earlier version kept directly in `assembly` into their
+/// subdirectories, so a resumed restore keeps what it already received. `ready`
+/// verifies every body before it is used, so a moved body that no longer
+/// matches the plan is received again.
+fn shard_flat_bodies(assembly:&Path)->Result<()> {
+    let mut moved=BTreeSet::new();
+    for entry in fs::read_dir(assembly).map_err(transient)? {
+        let entry=entry.map_err(transient)?;
+        let name=entry.file_name();
+        let Some(hash)=name.to_str().and_then(|name|name.strip_suffix(".stage")) else {continue;};
+        if !entry.file_type().map_err(transient)?.is_file() || risunest_sync_wire::validate_hash(hash).is_err() {continue;}
+        let shard=assembly.join(&hash[..2]);
+        ensure_directory(&shard)?;
+        fs::rename(entry.path(),shard.join(&name)).map_err(transient)?;
+        moved.insert(shard);
+    }
+    if moved.is_empty() {return Ok(());}
+    for shard in &moved {crate::trust_boundary::sync_directory(shard).map_err(transient)?;}
+    crate::trust_boundary::sync_directory(assembly).map_err(transient)?;
+    Ok(())
+}
+
 pub(crate) struct RestoreBodyPlan {
     db: rusqlite::Connection,
     directory: PathBuf,
@@ -2178,6 +2241,7 @@ impl RestoreBodyPlan {
         let directory=directory.join("pack-plan");
         ensure_directory(&directory)?;
         ensure_directory(&directory.join("assembly"))?;
+        shard_flat_bodies(&directory.join("assembly"))?;
         let path=directory.join("plan.sqlite");
         for suffix in ["","-wal","-shm"] {
             let path=PathBuf::from(format!("{}{suffix}",path.display()));
@@ -2226,7 +2290,7 @@ impl RestoreBodyPlan {
                 offset=offset.checked_add(chunk.plaintext_length).ok_or_else(||corrupt("restore body length"))?;
             }
         }
-        let path=self.body_path(&source.hash);
+        let path=self.body_path(&source.hash)?;
         let intact=match fs::symlink_metadata(&path) {
             Ok(metadata)=>metadata.is_file() && !crate::trust_boundary::is_link_like(&metadata) && metadata.len()==source.byte_length,
             Err(error) if error.kind()==std::io::ErrorKind::NotFound=>false,
@@ -2235,6 +2299,7 @@ impl RestoreBodyPlan {
         if !intact {
             self.reset_body(&source.hash)?;
             match fs::remove_file(&path) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(transient(error))}
+            ensure_directory(path.parent().expect("restore body shard"))?;
             let file=OpenOptions::new().create_new(true).write(true).open(&path).map_err(transient)?;
             file.set_len(source.byte_length).map_err(transient)?;
             file.sync_all().map_err(transient)?;
@@ -2251,17 +2316,22 @@ impl RestoreBodyPlan {
         self.db.execute_batch("DELETE FROM chunks WHERE hash NOT IN(SELECT hash FROM seen);
             DELETE FROM bodies WHERE hash NOT IN(SELECT hash FROM seen);
             DELETE FROM packs WHERE id NOT IN(SELECT pack FROM chunks)").map_err(transient)?;
-        crate::trust_boundary::sync_directory(&self.directory.join("assembly")).map_err(transient)?;
+        let assembly=self.directory.join("assembly");
+        for shard in fs::read_dir(&assembly).map_err(transient)? {
+            let shard=shard.map_err(transient)?;
+            if shard.file_type().map_err(transient)?.is_dir() {crate::trust_boundary::sync_directory(&shard.path()).map_err(transient)?;}
+        }
+        crate::trust_boundary::sync_directory(&assembly).map_err(transient)?;
         self.db.execute_batch("COMMIT").map_err(transient)?;
         crate::trust_boundary::sync_directory(&self.directory).map_err(transient)?;
         Ok(())
     }
-    fn body_path(&self,hash:&str)->PathBuf {self.directory.join("assembly").join(format!("{hash}.stage"))}
+    fn body_path(&self,hash:&str)->Result<PathBuf> {restore_body_path(&self.directory,hash)}
     pub(crate) fn ready(&self)->Result<Option<(String,PathBuf)>> {
         let ready:Option<(String,i64)>=self.db.query_row("SELECT hash,bytes FROM bodies WHERE settled=0 AND remaining=0 ORDER BY priority,hash LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(transient)?;
         ready.map(|(hash,length)| {
             let length=u64::try_from(length).map_err(corrupt)?;
-            let path=self.body_path(&hash);
+            let path=self.body_path(&hash)?;
             if !verify(&path,length,&hash)? {
                 self.db.execute_batch("BEGIN IMMEDIATE").map_err(transient)?;
                 self.reset_body(&hash)?;
@@ -2280,7 +2350,7 @@ impl RestoreBodyPlan {
         self.db.execute("DELETE FROM chunks WHERE hash=?1 AND EXISTS(SELECT 1 FROM bodies WHERE hash=?1 AND remaining=0)",[hash]).map_err(transient)?;
         self.db.execute("DELETE FROM bodies WHERE hash=?1 AND remaining=0",[hash]).map_err(transient)?;
         self.db.execute_batch("COMMIT").map_err(transient)?;
-        match fs::remove_file(self.body_path(hash)) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(transient(error))}
+        match fs::remove_file(self.body_path(hash)?) {Ok(())=>{},Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},Err(error)=>return Err(transient(error))}
         Ok(())
     }
     fn finish(self)->Result<()> {
@@ -2327,6 +2397,7 @@ impl RestoreBodyPlan {
         };
         let mut input=crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
         let tx=self.db.transaction().map_err(transient)?;
+        let mut shards=BTreeSet::new();
         {
             let mut query=tx.prepare("SELECT hash,offset,body FROM chunks WHERE pack=?1 AND done=0 ORDER BY hash,ordinal").map_err(transient)?;
             let mut rows=query.query([&remote.object_id]).map_err(transient)?;
@@ -2339,8 +2410,9 @@ impl RestoreBodyPlan {
                 let bytes=read_chunk(&mut input,remote.plaintext_length,&chunk)?;
                 if output.as_ref().is_none_or(|(current,_)|current!=&hash) {
                     if let Some((_,file))=output.take() {file.sync_all().map_err(transient)?;}
-                    let path=self.directory.join("assembly").join(format!("{hash}.stage"));
+                    let path=restore_body_path(&self.directory,&hash)?;
                     crate::trust_boundary::open_regular_source(&path).map_err(transient)?;
+                    shards.insert(path.parent().expect("restore body shard").to_owned());
                     output=Some((hash.clone(),OpenOptions::new().write(true).open(path).map_err(transient)?));
                 }
                 let body=&mut output.as_mut().unwrap().1;
@@ -2350,7 +2422,7 @@ impl RestoreBodyPlan {
             }
             if let Some((_,file))=output {file.sync_all().map_err(transient)?;}
         }
-        crate::trust_boundary::sync_directory(&self.directory.join("assembly")).map_err(transient)?;
+        for shard in &shards {crate::trust_boundary::sync_directory(shard).map_err(transient)?;}
         tx.execute("UPDATE chunks SET done=1 WHERE pack=?1",[&remote.object_id]).map_err(transient)?;
         tx.execute("UPDATE packs SET done=1 WHERE id=?1",[&remote.object_id]).map_err(transient)?;
         tx.commit().map_err(transient)?;
@@ -3013,6 +3085,12 @@ mod tests {
                 assert_eq!(plan.next_pack(&root_key,&provider,&repository,&PhaseProgress::silent(),&Cancellation::default()).await.unwrap_err().kind,interruption);
                 drop(plan);
                 assert!(stage.join("pack-plan/plan.sqlite").exists());
+                if index==0 {
+                    // An earlier version kept each body directly in `assembly`.
+                    let assembly=stage.join("pack-plan/assembly");
+                    let name=format!("{}.stage",source.hash);
+                    fs::rename(assembly.join(&source.hash[..2]).join(&name),assembly.join(&name)).unwrap();
+                }
             }
             let mut plan=RestoreBodyPlan::new(&stage).unwrap();
             plan.push(&source,false,&repository).unwrap();plan.seal().unwrap();

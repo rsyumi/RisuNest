@@ -36,6 +36,7 @@ pub struct CharXLimits {
     pub max_total_decoded_bytes: u64,
     pub max_compression_ratio: u64,
     pub max_metadata_bytes: u64,
+    pub max_staged_payloads_per_directory: usize,
 }
 
 impl Default for CharXLimits {
@@ -47,6 +48,7 @@ impl Default for CharXLimits {
             max_total_decoded_bytes: 10 * 1024 * 1024 * 1024,
             max_compression_ratio: 1_000,
             max_metadata_bytes: crate::import_export_jobs::MAX_CONTENT_METADATA_BYTES as u64,
+            max_staged_payloads_per_directory: 1_024,
         }
     }
 }
@@ -625,7 +627,8 @@ fn open_staged_payload(
         .staged_path
         .canonicalize()
         .map_err(|error| write_io_error("resolve staged CharX payload", error))?;
-    if canonical.parent() != Some(staging_root) {
+    let parent = canonical.parent();
+    if parent != Some(staging_root) && parent.and_then(Path::parent) != Some(staging_root) {
         return Err(CharXWriteError::new(
             CharXWriteErrorCode::InvalidDescriptor,
             "staged CharX payload escapes its owned directory",
@@ -898,9 +901,16 @@ where
         if entry.is_directory || entry.normalized_name == "card.json" {
             continue;
         }
-        let staged_path = staging
-            .path
-            .join(format!("{}.payload", uuid::Uuid::new_v4()));
+        // Android's ext4 has no directory index, so a single directory holding every entry makes
+        // each create and lookup scan all earlier entries. Consecutive entries share a
+        // subdirectory so each sync stays local.
+        let per_directory = limits.max_staged_payloads_per_directory.max(1);
+        let bucket = staging.path.join(format!("{:05}", payloads.len() / per_directory));
+        if payloads.len() % per_directory == 0 {
+            fs::create_dir(&bucket)
+                .map_err(|error| io_error("create CharX staging directory", error))?;
+        }
+        let staged_path = bucket.join(format!("{}.payload", uuid::Uuid::new_v4()));
         payloads.push(stage_entry(
             &mut archive,
             entry,

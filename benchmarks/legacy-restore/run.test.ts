@@ -7,7 +7,7 @@ import { fixtureCharacter, planFixture } from './fixture'
 import { runLegacyRestoreMeasurement, type ReadbackProgress } from './run'
 
 const native = vi.hoisted(() => ({ invoke: vi.fn(), remove: vi.fn(), bytes: new Uint8Array(3_000_000), offset: 0, length: 0,
-    retireActive: () => {}, activeIds: [] as string[], bufferPackets: false, nonPlainWrites: 0 }))
+    retireActive: () => {}, activeIds: [] as string[], bufferPackets: false, nonPlainWrites: 0, corruptBinary: false }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke }))
 vi.mock('@tauri-apps/api/path', () => ({ join: async (...parts: string[]) => parts.join('/') }))
 vi.mock('../../src/ts/storage/nativePaths', () => ({ nativeDataPath: async () => '/synthetic' }))
@@ -30,7 +30,8 @@ vi.mock('./fixture', async importOriginal => {
     const actual = await importOriginal<typeof import('./fixture')>()
     // Mirrors the WebView's Buffer polyfill, whose toJSON turns bytes into an object.
     class BufferLike extends Uint8Array { toJSON() { return { type: 'Buffer', data: [...this] } } }
-    return { ...actual, planFixture: (_bytes: number, prefix?: string) => actual.planFixture(2_500_000, prefix),
+    return { ...actual, planFixture: (_bytes: number, prefix?: string, binaryBytes?: number) =>
+        actual.planFixture(2_500_000, prefix, binaryBytes),
         *fixturePackets(...args: Parameters<typeof actual.fixturePackets>) {
             for (const bytes of actual.fixturePackets(...args)) yield native.bufferPackets ? new BufferLike(bytes) : bytes
         } }
@@ -43,6 +44,7 @@ beforeEach(() => {
     native.offset = native.length = 0
     native.bufferPackets = false
     native.nonPlainWrites = 0
+    native.corruptBinary = false
 })
 function installNative(corrupt = false) {
     const plan = planFixture(2_500_000)
@@ -85,6 +87,14 @@ function installNative(corrupt = false) {
             if (!value) return null
             if (corrupt) value.message[0].data = 'synthetic corruption'
             return { value }
+        }
+        if (command === 'pds_read_character') {
+            const character = active.get(args.id)
+            if (!character) return null
+            // The store returns a bin as the object JavaScript makes of a Uint8Array.
+            const value = JSON.parse(JSON.stringify(character))
+            if (native.corruptBinary) value.syntheticBinary[0] ^= 1
+            return { revision, value }
         }
         if (command === 'native_file_job_forget') return true
         throw new Error(`Unexpected command ${command}`)
@@ -212,6 +222,18 @@ describe('isolated legacy restore measurement', () => {
         expect(progress.slice(0, 3).map(event => event.stage)).toEqual([4, 5, 6])
         expect(native.invoke.mock.calls.some(([command]) => command === 'pds_read_conversation')).toBe(true)
         expect(native.remove).toHaveBeenCalledTimes(2)
+    })
+    it('verifies one restored bin when the characters carry them', async () => {
+        installNative()
+        const options = { megabytes: 100 as const, encoding: 'raw' as const, binaryBytes: 4_096,
+            assertIsolatedHarness: async () => {}, report: async () => {} }
+        expect(await runLegacyRestoreMeasurement(options)).toMatchObject({ phase: 'verified', binaryBytes: 4_096 })
+        expect(native.invoke.mock.calls.filter(([command]) => command === 'pds_read_character')).toHaveLength(1)
+        native.retireActive()
+        native.bytes.fill(0)
+        native.offset = native.length = 0
+        native.corruptBinary = true
+        await expect(runLegacyRestoreMeasurement(options)).rejects.toThrow('binary mismatch')
     })
     it('rejects incorrect readback without reporting verification', async () => {
         installNative(true)

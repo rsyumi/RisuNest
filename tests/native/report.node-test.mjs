@@ -8,4 +8,10 @@ test('native reports reject stale, incomplete, wrong-phase and failed process ev
         assert.throws(() => verifyReport({ ...report, ...changed }, 'synthetic', 'read', 0))
     }
     assert.throws(() => verifyReport(report, 'synthetic', 'read', 1))
+    // A failed run names the cause chain its failure record holds.
+    const failure = { message: 'Lua Worker could not start', causes: [{ name: 'SecurityError', message: 'Worker blocked' }] }
+    for (const status of [0, 1]) {
+        assert.throws(() => verifyReport({ ...report, success: false, error: 'Error: Lua Worker could not start', failure }, 'synthetic', 'read', status),
+            /SecurityError.*Worker blocked/)
+    }
 })

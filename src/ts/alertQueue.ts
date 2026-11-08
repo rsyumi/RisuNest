@@ -7,6 +7,11 @@ const REPEATABLE_TYPES: ReadonlySet<alertData['type']> = new Set(['normal', 'err
 /** The next queued dialog waits this long, so a double click or a repeated key cannot answer it unseen. */
 const NEXT_DIALOG_GAP_MS = 150
 
+/** Whether a published alert value is a dialog or the gap before the next queued one, rather than a status. */
+export function showsDialog(value: alertData): boolean {
+    return !!value.dialogPending || (value.type !== 'none' && !STATUS_TYPES.has(value.type))
+}
+
 interface Dialog {
     data: alertData
     closed: Promise<string>

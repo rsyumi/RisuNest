@@ -72,7 +72,7 @@ fn fixture(provider:&DownloadProvider,count:usize)->(BTreeMap<String,RemoteObjec
     (remotes,sources,expected)
 }
 fn run(future:impl std::future::Future<Output=()>) {tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    tokio::time::timeout(std::time::Duration::from_secs(20),future).await.expect("download test deadlocked");
+    tokio::time::timeout(fake::DEADLOCK_TEST_BOUND,future).await.expect("download test deadlocked");
 });}
 
 #[test]
@@ -150,6 +150,7 @@ fn turnover_keeps_placed_prefix_and_verified_siblings_on_failure_then_resumes() 
     provider.release("pack-1");
     let paths=download_packed_body_files(&sources,stage.path(),&[7;32],provider.as_ref(),&fake::repository(),&Cancellation::default()).await.unwrap();
     for (source,bytes) in sources.iter().zip(expected) {assert_eq!(fs::read(&paths[&source.hash]).unwrap(),bytes);}
+    for path in paths.values() {assert_ne!(path.parent(),Some(stage.path()),"a body was staged in the root");}
     assert_eq!(provider.inner.read_attempts("pack-0"),1);assert_eq!(provider.inner.read_attempts("pack-2"),1);assert_eq!(provider.inner.read_attempts("pack-3"),1);
 });}
 

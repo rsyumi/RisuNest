@@ -456,7 +456,7 @@
         max-width: 62ch;
         font-size: 12.5px;
         line-height: 1.55;
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
     .block-title {
         font-size: 14px;
@@ -500,7 +500,7 @@
         line-height: 1.45;
     }
     .kv dt {
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
         white-space: nowrap;
     }
     .kv dd {
@@ -584,7 +584,7 @@
         height: 2.25rem;
         border-radius: 0.5rem;
         background: var(--risu-theme-darkbg);
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .choice[data-checked='true'] .choice-icon {
         background: color-mix(in srgb, var(--risu-theme-primary-500) 18%, var(--risu-theme-bgcolor));
@@ -634,7 +634,7 @@
         min-width: 0;
         font-size: 12.5px;
         line-height: 1rem;
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
     .value-pending {
         flex: none;

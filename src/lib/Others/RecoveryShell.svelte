@@ -137,7 +137,7 @@
     <div class="mx-auto flex w-full max-w-3xl flex-col p-4 sm:p-6">
         <header>
             <h1 class="text-2xl font-bold">{strings.title}</h1>
-            <p class="mt-1 text-sm text-textcolor2">
+            <p class="mt-1 text-sm text-subtext">
                 {recovery.mode === 'choose' ? strings.chooseHelp : strings.recoveryHelp}
             </p>
         </header>
@@ -176,7 +176,7 @@
                     {#snippet below()}
                         {#if exportMessage}
                             <p
-                                class="mt-1.5 text-sm {exportMessage === strings.exportFailed ? 'text-danger-400' : 'text-textcolor2'}"
+                                class="mt-1.5 text-sm {exportMessage === strings.exportFailed ? 'text-danger-400' : 'text-subtext'}"
                                 role="status"
                             >{exportMessage}</p>
                         {/if}

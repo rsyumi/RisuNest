@@ -457,6 +457,7 @@ describe('common backup file production route', () => {
         expect(m.save.mock.calls[0][0].filters[0].extensions).toEqual([
             'risunest',
         ])
+        expect(m.save.mock.calls[0][0].defaultPath).toMatch(/^risunest-\d{4}(-\d{2}){5}\.risunest$/)
     })
     it('provides the account warning only when native source preservation requests confirmation', async () => {
         await exportPortableBackupFromSystemPicker()

@@ -558,7 +558,8 @@ struct Dependency {
 const CODEC: &str = "logical-v1";
 const PAGE: i64 = 128;
 const GC_SCAN_LIMIT: i64 = 128;
-const GC_DELETE_LIMIT: usize = 16;
+/// Registrations one cache cleanup removes at most.
+pub(super) const GC_DELETE_LIMIT: usize = 16;
 const GC_REFERENCE_LIMIT: i64 = 32;
 
 fn invalid(message: &str) -> StoreError {
@@ -775,11 +776,11 @@ impl PersistentStore {
         Ok(())
     }
 
-    /// Whether a registration was removed, which is when bodies may have
-    /// become unreferenced.
-    fn cleanup_capture_cache(&mut self, keep: &str) -> StoreResult<bool> {
+    /// How many registrations were removed, which is when bodies may have
+    /// become unreferenced. At `GC_DELETE_LIMIT` more may be left.
+    pub(super) fn cleanup_capture_cache(&mut self, keep: &str) -> StoreResult<usize> {
         self.cleanup_terminal_capture_references()?;
-        let mut removed = false;
+        let mut removed = 0;
         let mut paths = Vec::new();
         {
             let tx = self.connection.transaction()?;
@@ -816,7 +817,7 @@ impl PersistentStore {
                     [&id],
                 )?;
                 tx.execute("DELETE FROM external_storage_captures WHERE id=?1", [&id])?;
-                removed = true;
+                removed += 1;
                 if let Some(path) = path {
                     paths.push(PathBuf::from(path));
                 }
@@ -1204,7 +1205,7 @@ impl PersistentStore {
             )?;
             content_change_index::prune(&tx)?;
             tx.commit()?;
-            if !probe.is_cancelled() && self.cleanup_capture_cache(&candidate.id)? {
+            if !probe.is_cancelled() && self.cleanup_capture_cache(&candidate.id)? > 0 {
                 self.collect_released_external_content();
             }
             return Ok(CapturedSnapshot {
@@ -1277,7 +1278,7 @@ impl PersistentStore {
         let projected_records = prepared.project(&mut catalog, probe)?;
         check(probe)?;
         let capture_id = prepared.register(self, &catalog, &scope_id, CODEC)?;
-        if !probe.is_cancelled() && self.cleanup_capture_cache(&capture_id)? {
+        if !probe.is_cancelled() && self.cleanup_capture_cache(&capture_id)? > 0 {
             self.collect_released_external_content();
         }
         Ok(CapturedSnapshot {

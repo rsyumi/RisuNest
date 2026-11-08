@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, unmount, tick } from 'svelte'
 import { language } from 'src/lang'
+import { NativeExportError } from 'src/ts/storage/nativeExportFile'
 const mock = vi.hoisted(() => ({ call: vi.fn(), download: vi.fn() }))
 vi.mock('src/ts/network/networkLog', async original => ({ ...await original<typeof import('src/ts/network/networkLog')>(), networkLog: mock.call, downloadNetworkLog: mock.download }))
 import Component from './RisuNestNetworkLog.svelte'
@@ -84,6 +85,9 @@ describe('native network settings', () => {
         button(t.copy).click(); await settle(); expect(writeText).toHaveBeenCalledWith('hello')
         button(t.keep).click(); await settle(); expect(mock.call).toHaveBeenCalledWith({ op: 'retain', id: 'synthetic' })
         button(t.download).click(); await settle(); expect(mock.download).toHaveBeenCalledWith('synthetic')
+        mock.download.mockRejectedValueOnce(Object.assign(new NativeExportError('network-log-export-failed'), { warningCodes: ['partial-destination-may-remain'] }))
+        button(t.download).click(); await settle()
+        expect(host.textContent).toContain(`${t.exportFailed} ${language.screenshotPartialDestinationMayRemain}`)
     })
     it('shows SSE sequence and arrival times across pages without marking a known boundary partial', async () => {
         const original = mock.call.getMockImplementation()!

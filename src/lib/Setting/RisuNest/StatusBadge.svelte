@@ -40,7 +40,7 @@
         color: color-mix(in srgb, var(--risu-theme-danger-400) 65%, var(--risu-theme-textcolor));
     }
     .status[data-tone='idle'] {
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .status-dot {
         flex: none;

@@ -23,6 +23,7 @@ import {
 } from './nativeFileJobs'
 import type { NativeFileOperationSource } from './nativeFileJobManager'
 import { basenameOf } from './nativeFileSourceInfo'
+import { localFileStamp } from '../localFileStamp'
 import type {
     PinnedRisuSaveExport,
     RisuSaveExportRuntime,
@@ -352,7 +353,7 @@ export interface RisuSaveFileRouteResult {
 }
 
 function defaultExportName(): string {
-    return `risunest-${new Date().toISOString().replace(/[:.]/g, '-')}.risudat`
+    return `risunest-${localFileStamp(Date.now())}.risudat`
 }
 
 function isCapabilityUnavailable(error: unknown): boolean {

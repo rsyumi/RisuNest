@@ -74,5 +74,5 @@
     </div>
 {:else if item.type === 'number'}
     <NumberInput size="sm" min={item.options?.min} max={item.options?.max} ariaLabel={getLabel(item)} className="w-28 text-right" bind:value={localValue} />
-    {#if unit}<span class="text-sm text-textcolor2">{unit}</span>{/if}
+    {#if unit}<span class="text-sm text-subtext">{unit}</span>{/if}
 {/if}

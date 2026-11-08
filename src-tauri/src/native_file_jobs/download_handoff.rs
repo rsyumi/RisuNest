@@ -104,18 +104,55 @@ pub(crate) fn native_download_handoff_cleanup(
     )
 }
 
-pub(crate) fn write_native(state: &NativeFileJobState, write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> Result<(), String>) -> Result<String, String> {
-    let path = create(&state.root).map_err(|_| "network-log-export-failed")?;
+/// Writes a natively produced download to a new handoff for a mobile picker
+/// to copy from; `failed` is the code every write failure returns.
+pub(crate) fn write_native(state: &NativeFileJobState, failed: &str, write: impl FnOnce(&mut dyn Write) -> Result<(), String>) -> Result<String, String> {
+    let path = create(&state.root).map_err(|_| failed.to_owned())?;
     let result = (|| {
-        let output = OpenOptions::new().write(true).open(&path).map_err(|_| "network-log-export-failed")?;
+        let output = OpenOptions::new().write(true).open(&path).map_err(|_| failed.to_owned())?;
         let mut writer = std::io::BufWriter::new(output);
         write(&mut writer)?;
-        writer.flush().map_err(|_| "network-log-export-failed")?;
-        writer.get_ref().sync_all().map_err(|_| "network-log-export-failed")?;
+        writer.flush().map_err(|_| failed.to_owned())?;
+        writer.get_ref().sync_all().map_err(|_| failed.to_owned())?;
         Ok::<_, String>(())
     })();
     if let Err(error) = result { let _ = fs::remove_file(&path); return Err(error); }
     Ok(path)
+}
+
+/// Writes a natively produced download to the path a desktop picker chose.
+/// The path must be absolute and outside the app's own folders, and an
+/// existing file there is replaced only once the whole download is written.
+/// Returns the bytes written.
+#[cfg(desktop)]
+pub(crate) fn write_destination(
+    owned_roots: &[std::path::PathBuf],
+    destination: &str,
+    invalid: &str,
+    failed: &str,
+    write: impl FnOnce(&mut dyn Write) -> Result<(), String>,
+) -> Result<u64, String> {
+    let destination = std::path::PathBuf::from(destination);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid.to_owned())?
+        .canonicalize()
+        .map_err(|_| invalid.to_owned())?;
+    if !destination.is_absolute()
+        || owned_roots.iter().any(|root| root.canonicalize().is_ok_and(|root| parent.starts_with(root)))
+    {
+        return Err(invalid.to_owned());
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(&parent).map_err(|_| failed.to_owned())?;
+    {
+        let mut writer = std::io::BufWriter::new(temporary.as_file_mut());
+        write(&mut writer)?;
+        writer.flush().map_err(|_| failed.to_owned())?;
+    }
+    temporary.as_file().sync_all().map_err(|_| failed.to_owned())?;
+    let bytes = temporary.as_file().metadata().map_err(|_| failed.to_owned())?.len();
+    temporary.persist(destination).map_err(|_| failed.to_owned())?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -204,5 +241,48 @@ mod tests {
         fs::remove_file(&created).unwrap();
         assert_eq!(code(append(&root, &created, 0, &piece)), "invalid-state");
         assert!(!created.exists());
+    }
+
+    #[cfg(desktop)]
+    fn write_text(owned: &[PathBuf], destination: &Path, text: &'static str) -> Result<u64, String> {
+        write_destination(owned, destination.to_str().unwrap(), "invalid", "failed", |writer| {
+            writer.write_all(text.as_bytes()).map_err(|_| "failed".to_owned())
+        })
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_chosen_destination_is_replaced_only_by_a_whole_download() {
+        let directory = TempDir::new().unwrap();
+        let chosen = directory.path().join("chosen");
+        fs::create_dir_all(&chosen).unwrap();
+        let destination = chosen.join("export.txt");
+        fs::write(&destination, b"earlier").unwrap();
+
+        assert_eq!(write_text(&[], &destination, "whole download").unwrap(), 14);
+        assert_eq!(fs::read(&destination).unwrap(), b"whole download");
+
+        let failed = write_destination(&[], destination.to_str().unwrap(), "invalid", "failed", |writer| {
+            writer.write_all(b"partial").map_err(|_| "failed".to_owned())?;
+            Err("producer-failed".to_owned())
+        });
+        assert_eq!(failed.unwrap_err(), "producer-failed");
+        assert_eq!(fs::read(&destination).unwrap(), b"whole download");
+        assert_eq!(fs::read_dir(&chosen).unwrap().count(), 1);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn a_destination_inside_the_app_folders_or_relative_is_refused() {
+        let directory = TempDir::new().unwrap();
+        let owned = directory.path().join("app-data");
+        fs::create_dir_all(owned.join("logs")).unwrap();
+        let inside = owned.join("logs").join("risunest.log");
+        fs::write(&inside, b"source").unwrap();
+
+        assert_eq!(write_text(&[owned.clone()], &inside, "overwrite").unwrap_err(), "invalid");
+        assert_eq!(fs::read(&inside).unwrap(), b"source");
+        assert_eq!(write_text(&[owned.clone()], Path::new("export.txt"), "relative").unwrap_err(), "invalid");
+        assert_eq!(write_text(&[owned], &directory.path().join("missing").join("export.txt"), "x").unwrap_err(), "invalid");
     }
 }

@@ -634,6 +634,17 @@ impl JobCommandState {
         BackgroundWorker(self.background_workers.clone())
     }
 
+    /// One step of background maintenance that cleanup waits for, or `None`
+    /// once cleanup has begun. Checked under the lock `cleanup_drained` reads
+    /// the workers under, so a step never starts after cleanup saw none.
+    pub(crate) fn background_step(&self) -> Option<BackgroundWorker> {
+        let _active = self.active.lock().ok()?;
+        if self.cleanup_closed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some(self.track_worker())
+    }
+
     pub(crate) fn begin_cleanup(&self) -> Result<()> {
         let active = self.active.lock().map_err(failure)?;
         self.cleanup_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -829,16 +840,22 @@ mod tests {
         let job = DurableJob::new(request(), 1, identity());
         let (cancel, claim) = state.claim(&job).unwrap();
         let worker = state.track_worker();
+        let step = state.background_step().unwrap();
         state.begin_cleanup().unwrap();
         assert!(cancel.check().is_err());
         assert!(state.claim(&job).is_err());
+        // Background maintenance takes no new step once cleanup has begun.
+        assert!(state.background_step().is_none());
         drop(claim);
         assert!(!state.cleanup_drained().unwrap());
         assert!(state.finish_cleanup().is_err());
         drop(worker);
+        assert!(!state.cleanup_drained().unwrap());
+        drop(step);
         assert!(state.cleanup_drained().unwrap());
         state.finish_cleanup().unwrap();
         assert!(state.claim(&job).is_ok());
+        assert!(state.background_step().is_some());
     }
 
     #[test]

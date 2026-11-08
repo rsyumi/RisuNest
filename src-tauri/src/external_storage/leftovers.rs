@@ -9,11 +9,12 @@ use super::{
     runtime_restore::discard_finished_staging,
 };
 use crate::trust_boundary::is_link_like;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 use std::{
     collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 fn connection_directories(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
@@ -120,6 +121,51 @@ pub(crate) fn remove_at_startup(root: &Path) {
     }
     if let Err(error) = remove_unowned(root) {
         crate::nlog!("warn", "External storage leftovers were not removed: {error}");
+    }
+}
+
+/// How long a collection step waits for native file admission another
+/// operation holds.
+const COLLECTION_BUSY_RETRY: Duration = Duration::from_secs(30);
+
+/// Collects what earlier runs released and left: capture registrations no job
+/// holds and the bodies and directories only they named. Runs once the
+/// renderer has opened the store, a bounded step at a time, each under native
+/// file admission so no capture or replacement runs meanwhile.
+pub(crate) fn collect_released_content_later<R: Runtime>(app: &AppHandle<R>) {
+    let (Some(_), Some(files)) = (
+        app.try_state::<JobCommandState>(),
+        app.try_state::<crate::native_file_jobs::NativeFileJobState>(),
+    ) else {
+        return;
+    };
+    let admission = files.admission.clone();
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("external-content-collection".into())
+        .spawn(move || loop {
+            let Some(step) = app.state::<JobCommandState>().background_step() else {
+                return;
+            };
+            let Ok(permit) = admission.file(false) else {
+                drop(step);
+                std::thread::sleep(COLLECTION_BUSY_RETRY);
+                continue;
+            };
+            let collected = super::runtime::native_store(&app)
+                .and_then(|mut pds| pds.collect_released_captures().map_err(local_error));
+            drop(permit);
+            match collected {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    crate::nlog!("warn", "Released external content was not collected: {error}");
+                    return;
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        crate::nlog!("warn", "Released external content collection did not start: {error}");
     }
 }
 

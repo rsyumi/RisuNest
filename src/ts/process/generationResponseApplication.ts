@@ -210,10 +210,6 @@ export async function applyGenerationResponse(
             const prefix = options.continueGeneration ? initialOutput.data : ''
             const outputMessageId = outputTarget.messageId
             const performanceMode = options.streamingDisplayOptimizationMode()
-            if (targetChat.id) setStreamingConversation(targetChat.id, performanceMode)
-            targetChat.isStreaming = true
-            targetChat.activeStreamingDisplayOptimizationMode = performanceMode
-            options.operation.incrementReloadKeys()
             const processStreamingSnapshot = async (
                 snapshot: string,
                 cache: 'normal' | 'bypass',
@@ -245,6 +241,13 @@ export async function applyGenerationResponse(
                 : null)
             let streamCompleted = false
             try {
+                if (targetChat.id) setStreamingConversation(targetChat.id, performanceMode)
+                // The session records the flags, so a save before the first streamed edit covers the response.
+                outputTarget.commitMetadata({
+                    isStreaming: true,
+                    activeStreamingDisplayOptimizationMode: performanceMode,
+                })
+                options.operation.incrementReloadKeys()
                 if (displayWork.ready) await displayWork.ready
                 const streamResult = await consumeStreamingDisplayStream({
                     mode: performanceMode,
@@ -291,8 +294,10 @@ export async function applyGenerationResponse(
                 checkpoints?.stop()
                 displayWork.release()
                 if (targetChat.id) clearStreamingConversation(targetChat.id)
-                targetChat.isStreaming = false
-                targetChat.activeStreamingDisplayOptimizationMode = undefined
+                outputTarget.commitMetadata({
+                    isStreaming: false,
+                    activeStreamingDisplayOptimizationMode: undefined,
+                })
                 options.operation.incrementReloadKeys()
             }
 

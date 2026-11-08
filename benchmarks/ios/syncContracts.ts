@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { SyncDriver, SyncStepError, redact } from "../sync-ui/driver";
+import { SyncDriver, SyncStepError, redact, syncFailureRecord } from "../sync-ui/driver";
 import { publishLibrary, receiveAndPush, reconnectAndPull } from "../sync-ui/roundTrip";
 import { initialize } from "./contracts";
 
@@ -40,7 +40,7 @@ export async function syncContract(phase: "sync" | "sync-restart" | "sync-publis
   } catch (error) {
     const detail = error instanceof SyncStepError ? error.detail : { label: "sync-result", step: "unknown" };
     const message = error instanceof Error ? redact(error.message) : "failed";
-    await report("failure", { passed: false, message, detail }).catch(() => {});
+    await report("failure", { passed: false, ...syncFailureRecord(error), message, detail }).catch(() => {});
     overlay.textContent = `sync-result:failed:${JSON.stringify({ phase, ...detail, message })}`;
   }
 }

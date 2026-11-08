@@ -17,6 +17,7 @@
     import { selectSingleFile } from "src/ts/util";
     import { doingChat, previewFormated, previewBody, sendChat } from "src/ts/process/index.svelte";
     import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
+    import { setSelectedChatVariable } from "src/ts/process/selectedChatVariables";
     import {
         acquireCompleteConversation,
         captureSelectedConversationTarget,
@@ -156,9 +157,9 @@
                 {#if typeof DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] === "object"}
                     <div class="p-2 text-center">Object</div>
                 {:else if typeof DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] === "string"}
-                    <TextInput bind:value={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] as string} />
+                    <TextInput value={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] as string} oninput={(event) => setSelectedChatVariable(key.slice(1), event.currentTarget.value)} />
                 {:else if typeof DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] === "number"}
-                    <NumberInput bind:value={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] as number} />
+                    <NumberInput value={DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].scriptstate[key] as number} onChange={(event) => setSelectedChatVariable(key.slice(1), event.currentTarget.value)} />
                 {/if}
             {/each}
         {:else}

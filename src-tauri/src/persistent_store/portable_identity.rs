@@ -1,4 +1,5 @@
 use super::lww::{SourceLayer, REMAPPED_SOURCE, STAGED_SOURCE};
+use super::stored_json::{self, Depth, Document, Object, Raw};
 use super::{PersistentStore, StoreResult};
 use risunest_sync_wire::unit::{UnitKey, UnitValue};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -78,28 +79,78 @@ impl IdentityRemap {
         if let Some(order) = value.get_mut("characterOrder") {
             self.order(order, "character", None);
         }
-        for (field, kind) in [
-            ("personas", "persona"),
-            ("modules", "modules"),
-            ("loadouts", "loadouts"),
-            ("customModels", "customModels"),
-        ] {
+        for (field, kind) in ROOT_RECORDS {
             if let Some(records) = value.get_mut(field).and_then(Value::as_array_mut) {
                 for record in records {
-                    self.field(record, "id", kind);
-                    if kind == "loadouts" {
-                        self.list(record, "characterIds", "character");
-                        self.list(record, "modules", "modules");
-                        self.field(record, "personaId", "persona");
-                    }
-                    if kind == "persona" {
-                        if let Some(module) = record.get_mut("embeddedModule") {
-                            self.field(module, "id", "modules");
-                        }
-                    }
+                    self.record(kind, record);
                 }
             }
         }
+    }
+    fn record(&self, kind: &str, record: &mut Value) {
+        self.field(record, "id", kind);
+        if kind == "loadouts" {
+            self.list(record, "characterIds", "character");
+            self.list(record, "modules", "modules");
+            self.field(record, "personaId", "persona");
+        }
+        if kind == "persona" {
+            if let Some(module) = record.get_mut("embeddedModule") {
+                self.field(module, "id", "modules");
+            }
+        }
+    }
+    /// The stored root text with `root` applied, as `serde_json::to_string`
+    /// writes the edited value. Records are written from their text.
+    fn root_text(&self, text: &str) -> StoreResult<String> {
+        let document = Document::parse(text, Depth::Limited)?;
+        let mut out = Vec::new();
+        let Some(root) = document.value().object()? else {
+            document.value().write_json(&mut out)?;
+            return stored_json::text(out);
+        };
+        stored_json::write_json_object(root.members(), &mut out, |name, member, out| {
+            let Some((_, kind)) = ROOT_RECORDS.iter().find(|(field, _)| *field == name) else {
+                return edit_member(name, member, out, ROOT_REMAPPED, |value| self.root(value));
+            };
+            let Some(records) = member.elements()? else {
+                return member.write_json(out);
+            };
+            out.push(b'[');
+            for (index, record) in records.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                let Some(record) = record.object()? else {
+                    record.write_json(out)?;
+                    continue;
+                };
+                write_edited(&record, out, &["id", "characterIds", "modules", "personaId"], |name, member, out| {
+                    if *kind == "persona" && name == "embeddedModule" {
+                        if let Some(module) = member.object()? {
+                            return write_edited(&module, out, &["id"], |_, member, out| member.write_json(out), |value| {
+                                self.field(value, "id", "modules")
+                            });
+                        }
+                    }
+                    member.write_json(out)
+                }, |value| self.record(kind, value))?;
+            }
+            out.push(b']');
+            Ok(())
+        })?;
+        stored_json::text(out)
+    }
+    /// A stored record text with `edit` applied to the members it changes,
+    /// `names`, as `serde_json::to_string` writes the edited value.
+    fn detail_text(text: &str, names: &[&str], edit: impl Fn(&mut Value)) -> StoreResult<String> {
+        let document = Document::parse(text, Depth::Limited)?;
+        let mut out = Vec::new();
+        match document.value().object()? {
+            Some(record) => write_edited(&record, &mut out, names, |_, member, out| member.write_json(out), edit)?,
+            None => document.value().write_json(&mut out)?,
+        }
+        stored_json::text(out)
     }
     fn models(&self, value: &mut Value) {
         for field in ["aiModel", "subModel"] {
@@ -246,28 +297,20 @@ impl PersistentStore {
         for id in &presets {
             candidates.insert(("preset".to_owned(), id.clone()));
         }
-        for root in json_rows(&tx, "SELECT value FROM root WHERE generation=?1", staging)? {
-            for (field, kind) in [
-                ("personas", "persona"),
-                ("modules", "modules"),
-                ("loadouts", "loadouts"),
-                ("customModels", "customModels"),
-            ] {
-                for record in root
-                    .get(field)
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(id) = record.get("id").and_then(Value::as_str) {
-                        candidates.insert((kind.to_owned(), id.to_owned()));
+        for root in identity_rows(&tx, "SELECT value FROM root WHERE generation=?1", staging)? {
+            let root = Document::parse(&root, Depth::Limited)?;
+            let root = root.value().object()?;
+            for (field, kind) in ROOT_RECORDS {
+                let records = root.as_ref().and_then(|root| root.get(field)).map(Raw::elements).transpose()?;
+                for record in records.flatten().unwrap_or_default() {
+                    let Some(record) = record.object()? else { continue };
+                    if let Some(id) = text_member(&record, "id")? {
+                        candidates.insert((kind.to_owned(), id));
                     }
-                    if let Some(id) = record
-                        .get("embeddedModule")
-                        .and_then(|m| m.get("id"))
-                        .and_then(Value::as_str)
-                    {
-                        candidates.insert(("modules".to_owned(), id.to_owned()));
+                    if let Some(module) = record.get("embeddedModule").map(Raw::object).transpose()?.flatten() {
+                        if let Some(id) = text_member(&module, "id")? {
+                            candidates.insert(("modules".to_owned(), id));
+                        }
                     }
                 }
             }
@@ -318,12 +361,11 @@ impl PersistentStore {
             tx.commit()?;
             return Ok(staged_source.then_some(STAGED_SOURCE));
         }
-        let rows = json_rows(&tx, "SELECT value FROM root WHERE generation=?1", staging)?;
-        for mut value in rows {
-            map.root(&mut value);
+        let rows = identity_rows(&tx, "SELECT value FROM root WHERE generation=?1", staging)?;
+        for text in rows {
             tx.execute(
                 "UPDATE root SET value=?2 WHERE generation=?1",
-                params![staging, serde_json::to_string(&value)?],
+                params![staging, map.root_text(&text)?],
             )?;
         }
         for id in presets {
@@ -332,16 +374,17 @@ impl PersistentStore {
                 params![staging, id],
                 |r| r.get(0),
             )?;
-            let mut value: Value = serde_json::from_str(&raw)?;
-            map.field(&mut value, "id", "preset");
-            map.models(&mut value);
+            let value = IdentityRemap::detail_text(&raw, PRESET_REMAPPED, |value| {
+                map.field(value, "id", "preset");
+                map.models(value);
+            })?;
             tx.execute(
                 "UPDATE bot_presets SET preset_id=?3,value=?4 WHERE generation=?1 AND preset_id=?2",
                 params![
                     staging,
                     id,
                     map.id("preset", &id),
-                    serde_json::to_string(&value)?
+                    value
                 ],
             )?;
         }
@@ -351,8 +394,7 @@ impl PersistentStore {
                 params![staging, id],
                 |r| r.get(0),
             )?;
-            let mut value: Value = serde_json::from_str(&raw)?;
-            map.character(&mut value);
+            let value = IdentityRemap::detail_text(&raw, &["chaId", "modules"], |value| map.character(value))?;
             let archive: Option<String> = tx.query_row(
                 "SELECT archived_object FROM characters WHERE generation=?1 AND character_id=?2",
                 params![staging, id],
@@ -365,7 +407,7 @@ impl PersistentStore {
                     Ok(serde_json::to_string(&archived)?)
                 })
                 .transpose()?;
-            tx.execute("UPDATE characters SET character_id=?3,detail=?4,archived_object=?5 WHERE generation=?1 AND character_id=?2",params![staging,id,map.id("character",&id),serde_json::to_string(&value)?,archive])?;
+            tx.execute("UPDATE characters SET character_id=?3,detail=?4,archived_object=?5 WHERE generation=?1 AND character_id=?2",params![staging,id,map.id("character",&id),value,archive])?;
         }
         let chats = {
             let mut q = tx.prepare(
@@ -380,9 +422,8 @@ impl PersistentStore {
         };
         for (owner, id) in chats {
             let raw: String = tx.query_row("SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![staging,owner,id],|r|r.get(0))?;
-            let mut value = serde_json::from_str(&raw)?;
-            map.chat(&owner, &mut value);
-            tx.execute("UPDATE conversations SET character_id=?4,conversation_id=?5,detail=?6 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![staging,owner,id,map.id("character",&owner),map.conversation(&owner,&id),serde_json::to_string(&value)?])?;
+            let value = IdentityRemap::detail_text(&raw, &["id", "bindedPersona", "modules"], |value| map.chat(&owner, value))?;
+            tx.execute("UPDATE conversations SET character_id=?4,conversation_id=?5,detail=?6 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![staging,owner,id,map.id("character",&owner),map.conversation(&owner,&id),value])?;
         }
         let message_owners = {
             let mut q = tx.prepare(
@@ -468,11 +509,74 @@ fn identity_rows(db: &Connection, sql: &str, generation: &str) -> StoreResult<Ve
     Ok(rows)
 }
 
-fn json_rows(db: &Connection, sql: &str, generation: &str) -> StoreResult<Vec<Value>> {
-    identity_rows(db, sql, generation)?
-        .into_iter()
-        .map(|raw| Ok(serde_json::from_str(&raw)?))
-        .collect()
+/// The root collections whose records carry identities, with their kinds.
+const ROOT_RECORDS: [(&str, &str); 4] = [
+    ("personas", "persona"),
+    ("modules", "modules"),
+    ("loadouts", "loadouts"),
+    ("customModels", "customModels"),
+];
+/// The root fields besides `ROOT_RECORDS` that `IdentityRemap::root` changes.
+const ROOT_REMAPPED: &[&str] = &[
+    "botPresetsId",
+    "selectedPersona",
+    "enabledModules",
+    "aiModel",
+    "subModel",
+    "seperateModels",
+    "seperateModelsForAxModels",
+    "fallbackModels",
+    "characterOrder",
+];
+/// The preset fields a remap changes.
+const PRESET_REMAPPED: &[&str] = &[
+    "id",
+    "aiModel",
+    "subModel",
+    "seperateModels",
+    "seperateModelsForAxModels",
+    "fallbackModels",
+];
+
+fn text_member(object: &Object<'_>, name: &str) -> StoreResult<Option<String>> {
+    Ok(object.get(name).map(Raw::as_str).transpose()?.flatten().map(|text| text.into_owned()))
+}
+
+/// Writes a member, applying `edit` to it as the only member of an object when
+/// it is one of `names`. Every edit changes members independently of each
+/// other, so this writes what editing the whole object would.
+fn edit_member(
+    name: &str,
+    member: Raw<'_>,
+    out: &mut Vec<u8>,
+    names: &[&str],
+    edit: impl FnOnce(&mut Value),
+) -> StoreResult<()> {
+    if !names.contains(&name) {
+        return member.write_json(out);
+    }
+    let mut value = Value::Object(serde_json::Map::from_iter([(name.to_owned(), member.parse_value()?)]));
+    edit(&mut value);
+    serde_json::to_writer(&mut *out, &value[name])?;
+    Ok(())
+}
+
+/// Writes an object with `edit` applied to its members named in `names`, and
+/// every other member written by `write_member`.
+fn write_edited<'r>(
+    object: &Object<'r>,
+    out: &mut Vec<u8>,
+    names: &[&str],
+    mut write_member: impl FnMut(&str, Raw<'r>, &mut Vec<u8>) -> StoreResult<()>,
+    edit: impl Fn(&mut Value),
+) -> StoreResult<()> {
+    stored_json::write_json_object(object.members(), out, |name, member, out| {
+        if names.contains(&name) {
+            edit_member(name, member, out, names, &edit)
+        } else {
+            write_member(name, member, out)
+        }
+    })
 }
 
 fn remap_key(staging: &str) -> String {
@@ -921,5 +1025,64 @@ mod tests {
             remap_unit(&store.connection, &IdentityRemap::default(), &opaque.0, opaque.1.clone()).unwrap(),
             opaque
         );
+    }
+
+    #[test]
+    fn remapped_texts_are_what_the_remapped_values_write() {
+        let mut map = IdentityRemap::default();
+        for (kind, id) in [
+            ("preset", "preset"),
+            ("persona", "persona"),
+            ("modules", "module"),
+            ("modules", "embedded"),
+            ("loadouts", "loadout"),
+            ("customModels", "model"),
+            ("character", "char"),
+        ] {
+            map.records.entry(kind.into()).or_default().insert(id.into(), format!("fresh-{id}"));
+        }
+        map.conversations.entry("char".into()).or_default().insert("chat".into(), "fresh-chat".into());
+        let binary = (0..40).map(|index| format!("\"{index}\":{}", index % 256)).collect::<Vec<_>>().join(",");
+        let roots = [
+            format!(
+                r#"{{"username":"aé","botPresetsId":"preset","selectedPersona":"persona","aiModel":"model","subModel":"other",
+                "enabledModules":["module","other",3],"seperateModels":{{"memory":"model","x":1}},"fallbackModels":["model"],
+                "seperateModelsForAxModels":"model","characterOrder":["char",{{"name":"f","data":["char","x"]}},{{"ids":["char"]}}],
+                "modules":[{{"id":"module","binary":{{{binary}}},"modules":["module"]}},{{"name":"no id"}},5],
+                "personas":[{{"id":"persona","embeddedModule":{{"binary":{{{binary}}},"id":"embedded","id":"module"}}}},{{"id":"x","embeddedModule":"embedded"}}],
+                "loadouts":[{{"id":"loadout","characterIds":["char"],"modules":["module"],"personaId":"persona","n":-0}}],
+                "customModels":[{{"id":"model","binary":{{{binary}}}}}],"botPresetsId":"persona","n":1E5}}"#
+            ),
+            r#"{"modules":{"id":"module"},"personas":[],"characterOrder":"char"}"#.into(),
+            r#"{"$serde_json::private::RawValue":"{\"modules\":[{\"id\":\"module\"}]}"}"#.into(),
+            "[]".into(),
+            "{}".into(),
+        ];
+        for text in &roots {
+            let mut value: Value = serde_json::from_str(text).unwrap();
+            map.root(&mut value);
+            assert_eq!(map.root_text(text).unwrap(), serde_json::to_string(&value).unwrap(), "{text}");
+        }
+        let details = [
+            format!(r#"{{"chaId":"char","modules":["module"],"binary":{{{binary}}},"id":"chat","bindedPersona":"persona","aiModel":"model","n":-0.0}}"#),
+            r#"{"chaId":3,"id":["chat"],"modules":"module","chaId":"char"}"#.into(),
+            r#"{"$serde_json::private::RawValue":"{\"chaId\":\"char\"}"}"#.into(),
+            r#""char""#.into(),
+        ];
+        let edits: [(&[&str], &dyn Fn(&mut Value)); 3] = [
+            (&["chaId", "modules"], &|value| map.character(value)),
+            (&["id", "bindedPersona", "modules"], &|value| map.chat("char", value)),
+            (PRESET_REMAPPED, &|value| {
+                map.field(value, "id", "preset");
+                map.models(value);
+            }),
+        ];
+        for text in &details {
+            for (names, edit) in &edits {
+                let mut value: Value = serde_json::from_str(text).unwrap();
+                edit(&mut value);
+                assert_eq!(IdentityRemap::detail_text(text, names, edit).unwrap(), serde_json::to_string(&value).unwrap(), "{text}");
+            }
+        }
     }
 }

@@ -87,11 +87,11 @@
                 <div class="flex items-baseline justify-between gap-3">
                     <h2 id="native-file-job-dialog-title" class="text-lg font-bold">{model.title}</h2>
                     {#if model.subtitle}
-                        <span class="shrink-0 text-sm text-textcolor2">{model.subtitle}</span>
+                        <span class="shrink-0 text-sm text-subtext">{model.subtitle}</span>
                     {/if}
                 </div>
                 {#if model.sourceName || model.elapsed}
-                    <div class="flex items-center justify-between gap-3 text-sm text-textcolor2">
+                    <div class="flex items-center justify-between gap-3 text-sm text-subtext">
                         <span class="truncate">{model.sourceName}{#if model.sourceName && model.sourceSize}{' · '}{model.sourceSize}{/if}</span>
                         <span class="shrink-0 tabular-nums">{model.elapsed}</span>
                     </div>
@@ -102,15 +102,15 @@
                 <div class="flex flex-col gap-1 text-sm" role="status">
                     <p
                         class:text-success-500={model.terminal.state === 'succeeded'}
-                        class:text-textcolor2={model.terminal.state === 'cancelled'}
+                        class:text-subtext={model.terminal.state === 'cancelled'}
                         class:text-danger-400={model.terminal.state === 'failed'}>
                         {model.terminal.summary}
                     </p>
                     {#if model.terminal.reason}
-                        <p class="text-textcolor2">{model.terminal.reason}</p>
+                        <p class="text-subtext">{model.terminal.reason}</p>
                     {/if}
                     {#if model.terminal.location}
-                        <p class="text-textcolor2 break-words">{model.terminal.location}</p>
+                        <p class="text-subtext break-words">{model.terminal.location}</p>
                     {/if}
                     {#if model.terminal.failedFiles.length > 0}
                         <ul class="mt-1 flex max-h-40 flex-col gap-1 overflow-y-auto" data-testid="native-file-job-failed-files">
@@ -118,7 +118,7 @@
                                 <li class="flex flex-col">
                                     <span class="truncate">{file.name}</span>
                                     {#if file.reason}
-                                        <span class="text-textcolor2">{file.reason}</span>
+                                        <span class="text-subtext">{file.reason}</span>
                                     {/if}
                                 </li>
                             {/each}
@@ -148,9 +148,9 @@
                             {:else}
                                 <span class="inline-block size-4 shrink-0 rounded-full border border-darkborderc"></span>
                             {/if}
-                            <span class="grow truncate" class:text-textcolor2={row.state === 'pending'}>{row.label}</span>
+                            <span class="grow truncate" class:text-subtext={row.state === 'pending'}>{row.label}</span>
                             {#if row.detail && !model.compact}
-                                <span class="shrink-0 text-xs tabular-nums text-textcolor2">{row.detail}</span>
+                                <span class="shrink-0 text-xs tabular-nums text-subtext">{row.detail}</span>
                             {/if}
                         </li>
                     {/each}
@@ -158,14 +158,14 @@
             {/if}
 
             {#if model.currentItem}
-                <p class="truncate font-mono text-xs text-textcolor2">{model.currentItem}</p>
+                <p class="truncate font-mono text-xs text-subtext">{model.currentItem}</p>
             {/if}
 
             {#if model.counters.length > 0}
                 <dl class={model.compact ? "flex text-sm" : "grid grid-cols-2 gap-2 text-sm sm:grid-cols-4"}>
                     {#each model.counters as counter (counter.key)}
                         <div class="flex flex-col rounded-md border border-darkborderc bg-bgcolor px-2 py-1">
-                            <dt class="text-xs text-textcolor2">{counter.label}</dt>
+                            <dt class="text-xs text-subtext">{counter.label}</dt>
                             <dd class="tabular-nums">{counter.value}</dd>
                         </div>
                     {/each}
@@ -189,7 +189,7 @@
                         <div class="relative w-full">
                             <button
                                 type="button"
-                                class="absolute top-1 right-1 rounded-sm p-1 text-textcolor2 hover:text-textcolor"
+                                class="absolute top-1 right-1 rounded-sm p-1 text-subtext hover:text-textcolor"
                                 title={copied ? copy.copied : copy.copyDetails}
                                 aria-label={copy.copyDetails}
                                 onclick={copyDetails}>
@@ -199,7 +199,7 @@
                                     <CopyIcon size={14} />
                                 {/if}
                             </button>
-                            <pre class="max-h-48 overflow-auto rounded-md border border-darkborderc bg-bgcolor p-2 pr-8 text-xs whitespace-pre-wrap break-all text-textcolor2">{detailsText}</pre>
+                            <pre class="max-h-48 overflow-auto rounded-md border border-darkborderc bg-bgcolor p-2 pr-8 text-xs whitespace-pre-wrap break-all text-subtext">{detailsText}</pre>
                         </div>
                     {/if}
                 </div>
@@ -209,7 +209,7 @@
                 <footer class="flex flex-wrap items-center justify-end gap-2">
                     {#if model.cancelVisible}
                         {#if model.cancelNote}
-                            <span class="mr-auto text-xs text-textcolor2">{model.cancelNote}</span>
+                            <span class="mr-auto text-xs text-subtext">{model.cancelNote}</span>
                         {/if}
                         <SettingButton variant="secondary" disabled={!model.cancelEnabled} onclick={cancelActiveNativeFileOperation}>
                             {model.cancelLabel}

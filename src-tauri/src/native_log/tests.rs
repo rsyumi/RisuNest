@@ -387,6 +387,10 @@ fn unconfigured_file_path_command_returns_only_a_bounded_code() {
     let entry = state.tail(Some(1)).pop().unwrap();
     assert_eq!(entry.target, "native_log");
     assert!(entry.message.contains("file path unavailable"));
+
+    let error = file_page::read_page_for_command(&state, file_page::LogFile::Current, None, None).unwrap_err();
+    assert_eq!(error, NATIVE_LOG_FILE_PATH_UNAVAILABLE);
+    assert!(state.tail(Some(1)).pop().unwrap().message.contains("file read unavailable"));
 }
 
 #[cfg(unix)]
@@ -682,4 +686,382 @@ fn panic_hook_uses_a_safe_label_for_non_string_payloads() {
     assert!(entry.message.contains("non-string panic payload"));
     assert!(entry.message.contains("tests.rs"));
     assert!(!entry.message.contains("42"));
+}
+
+/// The longest line one entry can write: a capped message of four-byte characters.
+fn longest_file_line(level: &str, target: &str) -> u64 {
+    file_line(&LogEntry {
+        ts_ms: u128::from(u64::MAX),
+        level: level.to_owned(),
+        target: target.to_owned(),
+        message: "𝄞".repeat(MAX_MESSAGE_CHARS),
+    })
+    .len() as u64
+}
+
+#[test]
+fn the_log_and_its_rotation_together_stay_within_twice_the_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let message = "𝄞".repeat(MAX_MESSAGE_CHARS + 100);
+    let mut written = 0u64;
+    let mut largest = 0u64;
+    while written < 3 * FILE_ROTATE_BYTES as u64 {
+        state.record("error", "synthetic", &message);
+        written += longest_file_line("error", "synthetic");
+        let sizes = [LOG_FILE_NAME, PREVIOUS_LOG_FILE_NAME]
+            .map(|name| fs::metadata(logs.join(name)).map(|metadata| metadata.len()).unwrap_or(0));
+        largest = largest.max(sizes[0] + sizes[1]);
+    }
+
+    let line = longest_file_line("error", "synthetic");
+    assert!(logs.join(PREVIOUS_LOG_FILE_NAME).exists());
+    assert!(largest <= 2 * (FILE_ROTATE_BYTES as u64 + line), "{largest}");
+    let mut names = fs::read_dir(&logs)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, [LOG_FILE_NAME, PREVIOUS_LOG_FILE_NAME]);
+}
+
+#[test]
+fn one_oversized_message_is_capped_before_the_ring_and_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+
+    state.record("error", "synthetic", "가".repeat(1024 * 1024));
+
+    assert_eq!(state.tail(Some(1))[0].message.chars().count(), MAX_MESSAGE_CHARS);
+    assert!(fs::metadata(state.file_path()).unwrap().len() <= longest_file_line("error", "synthetic"));
+}
+
+#[test]
+fn a_log_that_cannot_be_rotated_starts_over_instead_of_growing() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let blocked = temp.path().join("logs").join(PREVIOUS_LOG_FILE_NAME);
+    fs::create_dir_all(blocked.join("occupied")).unwrap();
+    fs::write(state.file_path(), vec![b'x'; FILE_ROTATE_BYTES + 1]).unwrap();
+
+    state.record("info", "test", "after a failed rotation");
+
+    let log = fs::read_to_string(state.file_path()).unwrap();
+    assert_eq!(log, file_line(&state.tail(Some(1))[0]));
+}
+
+#[test]
+fn startup_failure_diagnostic_rotates_instead_of_growing() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("startup.log");
+    let line = 4097u64 * 4;
+    for _ in 0..64 {
+        append_startup_diagnostic(&path, &"𝄞".repeat(5000));
+    }
+
+    let rotated = root.path().join("startup.log.1");
+    assert!(rotated.exists());
+    let total = fs::metadata(&path).unwrap().len() + fs::metadata(&rotated).unwrap().len();
+    assert!(total <= 2 * (STARTUP_DIAGNOSTIC_ROTATE_BYTES + line), "{total}");
+}
+
+#[test]
+fn the_app_run_marks_its_start_before_lines_recorded_earlier_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::for_tests();
+    state.record("warn", "boot", "pending boot entry");
+
+    state.configure_file_path_for_run(temp.path(), "9.9.9-synthetic");
+    state.configure_file_path_for_run(temp.path(), "9.9.9-synthetic");
+    state.record("info", "setup", "later entry");
+
+    let log = fs::read_to_string(state.file_path()).unwrap();
+    let entries = file_page::parse_entries(log.as_bytes());
+    let summary = entries
+        .iter()
+        .map(|entry| (entry.level.as_str(), entry.target.as_str(), entry.message.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary,
+        [
+            ("info", RUN_START_TARGET, "RisuNest 9.9.9-synthetic"),
+            ("warn", "boot", "pending boot entry"),
+            ("info", "setup", "later entry"),
+        ]
+    );
+    assert!(entries[0].ts_ms <= entries[1].ts_ms);
+    assert!(state.tail(None).iter().all(|entry| entry.target != RUN_START_TARGET));
+}
+
+fn write_lines(path: &std::path::Path, entries: &[LogEntry]) {
+    let text = entries.iter().map(file_line).collect::<String>();
+    fs::write(path, text).unwrap();
+}
+
+fn synthetic_entries(prefix: &str, count: usize) -> Vec<LogEntry> {
+    (0..count)
+        .map(|index| LogEntry {
+            ts_ms: 1_700_000_000_000 + index as u128,
+            level: if index % 3 == 0 { "error" } else { "info" }.to_owned(),
+            target: "risunest_lib::server_sync::commands".to_owned(),
+            message: if index % 4 == 0 {
+                format!("{prefix}-{index} first line\n  at frame [x]: detail\nlast")
+            } else {
+                format!("{prefix}-{index} [ok] value: {}", "v".repeat(index % 40))
+            },
+        })
+        .collect()
+}
+
+#[test]
+fn saved_log_pages_walk_back_through_both_files_without_splitting_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = temp.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    let previous = synthetic_entries("previous", 120);
+    let current = synthetic_entries("current", 90);
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+    let page_bytes = 300;
+
+    let mut pages = Vec::new();
+    let mut cursor = None;
+    loop {
+        let (file, before) = cursor.map_or((file_page::LogFile::Current, None), |cursor: file_page::FileCursor| (cursor.file, cursor.before));
+        let page = file_page::read_page(&logs, file, before, page_bytes, 0).unwrap();
+        assert!(!page.entries.is_empty());
+        let span: usize = page.entries.iter().map(|entry| file_line(entry).len()).sum();
+        assert!(span <= page_bytes, "{span}");
+        pages.push(page.entries);
+        match page.older {
+            Some(older) => cursor = Some(older),
+            None => break,
+        }
+    }
+
+    let read = pages.into_iter().rev().flatten().map(|entry| file_line(&entry)).collect::<Vec<_>>();
+    let expected = previous.iter().chain(&current).map(file_line).collect::<Vec<_>>();
+    assert_eq!(read, expected);
+}
+
+#[test]
+fn a_saved_log_page_from_the_command_never_reads_more_than_its_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    write_lines(&logs.join(LOG_FILE_NAME), &synthetic_entries("large", 6000));
+    let size = fs::metadata(logs.join(LOG_FILE_NAME)).unwrap().len();
+    assert!(size > 3 * file_page::FILE_PAGE_BYTES as u64);
+
+    let page = file_page::read_page_for_command(&state, file_page::LogFile::Current, None, None).unwrap();
+
+    let start = page.older.unwrap().before.unwrap();
+    assert!(size - start <= file_page::FILE_PAGE_BYTES as u64);
+    assert_eq!(page.entries.last().unwrap().message, synthetic_entries("large", 6000)[5999].message);
+}
+
+#[test]
+fn a_cursor_from_before_a_rotation_continues_in_the_file_it_came_from() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let older = synthetic_entries("older", 40);
+    let filler = LogEntry {
+        ts_ms: 1_700_000_000_500,
+        level: "info".to_owned(),
+        target: "filler".to_owned(),
+        message: "x".repeat(FILE_ROTATE_BYTES),
+    };
+    let newest = synthetic_entries("newest", 40);
+    write_lines(&logs.join(LOG_FILE_NAME), &[&older[..], std::slice::from_ref(&filler), &newest[..]].concat());
+    let read = |cursor: Option<file_page::FileCursor>, page_bytes: usize| {
+        let (file, before, generation) = cursor.map_or((file_page::LogFile::Current, None, None), |cursor| {
+            (cursor.file, cursor.before, Some(cursor.generation))
+        });
+        file_page::read_page_bounded(&state, file, before, generation, page_bytes).unwrap()
+    };
+    // One page reaching back into the older entries, so its cursor points inside them.
+    let reach = file_line(&filler).len() + newest.iter().map(|entry| file_line(entry).len()).sum::<usize>() + 1000;
+    let first = read(None, reach);
+    let cursor = first.older.unwrap();
+
+    // The writer moves the file aside, and the next file grows past the cursor.
+    for entry in synthetic_entries("next", 200) {
+        state.record(&entry.level, &entry.target, &entry.message);
+    }
+    assert!(fs::metadata(logs.join(LOG_FILE_NAME)).unwrap().len() > cursor.before.unwrap());
+    let second = read(Some(cursor), 400);
+
+    let expected = &older[older.len() + newest.len() + 1 - first.entries.len() - 1];
+    assert_eq!(file_line(second.entries.last().unwrap()), file_line(expected));
+
+    // Once the file that cursor points into is dropped as well, nothing older is left.
+    let mut current = fs::OpenOptions::new().append(true).open(logs.join(LOG_FILE_NAME)).unwrap();
+    current.write_all(file_line(&filler).as_bytes()).unwrap();
+    drop(current);
+    state.record("info", "rotation", "first line of the next file");
+    let gone = read(second.older, 400);
+    assert!(gone.entries.is_empty());
+    assert_eq!(gone.older, None);
+}
+
+#[test]
+fn missing_or_empty_saved_logs_read_as_an_empty_page_or_the_previous_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let logs = temp.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+
+    let page = file_page::read_page(&logs, file_page::LogFile::Current, None, 400, 0).unwrap();
+    assert!(page.entries.is_empty());
+    assert_eq!(page.older, None);
+
+    fs::write(logs.join(LOG_FILE_NAME), b"").unwrap();
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &synthetic_entries("previous", 2));
+    let page = file_page::read_page(&logs, file_page::LogFile::Current, None, 4000, 0).unwrap();
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(page.older, None);
+}
+
+#[test]
+fn saved_lines_parse_back_into_the_entries_that_wrote_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let messages = [
+        "plain",
+        "",
+        "colon: inside [brackets] and ] closing",
+        "first line\n1700000000000 [info] lookalike: continued\nthird",
+    ];
+    for message in messages {
+        state.record("warn", "risunest_lib::native_log", message);
+    }
+
+    let page = file_page::read_page(&temp.path().join("logs"), file_page::LogFile::Current, None, 4000, 0).unwrap();
+    let ring = state.tail(None);
+    assert_eq!(page.entries.len(), 5);
+    for (read, recorded) in page.entries.iter().zip(&ring).take(3) {
+        assert_eq!((read.ts_ms, &read.level, &read.target, &read.message), (recorded.ts_ms, &recorded.level, &recorded.target, &recorded.message));
+    }
+    // A continuation line that looks like an entry is read as one; nothing is lost.
+    assert_eq!(page.entries[3].message, "first line");
+    assert_eq!(page.entries[4].target, "lookalike");
+    assert_eq!(page.entries[4].message, "continued\nthird");
+}
+
+fn exported(state: &NativeLogState) -> Vec<u8> {
+    let mut output = Vec::new();
+    let log = state.open_whole_log().unwrap();
+    let bytes = log.copy_to(&mut output).unwrap();
+    assert_eq!(bytes, output.len() as u64);
+    output
+}
+
+fn file_text(entries: &[LogEntry]) -> Vec<u8> {
+    entries.iter().map(file_line).collect::<String>().into_bytes()
+}
+
+#[test]
+fn the_whole_saved_log_is_the_previous_file_then_the_current_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let previous = synthetic_entries("previous", 30);
+    let current = synthetic_entries("current", 20);
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+
+    let log = state.open_whole_log().unwrap();
+    // A line written after the save starts is not part of it.
+    state.record("info", "later", "written while saving");
+    let mut output = Vec::new();
+    log.copy_to(&mut output).unwrap();
+
+    assert_eq!(output, [file_text(&previous), file_text(&current)].concat());
+}
+
+#[test]
+fn the_whole_saved_log_is_the_one_file_that_exists_or_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    assert_eq!(state.open_whole_log().unwrap().bytes(), 0);
+    assert_eq!(exported(&state), b"");
+
+    let current = synthetic_entries("current", 5);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+    assert_eq!(exported(&state), file_text(&current));
+
+    let previous = synthetic_entries("previous", 5);
+    fs::remove_file(logs.join(LOG_FILE_NAME)).unwrap();
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    assert_eq!(exported(&state), file_text(&previous));
+    fs::write(logs.join(LOG_FILE_NAME), b"").unwrap();
+    assert_eq!(state.open_whole_log().unwrap().bytes(), file_text(&previous).len() as u64);
+    assert_eq!(exported(&state), file_text(&previous));
+
+    assert_eq!(
+        NativeLogState::for_tests().open_whole_log().err(),
+        Some(NATIVE_LOG_FILE_PATH_UNAVAILABLE)
+    );
+}
+
+#[test]
+fn a_rotation_during_the_save_keeps_the_files_it_opened() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let previous = synthetic_entries("previous", 50);
+    write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &previous);
+    let current = [file_text(&synthetic_entries("current", 50)), vec![b'x'; FILE_ROTATE_BYTES], b"\n".to_vec()].concat();
+    fs::write(logs.join(LOG_FILE_NAME), &current).unwrap();
+
+    let log = state.open_whole_log().unwrap();
+    state.record("info", "rotation", "first line of the next file");
+    assert_eq!(fs::read(logs.join(PREVIOUS_LOG_FILE_NAME)).unwrap(), current);
+    let mut output = Vec::new();
+    log.copy_to(&mut output).unwrap();
+
+    assert!(output == [file_text(&previous), current].concat(), "{} bytes", output.len());
+}
+
+#[test]
+fn a_file_that_ends_mid_line_does_not_join_the_next_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    fs::write(logs.join(PREVIOUS_LOG_FILE_NAME), b"1700000000000 [error] cut: interrupted").unwrap();
+    let current = synthetic_entries("current", 2);
+    write_lines(&logs.join(LOG_FILE_NAME), &current);
+
+    let output = exported(&state);
+
+    assert_eq!(output, [b"1700000000000 [error] cut: interrupted\n".to_vec(), file_text(&current)].concat());
+    assert_eq!(file_page::parse_entries(&output).len(), 3);
+}
+
+#[test]
+fn the_whole_saved_log_is_copied_a_bounded_piece_at_a_time() {
+    struct Pieces { bytes: usize, largest: usize }
+    impl std::io::Write for Pieces {
+        fn write(&mut self, piece: &[u8]) -> std::io::Result<usize> {
+            self.bytes += piece.len();
+            self.largest = self.largest.max(piece.len());
+            Ok(piece.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
+    let logs = temp.path().join("logs");
+    let size = 3 * file_export::COPY_BUFFER_BYTES + 17;
+    fs::write(logs.join(PREVIOUS_LOG_FILE_NAME), vec![b'p'; size]).unwrap();
+    fs::write(logs.join(LOG_FILE_NAME), vec![b'c'; size]).unwrap();
+
+    let mut pieces = Pieces { bytes: 0, largest: 0 };
+    state.open_whole_log().unwrap().copy_to(&mut pieces).unwrap();
+
+    // The previous file ends mid-line, so one newline joins the two.
+    assert_eq!(pieces.bytes, 2 * size + 1);
+    assert!(pieces.largest <= file_export::COPY_BUFFER_BYTES, "{}", pieces.largest);
 }

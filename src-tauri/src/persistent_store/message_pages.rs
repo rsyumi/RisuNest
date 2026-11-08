@@ -1,4 +1,4 @@
-use super::{record_projection::codec_error, StoreError, StoreResult};
+use super::{record_projection::codec_error, stored_json, StoreError, StoreResult};
 use risunest_external_storage_format::{
     logical_records::{decode_message_page, encoded_object, LOGICAL_MESSAGE_PAGE_SIZE},
     message_pages::{
@@ -550,7 +550,7 @@ fn capture(
                     params![generation, character, conversation, position as i64],
                     |r| r.get(0),
                 )?;
-                let body = payload_value::canonicalize(body.as_bytes()).map_err(codec_error)?;
+                let body = stored_json::canonicalize(&body).map_err(codec_error)?;
                 if {
                     #[cfg(test)]
                     crate::persistent_store::hash_work::observe("native_message_verify", body.len());
@@ -734,7 +734,7 @@ fn stage_pages(
             let body: String = tx.prepare_cached("SELECT value FROM messages WHERE generation=?1 AND character_id=?2
                 AND conversation_id=?3 AND message_index=?4")?.query_row(params![generation, character, conversation, position],
                 |row| row.get(0))?;
-            let body = payload_value::canonicalize(body.as_bytes()).map_err(codec_error)?;
+            let body = stored_json::canonicalize(&body).map_err(codec_error)?;
             if {
                 #[cfg(test)]
                 crate::persistent_store::hash_work::observe("native_message_verify", body.len());
@@ -833,7 +833,7 @@ fn next_hash(
         params![generation, character, conversation, index],
         |r| r.get(0),
     )?;
-    let bytes = payload_value::canonicalize(body.as_bytes()).map_err(codec_error)?;
+    let bytes = stored_json::canonicalize(&body).map_err(codec_error)?;
     let cached = {
         #[cfg(test)]
         crate::persistent_store::hash_work::observe("native_message_verify", bytes.len());
@@ -1716,17 +1716,82 @@ mod capture_work_tests {
     }
 
     fn fixture() -> Connection {
+        fixture_with(&["{\"chatId\":\"first\"}", "{\"chatId\":\"second\"}"])
+    }
+
+    /// One conversation of messages stored as `values`, without cached hashes.
+    fn fixture_with(values: &[&str]) -> Connection {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE messages(generation TEXT,character_id TEXT,conversation_id TEXT,message_index INTEGER,
             message_id TEXT,value TEXT,canonical_hash TEXT NOT NULL DEFAULT '',canonical_size INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(generation,character_id,conversation_id,message_index));
             CREATE TABLE conversations(generation TEXT,character_id TEXT,conversation_id TEXT,message_count INTEGER,
-            PRIMARY KEY(generation,character_id,conversation_id));
-            INSERT INTO conversations VALUES('g','c','chat',2);
-            INSERT INTO messages VALUES('g','c','chat',0,'first','{\"chatId\":\"first\"}','','0');
-            INSERT INTO messages VALUES('g','c','chat',1,'second','{\"chatId\":\"second\"}','','0');").unwrap();
+            PRIMARY KEY(generation,character_id,conversation_id));").unwrap();
+        db.execute("INSERT INTO conversations VALUES('g','c','chat',?1)", [values.len() as i64]).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            db.execute("INSERT INTO messages VALUES('g','c','chat',?1,NULL,?2,'',0)", params![index as i64, value]).unwrap();
+        }
         db.execute_batch(SCHEMA).unwrap();
         db
+    }
+
+    #[test]
+    fn stored_message_texts_hash_and_page_as_their_canonical_encodings() {
+        // Texts whose encodings reorder keys, rewrite numbers and escapes, keep
+        // the raw value token as an ordinary key, or hold a converted binary
+        // under keys out of order. The digest was taken while message texts
+        // were canonicalized through a parsed value.
+        let binary = (0..300).map(|index| format!("\"{index}\":{}", index * 7 % 256)).collect::<Vec<_>>().join(",");
+        let texts = [
+            format!("{{\"role\":\"user\",\"data\":\"x\",\"blob\":{{{binary}}}}}"),
+            "{\"b\":1,\"a\":2,\"10\":3,\"9\":4,\"01\":5,\"\":6,\"\u{e9}\":7,\"\\ud83d\\ude00\":8,\"\u{ff5a}\":9}".to_owned(),
+            "{\"n\":[0,-0,-0.0,1.5,1e21,1e-7,18446744073709551616,-9223372036854775808,3.08984926168550152811e-32]}".to_owned(),
+            " { \"data\" : \"a\\n\\u0000\\u001f\\/\\\"\u{d55c}\" , \"z\" : [ true , false , null ] }\r\n".to_owned(),
+            r#"{"$serde_json::private::RawValue":"5","x":{"$serde_json::private::RawValue":"{}"}}"#.to_owned(),
+            r#"[1,{"b":2,"a":1},"s"]"#.to_owned(),
+        ];
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let stored = |db: &Connection| {
+            let rows: Vec<(String, i64)> = db.prepare("SELECT canonical_hash,canonical_size FROM messages ORDER BY message_index").unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<Result<_, _>>().unwrap();
+            let manifest: Vec<u8> = db.query_row("SELECT body FROM message_page_manifests", [], |row| row.get(0)).unwrap();
+            risunest_sync_wire::hash(format!("{rows:?}{manifest:?}").as_bytes())
+        };
+        let mut db = fixture_with(&texts);
+        let tx = db.transaction().unwrap();
+        // Hashes the rows lack, then verifies them while building the pages.
+        capture_manifest(&tx, "g", "c", "chat", None).unwrap();
+        let captured = stored(&tx);
+        assert_eq!(captured, "adec4beb34d1e394b2832c1d42531a0c41232289b5b1a9ba1a49da62830003a8");
+        // Staging verifies cached hashes, and hashes the rows that lack one.
+        for clear in [false, true] {
+            tx.execute_batch("DELETE FROM message_page_indexes; DELETE FROM message_page_manifests;").unwrap();
+            if clear {
+                tx.execute("UPDATE messages SET canonical_hash='',canonical_size=0", []).unwrap();
+            }
+            stage_conversation_pages(&tx, "g", "c", "chat", &|| Ok(())).unwrap();
+            assert_eq!(stored(&tx), captured, "cleared {clear}");
+        }
+        drop(tx);
+        // A repeated key fails, even when the row caches the hash of the text
+        // with the key's last value.
+        for (text, last) in [(r#"{"a":1,"a":2}"#, r#"{"a":2}"#), (r#"{"z":0,"b":{"0":1,"0":2}}"#, r#"{"b":{"0":2},"z":0}"#)] {
+            for cached in [false, true] {
+                let mut db = fixture_with(&[text]);
+                if cached {
+                    let hash = MessageHash::from_bytes(last.as_bytes());
+                    db.execute("UPDATE messages SET canonical_hash=?1,canonical_size=?2", params![hash.hash, sql_i64(hash.byte_length).unwrap()]).unwrap();
+                }
+                let tx = db.transaction().unwrap();
+                let failures = [
+                    capture_manifest(&tx, "g", "c", "chat", None).map(|_| ()).unwrap_err(),
+                    stage_conversation_pages(&tx, "g", "c", "chat", &|| Ok(())).unwrap_err(),
+                ];
+                for failure in failures {
+                    assert_eq!(failure.to_string(), "invalid-payload-json", "{text} cached {cached}");
+                }
+            }
+        }
     }
 
     #[test]

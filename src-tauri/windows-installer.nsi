@@ -1,4 +1,4 @@
-; Based on @tauri-apps/cli 2.12.1 (MPL-2.0, Apache-2.0, or MIT).
+; Based on @tauri-apps/cli 2.12.4 (MPL-2.0, Apache-2.0, or MIT).
 Unicode true
 ManifestDPIAware true
 ; Add in `dpiAwareness` `PerMonitorV2` to manifest for Windows 10 1607+ (note this should not affect lower versions since they should be able to ignore this and pick up `dpiAware` `true` set by `ManifestDPIAware true`)
@@ -263,7 +263,7 @@ Function PageReinstall
     StrCpy $R1 "$(olderOrUnknownVersionInstalled)"
     StrCpy $R2 "$(uninstallBeforeInstalling)"
     StrCpy $R3 "$(dontUninstall)"
-    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(choowHowToInstall)"
+    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(chooseHowToInstall)"
   ; Downgrading
   ${ElseIf} $R0 = -1
     StrCpy $R1 "$(newerVersionInstalled)"
@@ -273,7 +273,7 @@ Function PageReinstall
     !else
       StrCpy $R3 "$(dontUninstallDowngrade)"
     !endif
-    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(choowHowToInstall)"
+    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(chooseHowToInstall)"
   ${Else}
     Abort
   ${EndIf}
@@ -824,7 +824,7 @@ Section Install
   ; Create file associations
   {{#each file_associations as |association| ~}}
     {{#each association.ext as |ext| ~}}
-       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with ${PRODUCTNAME}" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
+       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\",0" "Open with ${PRODUCTNAME}" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
     {{/each}}
   {{/each}}
 
@@ -1072,6 +1072,13 @@ Section Uninstall
     !else
       !define RISUNEST_UNINSTALL_REG_ROOT HKCU
     !endif
+    ; NSIS drops `/` from `_?=`, so $INSTDIR can name a folder that does not
+    ; exist. Deleting there removes nothing and sets no error, so require the
+    ; uninstaller this teardown removes before touching the registration.
+    ${IfNot} ${FileExists} "$INSTDIR\uninstall.exe"
+      SetErrorLevel 1
+      Abort "removal-uninstaller-missing"
+    ${EndIf}
     ClearErrors
     DeleteRegKey ${RISUNEST_UNINSTALL_REG_ROOT} "${UNINSTKEY}"
     ${If} ${Errors}

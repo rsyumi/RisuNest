@@ -66,7 +66,7 @@
             <header>
                 <h2 id="app-update-title" class="text-lg font-bold">{text.dialogTitle}</h2>
                 {#if $appUpdateState.update}
-                    <p class="mt-1 text-sm text-textcolor2">{$appUpdateState.environment?.currentVersion ?? ''} → {$appUpdateState.update.version} · {new Date($appUpdateState.update.pubDate).toLocaleDateString()}</p>
+                    <p class="mt-1 text-sm text-subtext">{$appUpdateState.environment?.currentVersion ?? ''} → {$appUpdateState.update.version} · {new Date($appUpdateState.update.pubDate).toLocaleDateString()}</p>
                 {/if}
             </header>
 

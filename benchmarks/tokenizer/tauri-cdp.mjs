@@ -7,6 +7,7 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
+import { evaluationErrorText } from '../support/cdpException.mjs'
 import corpus from './native-tokenizer-corpus.json' with { type: 'json' }
 
 const CDP_HOST = '127.0.0.1'
@@ -221,11 +222,13 @@ async function evaluate(client, expression) {
         userGesture: true,
     })
     if (response.exceptionDetails) {
-        throw new Error(
+        throw new Error(await evaluationErrorText(
+            (method, params) => client.call(method, params),
+            response.exceptionDetails,
             response.exceptionDetails.exception?.description ??
                 response.exceptionDetails.text ??
                 'Runtime evaluation failed',
-        )
+        ))
     }
     return response.result.value
 }

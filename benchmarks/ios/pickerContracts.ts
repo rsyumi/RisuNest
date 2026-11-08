@@ -15,6 +15,7 @@ import {
 import { nativeDataPath } from "../../src/ts/storage/nativePaths";
 import { selectDomFiles } from "../../src/ts/storage/fileSelection";
 import { withNativeSelectedFile } from "../../src/ts/storage/nativeFileSelection";
+import { failureRecord, type FailureRecord } from "../failureRecord";
 
 /** Installed only in the isolated synthetic UI-test app. */
 export async function installPickerContracts(generalOnly = false) {
@@ -34,10 +35,12 @@ export async function installPickerContracts(generalOnly = false) {
     button.onclick = async () => {
       status.textContent = "working";
       let errorDetail: string | undefined;
+      let failure: FailureRecord | undefined;
       try {
         status.textContent = await work();
       } catch (error) {
         errorDetail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+        failure = failureRecord(error);
         status.textContent =
           error instanceof DOMException && error.name === "AbortError"
             ? "export-cancelled"
@@ -45,7 +48,7 @@ export async function installPickerContracts(generalOnly = false) {
       }
       await invoke("ios_bench_report", {
         stage: "ui",
-        result: { action: name, outcome: status.textContent, error: errorDetail },
+        result: { action: name, outcome: status.textContent, error: errorDetail, failure },
       });
     };
     document.body.append(button);

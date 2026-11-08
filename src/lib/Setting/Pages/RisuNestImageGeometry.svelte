@@ -21,7 +21,7 @@
                     <SettingProgress label={strings.calculate} detail={counts} fraction={null} />
                 </div>
             {:else if job.result || job.failed}
-                <p class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{status} {counts}</p>
+                <p class="mt-1 text-sm text-subtext" role="status" aria-live="polite">{status} {counts}</p>
             {/if}
         {/snippet}
         {#if job.running}

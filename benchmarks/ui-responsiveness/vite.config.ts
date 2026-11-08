@@ -58,27 +58,44 @@ function gitPathSet(argumentsList: string[]): Set<string> {
     )
 }
 
+interface BaselineTree {
+    changedSourcePaths: Set<string>
+    baselineSourcePaths: Set<string>
+    cache: Map<string, string>
+}
+
+let baselineTree: BaselineTree | undefined
+
+// The page and every worker bundle share one listing of the baseline tree.
+function readBaselineTree(): BaselineTree {
+    baselineTree ??= {
+        // With rename detection a renamed file is listed only under its new path.
+        changedSourcePaths: gitPathSet([
+            'diff',
+            '--name-only',
+            '--no-renames',
+            BASELINE_REVISION,
+            '--',
+            'src',
+        ]),
+        baselineSourcePaths: gitPathSet([
+            'ls-tree',
+            '-r',
+            '--name-only',
+            BASELINE_REVISION,
+            '--',
+            'src',
+        ]),
+        cache: new Map(),
+    }
+    return baselineTree
+}
+
 function baselineSourcePlugin(): Plugin | null {
     if (sourceMode !== 'baseline') return null
-    // With rename detection a renamed file is listed only under its new path.
-    const changedSourcePaths = gitPathSet([
-        'diff',
-        '--name-only',
-        '--no-renames',
-        BASELINE_REVISION,
-        '--',
-        'src',
-    ])
-    const baselineSourcePaths = gitPathSet([
-        'ls-tree',
-        '-r',
-        '--name-only',
-        BASELINE_REVISION,
-        '--',
-        'src',
-    ])
+    const { changedSourcePaths, baselineSourcePaths, cache } =
+        readBaselineTree()
     let extensions: string[] = []
-    const cache = new Map<string, string>()
     return {
         name: 'risunest-ui-benchmark-baseline-source',
         enforce: 'pre',
@@ -159,6 +176,9 @@ export default defineConfig(async () =>
         root: repositoryRoot,
         publicDir: false,
         plugins: [baselineSourcePlugin()],
+        // Workers are bundled through their own plugin list, which the page's
+        // plugins do not reach.
+        worker: { plugins: () => [baselineSourcePlugin()] },
         build: {
             outDir: outputDirectory,
             emptyOutDir: true,

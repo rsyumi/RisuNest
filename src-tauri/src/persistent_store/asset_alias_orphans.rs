@@ -2,6 +2,7 @@
 //! the ones deleted owners left behind, and a permanent delete removes the ones only the deleted
 //! character, module or persona used.
 
+use super::archive_asset_names::{self, ArchiveNames};
 use super::device_store::plugin_gc::PluginGcFence;
 use super::device_store::plugin_values::text_value;
 use super::{lww, message_pages, snapshot, PersistentStore, StoreError, StoreResult, WorkingSetCommit};
@@ -21,7 +22,7 @@ use std::{
 pub(crate) const OWNED_ASSET_KEY_PREFIX: &str = "assets/";
 
 /// Every encoded form of an owned key starts with this word, whatever its separator became.
-const ANCHOR: &str = "assets";
+pub(super) const ANCHOR: &str = "assets";
 
 /// The one device setting that names keys only to remember what an account already received.
 const PUBLICATION_LEDGER_SETTING: &str = "official-account.asset-ledger.v1";
@@ -127,11 +128,20 @@ impl PersistentStore {
 
     /// Deletes the aliases `scope` finds orphaned in one commit, returning them. Nothing is
     /// deleted while any root cannot be read, and a library or device plugin value that changed
-    /// since the search returns busy.
+    /// since the search returns busy. The unused-file cleanup then deletes the archive name
+    /// records no archive needs any more.
     pub(crate) fn delete_orphaned_asset_aliases(
         &mut self,
         scope: &OrphanAliasScope<'_>,
     ) -> StoreResult<Vec<UnreferencedAlias>> {
+        let deleted = self.delete_orphans(scope)?;
+        if matches!(scope, OrphanAliasScope::Cleanup { .. }) {
+            self.prune_archive_name_records();
+        }
+        Ok(deleted)
+    }
+
+    fn delete_orphans(&mut self, scope: &OrphanAliasScope<'_>) -> StoreResult<Vec<UnreferencedAlias>> {
         let Some(mut search) = self.search_unreferenced_asset_aliases(scope)? else {
             return Ok(Vec::new());
         };
@@ -181,32 +191,36 @@ impl PersistentStore {
         Ok(orphans)
     }
 
-    /// Takes out of `search` the aliases the unused-file cleanup would delete now that an archived
-    /// character's text names, and returns whether it took out any; the roots then have to be
-    /// marked again. Archives written before their records listed the keys inside longer text,
-    /// such as an `<img src>` in a chat, name those only in their payload.
+    /// Takes out of `search` the aliases `scope` would delete now that an archived character's
+    /// text names, and returns whether it took out any; the roots then have to be marked again.
+    /// Archives written before their records listed the keys inside longer text, such as an
+    /// `<img src>` in a chat, name those only in their payload, so each payload's recorded names
+    /// are looked at. While an archive has no record, the cleanup after a permanent delete keeps
+    /// every alias it would delete, and the unused-file cleanup reads the payloads this device
+    /// holds and keeps every alias when one is held elsewhere.
     pub(crate) fn keep_aliases_archives_name(
         &self,
         search: &mut OrphanAliasSearch,
         marks: &AssetGcMarks,
         scope: &OrphanAliasScope<'_>,
     ) -> StoreResult<bool> {
-        // A permanent delete runs after every delete with the store held, so it reads no payload.
-        if !matches!(scope, OrphanAliasScope::Cleanup { .. }) {
-            return Ok(false);
-        }
         // An alias still within the grace is checked once the grace has passed.
         let candidates = search.orphans(marks, scope).0.into_iter().map(|alias| alias.key).collect::<BTreeSet<_>>();
         if candidates.is_empty() {
             return Ok(false);
         }
-        let mut matcher = AssetKeyMatcher::new(candidates.iter().cloned());
-        let kept = if self.observe_archive_payloads(&mut matcher)? {
-            let unreferenced = matcher.unreferenced().collect::<BTreeSet<_>>();
-            candidates.difference(&unreferenced).cloned().collect()
-        } else {
-            // A payload this device cannot read could name any of them.
-            candidates
+        let kept = match self.archive_name_records()? {
+            None => candidates,
+            Some(records) if records.unrecorded.is_empty() => records.names.named(&candidates),
+            // A permanent delete runs after every delete with the store held, so it reads no payload.
+            Some(_) if matches!(scope, OrphanAliasScope::DeletedOwner { .. }) => candidates,
+            Some(mut records) => match self.record_held_archive_payloads(&records.unrecorded)? {
+                Some(names) => {
+                    records.names.extend(names);
+                    records.names.named(&candidates)
+                }
+                None => candidates,
+            },
         };
         if kept.is_empty() {
             return Ok(false);
@@ -215,36 +229,24 @@ impl PersistentStore {
         Ok(true)
     }
 
-    /// Feeds the payload of every archived character, the one a restore reads, to `matcher`.
-    /// Returns false when one is not held on this device or cannot be read.
-    fn observe_archive_payloads(&self, matcher: &mut AssetKeyMatcher) -> StoreResult<bool> {
-        let generation = super::active_generation(&self.connection)?;
+    /// Reads and records the payloads in `hashes`, or `None` when one of them is not held on this
+    /// device or cannot be read, since it could name any key.
+    fn record_held_archive_payloads(&self, hashes: &BTreeSet<String>) -> StoreResult<Option<ArchiveNames>> {
         let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
-        let mut statement = self.connection.prepare(
-            "SELECT archived_object FROM characters WHERE generation = ?1 AND archived_object IS NOT NULL",
-        )?;
-        let mut rows = statement.query([generation])?;
-        while let Some(row) = rows.next()? {
-            if matcher.is_complete() {
-                break;
+        for hash in hashes {
+            if cas.stat_object(hash)?.is_none() {
+                return Ok(None);
             }
-            let ValueRef::Text(record) = row.get_ref(0)? else { return Ok(false) };
-            let Ok(archived) = serde_json::from_slice::<super::archive::ArchivedObject>(record) else {
-                return Ok(false);
-            };
-            let Some(file) = cas.open_object(&archived.object_hash)? else { return Ok(false) };
-            let mut output = TextWriter { stream: matcher.stream(false), held: Vec::new() };
-            let read = super::archive::read_payload_text(file, |bytes| {
-                io::Write::write_all(&mut output, bytes)?;
-                Ok(!output.stream.matcher.is_complete())
-            });
-            // A read that stopped once every key was found can end inside a character.
-            if read.is_err() || !output.held.is_empty() && !output.stream.matcher.is_complete() {
-                return Ok(false);
-            }
-            output.stream.finish();
         }
-        Ok(true)
+        let mut names = ArchiveNames::default();
+        for hash in hashes {
+            let Some(file) = cas.open_object(hash)? else { return Ok(None) };
+            match archive_asset_names::record_payload(&self.repository_root, hash, file, &|| false) {
+                Ok(record) => names.extend(record),
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(Some(names))
     }
 
     /// Marks every key `matcher` finds in the active generation, its owner manifests, the stored
@@ -552,8 +554,7 @@ impl AssetKeyMatcher {
         let mut lengths = BTreeSet::new();
         let mut shapes = BTreeSet::new();
         for (index, key) in keys.iter().enumerate() {
-            let separated = key.replace('/', "\\");
-            for form in escaped_forms(key).into_iter().chain(escaped_forms(&separated)) {
+            for form in key_forms(key) {
                 lengths.insert(form.len());
                 matcher.insert(false, form, index);
             }
@@ -705,6 +706,12 @@ impl io::Write for TextWriter<'_> {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Every form of `key` a reader still resolves: the key and the key with `\` separators, each as
+/// `escaped_forms` writes it.
+pub(super) fn key_forms(key: &str) -> impl Iterator<Item = String> {
+    escaped_forms(key).into_iter().chain(escaped_forms(&key.replace('/', "\\")))
 }
 
 /// `text`, its JSON-escaped form, and both with `/` escaped as `\/`; non-ASCII text also with

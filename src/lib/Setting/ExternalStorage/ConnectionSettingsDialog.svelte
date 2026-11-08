@@ -122,12 +122,12 @@
         class="panel outline-hidden" style:--qr-target={`${targetSize}px`} onkeydown={keydown}>
         <div bind:this={heading} class="heading">
             <h3 id="external-connection-settings-title" class="text-lg font-bold">{strings.connectionSettings}</h3>
-            <p class="text-sm text-textcolor2">{strings.connectionSettingsNotice}</p>
+            <p class="text-sm text-subtext">{strings.connectionSettingsNotice}</p>
         </div>
         {#if qr}
             <img class="qr" src={qr} width={size} height={size} alt={strings.connectionSettingsQr} />
         {:else if qrPending}
-            <p class="text-sm text-textcolor2" role="status">{strings.loading}</p>
+            <p class="text-sm text-subtext" role="status">{strings.loading}</p>
         {:else}
             <p class="rounded-md border border-darkborderc bg-darkbg p-3 text-sm">{strings.connectionSettingsFileOnly}</p>
         {/if}
@@ -136,7 +136,7 @@
                 rows="3" spellcheck="false" autocapitalize="off"
                 class="w-full rounded-md border border-darkborderc bg-darkbg p-2 font-mono text-xs text-textcolor shadow-xs"></textarea>
             <div class="feedback">
-                <span class="text-sm text-textcolor2" role="status">{feedback}</span>
+                <span class="text-sm text-subtext" role="status">{feedback}</span>
                 {#if error}<p class="text-sm text-draculared" role="alert">{error}</p>{/if}
             </div>
         </div>

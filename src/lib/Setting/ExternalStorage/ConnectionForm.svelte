@@ -967,7 +967,7 @@
         margin: 0;
         font-size: 0.8125rem;
         line-height: 1.45;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .actions {
         display: flex;
@@ -991,7 +991,7 @@
         background: var(--risu-theme-bgcolor);
         font-size: 0.8125rem;
         line-height: 1.45;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .note.danger {
         color: var(--risu-theme-danger-400);
@@ -1034,7 +1034,7 @@
     }
     .review dt {
         font-size: 0.78rem;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .review dd {
         margin: 0 0 0.5rem;
@@ -1059,7 +1059,7 @@
     }
     .folder-status {
         font-weight: 500;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .field-error {
         flex-basis: 100%;

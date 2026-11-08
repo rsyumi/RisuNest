@@ -176,7 +176,7 @@ test.describe('actual App lock integration', () => {
         requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
     }))
 
-    test('presents loading and its confirmation before markers and delays native unlock until the PIN screen', async ({ page }) => {
+    test('presents loading and its confirmation before markers, then holds a startup confirmation behind the PIN screen', async ({ page }) => {
         await page.goto('/lazyApp.html?loading')
         const loading = page.getByRole('status').filter({ hasText: language.loading })
         await expect(loading).toBeVisible()
@@ -202,11 +202,20 @@ test.describe('actual App lock integration', () => {
         await expect(startupPlugin).toBeHidden()
         expect(await startupPlugin.ariaSnapshot()).toBe('')
         await page.evaluate(() => window.lazyApp.lock.loadingAlert())
-        await page.getByRole('button', { name: 'YES', exact: true }).click()
-        await page.evaluate(() => window.lazyApp.lock.loading(false))
-        await expect(page.getByRole('dialog', { name: 'RisuNest' })).toBeVisible()
+        const gate = page.getByRole('dialog', { name: 'RisuNest' })
+        await expect(gate).toBeVisible()
         await expect(page.locator('main')).toHaveAttribute('inert', '')
         await expect.poll(() => page.evaluate(() => window.appLockNative.authScreens())).toEqual([true])
+        await page.keyboard.type('123456')
+        await expect(gate).toHaveCount(0)
+        await expect(page.locator('main')).not.toHaveAttribute('inert')
+        await expect(loading).toBeVisible()
+        await expect.poll(() => page.evaluate(() => window.appLockNative.presentations().at(-1))).toBe(false)
+        await page.getByRole('button', { name: 'YES', exact: true }).click()
+        await expect(page.getByText('Synthetic startup confirmation')).toHaveCount(0)
+        await page.evaluate(() => window.lazyApp.lock.loading(false))
+        await expect(page.locator('main')).not.toHaveAttribute('inert')
+        await expect(gate).toHaveCount(0)
     })
 
     test('restores initial dialog focus after the native cover automatically focuses the first PIN button', async ({ page }) => {

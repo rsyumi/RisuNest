@@ -36,19 +36,24 @@ function fixture(options: { record?: unknown; timing?: AppLockTiming; nativeUnlo
             return true
         }),
         listen: vi.fn(async (callback) => { listener = callback; return () => {} }),
+        report: vi.fn(),
     }
     const storage: AppLockStorage = {
         read: vi.fn(async () => stored),
         commit: vi.fn(async (serialized) => { stored = serialized }),
     }
     const controller = new AppLockController(storage, adapter)
+    /** Changes the native lifecycle without its event reaching the page. */
+    const miss = (active: boolean, atMs: number, departedAtMs: number | null = lifecycle.departedAtMs) => {
+        lifecycle = { active, atMs, epoch: lifecycle.epoch + 1, departedAtMs: active ? departedAtMs : atMs }
+    }
     return {
-        controller, storage, adapter, capabilities,
+        controller, storage, adapter, capabilities, miss,
         stored: () => stored,
         presented: () => presentedLocked,
         refresh() { listener(lifecycle) },
         emit(active: boolean, atMs: number, departedAtMs: number | null = lifecycle.departedAtMs) {
-            lifecycle = { active, atMs, epoch: lifecycle.epoch + 1, departedAtMs: active ? departedAtMs : atMs }
+            miss(active, atMs, departedAtMs)
             listener(lifecycle)
         },
     }
@@ -348,6 +353,91 @@ describe('app lock controller', () => {
         expect(f.presented()).toBe(true)
         expect(f.controller.state.locked).toBe(true)
         f.controller.dispose()
+    })
+
+    it('asks for a refused return frame for a bounded time and again after a later page signal', async () => {
+        vi.useFakeTimers()
+        try {
+            const f = fixture()
+            await f.controller.initialize()
+            const ready = vi.mocked(f.adapter.ready).getMockImplementation()!
+            f.emit(false, 1)
+            f.emit(true, 2)
+            vi.mocked(f.adapter.ready).mockResolvedValue(false)
+            const revision = f.controller.state.presentationRevision
+            for (let retry = 1; retry <= 6; retry++) {
+                await f.controller.rendered('unlock')
+                await vi.advanceTimersByTimeAsync(4000)
+                expect(f.controller.state.presentationRevision).toBe(revision + retry)
+            }
+            await f.controller.rendered('unlock')
+            await vi.advanceTimersByTimeAsync(60_000)
+            expect(f.controller.state.presentationRevision).toBe(revision + 6)
+            expect(f.controller.state.returnPending).toBe(true)
+            f.miss(false, 3)
+            f.miss(true, 4)
+            vi.mocked(f.adapter.ready).mockImplementation(ready)
+            f.controller.retryPendingPresentation()
+            await vi.waitFor(() => expect(f.controller.state.presentationRevision).toBe(revision + 7))
+            expect(f.controller.state.epoch).toBe(4)
+            expect(f.controller.state.returnPending).toBe(true)
+            await f.controller.rendered('unlock')
+            expect(f.controller.state.returnPending).toBe(false)
+            expect(f.presented()).toBe(true)
+            const policies = vi.mocked(f.adapter.setPolicy).mock.calls.length
+            f.controller.retryPendingPresentation()
+            await vi.advanceTimersByTimeAsync(1000)
+            expect(f.controller.state.presentationRevision).toBe(revision + 7)
+            expect(f.adapter.setPolicy).toHaveBeenCalledTimes(policies)
+            expect(f.adapter.report).not.toHaveBeenCalled()
+            f.controller.dispose()
+        } finally { vi.useRealTimers() }
+    })
+
+    it('logs a return frame, policy update or frame confirmation that stays pending once per epoch', async () => {
+        vi.useFakeTimers()
+        try {
+            const f = fixture()
+            await f.controller.initialize()
+            f.emit(false, 1)
+            await vi.advanceTimersByTimeAsync(0)
+            const policy = deferred<AppLockLifecycle>()
+            vi.mocked(f.adapter.setPolicy).mockReturnValueOnce(policy.promise)
+            f.emit(true, 2)
+            const rendering = f.controller.rendered('unlock')
+            const again = f.controller.rendered('unlock')
+            await vi.advanceTimersByTimeAsync(3000)
+            expect(f.adapter.report).toHaveBeenCalledOnce()
+            expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock policy update still pending after 3000 ms: epoch 2')
+            const answer = deferred<boolean>()
+            vi.mocked(f.adapter.ready).mockReturnValueOnce(answer.promise).mockReturnValueOnce(new Promise<boolean>(() => {}))
+            policy.resolve({ active: true, epoch: 2, atMs: 2, departedAtMs: 1 })
+            await vi.advanceTimersByTimeAsync(3000)
+            expect(f.adapter.report).toHaveBeenCalledTimes(2)
+            expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock frame confirmation still pending after 3000 ms: epoch 2')
+            const revision = f.controller.state.presentationRevision
+            const policies = vi.mocked(f.adapter.setPolicy).mock.calls.length
+            f.controller.retryPendingPresentation()
+            await vi.advanceTimersByTimeAsync(1000)
+            expect(f.controller.state.presentationRevision).toBe(revision)
+            expect(f.adapter.setPolicy).toHaveBeenCalledTimes(policies)
+            answer.resolve(true)
+            await rendering
+            expect(f.controller.state.returnPending).toBe(false)
+            expect(f.adapter.report).toHaveBeenCalledTimes(2)
+            void again
+            f.emit(false, 3)
+            f.emit(true, 4)
+            await vi.advanceTimersByTimeAsync(3000)
+            expect(f.adapter.report).toHaveBeenCalledTimes(3)
+            expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock frame presentation still pending after 3000 ms: epoch 4')
+            f.emit(false, 5)
+            f.emit(true, 6)
+            await f.controller.rendered('unlock')
+            await vi.advanceTimersByTimeAsync(3000)
+            expect(f.adapter.report).toHaveBeenCalledTimes(3)
+            f.controller.dispose()
+        } finally { vi.useRealTimers() }
     })
 
     it('keeps a pending return separate from the native PIN gate so a pre-deadline return can present', async () => {

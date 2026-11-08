@@ -4,17 +4,32 @@
 //! per object. Larger ones keep the shared immutable file layout.
 use crate::{
     persistent_store::StoreError,
-    trust_boundary::{is_link_like, sync_directory},
+    trust_boundary::{is_link_like, is_lower_hex_256, sync_directory},
 };
 use risunest_external_storage_format::content_identity::{hash, hash_reader};
 use risunest_small_object_store as small_object_store;
 pub(crate) use risunest_small_object_store::Body;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
 };
+
+/// Bodies above the database threshold are files here, each in the
+/// subdirectory named by the first two hex digits of its identity. A file
+/// system without a directory index (Android's ext4) scans a whole directory
+/// for every create and every uncached lookup, so one directory holding every
+/// body costs time in the square of their count.
+const FILE_DIRECTORY: &str = "content-files";
+/// Where earlier versions kept every file body directly. Bodies are read from
+/// it for as long as it exists, and `move_flat_files` empties and removes it.
+/// A new directory rather than subdirectories of this one, because a
+/// directory never shrinks and a lookup that misses reads all of it.
+const FLAT_FILE_DIRECTORY: &str = "objects";
+/// Entries one step of the startup move takes, so app cleanup never waits for
+/// more than one step.
+const FLAT_MOVE_BATCH: usize = 4_096;
 
 type Result<T> = std::result::Result<T, StoreError>;
 
@@ -89,7 +104,9 @@ impl ObjectSource {
 }
 
 pub(crate) struct ContentStore {
-    objects: PathBuf,
+    files: PathBuf,
+    /// The flat directory, when it still existed at open.
+    flat: Option<PathBuf>,
     db: rusqlite::Connection,
     /// Bodies a caller has an identity for that are not durable yet. A reader
     /// on this store sees them exactly as it sees written ones.
@@ -105,13 +122,14 @@ impl ContentStore {
     /// directory rather than inside it, so a directory walk over objects never
     /// has to know about it.
     pub(crate) fn open(root: &Path) -> Result<Self> {
-        let objects = root.join("objects");
-        for directory in [root, &objects] {
+        let files = root.join(FILE_DIRECTORY);
+        for directory in [root, &files] {
             fs::create_dir_all(directory)?;
             if is_link_like(&fs::symlink_metadata(directory)?) {
                 return Err(invalid("Capture directory must not be a link"));
             }
         }
+        let flat = flat_directory(root)?;
         let db = crate::sqlite_open::open(root.join("content.sqlite"))?;
         // Incremental, so collection can return freed pages to the filesystem
         // without rewriting the database. It must precede the first table.
@@ -122,7 +140,8 @@ impl ContentStore {
         small_object_store::initialize(&db)
             .map_err(|_| invalid("Capture content store is unavailable"))?;
         Ok(Self {
-            objects,
+            files,
+            flat,
             db,
             staged: BTreeMap::new(),
             staged_bytes: 0,
@@ -139,10 +158,6 @@ impl ContentStore {
             return Ok(None);
         }
         Self::open(root).map(Some)
-    }
-
-    pub(crate) fn object_directory(&self) -> &Path {
-        &self.objects
     }
 
     /// Stage or publish one body under the identity the caller states. An
@@ -184,7 +199,7 @@ impl ContentStore {
         if self.staged.is_empty() {
             return Ok(());
         }
-        let available = fs2::available_space(&self.objects)?;
+        let available = fs2::available_space(&self.files)?;
         match small_object_store::admit(
             &self.db,
             &mut self.checkpoint,
@@ -249,15 +264,39 @@ impl ContentStore {
         {
             return Ok(Some((size, None)));
         }
-        let path = self.objects.join(digest);
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-            Ok(metadata) if is_link_like(&metadata) || !metadata.is_file() => {
+        Ok(self.locate_file(digest)?.map(|(size, path)| (size, Some(path))))
+    }
+
+    fn locate_file(&self, digest: &str) -> Result<Option<(u64, PathBuf)>> {
+        match self.find_file(digest, |path| fs::symlink_metadata(path))? {
+            None => Ok(None),
+            Some((metadata, _)) if is_link_like(&metadata) || !metadata.is_file() => {
                 Err(invalid("Capture object must not be a link"))
             }
-            Ok(metadata) => Ok(Some((metadata.len(), Some(path)))),
+            Some((metadata, path)) => Ok(Some((metadata.len(), path))),
         }
+    }
+
+    /// Asks `look` where this body's file is, at the moment of asking: in its
+    /// shard, then in the flat directory while that existed at open, then in
+    /// its shard again, because the move out of the flat directory may have
+    /// taken it there between the first two looks. Only NotFound moves on.
+    fn find_file<T>(
+        &self,
+        digest: &str,
+        mut look: impl FnMut(&Path) -> io::Result<T>,
+    ) -> Result<Option<(T, PathBuf)>> {
+        let sharded = sharded_path(&self.files, digest)?;
+        let flat = self.flat.as_ref().map(|flat| flat.join(digest));
+        let again = flat.as_ref().map(|_| &sharded);
+        for path in std::iter::once(&sharded).chain(&flat).chain(again) {
+            match look(path) {
+                Ok(found) => return Ok(Some((found, path.clone()))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn open_body(&self, digest: &str) -> Result<Body> {
@@ -269,9 +308,10 @@ impl ContentStore {
         if let Some(bytes) = stored {
             return Ok(Body::bytes(bytes));
         }
-        Ok(Body::File(crate::trust_boundary::open_regular_source(
-            &self.objects.join(digest),
-        )?))
+        match self.find_file(digest, crate::trust_boundary::open_regular_source)? {
+            Some((file, _)) => Ok(Body::File(file)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound).into()),
+        }
     }
 
     /// The file holding this body, when a file is where it lives. A body the
@@ -284,8 +324,7 @@ impl ContentStore {
         {
             return Ok(None);
         }
-        let path = self.objects.join(digest);
-        Ok(path.is_file().then_some(path))
+        Ok(self.locate_file(digest)?.map(|(_, path)| path))
     }
 
     /// The whole body, for callers that need it in memory anyway.
@@ -348,8 +387,40 @@ impl ContentStore {
         Ok(())
     }
 
+    /// Removes the file bodies `keep` does not name, and the partial files a
+    /// writer left, at most `budget` of them, from the flat directory while it
+    /// exists and from every shard. The caller has established that nothing is
+    /// writing a body. A file that is gone by the time it would be removed,
+    /// because the move out of the flat directory took it, is passed over.
+    pub(crate) fn remove_unnamed_files(&self, keep: &BTreeSet<String>, budget: usize) -> Result<usize> {
+        let mut directories: Vec<PathBuf> = self.flat.iter().cloned().collect();
+        match fs::read_dir(&self.files) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let shard = entry.file_name().to_str().is_some_and(|name| {
+                        name.len() == 2 && name.bytes().all(crate::trust_boundary::is_lower_hex_byte)
+                    });
+                    if shard && entry.file_type()?.is_dir() {
+                        directories.push(entry.path());
+                    }
+                }
+            }
+        }
+        let mut removed = 0;
+        for directory in directories {
+            if removed == budget {
+                break;
+            }
+            removed += remove_unnamed_in(&directory, keep, budget - removed)?;
+        }
+        Ok(removed)
+    }
+
     /// Identities and sizes of the database bodies, in identity order. Files
-    /// keep their own enumeration through the object directory.
+    /// keep their own enumeration through `remove_unnamed_files`.
     pub(crate) fn page(&self, after: &str, limit: usize) -> Result<Vec<(String, u64)>> {
         small_object_store::page(&self.db, after, limit)
             .map_err(|_| invalid("Capture content store is unavailable"))
@@ -409,26 +480,26 @@ impl ContentStore {
     }
 
     fn write_file_with(&self, expected: &str, length: u64, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
-        let path = self.objects.join(expected);
-        let staging_path = self
-            .objects
-            .join(format!(".capture-{}.partial", uuid::Uuid::new_v4()));
+        let path = sharded_path(&self.files, expected)?;
+        let directory = ensure_shard(&self.files, &path)?;
+        // Beside its destination, so one directory sync covers both.
+        let staging_path = directory.join(format!(".capture-{}.partial", uuid::Uuid::new_v4()));
         let mut staging_file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staging_path)?;
-        let mut staging = super::capture::OwnedCaptureFile::new(staging_path.clone(), &self.objects);
+        let mut staging = super::capture::OwnedCaptureFile::new(staging_path.clone(), &directory);
         write(&mut staging_file)?;
         staging_file.sync_all()?;
         drop(staging_file);
-        let _ = sync_directory(&self.objects)?;
+        let _ = sync_directory(&directory)?;
         #[cfg(target_os = "android")]
         let publication = crate::trust_boundary::rename_without_replace(&staging_path, &path);
         #[cfg(not(target_os = "android"))]
         let publication = fs::hard_link(&staging_path, &path);
         match publication {
             Ok(()) => {
-                let _ = sync_directory(&self.objects)?;
+                let _ = sync_directory(&directory)?;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if is_link_like(&fs::symlink_metadata(&path)?) {
@@ -447,10 +518,290 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Flush the object directory after a capture publishes its files.
+    /// Flush the file directory after a capture publishes its files. Each
+    /// publication already synced its shard, and each new shard its parent.
     pub(crate) fn sync_objects(&self) -> Result<()> {
-        sync_directory(&self.objects)?;
+        sync_directory(&self.files)?;
         Ok(())
+    }
+}
+
+/// The flat directory an earlier version kept file bodies in, while it exists.
+fn flat_directory(root: &Path) -> Result<Option<PathBuf>> {
+    let path = root.join(FLAT_FILE_DIRECTORY);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+        Ok(metadata) if is_link_like(&metadata) || !metadata.is_dir() => {
+            Err(invalid("Capture directory must not be a link"))
+        }
+        Ok(_) => Ok(Some(path)),
+    }
+}
+
+/// Where the store under `root` keeps the file holding `digest`.
+#[cfg(test)]
+pub(crate) fn file_location(root: &Path, digest: &str) -> PathBuf {
+    sharded_path(&root.join(FILE_DIRECTORY), digest).unwrap()
+}
+
+/// Writes `bytes` as the file body of `digest` where publication leaves one,
+/// for fixtures that fill a store without a capture.
+#[cfg(test)]
+pub(crate) fn write_file_fixture(root: &Path, digest: &str, bytes: &[u8]) {
+    let path = file_location(root, digest);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if !path.exists() {
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+fn sharded_path(files: &Path, digest: &str) -> Result<PathBuf> {
+    if !is_lower_hex_256(digest) {
+        return Err(invalid("Capture object identity is invalid"));
+    }
+    Ok(files.join(&digest[..2]).join(digest))
+}
+
+/// The shard directory of `path`, created the first time a body needs it.
+fn ensure_shard(files: &Path, path: &Path) -> Result<PathBuf> {
+    let directory = path.parent().expect("a sharded path has a shard").to_path_buf();
+    let real = |metadata: &fs::Metadata| metadata.is_dir() && !is_link_like(metadata);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if real(&metadata) => return Ok(directory),
+        Ok(_) => return Err(invalid("Capture directory must not be a link")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Whoever created it, its entry is durable before a body goes in it.
+    sync_directory(files)?;
+    if !real(&fs::symlink_metadata(&directory)?) {
+        return Err(invalid("Capture directory must not be a link"));
+    }
+    Ok(directory)
+}
+
+fn remove_unnamed_in(directory: &Path, keep: &BTreeSet<String>, budget: usize) -> Result<usize> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        if removed == budget {
+            break;
+        }
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // A partial file is a body a capture was writing, and none is.
+        let collectable = (is_lower_hex_256(&name) && !keep.contains(&name))
+            || (name.starts_with(".capture-") && name.ends_with(".partial"));
+        if !collectable {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || is_link_like(&metadata) {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if removed > 0 {
+        sync_directory(directory)?;
+    }
+    Ok(removed)
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Moves at most `limit` entries out of the flat directory under `root` and
+/// removes that directory once nothing in it is left to move. True while
+/// entries may remain. A crash leaves each move either undone or done, and a
+/// reader finds a body in either place, so a pass can stop anywhere and the
+/// next one carries on.
+pub(crate) fn move_flat_files(root: &Path, limit: usize) -> Result<bool> {
+    let Some(flat) = flat_directory(root)? else {
+        return Ok(false);
+    };
+    let files = root.join(FILE_DIRECTORY);
+    // Not `create_dir_all`: a root that cleanup removed is not recreated.
+    match fs::create_dir(&files) {
+        Ok(()) => {
+            sync_directory(root)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(&files)?;
+    if !metadata.is_dir() || is_link_like(&metadata) {
+        return Err(invalid("Capture directory must not be a link"));
+    }
+    let (mut bodies, mut partials) = (Vec::new(), Vec::new());
+    let (mut kept, mut more) = (false, false);
+    // Listing order: a lookup in a directory without an index starts where
+    // the last one ended, so moving in this order does not rescan it.
+    for entry in fs::read_dir(&flat)? {
+        let name = entry?.file_name();
+        match name.to_str() {
+            Some(name) if is_lower_hex_256(name) => bodies.push(name.to_owned()),
+            Some(name) if name.starts_with(".capture-") && name.ends_with(".partial") => {
+                partials.push(name.to_owned())
+            }
+            _ => kept = true,
+        }
+        if bodies.len() + partials.len() == limit {
+            more = true;
+            break;
+        }
+    }
+    let mut touched = BTreeSet::new();
+    // Whether this step changed what the next listing shows.
+    let mut progress = !partials.is_empty();
+    for digest in &bodies {
+        let source = flat.join(digest);
+        match fs::symlink_metadata(&source) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                progress = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if !metadata.is_file() || is_link_like(&metadata) => {
+                kept = true;
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let target = sharded_path(&files, digest)?;
+        let directory = ensure_shard(&files, &target)?;
+        if move_body(&source, &target, digest)? {
+            touched.insert(directory);
+            progress = true;
+        } else {
+            kept = true;
+        }
+    }
+    // The new layout never writes a partial here, and an older version does
+    // not run beside this one, so whatever is here was abandoned.
+    for partial in &partials {
+        remove_if_present(&flat.join(partial))?;
+    }
+    for directory in &touched {
+        sync_directory(directory)?;
+    }
+    if !bodies.is_empty() || !partials.is_empty() {
+        sync_directory(&flat)?;
+    }
+    // A step that left every entry where it was would list them again.
+    if more && progress {
+        return Ok(true);
+    }
+    if kept || more {
+        return Ok(false);
+    }
+    match fs::remove_dir(&flat) {
+        Ok(()) => {
+            sync_directory(root)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Moves one flat body into its shard with the primitive publication uses.
+/// False when the shard already holds other bytes under that identity, which
+/// leaves the flat file where it is.
+fn move_body(source: &Path, target: &Path, digest: &str) -> Result<bool> {
+    #[cfg(target_os = "android")]
+    let moved = crate::trust_boundary::rename_without_replace(source, target);
+    #[cfg(not(target_os = "android"))]
+    let moved = fs::hard_link(source, target);
+    match moved {
+        Ok(()) => {
+            #[cfg(not(target_os = "android"))]
+            remove_if_present(source)?;
+            Ok(true)
+        }
+        // Collected after it was listed.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        // A writer published it again before the move reached it, or an
+        // earlier move stopped between linking and removing.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(target)?;
+            if !metadata.is_file() || is_link_like(&metadata) {
+                return Ok(false);
+            }
+            let mut file = crate::trust_boundary::open_regular_source(target)?;
+            if !hash_reader(&mut file, metadata.len()).is_ok_and(|actual| hex::encode(actual) == digest) {
+                return Ok(false);
+            }
+            remove_if_present(source)?;
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Moves an earlier version's flat file bodies on a thread of its own, one
+/// step at a time, until none is left, app cleanup begins or a step fails.
+/// Startup does not wait for it, and readers find a body in either place.
+pub(crate) fn move_flat_files_later(app: &tauri::AppHandle, root: PathBuf) {
+    use tauri::Manager as _;
+    match flat_directory(&root) {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => {
+            crate::nlog!("warn", "External content files were not moved: {error}");
+            return;
+        }
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("content-files-move".into())
+        .spawn(move || {
+            let jobs = app.state::<super::job_store::JobCommandState>();
+            loop {
+                let Some(_step) = jobs.background_step() else {
+                    return;
+                };
+                match move_flat_files(&root, FLAT_MOVE_BATCH) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if matches!(flat_directory(&root), Ok(Some(_))) {
+                            crate::nlog!("warn", "Some external content files were not moved");
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        crate::nlog!("warn", "External content files were not moved: {error}");
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        crate::nlog!("warn", "External content files were not moved: {error}");
     }
 }
 
@@ -517,7 +868,11 @@ mod tests {
         }
         store.commit().unwrap();
         assert!(store.file_path(&digest(&small)).unwrap().is_none());
-        assert!(store.file_path(&digest(&large)).unwrap().is_some());
+        assert_eq!(
+            store.file_path(&digest(&large)).unwrap(),
+            Some(file_location(root.path(), &digest(&large)))
+        );
+        assert!(!root.path().join(FLAT_FILE_DIRECTORY).exists());
         for bytes in [&small, &large] {
             let hash = digest(bytes);
             assert_eq!(store.stat(&hash).unwrap(), Some(bytes.len() as u64));
@@ -673,6 +1028,128 @@ mod tests {
         assert_eq!(read, bytes);
     }
 
+    /// Bodies above the threshold where an earlier version kept them, all in
+    /// one directory.
+    fn flat_store(root: &Path, seeds: std::ops::Range<usize>) -> Vec<Vec<u8>> {
+        let flat = root.join(FLAT_FILE_DIRECTORY);
+        fs::create_dir_all(&flat).unwrap();
+        seeds
+            .map(|seed| {
+                let bytes = body(seed, SMALL_OBJECT_BYTES + 1 + seed);
+                fs::write(flat.join(digest(&bytes)), &bytes).unwrap();
+                bytes
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_flat_store_moves_into_shards_a_step_at_a_time_and_reads_throughout() {
+        let root = tempfile::tempdir().unwrap();
+        let bodies = flat_store(root.path(), 0..6);
+        let flat = root.path().join(FLAT_FILE_DIRECTORY);
+        fs::write(flat.join(".capture-abandoned.partial"), b"synthetic partial").unwrap();
+        let before = ContentStore::open(root.path()).unwrap();
+        let mut steps = 0;
+        while move_flat_files(root.path(), 2).unwrap() {
+            steps += 1;
+            let now = ContentStore::open(root.path()).unwrap();
+            for bytes in &bodies {
+                for store in [&before, &now] {
+                    assert_eq!(&store.read_all(&digest(bytes)).unwrap(), bytes);
+                }
+            }
+        }
+        assert_eq!(steps, 3);
+        assert!(!flat.exists());
+        let after = ContentStore::open(root.path()).unwrap();
+        for bytes in &bodies {
+            let hash = digest(bytes);
+            assert_eq!(after.file_path(&hash).unwrap(), Some(file_location(root.path(), &hash)));
+            for store in [&before, &after] {
+                store.validate(&hash, bytes.len() as i64, true).unwrap();
+            }
+        }
+        assert!(!move_flat_files(root.path(), 2).unwrap());
+    }
+
+    #[test]
+    fn an_interrupted_move_resumes_from_what_it_left() {
+        let root = tempfile::tempdir().unwrap();
+        let bodies = flat_store(root.path(), 10..14);
+        let hashes = bodies.iter().map(|bytes| digest(bytes)).collect::<Vec<_>>();
+        let flat = root.path().join(FLAT_FILE_DIRECTORY);
+        let shard_file = |index: usize| {
+            let path = file_location(root.path(), &hashes[index]);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        };
+        // In its shard and still in the flat directory, as a move that linked
+        // it and stopped, or a writer that published it again, leaves it.
+        fs::copy(flat.join(&hashes[0]), shard_file(0)).unwrap();
+        // Other bytes under the identity in its shard.
+        fs::write(shard_file(1), b"synthetic damage").unwrap();
+        // A shard created for a body that was never moved into it.
+        shard_file(2);
+        // An entry nothing writes there.
+        fs::write(flat.join("synthetic-notes"), b"synthetic").unwrap();
+
+        assert!(!move_flat_files(root.path(), 100).unwrap());
+        let store = ContentStore::open(root.path()).unwrap();
+        for index in [0, 2, 3] {
+            assert!(!flat.join(&hashes[index]).exists());
+            assert_eq!(fs::read(shard_file(index)).unwrap(), bodies[index]);
+            store.validate(&hashes[index], bodies[index].len() as i64, true).unwrap();
+        }
+        // Neither copy of the differing identity is removed, and the flat
+        // directory stays for it and for what the move does not know.
+        assert_eq!(fs::read(flat.join(&hashes[1])).unwrap(), bodies[1]);
+        assert_eq!(fs::read(shard_file(1)).unwrap(), b"synthetic damage");
+        assert!(flat.join("synthetic-notes").exists());
+
+        fs::remove_file(shard_file(1)).unwrap();
+        fs::remove_file(flat.join("synthetic-notes")).unwrap();
+        assert!(!move_flat_files(root.path(), 100).unwrap());
+        assert!(!flat.exists());
+        assert_eq!(fs::read(shard_file(1)).unwrap(), bodies[1]);
+        // An empty flat directory left behind goes on the next pass.
+        fs::create_dir(&flat).unwrap();
+        assert!(!move_flat_files(root.path(), 100).unwrap());
+        assert!(!flat.exists());
+
+        // A step that leaves every entry where it was ends the move instead
+        // of listing the same entries again.
+        for bytes in flat_store(root.path(), 30..32) {
+            let path = file_location(root.path(), &digest(&bytes));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"synthetic damage").unwrap();
+        }
+        assert!(!move_flat_files(root.path(), 1).unwrap());
+        assert!(flat.exists());
+    }
+
+    /// The move takes a body to its shard between the look there and the
+    /// look in the flat directory, and the third look finds it.
+    #[test]
+    fn a_body_moved_between_two_looks_is_still_found() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = flat_store(root.path(), 20..21).remove(0);
+        let hash = digest(&bytes);
+        let store = ContentStore::open(root.path()).unwrap();
+        let mut looks = 0;
+        let found = store
+            .find_file(&hash, |path| {
+                let read = fs::read(path);
+                looks += 1;
+                if looks == 1 {
+                    assert!(!move_flat_files(root.path(), 100).unwrap());
+                }
+                read
+            })
+            .unwrap();
+        assert_eq!(found, Some((bytes, file_location(root.path(), &hash))));
+        assert_eq!(looks, 3);
+    }
+
     #[test]
     #[ignore = "Explicit synthetic capture durability measurement"]
     fn capture_publication_cost_measurement() {
@@ -692,7 +1169,10 @@ mod tests {
                 }
             }
             store.commit().unwrap();
-            let files = fs::read_dir(directory.join("objects")).unwrap().count();
+            let files = fs::read_dir(directory.join(FILE_DIRECTORY))
+                .unwrap()
+                .map(|shard| fs::read_dir(shard.unwrap().path()).unwrap().count())
+                .sum::<usize>();
             eprintln!(
                 "pass={pass} as_files={as_files} bodies={BODIES} object_files={files} elapsed_ms={}",
                 started.elapsed().as_millis()

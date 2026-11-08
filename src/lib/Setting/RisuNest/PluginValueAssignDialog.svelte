@@ -58,9 +58,9 @@
         <h3 id="plugin-value-assign-title" class="shrink-0 px-5 pt-5 text-lg font-bold">{strings.stageTitle}</h3>
         <!-- Only the list scrolls, so the title and the closing actions stay reachable. -->
         <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-3">
-            <p class="text-sm text-textcolor2">{strings.stageDescription}</p>
+            <p class="text-sm text-subtext">{strings.stageDescription}</p>
             {#if !automatic}
-                <div class="rounded-md border border-darkborderc px-3 py-2 text-[13px] leading-normal text-textcolor2">
+                <div class="rounded-md border border-darkborderc px-3 py-2 text-[13px] leading-normal text-subtext">
                     {strings.autoAssignOffNotice}
                 </div>
             {/if}
@@ -75,7 +75,7 @@
             </div>
             <div>
                 <SettingToggle bind:checked={automatic} label={strings.autoAssign} showLabel />
-                <p class="mt-0.5 pl-7 text-xs text-textcolor2">{strings.autoAssignHelp}</p>
+                <p class="mt-0.5 pl-7 text-xs text-subtext">{strings.autoAssignHelp}</p>
             </div>
         </div>
         <div class="flex shrink-0 flex-wrap justify-end gap-2 px-5 pt-1 pb-5">

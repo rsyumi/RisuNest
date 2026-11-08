@@ -2,11 +2,14 @@ import { trackRerollOutput } from '../responseVariants'
 import { safeStructuredClone } from '../safeStructuredClone'
 import type { ConversationOperationCommit } from './conversationOperationContext'
 import type { Chat, Message } from '../storage/database.svelte'
-import type {
-    ActiveConversationSession,
-    MessageLocator,
+import {
+    cloneConversationMetadata,
+    type ActiveConversationSession,
+    type MessageLocator,
 } from '../storage/activeConversationSession'
 import type { WindowedConversationMutationController } from '../storage/activeWorkingSet.svelte'
+
+type ConversationMetadataValues = Partial<Omit<Chat, 'message'>>
 
 interface GenerationConversationOperationOptions {
     session: ActiveConversationSession | null
@@ -31,7 +34,50 @@ export interface GenerationConversationOperation {
     commitMessage(message: Message): boolean
     refresh(): boolean
     acceptCommit(commit: ConversationOperationCommit): boolean
+    /**
+     * Sets metadata fields of the operation's conversation through the session or window that
+     * records it, so a save covers them, even after the operation lost its output. A target the
+     * operation still owns stays owned.
+     */
+    commitMetadata(values: ConversationMetadataValues): void
     release(): void
+}
+
+function changedMetadata(chat: Chat, values: ConversationMetadataValues): [string, unknown][] {
+    const record = chat as unknown as Record<string, unknown>
+    return Object.entries(values).filter(([key, value]) => !Object.is(record[key], value))
+}
+
+function writeMetadata(chat: Chat, changes: readonly [string, unknown][]): void {
+    const record = chat as unknown as Record<string, unknown>
+    for (const [key, value] of changes) record[key] = value
+}
+
+/** Returns whether the current session recorded the change; a chat it does not own is written directly. */
+function commitSessionMetadata(
+    options: Pick<GenerationConversationOperationOptions, 'chat' | 'getCurrentSession'>,
+    values: ConversationMetadataValues,
+): boolean {
+    const changes = changedMetadata(options.chat, values)
+    if (changes.length === 0) return false
+    const session = options.getCurrentSession()
+    if (!session?.matchesConversation(session.characterId, options.chat)) {
+        writeMetadata(options.chat, changes)
+        return false
+    }
+    const expectedMetadata = cloneConversationMetadata(options.chat)
+    try {
+        session.applyOperation({
+            expectedVersion: session.version,
+            expectedMetadata,
+            metadata: { ...expectedMetadata, ...Object.fromEntries(changes) },
+        })
+    } catch (error) {
+        // The chat shows the new values even when the session cannot record them.
+        writeMetadata(options.chat, changes)
+        throw error
+    }
+    return true
 }
 
 const windowedControllers = new WeakMap<Chat, WindowedConversationMutationController>()
@@ -154,6 +200,13 @@ function captureWindowedOperation(
             target = chat.message[localIndex]
             return operation.isOwned()
         },
+        commitMetadata(values) {
+            const changes = changedMetadata(chat, values)
+            if (changes.length === 0) return
+            writeMetadata(chat, changes)
+            // The window copies its chat's metadata to the selected conversation only in a recorded range.
+            if (controller.isCurrent()) controller.applyRange(0, 0, [], 'update-metadata')
+        },
         release() { released = true },
     }
     return operation
@@ -267,6 +320,13 @@ function captureSessionOperation(
                 commit.follows(session, locator.sessionVersion, options.chat) && operation.refresh()
             )
         },
+        commitMetadata(values) {
+            const owned = operation.isOwned()
+            // This commit moves no message, so the owned target keeps its position.
+            if (commitSessionMetadata(options, values) && owned) {
+                locator = session.locate(locator.absoluteIndex)
+            }
+        },
         release() {
             if (released) return
             released = true
@@ -341,6 +401,9 @@ function captureFullArrayFallback(
             target = chat.message[refreshedIndex]
             return true
         },
+        commitMetadata(values) {
+            commitSessionMetadata(options, values)
+        },
         release() {
             released = true
         },
@@ -357,7 +420,7 @@ function captureEmptyTailFallbackOperation(
     const usesSession = canUseActiveSession(options)
     const session = usesSession ? options.session! : null
     const pin = session?.acquirePin('transaction')
-    const sessionVersion = session?.version
+    let sessionVersion = session?.version
     const messageCount = session?.totalMessages
     let released = false
     const ownerIsCurrent = () => {
@@ -384,6 +447,12 @@ function captureEmptyTailFallbackOperation(
         commitMessage: () => false,
         refresh: ownerIsCurrent,
         acceptCommit: () => false,
+        commitMetadata(values) {
+            const owned = ownerIsCurrent()
+            if (commitSessionMetadata(options, values) && owned && session) {
+                sessionVersion = session.version
+            }
+        },
         release() {
             if (released) return
             released = true
