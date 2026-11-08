@@ -669,7 +669,7 @@ describe('Chat frozen capture presentation', () => {
     test('renders frozen custom HTML with the normal text box slot', async () => {
         const frozen = context({
             theme: 'customHTML',
-            guiHTML: '<div class="capture-custom"><span>Frozen layout</span><RISUTEXTBOX></RISUTEXTBOX></div>',
+            guiHTML: '<div class="capture-custom"><span>Frozen layout</span><a href="#top">Top</a><a href="https://synthetic.invalid/">Web</a><RISUTEXTBOX></RISUTEXTBOX></div>',
         })
         live.db.theme = 'mobilechat'
         const message = { role: 'char' as const, data: 'Frozen custom body' }
@@ -690,6 +690,8 @@ describe('Chat frozen capture presentation', () => {
 
         await vi.waitFor(() => expect(target.querySelector('.capture-custom')).not.toBeNull())
         expect(target.textContent).toContain('Frozen layout')
+        const links = [...target.querySelectorAll('.capture-custom a')]
+        expect(links.map((link) => [link.textContent, link.getAttribute('href')])).toEqual([['Top', null], ['Web', 'https://synthetic.invalid/']])
         expect(target.querySelector('[data-chat-body-probe]')?.textContent).toBe('Frozen custom body')
     })
 

@@ -1752,7 +1752,7 @@
         <img class={dom.getAttribute('class') ?? ''} alt="" style={dom.getAttribute('style') ?? ''} />
     {:else if dom.tagName === 'A'}
         <a target="_blank" rel="noreferrer" href={
-            (dom.getAttribute('href') && dom.getAttribute('href').startsWith('https')) ? dom.getAttribute('href') : ''
+            (dom.getAttribute('href') && dom.getAttribute('href').startsWith('https')) ? dom.getAttribute('href') : undefined
         } class={dom.getAttribute('class') ?? ''} style={dom.getAttribute('style') ?? ''}>
             {@render renderChilds(dom)}
         </a>
