@@ -2,6 +2,8 @@
  * The diagnosis a native scan produces, and the grouping and reporting the screen needs. Nothing
  * here reads the store: the recovery shell mounts the same screen without a loaded library.
  */
+import { localFileStamp } from '../localFileStamp'
+
 export type DataHealthSeverity = 'blocking' | 'degraded' | 'informational'
 
 export interface DataHealthFinding {
@@ -158,11 +160,7 @@ export function formatDataHealthReport(
 }
 
 export function dataHealthReportFileName(result: DataHealthResult): string {
-    const stamp = new Date(result.scannedAt)
-        .toISOString()
-        .replace(/[:.]/g, '-')
-        .replace(/-\d{3}Z$/, 'Z')
-    return `risunest-data-health-${stamp}.txt`
+    return `risunest-data-health-${localFileStamp(result.scannedAt)}.txt`
 }
 
 /** Fraction of the deep pass that is done, by bytes, or null before a deep scan has started. */

@@ -564,7 +564,7 @@ describe('RisuNestLogViewer', () => {
             button('[data-save-saved-log]').click()
             await vi.waitFor(() => expect(save).toHaveBeenCalled())
             await settleAction()
-            expect(save).toHaveBeenCalledWith(expect.objectContaining({ defaultPath: expect.stringMatching(/^risunest-error-log-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\.txt$/) }))
+            expect(save).toHaveBeenCalledWith(expect.objectContaining({ defaultPath: expect.stringMatching(/^risunest-error-log-\d{4}(-\d{2}){5}\.txt$/) }))
             expect(commands.native_log_file_export).not.toHaveBeenCalled()
             expect(toasts).toEqual([])
 

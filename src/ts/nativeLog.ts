@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import type { NativeExportResult } from './storage/nativeExportFile'
+import { localFileStamp } from './localFileStamp'
 
 export interface NativeLogEntry {
     tsMs: number
@@ -45,10 +46,9 @@ export async function readNativeLogFilePage(
 /** Refusal from `native_log_file_export` when neither log file holds anything. */
 export const NATIVE_LOG_FILE_EMPTY = 'native-log-file-empty'
 
-/** The saved log file name: the product name and the time it was saved. */
+/** The saved log file name: the product name and the local time it was saved. */
 export function nativeLogFileName(now = Date.now()): string {
-    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-').replace(/-\d{3}Z$/, 'Z')
-    return `risunest-error-log-${stamp}.txt`
+    return `risunest-error-log-${localFileStamp(now)}.txt`
 }
 
 export type NativeLogFileSave = 'saved' | 'cancelled' | 'empty'

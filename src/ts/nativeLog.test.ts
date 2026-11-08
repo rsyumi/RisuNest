@@ -7,10 +7,22 @@ vi.mock('./storage/androidSafBridge', async (importOriginal) => ({
     reserveAndroidSafDestination: (...args: Parameters<typeof picker.reserve>) => picker.reserve(...args),
 }))
 import {
-    getNativeLogFilePath, getNativeLogTail, NATIVE_LOG_FILE_EMPTY, readNativeLogFilePage, saveNativeLogFile, setNativeLogFileEnabled,
+    getNativeLogFilePath, getNativeLogTail, NATIVE_LOG_FILE_EMPTY, nativeLogFileName, readNativeLogFilePage, saveNativeLogFile,
+    setNativeLogFileEnabled,
 } from './nativeLog'
 
 describe('native diagnostic log commands', () => {
+    it('names the saved log after the local time it was saved', () => {
+        const zone = process.env.TZ
+        process.env.TZ = 'Asia/Seoul'
+        try {
+            expect(nativeLogFileName(Date.UTC(2026, 10, 7, 18, 4, 5, 678))).toBe('risunest-error-log-2026-11-08-03-04-05.txt')
+        } finally {
+            if (zone === undefined) delete process.env.TZ
+            else process.env.TZ = zone
+        }
+    })
+
     it('requests the latest 500 log entries', async () => {
         const invoke = vi.fn(async () => [])
 
