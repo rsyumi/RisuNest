@@ -80,7 +80,7 @@ export interface AndroidSpoolConsumer {
 // checked in consumeAndroidSpoolBatch below, it forms the Kotlin
 // NATIVE_FILE_JOB_SPOOL_SUFFIXES allowlist; the alignment is pinned by the
 // shared taxonomy golden fixture (tests/fixtures/nativeFileTaxonomyV1Golden.json).
-export function isAndroidNativeContentSpool(source: AndroidSpoolReady): boolean {
+export function isAndroidNativeContentSpool(source: Pick<AndroidSpoolReady, 'displayName'>): boolean {
     const displayName = source.displayName.toLocaleLowerCase('en-US')
     return displayName.endsWith('.json')
         || displayName.endsWith('.charx')

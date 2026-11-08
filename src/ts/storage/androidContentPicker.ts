@@ -3,10 +3,12 @@ import {
     AndroidSafSourceError,
     pickAndroidContentSources,
     type AndroidSafJavascriptBridge,
+    type AndroidSpoolFailure,
     type AndroidSpoolReady,
 } from './androidSafBridge'
 import { importContentBatch } from './contentImportBatch'
 import {
+    runExternalAndroidNativeFileOperation,
     runSharedNativeFileOperation,
     type SharedNativeFileOperationContext,
 } from './nativeFileJobManager'
@@ -50,15 +52,58 @@ export function importAndroidContentFromPicker(
                     context,
                 ),
                 {
-                    failures: picked.failures.map((failure) => ({
-                        name: failure.displayName,
-                        error: new AndroidSafSourceError(failure.code, `${failure.displayName}: ${failure.code}`),
-                    })),
+                    failures: spoolFailures(picked.failures),
                     releaseUnstarted: (source) => discardContentSpool(source.token),
                 },
             )
         },
         { presentation: 'dialog', format: 'content', protectAfterPicker: true },
+    )
+}
+
+function spoolFailures(failures: readonly AndroidSpoolFailure[]) {
+    return failures.map((failure) => ({
+        name: failure.displayName,
+        error: new AndroidSafSourceError(failure.code, `${failure.displayName}: ${failure.code}`),
+    }))
+}
+
+/** The JSON converter destination of an opened spool, or null when the native classifier decides. */
+export function androidSpoolReplayDestination(
+    source: AndroidSpoolReady,
+): 'character' | 'module' | 'auto' | null {
+    return source.importDestination
+        ?? (/\.lorebook$/i.test(source.displayName) ? 'module'
+            : /\.json$/i.test(source.displayName) ? 'auto' : null)
+}
+
+/**
+ * Imports several shared or opened content spools in one operation, after any operation already
+ * running. Spools the JSON converters do not own go through `importPrepared`.
+ */
+export function importOpenedAndroidContentSpools(
+    sources: readonly AndroidSpoolReady[],
+    failures: readonly AndroidSpoolFailure[],
+    importPrepared: (source: AndroidSpoolReady, context: SharedNativeFileOperationContext) => Promise<string | null>,
+): Promise<string | null> {
+    return runExternalAndroidNativeFileOperation(
+        'import',
+        (context) => importContentBatch(
+            context,
+            sources,
+            (source) => ({ name: source.displayName, bytes: source.bytes }),
+            (source) => {
+                const destination = androidSpoolReplayDestination(source)
+                return destination
+                    ? consumeAndroidContentSpool(source, destination, context)
+                    : importPrepared(source, context)
+            },
+            {
+                failures: spoolFailures(failures),
+                releaseUnstarted: (source) => discardContentSpool(source.token),
+            },
+        ),
+        { presentation: 'dialog', format: 'content' },
     )
 }
 
