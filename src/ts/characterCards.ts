@@ -188,6 +188,39 @@ async function importDesktopCharacterPath(path: string, context: SharedNativeFil
     return outcome.value
 }
 
+/** Characters and modules a desktop or iOS file association hands over. */
+function isOpenedContentPath(path: string): boolean {
+    return (isTauriDesktop || isTauriIOS) && /\.(json|png|charx|jpe?g|risum)$/i.test(path)
+}
+
+async function importOpenedContentPaths(paths: string[]): Promise<void> {
+    const callStartedAt = Date.now()
+    try {
+        await runSharedNativeFileOperation(
+            'import',
+            'opened-content',
+            (context) => importContentBatch(
+                context,
+                paths,
+                (path) => ({ name: path.split(/[\\/]/).at(-1) || path }),
+                async (path) => {
+                    if (!/\.risum$/i.test(path)) return importDesktopCharacterPath(path, context)
+                    const { importPreparedNativeModuleContent } = await import('./process/modules')
+                    const result = await importPreparedNativeModuleContent(
+                        { source: { type: 'desktopPath', path }, displayName: path.split(/[\\/]/).at(-1) || path },
+                        { signal: context.signal, onStatus: context.onStatus },
+                    )
+                    return result.kind === 'imported' ? result.value : null
+                },
+            ),
+            { presentation: 'dialog', format: 'content' },
+        )
+    } catch (error) {
+        const { presentFileOperationError } = await import('./storage/fileOperationErrorPresentation')
+        presentFileOperationError('import', error, callStartedAt)
+    }
+}
+
 export async function importCharacterProcess<T extends boolean = false>(f: {
     name: string
     data: Uint8Array | File | ReadableStream<Uint8Array>
@@ -745,8 +778,7 @@ export async function characterURLImport() {
             await restoreBackupFromNativeSource({type:'desktopPath',path})
             return true
         }
-        if (!(isTauriDesktop || isTauriIOS) || !/\.(json|png|charx|jpe?g|risum)$/i.test(path))
-            return false
+        if (!isOpenedContentPath(path)) return false
         if (/\.risum$/i.test(path)) {
             const { importPreparedNativeModuleContent } = await import(
                 './process/modules'
@@ -770,7 +802,7 @@ export async function characterURLImport() {
             if (legacyFailed || outcome.kind === 'failed') return 'failed'
         }
         return true
-    })
+    }, { accepts: isOpenedContentPath, importBatch: importOpenedContentPaths })
 
     async function importFile(name: string, data: Uint8Array): Promise<void | 'failed'> {
         if (
