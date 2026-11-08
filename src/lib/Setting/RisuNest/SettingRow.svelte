@@ -57,6 +57,6 @@
 
 <style>
     .help {
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
 </style>

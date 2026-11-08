@@ -56,7 +56,7 @@
             data-testid="persistent-working-set-recovery"
             class="flex max-h-[90dvh] w-full max-w-lg flex-col gap-4 overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-5 text-textcolor outline-hidden">
             <h2 class="text-lg font-bold">{title}</h2>
-            <p class="text-sm text-textcolor2">{unknown
+            <p class="text-sm text-subtext">{unknown
                 ? language.risuNest.persistentData.confirmApplicationHelp
                 : language.risuNest.persistentData.refreshHelp}</p>
             {#if refreshFailed}

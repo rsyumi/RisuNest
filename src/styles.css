@@ -28,6 +28,8 @@ body > iframe[data-app-lock-covered] {
   --color-draculared: var(--risu-theme-draculared);
   --color-textcolor: var(--risu-theme-textcolor);
   --color-textcolor2: var(--risu-theme-textcolor2);
+  /* Secondary text on RisuNest screens; textcolor2 alone is too faint for small text on the default theme. */
+  --color-subtext: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
   --color-darkborderc: var(--risu-theme-darkborderc);
   --color-darkbutton: var(--risu-theme-darkbutton);
 

@@ -519,7 +519,7 @@
     }
     /* The settings help text color, which stays readable at small sizes on the default themes. */
     .muted {
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
     .saved-log .date {
         background: var(--risu-theme-bgcolor);
@@ -589,6 +589,6 @@
         font-weight: 600;
     }
     .entry[data-tone='info'] .level {
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
 </style>

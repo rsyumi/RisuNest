@@ -172,7 +172,7 @@
     .compact .key { width: 60px; height: 60px; font-size: 22px; }
     .key:enabled:hover { background: var(--risu-theme-selected); }
     .key:enabled:active { background: color-mix(in srgb, var(--risu-theme-selected) 75%, var(--risu-theme-textcolor) 25%); }
-    .key.delete { background: transparent; color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%); }
+    .key.delete { background: transparent; color: var(--color-subtext); }
     .key.delete:enabled:hover { background: color-mix(in srgb, var(--risu-theme-selected) 60%, transparent); }
     .key:focus-visible, .native:focus-visible { outline: 2px solid var(--risu-theme-borderc); outline-offset: 2px; }
     .keypad.disabled { opacity: .4; }

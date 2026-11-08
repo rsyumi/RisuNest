@@ -181,7 +181,7 @@
 <div class="network-log min-w-0 pb-5">
     <SettingGroup title={t.title} description={t.notice}>
         {#snippet actions()}
-            {#if settings}<span class="flex items-center gap-2 text-xs text-textcolor2"><span class="h-1.5 w-1.5 rounded-full" class:bg-green-500={settings.enabled} class:bg-textcolor2={!settings.enabled}></span>{settings.enabled ? t.on : t.off}</span>{/if}
+            {#if settings}<span class="flex items-center gap-2 text-xs text-subtext"><span class="h-1.5 w-1.5 rounded-full" class:bg-green-500={settings.enabled} class:bg-textcolor2={!settings.enabled}></span>{settings.enabled ? t.on : t.off}</span>{/if}
         {/snippet}
         {#if settings}
             <SettingRow label={t.recording} help={t.recordingHelp} inline><SettingToggle label={t.recording} checked={settings.enabled} disabled={busy} onchange={enabled => configure({ enabled })} /></SettingRow>
@@ -203,11 +203,11 @@
                     {/each}
                 </div>
             </details>
-        {:else}<p class="p-4 text-sm text-textcolor2">{t.loading}</p>{/if}
+        {:else}<p class="p-4 text-sm text-subtext">{t.loading}</p>{/if}
     </SettingGroup>
     {#if error}<p class="mt-3 break-words text-sm text-draculared" role="alert">{error}</p>{/if}
     {#if listing?.warning}<p class="mt-3 text-sm text-draculared" role="status">{reason(listing.warning)}</p>{/if}
-    <p class="mt-2 min-h-4 text-xs text-textcolor2" aria-live="polite">{notice}</p>
+    <p class="mt-2 min-h-4 text-xs text-subtext" aria-live="polite">{notice}</p>
     <div class="mt-2 flex flex-wrap items-center justify-between gap-2">
         <div class="flex gap-1 rounded-md bg-darkbg p-1" aria-label={t.title}>
             <button class:scope-active={!retained} onclick={() => { retained = false; filter() }}>{t.recent}</button>
@@ -216,23 +216,23 @@
         <button class="icon-button" aria-label={t.refresh} onclick={() => refresh(true)}><RefreshCw size={15}/></button>
     </div>
     <div class="mt-3 flex flex-wrap gap-2">
-        <label class="search-box flex min-w-0 flex-1 items-center gap-2 rounded-md border border-darkborderc bg-darkbg px-3"><Search size={15} class="shrink-0 text-textcolor2"/><input class="min-w-0 flex-1 border-0 bg-transparent py-2 text-sm outline-none" aria-label={t.search} placeholder={t.search} bind:value={search} oninput={searchChanged}/></label>
+        <label class="search-box flex min-w-0 flex-1 items-center gap-2 rounded-md border border-darkborderc bg-darkbg px-3"><Search size={15} class="shrink-0 text-subtext"/><input class="min-w-0 flex-1 border-0 bg-transparent py-2 text-sm outline-none" aria-label={t.search} placeholder={t.search} bind:value={search} oninput={searchChanged}/></label>
         <select class="risu-select" aria-label={t.status} bind:value={status} onchange={filter}><option value="all">{t.all}</option><option value="error">{t.errors}</option><option value="active">{t.active}</option></select>
     </div>
     <div class="mt-3 overflow-hidden rounded-lg border border-darkborderc bg-darkbg">
         {#each groupNetworkLogItems(listing?.items ?? []) as group (group[0].operationId ?? group[0].id)}
             <div class="request-group border-b border-darkborderc/50 last:border-b-0" class:operation-group={!!group[0].operationId}>
-            {#if group[0].operationId}<div class="px-3 pt-2 text-xs text-textcolor2">{t.operation} <span class="font-mono break-all">{group[0].operationId}</span></div>{/if}
+            {#if group[0].operationId}<div class="px-3 pt-2 text-xs text-subtext">{t.operation} <span class="font-mono break-all">{group[0].operationId}</span></div>{/if}
             {#each group as item (item.id)}
             <button class="request-row w-full border-b border-darkborderc/50 px-3 py-3 text-left last:border-b-0" class:request-selected={selected === item.id} onclick={() => select(item.id)} aria-pressed={selected === item.id}>
-                <span class="row-main flex min-w-0 items-center gap-2"><span class="method shrink-0 text-[11px] font-semibold">{item.method}</span><span class="min-w-0 flex-1 truncate text-sm">{item.url}</span><span class="shrink-0 font-mono text-xs" class:text-draculared={item.state === 'error' || (item.status ?? 0) >= 400}>{item.status ?? (item.state === 'active' ? '…' : '×')}</span>{#if item.retained}<Bookmark size={12} class="shrink-0 text-textcolor2"/>{/if}</span>
-                <span class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-textcolor2"><time>{new Date(item.startedAt).toLocaleTimeString()}</time><span>{item.source}</span><span>{item.elapsedMs.toLocaleString()} ms</span><span>{logSize(item.capturedBytes)}</span>{#if item.streamKind}<span>{item.streamKind === 'sse' ? 'SSE' : 'WebSocket'}</span>{/if}{#if item.incomplete}<span>{t.partial}</span>{/if}</span>
+                <span class="row-main flex min-w-0 items-center gap-2"><span class="method shrink-0 text-[11px] font-semibold">{item.method}</span><span class="min-w-0 flex-1 truncate text-sm">{item.url}</span><span class="shrink-0 font-mono text-xs" class:text-draculared={item.state === 'error' || (item.status ?? 0) >= 400}>{item.status ?? (item.state === 'active' ? '…' : '×')}</span>{#if item.retained}<Bookmark size={12} class="shrink-0 text-subtext"/>{/if}</span>
+                <span class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-subtext"><time>{new Date(item.startedAt).toLocaleTimeString()}</time><span>{item.source}</span><span>{item.elapsedMs.toLocaleString()} ms</span><span>{logSize(item.capturedBytes)}</span>{#if item.streamKind}<span>{item.streamKind === 'sse' ? 'SSE' : 'WebSocket'}</span>{/if}{#if item.incomplete}<span>{t.partial}</span>{/if}</span>
             </button>
             {/each}
             </div>
-        {:else}<div class="px-4 py-10 text-center text-sm text-textcolor2">{t.empty}</div>{/each}
+        {:else}<div class="px-4 py-10 text-center text-sm text-subtext">{t.empty}</div>{/each}
     </div>
-    <div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-textcolor2">
+    <div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-subtext">
         <span>{t.storage} {logSize((retained ? listing?.retainedBytes : listing?.recentBytes) ?? 0)}{#if settings} / {logSize((retained ? settings.retainedMib : settings.recentMib) * 1024 * 1024)}{/if}</span>
         {#if offset > 0 || listing?.hasMore}<div class="flex gap-2"><button disabled={offset === 0} onclick={() => { offset = Math.max(0, offset - 50); void refresh() }}>{t.previous}</button><button disabled={!listing?.hasMore} onclick={() => { offset += 50; void refresh() }}>{t.next}</button></div>{/if}
     </div>
@@ -244,8 +244,8 @@
                     <button disabled={busy} onclick={() => action(() => downloadNetworkLog(selected))}><Download size={14}/>{t.download}</button>
                     <button disabled={busy || detail.state === 'active'} aria-label={t.delete} onclick={() => action(async () => { await networkLog({ op: 'delete', id: selected }); selected = ''; detail = null; body = null; await refresh() })}><Trash2 size={14}/></button>
                 </div></div>
-                <p class="mt-2 break-all font-mono text-xs text-textcolor2">{detail.request.url}</p>
-                {#if detail.response.url && detail.response.url !== detail.request.url}<p class="mt-1 break-all font-mono text-xs text-textcolor2">→ {detail.response.url}</p>{/if}
+                <p class="mt-2 break-all font-mono text-xs text-subtext">{detail.request.url}</p>
+                {#if detail.response.url && detail.response.url !== detail.request.url}<p class="mt-1 break-all font-mono text-xs text-subtext">→ {detail.response.url}</p>{/if}
                 {#if detail.captureError}<p class="mt-2 text-xs text-draculared">{reason(detail.captureError)}</p>{/if}
             </div>
             <div class="flex overflow-x-auto border-b border-darkborderc px-2 [scrollbar-width:none]" role="tablist" aria-label={t.title}>
@@ -256,11 +256,11 @@
             {#if tab === 'headers'}
                 <div class="space-y-5 p-4">
                     {#each [{ title: t.requestHeaders, headers: detail.request.headers }, { title: t.responseHeaders, headers: detail.response.headers }] as section}
-                        <div><h3 class="mb-2 text-sm font-semibold">{section.title}</h3><dl class="headers space-y-2 font-mono text-xs">{#each section.headers as header}<div class="header-row"><dt class="break-all text-textcolor2">{header.name}</dt><dd class="min-w-0 whitespace-pre-wrap break-all">{header.value}{header.encoding ? ' (' + header.encoding + ')' : ''}</dd></div>{:else}<p class="text-textcolor2">{t.noHeaders}</p>{/each}</dl></div>
+                        <div><h3 class="mb-2 text-sm font-semibold">{section.title}</h3><dl class="headers space-y-2 font-mono text-xs">{#each section.headers as header}<div class="header-row"><dt class="break-all text-subtext">{header.name}</dt><dd class="min-w-0 whitespace-pre-wrap break-all">{header.value}{header.encoding ? ' (' + header.encoding + ')' : ''}</dd></div>{:else}<p class="text-subtext">{t.noHeaders}</p>{/each}</dl></div>
                     {/each}
                 </div>
             {:else if body}
-                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-darkborderc/50 px-3 py-2 text-xs text-textcolor2">
+                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-darkborderc/50 px-3 py-2 text-xs text-subtext">
                     <span>{logSize(body.offset)} – {logSize(body.nextOffset)} / {logSize(body.total)}</span>
                     <div class="flex flex-wrap gap-1">
                         {#if prettyText !== null && tab !== 'events'}<button onclick={() => { pretty = !pretty }}>{pretty ? t.raw : t.formatted}</button>{/if}
@@ -268,16 +268,16 @@
                     </div>
                 </div>
                 {#if tab === 'events' && detail.streamKind === 'sse'}
-                    <div class="divide-y divide-darkborderc/50">{#each sseEvents as event, index}<details class="event-row px-4 py-2"><summary class="flex flex-wrap cursor-pointer gap-2 text-xs"><span class="text-textcolor2">#{sequence + index}</span>{#if arrivals[index] != null}<time class="text-textcolor2" title={new Date(detail.startedAt + arrivals[index]!).toISOString()}>{new Date(detail.startedAt + arrivals[index]!).toLocaleTimeString(undefined, { hour12: false })}.{String((detail.startedAt + arrivals[index]!) % 1000).padStart(3, '0')}</time>{/if}<span class="font-mono">{event.event}</span>{#if event.id}<span>{event.id}</span>{/if}{#if !event.complete || event.partial}<span class="text-textcolor2">{t.fragment}</span>{/if}</summary><pre class="code mt-2">{event.data || event.raw}</pre><details class="mt-2 text-xs text-textcolor2"><summary class="cursor-pointer">{t.raw}</summary><pre class="code mt-2">{event.raw}</pre></details></details>{:else}<p class="p-4 text-sm text-textcolor2">{t.missingEvents}</p>{/each}</div>
+                    <div class="divide-y divide-darkborderc/50">{#each sseEvents as event, index}<details class="event-row px-4 py-2"><summary class="flex flex-wrap cursor-pointer gap-2 text-xs"><span class="text-subtext">#{sequence + index}</span>{#if arrivals[index] != null}<time class="text-subtext" title={new Date(detail.startedAt + arrivals[index]!).toISOString()}>{new Date(detail.startedAt + arrivals[index]!).toLocaleTimeString(undefined, { hour12: false })}.{String((detail.startedAt + arrivals[index]!) % 1000).padStart(3, '0')}</time>{/if}<span class="font-mono">{event.event}</span>{#if event.id}<span>{event.id}</span>{/if}{#if !event.complete || event.partial}<span class="text-subtext">{t.fragment}</span>{/if}</summary><pre class="code mt-2">{event.data || event.raw}</pre><details class="mt-2 text-xs text-subtext"><summary class="cursor-pointer">{t.raw}</summary><pre class="code mt-2">{event.raw}</pre></details></details>{:else}<p class="p-4 text-sm text-subtext">{t.missingEvents}</p>{/each}</div>
                 {:else if tab === 'events' && detail.streamKind === 'websocket'}
-                    <div class="divide-y divide-darkborderc/50">{#each observations as item}<button class="flex w-full justify-between rounded-none px-4 py-2 text-xs" onclick={() => openMessage(item)}><span class="flex gap-3"><span class="text-textcolor2">{item.elapsedMs.toLocaleString()} ms</span><span>{item.side === 'request' ? t.sent : t.received}</span><span class="font-mono">{item.kind}</span></span><span>{logSize(item.length)}</span></button>{:else}<p class="p-4 text-sm text-textcolor2">{t.missingEvents}</p>{/each}</div>
-                    {#if message}<div class="border-t border-darkborderc p-4"><h4 class="mb-2 text-xs text-textcolor2">{message.kind} · {logSize(message.length)}</h4><pre class="code">{messageBody?.text ?? t.loading}</pre></div>{/if}
+                    <div class="divide-y divide-darkborderc/50">{#each observations as item}<button class="flex w-full justify-between rounded-none px-4 py-2 text-xs" onclick={() => openMessage(item)}><span class="flex gap-3"><span class="text-subtext">{item.elapsedMs.toLocaleString()} ms</span><span>{item.side === 'request' ? t.sent : t.received}</span><span class="font-mono">{item.kind}</span></span><span>{logSize(item.length)}</span></button>{:else}<p class="p-4 text-sm text-subtext">{t.missingEvents}</p>{/each}</div>
+                    {#if message}<div class="border-t border-darkborderc p-4"><h4 class="mb-2 text-xs text-subtext">{message.kind} · {logSize(message.length)}</h4><pre class="code">{messageBody?.text ?? t.loading}</pre></div>{/if}
                 {:else}
                     {#if detail[selectedSide].body.truncated && detail.captureError !== 'binary-skipped'}<p class="px-4 pt-3 text-xs text-draculared">{t.bodyLimited}</p>{/if}
                     <pre class="code p-4">{pretty && prettyText !== null ? prettyText : (body.text || t.noBody)}</pre>
                 {/if}
                 {#if bodyOffset > 0 || body.nextOffset < body.total}<div class="flex justify-end gap-2 border-t border-darkborderc px-3 py-2"><button disabled={pageHistory.length === 0} onclick={() => bodyPage(false)}>{t.previous}</button><button disabled={body.nextOffset >= body.total} onclick={() => bodyPage(true)}>{t.next}</button></div>{/if}
-            {:else}<p class="p-4 text-sm text-textcolor2">{t.loading}</p>{/if}
+            {:else}<p class="p-4 text-sm text-subtext">{t.loading}</p>{/if}
         </section>
     {/if}
 </div>
@@ -292,7 +292,7 @@
     /* A shadow, not a border, so grouped rows keep their alignment and a selected row draws one marker. */
     .network-log .operation-group { box-shadow: inset 2px 0 var(--risu-theme-selected); }
     .network-log .request-selected { background: color-mix(in srgb, var(--risu-theme-selected) 16%, var(--risu-theme-darkbg)); box-shadow: inset 2px 0 var(--risu-theme-textcolor2); }
-    .network-log .detail-tab { border-radius: 0; padding: 0.75rem 0.5rem; border-bottom: 2px solid transparent; color: var(--risu-theme-textcolor2); }
+    .network-log .detail-tab { border-radius: 0; padding: 0.75rem 0.5rem; border-bottom: 2px solid transparent; color: var(--color-subtext); }
     .network-log .tab-active { border-bottom-color: var(--risu-theme-textcolor); color: var(--risu-theme-textcolor); }
     .header-row { display: grid; grid-template-columns: minmax(6rem, 32%) minmax(0, 1fr); gap: 0.75rem; }
     .code { max-height: 32rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.75rem; line-height: 1.65; }

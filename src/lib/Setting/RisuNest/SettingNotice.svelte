@@ -41,7 +41,7 @@
     .notice :global(.notice-icon) {
         flex: none;
         margin-top: 0.15rem;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .notice[data-notice='danger'] :global(.notice-icon) {
         color: color-mix(in srgb, var(--risu-theme-danger-400) 80%, var(--risu-theme-textcolor));

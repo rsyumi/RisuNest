@@ -97,7 +97,7 @@
                     </div>
                     <div class="min-w-0 grow">
                         <h2 id="sync-exit-title" class="text-lg font-semibold leading-tight">{title}</h2>
-                        <p id="sync-exit-detail" class="mt-1.5 text-sm leading-relaxed text-textcolor2" aria-live="polite">
+                        <p id="sync-exit-detail" class="mt-1.5 text-sm leading-relaxed text-subtext" aria-live="polite">
                             {detail}
                         </p>
                     </div>

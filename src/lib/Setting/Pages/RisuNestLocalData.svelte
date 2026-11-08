@@ -110,7 +110,7 @@
 
 <SettingGroup id="risunest-local-data" title={strings.title} description={strings.description}>
     {#if remotes === 'none'}
-        <p class="px-4 py-3 text-[13px] leading-normal text-textcolor2">{strings.notConnected}</p>
+        <p class="px-4 py-3 text-[13px] leading-normal text-subtext">{strings.notConnected}</p>
     {/if}
     {#if hypaUsage}
         <SettingRow label={strings.hypaCache} help={strings.hypaUsage.replace('{count}', hypaUsage.count.toLocaleString()).replace('{size}', formatRisuNestStorageBytes(hypaUsage.bytes))}>
@@ -145,9 +145,9 @@
             class="flex w-full max-w-md flex-col gap-3 rounded-xl border border-darkborderc bg-darkbg p-5 text-textcolor"
         >
             <h3 id="local-data-enable-title" class="text-lg font-bold">{strings.enableTitle}</h3>
-            <p class="text-sm text-textcolor2">{strings.enableBody}</p>
+            <p class="text-sm text-subtext">{strings.enableBody}</p>
             {#if section === 'local-plugins'}
-                <p class="text-sm text-textcolor2">{strings.enableBodyPlugin}</p>
+                <p class="text-sm text-subtext">{strings.enableBodyPlugin}</p>
             {/if}
             <div class="flex flex-wrap justify-end gap-2">
                 <SettingButton variant="secondary" disabled={busy} onclick={cancelEnable}>{language.cancel}</SettingButton>

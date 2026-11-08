@@ -89,9 +89,9 @@
 {#snippet table(caption: string, rows: InlayInventoryEntry[])}
     <!-- Fixed layout so both tables place their bar, count and size columns alike. -->
     <table data-inlay-inventory-table class="w-full table-fixed border-t border-darkborderc/55 text-sm">
-        <caption class="px-4 pt-3 pb-1 text-left text-xs text-textcolor2">{caption}</caption>
+        <caption class="px-4 pt-3 pb-1 text-left text-xs text-subtext">{caption}</caption>
         <thead>
-            <tr class="text-xs text-textcolor2">
+            <tr class="text-xs text-subtext">
                 <th scope="col" class="px-4 py-1 text-left font-normal">{strings.inventoryExtension}</th>
                 <th aria-hidden="true" class="hidden w-[35%] @md:table-cell"></th>
                 <th scope="col" class="w-20 px-4 py-1 text-right font-normal">{strings.inventoryCount}</th>
@@ -134,7 +134,7 @@
             <SettingButton busy={loading} onclick={load}>{strings.inventoryLoad}</SettingButton>
         </div>
     {:else if inventory.total.count === 0}
-        <div class="px-4 py-3 text-sm text-textcolor2">{strings.inventoryEmpty}</div>
+        <div class="px-4 py-3 text-sm text-subtext">{strings.inventoryEmpty}</div>
     {:else}
         <div data-inlay-inventory-summary class="p-4 text-[1.7rem] leading-tight font-bold tabular-nums">{summary}</div>
         {@render table(strings.inventoryImages, inventory.images)}
@@ -155,7 +155,7 @@
                                 />
                             </div>
                         {:else if sharedResultText}
-                            <p data-inlay-optimize-result class="mt-1 text-sm text-textcolor2" role="status" aria-live="polite">{sharedResultText}</p>
+                            <p data-inlay-optimize-result class="mt-1 text-sm text-subtext" role="status" aria-live="polite">{sharedResultText}</p>
                         {/if}
                     {/snippet}
                     {#if optimizing}

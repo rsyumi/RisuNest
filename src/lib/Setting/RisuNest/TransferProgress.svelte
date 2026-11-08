@@ -53,7 +53,7 @@
     {#if activity || stages.length > 1 || counters.length}
         {#if collapsible}
             <details class="group" bind:open>
-                <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-textcolor2 select-none [&::-webkit-details-marker]:hidden">
+                <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-subtext select-none [&::-webkit-details-marker]:hidden">
                     <ChevronRightIcon size={16} class="shrink-0 transition-transform duration-200 group-open:rotate-90" aria-hidden="true" />
                     <span>{detailsLabel}</span>
                 </summary>
@@ -70,10 +70,10 @@
     .details { margin-top: 0.5rem; padding-left: 1.5rem; }
     .activity, .stages, .counters { font-size: 13px; }
     .stages { display: grid; gap: 0.375rem; margin: 0; padding: 0; list-style: none; }
-    .stages li { display: flex; align-items: center; gap: 0.5rem; min-width: 0; color: var(--risu-theme-textcolor2); }
+    .stages li { display: flex; align-items: center; gap: 0.5rem; min-width: 0; color: var(--color-subtext); }
     .stages li[data-state='active'] { color: var(--risu-theme-textcolor); }
     .stages li[data-state='done'] :global(svg) { color: var(--risu-theme-success-500); }
     .counters { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.375rem 1rem; margin: 0; }
-    .counters dt { color: var(--risu-theme-textcolor2); }
+    .counters dt { color: var(--color-subtext); }
     .counters dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 </style>
