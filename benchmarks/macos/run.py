@@ -157,7 +157,7 @@ def start_appearance_capture(directory, label, platform, capture_input, capture_
         raise
 
 
-def finish_appearance_capture(capture):
+def finish_appearance_capture(capture, require_display_cadence=True):
     process = capture['process']
     try:
         process.communicate(None if capture.get('experimentCodec') else b'q\n', timeout=15)
@@ -205,7 +205,9 @@ def finish_appearance_capture(capture):
             raise RuntimeError('Capture input format or CPU timing unavailable')
         if result['duplicateFrames'] != 0 or result['droppedFrames'] != 0:
             raise RuntimeError('Capture output duplicated or dropped frames')
-    if len(times) < 60 or not gaps or max(gaps) > 0.04:
+    if not times:
+        raise RuntimeError('Screen capture recorded no frames')
+    if require_display_cadence and (len(times) < 60 or not gaps or max(gaps) > 0.04):
         raise RuntimeError('Capture cadence insufficient to assess a one-frame startup flash')
     return result
 

@@ -8,6 +8,7 @@ import subprocess
 import time
 
 PHASES = ('app-lock-immediate', 'app-lock-timed', 'app-lock-immediate-mutant')
+IOS_PHASES = ('app-lock-immediate', 'app-lock-timed', 'app-lock-immediate-mutant', 'app-lock-timed-mutant')
 
 
 def output(command, **kwargs):
@@ -97,16 +98,27 @@ def frame_times(path):
     return [float(frame['best_effort_timestamp_time']) for frame in probe['frames']]
 
 
-def cadence(path):
+def frame_timing(path):
     times = frame_times(path)
     gaps = [end - start for start, end in zip(times, times[1:])]
+    return times, gaps, {'frames': len(times), 'maximumFrameGapSeconds': max(gaps, default=None)}
+
+
+def cadence(path):
+    times, gaps, timing = frame_timing(path)
     if len(times) < 30 or not gaps or min(gaps) <= 0 or max(gaps) > .04:
         raise RuntimeError('Capture cadence cannot resolve a display-frame content flash')
-    return {'frames': len(times), 'maximumFrameGapSeconds': max(gaps)}
+    return timing
 
 
-def assess(video, baseline, ready, locked, expect_exposure=False):
-    timing = cadence(video)
+def contrast(pixels):
+    luminance = [(pixels[i] + pixels[i + 1] + pixels[i + 2]) // 3 for i in range(0, len(pixels), 3)]
+    return max(luminance) - min(luminance)
+
+
+def assess(video, baseline, ready, locked, expect_exposure=False, frame_exact=True, scan_from=1):
+    # Without frame-exact capture, exposure is judged on the frames the recorder wrote and the keypad on the last one.
+    timing = cadence(video) if frame_exact else {**frame_timing(video)[2], 'frameExact': False}
     width, height, data = rgb_image(baseline)
     marker = find_marker(width, height, data)
     info = metadata(video)
@@ -116,10 +128,13 @@ def assess(video, baseline, ready, locked, expect_exposure=False):
     detection_width = min(640, int(info['width']))
     detection_height = round(int(info['height']) * detection_width / int(info['width']))
     exposures = []
+    stripe_rows = {}
     count = 0
     # Inspect the whole frame so activation animations cannot move exposed content outside a fixed crop.
     for count, data in enumerate(frames(video, [0, 0, int(info['width']), int(info['height'])],
                                         scale=(detection_width, detection_height)), 1):
+        if count < scan_from:
+            continue
         hits = 0
         for y in range(0, detection_height, max(1, detection_height // 120)):
             if stripe(data[y * detection_width * 3:(y + 1) * detection_width * 3] + bytes(3)) is not None:
@@ -127,6 +142,14 @@ def assess(video, baseline, ready, locked, expect_exposure=False):
                 if hits >= 3:
                     exposures.append(count)
                     break
+        if hits:
+            stripe_rows[count] = hits
+    last = None
+    if not frame_exact:
+        for last in frames(video, [0, 0, int(info['width']), int(info['height'])]):
+            pass
+        if last is None:
+            raise RuntimeError('Recording has no decodable frame')
     scale = marker[2] / ready['marker']['width']
     origin_x = marker[0] - ready['marker']['x'] * scale
     origin_y = marker[1] - ready['marker']['y'] * scale
@@ -137,14 +160,18 @@ def assess(video, baseline, ready, locked, expect_exposure=False):
         key_crop = [left, top, int(key['width'] * scale * sx * .5), int(key['height'] * scale * sy * .5)]
         if left < 0 or top < 0 or left + key_crop[2] > int(info['width']) or top + key_crop[3] > int(info['height']):
             raise RuntimeError('Shared keypad falls outside the captured viewport')
-        contrasting = 0
-        for pixels in frames(video, key_crop, tail=.35):
-            luminance = [(pixels[i] + pixels[i + 1] + pixels[i + 2]) // 3 for i in range(0, len(pixels), 3)]
-            if max(luminance) - min(luminance) > 60:
-                contrasting += 1
-        if contrasting >= 3:
+        if frame_exact:
+            if sum(contrast(pixels) > 60 for pixels in frames(video, key_crop, tail=.35)) >= 3:
+                visible_keys += 1
+            continue
+        video_width = int(info['width'])
+        pixels = b''.join(last[((key_crop[1] + row) * video_width + key_crop[0]) * 3:
+                               ((key_crop[1] + row) * video_width + key_crop[0] + key_crop[2]) * 3]
+                          for row in range(key_crop[3]))
+        if contrast(pixels) > 60:
             visible_keys += 1
-    result = {**timing, 'decodedFrames': count, 'exposureFrames': exposures, 'visibleKeypadKeys': visible_keys,
+    result = {**timing, 'decodedFrames': count, 'scannedFromFrame': scan_from, 'exposureFrames': exposures,
+              'stripeRowsByFrame': stripe_rows, 'visibleKeypadKeys': visible_keys,
               'baselineMarker': marker, 'mutation': expect_exposure, 'retained': locked['retained'],
               'blockedAfterReturnMs': locked['blockedAfterReturnMs']}
     video.with_suffix('.frames.json').write_text(json.dumps(result, indent=2))
@@ -207,13 +234,13 @@ def run_macos(app, artifacts, capture_input, start_capture, finish_capture, acti
                 locked = wait_stage(report, 'app-lock-locked', 45, process)
                 time.sleep(.6)
                 completed_capture, capture = capture, None
-                finish_capture(completed_capture)
+                finish_capture(completed_capture, require_display_cadence=False)
                 video = completed_capture['video']
-                outcomes.append(assess(video, baseline, ready, locked, phase.endswith('mutant')))
+                outcomes.append(assess(video, baseline, ready, locked, phase.endswith('mutant'), frame_exact=False))
             finally:
                 try:
                     if capture is not None:
-                        finish_capture(capture)
+                        finish_capture(capture, require_display_cadence=False)
                 finally:
                     if process.poll() is None:
                         process.terminate()
@@ -257,6 +284,18 @@ def stop_simulator_recorder(recorder):
         raise RuntimeError('Simulator recording failed')
 
 
+def departure_frames(video, screenshot):
+    info, reference_info = metadata(video), metadata(screenshot)
+    size = (90, round(int(info['height']) * 90 / int(info['width'])))
+    reference = next(frames(screenshot, [0, 0, int(reference_info['width']), int(reference_info['height'])], scale=size))
+    matches = []
+    count = 0
+    for count, data in enumerate(frames(video, [0, 0, int(info['width']), int(info['height'])], scale=size), 1):
+        if sum(abs(left - right) for left, right in zip(data, reference)) / len(reference) < 8:
+            matches.append(count)
+    return matches, count
+
+
 def run_ios_phase(device, identifier, container, artifacts, phase):
     if list(container.rglob('verification-' + phase + '.jsonl')):
         raise RuntimeError('Refusing an existing app-lock verification phase')
@@ -277,15 +316,19 @@ def run_ios_phase(device, identifier, container, artifacts, phase):
         baseline = artifacts / (phase + '-baseline.png')
         subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(baseline)], check=True)
         started = time.monotonic()
-        subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
-        timing['departureLaunchedSeconds'] = time.monotonic() - started
-        time.sleep(.4)
-        if phase == 'app-lock-timed':
-            time.sleep(65)
         video = artifacts / (phase + '.mp4')
+        # Recording from before departure keeps the recorder's start latency out of the busy WebView interval.
         recorder = start_simulator_recorder(device, video, artifacts / (phase + '-capture.log'))
         timing['recorderStartedSeconds'] = time.monotonic() - started
+        departure_screen = artifacts / (phase + '-departure.png')
         try:
+            subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
+            timing['departureLaunchedSeconds'] = time.monotonic() - started
+            time.sleep(.4)
+            if phase in ('app-lock-timed', 'app-lock-timed-mutant'):
+                time.sleep(65)
+            subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(departure_screen)], check=True)
+            timing['returnRequestedSeconds'] = time.monotonic() - started
             subprocess.run(['xcrun', 'simctl', 'launch', device, identifier], check=True)
             timing['returnLaunchedSeconds'] = time.monotonic() - started
             locked = wait_stage(report, 'app-lock-locked', 45)
@@ -298,12 +341,17 @@ def run_ios_phase(device, identifier, container, artifacts, phase):
             raise
         stop_simulator_recorder(recorder)
         timing['recorderStoppedSeconds'] = time.monotonic() - started
-        times = frame_times(video)
-        gaps = [end - start for start, end in zip(times, times[1:])]
+        times, gaps, _ = frame_timing(video)
+        departed, decoded = departure_frames(video, departure_screen)
         video.with_suffix('.frame-timestamps.json').write_text(json.dumps({
             'frames': len(times), 'maximumFrameGapSeconds': max(gaps, default=None),
-            'gapsOver40ms': sum(gap > .04 for gap in gaps), 'times': times}, indent=2))
-        return assess(video, baseline, ready, locked, phase.endswith('mutant'))
+            'gapsOver40ms': sum(gap > .04 for gap in gaps), 'departureScreenFrames': departed, 'times': times}, indent=2))
+        # Frames before the departure screen show the retained page on purpose; the return is everything after it.
+        if not departed:
+            raise RuntimeError('Recording never showed the departure screen')
+        if departed[-1] == decoded:
+            raise RuntimeError('Recording ended before the return')
+        return assess(video, baseline, ready, locked, phase.endswith('mutant'), frame_exact=False, scan_from=departed[0])
     finally:
         (artifacts / (phase + '-timing.json')).write_text(json.dumps(timing, indent=2))
         (artifacts / (phase + '.jsonl')).write_text(report.read_text())
@@ -323,7 +371,7 @@ def run_ios(device, artifacts):
     outcomes = []
     failures = []
     # Later phases still run after a failure so every phase leaves its recording.
-    for phase in PHASES:
+    for phase in IOS_PHASES:
         try:
             outcomes.append(run_ios_phase(device, identifier, container, artifacts, phase))
         except Exception as error:
