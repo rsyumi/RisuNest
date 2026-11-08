@@ -8,7 +8,8 @@ import subprocess
 import time
 
 PHASES = ('app-lock-immediate', 'app-lock-timed', 'app-lock-immediate-mutant')
-IOS_PHASES = ('app-lock-immediate', 'app-lock-timed', 'app-lock-immediate-mutant', 'app-lock-timed-mutant')
+# A busy iOS WebView paints nothing after departure, so only the return-time busy interval keeps exposed content on screen.
+IOS_PHASES = ('app-lock-immediate', 'app-lock-timed', 'app-lock-timed-mutant')
 
 
 def output(command, **kwargs):
@@ -296,7 +297,7 @@ def departure_frames(video, screenshot):
     return matches, count
 
 
-def run_ios_phase(device, identifier, container, artifacts, phase):
+def run_ios_phase(device, identifier, container, artifacts, phase, departure_screen):
     if list(container.rglob('verification-' + phase + '.jsonl')):
         raise RuntimeError('Refusing an existing app-lock verification phase')
     environment = {**os.environ, 'SIMCTL_CHILD_RISUNEST_IOS_PHASE': phase}
@@ -320,14 +321,12 @@ def run_ios_phase(device, identifier, container, artifacts, phase):
         # Recording from before departure keeps the recorder's start latency out of the busy WebView interval.
         recorder = start_simulator_recorder(device, video, artifacts / (phase + '-capture.log'))
         timing['recorderStartedSeconds'] = time.monotonic() - started
-        departure_screen = artifacts / (phase + '-departure.png')
         try:
             subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
             timing['departureLaunchedSeconds'] = time.monotonic() - started
             time.sleep(.4)
             if phase in ('app-lock-timed', 'app-lock-timed-mutant'):
                 time.sleep(65)
-            subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(departure_screen)], check=True)
             timing['returnRequestedSeconds'] = time.monotonic() - started
             subprocess.run(['xcrun', 'simctl', 'launch', device, identifier], check=True)
             timing['returnLaunchedSeconds'] = time.monotonic() - started
@@ -368,12 +367,18 @@ def run_ios(device, artifacts):
         raise RuntimeError('Capture requires only the owned synthetic Simulator to be booted')
     (artifacts / 'simulator-selection.json').write_text(json.dumps({
         'udid': device, 'name': booted[0]['name'], 'onlyBootedDevice': True}, indent=2))
+    # The departure screen is captured once, outside every busy interval, to mark where each recorded return begins.
+    departure_screen = artifacts / 'departure-screen.png'
+    subprocess.run(['xcrun', 'simctl', 'terminate', device, 'com.apple.Preferences'], check=False)
+    subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
+    time.sleep(2)
+    subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(departure_screen)], check=True)
     outcomes = []
     failures = []
     # Later phases still run after a failure so every phase leaves its recording.
     for phase in IOS_PHASES:
         try:
-            outcomes.append(run_ios_phase(device, identifier, container, artifacts, phase))
+            outcomes.append(run_ios_phase(device, identifier, container, artifacts, phase, departure_screen))
         except Exception as error:
             failures.append({'phase': phase, 'error': f'{type(error).__name__}: {error}'})
         finally:
