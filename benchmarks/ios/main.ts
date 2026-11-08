@@ -82,7 +82,7 @@ async function main() {
   await guard();
   check(isTauriIOS && !isTauriDesktop, "iOS runtime classification");
   const phase = await invoke<string>("ios_bench_phase");
-  if (/^app-lock-(immediate|timed|immediate-mutant|ui)$/.test(phase)) {
+  if (/^app-lock-(immediate|timed|immediate-mutant|timed-mutant|ui)$/.test(phase)) {
     const { appLockFixture } = await import('../appLock/fixture');
     const { initialize } = await import('./contracts');
     await appLockFixture('ios', phase, initialize);

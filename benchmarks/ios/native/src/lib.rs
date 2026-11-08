@@ -24,7 +24,8 @@ async fn ios_bench_authenticate(
         use tauri_plugin_ios_native::{IosNativeExt, WebAuthenticationOutcome};
 
         let callback = "risunestoauthtest://oauth?code=synthetic&state=device";
-        let authorization_url = "https://httpbin.org/redirect-to?url=risunestoauthtest%3A%2F%2Foauth%3Fcode%3Dsynthetic%26state%3Ddevice";
+        // The redirector must pass a non-HTTP callback target through unchanged.
+        let authorization_url = "https://postman-echo.com/redirect-to?url=risunestoauthtest%3A%2F%2Foauth%3Fcode%3Dsynthetic%26state%3Ddevice";
         return Ok(match app
             .ios_native()
             .authenticate(authorization_url, "risunestoauthtest", true)

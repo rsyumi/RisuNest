@@ -16,9 +16,9 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
     sendReport?: (stage: string, result: unknown) => Promise<unknown>) {
     if (platform === 'linux' && !sendReport) throw new Error('Linux fixture requires an external report reader')
     const report = sendReport ?? ((stage: string, result: unknown) => invoke(`${platform}_bench_report`, { stage, result }))
-    const timed = phase === 'app-lock-timed'
+    const timed = phase === 'app-lock-timed' || phase === 'app-lock-timed-mutant'
     const ui = phase === 'app-lock-ui'
-    const mutant = phase === 'app-lock-immediate-mutant'
+    const mutant = phase.endsWith('-mutant')
     Object.assign(window, { __risunestAppLockRemoveCover: mutant })
     let armed = false
     let departure: AppLockLifecycle | null = null
