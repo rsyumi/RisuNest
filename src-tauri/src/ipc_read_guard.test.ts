@@ -5,7 +5,7 @@ import { runInNewContext } from "node:vm";
 import { webcrypto } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
-const tauriVersion = "2.12.1";
+const tauriVersion = "2.12.5";
 const fixtureDir = `tests/fixtures/tauri-${tauriVersion}`;
 const fixtureNames = ["core.js", "ipc-protocol.js", "process-ipc-message-fn.js"];
 const fixture = (name: string) => readFileSync(`${fixtureDir}/${name}`, "utf8");

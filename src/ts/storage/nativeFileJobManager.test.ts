@@ -497,7 +497,7 @@ describe('renderer-lifetime native file job manager', () => {
             state: 'failed',
             error,
             warningCodes: ['cleanup-failed'],
-            batch: { total: 3, imported: 1, failures: [{ name: 'broken.charx', error }] },
+            batch: { total: 3, imported: 1, failures: [{ name: 'broken.charx', error }], declined: ['declined.charx'] },
         })
 
         dismissNativeFileOperationOutcome()
@@ -507,7 +507,10 @@ describe('renderer-lifetime native file job manager', () => {
             context.recordBatchItem('declined.charx', { imported: false })
             return null
         }, { presentation: 'dialog', format: 'content' })
-        expect(get(nativeFileOperationOutcome)).toMatchObject({ state: 'succeeded', batch: { total: 2, imported: 1, failures: [] } })
+        expect(get(nativeFileOperationOutcome)).toMatchObject({
+            state: 'succeeded',
+            batch: { total: 2, imported: 1, failures: [], declined: ['declined.charx'] },
+        })
 
         dismissNativeFileOperationOutcome()
         await runSharedNativeFileOperation('import', 'content-picker', async context => {
@@ -516,6 +519,7 @@ describe('renderer-lifetime native file job manager', () => {
             context.recordBatchItem('second.charx', { imported: false })
             return null
         }, { presentation: 'dialog', format: 'content' })
+        // Every file was left out, which their own alerts or refusals already showed.
         expect(get(nativeFileOperationOutcome)).toBeNull()
 
         await expect(runSharedNativeFileOperation('import', 'content-picker', async context => {

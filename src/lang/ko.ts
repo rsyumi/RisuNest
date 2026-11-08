@@ -3034,6 +3034,7 @@ export const languageKorean = {
             notificationsOn: '허용됨',
             notificationsOff: '꺼짐',
             openSettings: '알림 설정 열기',
+            allowNotifications: '알림 허용',
             keepAlive: '응답 생성 중 앱 유지',
             keepAliveHelp:
                 '알림을 사용해 백그라운드에서도 생성을 이어가도록 돕습니다. Android가 앱을 일시 중지하거나 종료할 수 있습니다.',

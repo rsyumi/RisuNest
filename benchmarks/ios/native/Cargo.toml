@@ -8,15 +8,15 @@ name = "ios_bench"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = "2.7.1"
+tauri-build = "2.7.4"
 
 [dependencies]
 risunest = { path = "../../../src-tauri" }
-tauri = "2.12.1"
+tauri = "2.12.5"
 serde_json = "1"
-tauri-plugin-fs = "2.6.0"
+tauri-plugin-fs = "2.7.0"
 tauri-plugin-os = "2.3.2"
-tauri-plugin-dialog = "2.7.3"
+tauri-plugin-dialog = "2.8.2"
 # The plugin's default features without `cookies`, which the product leaves off.
 tauri-plugin-http = { version = "2.8.0", default-features = false, features = ["unsafe-headers", "rustls-tls", "http2", "charset", "system-proxy"] }
 tauri-plugin-deep-link = "2.4.10"
@@ -26,7 +26,7 @@ tauri-plugin-shell = "2.3.6"
 [target.'cfg(target_os = "ios")'.dependencies]
 libc = "0.2"
 mach2 = "0.7"
-tauri-plugin-opener = "2.5.5"
+tauri-plugin-opener = "2.7.1"
 tauri-plugin-ios-native = { path = "../../../crates/tauri-plugin-ios-native" }
 tauri-plugin-barcode-scanner = { path = "../../../crates/tauri-plugin-barcode-scanner" }
 
