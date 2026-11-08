@@ -52,6 +52,7 @@ describe('raw recovery export route', () => {
 
         expect(mocks.save).toHaveBeenCalledWith(
             expect.objectContaining({
+                defaultPath: expect.stringMatching(/^risunest-\d{4}(-\d{2}){5}\.risunest-rescue\.zip$/),
                 filters: [{
                     name: 'RisuNest Rescue Archive',
                     extensions: ['risunest-rescue.zip'],
