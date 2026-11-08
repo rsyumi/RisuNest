@@ -3210,6 +3210,7 @@ export const languageEnglish = {
             notificationsOn: 'Allowed',
             notificationsOff: 'Off',
             openSettings: 'Open notification settings',
+            allowNotifications: 'Allow notifications',
             keepAlive: 'Keep app alive while generating',
             keepAliveHelp:
                 "Uses a notification to help generation continue in the background. Android can still suspend or stop the app.",

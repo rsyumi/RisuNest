@@ -3,20 +3,30 @@
   import { language } from "src/lang";
   import { alertError } from "src/ts/alert";
   import { getDetailedOSLabel } from "src/ts/platform";
-  import { getIOSNativeState, openIOSSettings } from "src/ts/iosNative";
+  import {
+    getIOSNativeState,
+    openIOSSettings,
+    requestIOSNotifications,
+  } from "src/ts/iosNative";
   import SettingGroup from "../RisuNest/SettingGroup.svelte";
   import SettingRow from "../RisuNest/SettingRow.svelte";
   import SettingButton from "../RisuNest/SettingButton.svelte";
   import WebViewRefreshButton from "../RisuNest/WebViewRefreshButton.svelte";
 
   let notifications = $state<boolean | null>(null);
+  // UNAuthorizationStatus.notDetermined: Settings shows no notification switch until the app asks.
+  let undetermined = $state(false);
+  let requesting = $state(false);
   let os = $state("");
   async function refresh() {
     try {
-      notifications = (await getIOSNativeState()).notifications;
+      const native = await getIOSNativeState();
+      notifications = native.notifications;
+      undetermined = native.notificationStatus === 0;
       os = await getDetailedOSLabel();
     } catch {
       notifications = null;
+      undetermined = false;
     }
   }
   onMount(() => {
@@ -35,6 +45,16 @@
     } catch (error) {
       alertError(String(error));
     }
+  }
+  async function allow() {
+    requesting = true;
+    try {
+      await requestIOSNotifications();
+    } catch (error) {
+      alertError(String(error));
+    }
+    await refresh();
+    requesting = false;
   }
 </script>
 
@@ -60,9 +80,15 @@
           : language.risuNest.platform.notificationsOff}</span
       >
     {/if}
-    <SettingButton variant="secondary" onclick={settings}
-      >{language.risuNest.platform.openSettings}</SettingButton
-    >
+    {#if undetermined}
+      <SettingButton variant="secondary" busy={requesting} onclick={allow}
+        >{language.risuNest.platform.allowNotifications}</SettingButton
+      >
+    {:else}
+      <SettingButton variant="secondary" onclick={settings}
+        >{language.risuNest.platform.openSettings}</SettingButton
+      >
+    {/if}
   </SettingRow>
   <SettingRow
     label={language.risuNest.platform.iosBackgroundLabel}
