@@ -1,11 +1,10 @@
 """Synthetic native return-frame verification, using product gates and native lifecycle."""
 import argparse
 import json
-import importlib.util
 import os
 from pathlib import Path
+import signal
 import subprocess
-import sys
 import time
 
 PHASES = ('app-lock-immediate', 'app-lock-timed', 'app-lock-immediate-mutant')
@@ -92,10 +91,14 @@ def frames(path, crop, tail=None, scale=None):
             process.wait(timeout=5)
 
 
-def cadence(path):
+def frame_times(path):
     probe = json.loads(output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_frames',
         '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'json', path]))
-    times = [float(frame['best_effort_timestamp_time']) for frame in probe['frames']]
+    return [float(frame['best_effort_timestamp_time']) for frame in probe['frames']]
+
+
+def cadence(path):
+    times = frame_times(path)
     gaps = [end - start for start, end in zip(times, times[1:])]
     if len(times) < 30 or not gaps or min(gaps) <= 0 or max(gaps) > .04:
         raise RuntimeError('Capture cadence cannot resolve a display-frame content flash')
@@ -222,65 +225,91 @@ def run_macos(app, artifacts, capture_input, start_capture, finish_capture, acti
     (artifacts / 'app-lock-result.json').write_text(json.dumps({'passed': True, 'observations': outcomes}, indent=2))
 
 
-
-def dismiss_hosted_python_network_prompt():
-    if sys.platform != 'darwin' or os.environ.get('GITHUB_ACTIONS') != 'true':
-        raise RuntimeError('Host prompt preflight requires the fresh hosted macOS runner')
-    script = r"""
-function normalized(value) {
-    return typeof value === 'string' ? value.replace(/[“”]/g, '"').replace(/’/g, "'").replace(/\s+/g, ' ').trim() : '';
-}
-function property(element, name) {
-    try { return element[name](); } catch (_) { return null; }
-}
-function denialButton(window) {
-    var nodes = [window].concat(window.entireContents());
-    if (nodes.length > 2048) return null;
-    var texts = [];
-    var buttons = [];
-    nodes.forEach(function (node) {
-        ['name', 'value', 'description'].forEach(function (name) { texts.push(normalized(property(node, name))); });
-        if (property(node, 'role') === 'AXButton') buttons.push(node);
-    });
-    if (texts.indexOf('Allow "Python" to find devices on local networks?') < 0 || buttons.length !== 2) return null;
-    var deny = buttons.filter(function (button) { return normalized(property(button, 'name')) === "Don't Allow"; });
-    var allow = buttons.filter(function (button) { return normalized(property(button, 'name')) === 'Allow'; });
-    return deny.length === 1 && allow.length === 1 && property(deny[0], 'enabled') === true ? deny[0] : null;
-}
-function run() {
-    var system = Application('System Events');
-    if (!system.uiElementsEnabled()) throw new Error('Host UI scripting is unavailable');
-    var processes = system.processes();
-    var matches = [];
-    var inspected = 0;
-    if (processes.length > 256) throw new Error('Host process inspection limit exceeded');
-    processes.forEach(function (process) {
-        var windows;
-        try { windows = process.windows(); } catch (_) { return; }
-        windows.forEach(function (window) {
-            if (++inspected > 256) throw new Error('Host window inspection limit exceeded');
-            try { if (denialButton(window)) matches.push(window); } catch (_) {}
-        });
-    });
-    if (matches.length > 1) throw new Error('Ambiguous Python local-network prompts');
-    if (!matches.length) return JSON.stringify({status: 'not-found'});
-    var button = denialButton(matches[0]);
-    if (!button) throw new Error('Python local-network prompt changed before rejection');
-    system.click(button);
-    return JSON.stringify({status: 'denied'});
-}
-"""
-    result = subprocess.run(['osascript', '-l', 'JavaScript', '-e', script],
-                            capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
-        raise RuntimeError('Hosted Python prompt preflight failed: ' + result.stderr.strip())
-    observation = json.loads(result.stdout)
-    if observation.get('status') not in {'not-found', 'denied'}:
-        raise RuntimeError('Unexpected hosted prompt preflight result')
-    return observation
+def start_simulator_recorder(device, video, log_path):
+    if video.exists() or log_path.exists():
+        raise RuntimeError('Refusing to overwrite frame evidence')
+    with log_path.open('w') as log:
+        recorder = subprocess.Popen(['xcrun', 'simctl', 'io', device, 'recordVideo', '--codec=h264', str(video)],
+                                    stdout=log, stderr=subprocess.STDOUT)
+    # The movie file can stay empty until frames are flushed, so readiness comes from the recorder's own message.
+    deadline = time.monotonic() + 10
+    while 'Recording started' not in log_path.read_text(errors='replace'):
+        if recorder.poll() is not None or time.monotonic() > deadline:
+            try:
+                stop_simulator_recorder(recorder)
+            except RuntimeError:
+                pass
+            raise RuntimeError('Simulator recorder did not start: ' + log_path.read_text(errors='replace').strip()[-500:])
+        time.sleep(.025)
+    return recorder
 
 
-def run_ios(device, artifacts, capture_input):
+def stop_simulator_recorder(recorder):
+    if recorder.poll() is None:
+        recorder.send_signal(signal.SIGINT)
+    try:
+        recorder.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        recorder.kill()
+        recorder.wait(timeout=5)
+        raise RuntimeError('Simulator recorder did not finish')
+    if recorder.returncode != 0:
+        raise RuntimeError('Simulator recording failed')
+
+
+def run_ios_phase(device, identifier, container, artifacts, phase):
+    if list(container.rglob('verification-' + phase + '.jsonl')):
+        raise RuntimeError('Refusing an existing app-lock verification phase')
+    environment = {**os.environ, 'SIMCTL_CHILD_RISUNEST_IOS_PHASE': phase}
+    subprocess.run(['xcrun', 'simctl', 'launch', '--terminate-running-process', device, identifier], env=environment, check=True)
+    deadline = time.monotonic() + 120
+    while True:
+        matches = list(container.rglob('verification-' + phase + '.jsonl'))
+        if len(matches) == 1:
+            report = matches[0]
+            break
+        if time.monotonic() > deadline:
+            raise RuntimeError('Synthetic frame report was not created')
+        time.sleep(.1)
+    timing = {}
+    try:
+        ready = wait_stage(report, 'app-lock-ready', 120)
+        baseline = artifacts / (phase + '-baseline.png')
+        subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(baseline)], check=True)
+        started = time.monotonic()
+        subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
+        timing['departureLaunchedSeconds'] = time.monotonic() - started
+        time.sleep(.4)
+        if phase == 'app-lock-timed':
+            time.sleep(65)
+        video = artifacts / (phase + '.mp4')
+        recorder = start_simulator_recorder(device, video, artifacts / (phase + '-capture.log'))
+        timing['recorderStartedSeconds'] = time.monotonic() - started
+        try:
+            subprocess.run(['xcrun', 'simctl', 'launch', device, identifier], check=True)
+            timing['returnLaunchedSeconds'] = time.monotonic() - started
+            locked = wait_stage(report, 'app-lock-locked', 45)
+            time.sleep(.6)
+        except BaseException:
+            try:
+                stop_simulator_recorder(recorder)
+            except RuntimeError:
+                pass
+            raise
+        stop_simulator_recorder(recorder)
+        timing['recorderStoppedSeconds'] = time.monotonic() - started
+        times = frame_times(video)
+        gaps = [end - start for start, end in zip(times, times[1:])]
+        video.with_suffix('.frame-timestamps.json').write_text(json.dumps({
+            'frames': len(times), 'maximumFrameGapSeconds': max(gaps, default=None),
+            'gapsOver40ms': sum(gap > .04 for gap in gaps), 'times': times}, indent=2))
+        return assess(video, baseline, ready, locked, phase.endswith('mutant'))
+    finally:
+        (artifacts / (phase + '-timing.json')).write_text(json.dumps(timing, indent=2))
+        (artifacts / (phase + '.jsonl')).write_text(report.read_text())
+
+
+def run_ios(device, artifacts):
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         raise RuntimeError('Simulator capture requires the fresh hosted synthetic CI profile')
     identifier = 'io.github.rsyumi.risunest.ios.bench'
@@ -288,79 +317,34 @@ def run_ios(device, artifacts, capture_input):
     devices = json.loads(output(['xcrun', 'simctl', 'list', 'devices', 'booted', '--json']))['devices']
     booted = [item for runtime in devices.values() for item in runtime if item['state'] == 'Booted']
     if len(booted) != 1 or booted[0]['udid'] != device or not booted[0]['name'].startswith('RisuNest synthetic'):
-        raise RuntimeError('Hosted capture requires only the owned synthetic Simulator to be booted')
+        raise RuntimeError('Capture requires only the owned synthetic Simulator to be booted')
     (artifacts / 'simulator-selection.json').write_text(json.dumps({
-        'udid': device, 'name': booted[0]['name'], 'onlyBootedDevice': True, 'captureInput': capture_input}, indent=2))
-    specification = importlib.util.spec_from_file_location('appearance_capture', Path(__file__).resolve().parents[1] / 'macos/run.py')
-    capture_tools = importlib.util.module_from_spec(specification)
-    sys.path.insert(0, str(Path(specification.origin).parent))
-    try:
-        specification.loader.exec_module(capture_tools)
-    finally:
-        sys.path.pop(0)
-    subprocess.run(['open', '-a', 'Simulator'], check=True)
+        'udid': device, 'name': booted[0]['name'], 'onlyBootedDevice': True}, indent=2))
     outcomes = []
+    failures = []
+    # Later phases still run after a failure so every phase leaves its recording.
     for phase in PHASES:
-        if list(container.rglob('verification-' + phase + '.jsonl')):
-            raise RuntimeError('Refusing an existing app-lock verification phase')
-        environment = {**os.environ, 'SIMCTL_CHILD_RISUNEST_IOS_PHASE': phase}
-        subprocess.run(['xcrun', 'simctl', 'launch', '--terminate-running-process', device, identifier], env=environment, check=True)
-        deadline = time.monotonic() + 120
-        while True:
-            matches = list(container.rglob('verification-' + phase + '.jsonl'))
-            if len(matches) == 1:
-                report = matches[0]
-                break
-            if time.monotonic() > deadline:
-                raise RuntimeError('Synthetic frame report was not created')
-            time.sleep(.1)
-        ready = wait_stage(report, 'app-lock-ready', 120)
-        baseline = artifacts / (phase + '-baseline.png')
-        subprocess.run(['open', '-a', 'Simulator'], check=True)
-        deadline = time.monotonic() + 15
-        host_preflight = []
-        while True:
-            subprocess.run(['screencapture', '-x', str(baseline)], check=True)
-            try:
-                find_marker(*rgb_image(baseline))
-                break
-            except RuntimeError:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('Owned Simulator synthetic content is not visible on the captured host display')
-                if len(host_preflight) < 3:
-                    host_preflight.append(dismiss_hosted_python_network_prompt())
-                    (artifacts / (phase + '-host-preflight.json')).write_text(json.dumps(host_preflight, indent=2))
-                    if host_preflight[-1]['status'] == 'denied':
-                        subprocess.run(['open', '-a', 'Simulator'], check=True)
-                time.sleep(.1)
-        subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
-        time.sleep(.4)
-        if phase == 'app-lock-timed':
-            time.sleep(65)
-        capture = capture_tools.start_appearance_capture(artifacts, phase, 'macos', capture_input)
         try:
-            subprocess.run(['xcrun', 'simctl', 'launch', device, identifier], check=True)
-            locked = wait_stage(report, 'app-lock-locked', 45)
-            time.sleep(.6)
+            outcomes.append(run_ios_phase(device, identifier, container, artifacts, phase))
+        except Exception as error:
+            failures.append({'phase': phase, 'error': f'{type(error).__name__}: {error}'})
         finally:
-            capture_tools.finish_appearance_capture(capture)
-        video = capture['video']
-        (artifacts / (phase + '.jsonl')).write_text(report.read_text())
-        outcomes.append(assess(video, baseline, ready, locked, phase.endswith('mutant')))
-        subprocess.run(['xcrun', 'simctl', 'terminate', device, identifier], check=True)
-    (artifacts / 'app-lock-result.json').write_text(json.dumps({'passed': True, 'observations': outcomes}, indent=2))
+            subprocess.run(['xcrun', 'simctl', 'terminate', device, identifier], check=False)
+    (artifacts / 'app-lock-result.json').write_text(json.dumps(
+        {'passed': not failures, 'observations': outcomes, 'failures': failures}, indent=2))
+    if failures:
+        raise RuntimeError('App-lock frame phases failed: ' + json.dumps(failures))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', required=True)
     parser.add_argument('--artifacts', type=Path, required=True)
-    parser.add_argument('--capture-input', required=True)
     args = parser.parse_args()
     args.artifacts.mkdir(parents=True, exist_ok=True)
     if any(args.artifacts.iterdir()):
         parser.error('Use an empty frame artifact directory')
-    run_ios(args.device, args.artifacts.resolve(), args.capture_input)
+    run_ios(args.device, args.artifacts.resolve())
 
 
 if __name__ == '__main__':
