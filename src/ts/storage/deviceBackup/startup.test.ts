@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ invoke: vi.fn(), normalStarted: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: state.invoke }));
 
+const foreground = { active: true, epoch: 0, atMs: 0, departedAtMs: null };
+
 function nativeComplete(includesLibrary: boolean) {
   return {
     mode: "maintenance",
@@ -43,13 +45,20 @@ describe("device maintenance bootstrap ordering", () => {
     state.invoke.mockImplementation((command: string) => {
       if (command === "app_cleanup_status") return Promise.resolve({ pending: true, mode: "reset", error: null });
       if (command === "app_cleanup_resume") return Promise.resolve();
+      if (command === "app_lock_set_policy") return Promise.resolve(foreground);
+      if (command === "app_lock_ready") return Promise.resolve(true);
       throw new Error(`Unexpected command: ${command}`);
     });
     await import("../../../main");
     await vi.waitFor(() => expect(state.invoke).toHaveBeenCalledWith("app_cleanup_resume"));
+    // The reset page never mounts the app, so it releases the native launch cover itself.
+    await vi.waitFor(() => expect(state.invoke).toHaveBeenCalledWith("app_lock_ready", { epoch: 0, locked: false }));
     expect(state.invoke.mock.calls.map(([command]) => command)).toEqual([
-      "app_cleanup_status", "app_cleanup_resume",
+      "app_cleanup_status", "app_cleanup_resume", "app_lock_set_policy", "app_lock_ready",
     ]);
+    expect(state.invoke).toHaveBeenCalledWith("app_lock_set_policy", {
+      policy: expect.objectContaining({ enabled: false, gateRequired: false, hideRecentsPreview: false }),
+    });
     expect(state.normalStarted).not.toHaveBeenCalled();
   });
 
@@ -165,6 +174,8 @@ describe("device maintenance bootstrap ordering", () => {
           ...nativeComplete(true),
           session: { ...nativeComplete(true).session, sessionId: "" },
         });
+      if (command === "app_lock_set_policy") return Promise.resolve(foreground);
+      if (command === "app_lock_ready") return Promise.resolve(true);
       throw new Error(`Unexpected command: ${command}`);
     });
 
@@ -172,6 +183,8 @@ describe("device maintenance bootstrap ordering", () => {
     await vi.waitFor(() =>
       expect(document.querySelector("main[role=\"status\"]")).not.toBeNull(),
     );
+    // The recovery panel never mounts the app, so it releases the native launch cover itself.
+    await vi.waitFor(() => expect(state.invoke).toHaveBeenCalledWith("app_lock_ready", { epoch: 0, locked: false }));
 
     expect(state.invoke).not.toHaveBeenCalledWith(
       "native_device_backup_recovery_complete",

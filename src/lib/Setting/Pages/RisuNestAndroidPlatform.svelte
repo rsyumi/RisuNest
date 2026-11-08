@@ -93,7 +93,7 @@
     <SettingRow inline label={language.risuNest.platform.keepAlive} help={language.risuNest.platform.keepAliveHelp}>
         {#snippet below()}
             {#if notificationStatus === false}
-                <p class="mt-1 text-sm text-textcolor2">{language.risuNest.platform.keepAliveWithoutNotification}</p>
+                <p class="mt-1 text-sm text-subtext">{language.risuNest.platform.keepAliveWithoutNotification}</p>
             {/if}
         {/snippet}
         <SettingToggle checked={keepAlive} onchange={setKeepAlive} label={language.risuNest.platform.keepAlive} />
@@ -101,10 +101,10 @@
     {#if operatingSystem || webView}
         <dl data-platform-info class="grid grid-cols-[auto_1fr] gap-x-5 gap-y-1 px-4 py-3 text-sm">
             {#if operatingSystem}
-                <dt class="text-textcolor2">{language.risuNest.platform.operatingSystem}</dt><dd>{operatingSystem}</dd>
+                <dt class="text-subtext">{language.risuNest.platform.operatingSystem}</dt><dd>{operatingSystem}</dd>
             {/if}
             {#if webView}
-                <dt class="text-textcolor2">{language.risuNest.platform.webView}</dt><dd>{webView}</dd>
+                <dt class="text-subtext">{language.risuNest.platform.webView}</dt><dd>{webView}</dd>
             {/if}
         </dl>
     {/if}

@@ -96,23 +96,38 @@ fn an_owner_inside_the_root_is_offered_only_when_one_entry_carries_it() {
         inside("root", "database", "$.customBackground", "asset"),
         // No entry or several carry this identity, or the diagnosis was written before the mark.
         inside("persona", "persona-b", "$.icon", "asset"),
-        // Removing these leaves the finding in place.
+        // Removing these leaves the finding in place, so only a value answers the first and the
+        // last two.
         inside("persona", "persona-a", "$.embeddedModule.id", "module").in_sole_entry(),
         inside("loadout", "Loadout", "$.presetName", "preset").in_sole_entry(),
         inside("loadout", "Loadout", "$.personaId", "persona").in_sole_entry(),
         inside("root", "database", "$.botPresetsId", "preset"),
         inside("root", "database", "$.selectedPersona", "persona"),
         inside("folder", "folder-a", "$.img", "asset").in_sole_entry(),
+        inside("persona", "persona-b", "$.embeddedModule.id", "module"),
     ]));
     let removals: Vec<_> = plan
         .iter()
-        .map(|candidate| match &candidate.action {
+        .filter_map(|candidate| match &candidate.action {
             RepairAction::DropReference { owner, source_path, token, .. } => {
-                (candidate.finding, owner.kind.as_str(), owner.id.as_str(), source_path.as_str(), *token)
+                Some((candidate.finding, owner.kind.as_str(), owner.id.as_str(), source_path.as_str(), *token))
             }
-            other => panic!("unexpected action: {other:?}"),
+            _ => None,
         })
         .collect();
+    let created: Vec<_> = plan
+        .iter()
+        .filter(|candidate| !matches!(candidate.action, RepairAction::DropReference { .. }))
+        .map(|candidate| (candidate.finding, &candidate.action, candidate.preferred, candidate.discards))
+        .collect();
+    assert_eq!(
+        created,
+        [
+            (7, &RepairAction::AssignEmbeddedModuleId { persona_id: "persona-a".into() }, true, false),
+            (10, &RepairAction::SelectFirstPreset, true, false),
+            (11, &RepairAction::SelectFirstPersona, true, false),
+        ]
+    );
     assert_eq!(
         removals,
         [

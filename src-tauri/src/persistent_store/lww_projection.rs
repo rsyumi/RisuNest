@@ -1,6 +1,7 @@
 use super::classification::*;
 use super::*;
 use serde_json::{json, Map};
+use super::super::stored_json::{self, Depth, Document, Object, Raw};
 use device_store::plugin_values::{self, structure, text_value as plugin_text};
 
 const PERSONA_FIELDS: &[&str] = &[
@@ -97,6 +98,7 @@ fn add(
     out.insert(unit_key(parts)?, unit_value(db, value)?);
     Ok(())
 }
+#[cfg(test)]
 fn fields(
     db: &Connection,
     out: &mut BTreeMap<UnitKey, UnitValue>,
@@ -120,6 +122,54 @@ fn capture_root(
 ) -> StoreResult<()> {
     capture_root_fields(db, generation, None, out)
 }
+fn stored_text(
+    db: &Connection,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+) -> StoreResult<Option<String>> {
+    Ok(db.query_row(sql, parameters, |r| r.get(0)).optional()?)
+}
+fn stored_root(db: &Connection, generation: &str) -> StoreResult<String> {
+    Ok(stored_text(db, "SELECT value FROM root WHERE generation=?1", [generation])?
+        .unwrap_or_else(|| "{}".to_owned()))
+}
+/// `add` of a stored value, encoded from its text.
+fn add_stored(
+    db: &Connection,
+    out: &mut BTreeMap<UnitKey, UnitValue>,
+    parts: &[&str],
+    write: impl FnOnce(&mut Vec<u8>) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let key = unit_key(parts)?;
+    let mut canonical = Vec::new();
+    write(&mut canonical)?;
+    out.insert(key, canonical_unit_value(db, canonical)?);
+    Ok(())
+}
+fn stored_fields(
+    db: &Connection,
+    out: &mut BTreeMap<UnitKey, UnitValue>,
+    prefix: &[&str],
+    record: Option<&Object<'_>>,
+    names: &[&str],
+) -> StoreResult<()> {
+    for field in names {
+        if let Some(value) = record.and_then(|record| record.get(field)) {
+            let mut p = prefix.to_vec();
+            p.push(field);
+            add_stored(db, out, &p, |out| value.write_canonical(out))?;
+        }
+    }
+    Ok(())
+}
+fn stored_str(value: Option<Raw<'_>>) -> StoreResult<Option<Cow<'_, str>>> {
+    Ok(value.map(Raw::as_str).transpose()?.flatten())
+}
+fn stored_elements(value: Option<Raw<'_>>) -> StoreResult<Vec<Raw<'_>>> {
+    Ok(value.map(Raw::elements).transpose()?.flatten().unwrap_or_default())
+}
+/// Reads the stored root one record at a time, so no record is held as a
+/// value and records are not held together.
 fn capture_root_fields(
     db: &Connection,
     generation: &str,
@@ -127,9 +177,12 @@ fn capture_root_fields(
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
     let includes = |field: &str| selected.is_none_or(|fields| fields.contains(field));
-    let value = root(db, generation)?;
+    let text = stored_root(db, generation)?;
+    let document = Document::parse(&text, Depth::Limited)?;
+    let value = document.value().object()?;
+    let get = |field: &str| value.as_ref().and_then(|value| value.get(field));
     let root_fields: Vec<_> = ROOT_FIELDS.iter().copied().filter(|field| includes(field)).collect();
-    fields(db, out, &["root"], &value, &root_fields)?;
+    stored_fields(db, out, &["root"], value.as_ref(), &root_fields)?;
     for (collection, id_field) in [
         ("modules", "id"),
         ("plugins", "name"),
@@ -139,60 +192,44 @@ fn capture_root_fields(
         if !includes(collection) { continue; }
         let mut order = Vec::new();
         let mut seen = BTreeSet::new();
-        for record in value
-            .get(collection)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = record
-                .get(id_field)
-                .and_then(Value::as_str)
+        for record in stored_elements(get(collection))? {
+            let record = record.object()?;
+            let id = stored_str(record.as_ref().and_then(|record| record.get(id_field)))?
                 .ok_or_else(|| error("record-identity-required"))?;
-            if id.is_empty() || !seen.insert(id) {
+            if id.is_empty() || !seen.insert(id.clone()) {
                 return Err(error("record-identity-invalid"));
             }
             if collection != "plugins" {
-                add(db, out, &["exists", collection, id], &json!(true))?;
+                add(db, out, &["exists", collection, &id], &json!(true))?;
             }
-            let mut record = record.clone();
-            if let Some(o) = record.as_object_mut() {
-                o.shift_remove("configured_index");
-            }
-            add(db, out, &["record", collection, id], &record)?;
-            order.push(id.to_owned());
+            let members = record.iter().flat_map(Object::members)
+                .filter(|(name, _)| *name != "configured_index");
+            add_stored(db, out, &["record", collection, &id], |out| stored_json::write_canonical_object(members, out))?;
+            order.push(id.into_owned());
         }
-        if value.get(collection).is_some() {
+        if get(collection).is_some() {
             add(db, out, &["order", collection], &json!(order))?;
         }
     }
-    let mut personas = Vec::new();
-    for persona in value
-        .get("personas").filter(|_| includes("personas"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let id = persona
-            .get("id")
-            .and_then(Value::as_str)
+    let mut personas: Vec<String> = Vec::new();
+    for persona in stored_elements(get("personas").filter(|_| includes("personas")))? {
+        let persona = persona.object()?;
+        let id = stored_str(persona.as_ref().and_then(|persona| persona.get("id")))?
             .ok_or_else(|| error("persona-identity-required"))?;
-        if id.is_empty() || personas.iter().any(|old| old == id) {
+        if id.is_empty() || personas.iter().any(|old| *old == id) {
             return Err(error("persona-identity-invalid"));
         }
-        add(db, out, &["exists", "persona", id], &json!(true))?;
-        fields(db, out, &["persona", id], persona, PERSONA_FIELDS)?;
-        personas.push(id.to_owned());
+        add(db, out, &["exists", "persona", &id], &json!(true))?;
+        stored_fields(db, out, &["persona", &id], persona.as_ref(), PERSONA_FIELDS)?;
+        personas.push(id.into_owned());
     }
-    if includes("personas") && value.get("personas").is_some() {
+    if includes("personas") && get("personas").is_some() {
         add(db, out, &["order", "personas"], &json!(personas))?;
     }
-    if let Some(vars) = value
-        .get("explicitGlobalChatVariables").filter(|_| includes("explicitGlobalChatVariables"))
-        .and_then(Value::as_object)
-    {
-        for (key, value) in vars {
-            add(
+    let variables = get("explicitGlobalChatVariables").filter(|_| includes("explicitGlobalChatVariables"));
+    if let Some(vars) = variables.map(Raw::object).transpose()?.flatten() {
+        for (key, value) in vars.members() {
+            add_stored(
                 db,
                 out,
                 &[
@@ -203,15 +240,15 @@ fn capture_root_fields(
                     },
                     key,
                 ],
-                value,
+                |out| value.write_canonical(out),
             )?;
         }
     }
-    if let Some(values) = value.get("protectedPresetValues").filter(|_| includes("protectedPresetValues")) {
-        fields(db, out, &["preset-protected"], values, PROTECTED_FIELDS)?;
+    if let Some(values) = get("protectedPresetValues").filter(|_| includes("protectedPresetValues")) {
+        stored_fields(db, out, &["preset-protected"], values.object()?.as_ref(), PROTECTED_FIELDS)?;
     }
-    if let Some(order) = value.get("characterOrder").filter(|_| includes("characterOrder")) {
-        add(db, out, &["order", "characters"], order)?;
+    if let Some(order) = get("characterOrder").filter(|_| includes("characterOrder")) {
+        add_stored(db, out, &["order", "characters"], |out| order.write_canonical(out))?;
     }
     Ok(())
 }
@@ -221,13 +258,14 @@ fn capture_preset(
     id: &str,
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
-    if let Some(value) = text_value(
+    if let Some(text) = stored_text(
         db,
         "SELECT value FROM bot_presets WHERE generation=?1 AND preset_id=?2",
         params![generation, id],
     )? {
+        let document = Document::parse(&text, Depth::Limited)?;
         add(db, out, &["exists", "preset", id], &json!(true))?;
-        fields(db, out, &["preset", id], &value, PRESET_FIELDS)?;
+        stored_fields(db, out, &["preset", id], document.value().object()?.as_ref(), PRESET_FIELDS)?;
     }
     Ok(())
 }
@@ -257,67 +295,89 @@ fn capture_character(
     before: bool,
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
-    if let Some(value) = text_value(
+    if let Some(text) = stored_text(
         db,
         "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
         params![generation, id],
     )? {
-        add(
-            db,
-            out,
-            &["exists", "character", id],
-            &json!({"type":value.get("type").cloned().unwrap_or(json!("character"))}),
-        )?;
-        fields(db, out, &["character", id], &value, CHARACTER_FIELDS)?;
-        out.remove(&unit_key(&["character", id, "statics"])?);
-        if let Some(mut statics) = value.get("statics").cloned() {
-            if let Some(o) = statics.as_object_mut() {
-                o.shift_remove("messages");
-            }
-            add(db, out, &["character", id, "statics"], &statics)?;
+        let document = Document::parse(&text, Depth::Limited)?;
+        capture_character_detail(db, generation, id, document.value().object()?.as_ref(), full, before, out)?;
+    }
+    Ok(())
+}
+/// The order unit of a character's conversations, with its `chatFolders`.
+fn add_conversation_order(
+    db: &Connection,
+    out: &mut BTreeMap<UnitKey, UnitValue>,
+    character_id: &str,
+    ids: &[String],
+    folders: Option<Raw<'_>>,
+) -> StoreResult<()> {
+    let ids = serde_json::to_string(ids)?;
+    let ids = Document::parse(&ids, Depth::Limited)?;
+    let empty = Document::parse("[]", Depth::Limited)?;
+    let members = [("ids", ids.value()), ("folders", folders.unwrap_or(empty.value()))];
+    add_stored(db, out, &["order", "conversations", character_id], |out| stored_json::write_canonical_object(members, out))
+}
+/// `detail` is the stored detail when it is an object.
+fn capture_character_detail(
+    db: &Transaction<'_>,
+    generation: &str,
+    id: &str,
+    detail: Option<&Object<'_>>,
+    full: bool,
+    before: bool,
+    out: &mut BTreeMap<UnitKey, UnitValue>,
+) -> StoreResult<()> {
+    let get = |field: &str| detail.and_then(|detail| detail.get(field));
+    let character = Document::parse("\"character\"", Depth::Limited)?;
+    let kind = [("type", get("type").unwrap_or(character.value()))];
+    add_stored(db, out, &["exists", "character", id], |out| stored_json::write_canonical_object(kind, out))?;
+    stored_fields(db, out, &["character", id], detail, CHARACTER_FIELDS)?;
+    out.remove(&unit_key(&["character", id, "statics"])?);
+    if let Some(statics) = get("statics") {
+        let object = statics.object()?;
+        add_stored(db, out, &["character", id, "statics"], |out| match &object {
+            Some(object) => stored_json::write_canonical_object(object.members().filter(|(name, _)| *name != "messages"), out),
+            None => statics.write_canonical(out),
+        })?;
+    }
+    let archived: Option<String> = db.query_row(
+        "SELECT archived_object FROM characters WHERE generation=?1 AND character_id=?2",
+        params![generation, id],
+        |r| r.get(0),
+    )?;
+    if let Some(hash) = archived {
+        let archived = serde_json::from_str::<super::super::archive::ArchivedObject>(&hash)?;
+        let key = unit_key(&["archive", id])?;
+        let prior =
+            read_unit(db, &key)?.and_then(|(_, value)| match archive_metadata(db, &value) {
+                Ok(metadata) if metadata.object_hash == archived.shared_object_hash => {
+                    Some(value)
+                }
+                _ => None,
+            });
+        out.insert(
+            key,
+            if let Some(prior) = prior {
+                prior
+            } else {
+                archive_value(db, &archived)?
+            },
+        );
+    }
+    if full {
+        let ids: Vec<String> = {
+            let mut s=db.prepare("SELECT conversation_id FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index,conversation_id")?;
+            let v = s
+                .query_map(params![generation, id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            v
+        };
+        for conv in &ids {
+            capture_conversation(db, generation, id, conv, None, before, out)?;
         }
-        let archived: Option<String> = db.query_row(
-            "SELECT archived_object FROM characters WHERE generation=?1 AND character_id=?2",
-            params![generation, id],
-            |r| r.get(0),
-        )?;
-        if let Some(hash) = archived {
-            let archived = serde_json::from_str::<super::super::archive::ArchivedObject>(&hash)?;
-            let key = unit_key(&["archive", id])?;
-            let prior =
-                read_unit(db, &key)?.and_then(|(_, value)| match archive_metadata(db, &value) {
-                    Ok(metadata) if metadata.object_hash == archived.shared_object_hash => {
-                        Some(value)
-                    }
-                    _ => None,
-                });
-            out.insert(
-                key,
-                if let Some(prior) = prior {
-                    prior
-                } else {
-                    archive_value(db, &archived)?
-                },
-            );
-        }
-        if full {
-            let ids: Vec<String> = {
-                let mut s=db.prepare("SELECT conversation_id FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index,conversation_id")?;
-                let v = s
-                    .query_map(params![generation, id], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?;
-                v
-            };
-            for conv in &ids {
-                capture_conversation(db, generation, id, conv, None, before, out)?;
-            }
-            add(
-                db,
-                out,
-                &["order", "conversations", id],
-                &json!({"ids":ids,"folders":value.get("chatFolders").cloned().unwrap_or(json!([]))}),
-            )?;
-        }
+        add_conversation_order(db, out, id, &ids, get("chatFolders"))?;
     }
     Ok(())
 }
@@ -351,8 +411,9 @@ fn capture_conversation(
     before: bool,
     out: &mut BTreeMap<UnitKey, UnitValue>,
 ) -> StoreResult<()> {
-    if let Some(value)=text_value(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
-        add(db,out,&["exists","conversation",char_id,id],&json!(true))?;fields(db,out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
+    if let Some(text)=stored_text(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
+        let document=Document::parse(&text,Depth::Limited)?;
+        add(db,out,&["exists","conversation",char_id,id],&json!(true))?;stored_fields(db,out,&["conversation",char_id,id],document.value().object()?.as_ref(),CONVERSATION_FIELDS)?;
         let unchanged=edits.is_some_and(<[_]>::is_empty)||edits.is_none()&&out.contains_key(&unit_key(&["messages",char_id,id])?);
         let manifest=if before || unchanged {super::super::message_pages::current_manifest(db,generation,char_id,id)?}else{super::super::message_pages::capture_manifest(db,generation,char_id,id,edits)?};
         out.insert(unit_key(&["messages",char_id,id])?,manifest);
@@ -610,7 +671,11 @@ fn capture_key(
             _ => capture_root(db, generation, out)?,
         },
         "plugin" => {
-            if let Some(value)=text_value(db,"SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[1],p[2]])? {out.insert(key.clone(),unit_value(db,&value)?);}
+            if let Some(text)=stored_text(db,"SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3",params![generation,p[1],p[2]])? {
+                let mut canonical=Vec::new();
+                Document::parse(&text,Depth::Limited)?.value().write_canonical(&mut canonical)?;
+                out.insert(key.clone(),canonical_unit_value(db,canonical)?);
+            }
         }
         "asset" | "inlay" => {
             let alias = super::super::query::read_asset_alias(
@@ -693,10 +758,12 @@ pub(in crate::persistent_store) fn visit_generation_units(
     let mut rows = characters.query([generation])?;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
+        let Some(text) = stored_text(tx, "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2", params![generation,id])? else { continue; };
+        let document = Document::parse(&text, Depth::Limited)?;
+        let detail = document.value().object()?;
         let mut values = BTreeMap::new();
-        capture_character(tx, generation, &id, false, true, &mut values)?;
+        capture_character_detail(tx, generation, &id, detail.as_ref(), false, true, &mut values)?;
         flush(values)?;
-        let Some(detail) = text_value(tx, "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2", params![generation,id])? else { continue; };
         let mut conversations = tx.prepare("SELECT conversation_id FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index,conversation_id")?;
         let mut conversations = conversations.query(params![generation,id])?;
         let mut order = Vec::<String>::new();
@@ -708,7 +775,7 @@ pub(in crate::persistent_store) fn visit_generation_units(
             order.push(conversation);
         }
         let mut values = BTreeMap::new();
-        add(tx, &mut values, &["order","conversations",&id], &json!({"ids":order,"folders":detail.get("chatFolders").cloned().unwrap_or(json!([]))}))?;
+        add_conversation_order(tx, &mut values, &id, &order, detail.as_ref().and_then(|detail| detail.get("chatFolders")))?;
         flush(values)?;
     }
     let mut presets = tx.prepare("SELECT preset_id FROM bot_presets WHERE generation=?1 ORDER BY configured_index,preset_id")?;
@@ -762,8 +829,8 @@ pub(in crate::persistent_store) fn capture_all(
 ) -> StoreResult<BTreeMap<UnitKey, UnitValue>> {
     let tx = db.transaction()?;
     let mut out = BTreeMap::new();
-    capture_root(&tx, generation, &mut out)?;
-    capture_presets(&tx, generation, &mut out)?;
+    value_reference::capture_root(&tx, generation, &mut out)?;
+    value_reference::capture_presets(&tx, generation, &mut out)?;
     let ids: Vec<String> = {
         let mut s = tx.prepare("SELECT character_id FROM characters WHERE generation=?1")?;
         let v = s
@@ -772,7 +839,7 @@ pub(in crate::persistent_store) fn capture_all(
         v
     };
     for id in ids {
-        capture_character(&tx, generation, &id, true, current_manifests, &mut out)?;
+        value_reference::capture_character(&tx, generation, &id, true, current_manifests, &mut out)?;
     }
     let plugins: Vec<(String, String)> = {
         let mut s =
@@ -783,12 +850,7 @@ pub(in crate::persistent_store) fn capture_all(
         v
     };
     for (owner, key) in plugins {
-        capture_key(
-            &tx,
-            generation,
-            &unit_key(&["plugin", &owner, &key])?,
-            &mut out,
-        )?;
+        value_reference::capture_plugin(&tx, generation, &owner, &key, &mut out)?;
     }
     let owners: Vec<String> = {
         let mut q = tx.prepare("SELECT DISTINCT owner FROM plugin_storage WHERE generation=?1")?;
@@ -812,6 +874,281 @@ pub(in crate::persistent_store) fn capture_all(
     }
     tx.commit()?;
     Ok(out)
+}
+/// Captures and root rewrites as they were made from the parsed stored value,
+/// before the stored text was read one value at a time. Tests compare both.
+#[cfg(test)]
+pub(in crate::persistent_store) mod value_reference {
+    use super::*;
+
+    pub(in crate::persistent_store) fn set_character_order(
+        tx: &Connection,
+        generation: &str,
+        order: &Value,
+    ) -> StoreResult<()> {
+        let mut v = root(tx, generation)?;
+        patch(&mut v, "characterOrder", Some(order.clone()))?;
+        write_root(tx, generation, &v)
+    }
+
+    pub(in crate::persistent_store) fn sort_root_records(
+        tx: &Connection,
+        generation: &str,
+        collection: &str,
+        ids: &[String],
+    ) -> StoreResult<()> {
+        let mut v = root(tx, generation)?;
+        let records = v.get_mut(collection).and_then(Value::as_array_mut);
+        if let Some(records) = records {
+            let id_field = if collection == "plugins" { "name" } else { "id" };
+            records.sort_by_key(|r| {
+                ids.iter()
+                    .position(|id| r.get(id_field).and_then(Value::as_str) == Some(id))
+            });
+        }
+        write_root(tx, generation, &v)
+    }
+
+    pub(in crate::persistent_store) fn preserve_local_root(
+        db: &Connection,
+        active: &str,
+        staged: &str,
+    ) -> StoreResult<()> {
+        let old = root(db, active)?;
+        let mut next = root(db, staged)?;
+        for (key, value) in old.as_object().ok_or_else(|| error("invalid-root"))? {
+            if is_local_root_field(key) {
+                patch(&mut next, key, Some(value.clone()))?;
+            }
+        }
+        write_root(db, staged, &next)
+    }
+
+    pub(in crate::persistent_store) fn capture_root(
+        db: &Connection,
+        generation: &str,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        capture_root_fields(db, generation, None, out)
+    }
+    pub(in crate::persistent_store) fn capture_root_fields(
+        db: &Connection,
+        generation: &str,
+        selected: Option<&BTreeSet<String>>,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        let includes = |field: &str| selected.is_none_or(|fields| fields.contains(field));
+        let value = root(db, generation)?;
+        let root_fields: Vec<_> = ROOT_FIELDS.iter().copied().filter(|field| includes(field)).collect();
+        fields(db, out, &["root"], &value, &root_fields)?;
+        for (collection, id_field) in [
+            ("modules", "id"),
+            ("plugins", "name"),
+            ("loadouts", "id"),
+            ("customModels", "id"),
+        ] {
+            if !includes(collection) { continue; }
+            let mut order = Vec::new();
+            let mut seen = BTreeSet::new();
+            for record in value
+                .get(collection)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let id = record
+                    .get(id_field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error("record-identity-required"))?;
+                if id.is_empty() || !seen.insert(id) {
+                    return Err(error("record-identity-invalid"));
+                }
+                if collection != "plugins" {
+                    add(db, out, &["exists", collection, id], &json!(true))?;
+                }
+                let mut record = record.clone();
+                if let Some(o) = record.as_object_mut() {
+                    o.shift_remove("configured_index");
+                }
+                add(db, out, &["record", collection, id], &record)?;
+                order.push(id.to_owned());
+            }
+            if value.get(collection).is_some() {
+                add(db, out, &["order", collection], &json!(order))?;
+            }
+        }
+        let mut personas = Vec::new();
+        for persona in value
+            .get("personas").filter(|_| includes("personas"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let id = persona
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error("persona-identity-required"))?;
+            if id.is_empty() || personas.iter().any(|old| old == id) {
+                return Err(error("persona-identity-invalid"));
+            }
+            add(db, out, &["exists", "persona", id], &json!(true))?;
+            fields(db, out, &["persona", id], persona, PERSONA_FIELDS)?;
+            personas.push(id.to_owned());
+        }
+        if includes("personas") && value.get("personas").is_some() {
+            add(db, out, &["order", "personas"], &json!(personas))?;
+        }
+        if let Some(vars) = value
+            .get("explicitGlobalChatVariables").filter(|_| includes("explicitGlobalChatVariables"))
+            .and_then(Value::as_object)
+        {
+            for (key, value) in vars {
+                add(
+                    db,
+                    out,
+                    &[
+                        if key.starts_with("toggle_") {
+                            "toggle"
+                        } else {
+                            "variable"
+                        },
+                        key,
+                    ],
+                    value,
+                )?;
+            }
+        }
+        if let Some(values) = value.get("protectedPresetValues").filter(|_| includes("protectedPresetValues")) {
+            fields(db, out, &["preset-protected"], values, PROTECTED_FIELDS)?;
+        }
+        if let Some(order) = value.get("characterOrder").filter(|_| includes("characterOrder")) {
+            add(db, out, &["order", "characters"], order)?;
+        }
+        Ok(())
+    }
+    pub(in crate::persistent_store) fn capture_character(
+        db: &Transaction<'_>,
+        generation: &str,
+        id: &str,
+        full: bool,
+        before: bool,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        if let Some(value) = text_value(
+            db,
+            "SELECT detail FROM characters WHERE generation=?1 AND character_id=?2",
+            params![generation, id],
+        )? {
+            add(
+                db,
+                out,
+                &["exists", "character", id],
+                &json!({"type":value.get("type").cloned().unwrap_or(json!("character"))}),
+            )?;
+            fields(db, out, &["character", id], &value, CHARACTER_FIELDS)?;
+            out.remove(&unit_key(&["character", id, "statics"])?);
+            if let Some(mut statics) = value.get("statics").cloned() {
+                if let Some(o) = statics.as_object_mut() {
+                    o.shift_remove("messages");
+                }
+                add(db, out, &["character", id, "statics"], &statics)?;
+            }
+            let archived: Option<String> = db.query_row(
+                "SELECT archived_object FROM characters WHERE generation=?1 AND character_id=?2",
+                params![generation, id],
+                |r| r.get(0),
+            )?;
+            if let Some(hash) = archived {
+                let archived = serde_json::from_str::<crate::persistent_store::archive::ArchivedObject>(&hash)?;
+                let key = unit_key(&["archive", id])?;
+                let prior =
+                    read_unit(db, &key)?.and_then(|(_, value)| match archive_metadata(db, &value) {
+                        Ok(metadata) if metadata.object_hash == archived.shared_object_hash => {
+                            Some(value)
+                        }
+                        _ => None,
+                    });
+                out.insert(
+                    key,
+                    if let Some(prior) = prior {
+                        prior
+                    } else {
+                        archive_value(db, &archived)?
+                    },
+                );
+            }
+            if full {
+                let ids: Vec<String> = {
+                    let mut s=db.prepare("SELECT conversation_id FROM conversations WHERE generation=?1 AND character_id=?2 ORDER BY configured_index,conversation_id")?;
+                    let v = s
+                        .query_map(params![generation, id], |r| r.get(0))?
+                        .collect::<Result<_, _>>()?;
+                    v
+                };
+                for conv in &ids {
+                    capture_conversation(db, generation, id, conv, None, before, out)?;
+                }
+                add(
+                    db,
+                    out,
+                    &["order", "conversations", id],
+                    &json!({"ids":ids,"folders":value.get("chatFolders").cloned().unwrap_or(json!([]))}),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::persistent_store) fn capture_presets(
+        db: &Connection,
+        generation: &str,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        let ids: Vec<String> = {
+            let mut s = db.prepare("SELECT preset_id FROM bot_presets WHERE generation=?1 ORDER BY configured_index,preset_id")?;
+            let v = s.query_map([generation], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            v
+        };
+        for id in &ids {
+            if let Some(value) = text_value(db, "SELECT value FROM bot_presets WHERE generation=?1 AND preset_id=?2", params![generation, id])? {
+                add(db, out, &["exists", "preset", id], &json!(true))?;
+                fields(db, out, &["preset", id], &value, PRESET_FIELDS)?;
+            }
+        }
+        add(db, out, &["order", "presets"], &json!(ids))?;
+        Ok(())
+    }
+
+    pub(in crate::persistent_store) fn capture_plugin(
+        db: &Connection,
+        generation: &str,
+        owner: &str,
+        key: &str,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        if let Some(value) = text_value(db, "SELECT value FROM plugin_storage WHERE generation=?1 AND owner=?2 AND storage_key=?3", params![generation, owner, key])? {
+            out.insert(unit_key(&["plugin", owner, key])?, unit_value(db, &value)?);
+        }
+        Ok(())
+    }
+
+    fn capture_conversation(
+        db: &Transaction<'_>,
+        generation: &str,
+        char_id: &str,
+        id: &str,
+        edits: Option<&[crate::persistent_store::message_pages::MessageEdit]>,
+        before: bool,
+        out: &mut BTreeMap<UnitKey, UnitValue>,
+    ) -> StoreResult<()> {
+        if let Some(value)=text_value(db,"SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![generation,char_id,id])? {
+            add(db,out,&["exists","conversation",char_id,id],&json!(true))?;fields(db,out,&["conversation",char_id,id],&value,CONVERSATION_FIELDS)?;
+            let unchanged=edits.is_some_and(<[_]>::is_empty)||edits.is_none()&&out.contains_key(&unit_key(&["messages",char_id,id])?);
+            let manifest=if before || unchanged {crate::persistent_store::message_pages::current_manifest(db,generation,char_id,id)?}else{crate::persistent_store::message_pages::capture_manifest(db,generation,char_id,id,edits)?};
+            out.insert(unit_key(&["messages",char_id,id])?,manifest);
+        }
+        Ok(())
+    }
 }
 pub(in crate::persistent_store) fn validate_received(
     _db: &Connection,
@@ -969,7 +1306,16 @@ fn patch_root(v: &mut Value, p: &[String], next: Option<Value>) -> StoreResult<(
             let field = v.as_object_mut().ok_or_else(|| error("invalid-root"))?.entry(map).or_insert(json!({}));
             patch(field, &p[1], next)
         }
-        "persona" => patch_array(v, "personas", "id", &p[1], Some(&p[2]), next),
+        "persona" => {
+            let mut next = next;
+            if p[2] == "embeddedModule" {
+                // A unit written before modules had to carry an id would leave the root unsavable.
+                if let Some(module) = next.as_mut() {
+                    super::super::record_projection::assign_embedded_module_id(module, Some(&p[1]));
+                }
+            }
+            patch_array(v, "personas", "id", &p[1], Some(&p[2]), next)
+        }
         "record" => patch_array(v, &p[1], if p[1] == "plugins" { "name" } else { "id" }, &p[2], None, next),
         _ => Err(error("unit-not-editable")),
     }
@@ -985,6 +1331,65 @@ fn patch(value: &mut Value, field: &str, next: Option<Value>) -> StoreResult<()>
         map.shift_remove(field);
     }
     Ok(())
+}
+/// Writes the stored root as `write_root` writes the value `write` describes:
+/// `write` gets the root's members when it is an object, and the whole root.
+fn rewrite_root(
+    tx: &Connection,
+    generation: &str,
+    write: impl FnOnce(Option<&Object<'_>>, Raw<'_>, &mut Vec<u8>) -> StoreResult<()>,
+) -> StoreResult<()> {
+    let text = stored_root(tx, generation)?;
+    let document = Document::parse(&text, Depth::Limited)?;
+    let mut out = Vec::new();
+    write(document.value().object()?.as_ref(), document.value(), &mut out)?;
+    tx.execute(
+        "UPDATE root SET value=?2 WHERE generation=?1",
+        params![generation, stored_json::text(out)?],
+    )?;
+    Ok(())
+}
+pub(in crate::persistent_store) fn set_character_order(
+    tx: &Connection,
+    generation: &str,
+    order: &Value,
+) -> StoreResult<()> {
+    rewrite_root(tx, generation, |root, _, out| {
+        let root = root.ok_or_else(|| error("invalid-unit-record"))?;
+        let members = root.members().map(|(name, member)| (name, Some(member)));
+        let appended = root.get("characterOrder").is_none().then_some(("characterOrder", None));
+        stored_json::write_json_object(members.chain(appended), out, |name, member, out| match member {
+            Some(member) if name != "characterOrder" => member.write_json(out),
+            _ => Ok(serde_json::to_writer(&mut *out, order)?),
+        })
+    })
+}
+/// Sorts a root collection's records by the position of their ids in `ids`,
+/// records without one first.
+pub(in crate::persistent_store) fn sort_root_records(
+    tx: &Connection,
+    generation: &str,
+    collection: &str,
+    ids: &[String],
+) -> StoreResult<()> {
+    rewrite_root(tx, generation, |root, whole, out| {
+        let Some(root) = root.filter(|root| root.get(collection).is_some_and(Raw::is_array)) else {
+            return whole.write_json(out);
+        };
+        let id_field = if collection == "plugins" { "name" } else { "id" };
+        stored_json::write_json_object(root.members(), out, |name, member, out| {
+            if name != collection {
+                return member.write_json(out);
+            }
+            let mut records = Vec::new();
+            for record in stored_elements(Some(member))? {
+                let id = stored_str(record.object()?.and_then(|record| record.get(id_field)))?;
+                records.push((id.and_then(|id| ids.iter().position(|old| *old == id)), record));
+            }
+            records.sort_by_key(|(position, _)| *position);
+            stored_json::write_json_array(records.into_iter().map(|(_, record)| record), out)
+        })
+    })
 }
 fn write_root(tx: &Connection, generation: &str, value: &Value) -> StoreResult<()> {
     tx.execute(
@@ -1809,9 +2214,7 @@ pub(in crate::persistent_store) fn refresh_orders_charged(
                     projected.push(json!(id));
                 }
             }
-            let mut v = root(tx, generation)?;
-            patch(&mut v, "characterOrder", Some(json!(projected)))?;
-            write_root(tx, generation, &v)?;
+            set_character_order(tx, generation, &Value::Array(projected))?;
             if let Some(written) = written.as_deref_mut() { written(tx.query_row("SELECT length(CAST(value AS BLOB)) FROM root WHERE generation=?1", [generation], |row| row.get(0))?)?; }
         }
         for (i, id) in ids.iter().enumerate() {
@@ -1838,16 +2241,7 @@ pub(in crate::persistent_store) fn refresh_orders_charged(
             p[1].as_str(),
             "personas" | "modules" | "loadouts" | "customModels" | "plugins"
         ) {
-            let mut v = root(tx, generation)?;
-            let collection = v.get_mut(&p[1]).and_then(Value::as_array_mut);
-            if let Some(collection) = collection {
-                let id_field = if p[1] == "plugins" { "name" } else { "id" };
-                collection.sort_by_key(|r| {
-                    ids.iter()
-                        .position(|id| r.get(id_field).and_then(Value::as_str) == Some(id))
-                });
-            }
-            write_root(tx, generation, &v)?;
+            sort_root_records(tx, generation, &p[1], &ids)?;
             if let Some(written) = written.as_deref_mut() { written(tx.query_row("SELECT length(CAST(value AS BLOB)) FROM root WHERE generation=?1", [generation], |row| row.get(0))?)?; }
         }
     }
@@ -1904,28 +2298,45 @@ pub(in crate::persistent_store) fn preserve_local_root(
     active: &str,
     staged: &str,
 ) -> StoreResult<()> {
-    let old = root(db, active)?;
-    let mut next = root(db, staged)?;
-    for (key, value) in old.as_object().ok_or_else(|| error("invalid-root"))? {
-        if !ROOT_FIELDS.contains(&key.as_str())
-            && !matches!(
-                key.as_str(),
-                "modules"
-                    | "plugins"
-                    | "loadouts"
-                    | "customModels"
-                    | "personas"
-                    | "characterOrder"
-                    | "protectedPresetValues"
-                    | "explicitGlobalChatVariables"
-            )
-        {
-            patch(&mut next, key, Some(value.clone()))?;
+    let old = stored_root(db, active)?;
+    let old = Document::parse(&old, Depth::Limited)?;
+    let next = stored_root(db, staged)?;
+    let next = Document::parse(&next, Depth::Limited)?;
+    let old = old.value().object()?.ok_or_else(|| error("invalid-root"))?;
+    let local: Vec<_> = old.members().filter(|(key, _)| is_local_root_field(key)).collect();
+    let mut out = Vec::new();
+    match next.value().object()? {
+        Some(next) => {
+            let members = next.members().map(|(key, member)| {
+                (key, local.iter().find(|(name, _)| *name == key).map_or(member, |(_, value)| *value))
+            });
+            let appended = local.iter().copied().filter(|(key, _)| next.get(key).is_none());
+            stored_json::write_json_object(members.chain(appended), &mut out, |_, member, out| member.write_json(out))?;
         }
+        None if local.is_empty() => next.value().write_json(&mut out)?,
+        None => return Err(error("invalid-unit-record")),
     }
-    write_root(db, staged, &next)
+    db.execute(
+        "UPDATE root SET value=?2 WHERE generation=?1",
+        params![staged, stored_json::text(out)?],
+    )?;
+    Ok(())
 }
-
+/// Root fields that are not units, which a replacement keeps from this device.
+fn is_local_root_field(key: &str) -> bool {
+    !ROOT_FIELDS.contains(&key)
+        && !matches!(
+            key,
+            "modules"
+                | "plugins"
+                | "loadouts"
+                | "customModels"
+                | "personas"
+                | "characterOrder"
+                | "protectedPresetValues"
+                | "explicitGlobalChatVariables"
+        )
+}
 fn capture_plugin_order(
     db: &Connection,
     generation: &str,

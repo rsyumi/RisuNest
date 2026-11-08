@@ -144,7 +144,7 @@
                 <li><button type="button" class="crumb" aria-current={current ? undefined : 'location'} onclick={() => open(undefined)}>{strings.providers.onedrive.name}</button></li>
                 {#each path as entry, index (entry.handle)}
                     <li>
-                        <ChevronRightIcon size={14} class="shrink-0 text-textcolor2" aria-hidden="true" />
+                        <ChevronRightIcon size={14} class="shrink-0 text-subtext" aria-hidden="true" />
                         <button type="button" class="crumb" title={entry.name} aria-current={index === path.length - 1 ? 'location' : undefined} onclick={() => open(entry)}>{entry.name}</button>
                     </li>
                 {/each}
@@ -152,7 +152,7 @@
         </nav>
         <ul class="list" bind:this={list} aria-busy={loading ? 'true' : undefined} onscroll={onListScroll}>
             {#each folders as entry (entry.handle)}
-                <li><button type="button" class="row" onclick={() => open(entry)}><FolderIcon size={18} class="shrink-0 text-textcolor2" aria-hidden="true" /><span class="name">{entry.name}</span><ChevronRightIcon size={16} class="shrink-0 text-textcolor2" aria-hidden="true" /></button></li>
+                <li><button type="button" class="row" onclick={() => open(entry)}><FolderIcon size={18} class="shrink-0 text-subtext" aria-hidden="true" /><span class="name">{entry.name}</span><ChevronRightIcon size={16} class="shrink-0 text-subtext" aria-hidden="true" /></button></li>
             {/each}
             {#if loading}
                 <li class="state" role="status">{strings.loading}</li>
@@ -177,20 +177,20 @@
     .panel { max-width: 32rem; max-height: min(85vh, 40rem); border-radius: 0.75rem; }
     .head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 1.1rem 1.25rem 0.5rem; }
     .title { margin: 0; font-size: 1.125rem; font-weight: 700; outline: none; }
-    .close { display: inline-flex; align-items: center; justify-content: center; width: 2.25rem; height: 2.25rem; border-radius: 0.375rem; color: var(--risu-theme-textcolor2); transition: color 200ms, background-color 200ms; }
+    .close { display: inline-flex; align-items: center; justify-content: center; width: 2.25rem; height: 2.25rem; border-radius: 0.375rem; color: var(--color-subtext); transition: color 200ms, background-color 200ms; }
     .close:hover { color: var(--risu-theme-textcolor); background: var(--risu-theme-selected); }
     .close:focus-visible, .crumb:focus-visible, .row:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--risu-theme-selected); }
     .crumbs { padding: 0 1.25rem 0.6rem; overflow-x: auto; scrollbar-width: thin; }
     .crumbs ol { display: flex; align-items: center; gap: 0.15rem; margin: 0; padding: 0; list-style: none; white-space: nowrap; }
     .crumbs li { display: inline-flex; align-items: center; gap: 0.15rem; }
-    .crumb { max-width: 12rem; padding: 0.25rem 0.4rem; border-radius: 0.375rem; overflow: hidden; text-overflow: ellipsis; font-size: 0.875rem; color: var(--risu-theme-textcolor2); }
+    .crumb { max-width: 12rem; padding: 0.25rem 0.4rem; border-radius: 0.375rem; overflow: hidden; text-overflow: ellipsis; font-size: 0.875rem; color: var(--color-subtext); }
     .crumb:hover, .crumb[aria-current] { color: var(--risu-theme-textcolor); }
     .crumb[aria-current] { font-weight: 600; }
     .list { flex: 1 1 auto; min-height: 8rem; margin: 0; padding: 0; list-style: none; overflow-y: auto; border-top: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--risu-theme-darkborderc) 55%, transparent); }
     .row { display: flex; align-items: center; gap: 0.6rem; width: 100%; min-height: 2.75rem; padding: 0.55rem 1.25rem; text-align: start; font-size: 0.9375rem; transition: background-color 200ms; }
     .row:hover { background: var(--risu-theme-selected); }
     .row .name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
-    .state { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 0.75rem 1.25rem; font-size: 0.8125rem; line-height: 1.45; color: var(--risu-theme-textcolor2); }
+    .state { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; padding: 0.75rem 1.25rem; font-size: 0.8125rem; line-height: 1.45; color: var(--color-subtext); }
     .state [role='alert'] { color: var(--risu-theme-danger-400); }
     .sentinel { height: 1px; }
     .select-error { margin: 0; padding: 0.6rem 1.25rem 0; font-size: 0.8125rem; line-height: 1.45; color: var(--risu-theme-danger-400); }

@@ -71,9 +71,9 @@
 <div class="w-full h-full overflow-y-auto bg-darkbg text-textcolor flex justify-center items-start">
     <div class="w-full max-w-xl flex flex-col p-4 sm:p-6 gap-3">
         <h1 class="text-xl font-bold">{copy.title}</h1>
-        <p class="text-sm text-textcolor2">{explanation(failure)}</p>
+        <p class="text-sm text-subtext">{explanation(failure)}</p>
         {#if failure.kind === 'schema-unsupported' && (isTauriAndroid || isTauriIOS || dataFolder)}
-            <div class="flex flex-col gap-1 text-xs text-textcolor2 border border-darkborderc rounded-md p-3">
+            <div class="flex flex-col gap-1 text-xs text-subtext border border-darkborderc rounded-md p-3">
                 {#if isTauriAndroid}
                     <span>{copy.dataPathAndroid}</span>
                 {:else if isTauriIOS}
@@ -84,17 +84,17 @@
                 {/if}
             </div>
         {/if}
-        <code class="text-xs font-mono select-text break-all whitespace-pre-wrap border border-darkborderc rounded-md p-3 text-textcolor2">{details(failure)}</code>
+        <code class="text-xs font-mono select-text break-all whitespace-pre-wrap border border-darkborderc rounded-md p-3 text-subtext">{details(failure)}</code>
         {#if isTauri && failure.stage !== 'native-setup'}
             <div class="rounded-md border border-darkborderc p-3">
                 <p class="text-sm font-bold">{language.risuNest.recovery.exportTitle}</p>
-                <p class="mt-1 text-xs text-textcolor2">{language.risuNest.recovery.exportHelp}</p>
+                <p class="mt-1 text-xs text-subtext">{language.risuNest.recovery.exportHelp}</p>
                 <button
                     class="mt-2 bg-darkbutton border border-darkborderc rounded-md px-4 py-2 text-sm hover:bg-selected"
                     onclick={exportData}
                 >{language.risuNest.recovery.exportAction}</button>
                 {#if exportMessage}
-                    <p class="mt-2 text-xs text-textcolor2" role="status">{exportMessage}</p>
+                    <p class="mt-2 text-xs text-subtext" role="status">{exportMessage}</p>
                 {/if}
             </div>
         {/if}

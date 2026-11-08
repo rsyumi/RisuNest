@@ -375,7 +375,7 @@
             <button class="g-button small quiet" disabled={disabled || loading} onclick={refresh}><RefreshCwIcon size={14} />{text.refresh}</button>
         </div>
     </div>
-    <p class="attachment-summary text-sm text-textcolor2">{language.risuNest.inlay.inventoryTotal.replace('{count}', String(total)).replace('{size}', galleryBytes(totalBytes))}</p>
+    <p class="attachment-summary text-sm text-subtext">{language.risuNest.inlay.inventoryTotal.replace('{count}', String(total)).replace('{size}', galleryBytes(totalBytes))}</p>
     <div class="g-panel attachment-panel">
     <div class="attachment-toolbar" data-gallery-toolbar>
         {#if selected.size}
@@ -416,7 +416,7 @@
         {#if scanRunning && scan}<SettingProgress label={text.scanTitle} detail={fmt(text.scanDetail, scan.completedConversations, scan.totalConversations)} fraction={scan.totalItems ? scan.completedItems / scan.totalItems : null}>{#snippet actions()}<button class="g-button" onclick={() => { void cancelGalleryScan().catch(report) }}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
         {#if optimizing}<SettingProgress label={text.optimize} detail={inlayOptimizationProgressMessage(shownOptimizationProgress)} fraction={shownOptimizationProgress.total ? shownOptimizationProgress.scanned / shownOptimizationProgress.total : null}>{#snippet actions()}<button class="g-button" onclick={() => { optimizeCancel = true; optimization.cancel() }}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
         {#if downloadRunning}<SettingProgress label={downloadArchive ? text.zipTitle : text.download} detail={waitingForSync ? language.risuNest.importDialog.waitingForSync : fmt(text.zipProgress, downloadProgress.done, downloadProgress.total)} fraction={!waitingForSync && downloadProgress.total ? downloadProgress.done / downloadProgress.total : null}>{#snippet actions()}<button class="g-button" onclick={() => downloadAbort?.abort()}>{text.cancel}</button>{/snippet}</SettingProgress>{/if}
-    {#if !loading && !total}<p class="p-6 text-textcolor2">{query.type !== 'all' || query.usage !== 'all' || query.characterId ? text.emptyFiltered : text.empty}</p>{/if}
+    {#if !loading && !total}<p class="p-6 text-subtext">{query.type !== 'all' || query.usage !== 'all' || query.characterId ? text.emptyFiltered : text.empty}</p>{/if}
     <GalleryGrid bind:this={grid} {items} {total} size={$gallerySize} {selected} {selecting} onwindow={requestWindow} onopen={openViewer} ontoggle={toggle} />
     </div>
 </div>
@@ -479,16 +479,16 @@
     .attachment-types { flex: 1 1 auto; }
     .attachment-panel { overflow: clip; margin-top: .75rem; }
     .attachment-toolbar { position: sticky; top: -1.5rem; z-index: 5; border-radius: 0; background: var(--risu-theme-darkbg); }
-    .origin-label { color: var(--risu-theme-textcolor2); font-size: 13px; }
+    .origin-label { color: var(--color-subtext); font-size: 13px; }
     .origin-value { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin: 0; overflow-wrap: anywhere; font-size: 13px; }
     .origin-value b, .location-who b { font-weight: 600; }
     .usage-title { display: flex; align-items: center; gap: .5rem; font-size: .9375rem; font-weight: 600; margin: 1.25rem 0 .5rem; }
-    .usage-count { font-size: 13px; font-weight: 400; color: var(--risu-theme-textcolor2); }
+    .usage-count { font-size: 13px; font-weight: 400; color: var(--color-subtext); }
     .usage-recheck { margin-left: auto; }
-    .usage-help { font-size: 13px; color: color-mix(in srgb,var(--risu-theme-textcolor2) 62%,var(--risu-theme-textcolor) 38%); line-height: 1.5; margin: 0 0 .625rem; }
+    .usage-help { font-size: 13px; color: var(--color-subtext); line-height: 1.5; margin: 0 0 .625rem; }
     .usage-location { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: .125rem .75rem; padding: .5rem 0; border-top-width:1px; border-top-style:solid; border-top-color:color-mix(in srgb,var(--risu-theme-darkborderc) 55%,transparent); font-size: 13px; }
     .usage-location:first-child { border-top: 0; }
     .location-who { min-width: 0; overflow-wrap: anywhere; }
-    .usage-location small { grid-column: 1; color: var(--risu-theme-textcolor2); font-size: 12px; }
-    .location-pill { display: inline-block; padding: .05rem .45rem; border: 1px solid var(--risu-theme-darkborderc); border-radius: 999px; background: var(--risu-theme-bgcolor); font-size: 11px; font-weight: 600; color: var(--risu-theme-textcolor2); margin-left: .25rem; vertical-align: 1px; }
+    .usage-location small { grid-column: 1; color: var(--color-subtext); font-size: 12px; }
+    .location-pill { display: inline-block; padding: .05rem .45rem; border: 1px solid var(--risu-theme-darkborderc); border-radius: 999px; background: var(--risu-theme-bgcolor); font-size: 11px; font-weight: 600; color: var(--color-subtext); margin-left: .25rem; vertical-align: 1px; }
 </style>

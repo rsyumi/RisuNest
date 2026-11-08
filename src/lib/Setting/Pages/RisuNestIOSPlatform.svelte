@@ -99,7 +99,7 @@
       data-platform-info
       class="grid grid-cols-[auto_1fr] gap-x-5 gap-y-1 px-4 py-3 text-sm"
     >
-      <dt class="text-textcolor2">
+      <dt class="text-subtext">
         {language.risuNest.platform.operatingSystem}
       </dt>
       <dd>{os}</dd>

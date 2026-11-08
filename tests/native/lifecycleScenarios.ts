@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { Database } from '../../src/ts/storage/database.svelte'
 import type { PersistentDataStore } from '../../src/ts/storage/persistentDataStore'
+import { failureRecord } from '../../benchmarks/failureRecord'
 
 interface Phase { runId: string; phase: string }
 
@@ -12,7 +13,7 @@ export const endsByNativeExit = (phase: string): boolean => nativeExitPhases.has
 const sleep = (millis: number) => new Promise<void>(resolve => setTimeout(resolve, millis))
 
 function record(phase: Phase, cases: string[], exit?: number, error?: unknown): Promise<unknown> {
-    const report = { ...phase, cases, success: error === undefined, ...(error === undefined ? {} : { error: String(error) }) }
+    const report = { ...phase, cases, success: error === undefined, ...(error === undefined ? {} : { error: String(error), failure: failureRecord(error) }) }
     return invoke('boundary_record', { report, exit: exit ?? null })
 }
 

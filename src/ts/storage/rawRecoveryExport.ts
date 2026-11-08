@@ -1,6 +1,7 @@
 import { save } from './fileSelection'
 import { language } from 'src/lang'
 import { alertConfirm } from '../alert'
+import { localFileStamp } from '../localFileStamp'
 
 import { isTauri, isTauriAndroid, isTauriIOS } from '../platform'
 import { runSharedNativeFileOperation } from './nativeFileJobManager'
@@ -23,7 +24,7 @@ export async function exportOriginalData(): Promise<NativeFileJobResult | null> 
         async ({ signal, onStatus }) => {
             if (signal.aborted)
                 throw new DOMException('File operation cancelled', 'AbortError')
-            const suggestedName = `risunest-${new Date().toISOString().replace(/[:.]/g, '-')}.risunest-rescue.zip`
+            const suggestedName = `risunest-${localFileStamp(Date.now())}.risunest-rescue.zip`
             const path = isTauriAndroid || isTauriIOS
                 ? null
                 : await save({

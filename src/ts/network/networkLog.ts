@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
-import { isTauriAndroid, isTauriIOS } from '../platform'
+import { saveNativeExportFile, type NativeExportResult } from '../storage/nativeExportFile'
 
 export interface NetworkLogSettings {
     enabled: boolean
@@ -61,39 +61,9 @@ export function logSize(bytes: number): string {
     while (value >= 1024 && index < units.length - 1) { value /= 1024; index++ }
     return `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[index]}`
 }
-export async function downloadNetworkLog(id: string): Promise<boolean> {
-    const name = `network-${id}.json`
-    if (!isTauriAndroid && !isTauriIOS) {
-        const { save } = await import('@tauri-apps/plugin-dialog')
-        const destination = await save({ defaultPath: name, filters: [{ name: 'JSON', extensions: ['json'] }] })
-        if (!destination) return false
-        await networkLog({ op: 'export', id, destination })
-        return true
-    }
-    const android = isTauriAndroid ? await import('../storage/androidSafBridge') : undefined
-    let reservation
-    try { reservation = await android?.reserveAndroidSafDestination(name, 'download') }
-    catch (error) {
-        if ((error as {name?: string})?.name === 'AbortError') return false
-        throw error
-    }
-    let exported: {path: string; bytes: number} | undefined
-    try {
-        const publish = async () => {
-            exported = await networkLog<{ path: string; bytes: number }>({ op: 'export', id })
-            const published = isTauriAndroid
-                ? await android!.copyNativeExportToAndroidSaf({ sourcePath: exported.path, suggestedName: name, reservation })
-                : await (await import('../storage/iosFiles')).exportIOSFile({ sourcePath: exported.path, suggestedName: name })
-            if (published.bytes !== exported.bytes) throw new Error('network-log-export-incomplete')
-            return true
-        }
-        return await (android ? android.withAndroidSafDestination(reservation, publish) : publish())
-    } catch (error) {
-        if ((error as { name?: string })?.name === 'AbortError') return false
-        throw error
-    } finally {
-        if (exported) await invoke('native_download_handoff_cleanup', { path: exported.path })
-    }
+export function downloadNetworkLog(id: string): Promise<boolean> {
+    return saveNativeExportFile(`network-${id}.json`, [{ name: 'JSON', extensions: ['json'] }],
+        destination => networkLog<NativeExportResult>({ op: 'export', id, destination }))
 }
 
 export function prettyLogJson(text: string): string | null {

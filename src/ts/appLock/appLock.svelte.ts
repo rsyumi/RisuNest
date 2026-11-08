@@ -1,6 +1,7 @@
 import { getDeviceMarkers } from '../storage/deviceMarkers'
 import { AppLockController, appLockIsGated, initialAppLockState, type AppLockStorage } from './controller'
-import { createAppLockNativeAdapter, normalizeAppLockBackground, type AppLockLifecycle } from './native'
+import { createAppLockNativeAdapter, normalizeAppLockBackground } from './native'
+import { createStartupSurface, type StartupSurface } from './startupSurface'
 import { APP_LOCK_KEY } from './record'
 
 function markerStorage(): AppLockStorage {
@@ -23,9 +24,8 @@ class AppLockFacade {
     private controller: AppLockController | null = null
     private starting: Promise<void> | null = null
     private backgroundColor = '#21252b'
-    private failureUnlisten: (() => void) | null = null
+    private startupSurface: StartupSurface | null = null
     private failureStarting: Promise<void> | null = null
-    private failureGeneration = 0
     get gated(): boolean { return appLockIsGated(this.state) }
 
     initialize(options: { read?: AppLockStorage['read']; commit?: AppLockStorage['commit']; recovery?: boolean } = {}): Promise<void> {
@@ -40,12 +40,17 @@ class AppLockFacade {
             })
             return this.starting
         }
-        this.failureGeneration++
-        this.failureUnlisten?.()
-        this.failureUnlisten = null
+        this.startupSurface?.stop()
+        this.startupSurface = null
         this.controller = new AppLockController(storage, createAppLockNativeAdapter())
         const controller = this.controller
         controller.subscribe((state) => { this.state = state })
+        if (typeof window !== 'undefined') {
+            const shown = () => { if (document.visibilityState === 'visible') controller.retryPendingPresentation() }
+            window.addEventListener('focus', shown)
+            window.addEventListener('pageshow', shown)
+            document.addEventListener('visibilitychange', shown)
+        }
         this.starting = (this.failureStarting ?? Promise.resolve()).then(async () => {
             controller.setBackgroundColor(this.backgroundColor)
             await controller.initialize(options.recovery)
@@ -75,38 +80,10 @@ class AppLockFacade {
         if (this.controller) return this.controller.renderBootFailure()
         return this.renderBeforeInitialization()
     }
-    private async renderBeforeInitialization(): Promise<void> {
+    private renderBeforeInitialization(): Promise<void> {
         if (this.failureStarting) return this.failureStarting
-        const generation = this.failureGeneration
-        const native = createAppLockNativeAdapter()
-        let presentation = 0
-        let latestEpoch = -1
-        const present = async (snapshot: AppLockLifecycle) => {
-            if (snapshot.epoch < latestEpoch) return
-            latestEpoch = snapshot.epoch
-            const request = ++presentation
-            if (!snapshot.active) return
-            for (let attempt = 0; attempt < 4; attempt++) {
-                if (generation !== this.failureGeneration || this.controller || request !== presentation) return
-                try { if (await native.ready(snapshot.epoch, false)) return } catch { return }
-                if (attempt < 3) await new Promise<void>((resolve) => setTimeout(resolve, [32, 128, 512][attempt]))
-            }
-        }
-        this.failureStarting = (async () => {
-            if (!this.failureUnlisten) {
-                try {
-                    const unlisten = await native.listen((snapshot) => { void present(snapshot) })
-                    if (generation !== this.failureGeneration || this.controller) unlisten()
-                    else this.failureUnlisten = unlisten
-                } catch { /* The initial policy snapshot can still release the failure surface. */ }
-            }
-            if (generation !== this.failureGeneration || this.controller) return
-            const snapshot = await native.setPolicy({
-                enabled: false, timing: 'launch', gateRequired: false,
-                hideRecentsPreview: false, backgroundColor: this.backgroundColor,
-            })
-            await present(snapshot)
-        })().catch(() => undefined).finally(() => { this.failureStarting = null })
+        this.startupSurface ??= createStartupSurface()
+        this.failureStarting = this.startupSurface.present(this.backgroundColor).finally(() => { this.failureStarting = null })
         return this.failureStarting
     }
     rendered(reason: string) { return this.controller?.rendered(reason) }

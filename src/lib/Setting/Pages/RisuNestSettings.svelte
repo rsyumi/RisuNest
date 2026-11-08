@@ -97,7 +97,7 @@
                 aria-selected={active}
                 aria-controls="risunest-panel-{tab}"
                 tabindex={active ? 0 : -1}
-                class="-mb-px shrink-0 border-b-2 px-3 py-2 text-sm whitespace-nowrap transition-colors duration-200 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected {active ? 'border-textcolor font-semibold text-textcolor' : 'border-transparent text-textcolor2 hover:text-textcolor'}"
+                class="-mb-px shrink-0 border-b-2 px-3 py-2 text-sm whitespace-nowrap transition-colors duration-200 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected {active ? 'border-textcolor font-semibold text-textcolor' : 'border-transparent text-subtext hover:text-textcolor'}"
                 onclick={() => { activeTab = tab }}
                 onkeydown={(event) => moveTab(event, index)}
             >{tabLabels[tab]}</button>

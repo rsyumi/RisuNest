@@ -82,6 +82,18 @@ try {
     writeFileSync(appLockState, originalAppLockState.replace(' && (locked || !policy.gateRequired)', ''))
     try { run('AppLockStateTests/testUnlockedFrameCannotReplaceARequiredGateInTheSameEpoch', true) }
     finally { writeFileSync(appLockState, originalAppLockState) }
+    for (const [before, after] of [
+        ['guard active, epoch == coveredEpoch, awaitingReady,', 'guard epoch == coveredEpoch, awaitingReady,'],
+        ['guard active, epoch == coveredEpoch, awaitingReady,', 'guard active, awaitingReady,'],
+        ['guard active, epoch == coveredEpoch, awaitingReady,', 'guard active, epoch == coveredEpoch,'],
+        ['!policy.installsReturnCover, !policy.gateRequired else { return false }', '!policy.gateRequired else { return false }'],
+        ['!policy.installsReturnCover, !policy.gateRequired else { return false }', '!policy.installsReturnCover else { return false }'],
+    ]) {
+        assert.equal(originalAppLockState.split(before).length, 2)
+        writeFileSync(appLockState, originalAppLockState.replace(before, after))
+        try { run('AppLockStateTests/testUnconfirmedReleaseEndsOnlyCoversWithoutALockDecision', true) }
+        finally { writeFileSync(appLockState, originalAppLockState) }
+    }
     const original = readFileSync(source, 'utf8')
     for (const [before, after, test, occurrence = 0, count = 1] of [
         ['source.copyCancelled = true', 'source.copyCancelled = false', 'testCopyCancelledBeforeOrDuringTheCopyRemovesPartialFiles', 0, 2],

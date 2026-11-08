@@ -14,11 +14,14 @@ pub(super) fn exclude_record(value: &Value, excluded: &mut HashSet<String>) -> b
     true
 }
 
+/// Upstream message name settings and the names they are stored under here.
+pub(super) const MESSAGE_NAME_SETTINGS: [(&str, &str); 2] = [
+    ("groupTemplate", "messageNameTemplate"),
+    ("groupOtherBotRole", "namedMessageRole"),
+];
+
 pub(super) fn message_name_settings(value: &mut Map<String, Value>) {
-    for (upstream, local) in [
-        ("groupTemplate", "messageNameTemplate"),
-        ("groupOtherBotRole", "namedMessageRole"),
-    ] {
+    for (upstream, local) in MESSAGE_NAME_SETTINGS {
         if let Some(setting) = value.shift_remove(upstream) {
             value.insert(local.to_owned(), setting);
         }

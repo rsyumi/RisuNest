@@ -30,9 +30,9 @@
 </script>
 
 <details bind:open class="mt-3 min-w-0 w-full text-sm">
-    <summary class="cursor-pointer text-textcolor2">{open ? language.hideErrorDetails : language.showErrorDetails}</summary>
+    <summary class="cursor-pointer text-subtext">{open ? language.hideErrorDetails : language.showErrorDetails}</summary>
     <div class="relative mt-2">
-        <button type="button" class="absolute top-1 right-1 rounded-sm bg-bgcolor p-1 text-textcolor2"
+        <button type="button" class="absolute top-1 right-1 rounded-sm bg-bgcolor p-1 text-subtext"
             title={copied === report ? language.copied : failed === report ? language.risuNest.networkLog.clipboardDenied : language.copy}
             aria-label={language.copy} onclick={copy}>
             {#if copied === report}<CheckIcon size={14} />{:else if failed === report}<XIcon size={14} />{:else}<CopyIcon size={14} />{/if}

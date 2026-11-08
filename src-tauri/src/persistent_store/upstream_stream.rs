@@ -1,8 +1,11 @@
-use super::{commit, PersistentStore, StoreError, StoreResult};
+use super::stored_json::{self, Depth, Document, Object, Raw};
+use super::{commit, replacement_scan, PersistentStore, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, MAIN_DB};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -21,6 +24,11 @@ pub(crate) struct RootSpool {
 
 const MEMBERS_IN_ORDER: &str = "SELECT key,value FROM members WHERE field=?1 AND value IS NOT NULL
     ORDER BY array_index IS NULL,array_index,rowid";
+// Reading in index order keeps the rowid order of object members, which is the
+// order a copy is read back in, without sorting the values.
+const MEMBERS_TO_COPY: &str = "SELECT key,value,array_index FROM members WHERE field=?1
+    ORDER BY array_index IS NULL,array_index,rowid";
+const INSERT_MEMBER: &str = "INSERT INTO members(field,key,value,array_index) VALUES(?1,?2,?3,?4)";
 
 fn invalid(message: &str) -> StoreError {
     StoreError::Validation { message: message.to_owned() }
@@ -74,11 +82,28 @@ impl RootSpool {
         Ok(root)
     }
 
-    pub(super) fn record_by_id(&self, field: &str, id: &str) -> StoreResult<Option<Value>> {
+    /// Reads the first record of an array field whose `id` is `id`. The id is
+    /// read as a parse keeps it, so a repeated key matches by its last value.
+    pub(super) fn read_record<T>(&self, field: &str, id: &str, read: impl FnOnce(&str) -> StoreResult<T>) -> StoreResult<Option<T>> {
         if self.kind(field)? != Some(FieldKind::Array) { return Ok(None); }
-        let raw: Option<String>=self.db.query_row("SELECT value FROM members WHERE field=?1 AND json_extract(value,'$.id')=?2 ORDER BY rowid LIMIT 1",
-            params![field,id],|r|r.get(0)).optional()?;
-        raw.map(|raw|decode(&raw)).transpose()
+        let mut statement=self.db.prepare(MEMBERS_IN_ORDER)?;
+        let mut rows=statement.query([field])?;
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            let text=row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            if replacement_scan::record_id_is(text,id)? { return read(text).map(Some); }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn visit_member_texts(&self, field: &str, mut visit: impl FnMut(&str) -> StoreResult<()>) -> StoreResult<()> {
+        let mut statement=self.db.prepare(MEMBERS_IN_ORDER)?;
+        let mut rows=statement.query([field])?;
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            visit(row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?)?;
+        }
+        Ok(())
     }
 
     pub(super) fn visit_value_texts(&self, mut visit: impl FnMut(&str) -> StoreResult<()>) -> StoreResult<()> {
@@ -130,17 +155,38 @@ impl RootSpool {
     }
 
     pub(crate) fn put_member(&self, field: &str, key: &str, value: Option<&Value>) -> StoreResult<()> {
-        self.check_cancelled()?;
         let raw = value.map(serde_json::to_string).transpose()?;
+        self.put_member_json(field,key,raw.as_deref())
+    }
+
+    /// `put_member` of the value whose `serde_json::to_string` text is `raw`.
+    pub(crate) fn put_member_json(&self, field: &str, key: &str, raw: Option<&str>) -> StoreResult<()> {
+        self.check_cancelled()?;
+        self.put_member_text(field,key,raw)
+    }
+
+    fn put_member_text(&self, field: &str, key: &str, raw: Option<&str>) -> StoreResult<()> {
         self.db.execute("INSERT INTO members(field,key,value,array_index) VALUES(?1,?2,?3,?4)
             ON CONFLICT(field,key) DO UPDATE SET value=excluded.value",params![field,key,raw,array_index(key)])?;
         Ok(())
     }
 
+    /// Keeps a stored member's text as written instead of decoding and
+    /// serializing it again. Spools read from storage are never written back,
+    /// and their readers decode what they need from this text.
+    fn put_stored_member(&self, field: &str, key: &str, raw: &str) -> StoreResult<()> {
+        self.check_cancelled()?;
+        replacement_scan::check_value(raw)?;
+        self.put_member_text(field,key,Some(raw))
+    }
+
     pub(crate) fn member(&self, field: &str, key: &str) -> StoreResult<Option<Value>> {
-        let raw: Option<String> = self.db.query_row("SELECT value FROM members WHERE field=?1 AND key=?2 AND value IS NOT NULL",
-            params![field,key],|row| row.get(0)).optional()?;
-        raw.map(|raw| decode(&raw)).transpose()
+        self.member_text(field,key)?.map(|raw| decode(&raw)).transpose()
+    }
+
+    fn member_text(&self, field: &str, key: &str) -> StoreResult<Option<String>> {
+        Ok(self.db.query_row("SELECT value FROM members WHERE field=?1 AND key=?2 AND value IS NOT NULL",
+            params![field,key],|row| row.get(0)).optional()?)
     }
 
     pub(crate) fn scalar(&self, key: &str) -> StoreResult<Option<Value>> {
@@ -168,6 +214,71 @@ impl RootSpool {
             visit(&key, decode(&raw)?)?;
         }
         Ok(())
+    }
+
+    /// Writes each member of `field` as `put_member` writes it after, in a
+    /// member that is an object, the value of each `from` key in turn moves to
+    /// `to` as `shift_remove` and `insert` move it: in place of an existing
+    /// `to`, otherwise after the last member.
+    pub(crate) fn rename_object_members(&self, field: &str, renames: &[(&str, &str)]) -> StoreResult<()> {
+        self.visit_texts(field,|key,text| {
+            let document = Document::parse(text, Depth::Unlimited)?;
+            let mut out = Vec::new();
+            match document.value().object()? {
+                Some(object) => {
+                    let mut members: Vec<(&str, Raw<'_>)> = object.members().collect();
+                    for (from,to) in renames {
+                        let Some(index) = members.iter().position(|(name,_)| name == from) else { continue; };
+                        let (_,value) = members.remove(index);
+                        match members.iter_mut().find(|(name,_)| name == to) {
+                            Some(member) => member.1 = value,
+                            None => members.push((to,value)),
+                        }
+                    }
+                    stored_json::write_json_object(members, &mut out, |_,member,out| member.write_json(out))?;
+                }
+                None => document.value().write_json(&mut out)?,
+            }
+            self.put_member_json(field,key,Some(stored_json::text(out)?.as_str()))
+        })
+    }
+
+    /// `visit` of each member's text, which is not decoded.
+    fn visit_texts(&self, field: &str, mut visit: impl FnMut(&str, &str) -> StoreResult<()>) -> StoreResult<()> {
+        let mut statement = self.db.prepare(MEMBERS_IN_ORDER)?;
+        let mut rows = statement.query([field])?;
+        while let Some(row) = rows.next()? {
+            self.check_cancelled()?;
+            let key: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            visit(&key, &raw)?;
+        }
+        Ok(())
+    }
+
+    /// What `serde_json::to_vec` writes for `value(key)`, read one stored member
+    /// at a time.
+    fn field_json(&self, key: &str) -> StoreResult<Option<Vec<u8>>> {
+        let Some(kind) = self.kind(key)? else { return Ok(None); };
+        let mut out = Vec::new();
+        if kind == FieldKind::Value {
+            let raw: String = self.db.query_row("SELECT value FROM fields WHERE key=?1",[key],|r|r.get(0))?;
+            Document::parse(&raw, Depth::Unlimited)?.value().write_json(&mut out)?;
+            return Ok(Some(out));
+        }
+        out.push(if kind == FieldKind::Array { b'[' } else { b'{' });
+        let mut first = true;
+        self.visit_texts(key, |name, raw| {
+            if !first { out.push(b','); }
+            first = false;
+            if kind == FieldKind::Object {
+                serde_json::to_writer(&mut out, name)?;
+                out.push(b':');
+            }
+            Document::parse(raw, Depth::Unlimited)?.value().write_json(&mut out)
+        })?;
+        out.push(if kind == FieldKind::Array { b']' } else { b'}' });
+        Ok(Some(out))
     }
 
     pub(crate) fn count(&self, field: &str) -> StoreResult<u64> {
@@ -225,8 +336,16 @@ impl RootSpool {
         let Some(kind) = self.kind(from)? else { return Ok(()); };
         self.begin(to,kind)?;
         self.db.execute("UPDATE fields SET value=(SELECT value FROM fields WHERE key=?2) WHERE key=?1",params![to,from])?;
-        self.db.execute("INSERT INTO members(field,key,value,array_index)
-            SELECT ?2,key,value,array_index FROM members WHERE field=?1 ORDER BY rowid",params![from,to])?;
+        // An INSERT that selects from its own table first copies every selected
+        // value into a temporary table, so members are copied one row at a time.
+        let mut insert=self.db.prepare(INSERT_MEMBER)?;
+        let mut statement=self.db.prepare(MEMBERS_TO_COPY)?;
+        let mut rows=statement.query([from])?;
+        while let Some(row)=rows.next()? {
+            self.check_cancelled()?;
+            let column=|index: usize| row.get_ref(index).map(rusqlite::types::ToSqlOutput::Borrowed);
+            insert.execute(params![to,column(0)?,column(1)?,column(2)?])?;
+        }
         Ok(())
     }
 
@@ -274,15 +393,37 @@ impl RootSpool {
         Ok(())
     }
 
-    fn assign_record_id(&self, scope: &str, record: &mut Value) -> StoreResult<()> {
-        let object = record.as_object_mut().ok_or_else(||invalid("Imported record must be an object"))?;
-        let id = object.get("id").and_then(Value::as_str).filter(|id|!id.is_empty());
-        let id = match id {
-            Some(id) if self.remember_id(scope,id)? => id.to_owned(),
-            _ => { let id=uuid::Uuid::new_v4().to_string(); self.remember_id(scope,&id)?; id }
-        };
-        object.insert("id".into(),Value::String(id));
-        Ok(())
+    /// The id a record keeps: its own when it is a new non-empty string in
+    /// `scope`, or a new one.
+    fn record_id(&self, scope: &str, id: Option<Cow<'_, str>>) -> StoreResult<String> {
+        match id.filter(|id| !id.is_empty()) {
+            Some(id) if self.remember_id(scope,&id)? => Ok(id.into_owned()),
+            _ => { let id=uuid::Uuid::new_v4().to_string(); self.remember_id(scope,&id)?; Ok(id) }
+        }
+    }
+
+    /// A stored record's text with its id assigned, and a persona's
+    /// `embeddedModule` given an id when it has none, as `to_string` writes the
+    /// assigned value. Records are written from their text.
+    fn assigned_record(&self, scope: &str, text: &str) -> StoreResult<String> {
+        let document = Document::parse(text, Depth::Unlimited)?;
+        let record = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
+        let id = record.get("id").map(|id| id.as_str()).transpose()?.flatten();
+        let mut updates = vec![("id", serde_json::to_vec(&self.record_id(scope,id)?)?)];
+        if scope == "personas" {
+            if let Some(module) = record.get("embeddedModule") {
+                let module = module.object()?.ok_or_else(||invalid("Imported record must be an object"))?;
+                let id = module.get("id").map(|id| id.as_str()).transpose()?.flatten();
+                if id.is_none_or(|id| id.is_empty()) {
+                    let mut text = Vec::new();
+                    write_updated(&module, &[("id", serde_json::to_vec(&uuid::Uuid::new_v4().to_string())?)], &mut text)?;
+                    updates.push(("embeddedModule", text));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        write_updated(&record, &updates, &mut out)?;
+        stored_json::text(out)
     }
 
     fn selected(&self, field: &str, selector: &str) -> StoreResult<Option<String>> {
@@ -298,6 +439,71 @@ impl RootSpool {
     }
 
     fn normalize(&self) -> StoreResult<()> {
+        for field in ["modules","loadouts","customModels","personas","botPresets"] {
+            if self.kind(field)? != Some(FieldKind::Array) { continue; }
+            self.visit_texts(field,|key,text| {
+                let text = self.assigned_record(field,text)?;
+                self.put_member_json(field,key,Some(text.as_str()))
+            })?;
+        }
+        if self.kind("personas")? == Some(FieldKind::Array) {
+            if let Some(key) = self.selected("personas","selectedPersona")? {
+                let text = self.member_text("personas",&key)?.ok_or_else(||invalid("selected persona is missing"))?;
+                let document = Document::parse(&text, Depth::Unlimited)?;
+                let persona = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
+                let mut updates = Vec::new();
+                for (key,field) in [("username","name"),("userIcon","icon"),("personaPrompt","personaPrompt"),("userNote","note")] {
+                    if let Some(text) = self.field_json(key)? { updates.push((field, text)); }
+                }
+                let id = persona.get("id").map(|id| id.parse_value()).transpose()?.unwrap_or(Value::Null);
+                self.put("selectedPersona",Some(&id))?;
+                let mut out = Vec::new();
+                write_updated(&persona, &updates, &mut out)?;
+                self.put_member_json("personas",&key,Some(stored_json::text(out)?.as_str()))?;
+            }
+        }
+        if self.kind("explicitGlobalChatVariables")?.is_none() { self.copy_field("globalChatVariables","explicitGlobalChatVariables")?; }
+        if let Some(key) = self.selected("botPresets","botPresetsId")? {
+            let text = self.member_text("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
+            let document = Document::parse(&text, Depth::Unlimited)?;
+            let preset = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
+            let mut updates = Vec::new();
+            for (key,field) in super::export::PRESET_MIRRORS {
+                if let Some(text) = self.field_json(key)? {
+                    let protected = super::export::protected_preset_flag(key)
+                        .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false);
+                    if protected {
+                        if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
+                        self.put_member_json("protectedPresetValues",key,Some(stored_json::text(text)?.as_str()))?;
+                    } else { updates.push((*field, text)); }
+                }
+            }
+            let id = preset.get("id").map(|id| id.parse_value()).transpose()?.unwrap_or(Value::Null);
+            self.put("botPresetsId",Some(&id))?;
+            let mut out = Vec::new();
+            write_updated(&preset, &updates, &mut out)?;
+            self.put_member_json("botPresets",&key,Some(stored_json::text(out)?.as_str()))?;
+        }
+        Ok(())
+    }
+}
+
+impl RootSpool {
+    #[cfg(test)]
+    fn assign_record_id(&self, scope: &str, record: &mut Value) -> StoreResult<()> {
+        let object = record.as_object_mut().ok_or_else(||invalid("Imported record must be an object"))?;
+        let id = object.get("id").and_then(Value::as_str).filter(|id|!id.is_empty());
+        let id = match id {
+            Some(id) if self.remember_id(scope,id)? => id.to_owned(),
+            _ => { let id=uuid::Uuid::new_v4().to_string(); self.remember_id(scope,&id)?; id }
+        };
+        object.insert("id".into(),Value::String(id));
+        Ok(())
+    }
+
+    /// `normalize` as it was made on parsed values. Tests compare both.
+    #[cfg(test)]
+    fn normalize_values(&self) -> StoreResult<()> {
         for field in ["modules","loadouts","customModels","personas","botPresets"] {
             if self.kind(field)? != Some(FieldKind::Array) { continue; }
             self.visit(field,|key,mut record| {
@@ -343,6 +549,19 @@ impl RootSpool {
     }
 }
 
+/// Appends what `to_string` writes for a stored object after `object[name] =`
+/// each update's value, given as its JSON text. Names are distinct.
+fn write_updated(object: &Object<'_>, updates: &[(&str, Vec<u8>)], out: &mut Vec<u8>) -> StoreResult<()> {
+    let update = |name: &str| updates.iter().find(|(field, _)| *field == name).map(|(_, text)| text.as_slice());
+    let appended = updates.iter().map(|(name, _)| *name).filter(|name| object.get(name).is_none());
+    let members = object.members().map(|(name, member)| (name, Some(member))).chain(appended.map(|name| (name, None)));
+    stored_json::write_json_object(members, out, |name, member, out| match (update(name), member) {
+        (Some(text), _) => { out.extend_from_slice(text); Ok(()) }
+        (None, Some(member)) => member.write_json(out),
+        (None, None) => Err(invalid("updated member is missing")),
+    })
+}
+
 struct StoredRootSeed<'a>(&'a RootSpool);
 impl<'de> DeserializeSeed<'de> for StoredRootSeed<'_> {
     type Value=();
@@ -380,16 +599,16 @@ impl<'de> Visitor<'de> for StoredFieldSeed<'_> {
     fn visit_seq<A:SeqAccess<'de>>(self,mut sequence:A)->Result<(),A::Error> {
         self.root.begin(self.key,FieldKind::Array).map_err(de::Error::custom)?;
         let mut index=0u64;
-        while let Some(value)=sequence.next_element::<Value>()? {
-            self.root.put_member(self.key,&index.to_string(),Some(&value)).map_err(de::Error::custom)?;
+        while let Some(value)=sequence.next_element::<Box<RawValue>>()? {
+            self.root.put_stored_member(self.key,&index.to_string(),value.get()).map_err(de::Error::custom)?;
             index+=1;
         }
         Ok(())
     }
     fn visit_map<A:MapAccess<'de>>(self,mut map:A)->Result<(),A::Error> {
         self.root.begin(self.key,FieldKind::Object).map_err(de::Error::custom)?;
-        while let Some((key,value))=map.next_entry::<String,Value>()? {
-            self.root.put_member(self.key,&key,Some(&value)).map_err(de::Error::custom)?;
+        while let Some((key,value))=map.next_entry::<String,Box<RawValue>>()? {
+            self.root.put_stored_member(self.key,&key,value.get()).map_err(de::Error::custom)?;
         }
         Ok(())
     }
@@ -416,22 +635,23 @@ impl PersistentStore {
         let tx=self.connection.transaction()?;
         commit::require_staging(&tx,staging_id)?;
         tx.execute("DELETE FROM bot_presets WHERE generation=?1",[staging_id])?;
+        // Presets and plugin values are written from their text, which may
+        // hold a converted binary.
         let mut preset_index=0;
-        root.visit("botPresets",|_,preset| {
-            commit::put_preset_rows(&tx,staging_id,&[preset],preset_index)?;
+        root.visit_texts("botPresets",|_,preset| {
+            commit::put_preset_text(&tx,staging_id,preset,preset_index)?;
             preset_index+=1;
             Ok(())
         })?;
         tx.execute("DELETE FROM plugin_storage WHERE generation=?1",[staging_id])?;
         let carried=commit::carried_plugin_import_batches(&tx)?;
         let mut ordinal=0;
-        root.visit("pluginCustomStorage",|key,value| {
-            let mut values=Map::new(); values.insert(key.to_owned(),value);
+        root.visit_texts("pluginCustomStorage",|key,value| {
             let mut meta=Map::new();
             if root.kind("pluginStorageMeta")? == Some(FieldKind::Object) {
                 if let Some(value)=root.member("pluginStorageMeta",key)? { meta.insert(key.to_owned(),value); }
             }
-            commit::put_plugin_storage_map(&tx,staging_id,&values,Some(&meta),&carried,ordinal)?;
+            commit::put_plugin_storage_text(&tx,staging_id,key,value,Some(&meta),&carried,ordinal)?;
             ordinal+=1;
             Ok(())
         })?;
@@ -465,15 +685,19 @@ mod tests {
 
     #[test]
     fn streamed_root_matches_upstream_identity_mirrors_and_plugin_ownership() {
+        // A converted binary is an object with one member per byte.
+        let binary=Value::Object((0..300).map(|index| (index.to_string(),json!(index%256))).collect());
         let fixture=json!({
             "botPresetsId":1,"selectedPersona":1,"temperature":0.8,"NAIsettings":{"synthetic":true},
             "username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],
             "personas":[{"id":"persona-one","name":"one"},{"id":"persona-two","name":"stale","embeddedModule":{"id":"embedded","assets":[]}}],
             "modules":[{"id":"module"}],"loadouts":[{"id":"loadout"}],"customModels":[{"id":"model"}],
             "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},
-            "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]}],
-            "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value"},
-            "pluginStorageMeta":{"shared":{"plugin":"synthetic-plugin"}}
+            "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]},
+                {"name":"Binary \"preset\"\n","id":"preset-binary","image":"preset.png","NAISettings":{"blob":binary,"n":-0.0}}],
+            "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value","binary":{"blob":binary,"text":"\u{d55c}\n"},"owned-binary":binary,
+                "spaced":{"b":1,"a":-0.0,"c":"\u{e9}"}},
+            "pluginStorageMeta":{"shared":{"plugin":"synthetic-plugin"},"owned-binary":{"plugin":"synthetic-plugin"}}
         });
         let first=tempfile::tempdir().unwrap(); let second=tempfile::tempdir().unwrap();
         let mut old=PersistentStore::open(first.path()).unwrap(); let mut streamed=PersistentStore::open(second.path()).unwrap();
@@ -482,14 +706,25 @@ mod tests {
         old.replace_put_upstream_root(&a,&fixture).unwrap();
         old.replace_put_upstream_presets(&a,fixture["botPresets"].as_array().unwrap()).unwrap();
         let root=spool(&fixture);
+        // A member's text is written as its value is written.
+        root.put_member_json("pluginCustomStorage","spaced",Some(" { \"b\" : 1 , \"a\" : -0.0 , \"c\" : \"\\u00e9\" } ")).unwrap();
         streamed.replace_put_upstream_stream(&b,&root).unwrap();
         assert_eq!(streamed.materialize_staging(&b).unwrap(),old.materialize_staging(&a).unwrap());
+        for sql in [
+            "SELECT preset_id,configured_index,name,image,value FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
+            "SELECT owner,storage_key,byte_size,ordinal,value,import_batch_id=?1 FROM plugin_storage WHERE generation=?1 ORDER BY owner,storage_key",
+        ] {
+            let rows=|store:&PersistentStore,stage:&str| store.connection.prepare(sql).unwrap()
+                .query_map([stage],|row| (0..row.as_ref().column_count()).map(|index| row.get::<_,rusqlite::types::Value>(index)).collect::<Result<Vec<_>,_>>())
+                .unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+            assert_eq!(rows(&streamed,&b),rows(&old,&a),"{sql}");
+        }
         let (kind,valid):(String,bool)=streamed.connection.query_row("SELECT typeof(value),json_valid(value) FROM root WHERE generation=?1",[&b],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(kind,"text"); assert!(valid);
         assert_eq!(streamed.read_root(None).unwrap().value,before);
         assert_eq!(streamed.revision().unwrap(),0);
         let replay=RootSpool::from_stored(&streamed.connection,second.path(),&b).unwrap();
-        assert_eq!(replay.record_by_id("personas","persona-two").unwrap().unwrap()["name"],"edited");
+        assert_eq!(replay.read_record("personas","persona-two",decode).unwrap().unwrap()["name"],"edited");
         let scratch=replay._file.as_ref().unwrap().path().to_path_buf();
         assert!(scratch.starts_with(second.path().join("external-storage").join("scratch")),"{scratch:?}");
         drop(replay);
@@ -508,13 +743,54 @@ mod tests {
         let mut keys=Vec::new();
         root.visit("object",|key,_| { keys.push(key.to_owned()); Ok(()) }).unwrap();
         assert_eq!(keys,["0","2","10","b","4294967295","01"]);
+        root.copy_field("object","copy").unwrap();
         let mut text=Vec::new();
         root.write_root(&mut text,false).unwrap();
-        assert_eq!(String::from_utf8(text).unwrap(),r#"{"object":{"0":"0","2":"2","10":"10","b":"b","4294967295":"4294967295","01":"01"}}"#);
-        // A sorter would hold every member value, in RAM under Android's SQLITE_TEMP_STORE=3.
-        let plan=root.db.prepare(&format!("EXPLAIN QUERY PLAN {MEMBERS_IN_ORDER}")).unwrap()
-            .query_map(["object"],|row| row.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
-        assert!(!plan.iter().any(|step| step.contains("USE TEMP B-TREE")),"{plan:?}");
+        let members=r#"{"0":"0","2":"2","10":"10","b":"b","4294967295":"4294967295","01":"01"}"#;
+        assert_eq!(String::from_utf8(text).unwrap(),format!(r#"{{"object":{members},"copy":{members}}}"#));
+        // A sorter or a temporary table would hold every member value, in RAM under
+        // Android's SQLITE_TEMP_STORE=3.
+        for sql in [MEMBERS_IN_ORDER,MEMBERS_TO_COPY,INSERT_MEMBER] {
+            let mut statement=root.db.prepare(&format!("EXPLAIN {sql}")).unwrap();
+            let unbound=vec![rusqlite::types::Null;statement.parameter_count()];
+            let opcodes=statement.query_map(rusqlite::params_from_iter(unbound),|row| row.get::<_,String>(1)).unwrap()
+                .collect::<Result<Vec<_>,_>>().unwrap();
+            assert!(!opcodes.iter().any(|opcode| opcode=="SorterOpen" || opcode=="OpenEphemeral"),"{sql}: {opcodes:?}");
+        }
+    }
+
+    #[test]
+    fn stored_root_members_read_as_a_parse_of_the_stored_text() {
+        let directory=tempfile::tempdir().unwrap();
+        let mut store=PersistentStore::open(directory.path()).unwrap();
+        let stage=store.replace_begin().unwrap().staging_id;
+        let read=|stored: &str| {
+            store.connection.execute("UPDATE root SET value=?2 WHERE generation=?1",params![stage,stored]).unwrap();
+            RootSpool::from_stored(&store.connection,directory.path(),&stage)
+        };
+        let deep=format!("{}\"assets/deep.png\"{}","[".repeat(200),"]".repeat(200));
+        let stored=[
+            r#"{"modules":[ {"id":"stale" , "id":"m","n":1.50,"s":"é🙂"} , {"id":"m","second":true} ],"#,
+            r#""globalChatVariables":{"deep":"#, &deep, r#","repeated":{"k":1,"k":2},"empty":null},"username":"x"}"#,
+        ].concat();
+        let parsed=decode(&stored).unwrap();
+        let root=read(&stored).unwrap();
+        let mut modules=Vec::new();
+        root.visit("modules",|_,value| { modules.push(value); Ok(()) }).unwrap();
+        assert_eq!(Value::from(modules),parsed["modules"]);
+        let mut variables=Map::new();
+        root.visit("globalChatVariables",|key,value| { variables.insert(key.to_owned(),value); Ok(()) }).unwrap();
+        assert_eq!(Value::from(variables),parsed["globalChatVariables"]);
+        assert_eq!(root.read_record("modules","m",decode).unwrap(),Some(parsed["modules"][0].clone()));
+        assert_eq!(root.read_record("modules","stale",decode).unwrap(),None);
+        drop(root);
+        for stored in [
+            r#"{"modules":[1e400]}"#, r#"{"modules":["\ud800"]}"#,
+            r#"{"globalChatVariables":{"a":[1e400]}}"#, r#"{"globalChatVariables":{"a":"\ud800"}}"#,
+        ] {
+            assert!(decode(stored).is_err(),"{stored}");
+            assert!(read(stored).is_err(),"{stored}");
+        }
     }
 
     #[test]
@@ -625,6 +901,81 @@ mod tests {
         for value in [json!(true),json!(7)] {
             store.replace_put_root(&stage,&json!({"plugins":value})).unwrap();
             assert!(commit::staged_plugin_preview(&store.connection,directory.path(),&stage).is_err());
+        }
+        store.replace_put_root(&stage,&json!({"plugins":[{"name":"A"},{"name":""},"B",{"name":7},null,{"nested":{"name":"C"}}]})).unwrap();
+        assert_eq!(commit::staged_plugin_preview(&store.connection,directory.path(),&stage).unwrap().plugin_names,["A"]);
+        // A parse keeps the last of repeated keys.
+        store.connection.execute("UPDATE root SET value=?2 WHERE generation=?1",
+            params![stage,r#"{"plugins":[{"name":"stale","name":"D"},{"name":"E","name":7}]}"#]).unwrap();
+        assert_eq!(commit::staged_plugin_preview(&store.connection,directory.path(),&stage).unwrap().plugin_names,["D"]);
+    }
+
+    /// The root, presets and identities a normalized spool holds, with every
+    /// generated identity written as `<uuid>`.
+    fn normalized(root: &RootSpool) -> String {
+        let mut text = Vec::new();
+        root.write_root(&mut text, false).unwrap();
+        let mut presets = Vec::new();
+        root.visit_texts("botPresets", |_, text| { presets.push(text.to_owned()); Ok(()) }).unwrap();
+        let text = format!("{}\n{}", String::from_utf8(text).unwrap(), presets.join("\n"));
+        let uuid = |part: &str| part.len() == 36 && part.char_indices().all(|(index, c)| {
+            if matches!(index, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() }
+        });
+        let mut masked = String::new();
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find('"') {
+            masked.push_str(&rest[..=start]);
+            rest = &rest[start + 1..];
+            if rest.get(..36).is_some_and(uuid) && rest[36..].starts_with('"') {
+                masked.push_str("<uuid>");
+                rest = &rest[36..];
+            }
+        }
+        masked.push_str(rest);
+        masked
+    }
+
+    #[test]
+    fn normalizing_record_texts_writes_what_normalizing_their_values_writes() {
+        let binary = |length: usize| Value::Object((0..length).map(|index| (index.to_string(), json!(index % 256))).collect());
+        let fixtures = [
+            json!({
+                "username": "User", "userIcon": binary(3), "personaPrompt": "\"prompt\"\n", "selectedPersona": "persona-b",
+                "modules": [{"id": "m", "binary": binary(40)}, {"id": "m", "name": "repeated"}, {"name": "missing"}, {"id": "", "x": 1}, {"id": 5, "n": -0.0}],
+                "loadouts": [{"id": "l", "e": 1E5}],
+                "customModels": [{"name": "model", "id": "c"}],
+                "personas": [
+                    {"id": "persona-a", "embeddedModule": {"id": "e", "binary": binary(40)}},
+                    {"name": "old", "id": "persona-b", "embeddedModule": {"binary": binary(40), "id": ""}},
+                    {"id": "persona-c", "embeddedModule": {"assets": []}},
+                    {"id": "persona-d"},
+                ],
+                "botPresets": [{"id": "preset", "name": "Preset"}, {"name": "unnamed"}],
+                "botPresetsId": 1,
+                "globalChatVariables": {"a": binary(2)},
+            }),
+            json!({
+                "personas": [{"id": "p", "note": 1}], "selectedPersona": 7,
+                "userNote": {"a": {"$serde_json::private::RawValue": "[1]"}, "b": "note"},
+                "personaPrompt": {"$serde_json::private::RawValue": "[1]", "x": binary(2)},
+                "botPresets": [{"name": "a", "temperature": 1}, {"id": "b", "fallbackModels": ["old"], "mainPrompt": "old"}],
+                "botPresetsId": "b", "temperature": 0.25, "mainPrompt": binary(5), "aiModel": "model",
+                "fallbackModels": ["protected", binary(2)], "doNotChangeFallbackModels": true,
+                "seperateModels": {"a": "b"}, "doNotChangeSeperateModels": false,
+                "explicitGlobalChatVariables": {"kept": 1}, "globalChatVariables": {"other": 2},
+            }),
+            json!({"botPresets": [{"id": "x"}], "protectedPresetValues": {"fallbackModels": []}, "fallbackModels": [], "doNotChangeFallbackModels": true}),
+            json!({"modules": [{"id": "m"}, "not a record"]}),
+            json!({"personas": [{"id": "p", "embeddedModule": null}]}),
+            json!({"personas": [], "modules": {"id": "not an array"}}),
+        ];
+        for fixture in &fixtures {
+            let texts = spool(fixture);
+            let values = spool(fixture);
+            let normalized_texts = texts.normalize();
+            let normalized_values = values.normalize_values();
+            assert_eq!(normalized_texts, normalized_values, "{fixture}");
+            assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
         }
     }
 }

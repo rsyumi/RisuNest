@@ -184,10 +184,17 @@ describe('formatDataHealthReport', () => {
 })
 
 describe('dataHealthReportFileName', () => {
-    it('names the file after the moment of the scan', () => {
-        expect(dataHealthReportFileName(result())).toBe(
-            'risunest-data-health-2026-09-15T04-05-06Z.txt',
-        )
+    it('names the file after the local time of the scan', () => {
+        const zone = process.env.TZ
+        process.env.TZ = 'Asia/Seoul'
+        try {
+            expect(dataHealthReportFileName(result())).toBe(
+                'risunest-data-health-2026-09-15-13-05-06.txt',
+            )
+        } finally {
+            if (zone === undefined) delete process.env.TZ
+            else process.env.TZ = zone
+        }
     })
 })
 

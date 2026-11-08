@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { recordNativeLogError } from '../nativeLog'
 import type { AppLockTiming } from './record'
 
 export type OsAuthAvailability =
@@ -27,6 +28,8 @@ export interface AppLockNativeAdapter {
     setPolicy(policy: AppLockNativePolicy): Promise<AppLockLifecycle>
     ready(epoch: number, locked: boolean): Promise<boolean>
     listen(listener: (snapshot: AppLockLifecycle) => void): Promise<() => void>
+    /** Leaves one line in the device log. Never throws. */
+    report(message: string): void
 }
 
 export function createAppLockNativeAdapter(): AppLockNativeAdapter {
@@ -51,6 +54,9 @@ export function createAppLockNativeAdapter(): AppLockNativeAdapter {
                 nativeUnlisten()
                 window.removeEventListener('risunest-app-lock', onMobileLifecycle)
             }
+        },
+        report(message) {
+            void recordNativeLogError(message).catch(() => {})
         },
     }
 }

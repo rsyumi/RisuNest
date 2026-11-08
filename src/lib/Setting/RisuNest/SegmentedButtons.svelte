@@ -35,7 +35,7 @@
             aria-checked={role === 'radiogroup' ? active : undefined}
             aria-pressed={role === 'group' ? active : undefined}
             {disabled}
-            class="min-w-0 rounded-md px-3 py-1.5 text-center text-sm leading-snug transition-colors duration-200 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected disabled:cursor-not-allowed @xl:whitespace-nowrap {active ? 'bg-darkbutton font-medium text-textcolor shadow-xs ring-1 ring-darkborderc' : 'text-textcolor2 hover:bg-selected/50 hover:text-textcolor'}"
+            class="min-w-0 rounded-md px-3 py-1.5 text-center text-sm leading-snug transition-colors duration-200 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-selected disabled:cursor-not-allowed @xl:whitespace-nowrap {active ? 'bg-darkbutton font-medium text-textcolor shadow-xs ring-1 ring-darkborderc' : 'text-subtext hover:bg-selected/50 hover:text-textcolor'}"
             onclick={() => select(option.value)}
         >{option.label}</button>
     {/each}

@@ -855,12 +855,36 @@ fn rejects_missing_invalid_or_unreferenced_card_metadata() {
 
 #[test]
 fn staging_paths_never_derive_from_archive_names() {
-    let bytes = zip_bytes(&valid_entries(), false);
-    let (_directory, inspection) =
-        parse_card("staging.charx", &bytes, CharXLimits::default()).expect("parse CharX");
+    let extra = (0..64)
+        .map(|index| format!("assets/extra/{index}.bin"))
+        .collect::<Vec<_>>();
+    let mut entries = valid_entries();
+    entries.extend(
+        extra
+            .iter()
+            .map(|name| (name.as_str(), b"asset".as_slice(), CompressionMethod::Stored)),
+    );
+    let bytes = zip_bytes(&entries, false);
+    let limits = CharXLimits {
+        max_staged_payloads_per_directory: 8,
+        ..CharXLimits::default()
+    };
+    let (_directory, inspection) = parse_card("staging.charx", &bytes, limits).expect("parse CharX");
     let CharXInspection::Card(card) = inspection else {
         panic!("expected card")
     };
+    let mut directories = 0;
+    for directory in fs::read_dir(&card.staging_directory).expect("staging directory") {
+        let directory = directory.expect("staging entry");
+        assert!(
+            directory.file_type().expect("entry type").is_dir(),
+            "a payload was staged in the root"
+        );
+        let held = fs::read_dir(directory.path()).expect("staging subdirectory").count();
+        assert!(held <= 8, "one directory holds {held} payloads");
+        directories += 1;
+    }
+    assert!(directories > 1, "every payload was staged in one directory");
     for payload in card.payloads {
         let file_name = payload
             .staged_path

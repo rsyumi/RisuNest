@@ -3404,6 +3404,17 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         })
     }
 
+    fn add_characters_with_binaries(
+        &self,
+        staging_id: &str,
+        characters: &[serde_json::Value],
+        binaries: &crate::persistent_store::held_binary::HeldBinaries,
+    ) -> crate::persistent_store::StoreResult<()> {
+        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
+            store.replace_add_characters_with_binaries(staging_id, characters, binaries)
+        })
+    }
+
     fn supports_incremental_characters(&self) -> bool {
         true
     }

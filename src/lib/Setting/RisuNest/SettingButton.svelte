@@ -56,9 +56,9 @@
     .danger:not(:disabled):hover {
         background: color-mix(in srgb, var(--risu-theme-danger-400) 12%, transparent);
     }
-    /* Lifted toward the text color so an enabled quiet action reads as one, and faded further when disabled. */
+    /* Lifted above secondary text (subtext) so an enabled quiet action reads as one, and faded further when disabled. */
     .quiet {
-        color: color-mix(in srgb, var(--risu-theme-textcolor) 25%, var(--risu-theme-textcolor2));
+        color: color-mix(in srgb, var(--risu-theme-textcolor) 60%, var(--risu-theme-textcolor2));
     }
     .quiet:not(:disabled):hover {
         color: var(--risu-theme-textcolor);

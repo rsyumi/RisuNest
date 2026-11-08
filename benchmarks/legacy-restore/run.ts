@@ -25,6 +25,8 @@ export interface MeasurementOptions {
     megabytes: 100 | 300 | 600
     encoding: LegacyEncoding
     charactersFirst?: boolean
+    // Bytes of the MessagePack bin each synthetic character carries.
+    binaryBytes?: number
     assertIsolatedHarness(): Promise<void>
     report(event: Record<string, unknown>): Promise<void>
     sampleMemory?(): Promise<MemorySample>
@@ -53,10 +55,10 @@ export async function runLegacyRestoreMeasurement(options: MeasurementOptions) {
     if (!MEASUREMENT_MB.includes(options.megabytes) || !['raw', 'gzip'].includes(options.encoding))
         throw new Error('Unknown synthetic legacy restore case')
     const runId = crypto.randomUUID()
-    const plan = planFixture(options.megabytes * 1_000_000, runId)
+    const plan = planFixture(options.megabytes * 1_000_000, runId, options.binaryBytes)
     const identity = { schema: 'risunest.synthetic-legacy-restore/v1', synthetic: true, runId,
         decodedBytes: plan.decodedBytes, encoding: options.encoding, charactersFirst: options.charactersFirst ?? true,
-        characterCount: plan.characterCount, messageCount: plan.messageCount }
+        characterCount: plan.characterCount, messageCount: plan.messageCount, binaryBytes: plan.binaryBytes }
     const root = await join(await nativeDataPath(), 'synthetic-legacy-restore', runId)
     await mkdir(root, { recursive: true })
     const path = await join(root, 'synthetic.bin')
@@ -169,6 +171,13 @@ export async function runLegacyRestoreMeasurement(options: MeasurementOptions) {
         progress(6, index)
     }
     if (messages !== plan.messageCount) throw new Error('Restored synthetic message count mismatch')
+    if (plan.binaryBytes > 0) {
+        // A bin is stored as the object JavaScript makes of a Uint8Array, one member per byte.
+        const expected = fixtureCharacter(plan, plan.fullCharacterCount)
+        const read = await invoke<{ value: Record<string, unknown> } | null>('pds_read_character', { id: expected.chaId })
+        if (JSON.stringify(read?.value.syntheticBinary) !== JSON.stringify(expected.syntheticBinary))
+            throw new Error('Restored synthetic binary mismatch')
+    }
     progress(7, plan.characterCount)
     await invoke('native_file_job_forget', { jobId: job.jobId })
     progress(8, plan.characterCount)

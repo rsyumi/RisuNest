@@ -1148,11 +1148,11 @@
             class="dialog outline-hidden"
         >
             <h3 id="external-recovery-title" class="text-lg font-bold">{strings.recovery}</h3>
-            <p class="text-sm text-textcolor2">{strings.recoveryNotice}</p>
+            <p class="text-sm text-subtext">{strings.recoveryNotice}</p>
             <label class="block text-sm">
                 <span class="font-medium">{strings.recoveryCode}</span>
                 <input readonly class="mt-1 w-full select-all rounded-md border border-darkborderc bg-darkbg p-2 font-mono shadow-xs" value={recoveryKey} />
-                <span class="mt-1 block text-[13px] text-textcolor2">{strings.recoveryCodeHelp}</span>
+                <span class="mt-1 block text-[13px] text-subtext">{strings.recoveryCodeHelp}</span>
             </label>
             <div class="actions"><SettingButton onclick={closeRecoveryKey}>{strings.closeRecovery}</SettingButton></div>
         </div>
@@ -1170,7 +1170,7 @@
     .placeholder {
         padding: 1rem;
         font-size: 14px;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .blank {
         display: grid;
@@ -1187,14 +1187,14 @@
         border: 1px solid var(--risu-theme-darkborderc);
         border-radius: 50%;
         background: var(--risu-theme-bgcolor);
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .blank p {
         max-width: 46ch;
         margin: 0;
         font-size: 13px;
         line-height: 1.55;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .card {
         display: grid;
@@ -1230,7 +1230,7 @@
         border: 1px solid var(--risu-theme-darkborderc);
         border-radius: 0.5rem;
         background: var(--risu-theme-bgcolor);
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .card-name {
         min-width: 0;
@@ -1246,7 +1246,7 @@
         margin: 0.125rem 0 0;
         font-size: 12.5px;
         line-height: 1.4;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
         overflow-wrap: anywhere;
     }
     .kv {
@@ -1258,7 +1258,7 @@
         line-height: 1.45;
     }
     .kv dt {
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
         white-space: nowrap;
     }
     .kv dd {
@@ -1270,7 +1270,7 @@
     .note {
         margin: 0;
         font-size: 13px;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .unlock {
         display: grid;
@@ -1329,7 +1329,7 @@
         border-bottom: 2px solid transparent;
         background: transparent;
         font-size: 13px;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
         cursor: pointer;
     }
     .tabs:only-child .tab {
@@ -1356,7 +1356,7 @@
     .empty {
         margin: 0;
         font-size: 13px;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .rows {
         display: grid;
@@ -1393,7 +1393,7 @@
         font-size: 11.5px;
         font-weight: 600;
         line-height: 1.5;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .kind[data-kind='snapshot'] {
         border-color: color-mix(in srgb, var(--risu-theme-primary-500) 45%, transparent);
@@ -1427,7 +1427,7 @@
         gap: 0.25rem;
         font-size: 12px;
         line-height: 1.25;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .flag + .flag {
         margin-left: 0.5rem;
@@ -1469,7 +1469,7 @@
     .stat dt {
         font-size: 13px;
         line-height: 1.4;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .stat dd {
         margin: 0;
@@ -1484,12 +1484,12 @@
     }
     .stat-value[data-unknown='true'] {
         font-weight: 500;
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
     .stat-note {
         font-size: 13px;
         line-height: 1.45;
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
     .usage-section {
         display: grid;
@@ -1530,7 +1530,7 @@
         min-width: 0;
     }
     .bucket-count {
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
     }
@@ -1573,14 +1573,14 @@
     }
     .unit {
         font-size: 13px;
-        color: var(--risu-theme-textcolor2);
+        color: var(--color-subtext);
     }
     .help {
         max-width: 62ch;
         margin: 0;
         font-size: 13px;
         line-height: 1.5;
-        color: color-mix(in srgb, var(--risu-theme-textcolor2) 62%, var(--risu-theme-textcolor) 38%);
+        color: var(--color-subtext);
     }
     .foot {
         display: flex;

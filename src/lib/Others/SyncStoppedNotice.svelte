@@ -30,7 +30,7 @@
                 <p class="font-semibold">{display.label}</p>
                 {#if display.error}<p class="mt-1 whitespace-pre-wrap text-sm text-textcolor/70">{display.error}</p>{/if}
             </div>
-            <button type="button" class="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md text-textcolor2 transition-colors hover:bg-selected hover:text-textcolor" aria-label={language.close} title={language.close} onclick={() => { dismissed = { key: display.stopKey, lastSuccessAt: display.lastSuccessAt } }}><XIcon size={18} aria-hidden="true" /></button>
+            <button type="button" class="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md text-subtext transition-colors hover:bg-selected hover:text-textcolor" aria-label={language.close} title={language.close} onclick={() => { dismissed = { key: display.stopKey, lastSuccessAt: display.lastSuccessAt } }}><XIcon size={18} aria-hidden="true" /></button>
         </div>
         {#if !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
             <div class="mt-2 flex">

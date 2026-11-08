@@ -725,4 +725,50 @@ describe('OpenAI Responses API helpers', () => {
         const chunks = await chunksPromise
         expect(chunks.at(-1)?.['0']).toContain('stream failed')
     })
+
+    it.each([
+        ['chat completions', 'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n', (abortSignal: AbortSignal) => requestOpenAI(baseArg({
+            aiModel: 'gpt-fixture',
+            formated: [{ role: 'user', content: 'synthetic' }],
+            customURL: 'http://localhost:11434/v1/chat/completions',
+            useStreaming: true,
+            abortSignal,
+        }))],
+        ['Responses', 'data: {"type":"response.output_text.delta","delta":"Hel"}\n\n', (abortSignal: AbortSignal) => requestOpenAIResponseAPI(baseArg({
+            useStreaming: true,
+            abortSignal,
+        }))],
+    ])('reports a stopped %s stream to its reader without an unhandled rejection', async (_name, event, request) => {
+        const unhandledRejections: unknown[] = []
+        const onUnhandledRejection = (reason: unknown) => {
+            unhandledRejections.push(reason)
+        }
+        process.on('unhandledRejection', onUnhandledRejection)
+        try {
+            const stop = new AbortController()
+            mocks.fetchNative.mockResolvedValueOnce({
+                status: 200,
+                headers: { get: () => 'text/event-stream' },
+                // The native HTTP plugin errors a response body with this string once its request is aborted.
+                body: new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(new TextEncoder().encode(event))
+                        stop.signal.addEventListener('abort', () => controller.error('Request cancelled'))
+                    },
+                }),
+            })
+
+            const result = await request(stop.signal)
+            expect(result.type).toBe('streaming')
+            const reader = (result.result as ReadableStream<Record<string, string>>).getReader()
+            await expect(reader.read()).resolves.toEqual({ done: false, value: { '0': 'Hel' } })
+            stop.abort()
+
+            await expect(reader.read()).rejects.toBe('Request cancelled')
+            await new Promise((resolve) => setTimeout(resolve, 0))
+            expect(unhandledRejections).toEqual([])
+        } finally {
+            process.off('unhandledRejection', onUnhandledRejection)
+        }
+    })
 })

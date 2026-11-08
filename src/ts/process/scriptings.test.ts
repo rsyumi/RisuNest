@@ -98,6 +98,15 @@ vi.mock('./luaRuntime', async (importOriginal) => {
     },
   }
 })
+vi.mock('./luaWorkerExecutor', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./luaWorkerExecutor')>()
+  class LuaWorkerExecutor extends actual.LuaWorkerExecutor {
+    constructor(...[timeout, ...rest]: ConstructorParameters<typeof actual.LuaWorkerExecutor>) {
+      super(engineFunctionTimeout.ms ?? timeout, ...rest)
+    }
+  }
+  return { ...actual, LuaWorkerExecutor }
+})
 
 let runScripted: typeof import('./scriptings').runScripted
 let jsonLuaSource = ''
@@ -3322,4 +3331,5 @@ test('expands lorebook and persona text with the variables and messages written 
     vi.mocked(loadLoreBookV3PromptFromCompatibilitySnapshot).mockReset()
     continuationRuntime.session = null
   }
-})
+  // The real parser's cold import takes about 2 s alone and longer under a full run.
+}, 30_000)

@@ -13,10 +13,10 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 cc = "1"
-tauri-build = { version = "2.7.1", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
-tauri = { version = "2.12.1", features = ["tray-icon", "macos-private-api"] }
+tauri = { version = "2.12.5", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-single-instance = "2.4.5"
 risunest-sync-manager = { path = "../.." }
 risunest-sync-server = { path = "../../../sync" }

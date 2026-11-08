@@ -70,14 +70,14 @@
                         {#if error}<p class="mt-1 whitespace-pre-wrap text-sm text-textcolor/70">{error}</p>{/if}
                     </div>
                     {#if !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
-                        <button type="button" class="-my-2 min-h-11 text-sm text-textcolor2 underline hover:text-textcolor" onclick={settings}>{language.risuNest.tabs.sync}</button>
+                        <button type="button" class="-my-2 min-h-11 text-sm text-subtext underline hover:text-textcolor" onclick={settings}>{language.risuNest.tabs.sync}</button>
                     {/if}
                 </div>
             {:else}
                 <p role="status" class="min-w-0 flex-1">{language.risuNest.pluginStartup.waiting}</p>
             {/if}
             {#if !inline}
-                <button type="button" class="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md text-textcolor2 transition-colors hover:bg-selected hover:text-textcolor" aria-label={language.close} title={language.close} onclick={dismiss}><XIcon size={18} aria-hidden="true" /></button>
+                <button type="button" class="-mr-2 -mt-2 flex size-10 shrink-0 items-center justify-center rounded-md text-subtext transition-colors hover:bg-selected hover:text-textcolor" aria-label={language.close} title={language.close} onclick={dismiss}><XIcon size={18} aria-hidden="true" /></button>
             {/if}
         </div>
         {#if failed || stopped}

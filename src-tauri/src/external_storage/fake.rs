@@ -18,6 +18,9 @@ use std::{
 };
 /// The one mutable head, refused by every delete.
 const HEAD_OBJECT: &str = "head";
+/// Bounds a test wait only against a deadlock. A wait that spans the process-wide
+/// CPU permit also measures other tests' holds, so it gets no tighter bound.
+pub(crate) const DEADLOCK_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub(super) fn capabilities(cas: bool) -> Capabilities {
     Capabilities {

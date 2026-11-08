@@ -602,7 +602,8 @@ fn builder_with_main_window(
                 "network_log_initialize",
                 network_log::initialize(&app.state::<app_paths::AppPaths>()),
             );
-            setup_native_log_state.configure_file_path(&app_data_dir);
+            setup_native_log_state
+                .configure_file_path_for_run(&app_data_dir, &app.package_info().version.to_string());
             app.manage(setup_native_log_state.clone());
             slow_log::start_stall_watch();
             app.manage(app_cleanup::CleanupState::initialize(app.handle())?);
@@ -700,6 +701,11 @@ fn builder_with_main_window(
                     device_backup
                         .attach_maintenance_guard(guard)
                         .map_err(|error| format!("device maintenance guard failed: {error}"))?;
+                } else {
+                    external_storage::content_store::move_flat_files_later(
+                        app.handle(),
+                        app_data_dir.join("external-storage"),
+                    );
                 }
                 app.state::<native_media::ipc::NativeMediaIpcState>()
                     .configure(app_data_dir.join("native-media-ipc"))?;
@@ -906,6 +912,8 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         native_log::native_log_error,
         generation_diagnostics::native_generation_diagnostic,
         native_log::native_log_file_path,
+        native_log::file_page::native_log_file_read,
+        native_log::file_export::native_log_file_export,
         native_log::native_log_set_file_enabled,
         native_tokenizer::tokenize_batch,
         native_media::native_media_encode_inlay_image,

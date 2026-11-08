@@ -569,6 +569,32 @@ fn recover_orphans(transaction: &Connection, staging: &str, table: &str, now_ms:
     Ok(())
 }
 
+/// Gives the embedded module of the one persona that carries `persona_id` the id activation would
+/// give it when it has none the root can name it by.
+fn assign_embedded_module_id(transaction: &Connection, staging: &str, persona_id: &str) -> StoreResult<()> {
+    let serialized: Option<String> = rusqlite::OptionalExtension::optional(transaction.query_row(
+        "SELECT value FROM root WHERE generation=?1 AND json_valid(value)",
+        [staging],
+        |row| row.get(0),
+    ))?;
+    let Some(mut root) = serialized.and_then(|serialized| serde_json::from_str::<Value>(&serialized).ok()) else {
+        return Ok(());
+    };
+    let owner = Owner { kind: "persona".to_owned(), id: persona_id.to_owned() };
+    let (collection, index) = root_entry(&root, &owner)
+        .ok_or_else(|| validation("the persona the diagnosis named is no longer one entry"))?;
+    let Some(module) = root[collection][index].get_mut("embeddedModule") else {
+        return Ok(());
+    };
+    if super::record_projection::assign_embedded_module_id(module, Some(persona_id)) {
+        transaction.execute(
+            "UPDATE root SET value=?2 WHERE generation=?1",
+            rusqlite::params![staging, serde_json::to_string(&root)?],
+        )?;
+    }
+    Ok(())
+}
+
 fn drop_alias(transaction: &Connection, staging: &str, kind: &str, key: &str) -> StoreResult<()> {
     transaction.execute(
         "DELETE FROM asset_aliases WHERE generation=?1 AND kind=?2 AND logical_key=?3",
@@ -953,6 +979,25 @@ impl PersistentStore {
                          AND EXISTS(SELECT 1 FROM conversations WHERE generation=?1 AND character_id=?2)",
                         rusqlite::params![staging, character_id],
                     )?;
+                }
+                RepairAction::SelectFirstPreset => {
+                    transaction.execute(
+                        "UPDATE root SET value=json_set(value,'$.botPresetsId',
+                            (SELECT preset_id FROM bot_presets WHERE generation=?1 ORDER BY configured_index, preset_id LIMIT 1))
+                         WHERE generation=?1 AND json_valid(value) AND EXISTS(SELECT 1 FROM bot_presets WHERE generation=?1)",
+                        [staging],
+                    )?;
+                }
+                RepairAction::SelectFirstPersona => {
+                    transaction.execute(
+                        "UPDATE root SET value=json_set(value,'$.selectedPersona',json_extract(value,'$.personas[0].id'))
+                         WHERE generation=?1 AND json_valid(value) AND json_type(value,'$.personas[0].id')='text'
+                         AND json_extract(value,'$.personas[0].id')<>''",
+                        [staging],
+                    )?;
+                }
+                RepairAction::AssignEmbeddedModuleId { persona_id } => {
+                    assign_embedded_module_id(&transaction, staging, persona_id)?
                 }
                 RepairAction::DropReference { .. } => {}
                 RepairAction::DropAlias { kind, key } => {

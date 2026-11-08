@@ -10,6 +10,7 @@ import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import ts from 'typescript'
 import { REALM_BLOCKED_URL_PATTERNS } from '../../scripts/realmBlocklist.mjs'
+import { evaluationErrorText } from '../support/cdpException.mjs'
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
@@ -104,7 +105,11 @@ async function evaluate(page, expression) {
         returnByValue: true,
     })
     if (result.exceptionDetails) {
-        throw new Error(result.exceptionDetails.exception?.description ?? 'evaluation failed')
+        throw new Error(await evaluationErrorText(
+            (method, params) => page.call(method, params),
+            result.exceptionDetails,
+            result.exceptionDetails.exception?.description ?? 'evaluation failed',
+        ))
     }
     return result.result.value
 }

@@ -94,14 +94,19 @@ fn main() {
     assert_eq!(paths.data, root);
     let product = risunest_lib::invoke_handler();
     let boundary = boundary_handler();
-    let bootstrap = format!(r#"
-        window.addEventListener('error', event => {{
-            window.__TAURI_INTERNALS__.invoke('boundary_finish', {{ report: {{runId: {}, phase: {}, success: false, cases: [], error: String(event.message)}} }});
-        }});
-        window.addEventListener('unhandledrejection', event => {{
-            window.__TAURI_INTERNALS__.invoke('boundary_finish', {{ report: {{runId: {}, phase: {}, success: false, cases: [], error: String(event.reason)}} }});
-        }});
-    "#, serde_json::json!(id), serde_json::json!(value("RISUNEST_BOUNDARY_PHASE")), serde_json::json!(id), serde_json::json!(value("RISUNEST_BOUNDARY_PHASE")));
+    // The harness page exposes its failure record once it loads; an error before that keeps the text alone.
+    let bootstrap = format!(r#"(() => {{
+        const finish = (error, thrown) => {{
+            const report = {{runId: {}, phase: {}, success: false, cases: [], error}};
+            try {{
+                const record = window.__boundaryFailureRecord;
+                if (typeof record === 'function' && thrown !== undefined && thrown !== null) report.failure = record(thrown);
+            }} catch {{}}
+            window.__TAURI_INTERNALS__.invoke('boundary_finish', {{ report }});
+        }};
+        window.addEventListener('error', event => finish(String(event.message), event.error));
+        window.addEventListener('unhandledrejection', event => finish(String(event.reason), event.reason));
+    }})();"#, serde_json::json!(id), serde_json::json!(value("RISUNEST_BOUNDARY_PHASE")));
     let builder = risunest_lib::builder().manage(paths).append_invoke_initialization_script(&bootstrap).invoke_handler(move |invoke| {
         if invoke.message.command().starts_with("boundary_") { boundary(invoke) } else { product(invoke) }
     });

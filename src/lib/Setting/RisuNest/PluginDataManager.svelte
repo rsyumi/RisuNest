@@ -442,14 +442,14 @@
 {#snippet ownerChips()}
     <div class="flex flex-wrap items-center gap-1.5">
         {#if buckets.length > 0}
-            <span class="text-xs text-textcolor2">{strings.ownerFilterTitle}</span>
+            <span class="text-xs text-subtext">{strings.ownerFilterTitle}</span>
         {/if}
         {#each buckets as bucket (bucket.owner)}
             <button
                 type="button"
                 data-plugin-data-owner={bucket.owner}
                 aria-pressed={ownerFilter === bucket.owner}
-                class="rounded-full border px-2.5 py-0.5 text-xs transition-colors duration-200 {ownerFilter === bucket.owner ? 'border-borderc bg-selected text-textcolor' : 'border-darkborderc text-textcolor2 hover:bg-selected'} {isUnownedPluginOwner(bucket.owner) ? 'border-danger-400/50 text-danger-400' : ''}"
+                class="rounded-full border px-2.5 py-0.5 text-xs transition-colors duration-200 {ownerFilter === bucket.owner ? 'border-borderc bg-selected text-textcolor' : 'border-darkborderc text-subtext hover:bg-selected'} {isUnownedPluginOwner(bucket.owner) ? 'border-danger-400/50 text-danger-400' : ''}"
                 onclick={() => chooseOwner(ownerFilter === bucket.owner ? null : bucket.owner)}
             >{ownerLabel(bucket.owner)} <span class="tabular-nums opacity-70">{bucket.count}</span></button>
         {/each}
@@ -458,7 +458,7 @@
                 type="button"
                 data-plugin-data-automatic
                 aria-pressed={automaticOnly}
-                class="rounded-full border px-2.5 py-0.5 text-xs transition-colors duration-200 {automaticOnly ? 'border-borderc bg-selected text-textcolor' : 'border-darkborderc text-textcolor2 hover:bg-selected'}"
+                class="rounded-full border px-2.5 py-0.5 text-xs transition-colors duration-200 {automaticOnly ? 'border-borderc bg-selected text-textcolor' : 'border-darkborderc text-subtext hover:bg-selected'}"
                 onclick={chooseAutomatic}
             >{strings.ownerAutoAssigned} <span class="tabular-nums opacity-70">{items.filter((item) => item.automatic).length}</span></button>
         {/if}
@@ -474,7 +474,7 @@
                 label={strings.scopeTitle}
                 onchange={(next) => void chooseScope(next)}
             />
-            <span class="text-[13px] leading-normal text-textcolor2">
+            <span class="text-[13px] leading-normal text-subtext">
                 {scope === 'library' ? strings.scopeAllDevicesHelp : strings.scopeThisDeviceHelp}
             </span>
         </div>
@@ -493,7 +493,7 @@
         </div>
         {@render ownerChips()}
         {#if usage.length > 0}
-            <p class="text-xs text-textcolor2">{usage}</p>
+            <p class="text-xs text-subtext">{usage}</p>
         {/if}
     {/if}
 
@@ -503,11 +503,11 @@
                 <p>{language.risuNest.pluginData.import.warning}</p>
             {:else}
                 <p class="font-semibold">{strings.unknownBucketTitle}</p>
-                <p class="mt-1 text-textcolor2">{strings.unknownBucketHelp}</p>
+                <p class="mt-1 text-subtext">{strings.unknownBucketHelp}</p>
             {/if}
         </div>
     {:else if automaticOnly}
-        <div class="rounded-md border border-darkborderc px-3 py-2 text-[13px] leading-normal text-textcolor2">
+        <div class="rounded-md border border-darkborderc px-3 py-2 text-[13px] leading-normal text-subtext">
             {strings.autoBucketHelp}
         </div>
     {/if}
@@ -515,7 +515,7 @@
     {#if scope === 'device' && place === 'settings' && !deviceSynced}
         <div class="rounded-md border border-darkborderc px-3 py-2 text-[13px] leading-normal">
             <span class="font-semibold">{strings.deviceNotSyncedTitle}</span>
-            <span class="text-textcolor2">{strings.deviceNotSyncedHelp}</span>
+            <span class="text-subtext">{strings.deviceNotSyncedHelp}</span>
         </div>
     {/if}
 
@@ -527,7 +527,7 @@
                     <SettingButton variant="secondary" disabled={selectedItems.length === 0} busy={busy} onclick={() => remove(selectedItems)}>{strings.deleteSelected}</SettingButton>
                 </div>
             {:else}
-                <span class="text-xs text-textcolor2">
+                <span class="text-xs text-subtext">
                     {language.risuNest.pluginData.import.summary
                         .replace('{0}', String(visible.length))
                         .replace('{1}', formatRisuNestStorageBytes(totalPluginDataBytes(visible)))}
@@ -569,7 +569,7 @@
                         {/if}
                     {/if}
                 </div>
-                <div class="flex flex-wrap gap-x-3 gap-y-1 border-t border-darkborderc/55 px-3 py-1.5 font-mono text-xs text-textcolor2">
+                <div class="flex flex-wrap gap-x-3 gap-y-1 border-t border-darkborderc/55 px-3 py-1.5 font-mono text-xs text-subtext">
                     {#each group.items as item (pluginDataItemId(item))}
                         {@render assignmentRow(item)}
                     {/each}
@@ -585,7 +585,7 @@
 
     {#if place === 'settings'}
         <div class="flex flex-wrap items-center justify-between gap-2">
-            <span class="text-sm tabular-nums text-textcolor2" data-plugin-data-count>
+            <span class="text-sm tabular-nums text-subtext" data-plugin-data-count>
                 {strings.countOfTotal
                     .replace('{0}', String(items.length))
                     .replace('{1}', String(visible.length))}
@@ -603,25 +603,25 @@
             </div>
         </div>
         {#if loading || searchLoading}
-            <p class="py-8 text-center text-sm text-textcolor2" role="status" aria-live="polite">{language.loading}</p>
+            <p class="py-8 text-center text-sm text-subtext" role="status" aria-live="polite">{language.loading}</p>
         {:else if searchFailed}
-            <p class="py-8 text-center text-sm text-textcolor2" role="alert">{language.error}</p>
+            <p class="py-8 text-center text-sm text-subtext" role="alert">{language.error}</p>
         {:else if visible.length === 0}
-            <p class="py-8 text-center text-sm text-textcolor2">{strings.empty}</p>
+            <p class="py-8 text-center text-sm text-subtext">{strings.empty}</p>
         {:else if !unknownSelected}
             <ul data-plugin-data-list class="max-h-[clamp(24rem,65dvh,52rem)] divide-y divide-darkborderc/55 overflow-y-auto rounded-md border border-darkborderc">
                 {#each visible as item (pluginDataItemId(item))}
                     <!-- The key keeps the first line; the facts wrap under it on a narrow panel. -->
                     <li class="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-1.5 text-sm" data-plugin-data-row={item.key}>
                         <button type="button" class="min-w-0 flex-[1_1_10rem] truncate text-left font-mono hover:text-textcolor" title={strings.openValue} onclick={() => open(item)}>{item.key}</button>
-                        <span class="shrink-0 text-xs {isUnownedPluginOwner(item.owner) ? 'text-danger-400' : 'text-textcolor2'}">
+                        <span class="shrink-0 text-xs {isUnownedPluginOwner(item.owner) ? 'text-danger-400' : 'text-subtext'}">
                             {item.automatic
                                 ? strings.autoAssignedTag.replace('{0}', ownerLabel(item.owner))
                                 : ownerLabel(item.owner)}
                         </span>
-                        <span class="shrink-0 text-xs text-textcolor2">{typeLabel(item)}</span>
-                        <span class="shrink-0 text-xs tabular-nums text-textcolor2">{formatRisuNestStorageBytes(item.byteSize)}</span>
-                        <button type="button" class="ml-auto shrink-0 px-1 text-textcolor2 hover:text-danger-400" aria-label={language.remove} onclick={() => remove([item])}><XIcon size={16} aria-hidden="true" /></button>
+                        <span class="shrink-0 text-xs text-subtext">{typeLabel(item)}</span>
+                        <span class="shrink-0 text-xs tabular-nums text-subtext">{formatRisuNestStorageBytes(item.byteSize)}</span>
+                        <button type="button" class="ml-auto shrink-0 px-1 text-subtext hover:text-danger-400" aria-label={language.remove} onclick={() => remove([item])}><XIcon size={16} aria-hidden="true" /></button>
                     </li>
                 {/each}
             </ul>
@@ -633,7 +633,7 @@
     <div class="fixed inset-0 z-[1200] flex items-center justify-center bg-black/60 p-4">
         <div role="dialog" aria-modal="true" aria-label={openItem.key} class="flex w-full max-w-2xl flex-col gap-3 rounded-xl border border-darkborderc bg-darkbg p-5 text-textcolor">
             <h3 class="font-mono text-lg font-bold break-all">{openItem.key}</h3>
-            <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-textcolor2">
+            <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-subtext">
                 <span><b class="font-semibold">{strings.detailOwner}</b> {ownerLabel(openItem.owner)}</span>
                 <span><b class="font-semibold">{strings.detailType}</b> {typeLabel(openItem)}</span>
                 <span><b class="font-semibold">{strings.detailSize}</b> {formatRisuNestStorageBytes(openItem.byteSize)}</span>
@@ -658,14 +658,14 @@
         <div role="dialog" aria-modal="true" class="flex w-full max-w-md flex-col gap-3 rounded-xl border border-darkborderc bg-darkbg p-5 text-textcolor">
             <h3 class="text-lg font-bold">{assignStrings.confirmTitle.replace('{0}', pending.owner)}</h3>
             {#if pending.prefix !== null}
-                <p class="text-sm text-textcolor2">
+                <p class="text-sm text-subtext">
                     {assignStrings.confirmSummary
                         .replace('{0}', pending.prefix)
                         .replace('{1}', String(pending.items.length))
                         .replace('{2}', formatRisuNestStorageBytes(totalPluginDataBytes(pending.items)))}
                 </p>
             {/if}
-            <p class="text-sm text-textcolor2">{assignStrings.confirmBody.replace('{0}', pending.owner)}</p>
+            <p class="text-sm text-subtext">{assignStrings.confirmBody.replace('{0}', pending.owner)}</p>
             <div class="flex justify-end gap-2">
                 <SettingButton variant="secondary" onclick={() => { confirming = null }}>{language.cancel}</SettingButton>
                 <SettingButton busy={busy} onclick={confirmAssign}>{assignStrings.confirmAction}</SettingButton>
@@ -679,7 +679,7 @@
     <div class="fixed inset-0 z-[1200] flex items-center justify-center bg-black/60 p-4">
         <div role="dialog" aria-modal="true" class="flex w-full max-w-lg flex-col gap-3 rounded-xl border border-darkborderc bg-darkbg p-5 text-textcolor">
             <h3 class="text-lg font-bold">{assignStrings.collisionTitle.replace('{0}', String(pending.colliding.length))}</h3>
-            <p class="text-sm text-textcolor2">
+            <p class="text-sm text-subtext">
                 {assignStrings.collisionBody
                     .replace('{0}', pending.owner)
                     .replace('{1}', String(pending.items.length - pending.colliding.length))
@@ -699,7 +699,7 @@
                     onclick={() => applyAssign(pending.owner, pending.items, choice)}
                 >
                     <span>{title}</span>
-                    <span class="text-xs text-textcolor2">{help}</span>
+                    <span class="text-xs text-subtext">{help}</span>
                 </button>
             {/snippet}
             <div class="flex flex-col gap-2">
@@ -715,7 +715,7 @@
     <div class="fixed inset-0 z-[1200] flex items-center justify-center bg-black/60 p-4">
         <div role="dialog" aria-modal="true" class="flex w-full max-w-md flex-col gap-3 rounded-xl border border-darkborderc bg-darkbg p-5 text-textcolor">
             <h3 class="text-lg font-bold">{assignStrings.reloadTitle}</h3>
-            <p class="text-sm text-textcolor2">{assignStrings.reloadBody}</p>
+            <p class="text-sm text-subtext">{assignStrings.reloadBody}</p>
             <div class="flex justify-end gap-2">
                 <SettingButton variant="secondary" onclick={() => { reloadPrompt = false }}>{assignStrings.reloadLater}</SettingButton>
                 <SettingButton onclick={reloadPlugins}>{assignStrings.reloadNow}</SettingButton>

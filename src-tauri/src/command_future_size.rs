@@ -59,6 +59,8 @@ macro_rules! async_commands {
 async_commands![
     diagnostics::diagnostic_device_info,
     network_log::network_log_command,
+    native_log::file_page::native_log_file_read,
+    native_log::file_export::native_log_file_export,
     app_paths::app_paths_roots,
     app_lock::app_lock_check,
     app_lock::app_lock_authenticate,

@@ -162,7 +162,7 @@ describe('RisuSave picker route', () => {
             events.push('saf-copy-start')
             expect(request).toEqual(expect.objectContaining({
                 sourcePath: '/app/persistent/exports/risusave-a.risudat',
-                suggestedName: expect.stringMatching(/^risunest-.*\.risudat$/),
+                suggestedName: expect.stringMatching(/^risunest-\d{4}(-\d{2}){5}\.risudat$/),
                 deferAcknowledgement: true,
             }))
             expect(JSON.stringify(request)).not.toContain('Uint8Array')

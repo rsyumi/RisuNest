@@ -558,11 +558,24 @@ fn database_only_replacement_drops_forwarded_aliases_that_no_staged_value_names(
         }]
     });
     let all = aliases.iter().map(|alias| alias.key.as_str()).collect::<Vec<_>>();
-    // A character whose additionalAssets is not an array leaves the scan incomplete.
-    for (additional_assets, kept) in [(json!({}), all.clone()), (json!([]), all[..5].to_vec())] {
+    // A character whose additionalAssets is not an array, or a module or an
+    // embedded module whose assets is not, leaves the scan incomplete.
+    let listed = json!({ "modules": [{ "id": "module", "assets": [] }], "personas": [{ "id": "persona", "embeddedModule": { "id": "embedded" } }] });
+    let module = json!({ "modules": [{ "id": "module", "assets": {} }] });
+    let persona = json!({ "personas": [{ "id": "persona", "embeddedModule": { "id": "embedded", "assets": {} } }] });
+    let no_module = json!({ "personas": [{ "id": "persona", "embeddedModule": null }] });
+    for (additional_assets, root, kept) in [
+        (json!({}), listed.clone(), all.clone()),
+        (json!([]), module, all.clone()),
+        (json!([]), persona, all.clone()),
+        (json!([]), no_module, all.clone()),
+        (json!([]), listed, all[..5].to_vec()),
+    ] {
         let revision = store.revision().unwrap();
         let stage = store.replace_begin().unwrap().staging_id;
-        store.replace_put_root(&stage, &json!({ "activeAsset": "assets/root.bin" })).unwrap();
+        let mut root = root;
+        root["activeAsset"] = json!("assets/root.bin");
+        store.replace_put_root(&stage, &root).unwrap();
         store.replace_put_presets(&stage, &[json!({ "id": "preset", "name": "Preset", "mainPrompt": "assets/preset.bin" })]).unwrap();
         let mut character = character.clone();
         character["additionalAssets"] = additional_assets;
@@ -588,14 +601,30 @@ fn database_only_replacement_keeps_character_owner_heads_only_for_unchanged_asse
         character
     };
     let owner = |id: &str| AssetOwnerLocator::CharacterAdditionalAssets { character_id: id.to_owned() };
+    let module = |id: &str| AssetOwnerLocator::RootModuleAssets { module_id: id.to_owned() };
+    let embedded = |persona: &str, id: &str| AssetOwnerLocator::PersonaEmbeddedModuleAssets { persona_id: persona.to_owned(), module_id: id.to_owned() };
     let heads = [
         ("kept", AssetOwnerHead::present(owner("kept"), "11".repeat(32), 1)),
         ("changed", AssetOwnerHead::present(owner("changed"), "22".repeat(32), 1)),
         ("absent", AssetOwnerHead::absent(owner("absent"))),
         ("malformed", AssetOwnerHead::absent(owner("malformed"))),
+        ("kept-module", AssetOwnerHead::present(module("kept-module"), "33".repeat(32), 1)),
+        ("changed-module", AssetOwnerHead::present(module("changed-module"), "44".repeat(32), 1)),
+        ("kept-embedded", AssetOwnerHead::absent(embedded("kept-persona", "kept-embedded"))),
+        ("changed-embedded", AssetOwnerHead::present(embedded("changed-persona", "changed-embedded"), "55".repeat(32), 1)),
     ];
+    let root = |changed: &str| json!({
+        "modules": [
+            { "id": "kept-module", "assets": [["k", "assets/k", "bin"]] },
+            { "id": "changed-module", "assets": [[changed, "assets/m", "bin"]] }
+        ],
+        "personas": [
+            { "id": "kept-persona", "embeddedModule": { "id": "kept-embedded" } },
+            { "id": "changed-persona", "embeddedModule": { "id": "changed-embedded", "assets": [[changed, "assets/p", "bin"]] } }
+        ]
+    });
     let initial = store.replace_begin().unwrap().staging_id;
-    store.replace_put_root(&initial, &json!({})).unwrap();
+    store.replace_put_root(&initial, &root("before")).unwrap();
     store.replace_add_characters(&initial, &[
         character("kept", Some(json!([["a", "assets/a", "bin"]]))),
         character("changed", Some(json!([["b", "assets/b", "bin"]]))),
@@ -604,8 +633,21 @@ fn database_only_replacement_keeps_character_owner_heads_only_for_unchanged_asse
     ]).unwrap();
     store.replace_put_asset_owner_heads(&initial, &heads.clone().map(|(_, head)| head)).unwrap();
     store.replace_commit(&initial, Some(0)).unwrap();
+    // Stored text that another writer left with repeated keys is read like a
+    // parse, which keeps the last value of each.
+    let active = crate::persistent_store::active_generation(&store.connection).unwrap();
+    store.connection.execute(
+        r#"UPDATE root SET value = replace(replace(value, '{"id":"kept-module"', '{"id":"stale","id":"kept-module"'),
+            '"embeddedModule":{"id":"kept-embedded"}', '"embeddedModule":{"id":"stale","id":"kept-embedded"}')
+         WHERE generation = ?1"#,
+        [&active],
+    ).unwrap();
+    let repeated: i64 = store.connection.query_row(
+        r#"SELECT (length(value) - length(replace(value, '"stale"', ''))) / 7 FROM root WHERE generation = ?1"#,
+        [&active], |row| row.get(0)).unwrap();
+    assert_eq!(repeated, 2);
     let stage = store.replace_begin().unwrap().staging_id;
-    store.replace_put_root(&stage, &json!({})).unwrap();
+    store.replace_put_root(&stage, &root("after")).unwrap();
     let mut kept = character("kept", Some(json!([["a", "assets/a", "bin"]])));
     kept["name"] = json!("Renamed");
     store.replace_add_characters(&stage, &[
@@ -621,5 +663,5 @@ fn database_only_replacement_keeps_character_owner_heads_only_for_unchanged_asse
         .filter(|(_, head)| store.read_asset_owner_head(&head.owner, None).unwrap().is_some_and(|stored| stored.value == *head))
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
-    assert_eq!(retained, ["kept", "absent"]);
+    assert_eq!(retained, ["kept", "absent", "kept-module", "kept-embedded"]);
 }

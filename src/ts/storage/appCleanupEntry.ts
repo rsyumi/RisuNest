@@ -18,8 +18,13 @@ function damagedRecordInstruction(ko: boolean, folder: string | undefined): stri
 /** The app stylesheet resets buttons to bare text, so the buttons carry the panel buttons' look. */
 const STARTUP_BUTTON_CLASS = 'rounded-md border border-darkborderc bg-darkbutton px-4 py-2 text-textcolor hover:bg-selected disabled:cursor-not-allowed disabled:opacity-50'
 
+export interface AppCleanupEntryDependencies {
+    /** Runs once the reset page covers the window, which never shows library content. */
+    onPanelShown?: () => void
+}
+
 /** This entry must remain independent of application storage and plugins. */
-export async function appCleanupBeforeBootstrap(): Promise<void> {
+export async function appCleanupBeforeBootstrap(dependencies: AppCleanupEntryDependencies = {}): Promise<void> {
     if (!(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) return
     let status: AppCleanupStatus | undefined
     try {
@@ -105,6 +110,7 @@ export async function appCleanupBeforeBootstrap(): Promise<void> {
     host.append(panel)
     document.getElementById('preloading')?.remove()
     document.body.append(host)
+    dependencies.onPanelShown?.()
     if (status?.pending && status.error !== null) showFailure(status.error)
     else await retry()
     await new Promise<never>(() => {})

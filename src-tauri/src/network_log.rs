@@ -70,27 +70,19 @@ pub(crate) async fn network_log_command(
                 { let _ = destination; return Err("network-log-native-picker-required".into()); }
                 #[cfg(desktop)]
                 {
-                    use std::io::Write;
-                    let destination = std::path::PathBuf::from(destination);
-                    let parent = destination.parent().ok_or("network-log-invalid-destination")?.canonicalize().map_err(|_| "network-log-invalid-destination")?;
                     let paths = app.state::<crate::app_paths::AppPaths>();
-                    if !destination.is_absolute() || paths.owned_roots().iter().any(|root| root.canonicalize().is_ok_and(|root| parent.starts_with(root))) {
-                        return Err("network-log-invalid-destination".into());
-                    }
-                    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|_| "network-log-export-failed")?;
-                    {
-                        let mut writer = std::io::BufWriter::new(temporary.as_file_mut());
-                        snapshot.export_json(&mut writer)?;
-                        writer.flush().map_err(|_| "network-log-export-failed")?;
-                    }
-                    temporary.as_file().sync_all().map_err(|_| "network-log-export-failed")?;
-                    let bytes = temporary.as_file().metadata().map_err(|_| "network-log-export-failed")?.len();
-                    temporary.persist(destination).map_err(|_| "network-log-export-failed")?;
+                    let bytes = crate::native_file_jobs::download_handoff::write_destination(
+                        &paths.owned_roots(),
+                        &destination,
+                        "network-log-invalid-destination",
+                        "network-log-export-failed",
+                        |writer| snapshot.export_json(writer),
+                    )?;
                     json(serde_json::json!({ "bytes": bytes, "path": null }))
                 }
             } else {
                 let state = app.state::<crate::native_file_jobs::NativeFileJobState>();
-                let path = crate::native_file_jobs::download_handoff::write_native(&state, |writer| snapshot.export_json(writer))?;
+                let path = crate::native_file_jobs::download_handoff::write_native(&state, "network-log-export-failed", |writer| snapshot.export_json(writer))?;
                 let bytes = std::fs::metadata(&path).map_err(|_| "network-log-export-failed")?.len();
                 json(serde_json::json!({ "path": path, "bytes": bytes }))
             }
