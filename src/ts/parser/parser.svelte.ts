@@ -127,7 +127,8 @@ DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
                 node.setAttribute('target', '_blank')
                 break
             }
-            data.attrValue = ''
+            // An empty href would navigate to the app document and reload it.
+            data.keepAttr = false
             break
         }
     }
