@@ -446,7 +446,7 @@ describe('RisuNestLogViewer', () => {
                 { tsMs: 10_000, level: 'info', target: 'app-start', message: 'RisuNest 9.9.9' },
                 { tsMs: 11_000, level: 'warn', target: 'slow-operation', message: 'current run warning' },
             ],
-            older: { file: 'current', before: 120 },
+            older: { file: 'current', before: 120, generation: 3 },
         }
         const olderPage = {
             entries: [
@@ -475,7 +475,7 @@ describe('RisuNestLogViewer', () => {
             button('[data-view-saved-log]').click()
             await settleAction()
 
-            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: null })
+            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: null, generation: null })
             expect(button('[data-view-saved-log]').textContent).toContain(language.close)
             expect(button('[data-view-saved-log]').getAttribute('aria-expanded')).toBe('true')
             const rows = shownRows()
@@ -487,7 +487,7 @@ describe('RisuNestLogViewer', () => {
             button('[data-saved-log-older]').click()
             await settleAction()
 
-            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: 120 })
+            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: 120, generation: 3 })
             expect(shownRows().map((row) => row.text)).toEqual([
                 expect.stringContaining('error native-command previous run failure second line'),
                 'unsplit line',
@@ -496,7 +496,7 @@ describe('RisuNestLogViewer', () => {
 
             button('[data-saved-log-newer]').click()
             await settleAction()
-            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: null })
+            expect(commands.native_log_file_read).toHaveBeenLastCalledWith({ file: 'current', before: null, generation: null })
             expect(shownRows()[0].text).toContain('current run warning')
 
             button('[data-view-saved-log]').click()

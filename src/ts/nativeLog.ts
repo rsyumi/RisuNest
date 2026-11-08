@@ -26,6 +26,8 @@ export type NativeLogFile = 'current' | 'previous'
 export interface NativeLogFileCursor {
     file: NativeLogFile
     before: number | null
+    /** Which rotation of the files the cursor points into; absent for the newest page. */
+    generation?: number | null
 }
 
 export interface NativeLogFilePage {
@@ -40,7 +42,11 @@ export async function readNativeLogFilePage(
     cursor: NativeLogFileCursor = NATIVE_LOG_NEWEST_PAGE,
     invokeCommand: NativeLogInvoke = invoke,
 ): Promise<NativeLogFilePage> {
-    return (await invokeCommand('native_log_file_read', { file: cursor.file, before: cursor.before })) as NativeLogFilePage
+    return (await invokeCommand('native_log_file_read', {
+        file: cursor.file,
+        before: cursor.before,
+        generation: cursor.generation ?? null,
+    })) as NativeLogFilePage
 }
 
 /** Refusal from `native_log_file_export` when neither log file holds anything. */

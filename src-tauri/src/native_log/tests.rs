@@ -388,7 +388,7 @@ fn unconfigured_file_path_command_returns_only_a_bounded_code() {
     assert_eq!(entry.target, "native_log");
     assert!(entry.message.contains("file path unavailable"));
 
-    let error = file_page::read_page_for_command(&state, file_page::LogFile::Current, None).unwrap_err();
+    let error = file_page::read_page_for_command(&state, file_page::LogFile::Current, None, None).unwrap_err();
     assert_eq!(error, NATIVE_LOG_FILE_PATH_UNAVAILABLE);
     assert!(state.tail(Some(1)).pop().unwrap().message.contains("file read unavailable"));
 }
@@ -829,7 +829,7 @@ fn saved_log_pages_walk_back_through_both_files_without_splitting_entries() {
     let mut cursor = None;
     loop {
         let (file, before) = cursor.map_or((file_page::LogFile::Current, None), |cursor: file_page::FileCursor| (cursor.file, cursor.before));
-        let page = file_page::read_page(&logs, file, before, page_bytes).unwrap();
+        let page = file_page::read_page(&logs, file, before, page_bytes, 0).unwrap();
         assert!(!page.entries.is_empty());
         let span: usize = page.entries.iter().map(|entry| file_line(entry).len()).sum();
         assert!(span <= page_bytes, "{span}");
@@ -854,7 +854,7 @@ fn a_saved_log_page_from_the_command_never_reads_more_than_its_bound() {
     let size = fs::metadata(logs.join(LOG_FILE_NAME)).unwrap().len();
     assert!(size > 3 * file_page::FILE_PAGE_BYTES as u64);
 
-    let page = file_page::read_page_for_command(&state, file_page::LogFile::Current, None).unwrap();
+    let page = file_page::read_page_for_command(&state, file_page::LogFile::Current, None, None).unwrap();
 
     let start = page.older.unwrap().before.unwrap();
     assert!(size - start <= file_page::FILE_PAGE_BYTES as u64);
@@ -862,23 +862,48 @@ fn a_saved_log_page_from_the_command_never_reads_more_than_its_bound() {
 }
 
 #[test]
-fn a_cursor_from_before_a_rotation_continues_in_the_previous_file() {
+fn a_cursor_from_before_a_rotation_continues_in_the_file_it_came_from() {
     let temp = tempfile::tempdir().unwrap();
+    let state = NativeLogState::initialize(temp.path());
     let logs = temp.path().join("logs");
-    fs::create_dir_all(&logs).unwrap();
-    let entries = synthetic_entries("rotated", 40);
-    write_lines(&logs.join(LOG_FILE_NAME), &entries);
-    let first = file_page::read_page(&logs, file_page::LogFile::Current, None, 400).unwrap();
-    let older = first.older.unwrap();
+    let older = synthetic_entries("older", 40);
+    let filler = LogEntry {
+        ts_ms: 1_700_000_000_500,
+        level: "info".to_owned(),
+        target: "filler".to_owned(),
+        message: "x".repeat(FILE_ROTATE_BYTES),
+    };
+    let newest = synthetic_entries("newest", 40);
+    write_lines(&logs.join(LOG_FILE_NAME), &[&older[..], std::slice::from_ref(&filler), &newest[..]].concat());
+    let read = |cursor: Option<file_page::FileCursor>, page_bytes: usize| {
+        let (file, before, generation) = cursor.map_or((file_page::LogFile::Current, None, None), |cursor| {
+            (cursor.file, cursor.before, Some(cursor.generation))
+        });
+        file_page::read_page_bounded(&state, file, before, generation, page_bytes).unwrap()
+    };
+    // One page reaching back into the older entries, so its cursor points inside them.
+    let reach = file_line(&filler).len() + newest.iter().map(|entry| file_line(entry).len()).sum::<usize>() + 1000;
+    let first = read(None, reach);
+    let cursor = first.older.unwrap();
 
-    fs::rename(logs.join(LOG_FILE_NAME), logs.join(PREVIOUS_LOG_FILE_NAME)).unwrap();
-    fs::write(logs.join(LOG_FILE_NAME), file_line(&synthetic_entries("new", 1)[0])).unwrap();
-    let second = file_page::read_page(&logs, older.file, older.before, 400).unwrap();
+    // The writer moves the file aside, and the next file grows past the cursor.
+    for entry in synthetic_entries("next", 200) {
+        state.record(&entry.level, &entry.target, &entry.message);
+    }
+    assert!(fs::metadata(logs.join(LOG_FILE_NAME)).unwrap().len() > cursor.before.unwrap());
+    let second = read(Some(cursor), 400);
 
-    let next = second.entries.last().unwrap();
-    let expected = &entries[entries.len() - first.entries.len() - 1];
-    assert_eq!(file_line(next), file_line(expected));
-    assert_eq!(second.older.unwrap().file, file_page::LogFile::Previous);
+    let expected = &older[older.len() + newest.len() + 1 - first.entries.len() - 1];
+    assert_eq!(file_line(second.entries.last().unwrap()), file_line(expected));
+
+    // Once the file that cursor points into is dropped as well, nothing older is left.
+    let mut current = fs::OpenOptions::new().append(true).open(logs.join(LOG_FILE_NAME)).unwrap();
+    current.write_all(file_line(&filler).as_bytes()).unwrap();
+    drop(current);
+    state.record("info", "rotation", "first line of the next file");
+    let gone = read(second.older, 400);
+    assert!(gone.entries.is_empty());
+    assert_eq!(gone.older, None);
 }
 
 #[test]
@@ -887,13 +912,13 @@ fn missing_or_empty_saved_logs_read_as_an_empty_page_or_the_previous_file() {
     let logs = temp.path().join("logs");
     fs::create_dir_all(&logs).unwrap();
 
-    let page = file_page::read_page(&logs, file_page::LogFile::Current, None, 400).unwrap();
+    let page = file_page::read_page(&logs, file_page::LogFile::Current, None, 400, 0).unwrap();
     assert!(page.entries.is_empty());
     assert_eq!(page.older, None);
 
     fs::write(logs.join(LOG_FILE_NAME), b"").unwrap();
     write_lines(&logs.join(PREVIOUS_LOG_FILE_NAME), &synthetic_entries("previous", 2));
-    let page = file_page::read_page(&logs, file_page::LogFile::Current, None, 4000).unwrap();
+    let page = file_page::read_page(&logs, file_page::LogFile::Current, None, 4000, 0).unwrap();
     assert_eq!(page.entries.len(), 2);
     assert_eq!(page.older, None);
 }
@@ -912,7 +937,7 @@ fn saved_lines_parse_back_into_the_entries_that_wrote_them() {
         state.record("warn", "risunest_lib::native_log", message);
     }
 
-    let page = file_page::read_page(&temp.path().join("logs"), file_page::LogFile::Current, None, 4000).unwrap();
+    let page = file_page::read_page(&temp.path().join("logs"), file_page::LogFile::Current, None, 4000, 0).unwrap();
     let ring = state.tail(None);
     assert_eq!(page.entries.len(), 5);
     for (read, recorded) in page.entries.iter().zip(&ring).take(3) {

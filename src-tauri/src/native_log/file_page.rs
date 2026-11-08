@@ -30,6 +30,8 @@ pub(crate) enum LogFile {
 pub(crate) struct FileCursor {
     pub file: LogFile,
     pub before: Option<u64>,
+    /// How many times the files had rotated when the cursor was handed out.
+    pub generation: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,16 +47,9 @@ pub(crate) fn read_page(
     file: LogFile,
     before: Option<u64>,
     page_bytes: usize,
+    generation: u64,
 ) -> std::io::Result<FilePage> {
     let page_bytes = page_bytes.max(1) as u64;
-    let (file, before) = match file {
-        // A cursor past the end was handed out before the file was rotated;
-        // the lines it points into are in the previous file now.
-        LogFile::Current if before.is_some_and(|before| before > length(&root.join(LOG_FILE_NAME))) => {
-            (LogFile::Previous, before)
-        }
-        _ => (file, before),
-    };
     let path = root.join(match file {
         LogFile::Current => LOG_FILE_NAME,
         LogFile::Previous => PREVIOUS_LOG_FILE_NAME,
@@ -69,7 +64,7 @@ pub(crate) fn read_page(
     };
     let Some((mut handle, end)) = opened.filter(|(_, end)| *end > 0) else {
         return match file {
-            LogFile::Current => read_page(root, LogFile::Previous, None, page_bytes as usize),
+            LogFile::Current => read_page(root, LogFile::Previous, None, page_bytes as usize, generation),
             LogFile::Previous => Ok(FilePage { entries: Vec::new(), older: None }),
         };
     };
@@ -80,13 +75,24 @@ pub(crate) fn read_page(
     let skipped = if window_start == 0 { 0 } else { first_entry_start(&bytes) };
     let start = window_start + skipped as u64;
     let older = if start > 0 {
-        Some(FileCursor { file, before: Some(start) })
+        Some(FileCursor { file, before: Some(start), generation })
     } else if file == LogFile::Current && length(&root.join(PREVIOUS_LOG_FILE_NAME)) > 0 {
-        Some(FileCursor { file: LogFile::Previous, before: None })
+        Some(FileCursor { file: LogFile::Previous, before: None, generation })
     } else {
         None
     };
     Ok(FilePage { entries: parse_entries(&bytes[skipped..]), older })
+}
+
+/// The file a cursor handed out `rotations` rotations ago points into now. A
+/// rotation moves the current file to the previous one and drops the previous
+/// one, so only a cursor into the current file survives one rotation.
+fn after_rotations(file: LogFile, rotations: u64) -> Option<LogFile> {
+    match (rotations, file) {
+        (0, file) => Some(file),
+        (1, LogFile::Current) => Some(LogFile::Previous),
+        _ => None,
+    }
 }
 
 fn length(path: &Path) -> u64 {
@@ -168,8 +174,31 @@ pub(crate) fn read_page_for_command(
     state: &NativeLogState,
     file: LogFile,
     before: Option<u64>,
+    generation: Option<u64>,
 ) -> Result<FilePage, String> {
-    let Some(root) = state.root() else {
+    read_page_bounded(state, file, before, generation, FILE_PAGE_BYTES)
+}
+
+/// Reads a page while holding the lock the writer rotates under, so the files
+/// cannot rotate between finding the file a cursor points into and reading it.
+/// A cursor without a generation reads the files as they are now.
+pub(crate) fn read_page_bounded(
+    state: &NativeLogState,
+    file: LogFile,
+    before: Option<u64>,
+    generation: Option<u64>,
+    page_bytes: usize,
+) -> Result<FilePage, String> {
+    let read = state.0.lock().ok().and_then(|inner| {
+        let root = inner.root.as_deref()?;
+        let rotations = generation.map_or(Some(0), |generation| inner.rotations.checked_sub(generation));
+        Some(match rotations.and_then(|rotations| after_rotations(file, rotations)) {
+            Some(file) => read_page(root, file, before, page_bytes, inner.rotations),
+            // The file the cursor pointed into is gone, and with it everything older.
+            None => Ok(FilePage { entries: Vec::new(), older: None }),
+        })
+    });
+    let Some(read) = read else {
         state.record_ring_only(
             "error",
             "native_log",
@@ -177,7 +206,7 @@ pub(crate) fn read_page_for_command(
         );
         return Err(NATIVE_LOG_FILE_PATH_UNAVAILABLE.to_owned());
     };
-    read_page(&root, file, before, FILE_PAGE_BYTES).map_err(|error| {
+    read.map_err(|error| {
         state.record_ring_only("error", "native_log", format!("file read failed: {error}"));
         NATIVE_LOG_FILE_READ_FAILED.to_owned()
     })
@@ -188,10 +217,11 @@ pub(crate) async fn native_log_file_read(
     state: State<'_, NativeLogState>,
     file: Option<LogFile>,
     before: Option<u64>,
+    generation: Option<u64>,
 ) -> Result<FilePage, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        read_page_for_command(&state, file.unwrap_or_default(), before)
+        read_page_for_command(&state, file.unwrap_or_default(), before, generation)
     })
     .await
     .map_err(|_| NATIVE_LOG_FILE_READ_FAILED.to_owned())?

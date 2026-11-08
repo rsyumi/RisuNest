@@ -37,6 +37,9 @@ struct Inner {
     entries: VecDeque<LogEntry>,
     pending_file_entries: VecDeque<LogEntry>,
     root: Option<PathBuf>,
+    /// Counts the files moved aside or replaced, so a saved log page cursor
+    /// can tell which file it points into.
+    rotations: u64,
 }
 
 #[derive(Clone)]
@@ -57,6 +60,7 @@ impl NativeLogState {
             entries: VecDeque::with_capacity(RING_CAPACITY),
             pending_file_entries: VecDeque::with_capacity(RING_CAPACITY),
             root: None,
+            rotations: 0,
         })))
     }
 
@@ -90,16 +94,12 @@ impl NativeLogState {
                     target: RUN_START_TARGET.to_owned(),
                     message: mask(&format!("RisuNest {version}")),
                 };
-                write_file(&inner, &start);
+                write_file(&mut inner, &start);
             }
             for entry in pending {
-                write_file(&inner, &entry);
+                write_file(&mut inner, &entry);
             }
         }
-    }
-
-    fn root(&self) -> Option<PathBuf> {
-        self.0.lock().ok().and_then(|inner| inner.root.clone())
     }
 
     pub(crate) fn record(&self, level: &str, target: &str, message: impl AsRef<str>) {
@@ -133,7 +133,7 @@ impl NativeLogState {
             inner.entries.push_back(entry.clone());
             if write_to_file {
                 if inner.root.is_some() {
-                    write_file(&inner, &entry);
+                    write_file(&mut inner, &entry);
                 } else {
                     if inner.pending_file_entries.len() == RING_CAPACITY {
                         inner.pending_file_entries.pop_front();
@@ -204,7 +204,7 @@ impl NativeLogState {
     }
 }
 
-fn write_file(inner: &Inner, entry: &LogEntry) {
+fn write_file(inner: &mut Inner, entry: &LogEntry) {
     let Some(root) = inner.root.as_ref() else {
         return;
     };
@@ -218,7 +218,15 @@ fn write_file(inner: &Inner, entry: &LogEntry) {
         tighten_file(&root.join(PREVIOUS_LOG_FILE_NAME));
     }
     // A log that cannot be moved aside starts over instead of growing past the bound.
-    let Ok(mut file) = open_private_log(&path, rotation == Rotation::Failed) else {
+    let opened = open_private_log(&path, rotation == Rotation::Failed);
+    inner.rotations += match rotation {
+        Rotation::Kept => 0,
+        Rotation::Rotated => 1,
+        // Neither file holds what it held before: the previous one may be gone
+        // and the current one starts over.
+        Rotation::Failed => 2,
+    };
+    let Ok(mut file) = opened else {
         return;
     };
     // One write per line, so a reader never sees half of one.

@@ -45,11 +45,11 @@ describe('native diagnostic log commands', () => {
         const invoke = vi.fn(async () => ({ entries: [], older: null }))
 
         await readNativeLogFilePage(undefined, invoke)
-        await readNativeLogFilePage({ file: 'previous', before: 4096 }, invoke)
+        await readNativeLogFilePage({ file: 'previous', before: 4096, generation: 2 }, invoke)
 
         expect(invoke.mock.calls).toEqual([
-            ['native_log_file_read', { file: 'current', before: null }],
-            ['native_log_file_read', { file: 'previous', before: 4096 }],
+            ['native_log_file_read', { file: 'current', before: null, generation: null }],
+            ['native_log_file_read', { file: 'previous', before: 4096, generation: 2 }],
         ])
     })
 
