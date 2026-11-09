@@ -315,6 +315,35 @@ describe('sendChat prompt history characterization', () => {
         expect(previewFormated.map((message) => message.content)).toEqual(['Edited for Prompt Character', 'Synthetic question'])
     })
 
+    it.each([
+        { selected: '', bound: 'Bound description', sent: ['<persona>Bound description</persona>', 'Synthetic question'] },
+        { selected: 'Selected description', bound: '', sent: ['Synthetic question'] },
+    ])('builds the persona block from the bound persona description $bound, not the selected $selected', async ({ selected, bound, sent }) => {
+        const database = makeDatabase()
+        const character = database.characters[0]
+        character.customscript = []
+        character.triggerscript = []
+        character.firstMessage = ''
+        character.chats[0].fmIndex = -1
+        character.chats[0].message = [{ role: 'user', data: 'Synthetic question', chatId: 'question' }]
+        character.chats[0].bindedPersona = 'bound'
+        database.personas = [
+            { id: 'selected', name: 'Selected', icon: '', personaPrompt: selected, note: '' },
+            { id: 'bound', name: 'Bound', icon: '', personaPrompt: bound, note: '' },
+        ]
+        database.selectedPersona = 0
+        database.username = 'Selected'
+        database.personaPrompt = selected
+        database.promptTemplate = [
+            { type: 'persona', innerFormat: '<persona>{{slot}}</persona>' },
+            { type: 'chat', rangeStart: 0, rangeEnd: 'end' },
+        ]
+        setDatabaseLite(database)
+
+        await expect(sendChat({ preview: true })).resolves.toBe(true)
+        expect(previewFormated.map((message) => message.content)).toEqual(sent)
+    })
+
     it('preserves final OpenAIChat parity through trigger cloning, scripts, CBS, regex, and 128-message pages', async () => {
         setDatabaseLite(makeDatabase())
         const selectedCharacter = DBState.db.characters[0] as character
