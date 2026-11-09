@@ -26,3 +26,5 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 flate2 = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The native message page fixture compiles the app's stored JSON reader, which needs these.
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "unbounded_depth"] }

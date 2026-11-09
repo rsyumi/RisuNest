@@ -1,25 +1,28 @@
 use std::fmt;
 
-#[derive(Debug)]
+// Errors keep only their text so results compare, as the stored JSON tests compiled below require.
+#[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
-    Sql(rusqlite::Error),
-    Json(serde_json::Error),
+    Sql(String),
+    Json(String),
     Validation { message: String },
 }
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Sql(message) | Self::Json(message) | Self::Validation { message } => f.write_str(message),
+        }
     }
 }
 impl std::error::Error for StoreError {}
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::Sql(e)
+        Self::Sql(e.to_string())
     }
 }
 impl From<serde_json::Error> for StoreError {
     fn from(e: serde_json::Error) -> Self {
-        Self::Json(e)
+        Self::Json(e.to_string())
     }
 }
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -35,7 +38,15 @@ pub(crate) mod native_hash_work;
 mod persistent_store {
     pub(crate) use crate::native_hash_work as hash_work;
 }
+#[allow(dead_code)]
+#[path = "../../../src-tauri/src/persistent_store/stored_json.rs"]
+mod stored_json;
 mod lww {
+    pub(crate) fn error(message: impl ToString) -> super::StoreError {
+        super::StoreError::Validation {
+            message: message.to_string(),
+        }
+    }
     // Copied-database acceptance needs the full native LWW store. This page
     // fixture must reject any attempt to cross that unavailable boundary.
     pub(crate) fn validate_received(
