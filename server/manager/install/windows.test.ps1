@@ -634,7 +634,8 @@ FunctionEnd
                     $releasedHook = Read-FrozenSource 'server/manager/install/windows.nsh'
                     $resumable = $releasedHook -match 'installer remove-files-resumable\b'
                     if (!$resumable -and $releasedHook -notmatch 'installer remove-files ') { throw 'Unknown frozen removal command contract.' }
-                    $releasedTemplate = Read-FrozenSource 'src-tauri/windows-installer.nsi'
+                    # The current CLI's language files renamed choowHowToInstall; released templates still name it.
+                    $releasedTemplate = (Read-FrozenSource 'src-tauri/windows-installer.nsi').Replace('$(choowHowToInstall)', '$(chooseHowToInstall)')
                     $releasedCommon = Read-FrozenSource 'src-tauri/windows-common.nsh'
                     $releasedCommonPath = Join-Path $project 'released-common.nsh'
                     $releasedCommon | Set-Content -Encoding utf8 $releasedCommonPath
