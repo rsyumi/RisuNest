@@ -134,6 +134,9 @@ struct RendererGateState {
     maintenance_active: bool,
     /// The maintenance is a page reset, which operations wait out instead of failing.
     resetting: bool,
+    /// A page started during other maintenance. When that maintenance ends,
+    /// admission passes to the page's reset instead of reopening.
+    reset_after_maintenance: bool,
     operations: usize,
     /// Advances whenever renderer maintenance starts.
     epoch: u64,
@@ -185,8 +188,12 @@ impl Drop for DeviceMaintenanceGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.maintenance_active = false;
-        state.resetting = false;
+        if std::mem::take(&mut state.reset_after_maintenance) {
+            state.resetting = true;
+        } else {
+            state.maintenance_active = false;
+            state.resetting = false;
+        }
         self.gate.reopened.notify_all();
     }
 }
@@ -444,7 +451,8 @@ impl PersistentStoreState {
     /// Starts the reset for a new main document without waiting, since a page
     /// start arrives on the main thread. From here the outgoing document's
     /// dispatched operations are refused and new operations wait until
-    /// `finish_renderer_reset` drops the returned guard.
+    /// `finish_renderer_reset` drops the returned guard. During other
+    /// maintenance, the reset starts when that maintenance ends.
     pub(crate) fn begin_renderer_reset(&self) -> StoreResult<RendererReset> {
         let mut state = self
             .renderer_gate
@@ -456,11 +464,14 @@ impl PersistentStoreState {
         // Advanced even when maintenance is already active, so the reset still
         // refuses what the outgoing document dispatched.
         state.epoch += 1;
-        if state.resetting {
+        if state.resetting || state.reset_after_maintenance {
             return Ok(RendererReset::Pending);
         }
         if state.maintenance_active {
-            return Ok(RendererReset::Skipped);
+            state.reset_after_maintenance = true;
+            return Ok(RendererReset::AfterMaintenance(ResetAfterMaintenance {
+                gate: Some(Arc::clone(&self.renderer_gate)),
+            }));
         }
         state.begin_maintenance();
         state.resetting = true;
@@ -516,7 +527,8 @@ impl PersistentStoreState {
     pub(crate) fn reset_renderer_session(&self) -> StoreResult<()> {
         match self.begin_renderer_reset()? {
             RendererReset::Started(maintenance) => self.finish_renderer_reset(maintenance, || {}),
-            RendererReset::Pending | RendererReset::Skipped => Ok(()),
+            RendererReset::Pending => Ok(()),
+            RendererReset::AfterMaintenance(_) => panic!("a page start during maintenance resets after it ends"),
         }
     }
 }
@@ -525,11 +537,43 @@ impl PersistentStoreState {
 pub(crate) enum RendererReset {
     /// This start closed admission; `finish_renderer_reset` reopens it.
     Started(DeviceMaintenanceGuard),
-    /// An earlier start's reset is still waiting for its document's operations
-    /// and covers this start too.
+    /// Other maintenance holds admission and passes it to this start's reset when it ends.
+    AfterMaintenance(ResetAfterMaintenance),
+    /// An earlier start's reset has not finished and covers this start too.
     Pending,
-    /// Other maintenance holds admission.
-    Skipped,
+}
+
+/// The reset of a page that started during other maintenance.
+pub(crate) struct ResetAfterMaintenance {
+    gate: Option<Arc<RendererGate>>,
+}
+
+impl ResetAfterMaintenance {
+    /// Waits, however long the maintenance lasts, until it ends, and returns
+    /// the guard that `finish_renderer_reset` takes.
+    pub(crate) fn wait_for_gate(mut self) -> DeviceMaintenanceGuard {
+        let gate = self.gate.take().expect("the reset holds its gate until it waits");
+        let mut state = gate.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.reset_after_maintenance {
+            state = gate.reopened.wait(state).unwrap_or_else(|error| error.into_inner());
+        }
+        drop(state);
+        DeviceMaintenanceGuard { gate }
+    }
+}
+
+impl Drop for ResetAfterMaintenance {
+    /// A reset dropped without running must not keep admission closed.
+    fn drop(&mut self) {
+        let Some(gate) = self.gate.take() else { return };
+        let mut state = gate.state.lock().unwrap_or_else(|error| error.into_inner());
+        // Before the maintenance ends, it reopens admission itself.
+        if std::mem::take(&mut state.reset_after_maintenance) {
+            return;
+        }
+        drop(state);
+        drop(DeviceMaintenanceGuard { gate });
+    }
 }
 
 impl Default for PersistentStoreState {
@@ -2904,8 +2948,9 @@ mod tests {
         let maintenance = state.acquire_raw_capture().unwrap();
         let during = state.renderer_dispatch_epoch().unwrap();
         assert!(state.admit_renderer_operation_dispatched_at(during).is_err());
-        state.reset_renderer_session().unwrap();
+        let reset = reset_after_maintenance(state.begin_renderer_reset());
         drop(maintenance);
+        state.finish_renderer_reset(reset.wait_for_gate(), || {}).unwrap();
         assert!(state.admit_renderer_operation_dispatched_at(during).is_err());
         assert!(state.admit_renderer_operation_dispatched_at(state.renderer_dispatch_epoch().unwrap()).is_ok());
         assert!(state.admit_renderer_operation().is_ok());
@@ -3410,9 +3455,7 @@ mod tests {
         assert!(state.store.lock().unwrap().is_none());
         assert!(state.admit_renderer_operation().is_err());
         assert!(state.acquire_device_maintenance().is_err());
-        state
-            .reset_renderer_session()
-            .expect("active maintenance already owns renderer cleanup");
+        let reset = reset_after_maintenance(state.begin_renderer_reset());
         assert!(open_renderer_persistent_store(&state, directory.path()).is_err());
         assert!(
             with_store_mutex(&state, |store| {
@@ -3430,6 +3473,7 @@ mod tests {
             .unwrap();
         drop(native);
         drop(maintenance);
+        state.finish_renderer_reset(reset.wait_for_gate(), || {}).unwrap();
         open_renderer_persistent_store(&state, directory.path()).unwrap();
         assert_eq!(
             with_store_mutex(&state, |store| store
@@ -3653,7 +3697,14 @@ mod tests {
     fn reset_started(reset: StoreResult<RendererReset>) -> DeviceMaintenanceGuard {
         match reset.unwrap() {
             RendererReset::Started(maintenance) => maintenance,
-            RendererReset::Pending | RendererReset::Skipped => panic!("another reset or maintenance holds the gate"),
+            RendererReset::Pending | RendererReset::AfterMaintenance(_) => panic!("another reset or maintenance holds the gate"),
+        }
+    }
+
+    fn reset_after_maintenance(reset: StoreResult<RendererReset>) -> ResetAfterMaintenance {
+        match reset.unwrap() {
+            RendererReset::AfterMaintenance(reset) => reset,
+            RendererReset::Pending | RendererReset::Started(_) => panic!("no other maintenance holds the gate"),
         }
     }
 
@@ -3722,6 +3773,64 @@ mod tests {
     }
 
     #[test]
+    fn a_page_start_during_other_maintenance_resets_when_that_maintenance_ends() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(PersistentStoreState::default());
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let lease = with_store_mutex_mut(&state, |store| store.acquire_revision(0)).unwrap();
+        let outgoing = state.admit_renderer_operation().unwrap();
+        let capturer = Arc::clone(&state);
+        let capture = std::thread::spawn(move || capturer.acquire_raw_capture().unwrap());
+        // The page starts while the capture waits for the outgoing document.
+        while !state.maintenance_active() {
+            std::thread::yield_now();
+        }
+        let reset = reset_after_maintenance(state.begin_renderer_reset());
+        assert!(matches!(state.begin_renderer_reset().unwrap(), RendererReset::Pending));
+
+        let (drained, after_drain) = mpsc::channel();
+        let finisher = Arc::clone(&state);
+        let observer = Arc::clone(&state);
+        let finish = std::thread::spawn(move || {
+            finisher.finish_renderer_reset(reset.wait_for_gate(), move || {
+                let operations = observer.renderer_gate.state.lock().unwrap().operations;
+                let leases = lock_store(&observer.store).unwrap().as_ref().unwrap().revision_leases.len();
+                drained.send((operations, leases, observer.maintenance_active())).unwrap();
+            })
+        });
+        drop(outgoing);
+        let capture = capture.join().unwrap();
+        assert!(after_drain.recv_timeout(Duration::from_millis(100)).is_err(), "the reset ran during the capture");
+        drop(capture);
+        assert_eq!(
+            after_drain.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (0, 0, true),
+            "the reset releases the leases before new operations are admitted"
+        );
+        finish.join().unwrap().unwrap();
+        state.admit_renderer_operation().unwrap();
+        with_store_mutex(&state, |store| {
+            assert!(matches!(store.read_root(Some(&lease.lease)), Err(StoreError::SnapshotReleased)));
+            Ok(())
+        })
+        .unwrap();
+
+        // A reset dropped before or after its maintenance ends leaves admission open.
+        let capture = state.acquire_raw_capture().unwrap();
+        drop(reset_after_maintenance(state.begin_renderer_reset()));
+        drop(capture);
+        assert!(state.try_admit_renderer_operation().unwrap().is_some());
+        let capture = state.acquire_raw_capture().unwrap();
+        let reset = reset_after_maintenance(state.begin_renderer_reset());
+        drop(capture);
+        drop(reset);
+        assert!(state.try_admit_renderer_operation().unwrap().is_some());
+    }
+
+    #[test]
     fn a_wait_for_a_page_reset_ends_in_refusal_after_a_later_start_or_the_wait_limit() {
         use std::time::Duration;
 
@@ -3745,9 +3854,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .expect("maintenance waits for a page reset instead of failing");
-        let capture = state.acquire_raw_capture().unwrap();
-        assert!(matches!(state.begin_renderer_reset().unwrap(), RendererReset::Skipped));
-        drop(capture);
         state.admit_renderer_operation().unwrap();
 
         let limited = PersistentStoreState {

@@ -330,6 +330,7 @@ fn ipc_read_guard_script() -> String {
 /// starts arrive on the main thread, so the persistent store waits for the
 /// outgoing document's operations elsewhere and holds new ones until then.
 fn reset_renderer_sessions<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use persistent_store::commands::RendererReset;
     let persistent_reset = app
         .try_state::<persistent_store::PersistentStoreState>()
         .and_then(|state| match state.begin_renderer_reset() {
@@ -350,17 +351,24 @@ fn reset_renderer_sessions<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             );
         }
     }
-    let maintenance = match persistent_reset {
-        Some(persistent_store::commands::RendererReset::Started(maintenance)) => maintenance,
+    let reset = match persistent_reset {
         // The earlier start's reset clears these sessions once its document's operations end.
-        Some(persistent_store::commands::RendererReset::Pending) => return,
-        Some(persistent_store::commands::RendererReset::Skipped) | None => {
+        Some(RendererReset::Pending) => return,
+        Some(reset) => reset,
+        None => {
             reset_admitted_sessions(app);
             return;
         }
     };
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let maintenance = match reset {
+            RendererReset::Started(maintenance) => maintenance,
+            // Other maintenance may still wait for the outgoing document's
+            // operations, so the reset starts when that maintenance ends.
+            RendererReset::AfterMaintenance(reset) => reset.wait_for_gate(),
+            RendererReset::Pending => return,
+        };
         let state = app.state::<persistent_store::PersistentStoreState>();
         // The outgoing document's operations may still open these sessions, so
         // they are cleared after those operations end and before the new
@@ -1319,12 +1327,33 @@ mod header_map_tests {
         // Admitted before the page started, the outgoing upload registers after it.
         let filled = std::iter::from_fn(|| media.open_input_upload(directory.path()).ok()).count();
         assert!(filled > 0);
+        // Another start leaves the uploads to the pending reset while the operation runs.
+        reset_renderer_sessions(app.handle());
+        assert!(media.open_input_upload(directory.path()).is_err(), "a second start freed the running operation's uploads");
         drop(outgoing);
 
         // Admission reopens once the reset has finished.
         drop(persistent.admit_renderer_operation().unwrap());
         for _ in 0..filled {
             media.open_input_upload(directory.path()).expect("the new document gets every upload slot");
+        }
+
+        // The next page starts while a capture waits for this document, which
+        // keeps opening uploads until its operation ends.
+        let outgoing = persistent.admit_renderer_operation().unwrap();
+        std::thread::scope(|scope| {
+            let capture = scope.spawn(|| persistent.acquire_raw_capture().unwrap());
+            while !persistent.maintenance_active() {
+                std::thread::yield_now();
+            }
+            reset_renderer_sessions(app.handle());
+            while media.open_input_upload(directory.path()).is_ok() {}
+            drop(outgoing);
+            drop(capture.join().unwrap());
+        });
+        drop(persistent.admit_renderer_operation().unwrap());
+        for _ in 0..filled {
+            media.open_input_upload(directory.path()).expect("the new document gets every upload slot after the capture");
         }
     }
 
