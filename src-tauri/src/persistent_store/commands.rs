@@ -68,15 +68,72 @@ impl Drop for ArchiveOperationGuard<'_> {
     }
 }
 
-#[derive(Default)]
+/// How long an operation waits for a page reset before it is refused like any
+/// other maintenance, so a wait that the reset itself depends on still ends.
+const RENDERER_RESET_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(test)]
+thread_local! {
+    /// Runs while the gate is still locked, just before this thread waits out a page reset.
+    static RESET_WAIT_ENTERED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 struct RendererGate {
     state: Mutex<RendererGateState>,
     drained: Condvar,
+    /// Wakes operations that wait out a page reset.
+    reopened: Condvar,
+    reset_wait: std::time::Duration,
+}
+
+impl Default for RendererGate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            drained: Condvar::new(),
+            reopened: Condvar::new(),
+            reset_wait: RENDERER_RESET_WAIT,
+        }
+    }
+}
+
+impl RendererGate {
+    /// Waits, without occupying an async worker, until a page reset ends or `deadline` passes.
+    fn wait_out_reset<'a>(
+        &'a self,
+        state: std::sync::MutexGuard<'a, RendererGateState>,
+        deadline: std::time::Instant,
+    ) -> StoreResult<std::sync::MutexGuard<'a, RendererGateState>> {
+        if !state.resetting {
+            return Ok(state);
+        }
+        #[cfg(test)]
+        RESET_WAIT_ENTERED.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+        crate::async_worker::blocking(|| {
+            let mut state = state;
+            while state.resetting {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                state = self
+                    .reopened
+                    .wait_timeout(state, remaining)
+                    .map_err(|error| StoreError::Store {
+                        message: format!("persistent renderer reset mutex poisoned: {error}"),
+                    })?
+                    .0;
+            }
+            Ok(state)
+        })
+    }
 }
 
 #[derive(Default)]
 struct RendererGateState {
     maintenance_active: bool,
+    /// The maintenance is a page reset, which operations wait out instead of failing.
+    resetting: bool,
     operations: usize,
     /// Advances whenever renderer maintenance starts.
     epoch: u64,
@@ -123,11 +180,14 @@ pub(crate) struct DeviceMaintenanceGuard {
 
 impl Drop for DeviceMaintenanceGuard {
     fn drop(&mut self) {
-        self.gate
+        let mut state = self
+            .gate
             .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .maintenance_active = false;
+            .unwrap_or_else(|error| error.into_inner());
+        state.maintenance_active = false;
+        state.resetting = false;
+        self.gate.reopened.notify_all();
     }
 }
 
@@ -191,8 +251,9 @@ impl PersistentStoreState {
             .is_ok_and(|state| state.maintenance_active)
     }
 
+    /// Admits an operation, waiting out a page reset of the main document.
     pub(crate) fn admit_renderer_operation(&self) -> StoreResult<RendererOperationGuard> {
-        self.try_admit_renderer_operation()?
+        self.try_admit_renderer_operation_at(None, true)?
             .ok_or_else(renderer_gate_error)
     }
 
@@ -222,16 +283,20 @@ impl PersistentStoreState {
     /// Admits an operation dispatched at `epoch` only if no renderer maintenance
     /// or reset has started since, so a request queued before it never runs after it.
     pub(crate) fn admit_renderer_operation_dispatched_at(&self, epoch: u64) -> StoreResult<RendererOperationGuard> {
-        self.try_admit_renderer_operation_at(Some(epoch))?
+        self.try_admit_renderer_operation_at(Some(epoch), true)?
             .ok_or_else(renderer_gate_error)
     }
 
-    /// Admits an operation unless device maintenance holds the gate.
+    /// Admits an operation unless maintenance or a page reset holds the gate, without waiting.
     fn try_admit_renderer_operation(&self) -> StoreResult<Option<RendererOperationGuard>> {
-        self.try_admit_renderer_operation_at(None)
+        self.try_admit_renderer_operation_at(None, false)
     }
 
-    fn try_admit_renderer_operation_at(&self, dispatched: Option<u64>) -> StoreResult<Option<RendererOperationGuard>> {
+    fn try_admit_renderer_operation_at(
+        &self,
+        dispatched: Option<u64>,
+        wait_for_reset: bool,
+    ) -> StoreResult<Option<RendererOperationGuard>> {
         let mut state = self
             .renderer_gate
             .state
@@ -239,6 +304,15 @@ impl PersistentStoreState {
             .map_err(|error| StoreError::Store {
                 message: format!("persistent renderer admission mutex poisoned: {error}"),
             })?;
+        if wait_for_reset && state.resetting && dispatched.is_none_or(|epoch| epoch == state.epoch) {
+            let entered = state.epoch;
+            let deadline = std::time::Instant::now() + self.renderer_gate.reset_wait;
+            state = self.renderer_gate.wait_out_reset(state, deadline)?;
+            // A later page start or maintenance refuses what waited for this reset.
+            if state.epoch != entered {
+                return Ok(None);
+            }
+        }
         if state.maintenance_active || dispatched.is_some_and(|epoch| epoch != state.epoch) {
             return Ok(None);
         }
@@ -271,7 +345,8 @@ impl PersistentStoreState {
 
     pub(crate) fn acquire_cleanup_maintenance(&self, timeout: std::time::Duration) -> StoreResult<DeviceMaintenanceGuard> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut state = self.renderer_gate.state.lock().map_err(|_| renderer_gate_error())?;
+        let state = self.renderer_gate.state.lock().map_err(|_| renderer_gate_error())?;
+        let mut state = self.renderer_gate.wait_out_reset(state, deadline)?;
         if state.maintenance_active { return Err(renderer_gate_error()); }
         state.epoch += 1;
         state.begin_maintenance();
@@ -319,15 +394,15 @@ impl PersistentStoreState {
     }
 
     fn try_acquire_renderer_maintenance(&self) -> StoreResult<Option<DeviceMaintenanceGuard>> {
-        let mut state = self
+        let state = self
             .renderer_gate
             .state
             .lock()
             .map_err(|error| StoreError::Store {
                 message: format!("persistent renderer admission mutex poisoned: {error}"),
             })?;
-        // Advanced even when maintenance is already active, so a page reset
-        // then still refuses what the outgoing document dispatched.
+        let deadline = std::time::Instant::now() + self.renderer_gate.reset_wait;
+        let mut state = self.renderer_gate.wait_out_reset(state, deadline)?;
         state.epoch += 1;
         if state.maintenance_active {
             return Ok(None);
@@ -366,17 +441,81 @@ impl PersistentStoreState {
         open_persistent_store(app_data_dir, &mut store).map(|_| ())
     }
 
-    pub(crate) fn reset_renderer_session(&self) -> StoreResult<()> {
-        let Some(_maintenance) = self.try_acquire_renderer_maintenance()? else {
-            return Ok(());
-        };
-        let mut store = lock_store(&self.store).map_err(|error| StoreError::Store {
-            message: format!("persistent store mutex poisoned: {error}"),
-        })?;
-        if let Some(store) = store.as_mut() {
-            store.release_all_revision_leases()?;
+    /// Starts the reset for a new main document without waiting, since a page
+    /// start arrives on the main thread. From here the outgoing document's
+    /// dispatched operations are refused and new operations wait until
+    /// `finish_renderer_reset` drops the returned guard. Returns nothing while
+    /// other maintenance holds the gate.
+    pub(crate) fn begin_renderer_reset(&self) -> StoreResult<Option<DeviceMaintenanceGuard>> {
+        let mut state = self
+            .renderer_gate
+            .state
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent renderer admission mutex poisoned: {error}"),
+            })?;
+        // Advanced even when maintenance is already active, so the reset still
+        // refuses what the outgoing document dispatched.
+        state.epoch += 1;
+        if state.maintenance_active {
+            return Ok(None);
         }
-        Ok(())
+        state.begin_maintenance();
+        state.resetting = true;
+        Ok(Some(DeviceMaintenanceGuard {
+            gate: Arc::clone(&self.renderer_gate),
+        }))
+    }
+
+    /// Waits for the outgoing document's operations, releases its revision
+    /// leases and runs `after_drain` before new operations are admitted.
+    pub(crate) fn finish_renderer_reset(
+        &self,
+        maintenance: DeviceMaintenanceGuard,
+        after_drain: impl FnOnce(),
+    ) -> StoreResult<()> {
+        if !Arc::ptr_eq(&maintenance.gate, &self.renderer_gate) {
+            return Err(StoreError::Validation {
+                message: "renderer reset guard belongs to another persistent store".to_owned(),
+            });
+        }
+        let released = (|| {
+            let mut state = self
+                .renderer_gate
+                .state
+                .lock()
+                .map_err(|error| StoreError::Store {
+                    message: format!("persistent renderer admission mutex poisoned: {error}"),
+                })?;
+            while state.operations != 0 {
+                state = self
+                    .renderer_gate
+                    .drained
+                    .wait(state)
+                    .map_err(|error| StoreError::Store {
+                        message: format!("persistent renderer drain mutex poisoned: {error}"),
+                    })?;
+            }
+            drop(state);
+            let mut store = lock_store(&self.store).map_err(|error| StoreError::Store {
+                message: format!("persistent store mutex poisoned: {error}"),
+            })?;
+            match store.as_mut() {
+                Some(store) => store.release_all_revision_leases(),
+                None => Ok(()),
+            }
+        })();
+        after_drain();
+        drop(maintenance);
+        released
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_renderer_session(&self) -> StoreResult<()> {
+        match self.begin_renderer_reset()? {
+            Some(maintenance) => self.finish_renderer_reset(maintenance, || {}),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3496,6 +3635,112 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Spawns `operation` on a thread that reports through the returned channel
+    /// once it starts waiting out a page reset, and again with its result.
+    fn run_waiting_for_reset<T: Send + 'static>(
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Receiver<T>) {
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (sent, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            RESET_WAIT_ENTERED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || entered.send(()).unwrap()));
+            });
+            sent.send(operation()).unwrap();
+        });
+        (waiting, result)
+    }
+
+    #[test]
+    fn a_page_start_does_not_wait_for_the_outgoing_document_and_new_operations_wait_for_its_reset() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempdir().unwrap();
+        let state = Arc::new(PersistentStoreState::default());
+        open_renderer_persistent_store(&state, directory.path()).unwrap();
+        let lease = with_store_mutex_mut(&state, |store| store.acquire_revision(0)).unwrap();
+        let outgoing = state.admit_renderer_operation().unwrap();
+
+        // A page start arrives on the main thread, so it must return while the operation runs.
+        let (started, start) = mpsc::channel();
+        let starter = Arc::clone(&state);
+        std::thread::spawn(move || started.send(starter.begin_renderer_reset()).unwrap());
+        let maintenance = start
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the page start waited for an admitted operation")
+            .unwrap()
+            .expect("no other maintenance holds the gate");
+
+        let (drained, after_drain) = mpsc::channel();
+        let finisher = Arc::clone(&state);
+        let observer = Arc::clone(&state);
+        let finish = std::thread::spawn(move || {
+            finisher.finish_renderer_reset(maintenance, move || {
+                let operations = observer.renderer_gate.state.lock().unwrap().operations;
+                let leases = lock_store(&observer.store).unwrap().as_ref().unwrap().revision_leases.len();
+                drained.send((operations, leases, observer.maintenance_active())).unwrap();
+            })
+        });
+        let reader = Arc::clone(&state);
+        let (waiting, admitted) = run_waiting_for_reset(move || reader.admit_renderer_operation().map(drop));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(admitted.recv_timeout(Duration::from_millis(100)).is_err(), "a new operation ran before the reset");
+        assert!(after_drain.try_recv().is_err(), "the reset finished before the outgoing operation");
+
+        drop(outgoing);
+        assert_eq!(
+            after_drain.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (0, 0, true),
+            "the reset releases the leases before new operations are admitted"
+        );
+        admitted.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        finish.join().unwrap().unwrap();
+        with_store_mutex(&state, |store| {
+            assert!(matches!(store.read_root(Some(&lease.lease)), Err(StoreError::SnapshotReleased)));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_wait_for_a_page_reset_ends_in_refusal_after_a_later_start_or_the_wait_limit() {
+        use std::time::Duration;
+
+        let state = Arc::new(PersistentStoreState::default());
+        let maintenance = state.begin_renderer_reset().unwrap().unwrap();
+        let reader = Arc::clone(&state);
+        let (waiting, earlier) = run_waiting_for_reset(move || reader.admit_renderer_operation().map(drop));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The document that waited was replaced before the reset ended.
+        assert!(state.begin_renderer_reset().unwrap().is_none());
+        state.finish_renderer_reset(maintenance, || {}).unwrap();
+        assert!(earlier.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+
+        let maintenance = state.begin_renderer_reset().unwrap().unwrap();
+        let capturer = Arc::clone(&state);
+        let (waiting, capture) = run_waiting_for_reset(move || capturer.acquire_raw_capture().map(drop));
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        state.finish_renderer_reset(maintenance, || {}).unwrap();
+        capture
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .expect("maintenance waits for a page reset instead of failing");
+        state.admit_renderer_operation().unwrap();
+
+        let limited = PersistentStoreState {
+            renderer_gate: Arc::new(RendererGate {
+                reset_wait: Duration::from_millis(50),
+                ..RendererGate::default()
+            }),
+            ..PersistentStoreState::default()
+        };
+        let outgoing = limited.admit_renderer_operation().unwrap();
+        let _maintenance = limited.begin_renderer_reset().unwrap().unwrap();
+        assert!(limited.admit_renderer_operation().is_err(), "an operation the reset waits on must not hold it forever");
+        drop(outgoing);
     }
 
     #[test]

@@ -326,6 +326,58 @@ fn ipc_read_guard_script() -> String {
     )
 }
 
+/// Resets the per-document native state when the main document starts. Page
+/// starts arrive on the main thread, so the persistent store waits for the
+/// outgoing document's operations elsewhere and holds new ones until then.
+fn reset_renderer_sessions(webview: &tauri::Webview) {
+    let app = webview.app_handle();
+    let persistent_reset = webview
+        .try_state::<persistent_store::PersistentStoreState>()
+        .and_then(|state| match state.begin_renderer_reset() {
+            Ok(reset) => reset,
+            Err(error) => {
+                crate::nlog!("error", "failed to reset persistent renderer session: {error}");
+                None
+            }
+        });
+    if let Some(state) = webview.try_state::<native_media::ipc::NativeMediaIpcState>() {
+        if let Err(error) = state.reset_renderer_session() {
+            crate::nlog!("error", "failed to reset native media renderer session: {error}");
+        }
+    }
+    if let Some(state) = webview.try_state::<server_sync::commands::ServerSyncCommandState>() {
+        if let Err(error) = state.reset_renderer_session() {
+            crate::nlog!(
+                "error",
+                "failed to reset server sync renderer session: {}",
+                error.code
+            );
+        }
+    }
+    let Some(maintenance) = persistent_reset else {
+        reset_cas_renderer_session(app);
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<persistent_store::PersistentStoreState>();
+        // CAS journals are judged after the outgoing document's operations end
+        // and before the new document can begin its own.
+        let reset = state.finish_renderer_reset(maintenance, || reset_cas_renderer_session(&app));
+        if let Err(error) = reset {
+            crate::nlog!("error", "failed to reset persistent renderer session: {error}");
+        }
+    });
+}
+
+fn reset_cas_renderer_session(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<asset_repository::commands::DurableCasJobState>() {
+        if let Err(error) = state.reset_renderer_session(app) {
+            crate::nlog!("error", "failed to reset durable CAS renderer session: {error}");
+        }
+    }
+}
+
 /// Product initialization shared by native entry points. An alternative entry
 /// manages its own [`AppPaths`] before building.
 pub fn builder() -> tauri::Builder<tauri::Wry> {
@@ -422,47 +474,7 @@ fn builder_with_main_window(
                     && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
                 {
                     generation_diagnostics::document_started();
-                    if let Some(state) =
-                        webview.try_state::<persistent_store::PersistentStoreState>()
-                    {
-                        if let Err(error) = state.reset_renderer_session() {
-                            crate::nlog!(
-                                "error",
-                                "failed to reset persistent renderer session: {error}"
-                            );
-                        }
-                    }
-                    if let Some(state) =
-                        webview.try_state::<asset_repository::commands::DurableCasJobState>()
-                    {
-                        if let Err(error) = state.reset_renderer_session(webview.app_handle()) {
-                            crate::nlog!(
-                                "error",
-                                "failed to reset durable CAS renderer session: {error}"
-                            );
-                        }
-                    }
-                    if let Some(state) =
-                        webview.try_state::<native_media::ipc::NativeMediaIpcState>()
-                    {
-                        if let Err(error) = state.reset_renderer_session() {
-                            crate::nlog!(
-                                "error",
-                                "failed to reset native media renderer session: {error}"
-                            );
-                        }
-                    }
-                    if let Some(state) =
-                        webview.try_state::<server_sync::commands::ServerSyncCommandState>()
-                    {
-                        if let Err(error) = state.reset_renderer_session() {
-                            crate::nlog!(
-                                "error",
-                                "failed to reset server sync renderer session: {}",
-                                error.code
-                            );
-                        }
-                    }
+                    reset_renderer_sessions(webview);
                     webview
                         .state::<android_commit_transport::AndroidCommitState>()
                         .reset();
@@ -477,43 +489,7 @@ fn builder_with_main_window(
             {
                 generation_diagnostics::document_started();
                 renderer_recovery::document_started(webview.app_handle());
-                if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
-                    if let Err(error) = state.reset_renderer_session() {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset persistent renderer session: {error}"
-                        );
-                    }
-                }
-                if let Some(state) =
-                    webview.try_state::<asset_repository::commands::DurableCasJobState>()
-                {
-                    if let Err(error) = state.reset_renderer_session(webview.app_handle()) {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset durable CAS renderer session: {error}"
-                        );
-                    }
-                }
-                if let Some(state) = webview.try_state::<native_media::ipc::NativeMediaIpcState>() {
-                    if let Err(error) = state.reset_renderer_session() {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset native media renderer session: {error}"
-                        );
-                    }
-                }
-                if let Some(state) =
-                    webview.try_state::<server_sync::commands::ServerSyncCommandState>()
-                {
-                    if let Err(error) = state.reset_renderer_session() {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset server sync renderer session: {}",
-                            error.code
-                        );
-                    }
-                }
+                reset_renderer_sessions(webview);
                 let _ = webview.with_webview(|_| persistent_commit_transport::reset());
             }
         });
@@ -532,43 +508,7 @@ fn builder_with_main_window(
                 macos_lifecycle::document_started(webview.app_handle());
                 #[cfg(target_os = "linux")]
                 renderer_recovery::document_started(webview.app_handle());
-                if let Some(state) = webview.try_state::<persistent_store::PersistentStoreState>() {
-                    if let Err(error) = state.reset_renderer_session() {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset persistent renderer session: {error}"
-                        );
-                    }
-                }
-                if let Some(state) =
-                    webview.try_state::<asset_repository::commands::DurableCasJobState>()
-                {
-                    if let Err(error) = state.reset_renderer_session(webview.app_handle()) {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset durable CAS renderer session: {error}"
-                        );
-                    }
-                }
-                if let Some(state) = webview.try_state::<native_media::ipc::NativeMediaIpcState>() {
-                    if let Err(error) = state.reset_renderer_session() {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset native media renderer session: {error}"
-                        );
-                    }
-                }
-                if let Some(state) =
-                    webview.try_state::<server_sync::commands::ServerSyncCommandState>()
-                {
-                    if let Err(error) = state.reset_renderer_session() {
-                        crate::nlog!(
-                            "error",
-                            "failed to reset server sync renderer session: {}",
-                            error.code
-                        );
-                    }
-                }
+                reset_renderer_sessions(webview);
             }
         });
     }
