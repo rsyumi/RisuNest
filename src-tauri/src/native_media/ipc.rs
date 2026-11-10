@@ -491,6 +491,17 @@ impl NativeMediaIpcState {
             .reset_renderer_session();
         Ok(())
     }
+
+    /// Opens a streamed input upload the way `native_media_inlay_input_open` does.
+    #[cfg(test)]
+    pub(crate) fn open_input_upload(&self, directory: &std::path::Path) -> Result<(), String> {
+        let file = tempfile::NamedTempFile::new_in(directory).map_err(|error| error.to_string())?;
+        self.pool.lock().unwrap().open(
+            uuid::Uuid::new_v4().to_string(),
+            NATIVE_MEDIA_IPC_CHUNK_BYTES as u64 + 1,
+            file,
+        )
+    }
 }
 
 fn read_processing_input(mut input: ProcessingInput) -> Result<(ProcessingInput, Vec<u8>), String> {
