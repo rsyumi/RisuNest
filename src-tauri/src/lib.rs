@@ -334,7 +334,7 @@ fn reset_renderer_sessions(webview: &tauri::Webview) {
     let persistent_reset = webview
         .try_state::<persistent_store::PersistentStoreState>()
         .and_then(|state| match state.begin_renderer_reset() {
-            Ok(reset) => reset,
+            Ok(reset) => Some(reset),
             Err(error) => {
                 crate::nlog!("error", "failed to reset persistent renderer session: {error}");
                 None
@@ -354,9 +354,14 @@ fn reset_renderer_sessions(webview: &tauri::Webview) {
             );
         }
     }
-    let Some(maintenance) = persistent_reset else {
-        reset_cas_renderer_session(app);
-        return;
+    let maintenance = match persistent_reset {
+        Some(persistent_store::commands::RendererReset::Started(maintenance)) => maintenance,
+        // The earlier start's reset judges the CAS journals once its document's operations end.
+        Some(persistent_store::commands::RendererReset::Pending) => return,
+        Some(persistent_store::commands::RendererReset::Skipped) | None => {
+            reset_cas_renderer_session(app);
+            return;
+        }
     };
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {

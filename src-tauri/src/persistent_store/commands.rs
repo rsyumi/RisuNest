@@ -444,9 +444,8 @@ impl PersistentStoreState {
     /// Starts the reset for a new main document without waiting, since a page
     /// start arrives on the main thread. From here the outgoing document's
     /// dispatched operations are refused and new operations wait until
-    /// `finish_renderer_reset` drops the returned guard. Returns nothing while
-    /// other maintenance holds the gate.
-    pub(crate) fn begin_renderer_reset(&self) -> StoreResult<Option<DeviceMaintenanceGuard>> {
+    /// `finish_renderer_reset` drops the returned guard.
+    pub(crate) fn begin_renderer_reset(&self) -> StoreResult<RendererReset> {
         let mut state = self
             .renderer_gate
             .state
@@ -457,12 +456,15 @@ impl PersistentStoreState {
         // Advanced even when maintenance is already active, so the reset still
         // refuses what the outgoing document dispatched.
         state.epoch += 1;
+        if state.resetting {
+            return Ok(RendererReset::Pending);
+        }
         if state.maintenance_active {
-            return Ok(None);
+            return Ok(RendererReset::Skipped);
         }
         state.begin_maintenance();
         state.resetting = true;
-        Ok(Some(DeviceMaintenanceGuard {
+        Ok(RendererReset::Started(DeviceMaintenanceGuard {
             gate: Arc::clone(&self.renderer_gate),
         }))
     }
@@ -513,10 +515,21 @@ impl PersistentStoreState {
     #[cfg(test)]
     pub(crate) fn reset_renderer_session(&self) -> StoreResult<()> {
         match self.begin_renderer_reset()? {
-            Some(maintenance) => self.finish_renderer_reset(maintenance, || {}),
-            None => Ok(()),
+            RendererReset::Started(maintenance) => self.finish_renderer_reset(maintenance, || {}),
+            RendererReset::Pending | RendererReset::Skipped => Ok(()),
         }
     }
+}
+
+/// What a page start did to renderer admission.
+pub(crate) enum RendererReset {
+    /// This start closed admission; `finish_renderer_reset` reopens it.
+    Started(DeviceMaintenanceGuard),
+    /// An earlier start's reset is still waiting for its document's operations
+    /// and covers this start too.
+    Pending,
+    /// Other maintenance holds admission.
+    Skipped,
 }
 
 impl Default for PersistentStoreState {
@@ -3637,6 +3650,13 @@ mod tests {
         .unwrap();
     }
 
+    fn reset_started(reset: StoreResult<RendererReset>) -> DeviceMaintenanceGuard {
+        match reset.unwrap() {
+            RendererReset::Started(maintenance) => maintenance,
+            RendererReset::Pending | RendererReset::Skipped => panic!("another reset or maintenance holds the gate"),
+        }
+    }
+
     /// Spawns `operation` on a thread that reports through the returned channel
     /// once it starts waiting out a page reset, and again with its result.
     fn run_waiting_for_reset<T: Send + 'static>(
@@ -3668,11 +3688,7 @@ mod tests {
         let (started, start) = mpsc::channel();
         let starter = Arc::clone(&state);
         std::thread::spawn(move || started.send(starter.begin_renderer_reset()).unwrap());
-        let maintenance = start
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the page start waited for an admitted operation")
-            .unwrap()
-            .expect("no other maintenance holds the gate");
+        let maintenance = reset_started(start.recv_timeout(Duration::from_secs(5)).expect("the page start waited for an admitted operation"));
 
         let (drained, after_drain) = mpsc::channel();
         let finisher = Arc::clone(&state);
@@ -3710,16 +3726,17 @@ mod tests {
         use std::time::Duration;
 
         let state = Arc::new(PersistentStoreState::default());
-        let maintenance = state.begin_renderer_reset().unwrap().unwrap();
+        let maintenance = reset_started(state.begin_renderer_reset());
         let reader = Arc::clone(&state);
         let (waiting, earlier) = run_waiting_for_reset(move || reader.admit_renderer_operation().map(drop));
         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-        // The document that waited was replaced before the reset ended.
-        assert!(state.begin_renderer_reset().unwrap().is_none());
+        // The document that waited was replaced before the reset ended. The
+        // pending reset judges the CAS journals for both starts.
+        assert!(matches!(state.begin_renderer_reset().unwrap(), RendererReset::Pending));
         state.finish_renderer_reset(maintenance, || {}).unwrap();
         assert!(earlier.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
 
-        let maintenance = state.begin_renderer_reset().unwrap().unwrap();
+        let maintenance = reset_started(state.begin_renderer_reset());
         let capturer = Arc::clone(&state);
         let (waiting, capture) = run_waiting_for_reset(move || capturer.acquire_raw_capture().map(drop));
         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -3728,6 +3745,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .expect("maintenance waits for a page reset instead of failing");
+        let capture = state.acquire_raw_capture().unwrap();
+        assert!(matches!(state.begin_renderer_reset().unwrap(), RendererReset::Skipped));
+        drop(capture);
         state.admit_renderer_operation().unwrap();
 
         let limited = PersistentStoreState {
@@ -3738,7 +3758,7 @@ mod tests {
             ..PersistentStoreState::default()
         };
         let outgoing = limited.admit_renderer_operation().unwrap();
-        let _maintenance = limited.begin_renderer_reset().unwrap().unwrap();
+        let _maintenance = reset_started(limited.begin_renderer_reset());
         assert!(limited.admit_renderer_operation().is_err(), "an operation the reset waits on must not hold it forever");
         drop(outgoing);
     }
