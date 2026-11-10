@@ -4394,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "risunest"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "aes",
  "async-trait",
@@ -4566,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "risunest-sync-server"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "async-trait",
  "axum",
