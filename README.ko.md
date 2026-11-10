@@ -84,16 +84,16 @@ RisuNest Sync는 여러 기기가 같은 라이브러리를 공유하도록 돕�
 ### 다운로드
 
 <!-- release-downloads:sync:start -->
-[RisuNest Sync v1.1.1](https://github.com/rsyumi/RisuNest/releases/tag/sync-v1.1.1)을 다운로드할 수 있습니다. Sync는 앱과 별도로 릴리스됩니다.
+[RisuNest Sync v1.1.2](https://github.com/rsyumi/RisuNest/releases/tag/sync-v1.1.2)을 다운로드할 수 있습니다. Sync는 앱과 별도로 릴리스됩니다.
 
 | 플랫폼 | aarch64 (arm64) | x86_64 (x64) |
 | --- | --- | --- |
-| Windows | [EXE](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-managed-windows-aarch64-setup.exe) | [EXE](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-managed-windows-x86_64-setup.exe) |
-| macOS | [DMG](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-managed-darwin-aarch64.dmg) | [DMG](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-managed-darwin-x86_64.dmg) |
-| Linux | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-managed-linux-aarch64.tar.gz) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-managed-linux-x86_64.tar.gz) |
-| Windows (raw) | [ZIP](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-raw-windows-aarch64.zip) | [ZIP](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-raw-windows-x86_64.zip) |
-| macOS (raw) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-raw-darwin-aarch64.tar.gz) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-raw-darwin-x86_64.tar.gz) |
-| Linux (raw) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-raw-linux-aarch64.tar.gz) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.1/RisuNest-Sync-1.1.1-raw-linux-x86_64.tar.gz) |
+| Windows | [EXE](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-managed-windows-aarch64-setup.exe) | [EXE](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-managed-windows-x86_64-setup.exe) |
+| macOS | [DMG](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-managed-darwin-aarch64.dmg) | [DMG](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-managed-darwin-x86_64.dmg) |
+| Linux | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-managed-linux-aarch64.tar.gz) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-managed-linux-x86_64.tar.gz) |
+| Windows (raw) | [ZIP](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-raw-windows-aarch64.zip) | [ZIP](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-raw-windows-x86_64.zip) |
+| macOS (raw) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-raw-darwin-aarch64.tar.gz) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-raw-darwin-x86_64.tar.gz) |
+| Linux (raw) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-raw-linux-aarch64.tar.gz) | [TAR.GZ](https://github.com/rsyumi/RisuNest/releases/download/sync-v1.1.2/RisuNest-Sync-1.1.2-raw-linux-x86_64.tar.gz) |
 <!-- release-downloads:sync:end -->
 
 - `managed`는 권장 배포판이며, Sync 서버와 관리 GUI(Windows·macOS) 또는 `risunest-sync-manager` CLI/TUI(Linux), 업데이트 확인, `cloudflared`를 한 패키지로 담고 있습니다.
