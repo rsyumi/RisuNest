@@ -28,6 +28,28 @@ pub(super) struct Metadata {
     pub roots: AssetRootSet,
 }
 
+/// `Metadata` without its asset roots, which grow with the library and which
+/// a listing never reads. The insert validated them under the same checksum.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListedMetadata {
+    id: String,
+    reason: String,
+    revision: i64,
+    bytes: u64,
+    created_at: u64,
+    file_hash: Vec<u8>,
+    #[serde(rename = "roots")]
+    _roots: serde::de::IgnoredAny,
+}
+
+fn validate_metadata_fields(id: &str, stored_id: &str, bytes: u64, file_hash: &[u8], revision: i64) -> StoreResult<()> {
+    if stored_id != id || bytes == 0 || file_hash.len() != 32 || revision < 0 {
+        return Err(invalid("invalid snapshot metadata"));
+    }
+    Ok(())
+}
+
 pub(super) struct Archive {
     connection: Connection,
     directory: PathBuf,
@@ -205,7 +227,8 @@ impl Archive {
         Ok(metadata)
     }
 
-    pub fn metadata(&self, id: &str) -> StoreResult<Metadata> {
+    /// The stored metadata of `id` after its checksum is verified.
+    fn verified_metadata<T: serde::de::DeserializeOwned>(&self, id: &str) -> StoreResult<T> {
         validate_id(id)?;
         let encoded = self
             .connection
@@ -219,14 +242,12 @@ impl Archive {
         if Sha256::digest(&encoded.0).as_slice() != encoded.1 {
             return Err(invalid("snapshot metadata checksum mismatch"));
         }
-        let metadata: Metadata = serde_json::from_slice(&encoded.0)?;
-        if metadata.id != id
-            || metadata.bytes == 0
-            || metadata.file_hash.len() != 32
-            || metadata.revision < 0
-        {
-            return Err(invalid("invalid snapshot metadata"));
-        }
+        Ok(serde_json::from_slice(&encoded.0)?)
+    }
+
+    pub fn metadata(&self, id: &str) -> StoreResult<Metadata> {
+        let metadata: Metadata = self.verified_metadata(id)?;
+        validate_metadata_fields(id, &metadata.id, metadata.bytes, &metadata.file_hash, metadata.revision)?;
         validate_root_set(&metadata.roots)?;
         Ok(metadata)
     }
@@ -238,7 +259,8 @@ impl Archive {
             .collect::<Result<Vec<_>, _>>()?;
         let mut result = Vec::with_capacity(ids.len());
         for id in ids {
-            let metadata = self.metadata(&id)?;
+            let metadata: ListedMetadata = self.verified_metadata(&id)?;
+            validate_metadata_fields(&id, &metadata.id, metadata.bytes, &metadata.file_hash, metadata.revision)?;
             result.push(SnapshotInfo {
                 id,
                 bytes: metadata.bytes,
