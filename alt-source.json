@@ -23,6 +23,16 @@
       },
       "versions": [
         {
+          "version": "1.4.0",
+          "buildVersion": "1.4.0",
+          "date": "2026-11-10T19:17:21Z",
+          "localizedDescription": "### New Features\n\n- Added a sidebar module menu and redesigned the module activation UI.\n\n### Improvements\n\n- Allowed importing several characters or modules at once.\n- Allowed turning off automatic snapshots and limiting how many are kept.\n- Improved the error log screen and added saving the whole log.\n- Added Data check repairs for the first preset or persona and module IDs.\n- Unused data is now cleaned up sooner.\n- Backup, export, and error log file names now use local time.\n- Failed RisuAI/PocketRisu compatible exports now name the cause.\n- Backup restore confirmation now lists attachment references without files.\n- Improved secondary text readability on RisuNest screens.\n- Improved storage screen loading, restore, import, and storage performance.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed startup dialogs appearing before the app lock screen.\n- Fixed the reset and backup restore screens hidden behind the logo on iOS and macOS.\n- Fixed some chat message links reloading the app.\n- Fixed the persona prompt not being sent correctly with Bind Persona.\n- Fixed saves occasionally failing in chats using chat variables.\n- Fixed an error when stopping a Google or OpenAI response.\n- Fixed unused file cleanup deleting images used in archived characters' chats.\n- Fixed other operations stalling during snapshot work.\n- Fixed RisuAI/PocketRisu compatible exports failing with some settings.\n- Fixed some lorebook entries causing errors in the editor or the prompt.\n- Fixed notifications not being allowed from the iOS Platform page.\n- Fixed a debugging feature using extra memory on iOS.\n- Fixed the app possibly being force-closed on iOS when reloading.\n- Fixed UI issues in the pop-up editor.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.4.0/RisuNest-1.4.0-ios-aarch64-unsigned.ipa",
+          "size": 79003861,
+          "sha256": "68b9155d19e9af303df68491161c64dc2621dea37d5323bb8ddeb35e1e490c23",
+          "minOSVersion": "16.4"
+        },
+        {
           "version": "1.3.0",
           "buildVersion": "1.3.0",
           "date": "2026-11-05T20:40:16Z",
@@ -83,11 +93,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.3.0",
-      "versionDate": "2026-11-05T20:40:16Z",
-      "versionDescription": "### New Features\n\n- Applied RisuAI v2026.10.292 changes.\n- Added database compaction (reclaims unused SQLite space).\n\n### Improvements\n\n- Changed module imports to leave out MCP settings.\n- Allowed plugins to replace other plugins after user confirmation.\n- Changed startup text to appear in the device language.\n- Allowed plugins to convert to WebP even in environments that do not support WebP conversion.\n- Improved restore and storage performance.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed some API requests, such as Anthropic, being rejected.\n- Fixed responses, Lua buttons, and similar work stopping after leaving the app on Android.\n- Fixed Google Translate failing with error 429 in some environments.\n- Fixed storage growing continuously when plugins repeatedly saved large data.\n- Fixed permanent character deletion failing or being reported as failed.\n- Fixed RisuAI/PocketRisu compatible exports failing with some settings.\n- Fixed some RisuAI modules failing to import.\n- Fixed lorebooks and persona descriptions loaded from Lua not reflecting changed variables.\n- Fixed Data check failing to fix some issues.\n- Fixed the code block menu being hidden behind pop-up windows.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.3.0/RisuNest-1.3.0-ios-aarch64-unsigned.ipa",
-      "size": 78597800
+      "version": "1.4.0",
+      "versionDate": "2026-11-10T19:17:21Z",
+      "versionDescription": "### New Features\n\n- Added a sidebar module menu and redesigned the module activation UI.\n\n### Improvements\n\n- Allowed importing several characters or modules at once.\n- Allowed turning off automatic snapshots and limiting how many are kept.\n- Improved the error log screen and added saving the whole log.\n- Added Data check repairs for the first preset or persona and module IDs.\n- Unused data is now cleaned up sooner.\n- Backup, export, and error log file names now use local time.\n- Failed RisuAI/PocketRisu compatible exports now name the cause.\n- Backup restore confirmation now lists attachment references without files.\n- Improved secondary text readability on RisuNest screens.\n- Improved storage screen loading, restore, import, and storage performance.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed startup dialogs appearing before the app lock screen.\n- Fixed the reset and backup restore screens hidden behind the logo on iOS and macOS.\n- Fixed some chat message links reloading the app.\n- Fixed the persona prompt not being sent correctly with Bind Persona.\n- Fixed saves occasionally failing in chats using chat variables.\n- Fixed an error when stopping a Google or OpenAI response.\n- Fixed unused file cleanup deleting images used in archived characters' chats.\n- Fixed other operations stalling during snapshot work.\n- Fixed RisuAI/PocketRisu compatible exports failing with some settings.\n- Fixed some lorebook entries causing errors in the editor or the prompt.\n- Fixed notifications not being allowed from the iOS Platform page.\n- Fixed a debugging feature using extra memory on iOS.\n- Fixed the app possibly being force-closed on iOS when reloading.\n- Fixed UI issues in the pop-up editor.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.4.0/RisuNest-1.4.0-ios-aarch64-unsigned.ipa",
+      "size": 79003861
     }
   ],
   "news": []
