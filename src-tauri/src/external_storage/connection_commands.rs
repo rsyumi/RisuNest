@@ -609,21 +609,25 @@ fn validate_authenticated_account(
 }
 
 async fn exchange_oauth_credential(
+    root: &std::path::Path,
     dependencies: &Dependencies,
     exchange_config: &super::contract::ConnectionConfig,
     grant: &super::auth::AuthorizationCode,
     client_secret: Option<Zeroizing<String>>,
-    replaced: Option<&SecretRef>,
+    renewal: Option<&str>,
     cancel: &Cancellation,
 ) -> Result<BoundCredential> {
     match exchange_config.provider.as_str() {
         "google_drive" => {
+            let replaced = renewal
+                .and_then(|connection_id| ConnectionStore::open(root).and_then(|store| store.read(connection_id)).ok())
+                .map(|stored| SecretRef(stored.credential_ref));
             let authorized = providers::google_drive::auth::exchange_authorization_code(
                 dependencies,
                 exchange_config,
                 grant,
                 client_secret,
-                replaced,
+                replaced.as_ref(),
                 cancel,
             )
             .await?;
@@ -663,15 +667,13 @@ async fn finish_oauth_connection(
 ) -> ConnectResult<CompleteAuthorizationResult> {
     let root = connection_root(app)?;
     let dependencies = connection::dependencies(&root)?;
-    let replaced = pending.renewal.as_deref()
-        .and_then(|connection_id| ConnectionStore::open(&root).and_then(|store| store.read(connection_id)).ok())
-        .map(|stored| SecretRef(stored.credential_ref));
     let credential = match exchange_oauth_credential(
+        &root,
         &dependencies,
         &exchange_config,
         &grant,
         client_secret,
-        replaced.as_ref(),
+        pending.renewal.as_deref(),
         cancel,
     )
     .await
@@ -3329,6 +3331,50 @@ mod tests {
             assert!(success.recovery.is_none());
             assert!(vault.contents("old").is_none());
             assert_eq!(vault.contents(&replacement.0).unwrap(), b"replacement");
+        });
+    }
+
+    #[test]
+    fn a_google_renewal_reuses_the_client_secret_saved_with_the_renewed_connection() {
+        use super::super::{auth::AuthorizationCode, fake::{loopback_dependencies, MemoryVault}, wire_fixture::{Reply, WireServer}};
+        let json = |body: serde_json::Value| Reply::Http {
+            status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: serde_json::to_vec(&body).unwrap(),
+        };
+        let client = "123-current.apps.googleusercontent.com";
+        let mut replies = vec![json(serde_json::json!({"access_token": "granted-access", "refresh_token": "granted-refresh", "expires_in": 3599}))];
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            replies.push(json(serde_json::json!({"aud": client, "azp": client, "scope": "https://www.googleapis.com/auth/drive.file"})));
+        }
+        replies.push(json(serde_json::json!({"user": {"permissionId": "permission-1"}})));
+        let server = WireServer::start(replies);
+        let root = tempfile::tempdir().unwrap();
+        let mut stored = renewal_fixture();
+        stored.config = super::super::contract::ConnectionConfig {
+            provider: "google_drive".into(), profile: None, endpoint: server.url.to_string(), account_id: "permission-1".into(),
+            location: BTreeMap::from([("folderId".into(), "folder-root".into())]),
+            oauth_profile: Some(super::super::contract::OAuthProfile {
+                project_id: "project".into(), platform_client_ids: BTreeMap::from([(platform_key().into(), client.into())]),
+            }),
+        };
+        ConnectionStore::open(root.path()).unwrap().insert(&stored).unwrap();
+        let dependencies = loopback_dependencies(
+            MemoryVault::with(&stored.credential_ref, br#"{"refreshToken":"expired-refresh","clientSecret":"saved-client-secret"}"#),
+            1_700_000_000_000,
+        ).dependencies;
+        let grant = AuthorizationCode {
+            code: SecretBytes(Zeroizing::new(b"synthetic-code".to_vec())),
+            verifier: SecretBytes(Zeroizing::new(b"synthetic-verifier".to_vec())),
+            client_id: client.into(),
+            redirect_url: url::Url::parse("http://127.0.0.1:52001/oauth").unwrap(),
+            picked_file_id: None,
+        };
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let credential = exchange_oauth_credential(root.path(), &dependencies, &stored.config, &grant, None,
+                Some(&stored.id), &Cancellation::default()).await.unwrap();
+            let body = String::from_utf8(server.requests.lock().unwrap()[0].body.clone()).unwrap();
+            assert!(body.contains("client_secret=saved-client-secret"), "{body}");
+            let saved = dependencies.vault.read(&credential.reference).await.unwrap();
+            assert!(String::from_utf8(saved.0.to_vec()).unwrap().contains("\"clientSecret\":\"saved-client-secret\""));
         });
     }
 

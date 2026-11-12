@@ -2315,10 +2315,12 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
 #[test]
 fn a_renewal_without_a_client_secret_reuses_the_secret_of_the_replaced_credential() {
     runtime().block_on(async {
-        for (typed, replaced, sent) in [
-            (None, SECRET, Some("synthetic-client-secret")),
-            (Some("typed-client-secret"), SECRET, Some("typed-client-secret")),
-            (None, "missing-credential", None),
+        let saved = stored_secret_with_client_secret(NOW_MS);
+        for (typed, vault, sent) in [
+            (None, Some(saved.clone()), Some("synthetic-client-secret")),
+            (Some("typed-client-secret"), Some(saved.clone()), Some("typed-client-secret")),
+            (None, None, None),
+            (None, Some(b"unreadable".to_vec()), None),
         ] {
             let mut replies = vec![json_reply(
                 200,
@@ -2331,7 +2333,7 @@ fn a_renewal_without_a_client_secret_reuses_the_secret_of_the_replaced_credentia
             replies.extend(grant_verification_replies());
             replies.push(about_reply());
             let server = WireServer::start(replies);
-            let test = deps_with(Some(stored_secret_with_client_secret(NOW_MS)));
+            let test = deps_with(vault);
             let grant = AuthorizationCode {
                 code: SecretBytes(zeroize::Zeroizing::new(b"synthetic-code".to_vec())),
                 verifier: SecretBytes(zeroize::Zeroizing::new(b"synthetic-verifier".to_vec())),
@@ -2344,7 +2346,7 @@ fn a_renewal_without_a_client_secret_reuses_the_secret_of_the_replaced_credentia
                 &connection(server.url.as_str()),
                 &grant,
                 typed.map(|secret| zeroize::Zeroizing::new(secret.to_owned())),
-                Some(&SecretRef(replaced.to_owned())),
+                Some(&SecretRef(SECRET.to_owned())),
                 &Cancellation::default(),
             )
             .await
