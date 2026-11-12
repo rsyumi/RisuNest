@@ -2269,6 +2269,7 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
             &config,
             &grant(),
             Some(zeroize::Zeroizing::new("synthetic-client-secret".into())),
+            None,
             &cancel,
         )
         .await
@@ -2301,13 +2302,66 @@ fn a_code_exchange_returns_a_storable_refresh_payload() {
 
         // A grant without a refresh token cannot keep the connection alive.
         assert_eq!(
-            exchange_authorization_code(&test.dependencies, &config, &grant(), None, &cancel,)
+            exchange_authorization_code(&test.dependencies, &config, &grant(), None, None, &cancel,)
                 .await
                 .err()
                 .unwrap()
                 .kind,
             ErrorKind::ReauthRequired
         );
+    });
+}
+
+#[test]
+fn a_renewal_without_a_client_secret_reuses_the_secret_of_the_replaced_credential() {
+    runtime().block_on(async {
+        for (typed, replaced, sent) in [
+            (None, SECRET, Some("synthetic-client-secret")),
+            (Some("typed-client-secret"), SECRET, Some("typed-client-secret")),
+            (None, "missing-credential", None),
+        ] {
+            let mut replies = vec![json_reply(
+                200,
+                json!({
+                    "access_token": "granted-access",
+                    "refresh_token": "granted-refresh",
+                    "expires_in": 3599
+                }),
+            )];
+            replies.extend(grant_verification_replies());
+            replies.push(about_reply());
+            let server = WireServer::start(replies);
+            let test = deps_with(Some(stored_secret_with_client_secret(NOW_MS)));
+            let grant = AuthorizationCode {
+                code: SecretBytes(zeroize::Zeroizing::new(b"synthetic-code".to_vec())),
+                verifier: SecretBytes(zeroize::Zeroizing::new(b"synthetic-verifier".to_vec())),
+                client_id: client_id(config::platform_key()),
+                redirect_url: url::Url::parse("http://127.0.0.1:52001/oauth").unwrap(),
+                picked_file_id: None,
+            };
+            let payload = exchange_authorization_code(
+                &test.dependencies,
+                &connection(server.url.as_str()),
+                &grant,
+                typed.map(|secret| zeroize::Zeroizing::new(secret.to_owned())),
+                Some(&SecretRef(replaced.to_owned())),
+                &Cancellation::default(),
+            )
+            .await
+            .unwrap();
+            let body = String::from_utf8(server.requests.lock().unwrap()[0].body.clone()).unwrap();
+            let stored = String::from_utf8(payload.secret.0.to_vec()).unwrap();
+            match sent {
+                Some(secret) => {
+                    assert!(body.contains(&format!("client_secret={secret}")));
+                    assert!(stored.contains(&format!("\"clientSecret\":\"{secret}\"")));
+                }
+                None => {
+                    assert!(!body.contains("client_secret="));
+                    assert!(!stored.contains("clientSecret"));
+                }
+            }
+        }
     });
 }
 
@@ -2333,6 +2387,7 @@ fn a_rejected_code_exchange_preserves_the_oauth_error_details() {
             &test.dependencies,
             &connection(server.url.as_str()),
             &grant,
+            None,
             None,
             &Cancellation::default(),
         )

@@ -846,7 +846,7 @@
             {/if}
             {#if endpointConfirmed && prepared.requiresOAuth && googleOAuth}
                 <div class="fields two">
-                    <label class="field"><span>{strings.oauthClientSecret}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} /></label>
+                    <label class="field"><span>{strings.oauthClientSecret}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} />{#if renewalConnection}<small>{strings.renewalClientSecretHelp}</small>{/if}</label>
                     {#if googleAndroid && pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
                 </div>
             {/if}

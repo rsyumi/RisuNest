@@ -729,6 +729,7 @@ describe('Android Google authorization lifecycle', () => {
         await settle()
         await prepareGoogleConnection()
         const clientSecret = labelControl<HTMLInputElement>(strings.oauthClientSecret)
+        expect(target.textContent).not.toContain(strings.renewalClientSecretHelp)
         clientSecret.value = 'browser-client-secret'
         clientSecret.dispatchEvent(new Event('input', { bubbles: true }))
         button(strings.signIn).click()
@@ -1221,6 +1222,9 @@ describe('authorization waiting copy and renewal', () => {
         const terms = [...target.querySelectorAll('dt')]
         expect(terms.find(term => term.textContent === strings.account)?.nextElementSibling?.textContent).toBe('synthetic@example.invalid')
         expect(terms.find(term => term.textContent === strings.repository)?.nextElementSibling?.textContent).toBe(shown)
+        labelControl<HTMLInputElement>(strings.confirmEndpoint).click()
+        await settle()
+        expect(labelControl<HTMLInputElement>(strings.oauthClientSecret).closest('label')?.textContent).toContain(strings.renewalClientSecretHelp)
     })
 })
 

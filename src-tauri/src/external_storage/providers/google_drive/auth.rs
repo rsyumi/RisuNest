@@ -494,11 +494,14 @@ pub(crate) fn android_web_authorization_policy(
 
 /// Exchanges a PKCE grant for the secret payload the vault stores. The caller
 /// owns `vault.store`, so one connection keeps one reference afterwards.
+/// `replaced` is the credential a renewal replaces. Google shows a client
+/// secret only once, so a renewal without one reuses the secret stored there.
 pub(crate) async fn exchange_authorization_code(
     dependencies: &Dependencies,
     config: &ConnectionConfig,
     grant: &AuthorizationCode,
     client_secret: Option<Zeroizing<String>>,
+    replaced: Option<&SecretRef>,
     cancel: &Cancellation,
 ) -> Result<AuthorizedSecret> {
     let settings = AuthorizationSettings::parse(config, config::platform_key())?;
@@ -508,6 +511,14 @@ pub(crate) async fn exchange_authorization_code(
     let pending = AccountKey::pending(config::PROVIDER_ID, &settings.api("/")?)?;
     let code = std::str::from_utf8(&grant.code.0).map_err(|_| reauth())?;
     let verifier = std::str::from_utf8(&grant.verifier.0).map_err(|_| reauth())?;
+    let client_secret = match (client_secret, replaced) {
+        // A missing or unreadable credential leaves the exchange without one.
+        (None, Some(replaced)) => match dependencies.vault.read(replaced).await {
+            Ok(bytes) => decode(&bytes).ok().and_then(|stored| stored.client_secret),
+            Err(_) => None,
+        },
+        (client_secret, _) => client_secret,
+    };
     if client_secret.as_ref().is_some_and(|secret| {
         secret.is_empty()
             || secret.len() > 4096

@@ -613,6 +613,7 @@ async fn exchange_oauth_credential(
     exchange_config: &super::contract::ConnectionConfig,
     grant: &super::auth::AuthorizationCode,
     client_secret: Option<Zeroizing<String>>,
+    replaced: Option<&SecretRef>,
     cancel: &Cancellation,
 ) -> Result<BoundCredential> {
     match exchange_config.provider.as_str() {
@@ -622,6 +623,7 @@ async fn exchange_oauth_credential(
                 exchange_config,
                 grant,
                 client_secret,
+                replaced,
                 cancel,
             )
             .await?;
@@ -661,11 +663,15 @@ async fn finish_oauth_connection(
 ) -> ConnectResult<CompleteAuthorizationResult> {
     let root = connection_root(app)?;
     let dependencies = connection::dependencies(&root)?;
+    let replaced = pending.renewal.as_deref()
+        .and_then(|connection_id| ConnectionStore::open(&root).and_then(|store| store.read(connection_id)).ok())
+        .map(|stored| SecretRef(stored.credential_ref));
     let credential = match exchange_oauth_credential(
         &dependencies,
         &exchange_config,
         &grant,
         client_secret,
+        replaced.as_ref(),
         cancel,
     )
     .await
