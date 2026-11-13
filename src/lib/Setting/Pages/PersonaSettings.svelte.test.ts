@@ -15,7 +15,7 @@ vi.mock('src/ts/stores.svelte', () => {
     const DBState = $state({ db: {} })
     return { DBState, disableHighlight: writable(false), popUpEditorStore: {} }
 })
-vi.mock('sortablejs/modular/sortable.core.esm.js', () => ({ default: { create: () => ({ destroy() {} }) } }))
+vi.mock('sortablejs', () => ({ default: { create: () => ({ destroy() {} }) } }))
 vi.mock('src/ts/util', () => ({ sortableOptions: {}, sleep: async () => {} }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: vi.fn() }))
 vi.mock('src/ts/characters', () => ({ getCharImage: vi.fn(async () => '') }))

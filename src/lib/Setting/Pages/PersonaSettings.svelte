@@ -8,7 +8,7 @@
     import { alertConfirm, alertSelect } from "src/ts/alert";
     import { getCharImage } from "src/ts/characters";
     import { changeUserPersona, exportUserPersona, importUserPersona, saveUserPersona, selectUserImg } from "src/ts/persona";
-    import Sortable from 'sortablejs/modular/sortable.core.esm.js';
+    import Sortable from 'sortablejs';
     import { onDestroy, onMount } from "svelte";
     import { sleep, sortableOptions } from "src/ts/util";
     import { DBState } from 'src/ts/stores.svelte';

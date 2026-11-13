@@ -11,7 +11,7 @@ import { SaveCoordinator } from 'src/ts/storage/saveCoordinator'
 import { capturePersistentRoot } from 'src/ts/storage/persistentDataRuntime'
 
 const mocks = vi.hoisted(() => ({ create: vi.fn(), instances: [] as { destroy: ReturnType<typeof vi.fn> }[] }))
-vi.mock('sortablejs/modular/sortable.core.esm.js', () => ({ default: { create: mocks.create } }))
+vi.mock('sortablejs', () => ({ default: { create: mocks.create } }))
 vi.mock('src/ts/stores.svelte', () => {
     const DBState = $state({ db: {} })
     return { DBState, selectedCharID: writable(0) }

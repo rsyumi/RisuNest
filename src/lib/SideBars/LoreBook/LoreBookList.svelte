@@ -29,7 +29,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import LoreBookData from "./LoreBookData.svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
-    import Sortable from 'sortablejs/modular/sortable.core.esm.js';
+    import Sortable from 'sortablejs';
     import { onDestroy, onMount, tick } from "svelte";
     import { sortableOptions } from "src/ts/util";
     import { v4 } from "uuid";

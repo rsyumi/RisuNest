@@ -1,7 +1,7 @@
 <script lang="ts">
     import { tick } from "svelte";
     import { v4 } from "uuid";
-    import type Sortable from 'sortablejs/modular/sortable.core.esm.js';
+    import type Sortable from 'sortablejs';
     import { DownloadIcon, PencilIcon, HardDriveUploadIcon, MenuIcon, TrashIcon, SplitIcon, FolderPlusIcon, BookmarkCheckIcon } from "@lucide/svelte";
 
     import type { character } from "src/ts/storage/database.svelte";
@@ -15,6 +15,7 @@
     import { addNewChat, duplicateChat, editSelectedChatList as applyChatListEdit, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { sortableOptions } from "src/ts/util";
+    import { chosenByTouch } from "src/ts/sortableOptions";
 
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -23,7 +24,7 @@
     import ModuleScopeButton from "./ModuleScopeButton.svelte";
     import { changeChatTo } from "src/ts/globalApi.svelte";
     import { isWorkingSetCharacterStub } from "src/ts/storage/workingSetCatalog";
-    import { indexSideChatListRows, orderChatsByDroppedRows, orderFoldersByDroppedIds, type DroppedChatRow } from "./sideChatListRows";
+    import { indexSideChatListRows, moveDroppedChatToFolderTop, orderChatsByDroppedRows, orderFoldersByDroppedIds, type DroppedChatRow } from "./sideChatListRows";
 
     interface Props {
         chara: character;
@@ -45,6 +46,17 @@
     let sorted = $state(0)
     let opened = 0
     let sortableLoadId = 0
+
+    // While a chat is dragged: the folder whose header is under the pointer and
+    // the folder that holds the slot the chat would otherwise land in.
+    let chatDragging = $state(false)
+    let headerFolderId = $state<string | null>(null)
+    let slotFolderId = $state<string | null>(null)
+    let slotTopsHeaderFolder = $state(false)
+    let receivedFolderId = $state<string | null>(null)
+    let draggedChat: HTMLElement | null = null
+    let chatDragPoint: { x: number, y: number } | null = null
+    const chatDragMoveEvents = ['pointermove', 'touchmove', 'dragover'] as const
 
     async function editSelectedChatList(...args: Parameters<typeof applyChatListEdit>): Promise<boolean> {
         try {
@@ -73,7 +85,51 @@
         })
     }
 
+    function folderIdOf(element: Element | null | undefined): string | null {
+        const folder = element?.closest('[data-risu-chat-folder-idx]')
+        if (!folder || !listEle?.contains(folder)) return null
+        return chara.chatFolders?.[parseInt(folder.getAttribute('data-risu-chat-folder-idx'))]?.id ?? null
+    }
+
+    function updateChatDropFolder() {
+        const underPointer = chatDragPoint ? document.elementFromPoint(chatDragPoint.x, chatDragPoint.y) : null
+        headerFolderId = folderIdOf(underPointer?.closest('[data-risu-chat-folder-header]'))
+        slotFolderId = folderIdOf(draggedChat)
+        // A chat dropped on a header lands first in its folder, where the slot may already be.
+        slotTopsHeaderFolder = headerFolderId !== null && headerFolderId === slotFolderId && !draggedChat?.previousElementSibling
+    }
+
+    function trackChatDragPoint(event: Event) {
+        const point = 'touches' in event ? (event as TouchEvent).touches[0] : event as MouseEvent
+        if (!point || typeof point.clientX !== 'number') return
+        chatDragPoint = { x: point.clientX, y: point.clientY }
+        updateChatDropFolder()
+    }
+
+    function startChatDrag(event: Sortable.SortableEvent) {
+        draggedChat = event.item
+        chatDragging = true
+        for (const type of chatDragMoveEvents) document.addEventListener(type, trackChatDragPoint, { capture: true, passive: true })
+        // The list also moves under a resting pointer while it scrolls.
+        document.addEventListener('scroll', updateChatDropFolder, { capture: true, passive: true })
+        const original = (event as Sortable.SortableEvent & { originalEvent?: Event }).originalEvent
+        if (original) trackChatDragPoint(original)
+        else updateChatDropFolder()
+    }
+
+    function stopChatDrag() {
+        for (const type of chatDragMoveEvents) document.removeEventListener(type, trackChatDragPoint, true)
+        document.removeEventListener('scroll', updateChatDropFolder, true)
+        draggedChat = null
+        chatDragPoint = null
+        chatDragging = false
+        headerFolderId = null
+        slotFolderId = null
+        slotTopsHeaderFolder = false
+    }
+
     const destroySortable = () => {
+        stopChatDrag()
         if (folderStb) {
             try {
                 folderStb.destroy()
@@ -93,17 +149,30 @@
         destroySortable()
 
         await tick()
-        const { default: Sortable } =
-            await import('sortablejs/modular/sortable.core.esm.js')
+        // The default build scrolls the list while a touch drag rests near its edge.
+        const { default: Sortable } = await import('sortablejs')
         if (loadId !== sortableLoadId || !listEle || !folderEles)
             return
 
-        for (let chat of listEle.querySelectorAll('.risu-chat')) {
+        for (let chat of listEle.querySelectorAll<HTMLElement>('.risu-chat')) {
             chatsStb.push(new Sortable(chat, {
+                ...sortableOptions,
                 group: 'chats',
-                onEnd: async () => {
+                onChoose(this: Sortable, event) {
+                    sortableOptions.onChoose.call(this, event)
+                    if (chosenByTouch(event)) event.item.classList.add('risu-chat-held')
+                },
+                onUnchoose(this: Sortable, event) {
+                    sortableOptions.onUnchoose.call(this)
+                    event.item.classList.remove('risu-chat-held')
+                },
+                onStart: startChatDrag,
+                onChange: updateChatDropFolder,
+                onEnd: async (event) => {
+                    const droppedOnFolderId = headerFolderId
+                    const droppedId = chara.chats[parseInt(event.item.getAttribute('data-risu-chat-idx'))]?.id
                     // Read the dropped order before re-rendering the list.
-                    const rows: DroppedChatRow[] = []
+                    let rows: DroppedChatRow[] = []
                     listEle.querySelectorAll('[data-risu-chat-folder-idx]').forEach(folder => {
                         const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
                         folder.querySelectorAll('[data-risu-chat-idx]').forEach(chatInFolder => {
@@ -120,20 +189,23 @@
                             rows.push({ id, folderId: null })
                         }
                     })
+                    if (droppedOnFolderId !== null && droppedId) {
+                        rows = moveDroppedChatToFolderTop(rows, droppedId, droppedOnFolderId)
+                    }
 
                     destroySortable()
                     try {
-                        await editSelectedChatList(chara.chaId, 'reorder-chats', (character) => {
+                        const moved = await editSelectedChatList(chara.chaId, 'reorder-chats', (character) => {
                             const chats = orderChatsByDroppedRows(character.chats, rows)
                             if (!chats) return false
                             character.chats = chats
                             return null
                         })
+                        if (moved) receivedFolderId = droppedOnFolderId
                     } finally {
                         sorted += 1
                     }
                 },
-                ...sortableOptions
             }))
         }
         folderStb = Sortable.create(folderEles, {
@@ -142,7 +214,7 @@
                 // Read the dropped order before re-rendering the list.
                 const folderIds: string[] = []
                 const rows: DroppedChatRow[] = []
-                const folders: HTMLElement[] = Array.from<HTMLElement>(event.to.children)
+                const folders = Array.from(event.to.children)
 
                 folders.forEach(folder => {
                     const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
@@ -198,7 +270,7 @@
     }}>{language.newChat}</Button>
 
     {#key sorted}
-    <div class="flex flex-col mt-2 overflow-y-auto max-h-80 shrink-0" bind:this={listEle}>
+    <div class="risu-chat-list flex flex-col mt-2 overflow-y-auto max-h-80 shrink-0" class:risu-chat-dragging={chatDragging} class:risu-chat-header-drop={headerFolderId !== null && !slotTopsHeaderFolder} bind:this={listEle}>
         <!-- folder div -->
         <div class="flex flex-col" bind:this={folderEles}>
             <!-- chat folder -->
@@ -206,9 +278,14 @@
             {@const folder = folderRow.folder}
             {@const i = folderRow.index}
             <div data-risu-chat-folder-idx={i}
-                class="flex flex-col mb-2 border-solid border-1 border-darkborderc cursor-pointer rounded-md">
+                class="flex flex-col mb-2 border-solid border-1 border-darkborderc cursor-pointer rounded-md"
+                class:risu-chat-drop-folder={(headerFolderId ?? slotFolderId) === folder.id}
+                class:risu-chat-folder-received={receivedFolderId === folder.id}
+                onanimationend={() => {
+                    if (receivedFolderId === folder.id) receivedFolderId = null
+                }}>
                 <!-- folder header -->
-                <button 
+                <button data-risu-chat-folder-header
                     onclick={() => {
                         if(!editMode) {
                             void editFolder(chara.chaId, folder.id, (current) => { current.folded = !current.folded })
@@ -287,11 +364,8 @@
                     </div>
                 </button>
                 <!-- chats in folder -->
-                <div class="risu-chat flex flex-col w-full text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md {folder.folded ? 'hidden' : ''}">
-                    {#if folderRow.chats.length === 0}
-                    <span class="no-sort flex justify-center text-textcolor2">Empty</span>
-                    <div></div>
-                    {:else}
+                <!-- An empty folder keeps no child element, so its whole area takes a dropped chat. -->
+                <div data-risu-chat-empty-label="Empty" class="risu-chat flex flex-col w-full text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md {folder.folded ? 'hidden' : ''}">
                     {#each folderRow.chats as chatRow (chatRow.chat.id)}
                     {@const chat = chatRow.chat}
                     {@const chatIndex = chatRow.index}
@@ -382,13 +456,12 @@
                         </div>
                     </button>
                     {/each}
-                    {/if}
                 </div>
             </div>
             {/each}
         </div>
         <!-- chat without folder div -->
-        <div class="risu-chat flex flex-col">
+        <div class="risu-chat risu-chat-ungrouped flex flex-col">
             {#each indexedRows.ungrouped as chatRow (chatRow.chat.id)}
             {@const chat = chatRow.chat}
             {@const i = chatRow.index}
@@ -534,3 +607,85 @@
     </div>
 
 </div>
+
+<style>
+    .risu-chat[data-risu-chat-empty-label]:not(:has(> [data-risu-chat-idx]:not(:global(.sortable-fallback))))::before {
+        content: attr(data-risu-chat-empty-label);
+        display: flex;
+        justify-content: center;
+        color: var(--risu-theme-textcolor2);
+    }
+
+    /* With every chat in a folder, a dragged chat still needs room to leave them. */
+    .risu-chat-dragging > .risu-chat-ungrouped:not(:has(> [data-risu-chat-idx]:not(:global(.sortable-fallback)))) {
+        min-height: 2.5rem;
+        border-radius: 0.375rem;
+        outline: 1px dashed var(--risu-theme-darkborderc);
+        outline-offset: -1px;
+    }
+
+    /* A touched row once the hold is long enough to drag it. */
+    .risu-chat-list :global(.risu-chat-held) {
+        background-color: var(--risu-theme-darkbutton);
+        outline: 1px solid var(--risu-theme-borderc);
+        outline-offset: -1px;
+    }
+
+    /* The slot the dragged row lands in. */
+    .risu-chat-list :global(.sortable-ghost) {
+        background-color: color-mix(in srgb, var(--risu-theme-selected) 45%, transparent);
+        outline: 1px dashed var(--risu-theme-borderc);
+        outline-offset: -1px;
+    }
+
+    .risu-chat-list :global(.sortable-ghost > *) {
+        opacity: 0.45;
+    }
+
+    .risu-chat-header-drop :global(.sortable-ghost) {
+        background-color: transparent;
+        outline-color: transparent;
+    }
+
+    .risu-chat-header-drop :global(.sortable-ghost > *) {
+        opacity: 0.25;
+    }
+
+    /* The row that follows the pointer. */
+    .risu-chat-list :global(.sortable-drag) {
+        background-color: var(--risu-theme-darkbutton);
+        outline: 1px solid var(--risu-theme-borderc);
+        outline-offset: -1px;
+        box-shadow: 0 6px 16px rgb(0 0 0 / 0.35);
+    }
+
+    .risu-chat-list :global(.sortable-fallback) {
+        opacity: 1 !important;
+    }
+
+    .risu-chat-drop-folder {
+        outline: 2px solid var(--risu-theme-borderc);
+        outline-offset: -2px;
+    }
+
+    .risu-chat-folder-received {
+        animation: risu-chat-folder-received 0.7s ease-out;
+    }
+
+    @keyframes risu-chat-folder-received {
+        from {
+            outline: 2px solid var(--risu-theme-borderc);
+            outline-offset: -2px;
+        }
+        to {
+            outline: 2px solid transparent;
+            outline-offset: -2px;
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .risu-chat-folder-received {
+            animation: none;
+        }
+    }
+</style>

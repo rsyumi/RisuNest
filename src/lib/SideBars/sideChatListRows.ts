@@ -73,6 +73,22 @@ export function orderChatsByDroppedRows(
     return ordered
 }
 
+/**
+ * Rows for a chat dropped on a folder itself rather than between its chats: the
+ * chat becomes the first row of that folder.
+ */
+export function moveDroppedChatToFolderTop(
+    rows: DroppedChatRow[],
+    chatId: string,
+    folderId: string,
+): DroppedChatRow[] {
+    if (!rows.some((row) => row.id === chatId)) return rows
+    const others = rows.filter((row) => row.id !== chatId)
+    const firstInFolder = others.findIndex((row) => row.folderId === folderId)
+    others.splice(firstInFolder === -1 ? 0 : firstInFolder, 0, { id: chatId, folderId })
+    return others
+}
+
 /** Reorders folders by id. Returns null when the ids no longer match. */
 export function orderFoldersByDroppedIds(
     folders: ChatFolder[],
