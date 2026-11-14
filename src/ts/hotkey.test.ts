@@ -291,11 +291,12 @@ describe('mobile gesture ownership', () => {
         }
     }
 
-    it('ignores buttons, their SVG children, and editable ancestors without losing another finger', () => {
+    it('ignores buttons, their SVG children, sliders, and editable ancestors without losing another finger', () => {
         const dispatch = gestures()
         const parent = document.createElement('div')
         parent.innerHTML = '<button><svg><path/></svg></button><div contenteditable="true"><span>text</span></div>'
-        const targets = [parent.querySelector('button')!, parent.querySelector('path')!, parent.querySelector('span')!]
+            + '<div role="slider" tabindex="0"><b>50</b></div><input type="range">'
+        const targets = [parent.querySelector('button')!, parent.querySelector('path')!, parent.querySelector('span')!, parent.querySelector('b')!, parent.querySelector('input')!]
         for (const [identifier, target] of targets.entries()) {
             dispatch('touchstart', [{ identifier, clientX: 100, target }])
             expect(() => dispatch('touchend', [{ identifier, clientX: 0, target }])).not.toThrow()
@@ -356,6 +357,76 @@ describe('mobile gesture ownership', () => {
         dispatch('touchend', [{ identifier: 1, clientX: 0, target }])
         dispatch('touchend', [{ identifier: 1, clientX: 0, target }])
         expect(get(mocks.MobileGUIStack)).toBe(1)
+    })
+
+    it('leaves a swipe to a horizontally scrollable block while the block could scroll that way when the touch started', () => {
+        const dispatch = gestures()
+        mocks.MobileGUIStack.set(1)
+        const host = document.createElement('div')
+        host.innerHTML = '<pre style="overflow-x: auto"><span>wide</span></pre><pre style="overflow-x: auto; direction: rtl"><span>wide</span></pre>'
+        document.body.append(host)
+        const [ltr, rtl] = Array.from(host.querySelectorAll('pre'))
+        for (const block of [ltr, rtl]) {
+            Object.defineProperties(block, {
+                scrollWidth: { value: 300, configurable: true },
+                clientWidth: { value: 100, configurable: true },
+                scrollLeft: { value: 0, writable: true, configurable: true },
+            })
+        }
+        const swipe = (block: HTMLElement, from: number, to: number, scrolledTo = block.scrollLeft) => {
+            const target = block.querySelector('span')!
+            dispatch('touchstart', [{ identifier: 1, clientX: from, target }])
+            block.scrollLeft = scrolledTo
+            dispatch('touchend', [{ identifier: 1, clientX: to, target }])
+            return get(mocks.MobileGUIStack)
+        }
+        try {
+            // The block scrolls to its end during the swipe; it could scroll when the finger landed.
+            expect(swipe(ltr, 100, 0, 200)).toBe(1)
+            expect(swipe(ltr, 100, 0)).toBe(2)
+            expect(swipe(ltr, 0, 100)).toBe(2)
+            ltr.scrollLeft = 0
+            expect(swipe(ltr, 0, 100)).toBe(1)
+            expect(swipe(rtl, 0, 100)).toBe(1)
+            expect(swipe(rtl, 100, 0)).toBe(2)
+        } finally {
+            host.remove()
+        }
+    })
+
+    it('does not switch screens while text is selected or a list row is dragged', () => {
+        const dispatch = gestures()
+        const target = document.createElement('div')
+        target.textContent = 'Selectable text'
+        document.body.append(target)
+        const row = document.createElement('div')
+        document.body.append(row)
+        try {
+            document.getSelection()!.selectAllChildren(target)
+            dispatch('touchstart', [{ identifier: 1, clientX: 100, target }])
+            dispatch('touchend', [{ identifier: 1, clientX: 0, target }])
+            expect(get(mocks.MobileGUIStack)).toBe(0)
+            document.getSelection()!.removeAllRanges()
+
+            for (const className of ['risu-sort-held', 'sortable-chosen']) {
+                dispatch('touchstart', [{ identifier: 2, clientX: 100, target }])
+                row.classList.add(className)
+                dispatch('touchmove', [{ identifier: 2, clientX: 50, target }])
+                // The list drops the row on pointerup, which comes before touchend.
+                row.classList.remove(className)
+                dispatch('touchend', [{ identifier: 2, clientX: 0, target }])
+                expect(get(mocks.MobileGUIStack)).toBe(0)
+            }
+
+            dispatch('touchstart', [{ identifier: 3, clientX: 100, target }])
+            dispatch('touchmove', [{ identifier: 3, clientX: 50, target }])
+            dispatch('touchend', [{ identifier: 3, clientX: 0, target }])
+            expect(get(mocks.MobileGUIStack)).toBe(1)
+        } finally {
+            document.getSelection()!.removeAllRanges()
+            target.remove()
+            row.remove()
+        }
     })
 
     it('preserves horizontal navigation and ignores mostly vertical movement', () => {

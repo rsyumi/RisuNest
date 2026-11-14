@@ -332,7 +332,10 @@
     });
 
     let selection: HTMLDivElement;
-    let mouseDown = false;
+    // The pointer drawing the manual selection, the corner it started from, and the selection from before the press.
+    let selectionPointer: number | null = null;
+    let selectionStart = { x: 0, y: 0 };
+    let selectionBeforePress = '';
 </script>
 <SelectInput bind:value={mode} className="w-1/2">
     <option value="auto">{"auto"}</option>
@@ -370,9 +373,11 @@
 {/if}
 
 <div class="relative mt-2">
-    <canvas bind:this={canvas} class:blur-effect={loading && mode === 'auto'} onpointerdown={(e) => {
-        if(mode === 'manual'){
-            mouseDown = true;
+    <canvas bind:this={canvas} class:blur-effect={loading && mode === 'auto'} style:touch-action={mode === 'manual' ? 'none' : null} onpointerdown={(e) => {
+        if(mode === 'manual' && (selectionPointer === null || selectionPointer === e.pointerId)){
+            selectionPointer = e.pointerId;
+            selectionBeforePress = selection.style.cssText;
+            canvas.setPointerCapture(e.pointerId);
             selection.classList.remove('hidden');
             selection.style.width = '0px';
             selection.style.height = '0px';
@@ -382,31 +387,46 @@
 
             const startX = e.clientX - rect.left;
             const startY = e.clientY - rect.top;
+            selectionStart = { x: startX, y: startY };
 
             selection.style.left = `${startX}px`;
             selection.style.top = `${startY}px`;
         }}}
         
         onpointermove={(e) => {
-            if(mode === 'manual' && mouseDown){
+            if(mode === 'manual' && e.pointerId === selectionPointer){
                 const rect = canvas.getBoundingClientRect();
-                const currentX = e.clientX - rect.left;
-                const currentY = e.clientY - rect.top;
+                // The captured pointer keeps moving outside the canvas; the selection stays on it.
+                const currentX = Math.min(Math.max(e.clientX - rect.left, 0), rect.width);
+                const currentY = Math.min(Math.max(e.clientY - rect.top, 0), rect.height);
 
-                const width = currentX - parseFloat(selection.style.left);
-                const height = currentY - parseFloat(selection.style.top);
+                const width = currentX - selectionStart.x;
+                const height = currentY - selectionStart.y;
 
                 selection.style.width = `${Math.abs(width)}px`;
                 selection.style.height = `${Math.abs(height)}px`;
-                selection.style.left = `${Math.min(currentX, parseFloat(selection.style.left))}px`;
-                selection.style.top = `${Math.min(currentY, parseFloat(selection.style.top))}px`;
+                selection.style.left = `${Math.min(currentX, selectionStart.x)}px`;
+                selection.style.top = `${Math.min(currentY, selectionStart.y)}px`;
                 console.log(selection.style.left, selection.style.top, selection.style.width, selection.style.height);
             }
         }}
         
-        onpointerup={() => {
-            if(mode === 'manual'){
-                mouseDown = false;
+        onpointerup={(e) => {
+            if(e.pointerId === selectionPointer){
+                selectionPointer = null;
+            }
+        }}
+
+        onpointercancel={(e) => {
+            if(e.pointerId === selectionPointer){
+                selection.style.cssText = selectionBeforePress;
+                selectionPointer = null;
+            }
+        }}
+
+        onlostpointercapture={(e) => {
+            if(e.pointerId === selectionPointer){
+                selectionPointer = null;
             }
         }}
         ></canvas>

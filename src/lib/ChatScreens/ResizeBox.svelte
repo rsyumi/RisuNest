@@ -1,36 +1,38 @@
 <script>
     import { CharEmotion, ViewBoxsize } from '../../ts/stores.svelte';
-    import { onMount } from 'svelte';
     import TransitionImage from './TransitionImage.svelte';
     import { getEmotion } from '../../ts/util';
     
     import { DBState } from 'src/ts/stores.svelte';
 
     let box = $state();
-    let isResizing = false;
+    // The pointer that is resizing the box; the handle captures it, so moves outside the handle still arrive.
+    let resizePointer = null;
     let initialWidth;
     let initialHeight;
     let initialX;
     let initialY;
 
     function handleStart(event) {
-        isResizing = true;
+        if (resizePointer !== null && resizePointer !== event.pointerId) return;
+        resizePointer = event.pointerId;
+        event.currentTarget.setPointerCapture(event.pointerId);
         initialWidth = box.clientWidth;
         initialHeight = box.clientHeight;
-        initialX = event.clientX || event.touches[0].clientX;
-        initialY = event.clientY || event.touches[0].clientY;
+        initialX = event.clientX;
+        initialY = event.clientY;
     }
 
-    function handleEnd() {
-        isResizing = false;
+    function handleEnd(event) {
+        if (event.pointerId === resizePointer) resizePointer = null;
     }
 
     function handleMove(event) {
-        if (!isResizing) return;
+        if (event.pointerId !== resizePointer) return;
         event.preventDefault();
 
-        const clientX = event.clientX || event.touches[0].clientX;
-        const clientY = event.clientY || event.touches[0].clientY;
+        const clientX = event.clientX;
+        const clientY = event.clientY;
         const deltaX = initialX - clientX;
         const deltaY = clientY - initialY;
 
@@ -42,20 +44,6 @@
             height: newHeight
         })
     }
-
-    onMount(() => {
-        window.addEventListener('mousemove', handleMove);
-        window.addEventListener('mouseup', handleEnd);
-        window.addEventListener('touchmove', handleMove, { passive: false });
-        window.addEventListener('touchend', handleEnd);
-
-        return () => {
-        window.removeEventListener('mousemove', handleMove);
-        window.removeEventListener('mouseup', handleEnd);
-        window.removeEventListener('touchmove', handleMove);
-        window.removeEventListener('touchend', handleEnd);
-        };
-    });
 </script>
 
 <style>
@@ -80,6 +68,17 @@
         bottom: 0;
         left: 0;
         z-index: 10;
+        touch-action: none;
+    }
+
+    /* A finger-sized hit area centered on the handle; it draws nothing. */
+    .resize-handle::before {
+        content: '';
+        position: absolute;
+        left: -8px;
+        bottom: -8px;
+        width: 32px;
+        height: 32px;
     }
 </style>
 
@@ -88,9 +87,10 @@
     <TransitionImage classType='risu' src={getEmotion(DBState.db, $CharEmotion, 'plain')}/>
     <div role="button" tabindex="0"
       class="resize-handle"
-      onmousedown={handleStart}
-      onmouseup={handleEnd}
-      ontouchstart={handleStart}
-      ontouchend={handleEnd}
+      onpointerdown={handleStart}
+      onpointermove={handleMove}
+      onpointerup={handleEnd}
+      onpointercancel={handleEnd}
+      onlostpointercapture={handleEnd}
     ></div>
 </div>

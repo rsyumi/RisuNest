@@ -36,25 +36,12 @@
     style:background={
       `linear-gradient(to right, var(--risu-theme-darkbutton) 0%, var(--risu-theme-darkbutton) ${sliderPercent}%, var(--risu-theme-darkbg) ${sliderPercent}%, var(--risu-theme-darkbg) 100%)`
     }
-    onpointerdown={(event) => {
-      mouseDown = true;
-      changeValue(event);
-    }}
-
-    onpointermove={(event) => {
-      if (mouseDown) {
-        changeValue(event);
-      }
-    }}
-
-
-    onpointerup={() => {
-      mouseDown = false;
-    }}
-
-    onpointerleave={() => {
-      mouseDown = false;
-    }}
+    style:touch-action="pan-y"
+    onpointerdown={pressPointer}
+    onpointermove={movePointer}
+    onpointerup={releasePointer}
+    onpointercancel={cancelPointer}
+    onlostpointercapture={losePointer}
     onkeydown={handleKeydown}
     bind:this={slider}
   >
@@ -77,7 +64,10 @@
   import CheckInput from "./CheckInput.svelte";
 
     let slider: HTMLDivElement = $state()
-    let mouseDown = $state(false)
+    // The pointer that is changing the value. A touch writes nothing until it slides sideways or taps,
+    // so a page scroll that starts on the track leaves the value alone.
+    let press: { pointerId: number, touch: boolean, x: number, y: number, valueBefore: number, sliding: boolean, tap: boolean } | null = null
+    const touchSlop = 6
   interface Props {
     min?: number;
     max?: number;
@@ -118,6 +108,48 @@
         let newValue = ((x / rect.width) * (max - min)) + min;
         newValue = Math.round(newValue / step) * step;
         value = Math.min(Math.max(newValue, min), max);
+    }
+
+    function pressPointer(event: PointerEvent) {
+        if (press && press.pointerId !== event.pointerId) return
+        slider.setPointerCapture(event.pointerId)
+        const touch = event.pointerType === 'touch'
+        press = { pointerId: event.pointerId, touch, x: event.clientX, y: event.clientY, valueBefore: value, sliding: !touch, tap: touch }
+        if (!touch) changeValue(event)
+    }
+
+    function movePointer(event: PointerEvent) {
+        if (event.pointerId !== press?.pointerId) return
+        if (!press.touch && event.buttons === 0) {
+            press = null
+            return
+        }
+        if (!press.sliding) {
+            const dx = Math.abs(event.clientX - press.x)
+            const dy = Math.abs(event.clientY - press.y)
+            if (Math.max(dx, dy) < touchSlop) return
+            press.tap = false
+            if (dx <= dy) return
+            press.sliding = true
+        }
+        changeValue(event)
+    }
+
+    function releasePointer(event: PointerEvent) {
+        if (event.pointerId !== press?.pointerId) return
+        if (press.tap) changeValue(event)
+        press = null
+    }
+
+    // The browser cancels a touch it takes over for scrolling; the value goes back to what it was before the press.
+    function cancelPointer(event: PointerEvent) {
+        if (event.pointerId !== press?.pointerId) return
+        if (value !== press.valueBefore) value = press.valueBefore
+        press = null
+    }
+
+    function losePointer(event: PointerEvent) {
+        if (event.pointerId === press?.pointerId) press = null
     }
 
     function handleKeydown(event: KeyboardEvent) {

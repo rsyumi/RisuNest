@@ -350,30 +350,55 @@ function focusQuery(query:string){
 
 
 
+// Whether a horizontally scrollable element under the touch can still scroll with a finger moving right or left.
+function horizontalScrollRoom(target: Element | null) {
+    const room = { right: false, left: false }
+    for(let ele = target; ele && !(room.right && room.left); ele = ele.parentElement){
+        const range = ele.scrollWidth - ele.clientWidth
+        if(range <= 1) continue
+        const style = getComputedStyle(ele)
+        if(!['auto', 'scroll', 'overlay'].includes(style.overflowX)) continue
+        // Right-to-left content starts at scrollLeft 0 and scrolls into negative values.
+        const start = style.direction === 'rtl' ? -range : 0
+        if(ele.scrollLeft > start + 1) room.right = true
+        if(ele.scrollLeft < start + range - 1) room.left = true
+    }
+    return room
+}
+
 export function initMobileGesture(){
-    let pressingPointers = new Map<number, {x:number, y:number}>()
+    let pressingPointers = new Map<number, {x:number, y:number, scrollRoom: {right:boolean, left:boolean}}>()
+    const heldRows = document.getElementsByClassName('risu-sort-held')
+    const chosenRows = document.getElementsByClassName('sortable-chosen')
 
     document.addEventListener('touchstart', (ev) => {
         if (isAppLockInputBlocked()) { pressingPointers.clear(); return }
         for(const touch of ev.changedTouches){
             const ele = touch.target instanceof Element ? touch.target : null
-            if (ele?.closest('button, input, select, textarea, a, label, [role="button"], [contenteditable]:not([contenteditable="false"])')) {
+            if (ele?.closest('button, input, select, textarea, a, label, [role="button"], [role="slider"], [contenteditable]:not([contenteditable="false"])')) {
                 pressingPointers.delete(touch.identifier)
                 continue
             }
-            pressingPointers.set(touch.identifier, {x: touch.clientX, y: touch.clientY})
+            pressingPointers.set(touch.identifier, {x: touch.clientX, y: touch.clientY, scrollRoom: horizontalScrollRoom(ele)})
         }
     }, {
         passive: true
     })
+    // A list row held under the finger is being dragged, so the touches of that gesture do not switch screens.
+    document.addEventListener('touchmove', () => {
+        if (pressingPointers.size > 0 && (heldRows.length > 0 || chosenRows.length > 0)) pressingPointers.clear()
+    }, { passive: true, capture: true })
     document.addEventListener('touchend', (ev) => {
         if (isAppLockInputBlocked()) { pressingPointers.clear(); return }
+        const selection = document.getSelection()
+        const selecting = !!selection && !selection.isCollapsed
         for(const touch of ev.changedTouches){
             const d = pressingPointers.get(touch.identifier)
             pressingPointers.delete(touch.identifier)
-            if (!d) continue
+            if (!d || selecting) continue
             const moveX = touch.clientX - d.x
             const moveY = touch.clientY - d.y
+            if (moveX > 0 ? d.scrollRoom.right : d.scrollRoom.left) continue
 
             if(moveX > 50 && Math.abs(moveY) < Math.abs(moveX)){
                 if(get(selectedCharID) === -1){
