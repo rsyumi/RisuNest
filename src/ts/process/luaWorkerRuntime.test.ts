@@ -114,9 +114,10 @@ test('preserves async rejection handling and parallel promise completion', async
     expect(await runtime.invoke('onOutput', [])).toBe('handled:ab')
 })
 
-test('returns independent decoded views and observes changed JSON and overridden decoders', async () => {
+test('returns independent decoded views, observes changed JSON and overridden decoders, and ignores a script decodeJSON', async () => {
     let text = '[{"data":"original","nested":[1,2]}]'
     const runtime = await create(`
+        function decodeJSON(_) return {{data='script', nested={0}}} end
         function read()
             local a = getFullChat('id')
             a[1].data = 'local'
