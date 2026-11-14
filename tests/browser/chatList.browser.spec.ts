@@ -1,5 +1,5 @@
 import { test, expect } from './fixture'
-import type { Locator, Page } from '@playwright/test'
+import { devices, type Locator, type Page } from '@playwright/test'
 import { touchHoldMs } from '../../src/ts/gui/touchHold'
 
 type Point = { x: number, y: number }
@@ -152,27 +152,35 @@ test.describe('chat list by touch', () => {
         await expect.poll(async () => (await listed(page))['First folder']).toEqual(['Chat 14'])
     })
 
-    test('marks the held chat, the slot it lands in, and the copy under the finger', async ({ page }) => {
-        await open(page)
-        // The copy that follows the finger is the only fixed row.
-        const marks = () => chat(page, 'Chat 3').evaluateAll(rows => Object.fromEntries(rows.map(row => {
-            const style = getComputedStyle(row)
-            return [style.position === 'fixed' ? 'following' : 'listed', {
-                outline: style.outlineStyle,
-                opacity: style.opacity,
-                text: getComputedStyle(row.firstElementChild!).opacity,
-            }]
-        })))
-        await touchDrag(page, chat(page, 'Chat 3'), async (move) => {
-            await move(await middle(chat(page, 'Chat 1')))
-            await expect.poll(marks).toEqual({
-                listed: { outline: 'dashed', opacity: '1', text: '0.45' },
-                following: { outline: 'solid', opacity: '1', text: '1' },
+    test.describe('on a phone', () => {
+        // Sortable drags the rows itself on Android and never marks them draggable, so nothing else keeps their text from being selected.
+        test.use({ userAgent: devices['Pixel 7'].userAgent })
+
+        test('marks the held chat, the slot it lands in, and the copy under the finger', async ({ page }) => {
+            await open(page)
+            // The copy that follows the finger is the only fixed row.
+            const marks = () => chat(page, 'Chat 3').evaluateAll(rows => Object.fromEntries(rows.map(row => {
+                const style = getComputedStyle(row)
+                return [style.position === 'fixed' ? 'following' : 'listed', {
+                    outline: style.outlineStyle,
+                    opacity: style.opacity,
+                    text: getComputedStyle(row.firstElementChild!).opacity,
+                    // A finger at rest on the held chat must not start a text selection, which takes the touch on Android.
+                    select: style.userSelect,
+                }]
+            })))
+            expect(await marks()).toEqual({ listed: { outline: 'none', opacity: '1', text: '1', select: 'auto' } })
+            await touchDrag(page, chat(page, 'Chat 3'), async (move) => {
+                await move(await middle(chat(page, 'Chat 1')))
+                await expect.poll(marks).toEqual({
+                    listed: { outline: 'dashed', opacity: '1', text: '0.45', select: 'none' },
+                    following: { outline: 'solid', opacity: '1', text: '1', select: 'none' },
+                })
+            }, async () => {
+                await expect.poll(marks).toEqual({ listed: { outline: 'solid', opacity: '1', text: '1', select: 'none' } })
             })
-        }, async () => {
-            await expect.poll(marks).toEqual({ listed: { outline: 'solid', opacity: '1', text: '1' } })
+            await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': [], outside: ['Chat 3', 'Chat 1', 'Chat 2'] })
         })
-        await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': [], outside: ['Chat 3', 'Chat 1', 'Chat 2'] })
     })
 })
 

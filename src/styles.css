@@ -679,11 +679,15 @@ details[data-risu-streaming-thought] {
   }
 }
 
-/* A touched row of a sortable list once the hold is long enough to drag it. */
+/* A touched row of a sortable list once the hold is long enough to drag it.
+   A finger that rests on it longer would start a text selection on Android, which takes the touch from the drag. */
 .risu-sort-held {
   background-color: var(--risu-theme-darkbutton);
   outline: 1px solid var(--risu-theme-borderc);
   outline-offset: -1px;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* The slot a dragged row lands in, and a row that stays in place while its card is dragged. */
