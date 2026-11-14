@@ -10,10 +10,11 @@
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import { type triggerEffectV2, type triggerEffect, type triggerscript, displayAllowList, requestAllowList, type triggerV2IfAdvanced } from "src/ts/process/triggers";
-    import { onDestroy, onMount } from "svelte";
+    import { onDestroy, onMount, tick } from "svelte";
     import { isCompositionKey, shortcutModifier } from 'src/ts/hotkeyModifier';
     import { DBState } from "src/ts/stores.svelte";
     import { RISU_EFFECT_DRAG_TYPE, RISU_TRIGGER_DRAG_TYPE } from "src/ts/dragTypes";
+    import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
     import { downloadFile } from "src/ts/globalApi.svelte";
     import { selectDomFiles } from 'src/ts/storage/fileSelection';
 
@@ -163,6 +164,7 @@
     let selectMode = $state(0) //0 = trigger 1 = effect
     let contextMenu = $state(false)
     let contextMenuLoc = $state({x: 0, y: 0, style: ''})
+    let contextMenuElement = $state<HTMLDivElement | null>(null)
     let selectedTriggerIndex = $state(0)
     let selectedEffectIndexSaved = $state(-1)
     let effectElements = $state<HTMLButtonElement[]>([])
@@ -1785,8 +1787,9 @@
         return e.dataTransfer?.types.includes(RISU_TRIGGER_DRAG_TYPE) ?? false;
     }
 
+    // Touch drags scroll the list through htmlTouchDrag.
     const handleTriggerAutoScroll = (e: DragEvent) => {
-        if (!isMobileScreen && isDragging && triggerScrollRef && isTriggerDrag(e)) {
+        if (e.isTrusted && isDragging && triggerScrollRef && isTriggerDrag(e)) {
             const rect = triggerScrollRef.getBoundingClientRect()
             const autoScrollDirection = scrollManager.checkAutoScrollZone(e.clientY, rect)
 
@@ -1799,7 +1802,7 @@
     }
 
     const handleTriggerDragOver = (e: DragEvent) => {
-        if (!isMobileScreen && isTriggerDrag(e)) {
+        if (isTriggerDrag(e)) {
             handleTriggerAutoScroll(e)
             e.preventDefault()
             e.stopPropagation()
@@ -2000,7 +2003,7 @@
     }
 
     const handleEffectAutoScroll = (e: DragEvent) => {
-        if (!isMobileScreen && isEffectDragging && menu0Container && isEffectDrag(e)) {
+        if (e.isTrusted && isEffectDragging && menu0Container && isEffectDrag(e)) {
             const rect = menu0Container.getBoundingClientRect()
             const autoScrollDirection = scrollManager.checkAutoScrollZone(e.clientY, rect)
 
@@ -2013,7 +2016,7 @@
     }
 
     const handleEffectDragOver = (e: DragEvent) => {
-        if (!isMobileScreen && isEffectDragging && isEffectDrag(e)) {
+        if (isEffectDragging && isEffectDrag(e)) {
             handleEffectAutoScroll(e)
             e.preventDefault()
             e.stopPropagation()
@@ -2192,6 +2195,17 @@
         
         e.preventDefault()
         e.stopPropagation()
+        void tick().then(fitContextMenu)
+    }
+
+    // Narrow screens can leave the anchored menu partly outside the viewport.
+    const fitContextMenu = () => {
+        if (!contextMenu || !contextMenuElement) return
+        const rect = contextMenuElement.getBoundingClientRect()
+        const dx = Math.max(-rect.left, Math.min(0, window.innerWidth - rect.right))
+        const dy = Math.max(-rect.top, Math.min(0, window.innerHeight - rect.bottom))
+        if (dx === 0 && dy === 0) return
+        contextMenuLoc.style = `top: ${contextMenuElement.offsetTop + dy}px; left: ${contextMenuElement.offsetLeft + dx}px;`
     }
 
     const formatEffectDisplay = (effect:triggerEffect) => {
@@ -2273,13 +2287,21 @@
             }
         }
         
+        const handleGlobalTouchStart = (e: TouchEvent) => {
+            if (contextMenu && !(e.target instanceof Node && contextMenuElement?.contains(e.target))) {
+                contextMenu = false
+            }
+        }
+        
         document.addEventListener('click', handleGlobalClick, true);
         document.addEventListener('contextmenu', handleGlobalContextMenu, true);
+        document.addEventListener('touchstart', handleGlobalTouchStart, { capture: true, passive: true });
         
         return () => {
             window.removeEventListener('resize', checkMobileScreen)
             document.removeEventListener('click', handleGlobalClick, true);
             document.removeEventListener('contextmenu', handleGlobalContextMenu, true);
+            document.removeEventListener('touchstart', handleGlobalTouchStart, true);
         }
     })
 
@@ -2329,7 +2351,7 @@
          }}
     >
         {#if contextMenu}
-            <div class="absolute flex-col gap-2 w-28 p-2 flex bg-darkbg border border-darkborderc rounded-md z-50" style={contextMenuLoc.style} 
+            <div class="absolute flex-col gap-2 w-28 p-2 flex bg-darkbg border border-darkborderc rounded-md z-50" style={contextMenuLoc.style} bind:this={contextMenuElement}
                  onclick={(e) => {
                      e.stopPropagation()
                  }}
@@ -2451,9 +2473,13 @@
             {#if menuMode === 0}
                 <div class="pr-2 md:w-96 flex flex-col md:h-full mt-2 md:mt-0">
                     <div class="flex-1 flex flex-col overflow-y-auto" bind:this={triggerScrollRef} onscroll={scrollManager.handleTriggerScroll} 
+                         use:htmlTouchDrag
+                         ondragenter={(e) => {
+                             if (isTriggerDrag(e)) e.preventDefault()
+                         }}
                          ondragover={handleTriggerDragOver}
                          ondragleave={(e) => {
-                             if (!isMobileScreen) {
+                             if (isDragging) {
                                  const rect = e.currentTarget.getBoundingClientRect()
                                  const mouseX = e.clientX
                                  const mouseY = e.clientY
@@ -2470,15 +2496,15 @@
                                 <!-- Header, skip the first trigger -->
                             {:else}
                                                         <div class="w-full h-0.5 min-h-0.5 transition-all duration-200" 
-                            class:hover:bg-gray-600={!isMobileScreen && !isDragging}
+                            class:hover:bg-darkborderc={!isMobileScreen && !isDragging}
                             class:h-0.5={!isDragging || dragOverIndex !== i}
                             class:h-1={isDragging && dragOverIndex === i}
-                            class:bg-blue-500={isDragging && dragOverIndex === i}
+                            class:bg-borderc={isDragging && dragOverIndex === i}
                             class:shadow-lg={isDragging && dragOverIndex === i}
                             role="listitem"
                             ondragover={handleTriggerDragOver}
                             ondrop={(e) => {
-                                if (!isMobileScreen) {
+                                if (isDragging) {
                                     handleTriggerDrop(i, e)
                                     dragOverIndex = -1
                                 }
@@ -2495,12 +2521,8 @@
                                     class:bg-darkbg={selectedIndex === i && !isMultipleSelected()}
                                     class:bg-selected={isTriggerSelected(i)}
                                     style="user-select: none;"
-                                    draggable={!isMobileScreen}
+                                    draggable="true"
                                     ondragstart={(e) => {
-                                        if (isMobileScreen) {
-                                            e.preventDefault()
-                                            return
-                                        }
                                         isDragging = true
                                         markTriggerDrag(e, i)
                                         
@@ -2524,7 +2546,7 @@
                                         scrollManager.stopAutoScroll()
                                     }}
                                     ondragover={(e) => {
-                                        if (!isMobileScreen && isTriggerDrag(e)) {
+                                        if (isTriggerDrag(e)) {
                                             handleTriggerDragOver(e)
                                             const rect = e.currentTarget.getBoundingClientRect()
                                             const mouseY = e.clientY
@@ -2538,7 +2560,7 @@
                                         }
                                     }}
                                     ondragleave={(e) => {
-                                        if (!isMobileScreen) {
+                                        if (isDragging) {
                                             const rect = e.currentTarget.getBoundingClientRect()
                                             const mouseX = e.clientX
                                             const mouseY = e.clientY
@@ -2550,7 +2572,7 @@
                                         }
                                     }}
                                     ondrop={(e) => {
-                                        if (!isMobileScreen) {
+                                        if (isDragging) {
                                             handleTriggerDrop(dragOverIndex, e)
                                             dragOverIndex = -1
                                         }
@@ -2563,26 +2585,26 @@
                                         handleContextMenu(e, 0, i)
                                     }}
                                 >
-                                    {trigger?.comment || 'Unnamed Trigger'}
+                                    <span>{trigger?.comment || 'Unnamed Trigger'}</span>
                                 </button>
                             {/if}
                         {/each}
                         
                         <div class="w-full h-0.5 min-h-0.5 transition-all duration-200" 
-                            class:hover:bg-gray-600={!isMobileScreen && !isDragging}
+                            class:hover:bg-darkborderc={!isMobileScreen && !isDragging}
                             class:h-0.5={!isDragging || dragOverIndex !== value.length}
                             class:h-1={isDragging && dragOverIndex === value.length}
-                            class:bg-blue-500={isDragging && dragOverIndex === value.length}
+                            class:bg-borderc={isDragging && dragOverIndex === value.length}
                             class:shadow-lg={isDragging && dragOverIndex === value.length}
                             role="listitem"
                             ondragover={(e) => {
-                                if (!isMobileScreen && isTriggerDrag(e)) {
+                                if (isTriggerDrag(e)) {
                                     handleTriggerDragOver(e)
                                     dragOverIndex = value.length
                                 }
                             }} 
                             ondrop={(e) => {
-                                if (!isMobileScreen) {
+                                if (isDragging) {
                                     handleTriggerDrop(value.length, e)
                                     dragOverIndex = -1
                                 }
@@ -2671,11 +2693,16 @@
                         </div>
                     </div> -->
                     
+                    <!-- A held effect or add button opens its context menu; only the grip moves an effect. -->
                     <div class="border border-darkborderc mx-2 mb-2 rounded-md flex-1 overflow-x-hidden overflow-y-auto relative" bind:this={menu0Container}
                          onscroll={scrollManager.handleMenu0Scroll}
+                         use:htmlTouchDrag={{ source: '[draggable="true"], button', item: '[data-effect-row]' }}
+                         ondragenter={(e) => {
+                             if (isEffectDragging && isEffectDrag(e)) e.preventDefault()
+                         }}
                          ondragover={handleEffectDragOver}
                          ondragleave={(e) => {
-                             if (!isMobileScreen && isEffectDragging) {
+                             if (isEffectDragging) {
                                  const rect = e.currentTarget.getBoundingClientRect()
                                  const mouseX = e.clientX
                                  const mouseY = e.clientY
@@ -2721,26 +2748,26 @@
                         
                         {#each (value && value[selectedIndex] && value[selectedIndex].effect) ? value[selectedIndex].effect : [] as effect, i}
                             <div class="w-full h-0.5 min-h-0.5 transition-all duration-200" 
-                                class:hover:bg-gray-600={!isMobileScreen && !isEffectDragging}
+                                class:hover:bg-darkborderc={!isMobileScreen && !isEffectDragging}
                                 class:h-0.5={!isEffectDragging || effectDragOverIndex !== i}
                                 class:h-1={isEffectDragging && effectDragOverIndex === i}
-                                class:bg-blue-500={isEffectDragging && effectDragOverIndex === i}
+                                class:bg-borderc={isEffectDragging && effectDragOverIndex === i}
                                 class:shadow-lg={isEffectDragging && effectDragOverIndex === i}
                                 role="listitem"
                                 ondragover={handleEffectDragOver}
                                 ondrop={(e) => {
-                                    if (!isMobileScreen && isEffectDragging) {
+                                    if (isEffectDragging) {
                                         handleEffectDrop(i, e)
                                         effectDragOverIndex = -1
                                     }
                                 }}>
                             </div>
 
-                            <div class="flex items-center w-full relative"
+                            <div class="flex items-center w-full relative" data-effect-row
                                 class:hover:bg-selected={selectedEffectIndex !== i}
                                 class:bg-selected={selectedEffectIndex === i}
                                 ondragover={(e) => {
-                                    if (!isMobileScreen && isEffectDragging && isEffectDrag(e)) {
+                                    if (isEffectDragging && isEffectDrag(e)) {
                                         handleEffectDragOver(e)
                                         const rect = e.currentTarget.getBoundingClientRect()
                                         const mouseY = e.clientY
@@ -2754,7 +2781,7 @@
                                     }
                                 }}
                                 ondragleave={(e) => {
-                                    if (!isMobileScreen && isEffectDragging) {
+                                    if (isEffectDragging) {
                                         const rect = e.currentTarget.getBoundingClientRect()
                                         const mouseX = e.clientX
                                         const mouseY = e.clientY
@@ -2766,7 +2793,7 @@
                                     }
                                 }}
                                 ondrop={(e) => {
-                                    if (!isMobileScreen && isEffectDragging) {
+                                    if (isEffectDragging) {
                                         handleEffectDrop(effectDragOverIndex, e)
                                         effectDragOverIndex = -1
                                     }
@@ -2786,6 +2813,7 @@
                                         lastClickTime = Date.now()
                                         selectedEffectIndex = i
                                     }}
+                                    ondragstart={(e) => e.preventDefault()}
                                     oncontextmenu={(e) => handleContextMenu(e, 1, i, effect)}
                                 >
                                     {#if effect.type === 'v2EndIndent'}
@@ -2797,7 +2825,7 @@
                                 
                                 {#if effect.type !== 'v2EndIndent' && effect.type !== 'v2Else'}
                                     <div class="w-8 h-full flex items-center justify-center cursor-move opacity-30 hover:opacity-70 transition-opacity"
-                                         draggable={!isMobileScreen}
+                                         draggable="true"
                                          onclick={(e) => {
                                              e.stopPropagation();
                                          }}
@@ -2806,10 +2834,6 @@
                                              e.preventDefault();
                                          }}
                                          ondragstart={(e) => {
-                                             if (isMobileScreen) {
-                                                 e.preventDefault()
-                                                 return
-                                             }
                                              isEffectDragging = true
                                              markEffectDrag(e, i)
                                              
@@ -2839,15 +2863,15 @@
                         {/each}
                         
                         <div class="w-full h-0.5 min-h-0.5 transition-all duration-200" 
-                            class:hover:bg-gray-600={!isMobileScreen && !isEffectDragging}
+                            class:hover:bg-darkborderc={!isMobileScreen && !isEffectDragging}
                             class:h-0.5={!isEffectDragging || effectDragOverIndex !== (value && value[selectedIndex] && value[selectedIndex].effect ? value[selectedIndex].effect.length : 0)}
                             class:h-1={isEffectDragging && effectDragOverIndex === (value && value[selectedIndex] && value[selectedIndex].effect ? value[selectedIndex].effect.length : 0)}
-                            class:bg-blue-500={isEffectDragging && effectDragOverIndex === (value && value[selectedIndex] && value[selectedIndex].effect ? value[selectedIndex].effect.length : 0)}
+                            class:bg-borderc={isEffectDragging && effectDragOverIndex === (value && value[selectedIndex] && value[selectedIndex].effect ? value[selectedIndex].effect.length : 0)}
                             class:shadow-lg={isEffectDragging && effectDragOverIndex === (value && value[selectedIndex] && value[selectedIndex].effect ? value[selectedIndex].effect.length : 0)}
                             role="listitem"
                             ondragover={handleEffectDragOver}
                             ondrop={(e) => {
-                                if (!isMobileScreen && isEffectDragging) {
+                                if (isEffectDragging) {
                                     handleEffectDrop(value && value[selectedIndex] && value[selectedIndex].effect ? value[selectedIndex].effect.length : 0, e)
                                     effectDragOverIndex = -1
                                 }
@@ -2865,7 +2889,7 @@
                                 menuMode = 1
                             }
                             lastClickTime = Date.now()
-                        }} oncontextmenu={(e) => handleContextMenu(e, 1)}>
+                        }} ondragstart={(e) => e.preventDefault()} oncontextmenu={(e) => handleContextMenu(e, 1)}>
                             ...
                         </button>
                     </div>

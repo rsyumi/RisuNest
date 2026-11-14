@@ -18,6 +18,7 @@
     import { onDestroy, onMount } from "svelte";
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
+    import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
 
     let warns: string[] = $state([])
     let tokens = $state(0)
@@ -125,7 +126,7 @@
 {/if}
 
 {#if subMenu === 0}
-    <div class="contain w-full max-w-full mt-4 flex flex-col p-3 rounded-md">
+    <div class="contain w-full max-w-full mt-4 flex flex-col p-3 rounded-md" use:htmlTouchDrag>
         {#if DBState.db.promptTemplate.length === 0}
                 <div class="text-textcolor2">No Format</div>
         {/if}

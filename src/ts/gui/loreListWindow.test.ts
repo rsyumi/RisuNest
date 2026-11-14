@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest'
 import {
+    dropLoreOnFolder,
     groupLoreFolders,
     loreDropIndex,
     loreListWindow,
@@ -46,6 +47,40 @@ it('keeps a moved folder together with children that precede its new position', 
     const orphan = { folder: 'missing' } as loreBook
     const other = {} as loreBook
     expect(groupLoreFolders([child, other, folder, orphan])).toEqual([other, folder, child, orphan])
+})
+
+it('drops a row on a folder as the first of its entries', () => {
+    const keys = (rows: loreBook[] | null) => rows?.map(row => row.key) ?? null
+    const lore = () => [
+        { mode: 'folder', key: 'f' },
+        { key: 'c', folder: 'f' },
+        { mode: 'folder', key: 'g' },
+        { key: 'oc', folder: 'g' },
+        { key: 'r' },
+    ] as loreBook[]
+    const fromRoot = lore()
+    expect(keys(dropLoreOnFolder(fromRoot, 4, 'f'))).toEqual(['f', 'r', 'c', 'g', 'oc'])
+    expect(fromRoot[4].folder).toBe('f')
+    const fromFolder = lore()
+    expect(keys(dropLoreOnFolder(fromFolder, 3, 'f'))).toEqual(['f', 'oc', 'c', 'g', 'r'])
+    expect(fromFolder[3].folder).toBe('f')
+    // Entries stored ahead of their folder row still list after the dropped one.
+    const [folder, child, , , root] = lore()
+    expect(keys(dropLoreOnFolder([child, root, folder], 1, 'f'))).toEqual(['f', 'r', 'c'])
+})
+
+it('refuses a folder, an unknown folder, and a row already first in the folder', () => {
+    const folder = { mode: 'folder', key: 'f' } as loreBook
+    const other = { mode: 'folder', key: 'g' } as loreBook
+    const child = { key: 'c', folder: 'f' } as loreBook
+    const root = { key: 'r' } as loreBook
+    const items = [folder, child, other, root]
+    expect(dropLoreOnFolder(items, 2, 'f')).toBeNull()
+    expect(other.folder).toBeUndefined()
+    expect(dropLoreOnFolder(items, 3, 'missing')).toBeNull()
+    expect(dropLoreOnFolder(items, 3, 'c')).toBeNull()
+    expect(root.folder).toBeUndefined()
+    expect(dropLoreOnFolder(items, 1, 'f')).toBeNull()
 })
 
 it('keeps pinned rows from other pages mounted at the requested edge', () => {

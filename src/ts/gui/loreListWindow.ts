@@ -61,6 +61,24 @@ export function loreDropIndex(
     )
 }
 
+/** Puts the row at `source` into the folder, first among its entries. Null when the folder cannot take it or nothing changes. */
+export function dropLoreOnFolder(
+    items: readonly loreBook[],
+    source: number,
+    folderKey: string | null,
+): loreBook[] | null {
+    const moved = items[source]
+    const folder = items.find(item => item.mode === 'folder' && item.key === folderKey)
+    if (!moved || !folder || moved.mode === 'folder') return null
+    if (items.find(item => item.folder === folder.key) === moved) return null
+    moved.folder = folder.key
+    const others = items.filter((_, index) => index !== source)
+    // A folder lists its entries in array order, which may not follow the folder row.
+    const firstEntry = others.findIndex(item => item.folder === folder.key)
+    others.splice(firstEntry === -1 ? others.indexOf(folder) + 1 : firstEntry, 0, moved)
+    return groupLoreFolders(others)
+}
+
 export function groupLoreFolders(items: loreBook[]): loreBook[] {
     const children = new Map<string, loreBook[]>()
     const folders = new Set(items.filter(item => item.mode === 'folder').map(item => item.key))

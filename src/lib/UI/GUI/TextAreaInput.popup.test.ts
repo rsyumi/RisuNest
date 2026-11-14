@@ -79,6 +79,52 @@ describe('text area popup editor button', () => {
         expect(textEditorPopup.request?.value).toBe('Field text')
     })
 
+    it('opens the popup editor once from a touch hold only when that option is on', async () => {
+        vi.useFakeTimers()
+        const touch = (field: HTMLTextAreaElement, type: string) => {
+            const point = { identifier: 1, clientX: 20, clientY: 20, target: field }
+            const event = new Event(type, { bubbles: true, cancelable: true })
+            Object.defineProperties(event, {
+                touches: { value: type === 'touchend' ? [] : [point] },
+                changedTouches: { value: [point] },
+            })
+            field.dispatchEvent(event)
+            if (type === 'touchstart') vi.advanceTimersByTime(500)
+            return event
+        }
+        const menus = vi.fn()
+        document.addEventListener('contextmenu', menus)
+        try {
+            DBState.db.longPressToPopupEditor = undefined
+            const off = (await input({})).target.querySelector('textarea')!
+            touch(off, 'touchstart')
+            expect(touch(off, 'touchend').defaultPrevented).toBe(false)
+            expect(menus).not.toHaveBeenCalled()
+            expect(textEditorPopup.request).toBeNull()
+            await unmount(component!)
+            component = undefined
+
+            // iOS raises no contextmenu for a long press.
+            DBState.db.longPressToPopupEditor = true
+            const field = (await input({})).target.querySelector('textarea')!
+            touch(field, 'touchstart')
+            expect(touch(field, 'touchend').defaultPrevented).toBe(true)
+            expect(textEditorPopup.request?.value).toBe('Field text')
+
+            // Android raises its own during the hold.
+            textEditorPopup.request = null
+            touch(field, 'touchstart')
+            field.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+            const opened = textEditorPopup.request
+            expect(opened?.value).toBe('Field text')
+            touch(field, 'touchend')
+            expect(textEditorPopup.request).toBe(opened)
+        } finally {
+            document.removeEventListener('contextmenu', menus)
+            vi.useRealTimers()
+        }
+    })
+
     it('does not open another popup editor from a field inside the popup editor', async () => {
         const target = document.createElement('div')
         document.body.append(target)

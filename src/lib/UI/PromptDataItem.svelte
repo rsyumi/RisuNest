@@ -126,6 +126,9 @@
         dragOverIndex = currentIndex
         onDrop()
     }}
+    ondragenter={(e) => {
+        if(isPromptDrag(e)) e.preventDefault()
+    }}
     ondragover={(e) => {
         if(!isPromptDrag(e)){
             return
@@ -144,6 +147,9 @@
     class:scale-95={isDragging}
     class:border-b-borderc={draggedIndex !== -1 && dragOverIndex === currentIndex + 1}
 
+    ondragenter={(e) => {
+        if(isPromptDrag(e)) e.preventDefault()
+    }}
     ondragover={(e) => {
         if(!isPromptDrag(e)){
             return

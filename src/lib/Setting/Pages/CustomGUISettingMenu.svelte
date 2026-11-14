@@ -1,4 +1,6 @@
 <script lang="ts">
+    import { contextHold } from 'src/ts/gui/contextHold'
+
     interface CustomTree {
         name: string; // dom name, like div, span, etc. for component, we use 'component'
         type: string; // type, used for identifying in editor
@@ -101,16 +103,15 @@
                         selectedContatiner = treeChain
                         renderMainTree(tree)
                         break
-                    case 2:
-                        tree = removeTreeChain(tree, treeChain)
-                        renderMainTree(tree)
-                        break
                 }
             })
 
+            // Right click and a touch hold both remove the node.
             element.addEventListener('contextmenu', (e) => {
                 e.preventDefault()
                 e.stopPropagation()
+                tree = removeTreeChain(tree, treeChain)
+                renderMainTree(tree)
             })
 
         }
@@ -230,6 +231,7 @@
         e.preventDefault()
         oncontextmenu?.(e)
     }}
+    use:contextHold
     bind:this={mainTree}
 >
     

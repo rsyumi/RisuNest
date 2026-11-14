@@ -12,6 +12,7 @@ import { createSelectedConversationOperations } from 'src/ts/selectedConversatio
 import { SynchronousSessionConversationViewportSource } from 'src/ts/conversationViewportSource'
 import type { SelectedConversationTarget } from 'src/ts/storage/activeWorkingSet.svelte'
 import { cancelTextEditorPopup, textEditorPopup } from 'src/ts/gui/textEditorPopup.svelte'
+import { touchHoldMs } from 'src/ts/gui/touchHold'
 import { discardEditorDraftsExcept, keepEditorDraft, pendingEditorDrafts, type ChatEditorDraft } from 'src/ts/chatEditorDrafts'
 import { chatScreenState } from 'src/ts/ui/chatScreenState.svelte'
 import { language } from 'src/lang'
@@ -1492,21 +1493,30 @@ describe('Chat frozen capture presentation', () => {
         expect((mounted as { hasActiveEditor(): boolean }).hasActiveEditor()).toBe(false)
     })
 
-    test.each(['saved', 'refused'] as const)(
-        'keeps the draft when a long press closes the original editor and the save is %s',
-        async (outcome) => {
+    test.each([
+        { pointerType: 'mouse', layout: 'default', db: { theme: '' }, outcome: 'saved' },
+        { pointerType: 'mouse', layout: 'default', db: { theme: '' }, outcome: 'refused' },
+        // Without the message buttons a finger hold is the only way to finish the edit.
+        { pointerType: 'touch', layout: 'mobilechat', db: { theme: 'mobilechat' }, outcome: 'saved' },
+        { pointerType: 'touch', layout: 'custom HTML without buttons', db: { theme: 'customHTML', guiHTML: '<risutextbox></risutextbox>' }, outcome: 'saved' },
+        // With them a finger hold on the editor is left to text selection.
+        { pointerType: 'touch', layout: 'default', db: { theme: '' }, outcome: 'left open' },
+        { pointerType: 'touch', layout: 'custom HTML with buttons', db: { theme: 'customHTML', guiHTML: '<risubuttons></risubuttons><risutextbox></risutextbox>' }, outcome: 'left open' },
+    ] as const)(
+        'keeps the draft when a $pointerType long press on the original editor in the $layout layout is $outcome',
+        async ({ pointerType, db, outcome }) => {
             const harness = makeWindowedEditHarness()
             if (outcome === 'refused') {
                 harness.acquireCompleteMessageTargetForIntent.mockResolvedValueOnce(null as never)
             }
             live.db = {
                 ...live.db,
-                theme: '',
+                ...db,
                 characters: [harness.metadataCharacter],
                 translator: '',
                 useChatCopy: false,
                 enableBookmark: false,
-                clickToEdit: false,
+                clickToEdit: true,
                 risunestChatEditPopup: false,
             }
             mounted = mount(Chat, {
@@ -1530,30 +1540,40 @@ describe('Chat frozen capture presentation', () => {
                 },
             })
 
-            const editButton = await vi.waitFor(() => {
-                const button = target.querySelector<HTMLButtonElement>('.button-icon-edit')
-                expect(button).not.toBeNull()
-                return button!
+            const body = await vi.waitFor(() => {
+                const text = target.querySelector<HTMLElement>('.chattext')
+                expect(text).not.toBeNull()
+                return text!
             })
-            editButton.click()
+            body.click()
             const editor = await vi.waitFor(() => {
                 const textarea = target.querySelector<HTMLTextAreaElement>('.message-edit-area')
                 expect(textarea).not.toBeNull()
                 return textarea!
             })
+            // A finger hold saves exactly in the layouts that show no edit button.
+            expect(target.querySelector('.button-icon-edit') === null).toBe(pointerType === 'touch' && outcome === 'saved')
             editor.value = 'Kept after long press'
             editor.dispatchEvent(new Event('input', { bubbles: true }))
 
             vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-            editor.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
-            await vi.advanceTimersByTimeAsync(500)
+            editor.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType, isPrimary: true, button: 0 }))
+            await vi.advanceTimersByTimeAsync(touchHoldMs)
             vi.useRealTimers()
 
+            const hasActiveEditor = () =>
+                (mounted as { hasActiveEditor(): boolean }).hasActiveEditor()
+            if (outcome === 'left open') {
+                await tick()
+                expect(harness.acquireCompleteMessageTargetForIntent).not.toHaveBeenCalled()
+                expect(hasActiveEditor()).toBe(true)
+                expect(target.querySelector<HTMLTextAreaElement>('.message-edit-area')?.value)
+                    .toBe('Kept after long press')
+                return
+            }
             await vi.waitFor(() => expect(
                 harness.acquireCompleteMessageTargetForIntent,
             ).toHaveBeenCalledWith(expect.objectContaining({ rowKey: 'row-1' }), 'edit-message'))
-            const hasActiveEditor = () =>
-                (mounted as { hasActiveEditor(): boolean }).hasActiveEditor()
             if (outcome === 'saved') {
                 await vi.waitFor(() => {
                     expect(harness.completeConversation.message[1].data).toBe('Kept after long press')

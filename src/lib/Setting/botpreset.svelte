@@ -20,6 +20,7 @@
     import { ShowRealmFrameStore } from "src/ts/stores.svelte";
     import PromptDiffModal from "../Others/PromptDiffModal.svelte";
     import { RISU_PRESET_DRAG_TYPE } from "src/ts/dragTypes";
+    import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
     import { reportPresetOperation } from './presetOperation';
     import { assertPresetNames, capturePresetNames, type PresetListExpectation } from '../../ts/storage/presetWorkingSetOperations';
 
@@ -112,7 +113,7 @@
 </script>
 
 <div class="absolute w-full h-full z-40 bg-black/50 flex justify-center items-center">
-    <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-124 max-h-full overflow-y-auto">
+    <div class="bg-darkbg p-4 break-any rounded-md flex flex-col max-w-3xl w-124 max-h-full overflow-y-auto" use:htmlTouchDrag>
         <div class="flex items-center text-textcolor mb-4">
             <h2 class="mt-0 mb-0">{language.presets}</h2>
             <div class="grow flex justify-end">
@@ -125,10 +126,13 @@
             <div class="w-full transition-all duration-200"
                 class:h-0.5={!isDragging || dragOverIndex !== i}
                 class:h-1={isDragging && dragOverIndex === i}
-                class:bg-blue-500={isDragging && dragOverIndex === i}
+                class:bg-borderc={isDragging && dragOverIndex === i}
                 class:shadow-lg={isDragging && dragOverIndex === i}
-                class:hover:bg-gray-600={!isDragging}
+                class:hover:bg-darkborderc={!isDragging}
                 role="listitem"
+                ondragenter={(e) => {
+                    if (isPresetDrag(e)) e.preventDefault()
+                }}
                 ondragover={(e) => {
                     if (!isPresetDrag(e)) {
                         return
@@ -177,6 +181,9 @@
             ondragend={(e) => {
                 isDragging = false
                 dragOverIndex = -1
+            }}
+            ondragenter={(e) => {
+                if (isPresetDrag(e)) e.preventDefault()
             }}
             ondragover={(e) => {
                 if (!isPresetDrag(e)) {
@@ -287,10 +294,13 @@
         <div class="w-full transition-all duration-200"
             class:h-0.5={!isDragging || dragOverIndex !== DBState.db.botPresets.length}
             class:h-1={isDragging && dragOverIndex === DBState.db.botPresets.length}
-            class:bg-blue-500={isDragging && dragOverIndex === DBState.db.botPresets.length}
+            class:bg-borderc={isDragging && dragOverIndex === DBState.db.botPresets.length}
             class:shadow-lg={isDragging && dragOverIndex === DBState.db.botPresets.length}
-            class:hover:bg-gray-600={!isDragging}
+            class:hover:bg-darkborderc={!isDragging}
             role="listitem"
+            ondragenter={(e) => {
+                if (isPresetDrag(e)) e.preventDefault()
+            }}
             ondragover={(e) => {
                 if (!isPresetDrag(e)) {
                     return

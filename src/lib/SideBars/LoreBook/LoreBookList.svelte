@@ -24,14 +24,15 @@
     import { ChevronDownIcon, ChevronUpIcon } from '@lucide/svelte'
     import { language } from "src/lang"
     import ListPager from "src/lib/UI/GUI/ListPager.svelte"
-    import { loreListWindow, loreDropIndex, groupLoreFolders, lorePageOf } from "src/ts/gui/loreListWindow"
+    import { loreListWindow, loreDropIndex, groupLoreFolders, lorePageOf, dropLoreOnFolder } from "src/ts/gui/loreListWindow"
     import { type loreBook } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import LoreBookData from "./LoreBookData.svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
-    import Sortable from 'sortablejs/modular/sortable.core.esm.js';
+    import Sortable from 'sortablejs';
     import { onDestroy, onMount, tick } from "svelte";
     import { sortableOptions } from "src/ts/util";
+    import { abandonSortDrag, destroySortableOnClose, watchSortDrag } from "src/ts/sortableOptions";
     import { v4 } from "uuid";
 
     interface Props {
@@ -63,6 +64,86 @@
     let ele: HTMLDivElement = $state()
     let originalNextSibling: Node | null = null
     let ownSession: LoreDragSession | null = null
+    let draggedRow: HTMLElement | null = null
+    let dragPoint: { x: number, y: number } | null = null
+    let dragWatch: ReturnType<typeof watchSortDrag> | null = null
+    let headerTarget: HTMLElement | null = null
+    let markedRow: Element | null = null
+    let markedList: Element | null = null
+    const dragMoveEvents = ['pointermove', 'touchmove', 'dragover'] as const
+
+    function markHeaderTarget(header: HTMLElement | null, dimSlot: boolean) {
+        const row = header?.closest('[data-risu-idx]') ?? null
+        const list = row?.closest('[data-show-folder=""]') ?? null
+        if (markedRow !== row) markedRow?.removeAttribute('data-lore-drop-target')
+        if (markedList !== list) markedList?.removeAttribute('data-lore-header-drop')
+        headerTarget = header
+        markedRow = row
+        markedList = list
+        row?.setAttribute('data-lore-drop-target', '')
+        list?.toggleAttribute('data-lore-header-drop', dimSlot)
+    }
+
+    function updateHeaderTarget() {
+        const draggingEntry = ownSession && ownSession.book.mode !== 'folder'
+        const under = draggingEntry && dragPoint ? document.elementFromPoint(dragPoint.x, dragPoint.y) : null
+        // A closed folder takes the entry anywhere on its row, an open one on its name row.
+        const row = under?.closest('[data-risu-idx]')
+        const header = under?.closest<HTMLElement>('[data-lore-folder-header]')
+            ?? (row && !row.querySelector('[data-show-folder]') ? row.querySelector<HTMLElement>(':scope > [data-lore-folder-header]') : null)
+        if (header?.closest('[data-risu-idgroup]')?.getAttribute('data-risu-idgroup') !== idgroup) {
+            markHeaderTarget(null, false)
+            return
+        }
+        // A row dropped on a folder lands first in it, where the slot may already be.
+        const slotList = draggedRow?.parentElement
+        const slotTopsFolder = slotList?.getAttribute('data-show-folder') === header.getAttribute('data-lore-folder-header')
+            && !draggedRow?.previousElementSibling
+        markHeaderTarget(header, !slotTopsFolder)
+    }
+
+    function trackDragPoint(event: Event) {
+        const point = 'touches' in event ? (event as TouchEvent).touches[0] : event as MouseEvent
+        if (!point || typeof point.clientX !== 'number') return
+        dragPoint = { x: point.clientX, y: point.clientY }
+        updateHeaderTarget()
+    }
+
+    function startHeaderTracking(row: HTMLElement, original: Event | undefined) {
+        draggedRow = row
+        dragWatch = watchSortDrag()
+        for (const type of dragMoveEvents) document.addEventListener(type, trackDragPoint, { capture: true, passive: true })
+        // The list also moves under a resting pointer while it scrolls.
+        document.addEventListener('scroll', updateHeaderTarget, { capture: true, passive: true })
+        if (original) trackDragPoint(original)
+    }
+
+    /** Briefly outlines the folder row that took a dropped entry. */
+    function showReceived(row: Element | null) {
+        if (!row) return
+        const done = (event: Event) => {
+            if (event.target !== row) return
+            row.removeAttribute('data-lore-received')
+            row.removeEventListener('animationend', done)
+            row.removeEventListener('animationcancel', done)
+        }
+        row.addEventListener('animationend', done)
+        row.addEventListener('animationcancel', done)
+        row.setAttribute('data-lore-received', '')
+    }
+
+    /** Ends the tracking and returns the folder header the row was released on. */
+    function stopHeaderTracking(): HTMLElement | null {
+        for (const type of dragMoveEvents) document.removeEventListener(type, trackDragPoint, true)
+        document.removeEventListener('scroll', updateHeaderTarget, true)
+        const header = headerTarget
+        markHeaderTarget(null, false)
+        dragWatch?.stop()
+        dragWatch = null
+        draggedRow = null
+        dragPoint = null
+        return header
+    }
 
     const createStb = () => {
         stb = Sortable.create(ele, {
@@ -73,10 +154,11 @@
             preventOnFilter: false,
             animation: 150,
             chosenClass: "risu-chosen-item",
-            ghostClass: "risu-ghost-item",
             onMove: (event) => {
                 const moved = currentItems[Number(event.dragged.getAttribute('data-risu-idx'))]
                 if (moved?.mode === 'folder' && event.from !== event.to) return false
+                // Keep the folder row under the pointer while it is the drop target.
+                if (headerTarget) return false
                 return sortableOptions.onMove(event)
             },
             onStart: (event) => {
@@ -96,8 +178,12 @@
                     reanchor: () => { originalNextSibling = item.nextSibling },
                 }
                 dragSession = ownSession
+                startHeaderTracking(item, (event as Sortable.SortableEvent & { originalEvent?: Event }).originalEvent)
             },
+            onChange: updateHeaderTarget,
             onEnd: (event) => {
+                const cancelled = dragWatch?.cancelled(event)
+                const droppedOn = stopHeaderTracking()
                 const session = ownSession
                 ownSession = null
                 if (session && dragSession === session) dragSession = null
@@ -110,7 +196,17 @@
                 const previous = indexOfRow(event.item.previousElementSibling)
                 // Restore Svelte's DOM before changing either folder's keyed list.
                 event.from.insertBefore(event.item, originalNextSibling)
-                if (source === null) return
+                // An abandoned drag changes nothing.
+                if (source === null || cancelled) return
+                if (droppedOn) {
+                    const moved = currentItems[source]
+                    const reordered = dropLoreOnFolder(currentItems, source, droppedOn.getAttribute('data-lore-folder-header'))
+                    if (!reordered) return
+                    currentItems.splice(0, currentItems.length, ...reordered)
+                    revealRequest = { group: idgroup, book: moved }
+                    showReceived(droppedOn.closest('[data-risu-idx]'))
+                    return
+                }
                 if (!session?.flipped && event.from === event.to && event.oldIndex === event.newIndex) return
 
                 const moved = currentItems[source]
@@ -148,6 +244,7 @@
     const onOpen = (isDetail: boolean = true, bookRef?: loreBook) => {
         if (!bookRef || openedRefs.has(bookRef)) return
         if (isDetail && stb) {
+            abandonSortDrag()
             stb.destroy()
             stb = null
         }
@@ -242,7 +339,7 @@
         if (ownSession && dragSession === ownSession) dragSession = null
         if(stb){
             try {
-                stb.destroy()
+                destroySortableOnClose(stb)
             } catch (error) {  }
         }
     })

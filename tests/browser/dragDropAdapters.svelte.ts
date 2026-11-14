@@ -10,3 +10,7 @@ export const tokenizePreset = async () => 0
 export const templateCheck = () => []
 export const getCurrentCharacter = () => DBState.db.characters[0]
 export { sortableOptions } from '../../src/ts/sortableOptions'
+export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+// The persona list only selects through these; what they store is outside the fixture.
+export const saveUserPersona = () => {}
+export const changeUserPersona = (id: number) => { DBState.db.selectedPersona = id }

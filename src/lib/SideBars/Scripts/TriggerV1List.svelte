@@ -3,6 +3,7 @@
   import Sortable from 'sortablejs'
   import type { triggerscript } from 'src/ts/storage/database.svelte'
   import { sortableOptions } from 'src/ts/util'
+  import { abandonSortDrag, destroySortableOnClose, watchSortDrag } from 'src/ts/sortableOptions'
   import { onDestroy, onMount } from 'svelte'
   import TriggerData from './TriggerV1Data.svelte'
 
@@ -15,6 +16,7 @@
   let stb: Sortable = null
   let ele: HTMLDivElement = $state()
   let originalNextSibling: Node | null = null
+  let dragWatch: ReturnType<typeof watchSortDrag> | null = null
   let opened = $state(new Set<triggerscript>())
 
   const createStb = () => {
@@ -25,13 +27,19 @@
       draggable: '> [data-risu-idx2]',
       onStart: (event) => {
           originalNextSibling = event.item.nextSibling
+          dragWatch = watchSortDrag()
       },
       onEnd: (event) => {
+          const cancelled = dragWatch?.cancelled(event)
+          dragWatch?.stop()
+          dragWatch = null
           const newValue = Array.from(ele.children)
               .filter(row => row.hasAttribute('data-risu-idx2'))
               .map(row => value[Number(row.getAttribute('data-risu-idx2'))])
           // Restore Svelte's DOM before applying the new order.
           event.from.insertBefore(event.item, originalNextSibling)
+          // An abandoned drag changes nothing.
+          if (cancelled) return
           value = newValue
       },
       ...sortableOptions,
@@ -42,6 +50,7 @@
       if (opened.has(item)) return
       opened = new Set([...opened, item])
       if (stb) {
+          abandonSortDrag()
           stb.destroy()
           stb = null
       }
@@ -64,7 +73,7 @@
   onDestroy(() => {
     if (stb) {
       try {
-        stb.destroy()
+        destroySortableOnClose(stb)
       } catch (error) {}
     }
   })

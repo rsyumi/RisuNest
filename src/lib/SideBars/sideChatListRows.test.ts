@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
     indexSideChatListRows,
+    moveDroppedChatToFolderTop,
     orderChatsByDroppedRows,
     orderFoldersByDroppedIds,
+    type DroppedChatRow,
 } from './sideChatListRows'
 
 describe('side chat list row indexing', () => {
@@ -107,6 +109,29 @@ describe('side chat list drop ordering', () => {
         expect(orderChatsByDroppedRows(chats, [{ id: 'a', folderId: null }, { id: 'x' }])).toBeNull()
         expect(orderChatsByDroppedRows(chats, [{ id: 'a', folderId: null }, { id: 'a' }])).toBeNull()
         expect(chats[0].folderId).toBe('folder-a')
+    })
+
+    it('puts a chat dropped on a folder first in that folder and keeps every other row', () => {
+        const chats = [chat('a1', 'folder-a'), chat('b1', 'folder-b'), chat('b2', 'folder-b'), chat('free')]
+        const rows: DroppedChatRow[] = [
+            { id: 'a1', folderId: 'folder-a' },
+            { id: 'b1', folderId: 'folder-b' },
+            { id: 'b2', folderId: 'folder-b' },
+            { id: 'free', folderId: null },
+        ]
+        const listed = (dropped: DroppedChatRow[], folders: string[]) => {
+            const indexed = indexSideChatListRows(
+                orderChatsByDroppedRows(chats.map((row) => ({ ...row })), dropped)!,
+                folders.map((id) => ({ id, name: id, folded: false })),
+            )
+            return [...indexed.folders.map((row) => row.chats.map((item) => item.chat.id)), indexed.ungrouped.map((item) => item.chat.id)]
+        }
+        const folders = ['folder-a', 'folder-b', 'folder-empty']
+
+        expect(listed(moveDroppedChatToFolderTop(rows, 'free', 'folder-b'), folders)).toEqual([['a1'], ['free', 'b1', 'b2'], [], []])
+        expect(listed(moveDroppedChatToFolderTop(rows, 'b2', 'folder-b'), folders)).toEqual([['a1'], ['b2', 'b1'], [], ['free']])
+        expect(listed(moveDroppedChatToFolderTop(rows, 'a1', 'folder-empty'), folders)).toEqual([[], ['b1', 'b2'], ['a1'], ['free']])
+        expect(moveDroppedChatToFolderTop(rows, 'missing', 'folder-b')).toEqual(rows)
     })
 
     it('reorders folders only when the dropped ids match', () => {

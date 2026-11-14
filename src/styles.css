@@ -678,3 +678,58 @@ details[data-risu-streaming-thought] {
     background-image: none;
   }
 }
+
+/* A touched row of a sortable list once the hold is long enough to drag it.
+   A finger that rests on it longer would start a text selection on Android, which takes the touch from the drag. */
+.risu-sort-held {
+  background-color: var(--risu-theme-darkbutton);
+  outline: 1px solid var(--risu-theme-borderc);
+  outline-offset: -1px;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* The slot a dragged row lands in, and a row that stays in place while its card is dragged. */
+.sortable-ghost,
+.risu-drag-source {
+  background-color: color-mix(in srgb, var(--risu-theme-selected) 45%, transparent);
+  outline: 1px dashed var(--risu-theme-borderc);
+  outline-offset: -1px;
+}
+
+.sortable-ghost > *,
+.risu-drag-source > * {
+  opacity: 0.45;
+}
+
+/* The row that follows the pointer. */
+.sortable-drag,
+.risu-drag-card {
+  background-color: var(--risu-theme-darkbutton);
+  outline: 1px solid var(--risu-theme-borderc);
+  outline-offset: -1px;
+  box-shadow: 0 6px 16px rgb(0 0 0 / 0.35);
+}
+
+/* The copy keeps the row's size but sits last in the list, where first- and last-row
+   rules give it a different separator. Without one, its content is centred in that size. */
+.sortable-fallback {
+  opacity: 1 !important;
+  padding-block: 0 !important;
+  border-block-width: 0 !important;
+}
+
+.sortable-fallback.flex-col {
+  justify-content: center;
+}
+
+/* The insertion marker and the rows under the finger show through the card. */
+.risu-drag-card {
+  opacity: 0.7;
+}
+
+/* A target that a release puts the row into shows through the card. */
+:root:has([data-lore-drop-target], [data-risu-chat-drop-target], .risu-sidebar-drop-target) :is(.sortable-fallback, .risu-drag-card) {
+  opacity: 0.55 !important;
+}

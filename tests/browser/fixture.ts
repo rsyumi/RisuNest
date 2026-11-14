@@ -13,7 +13,7 @@ export const test = base.extend<{ guarded: void }>({
             const reason = classifyTestRequest(route.request().url(), origins)
             // Serve our owned HTML directly so machine-level HTTP injectors cannot add scripts.
             const pathname = new URL(route.request().url()).pathname
-            if (!reason && (pathname === '/' || pathname === '/imageFormats.html' || pathname === '/sidebarTouch.html' || pathname === '/dragDrop.html' || pathname === '/modalNavigation.html' || pathname === '/lazyApp.html' || pathname === '/monaco.html' || pathname === '/settledThought.html' || pathname === '/switchContainment.html' || pathname === '/chatRendering.html')) {
+            if (!reason && (pathname === '/' || pathname === '/imageFormats.html' || pathname === '/sidebarTouch.html' || pathname === '/dragDrop.html' || pathname === '/chatList.html' || pathname === '/modalNavigation.html' || pathname === '/lazyApp.html' || pathname === '/monaco.html' || pathname === '/settledThought.html' || pathname === '/switchContainment.html' || pathname === '/chatRendering.html')) {
                 const file = pathname === '/' ? 'index.html' : pathname.slice(1)
                 await route.fulfill({ contentType: 'text/html', body: readFileSync(new URL(`../../.tmp/test-results/browser/dist/${file}`, import.meta.url), 'utf8') })
                 return
