@@ -87,6 +87,7 @@
                     openTextEditor()
                 }
             }}
+            use:contextHold={!insidePopupEditor && !!DBState.db.longPressToPopupEditor}
 ></textarea>
 {:else}
     <div
@@ -144,6 +145,7 @@
     import Maximize2Icon from '@lucide/svelte/icons/maximize-2'
     import { language } from 'src/lang'
     import { cancelTextEditorPopup, isInsideTextEditorPopup, openTextEditorPopup, type TextEditorPopupRequest } from 'src/ts/gui/textEditorPopup.svelte'
+    import { contextHold } from 'src/ts/gui/contextHold'
     interface Props {
         size?: 'xs'|'sm'|'md'|'lg'|'xl'|'default';
         autocomplete?: 'on'|'off';

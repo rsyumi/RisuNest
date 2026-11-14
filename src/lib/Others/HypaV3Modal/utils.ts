@@ -26,14 +26,52 @@ export function handleDualAction(
   params: DualActionParams = {}
 ) {
   const DOUBLE_TAP_DELAY = 300;
+  // A finger that travels farther than this is scrolling, not tapping.
+  const TAP_SLOP_PX = 8;
+  // Touch screens follow a tap with a click of their own.
+  const TOUCH_CLICK_WINDOW = 700;
 
   const state = {
     lastTap: 0,
     tapTimeout: null,
+    touch: null as { identifier: number; x: number; y: number } | null,
+    lastTouchEnd: 0,
+  };
+
+  const trackedTouch = (event: TouchEvent) => {
+    const touch = state.touch;
+    return touch
+      ? Array.from(event.changedTouches).find((t) => t.identifier === touch.identifier)
+      : undefined;
+  };
+
+  const moved = (touch: Touch) =>
+    Math.hypot(touch.clientX - state.touch!.x, touch.clientY - state.touch!.y) > TAP_SLOP_PX;
+
+  const handleTouchStart = (event: TouchEvent) => {
+    const touch = event.changedTouches[0];
+    state.touch = event.touches.length === 1 && touch
+      ? { identifier: touch.identifier, x: touch.clientX, y: touch.clientY }
+      : null;
+  };
+
+  const handleTouchMove = (event: TouchEvent) => {
+    const touch = trackedTouch(event);
+    if (event.touches.length !== 1 || (touch && moved(touch))) state.touch = null;
+  };
+
+  const handleTouchCancel = () => {
+    state.touch = null;
   };
 
   const handleTouch = (event: TouchEvent) => {
-    const currentTime = new Date().getTime();
+    state.lastTouchEnd = new Date().getTime();
+    const touch = trackedTouch(event);
+    const tapped = touch && !moved(touch) && !(element as HTMLButtonElement).disabled;
+    state.touch = null;
+    if (!tapped) return;
+
+    const currentTime = state.lastTouchEnd;
     const tapLength = currentTime - state.lastTap;
 
     if (tapLength < DOUBLE_TAP_DELAY && tapLength > 0) {
@@ -55,6 +93,8 @@ export function handleDualAction(
   };
 
   const handleClick = (event: MouseEvent) => {
+    // The touch handlers have already decided this press.
+    if (new Date().getTime() - state.lastTouchEnd < TOUCH_CLICK_WINDOW) return;
     if (event.shiftKey) {
       params.onAlternativeAction?.();
     } else {
@@ -62,21 +102,20 @@ export function handleDualAction(
     }
   };
 
-  if ("ontouchend" in window) {
-    // Mobile environment
-    element.addEventListener("touchend", handleTouch);
-  } else {
-    // Desktop environment
-    element.addEventListener("click", handleClick);
-  }
+  // Touch-capable computers also have a mouse, so both paths stay registered.
+  element.addEventListener("touchstart", handleTouchStart, { passive: true });
+  element.addEventListener("touchmove", handleTouchMove, { passive: true });
+  element.addEventListener("touchcancel", handleTouchCancel);
+  element.addEventListener("touchend", handleTouch);
+  element.addEventListener("click", handleClick);
 
   return {
     destroy() {
-      if ("ontouchend" in window) {
-        element.removeEventListener("touchend", handleTouch);
-      } else {
-        element.removeEventListener("click", handleClick);
-      }
+      element.removeEventListener("touchstart", handleTouchStart);
+      element.removeEventListener("touchmove", handleTouchMove);
+      element.removeEventListener("touchcancel", handleTouchCancel);
+      element.removeEventListener("touchend", handleTouch);
+      element.removeEventListener("click", handleClick);
 
       window.clearTimeout(state.tapTimeout); // Cleanup timeout
     },

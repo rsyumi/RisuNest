@@ -198,6 +198,10 @@
         return retainedLayout
     })
     let captureTheme = $derived(presentedLayout.theme)
+    // Without the message buttons a long press on the inline editor is the only way to finish editing.
+    let editButtonShown = $derived(captureTheme === 'customHTML'
+        ? !!presentedLayout.gui?.querySelector('risubuttons')
+        : captureTheme !== 'mobilechat')
     let captureIconSize = $derived(captureSettings?.iconSize ?? DBState.db.iconsize)
     let captureZoomSize = $derived(captureSettings?.zoomSize ?? DBState.db.zoomsize)
     let captureLineHeight = $derived(captureSettings?.lineHeight ?? DBState.db.lineHeight ?? 1.25)
@@ -1168,7 +1172,7 @@
         }} />
     {/if}
     {#if inlineEditMode}
-        <AutoresizeArea bind:value={editDraft} handleLongPress={toggleOriginalEdit} />
+        <AutoresizeArea bind:value={editDraft} handleLongPress={toggleOriginalEdit} touchLongPress={!editButtonShown} />
     {:else if isComment}
         <div class="w-full flex justify-center text-textcolor2 italic mb-12">
 
