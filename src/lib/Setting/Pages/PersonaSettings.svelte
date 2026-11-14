@@ -11,6 +11,7 @@
     import Sortable from 'sortablejs';
     import { onDestroy, onMount } from "svelte";
     import { sleep, sortableOptions } from "src/ts/util";
+    import { watchSortDrag } from "src/ts/sortableOptions";
     import { DBState } from 'src/ts/stores.svelte';
     import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from 'src/ts/storage/deletedOwnerAssetCleanup';
     import { assetAliasCleanupTarget } from 'src/ts/storage/persistentDataRuntime.svelte';
@@ -20,18 +21,25 @@
     let ele: HTMLDivElement = $state()
     let sorted = $state(0)
     let selectedId:string = null
+    let dragWatch: ReturnType<typeof watchSortDrag> | null = null
     const createStb = () => {
         stb = Sortable.create(ele, {
             draggable: '> [data-risu-idx]',
             onStart: async () => {
+                dragWatch = watchSortDrag(ele)
                 selectedId = DBState.db.personas[DBState.db.selectedPersona].id
                 saveUserPersona()
             },
-            onEnd: async () => {
+            onEnd: async (event) => {
+                const cancelled = dragWatch?.cancelled(event)
+                dragWatch?.stop()
+                dragWatch = null
                 let idx:number[] = []
                 ele.querySelectorAll('[data-risu-idx]').forEach((e, i) => {
                     idx.push(parseInt(e.getAttribute('data-risu-idx')))
                 })
+                // An abandoned drag keeps the order the personas had.
+                if (cancelled) idx.sort((a, b) => a - b)
                 let newValue:{
                     personaPrompt:string
                     name:string
@@ -60,6 +68,7 @@
     onMount(createStb)
 
     onDestroy(() => {
+        dragWatch?.stop()
         if(stb){
             try {
                 stb.destroy()

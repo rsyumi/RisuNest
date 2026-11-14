@@ -33,6 +33,14 @@ export default defineConfig(({ mode }) => {
                         return resolve(import.meta.dirname, 'Empty.svelte').replaceAll('\\', '/')
                     }
                 }
+                if (owner.endsWith('/src/lib/Setting/Pages/PersonaSettings.svelte')) {
+                    if (/(^|\/)(stores\.svelte|util|alert|lang|characters|persona|deletedOwnerAssetCleanup|persistentDataRuntime\.svelte)$/.test(source)) {
+                        return adapter('dragDropAdapters.svelte.ts')
+                    }
+                    if (/TextAreaInput\.svelte$/.test(source)) {
+                        return resolve(import.meta.dirname, 'Empty.svelte').replaceAll('\\', '/')
+                    }
+                }
                 if (owner.endsWith('/src/lib/SideBars/SideChatList.svelte')) {
                     if (/(^|\/)(stores\.svelte|characters|alert|util|lang|chatBindings\.svelte|globalApi\.svelte|workingSetCatalog)$/.test(source)) {
                         return adapter('chatListAdapters.svelte.ts')

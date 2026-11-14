@@ -56,7 +56,7 @@
     let receivedFolderId = $state<string | null>(null)
     let draggedChat: HTMLElement | null = null
     let chatDragPoint: { x: number, y: number } | null = null
-    let chatDragWatch: ReturnType<typeof watchSortDrag> | null = null
+    let listDragWatch: ReturnType<typeof watchSortDrag> | null = null
     const chatDragMoveEvents = ['pointermove', 'touchmove', 'dragover'] as const
 
     async function editSelectedChatList(...args: Parameters<typeof applyChatListEdit>): Promise<boolean> {
@@ -113,7 +113,7 @@
         for (const type of chatDragMoveEvents) document.addEventListener(type, trackChatDragPoint, { capture: true, passive: true })
         // The list also moves under a resting pointer while it scrolls.
         document.addEventListener('scroll', updateChatDropFolder, { capture: true, passive: true })
-        chatDragWatch = watchSortDrag(listEle)
+        listDragWatch = watchSortDrag(listEle)
         const original = (event as Sortable.SortableEvent & { originalEvent?: Event }).originalEvent
         if (original) trackChatDragPoint(original)
         else updateChatDropFolder()
@@ -122,8 +122,8 @@
     function stopChatDrag() {
         for (const type of chatDragMoveEvents) document.removeEventListener(type, trackChatDragPoint, true)
         document.removeEventListener('scroll', updateChatDropFolder, true)
-        chatDragWatch?.stop()
-        chatDragWatch = null
+        listDragWatch?.stop()
+        listDragWatch = null
         draggedChat = null
         chatDragPoint = null
         chatDragging = false
@@ -166,7 +166,7 @@
                 onChange: updateChatDropFolder,
                 onEnd: async (event) => {
                     // An abandoned drag changes nothing: the list is drawn again from the chats as they are.
-                    if (chatDragWatch?.cancelled(event)) {
+                    if (listDragWatch?.cancelled(event)) {
                         destroySortable()
                         sorted += 1
                         return
@@ -212,7 +212,16 @@
         }
         folderStb = Sortable.create(folderEles, {
             group: 'folders',
+            onStart: () => {
+                listDragWatch = watchSortDrag(listEle)
+            },
             onEnd: async (event) => {
+                // An abandoned drag changes nothing.
+                if (listDragWatch?.cancelled(event)) {
+                    destroySortable()
+                    sorted += 1
+                    return
+                }
                 // Read the dropped order before re-rendering the list.
                 const folderIds: string[] = []
                 const rows: DroppedChatRow[] = []

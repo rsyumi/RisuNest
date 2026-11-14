@@ -7,7 +7,8 @@ async function order(page: Page, kind: string) {
     return page.evaluate(kind => {
         const db = (window as any).dragState.db
         const items = kind.startsWith('lore') ? db.characters[0].globalLore
-            : kind === 'regex' ? db.globalscript : kind === 'trigger' ? db.characters[0].triggerscript : db.promptTemplate
+            : kind === 'regex' ? db.globalscript : kind === 'trigger' ? db.characters[0].triggerscript
+            : kind === 'persona' ? db.personas : db.promptTemplate
         return items.map((item: any) => item.comment ?? item.name)
     }, kind)
 }
@@ -95,7 +96,34 @@ for (const kind of ['regex', 'trigger']) {
         await expect.poll(() => order(page, kind)).toEqual(['Second', 'Last'])
         expect(errors).toEqual([])
     })
+
+    test(`${kind}: an entry stays where it was when its drag is abandoned`, async ({ page }) => {
+        await open(page, kind)
+        const second = page.getByRole('button', { name: 'Second', exact: true })
+        const last = page.getByRole('button', { name: 'Last', exact: true })
+        await drag(last, second, false, 'escape')
+        await expect(page.locator('.sortable-chosen')).toHaveCount(0)
+        expect(await order(page, kind)).toEqual(['First', 'Second', 'Last'])
+        await drag(last, second)
+        await expect.poll(() => order(page, kind)).toEqual(['First', 'Last', 'Second'])
+    })
 }
+
+test('persona: a persona stays where it was when its drag is abandoned and moves when dropped', async ({ page }) => {
+    await open(page, 'persona')
+    const persona = (index: number) => page.locator('[data-risu-idx]').nth(index)
+    // The list is drawn again after each drag, and Sortable attaches to the new one.
+    const redrawn = async (finish: 'drop' | 'escape') => {
+        const list = await persona(0).locator('..').elementHandle()
+        await drag(persona(2), persona(1), false, finish)
+        await page.waitForFunction(old => !old!.isConnected, list)
+        await page.waitForFunction(() => Object.keys(document.querySelector('[data-risu-idx]')!.parentElement!).some(key => key.startsWith('Sortable')))
+    }
+    await redrawn('escape')
+    expect(await order(page, 'persona')).toEqual(['First', 'Second', 'Last'])
+    await redrawn('drop')
+    expect(await order(page, 'persona')).toEqual(['First', 'Last', 'Second'])
+})
 
 test('lore: reorder around an expanded folder without remounting its editors', async ({ page }) => {
     const errors: string[] = []

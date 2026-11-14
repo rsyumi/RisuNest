@@ -3,6 +3,7 @@
     import RegexList from '../../src/lib/SideBars/Scripts/RegexList.svelte'
     import TriggerList from '../../src/lib/SideBars/Scripts/TriggerV1List.svelte'
     import PromptSettings from '../../src/lib/Setting/Pages/PromptSettings.svelte'
+    import PersonaSettings from '../../src/lib/Setting/Pages/PersonaSettings.svelte'
     import { DBState } from './dragDropAdapters.svelte'
     import type { character, loreBook } from '../../src/ts/storage/database.svelte'
 
@@ -22,6 +23,8 @@
         globalscript: ['First', 'Second', 'Last'].map(comment => ({ comment, in: '', out: '', type: 'editinput' })),
         promptTemplate: ['First', 'Second', 'Last'].map(name => ({ name, type: 'plain', text: '', role: 'system', type2: 'normal' })),
         promptSettings: {},
+        personas: ['First', 'Second', 'Last'].map(name => ({ id: name, name, icon: '', personaPrompt: '', note: '' })),
+        selectedPersona: 0, userIcon: '', username: 'First', userNote: '', personaPrompt: '',
     } as any
 </script>
 
@@ -32,6 +35,8 @@
         <RegexList bind:value={DBState.db.globalscript} />
     {:else if kind === 'trigger'}
         <TriggerList bind:value={(DBState.db.characters[0] as character).triggerscript} />
+    {:else if kind === 'persona'}
+        <PersonaSettings />
     {:else}
         <PromptSettings />
     {/if}
@@ -49,4 +54,5 @@
     :global(#drag-fixture [role="doc-pagebreak"] + div) { border: 1px solid #aaa; padding: 10px; }
     :global(#drag-fixture [draggable="true"]) { min-height: 30px; }
     :global(#drag-fixture input) { display: block; }
+    :global(#drag-fixture button[data-risu-idx]) { width: 60px; height: 60px; }
 </style>

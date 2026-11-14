@@ -154,9 +154,9 @@ test.describe('chat list by touch', () => {
     })
 })
 
-/** Picks a chat up with the mouse and holds it over the middle of a row. */
-async function mouseDragTo(page: Page, source: string, target: Locator) {
-    const start = await middle(chat(page, source))
+/** Picks a chat, or the row given, up with the mouse and holds it over the middle of a row. */
+async function mouseDragTo(page: Page, source: string | Locator, target: Locator) {
+    const start = await middle(typeof source === 'string' ? chat(page, source) : source)
     const over = await middle(target)
     await page.mouse.move(start.x, start.y)
     await page.mouse.down()
@@ -187,6 +187,23 @@ test('a chat dragged by mouse onto a folded folder joins it when dropped and sta
     await mouseDragTo(page, 'Chat 3', header(page, 'Second folder'))
     await page.mouse.up()
     await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 3', 'Chat 1'], outside: ['Chat 2'] })
+})
+
+test('a folder dragged by mouse stays where it was when the drag is abandoned and moves when dropped', async ({ page }) => {
+    await open(page)
+    const folders = () => page.evaluate(() => (window as any).chatListState.db.characters[0].chatFolders.map((folder: any) => folder.id))
+    await untilRebuilt(page, async () => {
+        await mouseDragTo(page, header(page, 'Second folder'), header(page, 'First folder'))
+        await page.keyboard.press('Escape')
+    })
+    await page.mouse.up()
+    expect(await folders()).toEqual(['first', 'second'])
+    await sortableReady(page)
+    await untilRebuilt(page, async () => {
+        await mouseDragTo(page, header(page, 'Second folder'), header(page, 'First folder'))
+        await page.mouse.up()
+    })
+    expect(await folders()).toEqual(['second', 'first'])
 })
 
 test('a chat released by mouse beside the list lands in its slot', async ({ page }) => {

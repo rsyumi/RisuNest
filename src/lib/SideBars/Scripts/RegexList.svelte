@@ -3,6 +3,7 @@
     import RegexData from "./RegexData.svelte";
     import Sortable from "sortablejs";
     import { sortableOptions } from "src/ts/util";
+    import { watchSortDrag } from "src/ts/sortableOptions";
     import { onDestroy, onMount } from "svelte";
   import { DownloadIcon, HardDriveUploadIcon, PlusIcon } from "@lucide/svelte";
   import { exportRegex, importRegex } from "src/ts/process/scripts";
@@ -16,19 +17,26 @@
     let stb: Sortable = null
     let ele: HTMLDivElement = $state()
     let originalNextSibling: Node | null = null
+    let dragWatch: ReturnType<typeof watchSortDrag> | null = null
     let opened = $state(new Set<customscript>())
     const createStb = () => {
         stb = Sortable.create(ele, {
             draggable: '> [data-risu-idx]',
             onStart: (event) => {
                 originalNextSibling = event.item.nextSibling
+                dragWatch = watchSortDrag(ele)
             },
             onEnd: (event) => {
+                const cancelled = dragWatch?.cancelled(event)
+                dragWatch?.stop()
+                dragWatch = null
                 const newValue = Array.from(ele.children)
                     .filter(row => row.hasAttribute('data-risu-idx'))
                     .map(row => value[Number(row.getAttribute('data-risu-idx'))])
                 // Restore Svelte's DOM before applying the new order.
                 event.from.insertBefore(event.item, originalNextSibling)
+                // An abandoned drag changes nothing.
+                if (cancelled) return
                 value = newValue
             },
             ...sortableOptions
@@ -59,6 +67,7 @@
     onMount(createStb)
 
     onDestroy(() => {
+        dragWatch?.stop()
         if(stb){
             try {
                 stb.destroy()
