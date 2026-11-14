@@ -4,13 +4,21 @@ import { touchHoldMs } from '../../src/ts/gui/touchHold'
 
 type Point = { x: number, y: number }
 
+// Sortable attaches after the list renders.
+const sortableReady = (page: Page) =>
+    page.waitForFunction(() => Object.keys(document.querySelector('.risu-chat') ?? {}).some(key => key.startsWith('Sortable')))
 async function open(page: Page, query = '') {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
     await page.goto(`/chatList.html${query}`)
     await expect.poll(async () => ({ rows: await page.locator('[data-risu-chat-idx]').count() > 0, errors })).toEqual({ rows: true, errors: [] })
-    // Sortable attaches after the list renders.
-    await page.waitForFunction(() => Object.keys(document.querySelector('.risu-chat') ?? {}).some(key => key.startsWith('Sortable')))
+    await sortableReady(page)
+}
+/** Runs a drag and waits until the list is rebuilt from what the drag left. */
+async function untilRebuilt(page: Page, drag: () => Promise<void>) {
+    const list = await page.locator('.risu-chat-list').elementHandle()
+    await drag()
+    await page.waitForFunction(old => !old!.isConnected, list)
 }
 function arrange(page: Page, folders: Record<string, string>, folded: string[] = []) {
     return page.evaluate(({ folders, folded }) => {
@@ -39,10 +47,10 @@ async function middle(locator: Locator): Promise<Point> {
 test.describe('chat list by touch', () => {
     test.use({ hasTouch: true, isMobile: true, viewport: { width: 393, height: 852 } })
 
-    /** Holds a chat until it can be dragged, then moves the finger and lifts it where `during` leaves it. */
-    async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>, held?: () => Promise<void>) {
+    /** Holds a chat until it can be dragged, then moves the finger and lifts it, or loses it to the browser, where `during` leaves it. */
+    async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>, held?: () => Promise<void>, finish: 'touchEnd' | 'touchCancel' = 'touchEnd') {
         const cdp = await page.context().newCDPSession(page)
-        const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', point?: Point) =>
+        const send = (type: 'touchStart' | 'touchMove' | 'touchEnd' | 'touchCancel', point?: Point) =>
             cdp.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [point] : [] })
         const start = await middle(source)
         await send('touchStart', start)
@@ -57,7 +65,7 @@ test.describe('chat list by touch', () => {
             await send('touchMove', { x: point.x + 1, y: point.y })
             await page.waitForTimeout(120)
         })
-        await send('touchEnd')
+        await send(finish)
     }
 
     test('an empty folder takes a chat dropped anywhere on it', async ({ page }) => {
@@ -86,6 +94,18 @@ test.describe('chat list by touch', () => {
         })
         await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 3', 'Chat 1'], outside: ['Chat 2'] })
         await expect(target.locator('.risu-chat')).toBeHidden()
+    })
+
+    test('a chat whose touch is cancelled over a folded folder stays where it was', async ({ page }) => {
+        await open(page)
+        await arrange(page, { 'Chat 1': 'second' }, ['second'])
+        const target = folder(page, 'Second folder')
+        // The drag ends with the cancelled touch, not with a later one.
+        await untilRebuilt(page, () => touchDrag(page, chat(page, 'Chat 3'), async (move) => {
+            await move(await middle(target.locator('[data-risu-chat-folder-header]')))
+            await expect.poll(() => target.evaluate(element => getComputedStyle(element).outlineStyle)).toBe('solid')
+        }, undefined, 'touchCancel'))
+        expect(await listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 1'], outside: ['Chat 2', 'Chat 3'] })
     })
 
     test('a chat leaves the folders when none is outside them', async ({ page }) => {
@@ -134,16 +154,52 @@ test.describe('chat list by touch', () => {
     })
 })
 
-test('a chat dragged by mouse onto a folder header becomes its first chat', async ({ page }) => {
-    await open(page)
-    await arrange(page, { 'Chat 1': 'first' })
-    const start = await middle(chat(page, 'Chat 3'))
-    const header = await middle(folder(page, 'First folder').locator('[data-risu-chat-folder-header]'))
+/** Picks a chat up with the mouse and holds it over the middle of a row. */
+async function mouseDragTo(page: Page, source: string, target: Locator) {
+    const start = await middle(chat(page, source))
+    const over = await middle(target)
     await page.mouse.move(start.x, start.y)
     await page.mouse.down()
     await page.mouse.move(start.x + 8, start.y, { steps: 3 })
-    await page.mouse.move(header.x, header.y, { steps: 8 })
-    await page.mouse.move(header.x, header.y)
+    await page.mouse.move(over.x, over.y, { steps: 8 })
+    await page.mouse.move(over.x, over.y)
+}
+const header = (page: Page, name: string) => folder(page, name).locator('[data-risu-chat-folder-header]')
+
+test('a chat dragged by mouse onto a folder header becomes its first chat', async ({ page }) => {
+    await open(page)
+    await arrange(page, { 'Chat 1': 'first' })
+    await mouseDragTo(page, 'Chat 3', header(page, 'First folder'))
     await page.mouse.up()
     await expect.poll(() => listed(page)).toEqual({ 'First folder': ['Chat 3', 'Chat 1'], 'Second folder': [], outside: ['Chat 2'] })
+})
+
+test('a chat dragged by mouse onto a folded folder joins it when dropped and stays where it was when the drag is abandoned', async ({ page }) => {
+    await open(page)
+    await arrange(page, { 'Chat 1': 'second' }, ['second'])
+    await untilRebuilt(page, async () => {
+        await mouseDragTo(page, 'Chat 3', header(page, 'Second folder'))
+        await page.keyboard.press('Escape')
+    })
+    await page.mouse.up()
+    expect(await listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 1'], outside: ['Chat 2', 'Chat 3'] })
+    await sortableReady(page)
+    await mouseDragTo(page, 'Chat 3', header(page, 'Second folder'))
+    await page.mouse.up()
+    await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 3', 'Chat 1'], outside: ['Chat 2'] })
+})
+
+test('a chat released by mouse beside the list lands in its slot', async ({ page }) => {
+    await open(page)
+    const list = await page.locator('.risu-chat-list').boundingBox()
+    await page.evaluate(() => document.addEventListener('drop', () => { (window as any).droppedBeside = true }))
+    await untilRebuilt(page, async () => {
+        const over = await middle(chat(page, 'Chat 2'))
+        await mouseDragTo(page, 'Chat 3', chat(page, 'Chat 2'))
+        await page.mouse.move(list!.x + list!.width + 40, over.y, { steps: 4 })
+        await page.mouse.up()
+    })
+    expect((await listed(page)).outside).toEqual(['Chat 1', 'Chat 3', 'Chat 2'])
+    // Whatever lies beside the list is not handed the chat as a drop.
+    expect(await page.evaluate(() => (window as any).droppedBeside)).toBeUndefined()
 })

@@ -32,6 +32,7 @@
     import Sortable from 'sortablejs';
     import { onDestroy, onMount, tick } from "svelte";
     import { sortableOptions } from "src/ts/util";
+    import { watchSortDrag } from "src/ts/sortableOptions";
     import { v4 } from "uuid";
 
     interface Props {
@@ -65,6 +66,7 @@
     let ownSession: LoreDragSession | null = null
     let draggedRow: HTMLElement | null = null
     let dragPoint: { x: number, y: number } | null = null
+    let dragWatch: ReturnType<typeof watchSortDrag> | null = null
     let headerTarget: HTMLElement | null = null
     let markedRow: Element | null = null
     let markedList: Element | null = null
@@ -109,6 +111,7 @@
 
     function startHeaderTracking(row: HTMLElement, original: Event | undefined) {
         draggedRow = row
+        dragWatch = watchSortDrag(ele.closest('[data-show-folder=""]') ?? ele)
         for (const type of dragMoveEvents) document.addEventListener(type, trackDragPoint, { capture: true, passive: true })
         // The list also moves under a resting pointer while it scrolls.
         document.addEventListener('scroll', updateHeaderTarget, { capture: true, passive: true })
@@ -135,6 +138,8 @@
         document.removeEventListener('scroll', updateHeaderTarget, true)
         const header = headerTarget
         markHeaderTarget(null, false)
+        dragWatch?.stop()
+        dragWatch = null
         draggedRow = null
         dragPoint = null
         return header
@@ -177,6 +182,7 @@
             },
             onChange: updateHeaderTarget,
             onEnd: (event) => {
+                const cancelled = dragWatch?.cancelled(event)
                 const droppedOn = stopHeaderTracking()
                 const session = ownSession
                 ownSession = null
@@ -190,7 +196,8 @@
                 const previous = indexOfRow(event.item.previousElementSibling)
                 // Restore Svelte's DOM before changing either folder's keyed list.
                 event.from.insertBefore(event.item, originalNextSibling)
-                if (source === null) return
+                // An abandoned drag changes nothing.
+                if (source === null || cancelled) return
                 if (droppedOn) {
                     const moved = currentItems[source]
                     const reordered = dropLoreOnFolder(currentItems, source, droppedOn.getAttribute('data-lore-folder-header'))

@@ -17,7 +17,7 @@ async function open(page: Page, kind: string) {
     await page.goto(`/dragDrop.html?kind=${kind}`)
     await expect.poll(async () => ({ mounted: await page.locator('#drag-fixture').count(), errors })).toEqual({ mounted: 1, errors: [] })
 }
-async function drag(source: Locator, target: Locator, bottom = false) {
+async function drag(source: Locator, target: Locator, bottom = false, finish: 'drop' | 'escape' | 'beside' = 'drop') {
     await source.scrollIntoViewIfNeeded()
     const start = await source.boundingBox()
     const box = await target.boundingBox()
@@ -29,13 +29,18 @@ async function drag(source: Locator, target: Locator, bottom = false) {
     const y = box!.y + (bottom ? box!.height - 3 : 3)
     await mouse.move(x, y, { steps: 8 })
     await mouse.move(x, y)
+    if (finish === 'escape') await source.page().keyboard.press('Escape')
+    if (finish === 'beside') {
+        const list = await source.page().locator('[data-show-folder=""]').boundingBox()
+        await mouse.move(list!.x + list!.width + 40, y, { steps: 4 })
+    }
     await mouse.up()
 }
 type Point = { x: number, y: number }
-/** Holds a finger on `source` until it can be dragged, then lifts it where `during` leaves it. */
-async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>) {
+/** Holds a finger on `source` until it can be dragged, then lifts it, or loses it to the browser, where `during` leaves it. */
+async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>, finish: 'touchEnd' | 'touchCancel' = 'touchEnd') {
     const cdp = await page.context().newCDPSession(page)
-    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', point?: Point) =>
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd' | 'touchCancel', point?: Point) =>
         cdp.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [point] : [] })
     await source.scrollIntoViewIfNeeded()
     const box = await source.boundingBox()
@@ -56,7 +61,7 @@ async function touchDrag(page: Page, source: Locator, during: (move: (point: Poi
         await send('touchMove', at)
         await page.waitForTimeout(120)
     })
-    await send('touchEnd')
+    await send(finish)
 }
 const outline = (locator: Locator) => locator.evaluate(element => getComputedStyle(element).outlineStyle)
 const opacity = (locator: Locator) => locator.evaluate(element => Number(getComputedStyle(element).opacity))
@@ -126,6 +131,28 @@ test('lore: an entry dragged onto a closed folder row becomes its first entry', 
     await expect.poll(() => order(page, 'lore')).toEqual(['Folder', 'Last', 'Child', 'First'])
 })
 
+test('lore: an entry stays where it was when its drag onto a closed folder row is abandoned', async ({ page }) => {
+    await open(page, 'lore')
+    await drag(itemButton(page, 'Last'), itemButton(page, 'Folder'), false, 'escape')
+    await expect(page.locator('.risu-chosen-item')).toHaveCount(0)
+    expect(await order(page, 'lore')).toEqual(['Folder', 'Child', 'First', 'Last'])
+})
+
+test('lore: an entry dragged out of an open folder stays in it when the drag is abandoned', async ({ page }) => {
+    await open(page, 'lore')
+    await itemButton(page, 'Folder').click()
+    await drag(itemButton(page, 'Child'), itemButton(page, 'Last'), true, 'escape')
+    await expect(page.locator('.risu-chosen-item')).toHaveCount(0)
+    expect(await page.evaluate(() => (window as any).dragState.db.characters[0].globalLore.map((item: any) => `${item.comment}:${item.folder ?? ''}`)))
+        .toEqual(['Folder:', 'Child:folder', 'First:', 'Last:'])
+})
+
+test('lore: an entry released beside the list lands in its slot', async ({ page }) => {
+    await open(page, 'lore')
+    await drag(itemButton(page, 'Last'), itemButton(page, 'First'), false, 'beside')
+    await expect.poll(() => order(page, 'lore')).toEqual(['Folder', 'Child', 'Last', 'First'])
+})
+
 test('prompt: use gaps and card halves without changing the drag source during hover', async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
@@ -175,6 +202,18 @@ test.describe('touch dragging', () => {
         })
         await expect.poll(() => order(page, 'lore')).toEqual(['Folder', 'Last', 'Child', 'First'])
         await expect.poll(() => outline(folderRow)).toBe('none')
+    })
+
+    test('lore: an entry stays where it was when its touch is cancelled on a closed folder row', async ({ page }) => {
+        await open(page, 'lore')
+        const folderRow = loreRow(page, 'Folder')
+        await touchDrag(page, itemButton(page, 'Last'), async (move) => {
+            await move(await center(itemButton(page, 'Folder')))
+            await expect.poll(() => outline(folderRow)).toBe('solid')
+        }, 'touchCancel')
+        // The drag ends with the cancelled touch, not with a later one.
+        await expect(page.locator('.sortable-fallback')).toHaveCount(0)
+        expect(await order(page, 'lore')).toEqual(['Folder', 'Child', 'First', 'Last'])
     })
 
     test('lore: an entry released on an open folder name becomes its first entry', async ({ page }) => {

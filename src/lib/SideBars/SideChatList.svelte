@@ -15,6 +15,7 @@
     import { addNewChat, duplicateChat, editSelectedChatList as applyChatListEdit, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { sortableOptions } from "src/ts/util";
+    import { watchSortDrag } from "src/ts/sortableOptions";
 
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -55,6 +56,7 @@
     let receivedFolderId = $state<string | null>(null)
     let draggedChat: HTMLElement | null = null
     let chatDragPoint: { x: number, y: number } | null = null
+    let chatDragWatch: ReturnType<typeof watchSortDrag> | null = null
     const chatDragMoveEvents = ['pointermove', 'touchmove', 'dragover'] as const
 
     async function editSelectedChatList(...args: Parameters<typeof applyChatListEdit>): Promise<boolean> {
@@ -111,6 +113,7 @@
         for (const type of chatDragMoveEvents) document.addEventListener(type, trackChatDragPoint, { capture: true, passive: true })
         // The list also moves under a resting pointer while it scrolls.
         document.addEventListener('scroll', updateChatDropFolder, { capture: true, passive: true })
+        chatDragWatch = watchSortDrag(listEle)
         const original = (event as Sortable.SortableEvent & { originalEvent?: Event }).originalEvent
         if (original) trackChatDragPoint(original)
         else updateChatDropFolder()
@@ -119,6 +122,8 @@
     function stopChatDrag() {
         for (const type of chatDragMoveEvents) document.removeEventListener(type, trackChatDragPoint, true)
         document.removeEventListener('scroll', updateChatDropFolder, true)
+        chatDragWatch?.stop()
+        chatDragWatch = null
         draggedChat = null
         chatDragPoint = null
         chatDragging = false
@@ -160,6 +165,12 @@
                 onStart: startChatDrag,
                 onChange: updateChatDropFolder,
                 onEnd: async (event) => {
+                    // An abandoned drag changes nothing: the list is drawn again from the chats as they are.
+                    if (chatDragWatch?.cancelled(event)) {
+                        destroySortable()
+                        sorted += 1
+                        return
+                    }
                     const droppedOnFolderId = headerFolderId
                     const droppedId = chara.chats[parseInt(event.item.getAttribute('data-risu-chat-idx'))]?.id
                     // Read the dropped order before re-rendering the list.
