@@ -1578,7 +1578,12 @@
             {/if}
         </button>
     {/if}
-    <button class="flex items-center hover:text-blue-500 transition-colors button-icon-remove" onclick={(e) => rm(e, false)} use:longpress={(e) => rm(e, true)}>
+    <button class="flex items-center hover:text-blue-500 transition-colors button-icon-remove" onclick={(e) => rm(e, false)} use:longpress={(e) => {
+        // A held press ends without the click that closes the action popup.
+        popupStore.children = null
+        popupStore.openId = 0
+        rm(e, true)
+    }}>
             <TrashIcon size={20}/>
 
             {#if showNames}

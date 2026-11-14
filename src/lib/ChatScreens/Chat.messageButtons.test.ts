@@ -50,6 +50,7 @@ vi.mock('src/ts/util', () => ({
 }))
 vi.mock('../../ts/alert', () => ({
     alertClear: vi.fn(), alertConfirm: vi.fn(), alertError: vi.fn(), alertInput: vi.fn(), alertNormal: vi.fn(),
+    alertCheckboxConfirm: vi.fn(async () => ({ confirmed: false, checked: false })),
     alertRequestData: vi.fn(), alertWait: vi.fn(), alertToast: vi.fn(),
 }))
 vi.mock('../../ts/translator/translator', () => ({ getLLMCache: vi.fn(), setLLMCache: vi.fn() }))
@@ -68,6 +69,7 @@ vi.mock('../../ts/storage/persistentDataRuntime.svelte', () => ({
 import Chat from './Chat.svelte'
 import PopupList from '../UI/PopupList.svelte'
 import { additionalMessageButtons, type MessageButtonDef } from 'src/ts/plugins/messageButtons.svelte'
+import { alertCheckboxConfirm } from '../../ts/alert'
 
 const messages: Message[] = [
     { role: 'user', data: 'question', chatId: 'm-0' },
@@ -176,6 +178,24 @@ describe('plugin message buttons in the message action row', () => {
         expect([...popup.querySelectorAll('.button-icon-plugin span')].map((element) => element.textContent)).toEqual(['Button char-only', 'Button both'])
         popup.querySelector<HTMLButtonElement>('.button-icon-plugin')!.click()
         await vi.waitFor(() => expect(additionalMessageButtons[0].callback).toHaveBeenCalledWith(expect.objectContaining({ messageIndex: 1, messageId: 'm-1' })))
+    })
+
+    test('closes the action popup when its remove button is held', async () => {
+        setWidth(400)
+        await mountChat({ message: 'answer', role: 'char', idx: 1, totalLength: 3 })
+        target.querySelector<HTMLButtonElement>('.button-icon-menu')!.click()
+        await vi.waitFor(() => expect(live.popup.children).not.toBeNull())
+        const popup = document.createElement('div')
+        document.body.append(popup)
+        mounted.push(mount(PopupList, { target: popup }))
+        await tick()
+
+        // No click follows a held press, so the popup's own click handler never runs.
+        popup.querySelector('.button-icon-remove')!.dispatchEvent(new PointerEvent('pointerdown', {
+            bubbles: true, pointerId: 2, pointerType: 'touch', isPrimary: true, button: 0,
+        }))
+        await vi.waitFor(() => expect(alertCheckboxConfirm).toHaveBeenCalledOnce())
+        expect(live.popup).toMatchObject({ children: null, openId: 0 })
     })
 
     test('moves the buttons between the row and the popup when the window is resized', async () => {
