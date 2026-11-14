@@ -3,7 +3,7 @@
   import Sortable from 'sortablejs'
   import type { triggerscript } from 'src/ts/storage/database.svelte'
   import { sortableOptions } from 'src/ts/util'
-  import { watchSortDrag } from 'src/ts/sortableOptions'
+  import { abandonSortDrag, destroySortableOnClose, watchSortDrag } from 'src/ts/sortableOptions'
   import { onDestroy, onMount } from 'svelte'
   import TriggerData from './TriggerV1Data.svelte'
 
@@ -27,7 +27,7 @@
       draggable: '> [data-risu-idx2]',
       onStart: (event) => {
           originalNextSibling = event.item.nextSibling
-          dragWatch = watchSortDrag(ele)
+          dragWatch = watchSortDrag()
       },
       onEnd: (event) => {
           const cancelled = dragWatch?.cancelled(event)
@@ -50,6 +50,7 @@
       if (opened.has(item)) return
       opened = new Set([...opened, item])
       if (stb) {
+          abandonSortDrag()
           stb.destroy()
           stb = null
       }
@@ -70,10 +71,9 @@
   onMount(createStb)
 
   onDestroy(() => {
-    dragWatch?.stop()
     if (stb) {
       try {
-        stb.destroy()
+        destroySortableOnClose(stb)
       } catch (error) {}
     }
   })

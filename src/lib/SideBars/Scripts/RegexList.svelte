@@ -3,7 +3,7 @@
     import RegexData from "./RegexData.svelte";
     import Sortable from "sortablejs";
     import { sortableOptions } from "src/ts/util";
-    import { watchSortDrag } from "src/ts/sortableOptions";
+    import { abandonSortDrag, destroySortableOnClose, watchSortDrag } from "src/ts/sortableOptions";
     import { onDestroy, onMount } from "svelte";
   import { DownloadIcon, HardDriveUploadIcon, PlusIcon } from "@lucide/svelte";
   import { exportRegex, importRegex } from "src/ts/process/scripts";
@@ -24,7 +24,7 @@
             draggable: '> [data-risu-idx]',
             onStart: (event) => {
                 originalNextSibling = event.item.nextSibling
-                dragWatch = watchSortDrag(ele)
+                dragWatch = watchSortDrag()
             },
             onEnd: (event) => {
                 const cancelled = dragWatch?.cancelled(event)
@@ -47,6 +47,7 @@
         if (opened.has(item)) return
         opened = new Set([...opened, item])
         if (stb) {
+            abandonSortDrag()
             stb.destroy()
             stb = null
         }
@@ -67,10 +68,9 @@
     onMount(createStb)
 
     onDestroy(() => {
-        dragWatch?.stop()
         if(stb){
             try {
-                stb.destroy()
+                destroySortableOnClose(stb)
             } catch (error) {}
         }
     })

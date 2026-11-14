@@ -15,7 +15,7 @@
     import { addNewChat, duplicateChat, editSelectedChatList as applyChatListEdit, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { sortableOptions } from "src/ts/util";
-    import { watchSortDrag } from "src/ts/sortableOptions";
+    import { abandonSortDrag, watchSortDrag } from "src/ts/sortableOptions";
 
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -113,7 +113,7 @@
         for (const type of chatDragMoveEvents) document.addEventListener(type, trackChatDragPoint, { capture: true, passive: true })
         // The list also moves under a resting pointer while it scrolls.
         document.addEventListener('scroll', updateChatDropFolder, { capture: true, passive: true })
-        listDragWatch = watchSortDrag(listEle)
+        listDragWatch = watchSortDrag()
         const original = (event as Sortable.SortableEvent & { originalEvent?: Event }).originalEvent
         if (original) trackChatDragPoint(original)
         else updateChatDropFolder()
@@ -133,6 +133,7 @@
     }
 
     const destroySortable = () => {
+        abandonSortDrag()
         stopChatDrag()
         if (folderStb) {
             try {
@@ -213,7 +214,7 @@
         folderStb = Sortable.create(folderEles, {
             group: 'folders',
             onStart: () => {
-                listDragWatch = watchSortDrag(listEle)
+                listDragWatch = watchSortDrag()
             },
             onEnd: async (event) => {
                 // An abandoned drag changes nothing.

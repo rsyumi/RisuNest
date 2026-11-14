@@ -32,7 +32,7 @@
     import Sortable from 'sortablejs';
     import { onDestroy, onMount, tick } from "svelte";
     import { sortableOptions } from "src/ts/util";
-    import { watchSortDrag } from "src/ts/sortableOptions";
+    import { abandonSortDrag, destroySortableOnClose, watchSortDrag } from "src/ts/sortableOptions";
     import { v4 } from "uuid";
 
     interface Props {
@@ -111,7 +111,7 @@
 
     function startHeaderTracking(row: HTMLElement, original: Event | undefined) {
         draggedRow = row
-        dragWatch = watchSortDrag(ele.closest('[data-show-folder=""]') ?? ele)
+        dragWatch = watchSortDrag()
         for (const type of dragMoveEvents) document.addEventListener(type, trackDragPoint, { capture: true, passive: true })
         // The list also moves under a resting pointer while it scrolls.
         document.addEventListener('scroll', updateHeaderTarget, { capture: true, passive: true })
@@ -244,6 +244,7 @@
     const onOpen = (isDetail: boolean = true, bookRef?: loreBook) => {
         if (!bookRef || openedRefs.has(bookRef)) return
         if (isDetail && stb) {
+            abandonSortDrag()
             stb.destroy()
             stb = null
         }
@@ -335,11 +336,10 @@
     })
 
     onDestroy(() => {
-        stopHeaderTracking()
         if (ownSession && dragSession === ownSession) dragSession = null
         if(stb){
             try {
-                stb.destroy()
+                destroySortableOnClose(stb)
             } catch (error) {  }
         }
     })

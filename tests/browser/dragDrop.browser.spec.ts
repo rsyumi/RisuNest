@@ -17,8 +17,9 @@ async function open(page: Page, kind: string) {
     page.on('pageerror', error => errors.push(error.message))
     await page.goto(`/dragDrop.html?kind=${kind}`)
     await expect.poll(async () => ({ mounted: await page.locator('#drag-fixture').count(), errors })).toEqual({ mounted: 1, errors: [] })
+    return errors
 }
-async function drag(source: Locator, target: Locator, bottom = false, finish: 'drop' | 'escape' | 'beside' = 'drop') {
+async function drag(source: Locator, target: Locator, bottom = false, finish: 'drop' | 'escape' | 'beside' | 'hold' = 'drop') {
     await source.scrollIntoViewIfNeeded()
     const start = await source.boundingBox()
     const box = await target.boundingBox()
@@ -35,7 +36,7 @@ async function drag(source: Locator, target: Locator, bottom = false, finish: 'd
         const list = await source.page().locator('[data-show-folder=""]').boundingBox()
         await mouse.move(list!.x + list!.width + 40, y, { steps: 4 })
     }
-    await mouse.up()
+    if (finish !== 'hold') await mouse.up()
 }
 type Point = { x: number, y: number }
 /** Holds a finger on `source` until it can be dragged, then lifts it, or loses it to the browser, where `during` leaves it. */
@@ -110,7 +111,7 @@ for (const kind of ['regex', 'trigger']) {
 }
 
 test('persona: a persona stays where it was when its drag is abandoned and moves when dropped', async ({ page }) => {
-    await open(page, 'persona')
+    const errors = await open(page, 'persona')
     const persona = (index: number) => page.locator('[data-risu-idx]').nth(index)
     // The list is drawn again after each drag, and Sortable attaches to the new one.
     const redrawn = async (finish: 'drop' | 'escape') => {
@@ -123,7 +124,31 @@ test('persona: a persona stays where it was when its drag is abandoned and moves
     expect(await order(page, 'persona')).toEqual(['First', 'Second', 'Last'])
     await redrawn('drop')
     expect(await order(page, 'persona')).toEqual(['First', 'Last', 'Second'])
+    // Closing the page afterwards ends no drag: the one that was dropped is over.
+    await page.evaluate(() => (window as any).closeDragFixture())
+    expect(errors).toEqual([])
 })
+
+for (const kind of ['lore', 'regex', 'trigger', 'persona']) {
+    test(`${kind}: a list closed under a dragged row ends the drag`, async ({ page }) => {
+        const errors = await open(page, kind)
+        const [source, target] = kind === 'persona' ? [page.locator('[data-risu-idx]').nth(2), page.locator('[data-risu-idx]').nth(1)]
+            : [itemButton(page, 'Last'), itemButton(page, kind === 'lore' ? 'First' : 'Second')]
+        await drag(source, target, false, 'hold')
+        await expect(page.locator('.sortable-ghost')).toHaveCount(1)
+        await page.evaluate(() => (window as any).closeDragFixture())
+        // Nothing takes a later drag over the page, as a file dragged in.
+        expect(await page.evaluate(() => {
+            const over = new DragEvent('dragover', { bubbles: true, cancelable: true })
+            document.body.dispatchEvent(over)
+            return over.defaultPrevented
+        })).toBe(false)
+        await page.mouse.up()
+        // The release reaches no list that is gone, and the closed list is not built again.
+        await page.waitForTimeout(100)
+        expect(errors).toEqual([])
+    })
+}
 
 test('lore: reorder around an expanded folder without remounting its editors', async ({ page }) => {
     const errors: string[] = []
@@ -216,7 +241,28 @@ test.describe('touch dragging', () => {
         }
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
         await expect.poll(() => order(page, 'regex')).toEqual(['Last', 'First', 'Second'])
+        // A mouse drags the list the browser's way again once the finger is off: Escape abandons the drag.
+        await drag(itemButton(page, 'Second'), itemButton(page, 'First'), false, 'escape')
+        await expect(page.locator('.sortable-chosen')).toHaveCount(0)
+        expect(await order(page, 'regex')).toEqual(['Last', 'First', 'Second'])
     })
+
+    for (const kind of ['lore', 'regex', 'trigger']) {
+        test(`${kind}: a held row is let go when another row is opened under the drag`, async ({ page }) => {
+            await open(page, kind)
+            const before = await order(page, kind)
+            // The keyboard opens a row while the finger holds another one.
+            await itemButton(page, 'First').focus()
+            await touchDrag(page, itemButton(page, 'Last'), async (move) => {
+                const box = await itemButton(page, kind === 'lore' ? 'First' : 'Second').boundingBox()
+                await move({ x: box!.x + box!.width / 2, y: box!.y + box!.height - 3 })
+                await expect(page.locator('.sortable-fallback')).toHaveCount(1)
+                await page.keyboard.press('Enter')
+                await expect(page.locator('.sortable-fallback, .sortable-ghost, .risu-sort-held')).toHaveCount(0)
+            })
+            expect(await order(page, kind)).toEqual(before)
+        })
+    }
 
     test('lore: an entry released on a closed folder row becomes its first entry', async ({ page }) => {
         await open(page, 'lore')
@@ -344,10 +390,19 @@ test.describe('lore pages', () => {
         page.on('pageerror', error => errors.push(error.message))
         await open(page, 'lore-pages')
         await expect(zone(page, 'next')).toHaveCount(0)
+        // An open folder on the page left behind goes away under the drag, which carries on.
+        await itemButton(page, 'Folder').click()
+        const folderList = await page.locator('[data-show-folder="folder"]').elementHandle()
         await dragThroughZone(page, 'Item 0', 'next', '2 / 3', 'Item 70', 'Item 100')
         await expect.poll(async () => (await position(page, 'Item 70')) - (await position(page, 'Item 0'))).toBe(1)
         await expect(itemButton(page, 'Item 0')).toBeVisible()
         await expect(zone(page, 'next')).toHaveCount(0)
+        // Sortable lets go of the folder's list once the drag is over, and a later drag does not reach for it again.
+        await expect.poll(() => folderList!.evaluate(list => Object.entries(list).some(([key, sortable]) => key.startsWith('Sortable') && sortable))).toBe(false)
+        // Sortable takes no new drag while the rows still slide into place from the drop.
+        await expect(page.locator('[data-risu-idx][style*="transform"]')).toHaveCount(0)
+        await drag(itemButton(page, 'Item 0'), itemButton(page, 'Item 70'), true)
+        await expect.poll(async () => (await position(page, 'Item 0')) - (await position(page, 'Item 70'))).toBe(1)
         expect(errors).toEqual([])
     })
 
