@@ -253,7 +253,8 @@ test.each([0, 12])(
                 storeRevision: 1,
             })
             admit()
-            await vi.waitFor(() => expect(host.textContent).toContain('SYNTHETIC_LUA_OK ' + count))
+            // The first run starts Lua, which takes over a second when other files run beside it.
+            await vi.waitFor(() => expect(host.textContent).toContain('SYNTHETIC_LUA_OK ' + count), { timeout: 5_000 })
             expect(shell.scriptstate).toBeUndefined()
             expect(scriptingState.metadataReads).toBe(0)
             expect(complete.scriptstate).toEqual({ $__synthetic_initialized: '1' })
