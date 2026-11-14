@@ -1,6 +1,7 @@
 import { test, expect } from './fixture'
 import type { Locator, Page } from '@playwright/test'
 import { languageEnglish as language } from '../../src/lang/en'
+import { touchHoldMs } from '../../src/ts/gui/touchHold'
 
 async function order(page: Page, kind: string) {
     return page.evaluate(kind => {
@@ -30,6 +31,35 @@ async function drag(source: Locator, target: Locator, bottom = false) {
     await mouse.move(x, y)
     await mouse.up()
 }
+type Point = { x: number, y: number }
+/** Holds a finger on `source` until it can be dragged, then lifts it where `during` leaves it. */
+async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>) {
+    const cdp = await page.context().newCDPSession(page)
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', point?: Point) =>
+        cdp.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [point] : [] })
+    await source.scrollIntoViewIfNeeded()
+    const box = await source.boundingBox()
+    let at = { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 }
+    await send('touchStart', at)
+    await page.waitForTimeout(touchHoldMs + 100)
+    at = { x: at.x, y: at.y + 4 }
+    await send('touchMove', at)
+    await page.waitForTimeout(60)
+    await during(async (point) => {
+        // Cross the rows on the way at a finger's pace.
+        for (let step = 1; step <= 6; step++) {
+            await send('touchMove', { x: at.x + (point.x - at.x) * step / 6, y: at.y + (point.y - at.y) * step / 6 })
+            await page.waitForTimeout(40)
+        }
+        // A second sample at rest, as a finger that stopped moving gives.
+        at = { x: point.x + 1, y: point.y }
+        await send('touchMove', at)
+        await page.waitForTimeout(120)
+    })
+    await send('touchEnd')
+}
+const outline = (locator: Locator) => locator.evaluate(element => getComputedStyle(element).outlineStyle)
+const opacity = (locator: Locator) => locator.evaluate(element => Number(getComputedStyle(element).opacity))
 
 for (const kind of ['regex', 'trigger']) {
     test(`${kind}: restores dragging after replacing an open list`, async ({ page }) => {
@@ -90,6 +120,12 @@ test('lore: move into a folder and back to the root', async ({ page }) => {
     expect(errors).toEqual([])
 })
 
+test('lore: an entry dragged onto a closed folder row becomes its first entry', async ({ page }) => {
+    await open(page, 'lore')
+    await drag(itemButton(page, 'Last'), itemButton(page, 'Folder'))
+    await expect.poll(() => order(page, 'lore')).toEqual(['Folder', 'Last', 'Child', 'First'])
+})
+
 test('prompt: use gaps and card halves without changing the drag source during hover', async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
@@ -116,7 +152,7 @@ test.describe('touch dragging', () => {
         const x = source!.x + source!.width / 2
         const y = source!.y + source!.height / 2
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] })
-        await page.waitForTimeout(350)
+        await page.waitForTimeout(touchHoldMs + 100)
         for (let step = 1; step <= 6; step++) {
             await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{
                 x, y: y + (target!.y + 3 - y) * step / 6,
@@ -125,6 +161,62 @@ test.describe('touch dragging', () => {
         }
         await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
         await expect.poll(() => order(page, 'regex')).toEqual(['Last', 'First', 'Second'])
+    })
+
+    test('lore: an entry released on a closed folder row becomes its first entry', async ({ page }) => {
+        await open(page, 'lore')
+        const folderRow = loreRow(page, 'Folder')
+        await touchDrag(page, itemButton(page, 'Last'), async (move) => {
+            await move(await center(itemButton(page, 'Folder')))
+            await expect.poll(() => outline(folderRow)).toBe('solid')
+            expect(await outline(loreRow(page, 'First'))).toBe('none')
+            // The folder and its mark show through the copy under the finger.
+            expect(await opacity(page.locator('.sortable-fallback'))).toBeLessThan(1)
+        })
+        await expect.poll(() => order(page, 'lore')).toEqual(['Folder', 'Last', 'Child', 'First'])
+        await expect.poll(() => outline(folderRow)).toBe('none')
+    })
+
+    test('lore: an entry released on an open folder name becomes its first entry', async ({ page }) => {
+        await open(page, 'lore')
+        await itemButton(page, 'Folder').click()
+        await expect(page.locator('[data-show-folder="folder"]').getByRole('button', { name: 'Child', exact: true })).toBeVisible()
+        const folderRow = loreRow(page, 'Folder')
+        await itemButton(page, 'Last').scrollIntoViewIfNeeded()
+        const start = await center(itemButton(page, 'Last'))
+        const list = await page.locator('[data-show-folder=""]').boundingBox()
+        expect(list!.x).toBeGreaterThan(4)
+        // Pass beside the list, so the entry keeps its place at the root until the finger is on the folder name.
+        const beside = list!.x / 2
+        await touchDrag(page, itemButton(page, 'Last'), async (move) => {
+            const name = await center(itemButton(page, 'Folder'))
+            await move({ x: beside, y: start.y + 4 })
+            await move({ x: beside, y: name.y })
+            expect(await outline(folderRow)).toBe('none')
+            expect(await opacity(page.locator('.sortable-fallback'))).toBe(1)
+            await move(name)
+            await expect.poll(() => outline(folderRow)).toBe('solid')
+            expect(await outline(loreRow(page, 'First'))).toBe('none')
+        })
+        await expect.poll(() => order(page, 'lore')).toEqual(['Folder', 'Last', 'Child', 'First'])
+        await expect(page.locator('[data-show-folder="folder"]').getByRole('button', { name: 'Last', exact: true })).toBeVisible()
+        await expect.poll(() => outline(folderRow)).toBe('none')
+    })
+
+    test('prompt: a held item header reorders the items', async ({ page }) => {
+        await open(page, 'prompt')
+        const first = promptHeader(page, 'First')
+        await first.scrollIntoViewIfNeeded()
+        await touchDrag(page, promptHeader(page, 'Last').locator('span').first(), async (move) => {
+            const box = await first.boundingBox()
+            await move({ x: box!.x + box!.width / 3, y: box!.y + 3 })
+            // The item stays in place, marked like a slot, under a card the drop marker shows through.
+            const source = promptHeader(page, 'Last').first()
+            await expect(source).toHaveClass(/\brisu-drag-source\b/)
+            expect(await outline(source)).toBe('dashed')
+            expect(await opacity(page.locator('.risu-drag-card'))).toBe(0.7)
+        })
+        await expect.poll(() => order(page, 'prompt')).toEqual(['Last', 'First', 'Second'])
     })
 })
 
@@ -136,6 +228,9 @@ async function center(locator: Locator) {
 const zone = (page: Page, direction: 'previous' | 'next') => page.locator(`[data-lore-page-zone="${direction}"]`)
 const pagerText = (page: Page) => page.getByRole('navigation', { name: language.risuNest.pager.pages }).first()
 const itemButton = (page: Page, name: string) => page.getByRole('button', { name, exact: true })
+const loreRow = (page: Page, name: string) => itemButton(page, name).locator('xpath=../..')
+const promptHeader = (page: Page, name: string) =>
+    page.locator('[draggable="true"]').filter({ has: page.locator('span', { hasText: new RegExp(`^${name}$`) }) })
 async function position(page: Page, name: string) {
     return (await order(page, 'lore')).indexOf(name)
 }
@@ -225,7 +320,7 @@ test.describe('lore pages by touch', () => {
         const touch = (type: 'touchStart' | 'touchEnd' | 'touchMove' | 'touchCancel', x: number, y: number) =>
             cdp.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchEnd' ? [] : [{ x, y }] })
         await touch('touchStart', start.x, start.y)
-        await page.waitForTimeout(350)
+        await page.waitForTimeout(touchHoldMs + 100)
         await touch('touchMove', start.x, start.y + 10)
         await expect(zone(page, 'next')).toHaveCount(1)
         const edge = await center(zone(page, 'next'))

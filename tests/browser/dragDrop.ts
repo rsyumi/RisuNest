@@ -1,3 +1,4 @@
+import '../../src/styles.css'
 import { mount } from 'svelte'
 import DragDrop from './DragDrop.svelte'
 import { DBState } from './dragDropAdapters.svelte'

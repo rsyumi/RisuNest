@@ -38,7 +38,9 @@
 </main>
 
 <style>
-    main { width: 500px; max-width: 95vw; font-family: sans-serif; }
+    /* The theme color the lorebook drop marks are drawn in. */
+    :global(:root) { --risu-theme-borderc: #6272a4; }
+    main { width: 500px; max-width: 95vw; margin: 8px; font-family: sans-serif; }
     :global(#drag-fixture [data-risu-idx]), :global(#drag-fixture [data-risu-idx2]) { border: 1px solid #aaa; padding: 8px; margin: 8px; }
     :global(#drag-fixture [data-show-folder]) { padding: 10px; min-height: 32px; border: 1px solid #aaa; }
     :global(#drag-fixture button) { padding: 5px; }
