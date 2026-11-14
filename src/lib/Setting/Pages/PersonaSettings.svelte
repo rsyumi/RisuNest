@@ -22,6 +22,7 @@
     let selectedId:string = null
     const createStb = () => {
         stb = Sortable.create(ele, {
+            draggable: '> [data-risu-idx]',
             onStart: async () => {
                 selectedId = DBState.db.personas[DBState.db.selectedPersona].id
                 saveUserPersona()

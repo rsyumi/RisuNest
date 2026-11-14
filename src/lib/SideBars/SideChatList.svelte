@@ -15,7 +15,6 @@
     import { addNewChat, duplicateChat, editSelectedChatList as applyChatListEdit, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { sortableOptions } from "src/ts/util";
-    import { chosenByTouch } from "src/ts/sortableOptions";
 
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -158,14 +157,6 @@
             chatsStb.push(new Sortable(chat, {
                 ...sortableOptions,
                 group: 'chats',
-                onChoose(this: Sortable, event) {
-                    sortableOptions.onChoose.call(this, event)
-                    if (chosenByTouch(event)) event.item.classList.add('risu-chat-held')
-                },
-                onUnchoose(this: Sortable, event) {
-                    sortableOptions.onUnchoose.call(this)
-                    event.item.classList.remove('risu-chat-held')
-                },
                 onStart: startChatDrag,
                 onChange: updateChatDropFolder,
                 onEnd: async (event) => {
@@ -280,6 +271,7 @@
             <div data-risu-chat-folder-idx={i}
                 class="flex flex-col mb-2 border-solid border-1 border-darkborderc cursor-pointer rounded-md"
                 class:risu-chat-drop-folder={(headerFolderId ?? slotFolderId) === folder.id}
+                data-risu-chat-drop-target={headerFolderId === folder.id ? '' : undefined}
                 class:risu-chat-folder-received={receivedFolderId === folder.id}
                 onanimationend={() => {
                     if (receivedFolderId === folder.id) receivedFolderId = null
@@ -624,24 +616,6 @@
         outline-offset: -1px;
     }
 
-    /* A touched row once the hold is long enough to drag it. */
-    .risu-chat-list :global(.risu-chat-held) {
-        background-color: var(--risu-theme-darkbutton);
-        outline: 1px solid var(--risu-theme-borderc);
-        outline-offset: -1px;
-    }
-
-    /* The slot the dragged row lands in. */
-    .risu-chat-list :global(.sortable-ghost) {
-        background-color: color-mix(in srgb, var(--risu-theme-selected) 45%, transparent);
-        outline: 1px dashed var(--risu-theme-borderc);
-        outline-offset: -1px;
-    }
-
-    .risu-chat-list :global(.sortable-ghost > *) {
-        opacity: 0.45;
-    }
-
     .risu-chat-header-drop :global(.sortable-ghost) {
         background-color: transparent;
         outline-color: transparent;
@@ -649,18 +623,6 @@
 
     .risu-chat-header-drop :global(.sortable-ghost > *) {
         opacity: 0.25;
-    }
-
-    /* The row that follows the pointer. */
-    .risu-chat-list :global(.sortable-drag) {
-        background-color: var(--risu-theme-darkbutton);
-        outline: 1px solid var(--risu-theme-borderc);
-        outline-offset: -1px;
-        box-shadow: 0 6px 16px rgb(0 0 0 / 0.35);
-    }
-
-    .risu-chat-list :global(.sortable-fallback) {
-        opacity: 1 !important;
     }
 
     .risu-chat-drop-folder {

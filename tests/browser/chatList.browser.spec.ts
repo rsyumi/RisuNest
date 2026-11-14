@@ -1,5 +1,6 @@
 import { test, expect } from './fixture'
 import type { Locator, Page } from '@playwright/test'
+import { touchHoldMs } from '../../src/ts/gui/touchHold'
 
 type Point = { x: number, y: number }
 
@@ -39,13 +40,14 @@ test.describe('chat list by touch', () => {
     test.use({ hasTouch: true, isMobile: true, viewport: { width: 393, height: 852 } })
 
     /** Holds a chat until it can be dragged, then moves the finger and lifts it where `during` leaves it. */
-    async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>) {
+    async function touchDrag(page: Page, source: Locator, during: (move: (point: Point) => Promise<void>) => Promise<void>, held?: () => Promise<void>) {
         const cdp = await page.context().newCDPSession(page)
         const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', point?: Point) =>
             cdp.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [point] : [] })
         const start = await middle(source)
         await send('touchStart', start)
-        await page.waitForTimeout(350)
+        await page.waitForTimeout(touchHoldMs + 100)
+        await held?.()
         await send('touchMove', { x: start.x, y: start.y + 4 })
         await page.waitForTimeout(60)
         await during(async (point) => {
@@ -60,8 +62,14 @@ test.describe('chat list by touch', () => {
 
     test('an empty folder takes a chat dropped anywhere on it', async ({ page }) => {
         await open(page)
-        const area = await middle(folder(page, 'Second folder').locator('.risu-chat'))
-        await touchDrag(page, chat(page, 'Chat 3'), move => move(area))
+        const target = folder(page, 'Second folder')
+        const area = await middle(target.locator('.risu-chat'))
+        await touchDrag(page, chat(page, 'Chat 3'), async (move) => {
+            await move(area)
+            // A chat that lands inside the folder, not on its header, keeps an opaque copy.
+            await expect.poll(() => target.evaluate(element => getComputedStyle(element).outlineStyle)).toBe('solid')
+            expect(await page.locator('.sortable-fallback').evaluate(element => getComputedStyle(element).opacity)).toBe('1')
+        })
         await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 3'], outside: ['Chat 1', 'Chat 2'] })
     })
 
@@ -73,6 +81,8 @@ test.describe('chat list by touch', () => {
             await move(await middle(target.locator('[data-risu-chat-folder-header]')))
             await expect.poll(() => target.evaluate(element => getComputedStyle(element).outlineStyle)).toBe('solid')
             expect(await folder(page, 'First folder').evaluate(element => getComputedStyle(element).outlineStyle)).toBe('none')
+            // The folder and its mark show through the copy under the finger.
+            expect(Number(await page.locator('.sortable-fallback').evaluate(element => getComputedStyle(element).opacity))).toBeLessThan(1)
         })
         await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': ['Chat 3', 'Chat 1'], outside: ['Chat 2'] })
         await expect(target.locator('.risu-chat')).toBeHidden()
@@ -98,6 +108,29 @@ test.describe('chat list by touch', () => {
             await expect.poll(() => folder(page, 'First folder').evaluate(element => getComputedStyle(element).outlineStyle)).toBe('solid')
         })
         await expect.poll(async () => (await listed(page))['First folder']).toEqual(['Chat 14'])
+    })
+
+    test('marks the held chat, the slot it lands in, and the copy under the finger', async ({ page }) => {
+        await open(page)
+        // The copy that follows the finger is the only fixed row.
+        const marks = () => chat(page, 'Chat 3').evaluateAll(rows => Object.fromEntries(rows.map(row => {
+            const style = getComputedStyle(row)
+            return [style.position === 'fixed' ? 'following' : 'listed', {
+                outline: style.outlineStyle,
+                opacity: style.opacity,
+                text: getComputedStyle(row.firstElementChild!).opacity,
+            }]
+        })))
+        await touchDrag(page, chat(page, 'Chat 3'), async (move) => {
+            await move(await middle(chat(page, 'Chat 1')))
+            await expect.poll(marks).toEqual({
+                listed: { outline: 'dashed', opacity: '1', text: '0.45' },
+                following: { outline: 'solid', opacity: '1', text: '1' },
+            })
+        }, async () => {
+            await expect.poll(marks).toEqual({ listed: { outline: 'solid', opacity: '1', text: '1' } })
+        })
+        await expect.poll(() => listed(page)).toEqual({ 'First folder': [], 'Second folder': [], outside: ['Chat 3', 'Chat 1', 'Chat 2'] })
     })
 })
 
