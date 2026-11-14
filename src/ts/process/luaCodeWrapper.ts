@@ -2,7 +2,7 @@ export function luaCodeWrapper(code:string){
     return `
 json = require 'json'
 
-local decodeJSON
+-- The script shares this chunk's limit of 200 locals, so the wrapper keeps upstream's four.
 do
     local original = json
     local decode = json.decode
@@ -19,7 +19,7 @@ do
         for key, item in rawnext, value do result[key] = copy(item) end
         return result
     end
-    decodeJSON = function(value)
+    local function decodeJSON(value)
         local current = {string.byte, string.find, string.sub, string.match, string.format, string.char, math.floor,
             tonumber, tostring, error, type, pairs, table.insert, table.concat}
         if json ~= original or json.decode ~= decode then return json.decode(value) end
@@ -37,18 +37,27 @@ do
         size = size + #value
         return copy(result)
     end
-end
 
-function getChat(id, index)
-    return decodeJSON(getChatMain(id, index))
-end
+    function getChat(id, index)
+        return decodeJSON(getChatMain(id, index))
+    end
 
-function getFullChat(id)
-    return decodeJSON(getFullChatMain(id))
-end
+    function getFullChat(id)
+        return decodeJSON(getFullChatMain(id))
+    end
 
-function getRecentChats(id, count)
-    return decodeJSON(getRecentChatsMain(id, count))
+    function getRecentChats(id, count)
+        return decodeJSON(getRecentChatsMain(id, count))
+    end
+
+    function getLoreBooks(id, search)
+        return decodeJSON(getLoreBooksMain(id, search))
+    end
+
+    function getState(id, name)
+        local escapedName = "__"..name
+        return decodeJSON(getChatVar(id, escapedName))
+    end
 end
 
 function setFullChat(id, value)
@@ -57,10 +66,6 @@ end
 
 function log(value)
     logMain(json.encode(value))
-end
-
-function getLoreBooks(id, search)
-    return decodeJSON(getLoreBooksMain(id, search))
 end
 
 
@@ -115,11 +120,6 @@ function listenEdit(type, func)
     end
 
     throw('Invalid type')
-end
-
-function getState(id, name)
-    local escapedName = "__"..name
-    return decodeJSON(getChatVar(id, escapedName))
 end
 
 function setState(id, name, value)

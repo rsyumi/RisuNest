@@ -139,6 +139,14 @@ test('returns independent decoded views and observes changed JSON and overridden
     expect(await runtime.invoke('read', [])).toBe('changed:2')
 })
 
+test('leaves a script the 196 main-chunk locals that upstream leaves it', async () => {
+    const locals = Array.from({ length: 196 }, (_, i) => `local v${i} = ${i}`).join('\n')
+    const runtime = await create(`${locals}
+        function read() return v0 + v195 end
+    `)
+    expect(await runtime.invoke('read', [])).toBe(195)
+})
+
 test('does not reuse decoded output after a decoder dependency changes', async () => {
     const runtime = await create(`
         function run()
