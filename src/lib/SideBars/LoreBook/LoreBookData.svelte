@@ -104,7 +104,7 @@
     class:no-sort={value.mode === 'folder' && openFolders > 0}
     data-risu-idx={idx} data-risu-idgroup={idgroup}
 >
-    <div class="flex items-center transition-colors w-full p-1">
+    <div class="flex items-center transition-colors w-full p-1" data-lore-folder-header={value.mode === 'folder' ? value.key : undefined}>
 
     {#if value.mode !== 'child'}
         <button class="endflex valuer border-darkborderc flex items-center" onclick={() => {
@@ -301,12 +301,42 @@
         margin-bottom: 0.5rem;
         border-bottom: 1px solid;
         border-bottom-color: var(--risu-theme-selected);
-        opacity: 0.7;
     }
 
-    :global(.risu-ghost-item) {
-        /* The placeholder for the drop location */
-        background-color: rgba(var(--risu-theme-selected-rgb), 0.2);
+    /* The folder a dragged entry goes into when it is released on the folder's row. */
+    :global([data-lore-drop-target]) {
+        border-radius: 0.375rem;
+        outline: 2px solid var(--risu-theme-borderc);
+        outline-offset: -2px;
+    }
 
+    :global([data-lore-header-drop] .sortable-ghost) {
+        background-color: transparent;
+        outline-color: transparent;
+    }
+
+    :global([data-lore-header-drop] .sortable-ghost > *) {
+        opacity: 0.25;
+    }
+
+    :global([data-lore-received]) {
+        animation: risu-lore-received 0.7s ease-out;
+    }
+
+    @keyframes -global-risu-lore-received {
+        from {
+            outline: 2px solid var(--risu-theme-borderc);
+            outline-offset: -2px;
+        }
+        to {
+            outline: 2px solid transparent;
+            outline-offset: -2px;
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        :global([data-lore-received]) {
+            animation: none;
+        }
     }
 </style>
