@@ -30,6 +30,12 @@ function contextmenu(target: EventTarget) {
     return event
 }
 
+function selectstart(target: EventTarget) {
+    const event = new Event('selectstart', { bubbles: true, cancelable: true })
+    target.dispatchEvent(event)
+    return event
+}
+
 beforeEach(() => {
     vi.useFakeTimers()
     row = document.createElement('div')
@@ -46,6 +52,8 @@ beforeEach(() => {
 
 afterEach(() => {
     for (const action of actions) action.destroy()
+    // A test that leaves its finger down would keep the hold's guard on the document.
+    pointer('pointercancel', window, 'touch')
     document.body.replaceChildren()
     vi.useRealTimers()
 })
@@ -60,6 +68,8 @@ it.each(['touch', 'mouse'])('runs a held %s press once with its event and drops 
     expect(held).toHaveBeenCalledOnce()
     expect(held.mock.calls[0][0].shiftKey).toBe(true)
     expect(contextmenu(button).defaultPrevented).toBe(true)
+    // Only a finger brings the platform's long press with it.
+    expect(selectstart(field).defaultPrevented).toBe(pointerType === 'touch')
 
     pointer('pointerup', button, pointerType)
     expect(click(button).defaultPrevented).toBe(true)
@@ -127,6 +137,30 @@ it('cancels the touchend of a fired touch hold, also after the action removed th
     vi.advanceTimersByTime(touchHoldMs)
     expect(held).toHaveBeenCalledTimes(5)
     expect(touchend().defaultPrevented).toBe(true)
+})
+
+it.each(['pointerup', 'pointercancel', 'pointerdown'])('keeps the platform long press off what a held touch put under the finger until %s', ending => {
+    const menu = vi.fn()
+    row.addEventListener('contextmenu', menu)
+    // The action replaces the pressed button, as a menu item that opens a dialog does.
+    const action = longpress(button, () => {
+        action.destroy()
+        button.remove()
+    })
+    pointer('pointerdown', button, 'touch')
+    expect(selectstart(field).defaultPrevented).toBe(false)
+    vi.advanceTimersByTime(touchHoldMs)
+    expect(selectstart(field).defaultPrevented).toBe(true)
+    expect(contextmenu(field).defaultPrevented).toBe(true)
+    expect(menu).not.toHaveBeenCalled()
+
+    // Another pointer's release does not end it. The finger lifting does, and so does the next press when the lift was never seen.
+    pointer('pointerup', field, 'mouse')
+    expect(selectstart(field).defaultPrevented).toBe(true)
+    pointer(ending, field, 'touch')
+    expect(selectstart(field).defaultPrevented).toBe(false)
+    expect(contextmenu(field).defaultPrevented).toBe(false)
+    expect(menu).toHaveBeenCalledOnce()
 })
 
 it.each(['move', 'pointercancel', 'release'])('drops the hold on %s and leaves the next click alone', reason => {

@@ -37,20 +37,39 @@ export function longpress(node:HTMLElement, param:((e:MouseEvent)=>void) | LongP
 	let guardUntil = 0
 	let releaseTouchGuard: (() => void) | null = null
 
-	// A held touch must not end as a tap on whatever the action put under the finger.
+	// A held touch must not end as a tap on whatever the action put under the finger, and while the finger stays down
+	// the platform's own long press must not select text or open a menu there.
 	// Touch events stay on the pressed element, so the guard also works once the action has removed it.
-	function guardTouchEnd(target: EventTarget | null) {
+	function guardHeldTouch(held: PointerEvent) {
 		releaseTouchGuard?.()
+		const target = held.target
 		if (!target) return
 		const stop = (e: Event) => {
 			if (e.cancelable) e.preventDefault()
 			release()
 		}
+		const block = (e: Event) => {
+			e.preventDefault()
+			if (e.type === 'contextmenu') e.stopPropagation()
+		}
+		const lifted = (e: PointerEvent) => {
+			// A new press means the release never reached the page.
+			if (e.type === 'pointerdown' ? e.isPrimary : e.pointerId === held.pointerId) unblock()
+		}
+		const unblock = () => {
+			document.removeEventListener('selectstart', block, true)
+			document.removeEventListener('contextmenu', block, true)
+			for (const type of ['pointerup', 'pointercancel', 'pointerdown']) window.removeEventListener(type, lifted as EventListener, true)
+		}
 		const release = () => {
+			unblock()
 			target.removeEventListener('touchend', stop)
 			if (releaseTouchGuard === release) releaseTouchGuard = null
 		}
 		target.addEventListener('touchend', stop, { passive: false })
+		document.addEventListener('selectstart', block, true)
+		document.addEventListener('contextmenu', block, true)
+		for (const type of ['pointerup', 'pointercancel', 'pointerdown']) window.addEventListener(type, lifted as EventListener, true)
 		releaseTouchGuard = release
 	}
 
@@ -67,7 +86,7 @@ export function longpress(node:HTMLElement, param:((e:MouseEvent)=>void) | LongP
 		if (!press || press.fired) return
 		press.fired = true
 		window.clearTimeout(press.timer)
-		if (press.touch) guardTouchEnd(press.event.target)
+		if (press.touch) guardHeldTouch(press.event)
 		current.onLongPress(press.event)
 	}
 	function handlePointerDown(e:PointerEvent) {
