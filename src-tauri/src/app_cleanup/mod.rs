@@ -410,6 +410,9 @@ struct Effects<'a> {
     remove_secrets: &'a dyn Fn(&std::path::Path) -> Result<()>,
     remove_webview: &'a dyn Fn(Option<&ProfileName>) -> Result<()>,
     relaunch: &'a dyn Fn(&Request, Option<&ProfileName>) -> Result<()>,
+    /// How long removal waits out files still open and a data root still
+    /// locked by an instance that is exiting.
+    retry_for: Duration,
 }
 
 /// A lock attempt that failed only because another process holds the lock.
@@ -482,11 +485,12 @@ fn refuse_while_other_profiles_run(profiles: &DesktopProfiles, profile: Option<&
 
 #[cfg(desktop)]
 fn erase_retrying(paths: &Paths, request: &mut Request, effects: &Effects) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + effects.retry_for;
     loop {
         match erase_with(paths, request, effects.remove_secrets, files::remove) {
             Ok(()) => return Ok(()),
-            Err(error) if error == "cleanup-files-busy-or-denied" && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) if (error == "cleanup-files-busy-or-denied" || error == "cleanup-data-root-in-use") && Instant::now() < deadline =>
+                std::thread::sleep(Duration::from_millis(100)),
             Err(error) => return Err(error),
         }
     }
@@ -578,7 +582,8 @@ pub(crate) fn run_cli(arguments: &[std::ffi::OsString], profiles: &DesktopProfil
     let args = arguments.iter().map(|argument| argument.to_string_lossy().into_owned()).collect::<Vec<_>>();
     if !args.first().is_some_and(|arg| matches!(arg.as_str(), "--remove-local-data" | "--cleanup-worker")) { return None; }
     let remove_webview = |profile: Option<&ProfileName>| crate::cleanup_webview::remove_profile_store(profiles.agent(), profile);
-    let effects = Effects { remove_secrets: &crate::cleanup_secrets::remove_all, remove_webview: &remove_webview, relaunch: &relaunch };
+    let effects = Effects { remove_secrets: &crate::cleanup_secrets::remove_all, remove_webview: &remove_webview, relaunch: &relaunch,
+        retry_for: Duration::from_secs(10) };
     match cli(&args, profiles, profile, &effects) {
         Ok(()) => Some(0),
         Err(error) => { eprintln!("{error}"); Some(1) },
@@ -902,6 +907,7 @@ mod tests {
             _root: tempfile::TempDir,
             profiles: DesktopProfiles,
             webview_root: PathBuf,
+            retry_for: std::cell::Cell<Duration>,
         }
 
         impl Fixture {
@@ -912,7 +918,7 @@ mod tests {
                 let base = fs::canonicalize(root.path()).unwrap();
                 let base = if cfg!(target_os = "macos") { base } else { root.path().to_owned() };
                 let profiles = DesktopProfiles::synthetic(&base, false);
-                Self { _root: root, profiles, webview_root: base.join("webview") }
+                Self { _root: root, profiles, webview_root: base.join("webview"), retry_for: std::cell::Cell::new(Duration::from_secs(10)) }
             }
 
             fn create(&self, profile: Option<&str>) -> PathBuf {
@@ -951,7 +957,7 @@ mod tests {
                     relaunched.borrow_mut().push(profile.map(|profile| profile.as_str().to_owned()));
                     Ok(())
                 };
-                let effects = Effects { remove_secrets: secrets, remove_webview: webview, relaunch: &relaunch };
+                let effects = Effects { remove_secrets: secrets, remove_webview: webview, relaunch: &relaunch, retry_for: self.retry_for.get() };
                 let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
                 cli(&args, &self.profiles, name(profile).as_ref(), &effects)
             }
@@ -1190,13 +1196,20 @@ mod tests {
             let (_, target) = link_data_root(&fixture, "work", false);
             let held = DataRootLock::acquire(&target).unwrap();
             assert_eq!(DataRootLock::acquire_within(&target, Duration::ZERO).err().unwrap(), "data-root-in-use");
+            fixture.retry_for.set(Duration::ZERO);
             let error = fixture.run(&REMOVE, Some("work"), &|_| panic!("secrets stay until the data root is free"),
                 &RefCell::new(Vec::new())).unwrap_err();
             assert_eq!(error, "cleanup-data-root-in-use");
             assert!(target.join("persistent/records/synthetic").exists());
-            // The app releases its hold before it exits for the worker.
-            held.release();
+            // An exiting app lets go of the data root only as its process ends,
+            // which can be after the owner lock.
+            fixture.retry_for.set(Duration::from_secs(30));
+            let releasing = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                held.release();
+            });
             fixture.run(&REMOVE, Some("work"), &|_| Ok(()), &RefCell::new(Vec::new())).unwrap();
+            releasing.join().unwrap();
             assert!(!target.exists());
         }
 
