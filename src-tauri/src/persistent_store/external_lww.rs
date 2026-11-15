@@ -1030,7 +1030,8 @@ impl PersistentStore {
             let job=publication.asset_job.as_ref().ok_or_else(||super::lww::error("captured-control-job-missing"))?;
             let expected=self.repository_root.join("external-storage").join("lww-publications")
                 .join(&job.job_id).join("controls").join(&control.content_hash);
-            if control.source!=expected {
+            // Written under the data root of the run that froze it.
+            if crate::app_paths::relocated_external_storage_path(&control.source,&self.repository_root)!=expected {
                 return Err(super::lww::error("captured-control-source-integrity"));
             }
         }

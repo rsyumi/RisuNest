@@ -697,6 +697,17 @@ fn oversized_control_pages_use_frozen_data_packs_and_preserve_newer_edits_on_ret
         let reopened=f.a.external_lww_pending(&f.sender.target_scope(),&writer).unwrap().unwrap().0;
         assert_eq!(reopened.controls,pending.controls);
         assert!(reopened.asset_job==pending.asset_job);
+        // As a run with the data root at an earlier location froze it, before a link moved it here.
+        let earlier=tempfile::tempdir().unwrap();
+        let mut frozen=reopened.clone();
+        for control in &mut frozen.controls {
+            let rest=control.source.components().rev().take_while(|part|part.as_os_str()!="external-storage").collect::<Vec<_>>();
+            control.source=rest.into_iter().rev().fold(earlier.path().join("RisuNestData").join("external-storage"),|path,part|path.join(part));
+        }
+        f.a.device_store().unwrap().connection().execute(
+            "UPDATE external_lww_segments SET metadata=?1 WHERE target=?2 AND writer=?3 AND seq=?4",
+            rusqlite::params![serde_json::to_string(&frozen).unwrap(),frozen.target,writer,frozen.seq.0.to_string()],
+        ).unwrap();
         assert_eq!(f.publish_a().await.segments.0,2,"exact older ACK must leave the newer messages version pending");
         assert_eq!(f.provider.contents(&pack).unwrap(),original_pack);
         let mut segments=f.sender.listing(&Cancellation::default()).await.unwrap();
