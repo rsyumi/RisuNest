@@ -501,20 +501,7 @@ impl ServerClient {
         retry_budget: Arc<RetryBudget>,
     ) -> Result<Self> {
         let url = config.validate()?;
-        // New clients must pick up system proxy changes. Keep the connection
-        // pool scoped to this client and its transfer workers.
-        // Other crates enable reqwest's decoders, which would strip a
-        // Content-Encoding this client has to see and refuse.
-        let http = crate::platform_tls::blocking_client_builder()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
+        let http = shared_http()?;
         Ok(Self {
             body_download_observer: None,
             #[cfg(test)]
@@ -1061,6 +1048,46 @@ pub(crate) fn retryable_response(reply: &Reply) -> bool {
         || (reply.status == 408 && response_code(reply).as_deref() == Some("request-timeout"))
 }
 
+/// How long sync clients share one HTTP client.
+const SHARED_HTTP_LIFETIME: Duration = Duration::from_secs(60);
+
+type SharedHttp = Option<(reqwest::blocking::Client, Instant)>;
+
+/// The HTTP client of every sync client built within a minute of it. Commands
+/// that follow one another reuse its open connections; the next one built
+/// after that minute picks up system proxy changes. Idle connections close
+/// well before a server or proxy would close them under a request.
+fn shared_http() -> Result<reqwest::blocking::Client> {
+    #[cfg(test)]
+    if let Some(http) = tests::private_shared_http() {
+        return http;
+    }
+    static SHARED: std::sync::Mutex<SharedHttp> = std::sync::Mutex::new(None);
+    reuse_or_build_http(&mut SHARED.lock().unwrap_or_else(|error| error.into_inner()), Instant::now())
+}
+fn reuse_or_build_http(shared: &mut SharedHttp, now: Instant) -> Result<reqwest::blocking::Client> {
+    if let Some((http, built)) = shared.as_ref() {
+        if now.saturating_duration_since(*built) < SHARED_HTTP_LIFETIME {
+            return Ok(http.clone());
+        }
+    }
+    // Other crates enable reqwest's decoders, which would strip a
+    // Content-Encoding this client has to see and refuse.
+    let http = crate::platform_tls::blocking_client_builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| SyncError::new("http-client-unavailable", 503))?;
+    *shared = Some((http.clone(), now));
+    Ok(http)
+}
+
 pub(crate) fn is_ambiguous_transient(error: &SyncError) -> bool {
     error.status == 503
         && matches!(
@@ -1314,8 +1341,48 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// The shared HTTP client of a `PrivateSharedHttp` scope, and how far its
+        /// clock was moved ahead.
+        static PRIVATE_SHARED_HTTP: std::cell::RefCell<Option<(SharedHttp, Duration)>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn private_shared_http() -> Option<Result<reqwest::blocking::Client>> {
+        PRIVATE_SHARED_HTTP.with(|private| {
+            let mut private = private.borrow_mut();
+            let (shared, ahead) = private.as_mut()?;
+            Some(reuse_or_build_http(shared, Instant::now() + *ahead))
+        })
+    }
+    /// Gives clients built on this thread a shared HTTP client of their own,
+    /// which no other test reuses or ages, until dropped. Dropping it drops that
+    /// client here rather than in the thread-local's destructor, where joining
+    /// the client's runtime thread deadlocks on Windows.
+    struct PrivateSharedHttp;
+    impl PrivateSharedHttp {
+        fn new() -> Self {
+            PRIVATE_SHARED_HTTP.with(|private| *private.borrow_mut() = Some((None, Duration::ZERO)));
+            Self
+        }
+        fn move_clock_ahead(&self, by: Duration) {
+            PRIVATE_SHARED_HTTP.with(|private| {
+                if let Some((_, ahead)) = private.borrow_mut().as_mut() {
+                    *ahead += by;
+                }
+            });
+        }
+    }
+    impl Drop for PrivateSharedHttp {
+        fn drop(&mut self) {
+            let private = PRIVATE_SHARED_HTTP.with(|private| private.borrow_mut().take());
+            drop(private);
+        }
+    }
+
+    /// Clients built within the shared lifetime reuse its connection, one built
+    /// after it refreshes transport configuration, and none shares another's
+    /// credentials or cancellation.
     #[test]
-    fn successive_clients_refresh_transport_without_sharing_credentials_or_cancellation() {
+    fn clients_share_transport_for_a_minute_without_sharing_credentials_or_cancellation() {
         use axum::{extract::ConnectInfo, http::{HeaderMap, StatusCode}, Router};
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1337,6 +1404,7 @@ mod tests {
                     .with_graceful_shutdown(async { let _ = stopped.await; }).await.unwrap();
             });
         });
+        let shared = PrivateSharedHttp::new();
         let cancelled = Arc::new(AtomicBool::new(false));
         let first = ServerClient::with_cancellation(config(&endpoint), Some(cancelled.clone())).unwrap();
         assert_eq!(first.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
@@ -1347,13 +1415,18 @@ mod tests {
         next.token = "b".repeat(64);
         let second = ServerClient::new(next).unwrap();
         assert_eq!(second.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
+        shared.move_clock_ahead(SHARED_HTTP_LIFETIME);
+        let third = ServerClient::new(config(&endpoint)).unwrap();
+        assert_eq!(third.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
         stop.send(()).unwrap();
         server.join().unwrap();
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert_ne!(seen[0].0, seen[1].0, "a new client must refresh transport configuration");
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].0, seen[1].0, "a client within the lifetime reuses the connection");
+        assert_ne!(seen[1].0, seen[2].0, "a client after the lifetime refreshes transport configuration");
         assert_eq!(seen[0].1, format!("Bearer {}", "a".repeat(64)));
         assert_eq!(seen[1].1, format!("Bearer {}", "b".repeat(64)));
+        assert_eq!(seen[2].1, format!("Bearer {}", "a".repeat(64)));
     }
     #[test]
     fn verified_progress_renews_more_than_five_minutes_of_transient_failures() {
