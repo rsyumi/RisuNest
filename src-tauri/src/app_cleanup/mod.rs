@@ -342,15 +342,25 @@ fn erase_with(paths: &Paths, request: &mut Request,
     mut remove_root: impl FnMut(&std::path::Path) -> Result<()>) -> Result<()> {
     paths.preflight()?;
     #[cfg(desktop)]
-    if let Some(directory) = paths.data_directory() { ensure_data_root_unused(directory)?; }
+    let release = {
+        let hold = match paths.data_directory() { Some(directory) => DataRootHold::take(directory)?, None => None };
+        move || hold.map_or(Ok(()), DataRootHold::release)
+    };
+    #[cfg(mobile)]
+    let release = || -> Result<()> { Ok(()) };
     remove_secrets(&paths.data)?;
     begin_roots(paths, request)?;
-    for root in &paths.roots { remove_root(root)?; }
-    // A reset keeps the link, so the relaunched app goes on using its target.
-    if let Some(link) = &paths.data_link {
-        files::clear_linked(&link.link, link.target.as_deref(), request.mode != Mode::Reset)?;
+    // The data root goes after the other roots and its lock file after the
+    // rest of it, so that a profile whose data root leads to the same
+    // directory cannot start while any of it is left.
+    let data_root = paths.data_link.is_none() && paths.roots.contains(&paths.data);
+    for root in paths.roots.iter().filter(|root| !data_root || **root != paths.data) { remove_root(root)?; }
+    match &paths.data_link {
+        // A reset keeps the link, so the relaunched app goes on using its target.
+        Some(link) => files::clear_linked(&link.link, link.target.as_deref(), request.mode != Mode::Reset, release),
+        None if data_root => files::clear_data_root(&paths.data, release),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Held by a desktop instance inside the data root it uses for its whole run,
@@ -389,18 +399,36 @@ impl DataRootLock {
     }
 }
 
-/// Only an existing lock file is opened, so the check creates nothing.
+/// A data root's lock, held by cleanup for as long as it erases that data root.
 #[cfg(desktop)]
-fn ensure_data_root_unused(root: &std::path::Path) -> Result<()> {
-    let file = match fs::OpenOptions::new().read(true).write(true).open(root.join(crate::app_paths::DATA_ROOT_LOCK)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(failed("cleanup-lock-unavailable", error)),
-    };
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(()),
-        Err(error) if contended(&error) => Err("cleanup-data-root-in-use".into()),
-        Err(error) => Err(failed("cleanup-lock-unavailable", error)),
+struct DataRootHold {
+    lock: std::path::PathBuf,
+    file: fs::File,
+}
+
+#[cfg(desktop)]
+impl DataRootHold {
+    /// Nothing is created for a data root directory that does not exist.
+    fn take(root: &std::path::Path) -> Result<Option<Self>> {
+        let lock = root.join(crate::app_paths::DATA_ROOT_LOCK);
+        let file = match fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(failed("cleanup-lock-unavailable", error)),
+        };
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Some(Self { lock, file })),
+            Err(error) if contended(&error) => Err("cleanup-data-root-in-use".into()),
+            Err(error) => Err(failed("cleanup-lock-unavailable", error)),
+        }
+    }
+
+    /// Deletes the lock file before letting go of it.
+    fn release(self) -> Result<()> {
+        match fs::remove_file(&self.lock) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(failed("cleanup-files-busy-or-denied", error)),
+            _ => { drop(self.file); Ok(()) }
+        }
     }
 }
 
@@ -1211,6 +1239,21 @@ mod tests {
             fixture.run(&REMOVE, Some("work"), &|_| Ok(()), &RefCell::new(Vec::new())).unwrap();
             releasing.join().unwrap();
             assert!(!target.exists());
+        }
+
+        #[test]
+        fn cleanup_keeps_a_data_root_locked_while_it_erases_it() {
+            let fixture = Fixture::new();
+            let data = fixture.create(None);
+            let (_, target) = link_data_root(&fixture, "work", true);
+            for (profile, directory) in [(None, &data), (Some("work"), &target)] {
+                erase_with(&fixture.paths(profile), &mut request(), &|_| Ok(()), |root| {
+                    assert_eq!(DataRootLock::acquire_within(directory, Duration::ZERO).err().as_deref(), Some("data-root-in-use"));
+                    files::remove(root)
+                }).unwrap();
+            }
+            assert!(!data.exists());
+            assert_eq!(fs::read_dir(&target).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>(), vec!["notes.txt"]);
         }
 
         #[test]
