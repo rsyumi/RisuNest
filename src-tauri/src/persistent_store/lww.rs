@@ -69,6 +69,51 @@ CREATE TABLE lww_unpublished_proofs(proof_id TEXT PRIMARY KEY,authority TEXT NOT
 CREATE TABLE lww_new_device_authorizations(authorization_id TEXT PRIMARY KEY,request_id TEXT NOT NULL UNIQUE,authority TEXT NOT NULL,staging_id TEXT NOT NULL,old_writer_id TEXT NOT NULL,writer_id TEXT NOT NULL,selection_change TEXT NOT NULL,authorized INTEGER NOT NULL CHECK(authorized IN (0,1)));
 "#;
 
+/// The finished receives that no longer belong to the newest part of their stream, before
+/// proofs are considered. Streams and rows are read through `lww_receive_stream`, so a page's
+/// body is walked only to compare an external page's cursor, and only back to the first page
+/// whose cursor differs from the newest one.
+fn superseded_receives(device: &Connection) -> StoreResult<Vec<String>> {
+    let streams: Vec<(String, String)> = {
+        let mut statement = device.prepare("SELECT DISTINCT kind,writer_id FROM lww_receive")?;
+        let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        rows
+    };
+    let mut superseded = Vec::new();
+    for (kind, writer) in streams {
+        let newest: Option<i64> = device
+            .query_row(
+                "SELECT rowid FROM lww_receive WHERE kind=?1 AND writer_id=?2 AND finished=1 ORDER BY rowid DESC LIMIT 1",
+                params![kind, writer],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(newest) = newest else { continue };
+        let before = if kind == "server" {
+            newest
+        } else {
+            let cursor: String =
+                device.query_row("SELECT cursor FROM lww_receive WHERE rowid=?1", [newest], |r| r.get(0))?;
+            let moved: Option<i64> = device
+                .query_row(
+                    "SELECT rowid FROM lww_receive WHERE kind=?1 AND writer_id=?2 AND finished=1 AND rowid<?3 AND cursor<>?4 ORDER BY rowid DESC LIMIT 1",
+                    params![kind, writer, newest, cursor],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(moved) = moved else { continue };
+            moved + 1
+        };
+        let mut statement = device.prepare(
+            "SELECT request_id FROM lww_receive WHERE kind=?1 AND writer_id=?2 AND finished=1 AND rowid<?3",
+        )?;
+        for request_id in statement.query_map(params![kind, writer, before], |r| r.get::<_, String>(0))? {
+            superseded.push(request_id?);
+        }
+    }
+    Ok(superseded)
+}
+
 /// The receive rows a deferred drain applies again.
 pub(super) const DRAIN_ROWS_SQL: &str = "SELECT request_id,key,stamp,value,status FROM lww_receive_rows WHERE status IN ('staged','held','deferred') ORDER BY key";
 /// Replays of one intent that may fail before recovery sets it aside.
@@ -2671,10 +2716,12 @@ impl PersistentStore {
         self.prune_receive_history()
     }
     /// Drops the receive history no proof needs. A finished receive stays while a held or
-    /// deferred row points at it, or until a later finished receive of its progress stream
-    /// moves the cursor. Pages that repeat the cursor belong to a group still arriving, and
-    /// acknowledging the last page reads it back. `done` rows go once their receive has
-    /// finished.
+    /// deferred row points at it. Otherwise only the newest finished server page stays: the
+    /// operation log hands out one server page at a time, never an older one again, and
+    /// acknowledging a page reads back only that page. An external page stays until a later
+    /// finished page of its stream moves the cursor, because pages that repeat the cursor belong
+    /// to a group still arriving, which may be delivered again under the same request ids.
+    /// `done` rows go once their receive has finished.
     fn prune_receive_history(&mut self) -> StoreResult<()> {
         let unfinished: Vec<String> = {
             let device = self.device_store()?.connection();
@@ -2689,31 +2736,25 @@ impl PersistentStore {
                 [&unfinished],
             )?;
         }
-        let superseded: Vec<String> = {
-            let device = self.device_store()?.connection();
-            let mut statement = device.prepare(
-                "SELECT request_id FROM lww_receive old WHERE finished=1 AND EXISTS(
-                     SELECT 1 FROM lww_receive newer WHERE newer.finished=1 AND newer.kind=old.kind
-                     AND newer.writer_id=old.writer_id AND newer.rowid>old.rowid AND newer.cursor<>old.cursor)",
+        let superseded = superseded_receives(self.device_store()?.connection())?;
+        if superseded.is_empty() {
+            return Ok(());
+        }
+        let mut proofs = BTreeSet::new();
+        for db in [&self.connection, self.device_store()?.connection()] {
+            let mut statement = db.prepare(
+                "SELECT DISTINCT request_id FROM lww_receive_rows WHERE status IN ('held','deferred')",
             )?;
-            let ids = statement.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            ids
-        };
-        for request_id in superseded {
-            let mut proof = false;
-            for db in [&self.connection, self.device_store()?.connection()] {
-                proof |= db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM lww_receive_rows WHERE request_id=?1 AND status IN ('held','deferred'))",
-                    [&request_id],
-                    |r| r.get::<_, bool>(0),
-                )?;
+            for request_id in statement.query_map([], |r| r.get::<_, String>(0))? {
+                proofs.insert(request_id?);
             }
-            if !proof {
-                self.device_store()?.connection().execute(
-                    "DELETE FROM lww_receive WHERE request_id=?1 AND finished=1",
-                    [&request_id],
-                )?;
-            }
+        }
+        let device = self.device_store()?.connection();
+        for request_id in superseded.iter().filter(|id| !proofs.contains(*id)) {
+            device.execute(
+                "DELETE FROM lww_receive WHERE request_id=?1 AND finished=1",
+                [request_id],
+            )?;
         }
         Ok(())
     }
