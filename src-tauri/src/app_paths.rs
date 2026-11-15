@@ -717,6 +717,7 @@ pub(crate) enum DataRoot {
 pub(crate) enum LinkRefusal {
     TargetMissing,
     /// The store's SQLite WAL mode does not work on a network file system.
+    #[cfg_attr(not(desktop), allow(dead_code))]
     NetworkTarget,
     NotDirectory,
     /// A Windows target whose name has no form without the `\\?\` prefix.
