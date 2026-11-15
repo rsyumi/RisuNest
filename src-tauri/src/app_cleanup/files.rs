@@ -36,10 +36,33 @@ pub(super) fn linked(metadata: &fs::Metadata) -> bool {
 
 /// A cleanup root must be an absolute, dedicated path with no redirected ancestors.
 pub(super) fn validate(path: &Path) -> Result<()> {
+    validate_from(path, path)
+}
+
+/// A data root entry that is itself a link: it is validated as a root, except
+/// that its own last component may be the link.
+pub(super) fn validate_link(link: &Path) -> Result<()> {
+    validate_from(link, link.parent().ok_or("cleanup-path-invalid")?)
+}
+
+/// The directory a data root link leads to. It is canonical, so no component
+/// is redirected, but it may sit directly under a drive or filesystem root.
+pub(super) fn validate_target(target: &Path) -> Result<()> {
+    if !target.is_absolute() || target.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)) {
+        return Err("cleanup-path-invalid".into());
+    }
+    unredirected(target)
+}
+
+fn validate_from(path: &Path, checked: &Path) -> Result<()> {
     if !path.is_absolute() || path.parent().and_then(Path::parent).is_none()
         || path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)) {
         return Err("cleanup-path-invalid".into());
     }
+    unredirected(checked)
+}
+
+fn unredirected(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) if linked(&metadata) => return Err("cleanup-path-redirected".into()),
@@ -60,6 +83,86 @@ pub(super) fn remove(path: &Path) -> Result<()> {
     };
     let result = if metadata.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
     result.map_err(|error| failed("cleanup-files-busy-or-denied", error))
+}
+
+/// Empties a data root that is not a link and removes it. `release` deletes
+/// its lock file once nothing else is left in it.
+pub(super) fn clear_data_root(data: &Path, release: impl FnOnce() -> Result<()>) -> Result<()> {
+    validate(data)?;
+    clear_entries(data, false)?;
+    release()?;
+    match fs::remove_dir(data) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(failed("cleanup-files-busy-or-denied", error)),
+        _ => Ok(()),
+    }
+}
+
+/// Deletes what the app created inside a linked data root's target and leaves
+/// every other entry, then `release` deletes the lock file. A removal then
+/// takes the target if nothing else is left in it, and the link last, so an
+/// interrupted run finds the same target again.
+pub(super) fn clear_linked(link: &Path, target: Option<&Path>, remove_link: bool,
+    release: impl FnOnce() -> Result<()>) -> Result<()> {
+    validate_link(link)?;
+    if let Some(target) = target {
+        validate_target(target)?;
+        clear_entries(target, true)?;
+    }
+    release()?;
+    if !remove_link { return Ok(()); }
+    if let Some(target) = target.filter(|target| target.parent().is_some()) {
+        match fs::remove_dir(target) {
+            Err(error) if !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) =>
+                return Err(failed("cleanup-files-busy-or-denied", error)),
+            _ => {},
+        }
+    }
+    remove_entry(link)
+}
+
+/// Removes every entry of a data root directory but its lock file, or with
+/// `owned_only` only the entries the app creates.
+fn clear_entries(directory: &Path, owned_only: bool) -> Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failed("cleanup-path-unavailable", error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| failed("cleanup-path-unavailable", error))?;
+        let name = entry.file_name();
+        if name == crate::app_paths::DATA_ROOT_LOCK || owned_only && !crate::app_paths::is_data_root_entry(&name) { continue; }
+        remove_entry(&entry.path())?;
+    }
+    Ok(())
+}
+
+/// Removes one entry without following it when it is a link.
+fn remove_entry(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failed("cleanup-path-unavailable", error)),
+    };
+    let result = if linked(&metadata) {
+        remove_link_itself(path, &metadata)
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| failed("cleanup-files-busy-or-denied", error))
+}
+
+fn remove_link_itself(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // A junction or directory symlink is removed as a directory.
+        if metadata.file_attributes() & 0x10 != 0 { return fs::remove_dir(path); }
+    }
+    let _ = metadata;
+    fs::remove_file(path)
 }
 
 pub(super) fn independent_roots(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -110,6 +213,38 @@ mod tests {
         remove(&owned).unwrap();
         assert!(!owned.exists());
         assert_eq!(fs::read(exported).unwrap(), b"synthetic export");
+    }
+
+    #[test]
+    fn a_data_root_lock_file_outlasts_everything_else_cleared_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // macOS hands out temporary directories behind the /var link.
+        let base = if cfg!(target_os = "macos") { fs::canonicalize(dir.path()).unwrap() } else { dir.path().to_owned() };
+        let lock = crate::app_paths::DATA_ROOT_LOCK;
+        let data = base.join("profile").join("data");
+        let target = base.join("moved");
+        for directory in [&data, &target] {
+            fs::create_dir_all(directory.join("persistent")).unwrap();
+            fs::write(directory.join("persistent/synthetic"), b"synthetic").unwrap();
+            fs::write(directory.join(lock), b"").unwrap();
+        }
+        fs::write(target.join("notes.txt"), b"synthetic").unwrap();
+        let release = |directory: &Path, left: Vec<&'static str>| {
+            let directory = directory.to_owned();
+            move || {
+                let mut names = fs::read_dir(&directory).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>();
+                names.sort();
+                assert_eq!(names, left);
+                fs::remove_file(directory.join(lock)).map_err(|error| error.to_string())
+            }
+        };
+        clear_data_root(&data, release(&data, vec![lock])).unwrap();
+        assert!(!data.exists());
+        let link = base.join("profile").join("link");
+        crate::app_paths::tests::link_directory(&target, &link);
+        clear_linked(&link, Some(&target), true, release(&target, vec![lock, "notes.txt"])).unwrap();
+        assert_eq!(fs::read_dir(&target).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>(), vec!["notes.txt"]);
+        assert!(fs::symlink_metadata(&link).is_err());
     }
 
     #[test]

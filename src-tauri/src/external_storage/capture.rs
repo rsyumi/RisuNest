@@ -937,7 +937,10 @@ pub(crate) fn registered_references(
     let mut query=db.prepare("SELECT c.id,c.identity,f.catalog_path,f.file_hash FROM external_storage_capture_files f JOIN external_storage_captures c ON c.id=f.capture_id")?;
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
-        let original = PathBuf::from(row.get::<_, String>(2)?);
+        let original = crate::app_paths::relocated_external_storage_path(
+            Path::new(&row.get::<_, String>(2)?),
+            repository_root,
+        );
         if is_link_like(&fs::symlink_metadata(&original)?) {
             return Err(invalid("Registered capture is a link"));
         }

@@ -544,7 +544,7 @@ fn builder_with_main_window(
     }
 
     builder
-        .setup(move |app| {
+        .setup(move |app| exit_on_setup_failure((move || -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(mobile)]
             app.manage(app_paths::AppPaths::resolve(app)?);
             // `run` resolves the desktop manifest before the builder, because the
@@ -555,6 +555,11 @@ fn builder_with_main_window(
                 app.manage(app_paths::AppPaths::desktop(app.config())?.prepared()?);
             }
             let app_data_dir = app_paths::data_root(app)?;
+            // After the single-instance plugin has handed a second launch of
+            // this profile to the running one, so only another profile whose
+            // data root leads here can find the lock held.
+            #[cfg(desktop)]
+            app.manage(app_cleanup::DataRootLock::acquire(&app_data_dir)?);
             let _ = native_log::logged_without_detail(
                 "network_log_initialize",
                 network_log::initialize(&app.state::<app_paths::AppPaths>()),
@@ -703,7 +708,7 @@ fn builder_with_main_window(
                 setup_native_startup_state.record_failure(error, persistent_gate, native_file_gate);
             }
             Ok(())
-        })
+        })()))
         .manage(asset_repository::commands::DurableCasJobState::default())
         .manage(native_media::ipc::NativeMediaIpcState::default())
         .manage(persistent_store::PersistentStoreState::default())
@@ -1194,6 +1199,16 @@ pub fn run() {
     if let Some(code) = app_cleanup::run_cli(&arguments, &profiles, profile.as_ref()) {
         std::process::exit(code);
     }
+    // A data root link whose target is gone stops here rather than starting
+    // with an empty store.
+    #[cfg(desktop)]
+    let paths = match paths.prepared() {
+        Ok(paths) => paths,
+        Err(error) => {
+            native_log::record_startup_failure(&error);
+            std::process::exit(1);
+        }
+    };
     #[cfg(target_os = "macos")]
     let data_store = profile.as_ref().map(|profile| launch_profile::webview_store(profiles.agent(), profile));
     #[cfg(all(desktop, not(target_os = "macos")))]
@@ -1216,25 +1231,34 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder
-            .manage(paths.prepared().expect("application data root unavailable"))
+            .manage(paths)
             .manage(launch_profile::LaunchProfile(profile));
     }
     match builder.build(context) {
         Ok(app) => app.run(handle_run_event),
         Err(error) => {
-            // Cleanup lock contention is an expected refusal while its owner runs.
-            // Other prerequisite failures still terminate, with a native diagnostic.
             native_log::record_startup_failure(&error.to_string());
-            std::process::exit(startup_failure_exit_code(&error));
+            std::process::exit(startup_failure_exit_code(&error.to_string()));
         }
     }
 }
 
-fn startup_failure_exit_code(error: &tauri::Error) -> i32 {
-    match error {
-        tauri::Error::Setup(error) if error.to_string() == "cleanup-app-still-running" => 0,
-        _ => 1,
+/// Tauri runs the setup hook inside the event loop and panics on its error, so
+/// a desktop refusal there is logged and ends the process with its own code.
+fn exit_on_setup_failure(result: Result<(), Box<dyn std::error::Error>>) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(desktop)]
+    if let Err(error) = &result {
+        let message = error.to_string();
+        native_log::record_startup_failure(&message);
+        std::process::exit(startup_failure_exit_code(&message));
     }
+    result
+}
+
+fn startup_failure_exit_code(message: &str) -> i32 {
+    // Cleanup lock contention is an expected refusal while its owner runs.
+    // Other prerequisite failures still terminate, with a native diagnostic.
+    if message == "cleanup-app-still-running" { 0 } else { 1 }
 }
 
 fn header_map_to_json(header_map: &HeaderMap) -> serde_json::Value {
@@ -1254,10 +1278,10 @@ mod header_map_tests {
 
     #[test]
     fn cleanup_owner_refusal_is_a_logged_exit_not_a_panic() {
-        let setup = |message: &str| tauri::Error::Setup(Box::<dyn std::error::Error>::from(message).into());
-        assert_eq!(startup_failure_exit_code(&setup("cleanup-app-still-running")), 0);
-        assert_eq!(startup_failure_exit_code(&setup("cleanup-lock-unavailable")), 1);
-        assert_eq!(startup_failure_exit_code(&setup("invalid native path")), 1);
+        assert_eq!(startup_failure_exit_code("cleanup-app-still-running"), 0);
+        assert_eq!(startup_failure_exit_code("cleanup-lock-unavailable"), 1);
+        assert_eq!(startup_failure_exit_code("data-root-in-use"), 1);
+        assert_eq!(startup_failure_exit_code("invalid native path"), 1);
     }
 
     #[test]

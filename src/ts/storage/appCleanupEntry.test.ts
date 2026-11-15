@@ -100,15 +100,15 @@ describe('app cleanup startup gate', () => {
         expect(bootstrap).not.toHaveBeenCalled()
     })
     it.each([
-        ['cleanup-webview-update-required', true],
-        ['synthetic-private-path', false],
-    ])('waits for explicit retry when a previous cleanup failed with %s', async (error, webViewUpdate) => {
+        ['cleanup-webview-update-required', 'Android System WebView'],
+        ['cleanup-data-root-in-use', 'same data folder'],
+        ['synthetic-private-path', 'Please retry'],
+    ])('waits for explicit retry when a previous cleanup failed with %s', async (error, guidance) => {
         vi.mocked(invoke).mockResolvedValueOnce({ pending: true, mode: 'prepare-removal', error }).mockResolvedValue(undefined)
         const bootstrap = vi.fn()
         void appCleanupBeforeBootstrap().then(bootstrap)
         await vi.waitFor(() => expect(document.querySelector('button')?.disabled).toBe(false))
-        expect(statusText()).toBeTruthy()
-        expect(statusText()!.includes('Android System WebView')).toBe(webViewUpdate)
+        expect(statusText()).toContain(guidance)
         expect(invoke).toHaveBeenCalledExactlyOnceWith('app_cleanup_status')
         expect(document.body.textContent).not.toContain('synthetic-private-path')
         document.querySelector('button')!.click()

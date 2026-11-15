@@ -11,8 +11,10 @@ use crate::{
 use serde_json::Value;
 use tauri::AppHandle;
 
+/// Keyed by the data root's entry path, so a link at the data root can be
+/// added, changed or removed without signing out.
 fn slot(app: &AppHandle) -> Result<crate::external_storage::secrets::NamedSecretSlot, String> {
-    let root = app_paths::data_root(app)?;
+    let root = app_paths::data_entry(app)?;
     Ok(account_credential_slot(&root))
 }
 

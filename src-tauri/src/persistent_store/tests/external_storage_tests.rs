@@ -458,6 +458,36 @@ fn external_capture_never_discards_a_missing_cache_owned_by_a_pending_job() {
 }
 
 #[test]
+fn a_pinned_capture_is_found_after_a_link_moved_the_data_root() {
+    struct Never;
+    impl crate::local_backup::CancellationProbe for Never {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+    let (directory, mut store, _) = capture_fixture();
+    let first = capture_library(&mut store, "destination", &Never).unwrap();
+    let first_id = first.id.clone();
+    let tx = store.connection.transaction().unwrap();
+    external::prepare_backup(&tx, "pending-backup", "destination", "repository", &first_id, "history-point").unwrap();
+    tx.commit().unwrap();
+    drop(first);
+    // The row a run with the data root at its earlier location wrote.
+    let stored: String = store
+        .connection
+        .query_row("SELECT catalog_path FROM external_storage_capture_files WHERE capture_id=?1", [&first_id], |row| row.get(0))
+        .unwrap();
+    let spool = store.repository_root().join("external-storage").canonicalize().unwrap();
+    let earlier = directory.path().join("earlier").join("RisuNestData").join("external-storage")
+        .join(std::path::Path::new(&stored).strip_prefix(&spool).unwrap());
+    store
+        .connection
+        .execute("UPDATE external_storage_capture_files SET catalog_path=?1 WHERE capture_id=?2", rusqlite::params![earlier.to_string_lossy(), first_id])
+        .unwrap();
+    assert_eq!(store.reopen_external_capture(&first_id).unwrap().id, first_id);
+}
+
+#[test]
 fn external_capture_reopens_a_pinned_old_revision_and_gc_keeps_only_needed_cache() {
     struct Never;
     impl crate::local_backup::CancellationProbe for Never {
