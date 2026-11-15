@@ -49,6 +49,17 @@ pub(crate) fn account_id(root: &Path) -> String {
     )
 }
 
+/// An account entry another data root entry path wrote, for example before a
+/// link at the data root was pointed at this directory. It names that path's
+/// OS vault item.
+fn foreign_account(root: &Path, entry: &Entry) -> bool {
+    entry.purpose == Purpose::AccountCredential
+        && entry.id != account_id(root)
+        && entry.id.strip_prefix("official-account-").is_some_and(|hash| {
+            hash.len() == 64 && hash.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
 fn validate(root: &Path, entry: &Entry) -> Result<(), String> {
     let valid = match entry.purpose {
         Purpose::AccountCredential => entry.id == account_id(root),
@@ -82,6 +93,10 @@ fn ensure_directory(root: &Path) -> Result<std::path::PathBuf, String> {
 }
 
 fn read_entry(root: &Path, path: &Path) -> Result<Entry, String> {
+    read_inventory_entry(root, path, false)
+}
+
+fn read_inventory_entry(root: &Path, path: &Path, foreign_accounts: bool) -> Result<Entry, String> {
     let name = path.file_name().and_then(|name| name.to_str()).ok_or("secret-index-corrupt")?;
     let (purpose, id) = name.strip_suffix(".json").and_then(|name| name.split_once("--"))
         .ok_or("secret-index-corrupt")?;
@@ -93,7 +108,9 @@ fn read_entry(root: &Path, path: &Path) -> Result<Entry, String> {
         _ => return Err("secret-index-corrupt".into()),
     };
     let entry = Entry { purpose, id: id.to_owned(), backend: Backend::System };
-    validate(root, &entry)?;
+    if !(foreign_accounts && foreign_account(root, &entry)) {
+        validate(root, &entry)?;
+    }
     let metadata = fs::symlink_metadata(path).map_err(|_| "secret-index-unavailable")?;
     if !metadata.is_file()
         || crate::trust_boundary::is_link_like(&metadata)
@@ -191,12 +208,15 @@ fn remove_with(
     let mut entries = Vec::new();
     for file in fs::read_dir(&directory).map_err(|_| "secret-index-unavailable")? {
         let path = file.map_err(|_| "secret-index-unavailable")?.path();
-        let entry = read_entry(root, &path)?;
+        let entry = read_inventory_entry(root, &path, true)?;
         entries.push((path, entry));
     }
-    // Validate the complete inventory before deleting any credential.
+    // Validate the complete inventory before deleting any credential. A
+    // foreign account entry leaves the vault item to the path that owns it.
     for (path, entry) in entries {
-        remove(entry.purpose, &entry.id, entry.backend)?;
+        if !foreign_account(root, &entry) {
+            remove(entry.purpose, &entry.id, entry.backend)?;
+        }
         fs::remove_file(path).map_err(|_| "secret-index-unavailable")?;
     }
     fs::remove_dir(directory).map_err(|_| "secret-index-unavailable".into())
@@ -373,6 +393,18 @@ mod tests {
         let id = account_id(first.path());
         tracked_write(first.path(), Purpose::AccountCredential, &id, || Ok(())).unwrap();
         tracked_write(first.path(), Purpose::AccountCredential, &id, || Ok(())).unwrap();
+        // A data root a link brought here from another entry path keeps that
+        // path's entry, whose vault item belongs to the other path.
+        let foreign = account_id(second.path());
+        fs::write(
+            first.path().join(DIRECTORY).join(format!("account-credential--{foreign}.json")),
+            serde_json::to_vec(&Entry { backend: Backend::System, purpose: Purpose::AccountCredential, id: foreign.clone() }).unwrap(),
+        )
+        .unwrap();
+        assert!(tracked_write(first.path(), Purpose::AccountCredential, &foreign, || -> Result<(), String> {
+            panic!("another path's slot is never written here")
+        })
+        .is_err());
         let mut count = 0;
         remove_with(first.path(), |purpose, found, _| {
             assert_eq!(purpose, Purpose::AccountCredential);
@@ -382,5 +414,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(count, 1);
+        assert!(!first.path().join(DIRECTORY).exists());
     }
 }

@@ -1,6 +1,6 @@
 use super::{
-    default_install_dirs, overlaps, platform_store_root, resolve_platform_root, AppPaths, DesktopProfiles, Hives,
-    Integration, Platform, ProfileBases,
+    default_install_dirs, is_data_root_entry, overlaps, platform_store_root, relocated_external_storage_path,
+    resolve_platform_root, AppPaths, DesktopProfiles, Hives, Integration, Platform, ProfileBases,
 };
 use crate::launch_profile::ProfileName;
 use crate::asset_repository::{ExactObjectUnlink, PayloadCas};
@@ -377,12 +377,12 @@ fn a_missing_hive_or_invalid_identifier_is_an_error_not_a_guess() {
 }
 
 #[cfg(unix)]
-fn link_directory(target: &Path, link: &Path) {
+pub(crate) fn link_directory(target: &Path, link: &Path) {
     std::os::unix::fs::symlink(target, link).expect("create synthetic directory link");
 }
 
 #[cfg(windows)]
-fn link_directory(target: &Path, link: &Path) {
+pub(crate) fn link_directory(target: &Path, link: &Path) {
     use std::os::windows::process::CommandExt;
     let output = std::process::Command::new("cmd")
         .creation_flags(0x08000000)
@@ -580,4 +580,113 @@ fn resolved_root_replaced_by_link_is_rejected_by_cas() {
     );
     assert!(PayloadCas::new(&root).is_err());
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+fn settled(entry: &Path, create: bool) -> Result<AppPaths, String> {
+    AppPaths::isolated(entry.to_owned()).unwrap().settled(Platform::current(), create)
+}
+
+/// Every release before links were followed used this as the data root.
+fn released_root(entry: &Path) -> PathBuf {
+    if cfg!(target_os = "linux") {
+        fs::canonicalize(entry.parent().unwrap()).unwrap().join(entry.file_name().unwrap())
+    } else {
+        entry.to_owned()
+    }
+}
+
+#[test]
+fn a_desktop_data_root_link_leads_to_its_target_and_keeps_its_entry() {
+    let fixture = tempfile::tempdir().unwrap();
+    let target = fixture.path().join("moved");
+    fs::create_dir(&target).unwrap();
+    let entry = fixture.path().join("RisuNestData");
+    link_directory(&target, &entry);
+    let paths = settled(&entry, true).unwrap();
+    assert_eq!(paths.data_entry, released_root(&entry));
+    assert_eq!(fs::canonicalize(&paths.data).unwrap(), fs::canonicalize(&target).unwrap());
+    assert!(!paths.data.to_string_lossy().starts_with(r"\?\"));
+    assert_eq!(paths.logs, paths.data.join("logs"));
+    // The CAS rejects every linked component, and still works there.
+    let cas = PayloadCas::new(&paths.data).unwrap();
+    let payload = cas.prepare_bytes(b"synthetic moved asset").unwrap();
+    assert_eq!(cas.read_object(&payload.content_hash).unwrap().unwrap(), b"synthetic moved asset");
+    assert!(target.join("assets").is_dir());
+    assert!(matches!(
+        cas.unlink_exact_object(&payload.content_hash, payload.byte_size, &payload.physical_key).unwrap(),
+        ExactObjectUnlink::Removed { .. }
+    ));
+    assert!(cas.read_object(&payload.content_hash).unwrap().is_none());
+    assert_eq!(settled(&entry, false).unwrap(), paths);
+}
+
+#[test]
+fn a_desktop_data_root_without_a_link_keeps_the_path_every_release_used() {
+    let fixture = tempfile::tempdir().unwrap();
+    let parent = fixture.path().join("real-parent");
+    fs::create_dir(&parent).unwrap();
+    let alias = fixture.path().join("home-alias");
+    link_directory(&parent, &alias);
+    for entry in [fixture.path().join("RisuNestData"), alias.join("RisuNestData")] {
+        let first = settled(&entry, true).unwrap();
+        assert_eq!(first.data_entry, released_root(&entry));
+        assert_eq!(first.data, first.data_entry);
+        // Only Linux has created it at startup.
+        assert_eq!(entry.exists(), cfg!(target_os = "linux"));
+        fs::create_dir_all(&entry).unwrap();
+        let existing = settled(&entry, true).unwrap();
+        assert_eq!((existing.data, existing.data_entry), (first.data.clone(), first.data));
+    }
+}
+
+#[test]
+fn a_data_root_link_whose_target_is_gone_stops_startup_and_creates_nothing() {
+    let fixture = tempfile::tempdir().unwrap();
+    let target = fixture.path().join("moved");
+    fs::create_dir(&target).unwrap();
+    let entry = fixture.path().join("RisuNestData");
+    link_directory(&target, &entry);
+    fs::remove_dir(&target).unwrap();
+    assert!(settled(&entry, true).unwrap_err().contains("link target is missing"));
+    assert!(!target.exists());
+    let cleanup = settled(&entry, false).unwrap();
+    assert_eq!(cleanup.data, cleanup.data_entry);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_data_root_link_to_a_network_share_is_refused() {
+    for path in [r"\?\UNC\server\share\RisuNest", r"\server\share\RisuNest"] {
+        assert_eq!(super::local_path(PathBuf::from(path)).unwrap_err().kind(), ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn only_names_the_app_creates_count_as_data_root_entries() {
+    for name in ["persistent", "assets", "data-root.lock", ".window-state.json", "external-connections.sqlite-wal",
+        "external-jobs.sqlite-shm", ".tmpA1b2C3", "asset-hydration-x1Y2z3", "remotes", "oauthData.json"] {
+        assert!(is_data_root_entry(name.as_ref()), "{name}");
+    }
+    for name in ["notes.txt", ".tmp", "persistent-old", "Persistent", "notes.sqlite-wal", "persistent-wal", "asset-hydration-"] {
+        assert!(!is_data_root_entry(name.as_ref()), "{name}");
+    }
+}
+
+#[test]
+fn stored_external_storage_paths_follow_the_data_root() {
+    let root = base("moved").join("RisuNestData");
+    let old = base("local").join("RisuNestData").join("external-storage").join("captures").join("a").join("capture.sqlite");
+    let current = root.join("external-storage").join("captures").join("a").join("capture.sqlite");
+    assert_eq!(relocated_external_storage_path(&old, &root), current);
+    assert_eq!(relocated_external_storage_path(&current, &root), current);
+    #[cfg(windows)]
+    assert_eq!(
+        relocated_external_storage_path(Path::new(r"\?\C:\old\RisuNestData\external-storage\captures\a\capture.sqlite"), &root),
+        current,
+    );
+    // A path with no such part, or one that climbs out of it, is left for the
+    // caller's containment check.
+    for stored in [base("elsewhere").join("capture.sqlite"), base("old").join("external-storage").join("..").join("escape")] {
+        assert_eq!(relocated_external_storage_path(&stored, &root), stored);
+    }
 }

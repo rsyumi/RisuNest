@@ -36,10 +36,33 @@ pub(super) fn linked(metadata: &fs::Metadata) -> bool {
 
 /// A cleanup root must be an absolute, dedicated path with no redirected ancestors.
 pub(super) fn validate(path: &Path) -> Result<()> {
+    validate_from(path, path)
+}
+
+/// A data root entry that is itself a link: it is validated as a root, except
+/// that its own last component may be the link.
+pub(super) fn validate_link(link: &Path) -> Result<()> {
+    validate_from(link, link.parent().ok_or("cleanup-path-invalid")?)
+}
+
+/// The directory a data root link leads to. It is canonical, so no component
+/// is redirected, but it may sit directly under a drive or filesystem root.
+pub(super) fn validate_target(target: &Path) -> Result<()> {
+    if !target.is_absolute() || target.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)) {
+        return Err("cleanup-path-invalid".into());
+    }
+    unredirected(target)
+}
+
+fn validate_from(path: &Path, checked: &Path) -> Result<()> {
     if !path.is_absolute() || path.parent().and_then(Path::parent).is_none()
         || path.components().any(|part| matches!(part, Component::ParentDir | Component::CurDir)) {
         return Err("cleanup-path-invalid".into());
     }
+    unredirected(checked)
+}
+
+fn unredirected(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) if linked(&metadata) => return Err("cleanup-path-redirected".into()),
@@ -60,6 +83,63 @@ pub(super) fn remove(path: &Path) -> Result<()> {
     };
     let result = if metadata.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
     result.map_err(|error| failed("cleanup-files-busy-or-denied", error))
+}
+
+/// Deletes what the app created inside a linked data root's target and leaves
+/// every other entry. A removal then takes the target if nothing else is left
+/// in it, and the link last, so an interrupted run finds the same target again.
+pub(super) fn clear_linked(link: &Path, target: Option<&Path>, remove_link: bool) -> Result<()> {
+    validate_link(link)?;
+    if let Some(target) = target {
+        validate_target(target)?;
+        let entries = match fs::read_dir(target) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(failed("cleanup-path-unavailable", error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| failed("cleanup-path-unavailable", error))?;
+            if !crate::app_paths::is_data_root_entry(&entry.file_name()) { continue; }
+            remove_entry(&entry.path())?;
+        }
+        if remove_link && target.parent().is_some() {
+            match fs::remove_dir(target) {
+                Err(error) if !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) =>
+                    return Err(failed("cleanup-files-busy-or-denied", error)),
+                _ => {},
+            }
+        }
+    }
+    if remove_link { remove_entry(link)?; }
+    Ok(())
+}
+
+/// Removes one entry without following it when it is a link.
+fn remove_entry(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failed("cleanup-path-unavailable", error)),
+    };
+    let result = if linked(&metadata) {
+        remove_link_itself(path, &metadata)
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|error| failed("cleanup-files-busy-or-denied", error))
+}
+
+fn remove_link_itself(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // A junction or directory symlink is removed as a directory.
+        if metadata.file_attributes() & 0x10 != 0 { return fs::remove_dir(path); }
+    }
+    let _ = metadata;
+    fs::remove_file(path)
 }
 
 pub(super) fn independent_roots(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {

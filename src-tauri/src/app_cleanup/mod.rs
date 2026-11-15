@@ -302,6 +302,7 @@ async fn resume(app: &AppHandle, request: &mut Request) -> Result<()> {
         }
         command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()).spawn().map_err(|error| failed("cleanup-worker-start-failed", error))?;
+        if let Some(lock) = app.try_state::<DataRootLock>() { lock.release(); }
         state.closing.store(true, Ordering::Release);
         app.exit(0);
         Ok(())
@@ -340,10 +341,57 @@ fn erase_with(paths: &Paths, request: &mut Request,
     remove_secrets: &dyn Fn(&std::path::Path) -> Result<()>,
     mut remove_root: impl FnMut(&std::path::Path) -> Result<()>) -> Result<()> {
     paths.preflight()?;
+    #[cfg(desktop)]
+    if let Some(directory) = paths.data_directory() { ensure_data_root_unused(directory)?; }
     remove_secrets(&paths.data)?;
     begin_roots(paths, request)?;
     for root in &paths.roots { remove_root(root)?; }
+    // A reset keeps the link, so the relaunched app goes on using its target.
+    if let Some(link) = &paths.data_link {
+        files::clear_linked(&link.link, link.target.as_deref(), request.mode != Mode::Reset)?;
+    }
     Ok(())
+}
+
+/// Held by a desktop instance inside the data root it uses for its whole run,
+/// so that another profile whose data root leads to the same directory can
+/// neither open it nor delete it meanwhile.
+#[cfg(desktop)]
+pub(crate) struct DataRootLock(std::sync::Mutex<Option<fs::File>>);
+
+#[cfg(desktop)]
+impl DataRootLock {
+    pub(crate) fn acquire(root: &std::path::Path) -> Result<Self> {
+        fs::create_dir_all(root).map_err(|error| failed("data-root-lock-unavailable", error))?;
+        let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(root.join(crate::app_paths::DATA_ROOT_LOCK)).map_err(|error| failed("data-root-lock-unavailable", error))?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(Self(std::sync::Mutex::new(Some(file)))),
+            Err(error) if contended(&error) => Err("data-root-in-use".into()),
+            Err(error) => Err(failed("data-root-lock-unavailable", error)),
+        }
+    }
+
+    /// Lets the cleanup worker in before the owner lock goes with the process,
+    /// whose handles close in no particular order.
+    fn release(&self) {
+        drop(self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take());
+    }
+}
+
+/// Only an existing lock file is opened, so the check creates nothing.
+#[cfg(desktop)]
+fn ensure_data_root_unused(root: &std::path::Path) -> Result<()> {
+    let file = match fs::OpenOptions::new().read(true).write(true).open(root.join(crate::app_paths::DATA_ROOT_LOCK)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(failed("cleanup-lock-unavailable", error)),
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(()),
+        Err(error) if contended(&error) => Err("cleanup-data-root-in-use".into()),
+        Err(error) => Err(failed("cleanup-lock-unavailable", error)),
+    }
 }
 
 /// The effects of a desktop cleanup outside the profile directories.
@@ -405,7 +453,8 @@ fn other_profiles(profiles: &DesktopProfiles, profile: Option<&ProfileName>) -> 
 
 #[cfg(desktop)]
 fn profile_paths(profiles: &DesktopProfiles, profile: Option<&ProfileName>) -> Result<Paths> {
-    let manifest = profiles.manifest(profile).map_err(|error| failed("cleanup-path-unavailable", error))?;
+    let manifest = profiles.manifest(profile).and_then(crate::app_paths::AppPaths::resolved)
+        .map_err(|error| failed("cleanup-path-unavailable", error))?;
     Ok(Paths::from_manifest(&manifest))
 }
 
@@ -592,7 +641,7 @@ mod tests {
             webview_cleared: true, roots_started: false, error: None, appimage: None }
     }
     fn paths(root: &Path) -> Paths {
-        Paths { data: root.join("data"), roots: vec![root.join("data"), root.join("webview")], control: root.join("control"), install_conflict: None }
+        Paths { data: root.join("data"), roots: vec![root.join("data"), root.join("webview")], data_link: None, control: root.join("control"), install_conflict: None }
     }
     #[test]
     fn full_reset_removes_profile_image_geometry() {
@@ -1064,6 +1113,81 @@ mod tests {
             let release = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(300)); drop(held); });
             lock(&paths, Duration::from_secs(10)).unwrap();
             release.join().unwrap();
+        }
+
+        /// Replaces a profile's data root with a link to a directory outside
+        /// it that holds app entries and, optionally, a file of the user's.
+        fn link_data_root(fixture: &Fixture, profile: &str, user_file: bool) -> (PathBuf, PathBuf) {
+            let data = fixture.create(Some(profile));
+            fs::remove_dir_all(&data).unwrap();
+            let target = fixture.webview_root.with_file_name(format!("moved-{profile}"));
+            for directory in ["persistent/records", "logs", "assets/objects"] {
+                fs::create_dir_all(target.join(directory)).unwrap();
+                fs::write(target.join(directory).join("synthetic"), b"fixture").unwrap();
+            }
+            for file in ["external-connections.sqlite", "external-connections.sqlite-wal", crate::app_paths::DATA_ROOT_LOCK, ".tmpA1b2C3"] {
+                fs::write(target.join(file), b"fixture").unwrap();
+            }
+            if user_file { fs::write(target.join("notes.txt"), b"user").unwrap(); }
+            crate::app_paths::tests::link_directory(&target, &data);
+            (data, target)
+        }
+
+        #[test]
+        fn removing_a_linked_data_root_keeps_only_what_the_app_did_not_create() {
+            let fixture = Fixture::new();
+            let (work, work_target) = link_data_root(&fixture, "work", true);
+            let (_, test_target) = link_data_root(&fixture, "test", false);
+            let removed = RefCell::new(Vec::new());
+            let secrets = |root: &std::path::Path| { removed.borrow_mut().push(root.to_owned()); Ok(()) };
+            let relaunched = RefCell::new(Vec::new());
+            fixture.run(&REMOVE, Some("work"), &secrets, &relaunched).unwrap();
+            fixture.run(&REMOVE, Some("test"), &secrets, &relaunched).unwrap();
+            // Secrets are keyed by the link, not by where it leads.
+            assert_eq!(removed.borrow()[0], work);
+            assert_eq!(fs::read_dir(&work_target).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>(), vec!["notes.txt"]);
+            assert!(!test_target.exists());
+            for profile in ["work", "test"] {
+                for directory in fixture.profiles.directories(&ProfileName::parse(profile).unwrap()).unwrap() {
+                    assert!(fs::symlink_metadata(&directory).is_err(), "{}", directory.display());
+                }
+            }
+        }
+
+        #[test]
+        fn a_reset_clears_a_linked_data_root_and_keeps_the_link() {
+            let fixture = Fixture::new();
+            let (data, target) = link_data_root(&fixture, "work", true);
+            let paths = fixture.paths(Some("work"));
+            erase_with(&paths, &mut request(), &|_| Ok(()), files::remove).unwrap();
+            assert_eq!(fs::read_dir(&target).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>(), vec!["notes.txt"]);
+            assert!(crate::trust_boundary::is_link_like(&fs::symlink_metadata(&data).unwrap()));
+            assert_eq!(fs::canonicalize(&data).unwrap(), fs::canonicalize(&target).unwrap());
+        }
+
+        #[test]
+        fn a_data_root_link_whose_target_is_gone_is_removed() {
+            let fixture = Fixture::new();
+            let (data, target) = link_data_root(&fixture, "work", false);
+            fs::remove_dir_all(&target).unwrap();
+            fixture.run(&REMOVE, Some("work"), &|_| Ok(()), &RefCell::new(Vec::new())).unwrap();
+            assert!(fs::symlink_metadata(&data).is_err());
+        }
+
+        #[test]
+        fn cleanup_refuses_a_data_root_another_profile_is_using() {
+            let fixture = Fixture::new();
+            let (_, target) = link_data_root(&fixture, "work", false);
+            let held = DataRootLock::acquire(&target).unwrap();
+            assert_eq!(DataRootLock::acquire(&target).err().unwrap(), "data-root-in-use");
+            let error = fixture.run(&REMOVE, Some("work"), &|_| panic!("secrets stay until the data root is free"),
+                &RefCell::new(Vec::new())).unwrap_err();
+            assert_eq!(error, "cleanup-data-root-in-use");
+            assert!(target.join("persistent/records/synthetic").exists());
+            // The app releases its hold before it exits for the worker.
+            held.release();
+            fixture.run(&REMOVE, Some("work"), &|_| Ok(()), &RefCell::new(Vec::new())).unwrap();
+            assert!(!target.exists());
         }
     }
 }

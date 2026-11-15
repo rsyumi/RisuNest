@@ -579,6 +579,7 @@ fn an_opened_store_collects_what_earlier_releases_left() {
         .unwrap();
     app.manage(crate::app_paths::AppPaths {
         data: root.to_owned(),
+        data_entry: root.to_owned(),
         webview: None,
         logs: root.join("logs"),
         cache: root.join("cache"),

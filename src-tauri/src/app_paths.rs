@@ -36,6 +36,24 @@ const LOGS_LEAF: &str = "logs";
 /// a distinct leaf and an agent run cannot open real user data.
 const AGENT_SUFFIX: &str = "-agent";
 const CLEANUP_SUFFIX: &str = "-cleanup";
+/// Held inside the data root by the instance using it.
+pub(crate) const DATA_ROOT_LOCK: &str = "data-root.lock";
+/// The names a desktop instance creates directly inside the data root, native
+/// and renderer alike, and the OS metadata a file manager adds. Cleanup of a
+/// linked data root deletes only these, so a name missing here leaves that
+/// entry behind and never deletes anything else.
+const DATA_ROOT_ENTRIES: &[&str] = &[
+    DATA_ROOT_LOCK, LOGS_LEAF, "persistent", "assets", "network-logs", "native-file-jobs", "native-media-ipc",
+    "external-storage", "device-backup", "boot", "server-sync", "external-sync", "descriptor-staging",
+    "recovery-staging", "source-preservation", "owned-secret-index", "external-storage-secrets",
+    "external-storage-root-keys", "account-credentials", "server-sync-credentials", "device-secret-files",
+    "external-jobs.sqlite", "external-connections.sqlite", "external-gc.sqlite", "account-quota.sqlite",
+    "windows-appearance.json", "startup-appearance.json", ".window-state.json", "remotes", "oauthData.json",
+    "content-import-inbox", ".DS_Store", "Thumbs.db", "desktop.ini",
+];
+/// Temporary files and directories that are renamed or dropped in normal runs.
+const DATA_ROOT_TRANSIENT_PREFIXES: &[&str] = &[".tmp", "asset-hydration-", "asset-transient-", "asset-offload-"];
+const SQLITE_SIDECARS: &[&str] = &["-wal", "-shm", "-journal"];
 
 /// Every target rather than only the one being compiled, so one table can pin
 /// the whole matrix from any host.
@@ -117,8 +135,12 @@ pub struct Integration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppPaths {
-    /// The authoritative native store.
+    /// The authoritative native store, with a link at the data root followed.
     pub data: PathBuf,
+    /// The data root as the layout names it, before a link at the root itself
+    /// is followed. Device secrets are keyed by it, so adding, changing or
+    /// removing such a link keeps them.
+    pub data_entry: PathBuf,
     /// `None` where the platform manages the WebView profile itself.
     pub webview: Option<PathBuf>,
     pub logs: PathBuf,
@@ -145,8 +167,38 @@ impl AppPaths {
     /// one. Kept out of the constructors so the cleanup CLI never creates a
     /// directory it is about to delete.
     #[cfg(desktop)]
-    pub(crate) fn prepared(mut self) -> Result<Self, String> {
-        self.data = platform_store_root(&self.data, Platform::current())?;
+    pub(crate) fn prepared(self) -> Result<Self, String> {
+        self.settled(Platform::current(), true)
+    }
+
+    /// The same resolution without creating anything, for the cleanup CLI. A
+    /// link whose target is missing leaves `data` at the link.
+    #[cfg(desktop)]
+    pub(crate) fn resolved(self) -> Result<Self, String> {
+        self.settled(Platform::current(), false)
+    }
+
+    /// Settles `data_entry` and follows a link at it. Without such a link both
+    /// keep the path every earlier release used: the layout path on Windows and
+    /// macOS, and the canonical path on Linux.
+    #[cfg_attr(not(desktop), allow(dead_code))]
+    fn settled(mut self, platform: Platform, create: bool) -> Result<Self, String> {
+        let unavailable = |error: std::io::Error| format!("application data root unavailable: {error}");
+        let entry = desktop_data_entry(&self.data_entry, platform, create).map_err(unavailable)?;
+        self.data = match inspect_data_root(&entry).map_err(unavailable)? {
+            DataRoot::Absent if create && platform == Platform::Linux => {
+                std::fs::create_dir(&entry).map_err(unavailable)?;
+                entry.clone()
+            }
+            DataRoot::Absent | DataRoot::Directory => entry.clone(),
+            DataRoot::Linked(target) => target,
+            DataRoot::Dangling if create => return Err(unavailable(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Application data root link target is missing",
+            ))),
+            DataRoot::Dangling => entry.clone(),
+        };
+        self.data_entry = entry;
         self.logs = self.data.join(LOGS_LEAF);
         Ok(self)
     }
@@ -165,6 +217,7 @@ impl AppPaths {
         { hives.os_documents = Some(app.path().document_dir().map_err(|_| "application documents directory unavailable")?); }
         let mut paths = Self::layout(platform, &hives, &app.config().identifier, false)?;
         paths.data = platform_store_root(&paths.data, platform)?;
+        paths.data_entry = paths.data.clone();
         paths.logs = paths.data.join(LOGS_LEAF);
         paths.cache = platform_store_root(&paths.cache, platform)?;
         paths.cleanup_control = paths
@@ -187,6 +240,7 @@ impl AppPaths {
             logs: root.join(LOGS_LEAF),
             cache: root.join("cache"),
             webview: Some(root.join("webview")),
+            data_entry: root.clone(),
             data: root,
             cleanup_control,
             tauri_derived: Vec::new(),
@@ -262,6 +316,7 @@ impl AppPaths {
         };
         Ok(Self {
             logs: data.join(LOGS_LEAF),
+            data_entry: data.clone(),
             data,
             webview,
             cache,
@@ -434,6 +489,7 @@ impl DesktopProfiles {
                 None => directory.join(PROFILE_CACHE_LEAF),
             },
             cleanup_control: directory.join(PROFILE_CLEANUP_LEAF),
+            data_entry: data.clone(),
             data,
             // Identifier-derived directories and the Linux desktop integration
             // belong to the default profile.
@@ -501,6 +557,42 @@ pub(crate) fn data_root<R: tauri::Runtime>(
     app: &impl tauri::Manager<R>,
 ) -> Result<PathBuf, String> {
     manifest(app).map(|paths| paths.data.clone())
+}
+
+/// The data root's entry path, for the callers that key device secrets by it.
+pub(crate) fn data_entry<R: tauri::Runtime>(
+    app: &impl tauri::Manager<R>,
+) -> Result<PathBuf, String> {
+    manifest(app).map(|paths| paths.data_entry.clone())
+}
+
+/// A path an earlier run stored below `<data root>/external-storage`, carried
+/// over to `root`, which a link at the data root may have moved since. The
+/// stored path is returned as it is when it has no such part, so the caller's
+/// containment check still rejects it.
+pub(crate) fn relocated_external_storage_path(stored: &Path, root: &Path) -> PathBuf {
+    use std::path::Component;
+    let components = stored.components().collect::<Vec<_>>();
+    let Some(anchor) = components.iter().rposition(|component| component.as_os_str() == "external-storage") else {
+        return stored.to_owned();
+    };
+    let rest = &components[anchor + 1..];
+    if rest.is_empty() || !rest.iter().all(|component| matches!(component, Component::Normal(_))) {
+        return stored.to_owned();
+    }
+    rest.iter().fold(root.join("external-storage"), |path, component| path.join(component))
+}
+
+/// Whether a top-level name inside the data root is one the app creates.
+#[cfg_attr(not(desktop), allow(dead_code))]
+pub(crate) fn is_data_root_entry(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else { return false };
+    let base = SQLITE_SIDECARS
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix).filter(|base| base.ends_with(".sqlite")))
+        .unwrap_or(name);
+    DATA_ROOT_ENTRIES.contains(&base)
+        || DATA_ROOT_TRANSIENT_PREFIXES.iter().any(|prefix| name.len() > prefix.len() && name.starts_with(prefix))
 }
 
 /// Component-wise containment. A string prefix would report `RisuNestData` as
@@ -601,14 +693,106 @@ fn validate_identifier(identifier: &str) -> Result<(), String> {
         .ok_or_else(|| "application identifier is invalid".to_owned())
 }
 
-/// Android mount aliases and Linux data-home aliases are trusted only above the
-/// OS-provided root. CAS still rejects every app-owned link.
+/// Android mount aliases are trusted only above the OS-provided root. CAS still
+/// rejects every app-owned link.
+#[cfg(any(mobile, test))]
 fn platform_store_root(root: &Path, platform: Platform) -> Result<PathBuf, String> {
-    if !matches!(platform, Platform::Android | Platform::Linux) {
+    if platform != Platform::Android {
         return Ok(root.to_owned());
     }
     resolve_platform_root(root, true)
         .map_err(|error| format!("application data root unavailable: {error}"))
+}
+
+/// Where a desktop data root leads, seen from its entry path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DataRoot {
+    Absent,
+    Directory,
+    /// The entry is a link to this directory, every link in it followed.
+    Linked(PathBuf),
+    /// The entry is a link whose target is missing.
+    Dangling,
+}
+
+/// The entry path of a desktop data root. Linux has always resolved the
+/// aliases above the leaf, so its parent is canonical; Windows and macOS keep
+/// the layout path exactly as computed.
+fn desktop_data_entry(layout: &Path, platform: Platform, create: bool) -> std::io::Result<PathBuf> {
+    use std::io;
+    if !layout.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Application data root must be absolute"));
+    }
+    if platform != Platform::Linux {
+        return Ok(layout.to_owned());
+    }
+    let (Some(parent), Some(leaf)) = (layout.parent(), layout.file_name()) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Application data root has no parent"));
+    };
+    if create {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::canonicalize(parent) {
+        Ok(parent) => Ok(parent.join(leaf)),
+        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => Ok(layout.to_owned()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Follows a link at the data root itself. Only a target that is a directory
+/// on a local drive is accepted.
+pub(crate) fn inspect_data_root(entry: &Path) -> std::io::Result<DataRoot> {
+    use std::{fs, io};
+    let metadata = match fs::symlink_metadata(entry) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DataRoot::Absent),
+        result => result?,
+    };
+    if !crate::trust_boundary::is_link_like(&metadata) {
+        return if metadata.is_dir() {
+            Ok(DataRoot::Directory)
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "Application data root must be a directory"))
+        };
+    }
+    let target = match fs::canonicalize(entry) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DataRoot::Dangling),
+        result => local_path(result?)?,
+    };
+    if !fs::metadata(&target)?.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Application data root link must lead to a directory"));
+    }
+    Ok(DataRoot::Linked(target))
+}
+
+/// A canonical Windows path without the `\\?\` prefix, which the WebView, the
+/// renderer and the path checks elsewhere do not expect. A network share is
+/// refused: the store's SQLite WAL mode does not work there.
+#[cfg(windows)]
+fn local_path(path: PathBuf) -> std::io::Result<PathBuf> {
+    use std::{io, path::{Component, Prefix}};
+    let mut components = path.components();
+    let local = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => return Ok(path),
+            Prefix::VerbatimDisk(drive) => {
+                let mut local = PathBuf::from(format!("{}:\\", char::from(drive)));
+                local.extend(components.filter(|component| matches!(component, Component::Normal(_))));
+                local
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Application data root link must lead to a local drive")),
+        },
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Application data root must be absolute")),
+    };
+    // A name the plain form cannot express would lead somewhere else.
+    if std::fs::canonicalize(&local)? != path {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Application data root link target has no plain path"));
+    }
+    Ok(local)
+}
+
+#[cfg(not(windows))]
+fn local_path(path: PathBuf) -> std::io::Result<PathBuf> {
+    Ok(path)
 }
 
 /// The main window when startup must build it itself: with the WebView data
@@ -644,6 +828,7 @@ pub(crate) fn take_main_window(
     Ok(Some(MainWindow { config, data_directory: paths.webview.clone(), data_store }))
 }
 
+#[cfg(any(mobile, test))]
 fn resolve_platform_root(root: &Path, create_missing: bool) -> std::io::Result<PathBuf> {
     use std::{fs, io};
 
@@ -671,4 +856,4 @@ fn resolve_platform_root(root: &Path, create_missing: bool) -> std::io::Result<P
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

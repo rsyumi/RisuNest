@@ -611,7 +611,7 @@ impl PersistentStore {
                 identity: identity.clone(),
                 scope_id: scope.into(),
                 manifest_hash,
-                path: path.map(PathBuf::from),
+                path: path.map(|path| self.stored_capture_path(&path)),
                 file_hash,
             }),
         )
@@ -633,7 +633,7 @@ impl PersistentStore {
                     identity: serde_json::from_str(&identity)?,
                     scope_id,
                     manifest_hash,
-                    path: path.map(PathBuf::from),
+                    path: path.map(|path| self.stored_capture_path(&path)),
                     file_hash,
                 })
             })
@@ -730,6 +730,11 @@ impl PersistentStore {
         }
     }
 
+    /// Capture rows hold the absolute path of the run that wrote them.
+    fn stored_capture_path(&self, stored: &str) -> PathBuf {
+        crate::app_paths::relocated_external_storage_path(Path::new(stored), &self.repository_root)
+    }
+
     fn remove_capture_file(&self, path: &Path) {
         let captures = self
             .repository_root
@@ -819,13 +824,13 @@ impl PersistentStore {
                 tx.execute("DELETE FROM external_storage_captures WHERE id=?1", [&id])?;
                 removed += 1;
                 if let Some(path) = path {
-                    paths.push(PathBuf::from(path));
+                    paths.push(path);
                 }
             }
             tx.commit()?;
         }
         for path in paths {
-            self.remove_capture_file(&path);
+            self.remove_capture_file(&self.stored_capture_path(&path));
         }
         Ok(removed)
     }

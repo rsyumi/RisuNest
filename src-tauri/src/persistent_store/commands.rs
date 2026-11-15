@@ -4572,6 +4572,7 @@ mod tests {
         let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
         app.manage(crate::app_paths::AppPaths {
             data: root.to_owned(),
+            data_entry: root.to_owned(),
             webview: None,
             logs: root.join("logs"),
             cache: root.join("cache"),

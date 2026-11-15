@@ -1222,7 +1222,8 @@ impl ExternalLwwEngine {
                 let _execution = journal.begin_spool_execution();
                 let sources=publication.controls.iter().map(|control|super::packaging::AssetCatalogSource {
                     content_hash:control.content_hash.clone(),byte_length:control.byte_length,
-                    source:super::content_store::ObjectSource::File(control.source.clone()),
+                    // Written under the data root of the run that froze it.
+                    source:super::content_store::ObjectSource::File(crate::app_paths::relocated_external_storage_path(&control.source,&root)),
                 }).collect();
                 let completed=super::packaging::package_and_upload_control_catalog(
                     sources,&root,&self.connection_root.join("external-storage").join("package-cache").join(&self.connection_id),
@@ -1250,7 +1251,7 @@ impl ExternalLwwEngine {
                     Self::check_publication_authority(store, &publication)?;
                     let source = if let Some(proof) = &asset.remote_source {
                         let spool = super::lww_residency::spool_frozen_remote_body(
-                            proof, &root.join("external-storage").join("lww-publications").join(&job.job_id), cancel,
+                            &proof.clone().rooted(&root), &root.join("external-storage").join("lww-publications").join(&job.job_id), cancel,
                         ).await.map_err(Self::held_body_error)?.into_temp_path();
                         Self::check_publication_authority(store, &publication)?;
                         let source = super::content_store::ObjectSource::File(spool.to_path_buf());
@@ -1615,7 +1616,7 @@ impl ExternalLwwEngine {
             }
         } else if let Some(proof) = &asset.remote_source {
             let spool = super::lww_residency::spool_frozen_remote_body(
-                proof, &publication_directory(store.repository_root(), &job.job_id), cancel,
+                &proof.clone().rooted(store.repository_root()), &publication_directory(store.repository_root(), &job.job_id), cancel,
             ).await.map_err(Self::held_body_error)?;
             Self::check_frozen_body_authority(store, authority, cancel).map_err(|error| Self::body_source_error(error, cancel))?;
             #[cfg(test)]
