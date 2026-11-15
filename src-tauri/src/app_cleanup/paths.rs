@@ -51,6 +51,7 @@ impl Paths {
     }
 
     /// The directory the data root's files are in, when it exists.
+    #[cfg(desktop)]
     pub fn data_directory(&self) -> Option<&std::path::Path> {
         match &self.data_link {
             Some(link) => link.target.as_deref(),

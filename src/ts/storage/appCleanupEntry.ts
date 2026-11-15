@@ -74,7 +74,7 @@ export async function appCleanupBeforeBootstrap(dependencies: AppCleanupEntryDep
             : code === 'secret-index-unavailable' || code === 'cleanup-journal-unavailable' || code === 'cleanup-files-busy-or-denied'
             ? ko ? '삭제할 파일에 접근할 수 없습니다. 파일 권한과 저장 공간을 확인한 후 다시 시도해주세요.' : 'The files could not be accessed. Check file permissions and free space, then retry.'
             : code === 'cleanup-data-root-in-use'
-            ? ko ? '같은 데이터 폴더를 사용하는 다른 프로필이 실행 중입니다. 해당 프로필을 종료한 뒤 다시 시도해주세요.' : 'Another profile that uses the same data folder is running. Close it, then retry.'
+            ? ko ? '같은 데이터 폴더를 사용하는 다른 프로필이 실행 중이어서 데이터 삭제를 완료하지 못했습니다. 다시 시도해주세요.' : 'Another profile that uses the same data folder was running, so local data deletion could not finish. Please retry.'
             : code === 'cleanup-path-redirected' || code === 'cleanup-path-overlap' || code === 'cleanup-root-overlaps-install'
             ? ko ? '현재 저장 경로에서는 로컬 데이터를 삭제할 수 없습니다.' : 'Local data cannot be deleted from the current storage location.'
             : ko ? '데이터 삭제를 완료하지 못했습니다. 다시 시도해주세요.' : 'Local data deletion could not finish. Please retry.'

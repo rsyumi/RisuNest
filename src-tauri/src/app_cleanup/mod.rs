@@ -361,14 +361,24 @@ pub(crate) struct DataRootLock(std::sync::Mutex<Option<fs::File>>);
 
 #[cfg(desktop)]
 impl DataRootLock {
+    /// After an in-app relaunch the exiting instance still holds the lock for
+    /// a moment, while another profile holds it for as long as it runs.
     pub(crate) fn acquire(root: &std::path::Path) -> Result<Self> {
+        Self::acquire_within(root, Duration::from_secs(10))
+    }
+
+    fn acquire_within(root: &std::path::Path, timeout: Duration) -> Result<Self> {
         fs::create_dir_all(root).map_err(|error| failed("data-root-lock-unavailable", error))?;
         let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .open(root.join(crate::app_paths::DATA_ROOT_LOCK)).map_err(|error| failed("data-root-lock-unavailable", error))?;
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Self(std::sync::Mutex::new(Some(file)))),
-            Err(error) if contended(&error) => Err("data-root-in-use".into()),
-            Err(error) => Err(failed("data-root-lock-unavailable", error)),
+        let deadline = Instant::now() + timeout;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self(std::sync::Mutex::new(Some(file)))),
+                Err(error) if contended(&error) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                Err(error) if contended(&error) => return Err("data-root-in-use".into()),
+                Err(error) => return Err(failed("data-root-lock-unavailable", error)),
+            }
         }
     }
 
@@ -1179,7 +1189,7 @@ mod tests {
             let fixture = Fixture::new();
             let (_, target) = link_data_root(&fixture, "work", false);
             let held = DataRootLock::acquire(&target).unwrap();
-            assert_eq!(DataRootLock::acquire(&target).err().unwrap(), "data-root-in-use");
+            assert_eq!(DataRootLock::acquire_within(&target, Duration::ZERO).err().unwrap(), "data-root-in-use");
             let error = fixture.run(&REMOVE, Some("work"), &|_| panic!("secrets stay until the data root is free"),
                 &RefCell::new(Vec::new())).unwrap_err();
             assert_eq!(error, "cleanup-data-root-in-use");
@@ -1188,6 +1198,24 @@ mod tests {
             held.release();
             fixture.run(&REMOVE, Some("work"), &|_| Ok(()), &RefCell::new(Vec::new())).unwrap();
             assert!(!target.exists());
+        }
+
+        #[test]
+        fn startup_waits_for_an_exiting_instance_to_free_the_data_root() {
+            let root = tempfile::tempdir().unwrap();
+            let held = DataRootLock::acquire(root.path()).unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let waiting = {
+                let root = root.path().to_owned();
+                std::thread::spawn(move || {
+                    sender.send(()).unwrap();
+                    DataRootLock::acquire_within(&root, Duration::from_secs(30)).map(|_| ())
+                })
+            };
+            receiver.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            held.release();
+            waiting.join().unwrap().unwrap();
         }
     }
 }
