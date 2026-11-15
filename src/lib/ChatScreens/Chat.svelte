@@ -1287,13 +1287,13 @@
                 {#if (innerWidth.current ?? 0) >= 640}
                     {@render majorIconButtonsBody(false)}
                     {@render pluginMessageButtons(false)}
-                    {#if DBState.db.characters[selIdState.selId]}
+                    {#if DBState.db.characters[selIdState.selId] && idx > -1}
                         <PopupButton>
                             {@render minorIconButtonsBody(true)}
                         </PopupButton>
                     {/if}
                 {:else}
-                    {#if DBState.db.characters[selIdState.selId]}
+                    {#if DBState.db.characters[selIdState.selId] && (idx > -1 || (DBState.db.useChatCopy && !blankMessage))}
                         <PopupButton>
                             {@render majorIconButtonsBody(true)}
                             {@render pluginMessageButtons(true)}
@@ -1643,7 +1643,8 @@
 {/snippet}
 
 {#snippet minorIconButtonsBody(showNames:boolean)}
-    
+    <!-- These act on a stored message, which the greeting row is not. -->
+    {#if idx > -1}
     {#if DBState.db.enableBookmark}
         <button class="flex items-center hover:text-blue-500 transition-colors button-icon-bookmark {isBookmarked ? 'text-yellow-400' : ''}" onclick={async () => {
             if (mutationBlocked()) return
@@ -1726,6 +1727,7 @@
             <span class="ml-1">{language.disableAbove}</span>
         {/if}
     </button>
+    {/if}
 {/snippet}
 
 {#snippet senderIcon(options:{rounded?:boolean,styleFix?:string} = {})}

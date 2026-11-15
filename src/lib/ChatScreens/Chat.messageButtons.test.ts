@@ -69,7 +69,10 @@ vi.mock('../../ts/storage/persistentDataRuntime.svelte', () => ({
 import Chat from './Chat.svelte'
 import PopupList from '../UI/PopupList.svelte'
 import { additionalMessageButtons, type MessageButtonDef } from 'src/ts/plugins/messageButtons.svelte'
+import { createMetadataOnlySelectedConversation } from 'src/ts/storage/selectedConversationLifecycle'
+import { language } from 'src/lang'
 import { alertCheckboxConfirm } from '../../ts/alert'
+import { getLLMCache } from '../../ts/translator/translator'
 
 const messages: Message[] = [
     { role: 'user', data: 'question', chatId: 'm-0' },
@@ -81,7 +84,7 @@ function button(id: string, roles?: MessageButtonDef['roles']): MessageButtonDef
     return { id, name: `Button ${id}`, icon: '', iconType: 'none', callback: vi.fn(), roles }
 }
 
-function installCharacter(conversation: Record<string, unknown>) {
+function installCharacter(conversation: object) {
     live.db = {
         theme: '',
         clickToEdit: false,
@@ -213,6 +216,41 @@ describe('plugin message buttons in the message action row', () => {
         }))
         await vi.waitFor(() => expect(alertCheckboxConfirm).toHaveBeenCalledOnce())
         expect(live.popup).toMatchObject({ children: null, openId: 0 })
+    })
+
+    test('offers a row without a stored message only the actions that work on it', async () => {
+        // A chat nothing was sent in keeps no message list to read.
+        const install = (options: Record<string, unknown>) => {
+            installCharacter(createMetadataOnlySelectedConversation({ id: 'conversation-a', name: 'Chat', note: '', localLore: [], bookmarks: [] }))
+            Object.assign(live.db, { enableBookmark: true, translator: 'llm', translatorType: 'llm', translateBeforeHTMLFormatting: true }, options)
+        }
+        const greeting = { message: 'greeting', role: 'char', idx: -1, firstMessage: true, totalLength: 0 }
+        const actions = (root: ParentNode) => [...root.querySelectorAll('button')].flatMap((element) => element.className.match(/button-icon-[\w-]+/) ?? [])
+
+        install({ useChatCopy: true })
+        await mountChat(greeting)
+        expect(actions(target)).toEqual(['button-icon-translate', 'button-icon-copy'])
+
+        vi.mocked(getLLMCache).mockResolvedValue('Cached translation')
+        target.querySelector<HTMLButtonElement>('.button-icon-translate')!.click()
+        ;(await vi.waitFor(() => {
+            const edit = [...target.querySelectorAll('button')].find((element) => element.textContent?.includes(language.editTranslation))
+            expect(edit).toBeDefined()
+            return edit!
+        })).click()
+        await vi.waitFor(() => expect(target.querySelector<HTMLTextAreaElement>('textarea.message-edit-area')?.value).toBe('Cached translation'))
+
+        setWidth(400)
+        target.replaceChildren()
+        await mountChat(greeting)
+        expect(actions(target)).toEqual(['button-icon-translate', 'button-icon-menu'])
+        expect(actions(await openPopup())).toEqual(['button-icon-copy'])
+
+        install({ useChatCopy: false })
+        const bare = document.createElement('div')
+        document.body.append(bare)
+        await mountChat(greeting, bare)
+        expect(actions(bare)).toEqual(['button-icon-translate'])
     })
 
     test('moves the buttons between the row and the popup when the window is resized', async () => {

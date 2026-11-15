@@ -135,6 +135,8 @@ export async function navigateCapturedChatMessage(options: {
 export function captureChatMessageTarget(
     options: CaptureChatMessageTargetOptions,
 ): CapturedChatMessageTarget | null {
+    // A row without a stored message has no target, and its conversation may have no message list to read.
+    if (options.absoluteIndex < 0) return null
     const current = options.captureCurrent()
     const message = current?.conversation.message[options.absoluteIndex]
     if (!current || !message) return null
