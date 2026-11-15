@@ -451,3 +451,29 @@ it.each([5_000, 60_000])('honors a %i ms handler budget at either side of its de
     `)
     expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
 })
+
+it.each([
+    ['one decode of an escape-heavy string', 'expire(); return #json.decode(heavy)'],
+    ['a decode nested in a coroutine and pcall', 'return coroutine.wrap(function() return pcall(function() expire(); return #json.decode(heavy) end) end)()'],
+])('reaches the timeout during %s and decodes normally afterwards', async (_label, body) => {
+    const child = await runIsolatedWasmoon(`
+        const timedEngine = await create(300)
+        let now = 0
+        const originalNow = performance.now
+        performance.now = () => now
+        timedEngine.global.set('expire', () => { now = 1e12 })
+        timedEngine.global.set('heavy', JSON.stringify('"'.repeat(100000)))
+        timedEngine.global.set('plain', JSON.stringify('x'.repeat(1000000)))
+        try {
+            await runLuaSource(timedEngine, ${JSON.stringify(`
+                local json = require 'json'
+                function run() ${body} end
+                function check() return #json.decode(heavy) + #json.decode(plain) end
+            `)})
+            assert.throws(() => timedEngine.global.get('run')(), /thread timeout exceeded/)
+            now = 0
+            assert.equal(timedEngine.global.get('check')(), 1100000)
+        } finally { performance.now = originalNow }
+    `)
+    expect(child, child.stderr).toMatchObject({ code: 0, timedOut: false })
+})
