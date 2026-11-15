@@ -1508,7 +1508,7 @@ pub(super) mod tests {
         let (lease,prepared)=source.lww_acquire_backup_capture(source.revision().unwrap()).unwrap();
         let sections=super::super::sections::capture_prepared_backup_sections(&prepared,&source_root.join("backup-sections"),&probe.0).unwrap();
         let capture=source.capture_external_library_from_lease_with_sections("sender",&hydration,&lease.lease,sections,&probe).unwrap();
-        let sections=capture.catalog.backup_sections().unwrap();
+        let sections=capture.catalog.backup_sections(&source_root).unwrap();
         let original_units=capture.catalog.original_backup_units().unwrap();
         let original_units=if legacy_units.is_empty() {original_units} else {
             let mut units=original_units.units().unwrap().collect::<crate::persistent_store::StoreResult<std::collections::BTreeMap<_,_>>>().unwrap();
@@ -1632,7 +1632,7 @@ pub(super) mod tests {
         let (lease,prepared)=source.lww_acquire_backup_capture(source.revision().unwrap()).unwrap();
         let sections=super::super::sections::capture_prepared_backup_sections(&prepared,&source_root.path().join("backup-sections"),&probe.0).unwrap();
         let capture=source.capture_external_library_from_lease_with_sections("sender",&hydration,&lease.lease,sections,&probe).unwrap();
-        let sections=capture.catalog.backup_sections().unwrap();
+        let sections=capture.catalog.backup_sections(source_root.path()).unwrap();
         let original_units=capture.catalog.original_backup_units().unwrap();
         let repository=fake::repository();
         let connected=ConnectedRepository {

@@ -83,7 +83,7 @@ fn restore_original_backup(populate: impl FnOnce(&mut PersistentStore)) -> (temp
     let (lease, prepared) = source.lww_acquire_backup_capture(source.revision().unwrap()).unwrap();
     let sections = super::sections::capture_prepared_backup_sections(&prepared, &source_root.path().join("backup-sections"), &probe.0).unwrap();
     let capture = source.capture_external_library_from_lease_with_sections("sender", &hydration, &lease.lease, sections, &probe).unwrap();
-    let sections = capture.catalog.backup_sections().unwrap();
+    let sections = capture.catalog.backup_sections(source_root.path()).unwrap();
     let original_units = capture.catalog.original_backup_units().unwrap();
     let provider = Arc::new(fake::FakeProvider::new(false));
     let repository = fake::repository();
@@ -138,7 +138,7 @@ fn restore_original_backup(populate: impl FnOnce(&mut PersistentStore)) -> (temp
         let (lease,prepared)=store.lww_acquire_backup_capture(store.revision().unwrap()).unwrap();
         let sections=super::sections::capture_prepared_backup_sections(&prepared,&destination.path().join("backup-sections"),&probe.0).unwrap();
         let capture=store.capture_external_library_from_lease_with_sections("restored-backup",&hydration,&lease.lease,sections,&probe).unwrap();
-        let sections=capture.catalog.backup_sections().unwrap();
+        let sections=capture.catalog.backup_sections(destination.path()).unwrap();
         let units=capture.catalog.original_backup_units().unwrap();
         let meta=packaging::SnapshotMetadata {snapshot_id:"restored-backup".into(),repository_id:connected.stored.descriptor.repository_id.clone(),library_id:capture.identity.library_epoch.clone(),author_device_id:capture.identity.store_id.clone(),
             created_at_ms:super::runtime::now_ms(),logical_revision:capture.identity.revision as u64,parent_snapshot_id:None,

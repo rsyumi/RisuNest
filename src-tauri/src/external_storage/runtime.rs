@@ -1635,7 +1635,7 @@ async fn run_backup(
             .catalog
             .content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain())
             .map_err(local_error)?;
-        let sections = capture.catalog.backup_sections().map_err(local_error)?;
+        let sections = capture.catalog.backup_sections(&self::root(&worker_app)?).map_err(local_error)?;
         Ok((capture, fingerprint, sections))
     })
     .await

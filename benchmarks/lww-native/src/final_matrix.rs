@@ -625,7 +625,7 @@ async fn prepare_remote_backup(store:&mut PersistentStore,connected:&crate::exte
     let fingerprint=capture.catalog.content_fingerprint(&risunest_external_storage_format::format::library_fingerprint_domain())
         .map_err(|e|e.to_string())?;
     let original_units=capture.catalog.original_backup_units().map_err(|e|e.to_string())?;
-    let sections=capture.catalog.backup_sections().map_err(|e|e.to_string())?;
+    let sections=capture.catalog.backup_sections(store.repository_root()).map_err(|e|e.to_string())?;
     let mut journal=TransferJournal::open(directory,JobIdentity {job_id:snapshot_id.clone(),connection_id:connected.stored.id.clone(),
         repository_id:connected.handle.repository_id.clone(),capture_id:capture.id.clone(),capture:identity.clone()}).map_err(|e|format!("{e:?}"))?;
     let metadata=packaging::SnapshotMetadata {snapshot_id:snapshot_id.clone(),repository_id:connected.stored.descriptor.repository_id.clone(),

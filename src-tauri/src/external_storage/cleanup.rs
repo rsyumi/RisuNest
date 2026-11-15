@@ -1320,7 +1320,7 @@ pub(super) mod tests {
             let (lease,prepared)=source.lww_acquire_backup_capture(source.revision().unwrap()).unwrap();
             let sections=super::super::sections::capture_prepared_backup_sections(&prepared,&backup_spool,&probe.0).unwrap();
             let capture=source.capture_external_library_from_lease_with_sections("sender",&hydration,&lease.lease,sections,&probe).unwrap();
-            let sections=capture.catalog.backup_sections().unwrap();let original=capture.catalog.original_backup_units().unwrap();
+            let sections=capture.catalog.backup_sections(&source_root).unwrap();let original=capture.catalog.original_backup_units().unwrap();
             (capture,sections,original,source.lww_clock_state().unwrap().writer_id)
         }).await.unwrap();
         let backup_id=uuid::Uuid::new_v4().to_string();

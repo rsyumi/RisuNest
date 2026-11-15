@@ -452,15 +452,20 @@ impl CaptureCatalog {
         Ok(())
     }
 
-    pub(crate) fn backup_sections(&self) -> Result<Vec<super::sections::CapturedSection>> {
+    /// Section sources hold the absolute paths of the run that captured them,
+    /// so a job resumed under another data root finds them under `data_root`.
+    pub(crate) fn backup_sections(&self, data_root: &Path) -> Result<Vec<super::sections::CapturedSection>> {
         if !self.finalized { return Err(invalid("Backup capture is not durable")); }
         self.original_backup_units()?;
         let mut sections = Vec::new();
         let mut statement = self.db.prepare("SELECT kind,body FROM backup_sections ORDER BY kind")?;
         for row in statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
             let (kind, body) = row?;
-            let section: super::sections::CapturedSection = serde_json::from_str(&body)?;
+            let mut section: super::sections::CapturedSection = serde_json::from_str(&body)?;
             if section.kind.id() != kind { return Err(invalid("Backup section identity differs")); }
+            for source in &mut section.sources {
+                source.path = crate::app_paths::relocated_external_storage_path(&source.path, data_root);
+            }
             sections.push(section);
         }
         if sections.len() != 3 { return Err(invalid("Complete backup sections are unavailable")); }
