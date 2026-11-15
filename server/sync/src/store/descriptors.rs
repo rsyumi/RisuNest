@@ -1,4 +1,4 @@
-use super::{descriptors_index::PendingIndex, json, parse, Store};
+use super::{descriptors_index::PendingIndex, json, objects::ObjectPaths, parse, Store};
 use crate::{Error, Result};
 use risunest_sync_wire::{
     canonical,
@@ -20,6 +20,7 @@ impl Store {
     ) -> Result<()> {
         #[cfg(all(test, feature = "source-observer"))]
         let _observed = crate::source_observer::ingress(&self.root);
+        let paths = self.object_paths();
         let mut pending = PendingIndex::default();
         for change in changes {
             if let risunest_sync_wire::unit::UnitValue::Object {
@@ -28,7 +29,7 @@ impl Store {
             } = &change.value
             {
                 let stored = self
-                    .prepare_descriptor(descriptor_hash, &mut pending)
+                    .prepare_descriptor(&paths, descriptor_hash, &mut pending)
                     .map_err(|error| error.for_key(change.key.as_str()))?;
                 if stored != *descriptor {
                     return Err(Error::new("descriptor-object-mismatch", 409));
@@ -42,6 +43,7 @@ impl Store {
     }
     fn prepare_descriptor(
         &self,
+        paths: &ObjectPaths,
         digest: &str,
         pending: &mut PendingIndex,
     ) -> Result<RecordDescriptor> {
@@ -67,7 +69,7 @@ impl Store {
                 .chain(std::iter::once(descriptor.object_hash.as_str()))
                 .chain(descriptor.dependencies.iter().map(String::as_str))
             {
-                if !self.object_presence(hash)? {
+                if !self.object_presence_in(paths, hash)? {
                     return Err(Error::new("missing-dependency", 409));
                 }
             }
@@ -75,7 +77,7 @@ impl Store {
                 .into_iter()
                 .flatten()
             {
-                self.validate_cached_reference(root)?;
+                self.validate_cached_reference(paths, root)?;
             }
             pending.remember_descriptor(digest.into(), body);
             return Ok(descriptor);
@@ -91,19 +93,19 @@ impl Store {
             MAX_METADATA_BYTES,
         )?;
         descriptor.validate()?;
-        if !self.object_presence(&descriptor.object_hash)? {
+        if !self.object_presence_in(paths, &descriptor.object_hash)? {
             return Err(Error::new("missing-dependency", 409));
         }
         for hash in &descriptor.dependencies {
-            if !self.object_presence(hash)? {
+            if !self.object_presence_in(paths, hash)? {
                 return Err(Error::new("missing-dependency", 409));
             }
         }
         if let Some(root) = &descriptor.dependency_root {
-            self.prepare_reference_tree(root, false, pending)?;
+            self.prepare_reference_tree(paths, root, false, pending)?;
         }
         if let Some(root) = &descriptor.relation_root {
-            self.prepare_reference_tree(root, true, pending)?;
+            self.prepare_reference_tree(paths, root, true, pending)?;
         }
         pending.add_descriptor(
             digest.to_owned(),
@@ -112,7 +114,7 @@ impl Store {
         );
         Ok(descriptor)
     }
-    fn validate_cached_reference(&self, root: &str) -> Result<()> {
+    fn validate_cached_reference(&self, paths: &ObjectPaths, root: &str) -> Result<()> {
         let hashes: Vec<String> = {
             let db = self.reader()?;
             let mut stmt = db.prepare("WITH RECURSIVE nodes(hash) AS (SELECT ?1 UNION SELECT child FROM reference_children JOIN nodes ON root=nodes.hash) SELECT hash FROM nodes UNION SELECT object FROM reference_objects WHERE root IN nodes")?;
@@ -120,7 +122,7 @@ impl Store {
             rows.collect::<std::result::Result<_, _>>()?
         };
         for hash in hashes {
-            if !self.object_presence(&hash)? {
+            if !self.object_presence_in(paths, &hash)? {
                 return Err(Error::new("missing-dependency", 409));
             }
         }
@@ -128,6 +130,7 @@ impl Store {
     }
     fn prepare_reference_tree(
         &self,
+        paths: &ObjectPaths,
         root: &str,
         relations: bool,
         pending: &mut PendingIndex,
@@ -152,7 +155,7 @@ impl Store {
                     return Err(Error::new("reference-kind-mismatch", 409));
                 }
                 if pending.node(&digest).is_none() {
-                    self.validate_cached_reference(&digest)?;
+                    self.validate_cached_reference(paths, &digest)?;
                 }
                 continue;
             }
@@ -228,7 +231,9 @@ impl Store {
                 ReferencePage::Branches { .. } => "reference_children",
             };
             for value in page.values() {
-                if matches!(page, ReferencePage::Objects { .. }) && !self.object_presence(value)? {
+                if matches!(page, ReferencePage::Objects { .. })
+                    && !self.object_presence_in(paths, value)?
+                {
                     return Err(Error::new("missing-dependency", 409));
                 }
                 pending.add_edge(table, digest.clone(), value.clone());
