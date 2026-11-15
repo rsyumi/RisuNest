@@ -227,9 +227,10 @@ impl Residency {
         Self::check_head(config, head)?;
         self.retain_under(client, config, &head.epoch, objects)
     }
-    /// Retains `objects` under the epoch this device last confirmed custody under in the
-    /// configured library, without asking the server for its head first. When there is no such
-    /// epoch, or the server has moved to another, it asks and retains under the current head.
+    /// Retains `objects` under the epoch of the newest custody confirmation, without asking the
+    /// server for its head first, when that confirmation was this device's in the configured
+    /// library. Otherwise, or when the server has moved to another epoch, it asks and retains
+    /// under the current head.
     pub fn retain_current(
         &mut self,
         client: &super::client::ServerClient,
@@ -237,7 +238,7 @@ impl Residency {
         objects: &[(String, Option<u64>)],
     ) -> Result<()> {
         let confirmed: Option<String> = self.db.query_row(
-            "SELECT c.epoch FROM objects o JOIN contexts c ON c.id=o.context WHERE c.library_id=?1 AND c.device_id=?2 ORDER BY o.confirmation_order DESC LIMIT 1",
+            "SELECT epoch FROM contexts WHERE id=(SELECT context FROM objects ORDER BY confirmation_order DESC LIMIT 1) AND library_id=?1 AND device_id=?2",
             params![config.library_id, config.device_id],
             |row| row.get(0),
         ).optional()?;
