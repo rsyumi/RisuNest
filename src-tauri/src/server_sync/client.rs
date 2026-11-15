@@ -1378,19 +1378,16 @@ mod tests {
         }
     }
 
-    /// Clients built within the shared lifetime reuse its connection, one built
-    /// after it refreshes transport configuration, and none shares another's
-    /// credentials or cancellation.
-    #[test]
-    fn clients_share_transport_for_a_minute_without_sharing_credentials_or_cancellation() {
+    /// A server that records each request's connection and credentials, and a
+    /// call that stops it.
+    fn recording_server() -> (String, Arc<Mutex<Vec<(std::net::SocketAddr, String)>>>, impl FnOnce()) {
         use axum::{extract::ConnectInfo, http::{HeaderMap, StatusCode}, Router};
-        use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let captured = seen.clone();
-        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let router = Router::new().fallback(move |ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>, headers: HeaderMap| {
@@ -1404,6 +1401,31 @@ mod tests {
                     .with_graceful_shutdown(async { let _ = stopped.await; }).await.unwrap();
             });
         });
+        (endpoint, seen, move || { stop.send(()).unwrap(); server.join().unwrap(); })
+    }
+
+    /// Clients built one after another share the process-wide transport.
+    #[test]
+    fn clients_built_one_after_another_share_the_process_transport() {
+        let (endpoint, seen, stop) = recording_server();
+        for _ in 0..3 {
+            let client = ServerClient::new(config(&endpoint)).unwrap();
+            assert_eq!(client.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
+        }
+        stop();
+        let seen = seen.lock().unwrap();
+        let connections = seen.iter().map(|(peer, _)| *peer).collect::<std::collections::BTreeSet<_>>();
+        // The shared client may reach the end of its lifetime between two of them.
+        assert!(seen.len() == 3 && connections.len() <= 2, "{} requests on {} connections", seen.len(), connections.len());
+    }
+
+    /// Clients built within the shared lifetime reuse its connection, one built
+    /// after it refreshes transport configuration, and none shares another's
+    /// credentials or cancellation.
+    #[test]
+    fn clients_share_transport_for_a_minute_without_sharing_credentials_or_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (endpoint, seen, stop) = recording_server();
         let shared = PrivateSharedHttp::new();
         let cancelled = Arc::new(AtomicBool::new(false));
         let first = ServerClient::with_cancellation(config(&endpoint), Some(cancelled.clone())).unwrap();
@@ -1418,8 +1440,7 @@ mod tests {
         shared.move_clock_ahead(SHARED_HTTP_LIFETIME);
         let third = ServerClient::new(config(&endpoint)).unwrap();
         assert_eq!(third.request(Method::GET, "head", &[], None, &[], 1024).unwrap().status, 204);
-        stop.send(()).unwrap();
-        server.join().unwrap();
+        stop();
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[0].0, seen[1].0, "a client within the lifetime reuses the connection");
