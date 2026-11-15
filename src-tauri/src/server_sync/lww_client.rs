@@ -63,6 +63,9 @@ impl OperationLog {
         let db = crate::sqlite_open::open(Self::path(root))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS publications(id TEXT PRIMARY KEY, digest TEXT NOT NULL, body BLOB NOT NULL, intent TEXT NOT NULL, receipt TEXT,acknowledged INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS pending_publications ON publications(id) WHERE receipt IS NULL; CREATE INDEX IF NOT EXISTS unacknowledged_publications ON publications(id) WHERE acknowledged=0;")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS bootstrap(authority TEXT PRIMARY KEY,pin TEXT NOT NULL,after_key TEXT,cursor TEXT NOT NULL); CREATE TABLE IF NOT EXISTS receive_pages(authority TEXT PRIMARY KEY,body TEXT NOT NULL,next_key TEXT,bootstrap INTEGER NOT NULL,done INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS configurations(slot TEXT PRIMARY KEY,config TEXT NOT NULL); CREATE TABLE IF NOT EXISTS bindings(id TEXT PRIMARY KEY,body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS claims(id TEXT PRIMARY KEY,body TEXT NOT NULL);")?;
+        // Units of a state pin that finished pages already received, so a bootstrap resumed in a
+        // later session still reports how much of the pin is left.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS bootstrap_listed(pin TEXT PRIMARY KEY,units INTEGER NOT NULL);")?;
         Ok(Self(db))
     }
     pub(crate) fn prepare(&self, publication: &Publication) -> Result<Vec<u8>> {
@@ -206,6 +209,14 @@ impl OperationLog {
         )?;
         Ok(())
     }
+}
+/// Drops the received counts of pins no bootstrap reads any more.
+fn forget_listed_pins(log: &Connection) -> Result<()> {
+    log.execute(
+        "DELETE FROM bootstrap_listed WHERE pin NOT IN (SELECT json_extract(pin,'$.pinId') FROM bootstrap WHERE json_valid(pin))",
+        [],
+    )?;
+    Ok(())
 }
 fn now_ms() -> Result<u64> {
     u64::try_from(
@@ -1162,6 +1173,7 @@ impl LwwClient {
                 self.log
                     .0
                     .execute("DELETE FROM bootstrap WHERE authority=?1", [&authority])?;
+                forget_listed_pins(&self.log.0)?;
                 // A pin kept from an earlier page is replaced once; one made by this
                 // call that already expired is reported instead of pinning again.
                 if existing_pin.is_none() {
@@ -1176,10 +1188,23 @@ impl LwwClient {
             if page.pin_id != pin.pin_id || page.start_seq != pin.start_seq {
                 return Err(SyncError::new("invalid-state-page", 502));
             }
-            // Reading the whole state has no known size, so its pages count as they arrive.
-            self.client.lane().backlog(page.items.len() as u64, 0);
             next_key = page.next_key.map(|key| key.as_str().to_owned());
             done = next_key.is_none();
+            // The pin holds a known number of units; finished pages, including those of an
+            // earlier session, have received some of them.
+            let listed: i64 = self
+                .log
+                .0
+                .query_row("SELECT units FROM bootstrap_listed WHERE pin=?1", [&pin.pin_id], |r| r.get(0))
+                .optional()?
+                .unwrap_or(0);
+            let items = page.items.len() as u64;
+            let left = if done {
+                0
+            } else {
+                pin.unit_count.0.saturating_sub(u64::try_from(listed).unwrap_or(0).saturating_add(items))
+            };
+            self.client.lane().backlog(items, left);
             more = !done;
             receive_frontier = done.then_some(pin.start_seq);
             (
@@ -1374,10 +1399,16 @@ impl LwwClient {
         let tx = self.log.0.unchecked_transaction()?;
         if boot && done {
             tx.execute("DELETE FROM bootstrap WHERE authority=?1", [&authority])?;
+            forget_listed_pins(&tx)?;
         } else if boot {
             tx.execute(
                 "UPDATE bootstrap SET after_key=?1 WHERE authority=?2",
                 params![next, authority],
+            )?;
+            tx.execute(
+                "INSERT INTO bootstrap_listed SELECT json_extract(pin,'$.pinId'),?2 FROM bootstrap WHERE authority=?1 AND json_valid(pin)
+                 ON CONFLICT(pin) DO UPDATE SET units=units+excluded.units",
+                params![authority, page.changes.len() as i64],
             )?;
         }
         tx.execute("DELETE FROM receive_pages WHERE authority=?1", [&authority])?;

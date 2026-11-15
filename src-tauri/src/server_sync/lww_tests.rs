@@ -1788,6 +1788,39 @@ fn a_multi_page_bootstrap_from_cursor_zero_finishes_every_page() {
 }
 
 #[test]
+fn a_bootstrap_reports_what_is_left_of_its_pin_in_every_session() {
+    use super::progress::{within, ProgressLane};
+    let server = LocalServerFixture::new();
+    ServerWriter::new(&server.server).push_units("first-library", "unit", 600);
+    raise_journal_floor(&server);
+    let (_root, mut target) = local();
+    server.client(&target);
+    // Each page is read by a new client, as a later session would read it.
+    let page = |target: &mut PersistentStore| {
+        let lane = Arc::new(ProgressLane::default());
+        within(&lane, || {
+            let client = LocalServerFixture::reopen_client(target, Default::default())?;
+            receive_cycle(&client, target, &[])
+        }).unwrap();
+        let read = lane.snapshot("receive");
+        (read.backlog_done, read.backlog_left)
+    };
+    let (done, left) = page(&mut target);
+    assert_eq!(done, 256);
+    let total = done + left;
+    assert!(total >= 600, "{total}");
+    let (done, left) = page(&mut target);
+    assert_eq!((done, done + left), (256, total - 256));
+    let (_, left) = page(&mut target);
+    assert_eq!(left, 0);
+    assert_eq!(received_bootstrap_units(&target), 600);
+    let listed: i64 = OperationLog::open(target.repository_root()).unwrap().0
+        .query_row("SELECT count(*) FROM bootstrap_listed", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(listed, 0);
+}
+
+#[test]
 fn a_multi_page_bootstrap_from_a_received_cursor_keeps_it_until_the_last_page() {
     let server = LocalServerFixture::new();
     let writer = ServerWriter::new(&server.server);
