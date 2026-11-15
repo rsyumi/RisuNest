@@ -13,8 +13,11 @@
 </script>
 
 <button onclick={async (e:MouseEvent) => {
+    // A menu closed by a tap elsewhere keeps this button's id, so the id alone does not mean it is open.
+    // Read before the wait: this tap also reaches the menu's own handler, which closes it.
+    const open = popupStore.children !== null && popupStore.openId === buttonId
     await sleep(0)
-    if(popupStore.openId === buttonId){
+    if(open){
         popupStore.children = null
         popupStore.openId = 0
         return

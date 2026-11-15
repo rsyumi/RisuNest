@@ -108,6 +108,16 @@ describe('plugin message buttons in the message action row', () => {
     }
     const pluginButtons = (root: ParentNode = target) =>
         [...root.querySelectorAll<HTMLButtonElement>('.button-icon-plugin')].map((element) => element.title)
+    const menuButton = () => target.querySelector<HTMLButtonElement>('.button-icon-menu')!
+    const openPopup = async () => {
+        menuButton().click()
+        await vi.waitFor(() => expect(live.popup.children).not.toBeNull())
+        const popup = document.createElement('div')
+        document.body.append(popup)
+        mounted.push(mount(PopupList, { target: popup }))
+        await tick()
+        return popup
+    }
 
     beforeEach(() => {
         additionalMessageButtons.push(button('char-only', ['char']), button('user-only', ['user']), button('both'))
@@ -167,12 +177,7 @@ describe('plugin message buttons in the message action row', () => {
         await mountChat({ message: 'answer', role: 'char', idx: 1, totalLength: 3 })
         expect(pluginButtons()).toEqual([])
 
-        target.querySelector<HTMLButtonElement>('.button-icon-menu')!.click()
-        await vi.waitFor(() => expect(live.popup.children).not.toBeNull())
-        const popup = document.createElement('div')
-        document.body.append(popup)
-        mounted.push(mount(PopupList, { target: popup }))
-        await tick()
+        const popup = await openPopup()
 
         expect(pluginButtons(popup)).toEqual(['Button char-only', 'Button both'])
         expect([...popup.querySelectorAll('.button-icon-plugin span')].map((element) => element.textContent)).toEqual(['Button char-only', 'Button both'])
@@ -180,15 +185,27 @@ describe('plugin message buttons in the message action row', () => {
         await vi.waitFor(() => expect(additionalMessageButtons[0].callback).toHaveBeenCalledWith(expect.objectContaining({ messageIndex: 1, messageId: 'm-1' })))
     })
 
+    test('opens the action popup again with one tap after a tap closed it, and closes it with a tap on its button', async () => {
+        setWidth(400)
+        await mountChat({ message: 'answer', role: 'char', idx: 1, totalLength: 3 })
+        const popup = await openPopup()
+
+        popup.querySelector<HTMLButtonElement>('.button-icon-plugin')!.click()
+        expect(live.popup.children).toBeNull()
+        menuButton().click()
+        await vi.waitFor(() => expect(live.popup.children).not.toBeNull())
+
+        menuButton().click()
+        await tick()
+        expect(live.popup.children).toBeNull()
+        menuButton().click()
+        await vi.waitFor(() => expect(live.popup.children).not.toBeNull())
+    })
+
     test('closes the action popup when its remove button is held', async () => {
         setWidth(400)
         await mountChat({ message: 'answer', role: 'char', idx: 1, totalLength: 3 })
-        target.querySelector<HTMLButtonElement>('.button-icon-menu')!.click()
-        await vi.waitFor(() => expect(live.popup.children).not.toBeNull())
-        const popup = document.createElement('div')
-        document.body.append(popup)
-        mounted.push(mount(PopupList, { target: popup }))
-        await tick()
+        const popup = await openPopup()
 
         // No click follows a held press, so the popup's own click handler never runs.
         popup.querySelector('.button-icon-remove')!.dispatchEvent(new PointerEvent('pointerdown', {
