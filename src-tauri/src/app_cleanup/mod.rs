@@ -348,7 +348,11 @@ fn erase_with(paths: &Paths, request: &mut Request,
     };
     #[cfg(mobile)]
     let release = || -> Result<()> { Ok(()) };
-    remove_secrets(&paths.data)?;
+    // A link that leads to no usable data root is removed without being
+    // followed.
+    if !paths.data_link.as_ref().is_some_and(|link| link.target.is_none()) {
+        remove_secrets(&paths.data)?;
+    }
     begin_roots(paths, request)?;
     // On desktop the data root goes after the other roots and its lock file
     // after the rest of it, so that a profile whose data root leads to the
@@ -363,6 +367,10 @@ fn erase_with(paths: &Paths, request: &mut Request,
     }
 }
 
+/// Startup's refusal while another instance holds the data root lock.
+#[cfg(desktop)]
+pub(crate) const DATA_ROOT_IN_USE: &str = "data-root-in-use";
+
 /// Held by a desktop instance inside the data root it uses for its whole run,
 /// so that another profile whose data root leads to the same directory can
 /// neither open it nor delete it meanwhile.
@@ -374,10 +382,11 @@ impl DataRootLock {
     /// After an in-app relaunch the exiting instance still holds the lock for
     /// a moment, while another profile holds it for as long as it runs.
     pub(crate) fn acquire(root: &std::path::Path) -> Result<Self> {
-        Self::acquire_within(root, Duration::from_secs(10))
+        Self::acquire_within(root, Duration::from_secs(10), &pause_briefly)
     }
 
-    fn acquire_within(root: &std::path::Path, timeout: Duration) -> Result<Self> {
+    /// `pause` runs each time the lock is found held before the deadline.
+    fn acquire_within(root: &std::path::Path, timeout: Duration, pause: &dyn Fn()) -> Result<Self> {
         let lock = root.join(crate::app_paths::DATA_ROOT_LOCK);
         let unavailable = |error: std::io::Error| failed("data-root-lock-unavailable", error);
         let deadline = Instant::now() + timeout;
@@ -392,15 +401,15 @@ impl DataRootLock {
             loop {
                 match fs2::FileExt::try_lock_exclusive(&file) {
                     Ok(()) => break,
-                    Err(error) if contended(&error) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-                    Err(error) if contended(&error) => return Err("data-root-in-use".into()),
+                    Err(error) if contended(&error) && Instant::now() < deadline => pause(),
+                    Err(error) if contended(&error) => return Err(DATA_ROOT_IN_USE.into()),
                     Err(error) => return Err(unavailable(error)),
                 }
             }
             // Cleanup deletes the lock file while holding it, so an instance
             // that waited on it is granted a lock no other instance can find.
             if names_file(&lock, &file).map_err(unavailable)? { return Ok(Self(std::sync::Mutex::new(Some(file)))); }
-            if Instant::now() >= deadline { return Err("data-root-in-use".into()); }
+            if Instant::now() >= deadline { return Err(DATA_ROOT_IN_USE.into()); }
         }
     }
 
@@ -487,6 +496,14 @@ struct Effects<'a> {
     /// How long removal waits out files still open and a data root still
     /// locked by an instance that is exiting.
     retry_for: Duration,
+    /// Runs between removal attempts.
+    pause: &'a dyn Fn(),
+}
+
+/// The wait between attempts on a lock or a file another process holds.
+#[cfg(desktop)]
+fn pause_briefly() {
+    std::thread::sleep(Duration::from_millis(100));
 }
 
 /// A lock attempt that failed only because another process holds the lock.
@@ -564,7 +581,7 @@ fn erase_retrying(paths: &Paths, request: &mut Request, effects: &Effects) -> Re
         match erase_with(paths, request, effects.remove_secrets, files::remove) {
             Ok(()) => return Ok(()),
             Err(error) if (error == "cleanup-files-busy-or-denied" || error == "cleanup-data-root-in-use") && Instant::now() < deadline =>
-                std::thread::sleep(Duration::from_millis(100)),
+                (effects.pause)(),
             Err(error) => return Err(error),
         }
     }
@@ -657,7 +674,7 @@ pub(crate) fn run_cli(arguments: &[std::ffi::OsString], profiles: &DesktopProfil
     if !args.first().is_some_and(|arg| matches!(arg.as_str(), "--remove-local-data" | "--cleanup-worker")) { return None; }
     let remove_webview = |profile: Option<&ProfileName>| crate::cleanup_webview::remove_profile_store(profiles.agent(), profile);
     let effects = Effects { remove_secrets: &crate::cleanup_secrets::remove_all, remove_webview: &remove_webview, relaunch: &relaunch,
-        retry_for: Duration::from_secs(10) };
+        retry_for: Duration::from_secs(10), pause: &pause_briefly };
     match cli(&args, profiles, profile, &effects) {
         Ok(()) => Some(0),
         Err(error) => { eprintln!("{error}"); Some(1) },
@@ -982,6 +999,7 @@ mod tests {
             profiles: DesktopProfiles,
             webview_root: PathBuf,
             retry_for: std::cell::Cell<Duration>,
+            pause: RefCell<Box<dyn Fn()>>,
         }
 
         impl Fixture {
@@ -992,7 +1010,8 @@ mod tests {
                 let base = fs::canonicalize(root.path()).unwrap();
                 let base = if cfg!(target_os = "macos") { base } else { root.path().to_owned() };
                 let profiles = DesktopProfiles::synthetic(&base, false);
-                Self { _root: root, profiles, webview_root: base.join("webview"), retry_for: std::cell::Cell::new(Duration::from_secs(10)) }
+                Self { _root: root, profiles, webview_root: base.join("webview"), retry_for: std::cell::Cell::new(Duration::from_secs(10)),
+                    pause: RefCell::new(Box::new(pause_briefly)) }
             }
 
             fn create(&self, profile: Option<&str>) -> PathBuf {
@@ -1031,7 +1050,9 @@ mod tests {
                     relaunched.borrow_mut().push(profile.map(|profile| profile.as_str().to_owned()));
                     Ok(())
                 };
-                let effects = Effects { remove_secrets: secrets, remove_webview: webview, relaunch: &relaunch, retry_for: self.retry_for.get() };
+                let pause = self.pause.borrow();
+                let effects = Effects { remove_secrets: secrets, remove_webview: webview, relaunch: &relaunch, retry_for: self.retry_for.get(),
+                    pause: &**pause };
                 let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
                 cli(&args, &self.profiles, name(profile).as_ref(), &effects)
             }
@@ -1264,12 +1285,25 @@ mod tests {
             assert!(fs::symlink_metadata(&data).is_err());
         }
 
+        #[cfg(unix)]
+        #[test]
+        fn a_data_root_link_startup_refuses_is_removed_without_following_it() {
+            let fixture = Fixture::new();
+            let (data, target) = link_data_root(&fixture, "work", false);
+            fs::remove_dir_all(&target).unwrap();
+            fs::write(&target, b"user").unwrap();
+            fixture.run(&REMOVE, Some("work"), &|_| panic!("the link's target was never a data root"),
+                &RefCell::new(Vec::new())).unwrap();
+            assert!(fs::symlink_metadata(&data).is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"user");
+        }
+
         #[test]
         fn cleanup_refuses_a_data_root_another_profile_is_using() {
             let fixture = Fixture::new();
             let (_, target) = link_data_root(&fixture, "work", false);
             let held = DataRootLock::acquire(&target).unwrap();
-            assert_eq!(DataRootLock::acquire_within(&target, Duration::ZERO).err().unwrap(), "data-root-in-use");
+            assert_eq!(DataRootLock::acquire_within(&target, Duration::ZERO, &|| {}).err().unwrap(), "data-root-in-use");
             fixture.retry_for.set(Duration::ZERO);
             let error = fixture.run(&REMOVE, Some("work"), &|_| panic!("secrets stay until the data root is free"),
                 &RefCell::new(Vec::new())).unwrap_err();
@@ -1278,8 +1312,13 @@ mod tests {
             // An exiting app lets go of the data root only as its process ends,
             // which can be after the owner lock.
             fixture.retry_for.set(Duration::from_secs(30));
+            let (paused, waiting) = std::sync::mpsc::channel();
+            *fixture.pause.borrow_mut() = Box::new(move || {
+                let _ = paused.send(());
+                std::thread::sleep(Duration::from_millis(10));
+            });
             let releasing = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
+                waiting.recv_timeout(Duration::from_secs(30)).expect("cleanup finds the data root in use");
                 held.release();
             });
             fixture.run(&REMOVE, Some("work"), &|_| Ok(()), &RefCell::new(Vec::new())).unwrap();
@@ -1294,7 +1333,7 @@ mod tests {
             let (_, target) = link_data_root(&fixture, "work", true);
             for (profile, directory) in [(None, &data), (Some("work"), &target)] {
                 erase_with(&fixture.paths(profile), &mut request(), &|_| Ok(()), |root| {
-                    assert_eq!(DataRootLock::acquire_within(directory, Duration::ZERO).err().as_deref(), Some("data-root-in-use"));
+                    assert_eq!(DataRootLock::acquire_within(directory, Duration::ZERO, &|| {}).err().as_deref(), Some("data-root-in-use"));
                     files::remove(root)
                 }).unwrap();
             }
@@ -1306,19 +1345,11 @@ mod tests {
         fn an_instance_waiting_through_cleanup_holds_the_lock_on_the_data_root_it_finds() {
             let root = tempfile::tempdir().unwrap();
             let hold = DataRootHold::take(root.path()).unwrap().unwrap();
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let waiting = {
-                let root = root.path().to_owned();
-                std::thread::spawn(move || {
-                    sender.send(()).unwrap();
-                    DataRootLock::acquire_within(&root, Duration::from_secs(30))
-                })
-            };
-            receiver.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            let (paused, waiting) = waiting_on_lock(root.path());
+            paused.recv_timeout(Duration::from_secs(30)).expect("startup finds the data root held");
             hold.release().unwrap();
             let started = waiting.join().unwrap().unwrap();
-            assert_eq!(DataRootLock::acquire_within(root.path(), Duration::ZERO).err().as_deref(), Some("data-root-in-use"));
+            assert_eq!(DataRootLock::acquire_within(root.path(), Duration::ZERO, &|| {}).err().as_deref(), Some("data-root-in-use"));
             drop(started);
         }
 
@@ -1326,18 +1357,22 @@ mod tests {
         fn startup_waits_for_an_exiting_instance_to_free_the_data_root() {
             let root = tempfile::tempdir().unwrap();
             let held = DataRootLock::acquire(root.path()).unwrap();
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let waiting = {
-                let root = root.path().to_owned();
-                std::thread::spawn(move || {
-                    sender.send(()).unwrap();
-                    DataRootLock::acquire_within(&root, Duration::from_secs(30)).map(|_| ())
-                })
-            };
-            receiver.recv().unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            let (paused, waiting) = waiting_on_lock(root.path());
+            paused.recv_timeout(Duration::from_secs(30)).expect("startup finds the data root held");
             held.release();
             waiting.join().unwrap().unwrap();
+        }
+
+        /// Startup on another thread, reporting each time it finds the lock held.
+        fn waiting_on_lock(root: &std::path::Path)
+            -> (std::sync::mpsc::Receiver<()>, std::thread::JoinHandle<Result<DataRootLock>>) {
+            let (sender, paused) = std::sync::mpsc::channel();
+            let root = root.to_owned();
+            let waiting = std::thread::spawn(move || DataRootLock::acquire_within(&root, Duration::from_secs(30), &|| {
+                let _ = sender.send(());
+                std::thread::sleep(Duration::from_millis(10));
+            }));
+            (paused, waiting)
         }
     }
 }

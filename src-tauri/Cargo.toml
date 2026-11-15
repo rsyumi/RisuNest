@@ -119,6 +119,7 @@ windows-future = "0.3.2"
 windows = { version = "0.62.2", features = ["Security_Credentials_UI", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_WinRT", "Win32_Graphics_Dwm", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Cryptography",
@@ -152,8 +153,8 @@ dbus = "0.9.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "libc", "objc2-core-foundation", "NSApplication", "NSWorkspace", "NSWindow", "NSView", "NSImageView", "NSImage", "NSColor", "NSRunningApplication", "NSResponder", "NSBox", "NSControl", "NSCell", "NSGraphics"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString", "NSError", "NSArray", "NSDictionary", "NSObject", "NSGeometry", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "block2", "libc", "objc2-core-foundation", "NSAlert", "NSApplication", "NSWorkspace", "NSWindow", "NSView", "NSImageView", "NSImage", "NSColor", "NSRunningApplication", "NSResponder", "NSBox", "NSControl", "NSCell", "NSGraphics"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString", "NSError", "NSArray", "NSDictionary", "NSObject", "NSGeometry", "NSLocale", "objc2-core-foundation"] }
 block2 = "0.6"
 
 [target.'cfg(target_os = "ios")'.dependencies]

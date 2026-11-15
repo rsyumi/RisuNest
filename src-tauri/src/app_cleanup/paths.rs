@@ -19,7 +19,8 @@ pub(super) struct Paths {
 #[derive(Clone, Debug)]
 pub(super) struct DataLink {
     pub link: PathBuf,
-    /// `None` when the link's target is missing.
+    /// `None` when startup refuses the link, for example because its target
+    /// is missing or on a network file system.
     pub target: Option<PathBuf>,
 }
 
@@ -72,7 +73,7 @@ impl Paths {
     pub fn from_manifest(paths: &AppPaths) -> Self {
         let data_link = match crate::app_paths::inspect_data_root(&paths.data_entry) {
             Ok(DataRoot::Linked(target)) => Some(DataLink { link: paths.data_entry.clone(), target: Some(target) }),
-            Ok(DataRoot::Dangling) => Some(DataLink { link: paths.data_entry.clone(), target: None }),
+            Ok(DataRoot::Refused(_)) => Some(DataLink { link: paths.data_entry.clone(), target: None }),
             _ => None,
         };
         let mut owned = paths.owned_roots();

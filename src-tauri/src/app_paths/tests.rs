@@ -1,6 +1,6 @@
 use super::{
     default_install_dirs, is_data_root_entry, overlaps, platform_store_root, relocated_external_storage_path,
-    resolve_platform_root, AppPaths, DesktopProfiles, Hives, Integration, Platform, ProfileBases,
+    resolve_platform_root, AppPaths, DesktopProfiles, Hives, Integration, LinkRefusal, Platform, ProfileBases,
 };
 use crate::launch_profile::ProfileName;
 use crate::asset_repository::{ExactObjectUnlink, PayloadCas};
@@ -582,7 +582,7 @@ fn resolved_root_replaced_by_link_is_rejected_by_cas() {
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 }
 
-fn settled(entry: &Path, create: bool) -> Result<AppPaths, String> {
+fn settled(entry: &Path, create: bool) -> Result<AppPaths, super::DataRootError> {
     AppPaths::isolated(entry.to_owned()).unwrap().settled(Platform::current(), create)
 }
 
@@ -605,7 +605,7 @@ fn a_desktop_data_root_link_leads_to_its_target_and_keeps_its_entry() {
     let paths = settled(&entry, true).unwrap();
     assert_eq!(paths.data_entry, released_root(&entry));
     assert_eq!(fs::canonicalize(&paths.data).unwrap(), fs::canonicalize(&target).unwrap());
-    assert!(!paths.data.to_string_lossy().starts_with(r"\?\"));
+    assert!(!paths.data.to_string_lossy().starts_with(r"\\?\"));
     assert_eq!(paths.logs, paths.data.join("logs"));
     // The CAS rejects every linked component, and still works there.
     let cas = PayloadCas::new(&paths.data).unwrap();
@@ -647,18 +647,45 @@ fn a_data_root_link_whose_target_is_gone_stops_startup_and_creates_nothing() {
     let entry = fixture.path().join("RisuNestData");
     link_directory(&target, &entry);
     fs::remove_dir(&target).unwrap();
-    assert!(settled(&entry, true).unwrap_err().contains("link target is missing"));
+    let error = settled(&entry, true).unwrap_err();
+    assert_eq!(error.refusal, Some(LinkRefusal::TargetMissing));
+    assert!(error.to_string().contains("link target is missing"));
     assert!(!target.exists());
     let cleanup = settled(&entry, false).unwrap();
     assert_eq!(cleanup.data, cleanup.data_entry);
+    // A link to a file is refused the same way.
+    #[cfg(unix)]
+    {
+        fs::write(&target, b"user").unwrap();
+        assert_eq!(settled(&entry, true).unwrap_err().refusal, Some(LinkRefusal::NotDirectory));
+        let cleanup = settled(&entry, false).unwrap();
+        assert_eq!(cleanup.data, cleanup.data_entry);
+        assert_eq!(fs::read(&target).unwrap(), b"user");
+    }
 }
 
 #[cfg(windows)]
 #[test]
 fn a_data_root_link_to_a_network_share_is_refused() {
-    for path in [r"\?\UNC\server\share\RisuNest", r"\server\share\RisuNest"] {
-        assert_eq!(super::local_path(PathBuf::from(path)).unwrap_err().kind(), ErrorKind::InvalidInput);
+    for path in [r"\\?\UNC\server\share\RisuNest", r"\\server\share\RisuNest"] {
+        assert_eq!(super::local_path(PathBuf::from(path)).unwrap(), Err(LinkRefusal::NetworkTarget));
     }
+}
+
+#[test]
+fn network_file_systems_are_told_from_local_ones() {
+    // NFS, SMB, CIFS, SMB2, both AFS, Coda, NCP, Ceph.
+    for magic in [0x6969, 0x517B, 0xFF53_4D42, 0xFE53_4D42, 0x5346_414F, 0x6B41_4653, 0x7375_7245, 0x564C, 0x00C3_6400] {
+        assert!(super::network_file_system(magic), "{magic:#x}");
+    }
+    // ext4, btrfs, XFS, tmpfs, FUSE (ntfs-3g) and 9p (WSL drives) stay usable.
+    for magic in [0xEF53, 0x9123_683E, 0x5846_5342, 0x0102_1994, 0x6573_5546, 0x0102_1997] {
+        assert!(!super::network_file_system(magic), "{magic:#x}");
+    }
+    assert!(super::network_mount_flags(0));
+    assert!(!super::network_mount_flags(0x1000));
+    #[cfg(target_os = "macos")]
+    assert!(!super::network_mount_flags(libc::MNT_LOCAL as u32));
 }
 
 #[test]
@@ -681,7 +708,7 @@ fn stored_external_storage_paths_follow_the_data_root() {
     assert_eq!(relocated_external_storage_path(&current, &root), current);
     #[cfg(windows)]
     assert_eq!(
-        relocated_external_storage_path(Path::new(r"\?\C:\old\RisuNestData\external-storage\captures\a\capture.sqlite"), &root),
+        relocated_external_storage_path(Path::new(r"\\?\C:\old\RisuNestData\external-storage\captures\a\capture.sqlite"), &root),
         current,
     );
     // A path with no such part, or one that climbs out of it, is left for the

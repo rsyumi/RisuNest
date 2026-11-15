@@ -6,6 +6,8 @@ mod app_paths;
 mod desktop_notifications;
 #[cfg(desktop)]
 mod startup_appearance;
+#[cfg(desktop)]
+mod startup_notice;
 mod cleanup_secrets;
 mod device_secrets;
 mod cleanup_webview;
@@ -559,7 +561,8 @@ fn builder_with_main_window(
             // this profile to the running one, so only another profile whose
             // data root leads here can find the lock held.
             #[cfg(desktop)]
-            app.manage(app_cleanup::DataRootLock::acquire(&app_data_dir)?);
+            app.manage(app_cleanup::DataRootLock::acquire(&app_data_dir)
+                .map_err(|error| startup_notice::lock_error(app, error, &app_data_dir))?);
             let _ = native_log::logged_without_detail(
                 "network_log_initialize",
                 network_log::initialize(&app.state::<app_paths::AppPaths>()),
@@ -1202,10 +1205,15 @@ pub fn run() {
     // A data root link whose target is gone stops here rather than starting
     // with an empty store.
     #[cfg(desktop)]
+    let entry = paths.data_entry.clone();
+    #[cfg(desktop)]
     let paths = match paths.prepared() {
         Ok(paths) => paths,
         Err(error) => {
-            native_log::record_startup_failure(&error);
+            native_log::record_startup_failure(&error.to_string());
+            if let Some(refusal) = error.refusal {
+                startup_notice::show(startup_notice::Refusal::Link(refusal), &entry);
+            }
             std::process::exit(1);
         }
     };
@@ -1232,7 +1240,8 @@ pub fn run() {
     {
         builder = builder
             .manage(paths)
-            .manage(launch_profile::LaunchProfile(profile));
+            .manage(launch_profile::LaunchProfile(profile))
+            .manage(startup_notice::Enabled);
     }
     match builder.build(context) {
         Ok(app) => app.run(handle_run_event),
@@ -1250,6 +1259,9 @@ fn exit_on_setup_failure(result: Result<(), Box<dyn std::error::Error>>) -> Resu
     if let Err(error) = &result {
         let message = error.to_string();
         native_log::record_startup_failure(&message);
+        if let Some(refused) = error.downcast_ref::<startup_notice::Refused>() {
+            refused.show();
+        }
         std::process::exit(startup_failure_exit_code(&message));
     }
     result

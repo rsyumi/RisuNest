@@ -167,36 +167,32 @@ impl AppPaths {
     /// one. Kept out of the constructors so the cleanup CLI never creates a
     /// directory it is about to delete.
     #[cfg(desktop)]
-    pub(crate) fn prepared(self) -> Result<Self, String> {
+    pub(crate) fn prepared(self) -> Result<Self, DataRootError> {
         self.settled(Platform::current(), true)
     }
 
     /// The same resolution without creating anything, for the cleanup CLI. A
-    /// link whose target is missing leaves `data` at the link.
+    /// link startup refuses leaves `data` at the link.
     #[cfg(desktop)]
     pub(crate) fn resolved(self) -> Result<Self, String> {
-        self.settled(Platform::current(), false)
+        self.settled(Platform::current(), false).map_err(|error| error.to_string())
     }
 
     /// Settles `data_entry` and follows a link at it. Without such a link both
     /// keep the path every earlier release used: the layout path on Windows and
     /// macOS, and the canonical path on Linux.
     #[cfg_attr(not(desktop), allow(dead_code))]
-    fn settled(mut self, platform: Platform, create: bool) -> Result<Self, String> {
-        let unavailable = |error: std::io::Error| format!("application data root unavailable: {error}");
-        let entry = desktop_data_entry(&self.data_entry, platform, create).map_err(unavailable)?;
-        self.data = match inspect_data_root(&entry).map_err(unavailable)? {
+    fn settled(mut self, platform: Platform, create: bool) -> Result<Self, DataRootError> {
+        let entry = desktop_data_entry(&self.data_entry, platform, create)?;
+        self.data = match inspect_data_root(&entry)? {
             DataRoot::Absent if create && platform == Platform::Linux => {
-                std::fs::create_dir(&entry).map_err(unavailable)?;
+                std::fs::create_dir(&entry)?;
                 entry.clone()
             }
             DataRoot::Absent | DataRoot::Directory => entry.clone(),
             DataRoot::Linked(target) => target,
-            DataRoot::Dangling if create => return Err(unavailable(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Application data root link target is missing",
-            ))),
-            DataRoot::Dangling => entry.clone(),
+            DataRoot::Refused(refusal) if create => return Err(refusal.into()),
+            DataRoot::Refused(_) => entry.clone(),
         };
         self.data_entry = entry;
         self.logs = self.data.join(LOGS_LEAF);
@@ -711,9 +707,62 @@ pub(crate) enum DataRoot {
     Directory,
     /// The entry is a link to this directory, every link in it followed.
     Linked(PathBuf),
-    /// The entry is a link whose target is missing.
-    Dangling,
+    /// The entry is a link startup does not follow.
+    Refused(LinkRefusal),
 }
+
+/// Why startup does not follow a data root link. Cleanup removes such a link
+/// without opening what it leads to, since no data root is kept there.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkRefusal {
+    TargetMissing,
+    /// The store's SQLite WAL mode does not work on a network file system.
+    NetworkTarget,
+    NotDirectory,
+    /// A Windows target whose name has no form without the `\\?\` prefix.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NoPlainPath,
+}
+
+impl std::fmt::Display for LinkRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TargetMissing => "Application data root link target is missing",
+            Self::NetworkTarget => "Application data root link must lead to a local drive",
+            Self::NotDirectory => "Application data root link must lead to a directory",
+            Self::NoPlainPath => "Application data root link target has no plain path",
+        })
+    }
+}
+
+/// Why startup cannot use the desktop data root.
+#[cfg_attr(not(desktop), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct DataRootError {
+    message: String,
+    /// Set when the data root is a link the user has to repair.
+    pub(crate) refusal: Option<LinkRefusal>,
+}
+
+impl From<std::io::Error> for DataRootError {
+    fn from(error: std::io::Error) -> Self {
+        Self { message: error.to_string(), refusal: None }
+    }
+}
+
+impl From<LinkRefusal> for DataRootError {
+    fn from(refusal: LinkRefusal) -> Self {
+        Self { message: refusal.to_string(), refusal: Some(refusal) }
+    }
+}
+
+impl std::fmt::Display for DataRootError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "application data root unavailable: {}", self.message)
+    }
+}
+
+impl std::error::Error for DataRootError {}
 
 /// The entry path of a desktop data root. Linux has always resolved the
 /// aliases above the leaf, so its parent is canonical; Windows and macOS keep
@@ -755,44 +804,91 @@ pub(crate) fn inspect_data_root(entry: &Path) -> std::io::Result<DataRoot> {
         };
     }
     let target = match fs::canonicalize(entry) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DataRoot::Dangling),
-        result => local_path(result?)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DataRoot::Refused(LinkRefusal::TargetMissing)),
+        result => match local_path(result?)? {
+            Ok(target) => target,
+            Err(refusal) => return Ok(DataRoot::Refused(refusal)),
+        },
     };
     if !fs::metadata(&target)?.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Application data root link must lead to a directory"));
+        return Ok(DataRoot::Refused(LinkRefusal::NotDirectory));
     }
     Ok(DataRoot::Linked(target))
 }
 
 /// A canonical Windows path without the `\\?\` prefix, which the WebView, the
 /// renderer and the path checks elsewhere do not expect. A network share is
-/// refused: the store's SQLite WAL mode does not work there.
+/// refused.
 #[cfg(windows)]
-fn local_path(path: PathBuf) -> std::io::Result<PathBuf> {
+fn local_path(path: PathBuf) -> std::io::Result<Result<PathBuf, LinkRefusal>> {
     use std::{io, path::{Component, Prefix}};
     let mut components = path.components();
     let local = match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
-            Prefix::Disk(_) => return Ok(path),
+            Prefix::Disk(_) => return Ok(Ok(path)),
             Prefix::VerbatimDisk(drive) => {
                 let mut local = PathBuf::from(format!("{}:\\", char::from(drive)));
                 local.extend(components.filter(|component| matches!(component, Component::Normal(_))));
                 local
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Application data root link must lead to a local drive")),
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => return Ok(Err(LinkRefusal::NetworkTarget)),
+            Prefix::Verbatim(_) | Prefix::DeviceNS(_) => return Ok(Err(LinkRefusal::NoPlainPath)),
         },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Application data root must be absolute")),
     };
     // A name the plain form cannot express would lead somewhere else.
     if std::fs::canonicalize(&local)? != path {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Application data root link target has no plain path"));
+        return Ok(Err(LinkRefusal::NoPlainPath));
     }
-    Ok(local)
+    Ok(Ok(local))
 }
 
-#[cfg(not(windows))]
-fn local_path(path: PathBuf) -> std::io::Result<PathBuf> {
-    Ok(path)
+/// A target on a network file system is refused.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn local_path(path: PathBuf) -> std::io::Result<Result<PathBuf, LinkRefusal>> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `name` is NUL-terminated and statfs fills `stat` when it succeeds.
+    if unsafe { libc::statfs(name.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statfs succeeded above.
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_os = "macos")]
+    let network = network_mount_flags(stat.f_flags);
+    #[cfg(target_os = "linux")]
+    let network = network_file_system(stat.f_type as u32);
+    Ok(if network { Err(LinkRefusal::NetworkTarget) } else { Ok(path) })
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn local_path(path: PathBuf) -> std::io::Result<Result<PathBuf, LinkRefusal>> {
+    Ok(Ok(path))
+}
+
+/// macOS marks every mount it does not consider local, network shares and
+/// unmarked FUSE mounts alike.
+#[cfg(any(target_os = "macos", test))]
+fn network_mount_flags(flags: u32) -> bool {
+    flags & 0x0000_1000 == 0 // MNT_LOCAL
+}
+
+/// The Linux `statfs` magic numbers of network file systems. FUSE and 9p are
+/// left out because local file systems use them too.
+#[cfg(any(target_os = "linux", test))]
+fn network_file_system(magic: u32) -> bool {
+    matches!(magic,
+        0x6969 // NFS
+        | 0x517B // SMB
+        | 0xFF53_4D42 // CIFS
+        | 0xFE53_4D42 // SMB2
+        | 0x5346_414F | 0x6B41_4653 // AFS
+        | 0x7375_7245 // Coda
+        | 0x564C // NCP
+        | 0x00C3_6400 // Ceph
+    )
 }
 
 /// The main window when startup must build it itself: with the WebView data
