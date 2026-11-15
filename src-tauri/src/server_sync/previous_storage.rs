@@ -71,8 +71,7 @@ impl<'a> PreviousStorage<'a> {
             return Ok(());
         }
         (self.check)()?;
-        let head = client.resolve_identity()?;
-        Residency::open(&self.root)?.retain(client, config, &head, &objects)
+        Residency::open(&self.root)?.retain_current(client, config, &objects)
     }
     fn unavailable(&self, cause: String) -> SyncError {
         if let Err(stopped) = (self.check)() {

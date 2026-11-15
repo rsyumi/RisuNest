@@ -1594,9 +1594,8 @@ impl LwwClient {
                     .or(store.server_stored_config()?)
                     .filter(|config| config.library_id == self.client.config().library_id)
                     .ok_or_else(|| SyncError::new("server-unconfigured", 409))?;
-                let head = self.client.resolve_identity()?;
                 let mut residency = super::residency::Residency::open(store.repository_root())?;
-                residency.retain(&self.client, &config, &head, &missing)?;
+                residency.retain_current(&self.client, &config, &missing)?;
                 let hashes = missing.into_iter().map(|(hash, _)| hash).collect::<Vec<_>>();
                 let sizes = residency.active_sizes(&hashes)?;
                 let objects = hashes.into_iter().zip(sizes).map(|(object_hash, size)| {

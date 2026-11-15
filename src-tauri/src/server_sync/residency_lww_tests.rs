@@ -31,6 +31,60 @@ fn present_bulk_hydration_completes_without_any_body_open_or_hash() {
     assert!(hashes_work.domains.is_empty()); assert!(hashes_work.incomplete.is_empty());
 }
 
+/// Received remote bodies are retained under the epoch this device last confirmed custody
+/// under, so a receive of many pages reads the server head once, and again only when the
+/// server has left that epoch.
+#[test]
+fn received_pages_retain_under_the_confirmed_epoch_and_read_the_head_only_when_it_moved() {
+    use super::lww_tests::{drain_publications, receive_available};
+    use std::sync::atomic::AtomicUsize;
+    let heads = Arc::new(AtomicUsize::new(0));
+    let observed = heads.clone();
+    let server = LocalServerFixture::with_router(move |router| router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let observed = observed.clone();
+            async move {
+                if request.method() == axum::http::Method::GET && request.uri().path().ends_with("/session") {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                }
+                next.run(request).await
+            }
+        },
+    )));
+    let (_a_root, mut a) = local();
+    let (_b_root, mut b) = local();
+    let ca = server.client(&a);
+    let cb = server.client(&b);
+    let publish = |a: &mut PersistentStore, prefix: &str, count: usize| {
+        let hashes = (0..count).map(|index| put_asset(a, &format!("assets/{prefix}-{index}.png"), format!("synthetic {prefix} {index}").as_bytes()).object_hash.unwrap()).collect::<Vec<_>>();
+        drain_publications(&ca, a, &[]).unwrap();
+        hashes
+    };
+    let retained = |b: &PersistentStore, hashes: &[String]| {
+        let sizes = Residency::open(b.repository_root()).unwrap().active_sizes(hashes).unwrap();
+        hashes.iter().zip(sizes).all(|(hash, size)| size.is_some() && b.asset_object_byte_size(hash).unwrap() == size)
+    };
+
+    let first = publish(&mut a, "first", 300);
+    heads.store(0, Ordering::Relaxed);
+    receive_available(&cb, &mut b, &[]).unwrap();
+    assert_eq!(heads.load(Ordering::Relaxed), 1);
+    assert!(retained(&b, &first));
+
+    // Custody this device last confirmed under an epoch the server has since left.
+    let config = b.server_stored_config().unwrap().unwrap();
+    let earlier = Residency::context_id(&config, "an-earlier-epoch");
+    let db = rusqlite::Connection::open(b.repository_root().join("server-sync").join("asset-residency.sqlite")).unwrap();
+    db.execute("INSERT INTO contexts VALUES(?1,?2,?3,'an-earlier-epoch',?4)", rusqlite::params![earlier, config.library_id, config.device_id, serde_json::to_string(&config).unwrap()]).unwrap();
+    db.execute("INSERT INTO objects SELECT ?1,hash,size,retention_id,'active',(SELECT MAX(confirmation_order)+1 FROM objects) FROM objects LIMIT 1", [&earlier]).unwrap();
+    drop(db);
+    let second = publish(&mut a, "second", 3);
+    heads.store(0, Ordering::Relaxed);
+    receive_available(&cb, &mut b, &[]).unwrap();
+    assert_eq!(heads.load(Ordering::Relaxed), 1);
+    assert!(retained(&b, &second));
+}
+
 #[test]
 fn server_hydration_prepares_downloaded_bodies_with_four_joined_workers() {
     use crate::asset_repository::body_io;
