@@ -350,10 +350,10 @@ fn erase_with(paths: &Paths, request: &mut Request,
     let release = || -> Result<()> { Ok(()) };
     remove_secrets(&paths.data)?;
     begin_roots(paths, request)?;
-    // The data root goes after the other roots and its lock file after the
-    // rest of it, so that a profile whose data root leads to the same
-    // directory cannot start while any of it is left.
-    let data_root = paths.data_link.is_none() && paths.roots.contains(&paths.data);
+    // On desktop the data root goes after the other roots and its lock file
+    // after the rest of it, so that a profile whose data root leads to the
+    // same directory cannot start while any of it is left.
+    let data_root = cfg!(desktop) && paths.data_link.is_none() && paths.roots.contains(&paths.data);
     for root in paths.roots.iter().filter(|root| !data_root || **root != paths.data) { remove_root(root)?; }
     match &paths.data_link {
         // A reset keeps the link, so the relaunched app goes on using its target.
@@ -378,17 +378,29 @@ impl DataRootLock {
     }
 
     fn acquire_within(root: &std::path::Path, timeout: Duration) -> Result<Self> {
-        fs::create_dir_all(root).map_err(|error| failed("data-root-lock-unavailable", error))?;
-        let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
-            .open(root.join(crate::app_paths::DATA_ROOT_LOCK)).map_err(|error| failed("data-root-lock-unavailable", error))?;
+        let lock = root.join(crate::app_paths::DATA_ROOT_LOCK);
+        let unavailable = |error: std::io::Error| failed("data-root-lock-unavailable", error);
         let deadline = Instant::now() + timeout;
         loop {
-            match fs2::FileExt::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Self(std::sync::Mutex::new(Some(file)))),
-                Err(error) if contended(&error) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-                Err(error) if contended(&error) => return Err("data-root-in-use".into()),
-                Err(error) => return Err(failed("data-root-lock-unavailable", error)),
+            fs::create_dir_all(root).map_err(unavailable)?;
+            let file = match fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock) {
+                Ok(file) => file,
+                // Cleanup can remove the directory again right after it is created.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => continue,
+                Err(error) => return Err(unavailable(error)),
+            };
+            loop {
+                match fs2::FileExt::try_lock_exclusive(&file) {
+                    Ok(()) => break,
+                    Err(error) if contended(&error) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                    Err(error) if contended(&error) => return Err("data-root-in-use".into()),
+                    Err(error) => return Err(unavailable(error)),
+                }
             }
+            // Cleanup deletes the lock file while holding it, so an instance
+            // that waited on it is granted a lock no other instance can find.
+            if names_file(&lock, &file).map_err(unavailable)? { return Ok(Self(std::sync::Mutex::new(Some(file)))); }
+            if Instant::now() >= deadline { return Err("data-root-in-use".into()); }
         }
     }
 
@@ -417,7 +429,10 @@ impl DataRootHold {
             Err(error) => return Err(failed("cleanup-lock-unavailable", error)),
         };
         match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(Some(Self { lock, file })),
+            Ok(()) if names_file(&lock, &file).map_err(|error| failed("cleanup-lock-unavailable", error))? =>
+                Ok(Some(Self { lock, file })),
+            // Another cleanup deleted the lock file while it held it.
+            Ok(()) => Err("cleanup-data-root-in-use".into()),
             Err(error) if contended(&error) => Err("cleanup-data-root-in-use".into()),
             Err(error) => Err(failed("cleanup-lock-unavailable", error)),
         }
@@ -430,6 +445,37 @@ impl DataRootHold {
             _ => { drop(self.file); Ok(()) }
         }
     }
+}
+
+/// Whether `path` still names the file `file` has open.
+#[cfg(desktop)]
+fn names_file(path: &std::path::Path, file: &fs::File) -> std::io::Result<bool> {
+    let current = match fs::File::open(path) {
+        Ok(current) => current,
+        // Windows refuses to open a file deleted while a handle keeps it.
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(file_identity(file)? == file_identity(&current)?)
+}
+
+#[cfg(all(desktop, unix))]
+fn file_identity(file: &fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(file: &fs::File) -> std::io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((u64::from(information.dwVolumeSerialNumber),
+        u64::from(information.nFileIndexHigh) << 32 | u64::from(information.nFileIndexLow)))
 }
 
 /// The effects of a desktop cleanup outside the profile directories.
@@ -1254,6 +1300,26 @@ mod tests {
             }
             assert!(!data.exists());
             assert_eq!(fs::read_dir(&target).unwrap().map(|entry| entry.unwrap().file_name()).collect::<Vec<_>>(), vec!["notes.txt"]);
+        }
+
+        #[test]
+        fn an_instance_waiting_through_cleanup_holds_the_lock_on_the_data_root_it_finds() {
+            let root = tempfile::tempdir().unwrap();
+            let hold = DataRootHold::take(root.path()).unwrap().unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let waiting = {
+                let root = root.path().to_owned();
+                std::thread::spawn(move || {
+                    sender.send(()).unwrap();
+                    DataRootLock::acquire_within(&root, Duration::from_secs(30))
+                })
+            };
+            receiver.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            hold.release().unwrap();
+            let started = waiting.join().unwrap().unwrap();
+            assert_eq!(DataRootLock::acquire_within(root.path(), Duration::ZERO).err().as_deref(), Some("data-root-in-use"));
+            drop(started);
         }
 
         #[test]
