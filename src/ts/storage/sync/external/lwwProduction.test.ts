@@ -160,10 +160,13 @@ describe('external sync asset downloads', () => {
         await requestExternalLwwNow('sync'); await settle()
         expect(fixture.download).toHaveBeenCalledTimes(2)
     })
-    it('keeps a download stopped on another storage sign-in until that storage signs in again', async () => {
-        const storages = (sync: string, other: string) => ({ connections: [
+    it.each([
+        ['signs in again', '2'],
+        ['is removed', undefined],
+    ] as const)('keeps a download stopped on another storage sign-in until that storage %s', async (_, renewed) => {
+        const storages = (sync: string, other: string | undefined) => ({ connections: [
             { id: 'sync', providerId: 'webdav', purpose: 'sync', status: 'ready', lastVerifiedAtMs: sync },
-            { id: 'drive-2', providerId: 'google_drive', purpose: 'backup', status: 'ready', lastVerifiedAtMs: other },
+            ...other === undefined ? [] : [{ id: 'drive-2', providerId: 'google_drive', purpose: 'backup', status: 'ready', lastVerifiedAtMs: other }],
         ] } as unknown as ExternalStorageState)
         const refused = { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }
         fixture.download.mockRejectedValueOnce(refused)
@@ -177,7 +180,7 @@ describe('external sync asset downloads', () => {
         expect(fixture.download).toHaveBeenCalledOnce()
         expect(failures.get('sync')).toEqual(refused)
 
-        await refreshExternalLwwAdapters(storages('2', '2')); await settle()
+        await refreshExternalLwwAdapters(storages('2', renewed)); await settle()
         expect(fixture.download).toHaveBeenCalledTimes(2)
         expect(failures.has('sync')).toBe(false)
         unsubscribe()

@@ -342,13 +342,14 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
     const recovered = new Set<Adapter>()
     for (const [id, adapter] of adapters) if (!sync.has(id)) adapter.dispose()
     for (const id of sync) if (!adapters.has(id)) adapters.set(id, createAdapter(id))
-    // The verified time changes when a sign-in, key or address is renewed, which a sync failure leaves unmarked.
+    // The verified time changes when a sign-in, key or address is renewed, which a sync failure leaves unmarked. A
+    // removed connection can no longer be signed in, so the stops it caused clear as well.
     const recoveries = new Map(state.connections.map(connection => [connection.id, JSON.stringify([connection.status, connection.lastError, connection.lastVerifiedAtMs])]))
     for (const adapter of adapters.values()) {
         const previous = adapter.recoveries
         adapter.recoveries = recoveries
         if (!previous) continue
-        const renewed = new Set([...recoveries].filter(([id, recovery]) => previous.has(id) && previous.get(id) !== recovery).map(([id]) => id))
+        const renewed = new Set([...previous].filter(([id, recovery]) => recoveries.get(id) !== recovery).map(([id]) => id))
         if (renewed.size && adapter.recover(renewed)) recovered.add(adapter)
     }
     const binding = await native.state()
