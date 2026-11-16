@@ -24,7 +24,7 @@
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { language } from 'src/lang'
-    import { externalJobIsActive, externalJobIsPaused, externalJobProgress, externalRenewalConnection, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
+    import { externalJobFixedOn, externalJobIsActive, externalJobIsPaused, externalJobProgress, externalRenewalConnection, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
     import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
     import {
         refreshExternalStorageProductionState,
@@ -321,13 +321,13 @@
         schedulePoll()
         if (addressChanged) return
         if (renewed) {
-            const job = activeJob(result.connection)
-            if (job && externalJobIsPaused(job)) await resumeJob(result.connection, job)
             // Sync stopped on the failed sign-in; it runs now instead of at its next retry.
             const selection = storageState?.selection
             if (selection?.kind === 'external' && selection.connectionId === result.connection.id) {
                 void requestExternalLwwNow(result.connection.id).catch(() => {}).finally(() => refresh(true))
             }
+            // A resumed backup runs until it ends, so the sync above does not wait for it.
+            await resumeJobsWaitingOn(result.connection.id)
         } else if (result.connection.purpose === 'sync') {
             if (recoveryKey) pendingSyncStart = result.connection
             else await startSync(result.connection)
@@ -530,8 +530,15 @@
             await refresh(true)
         } catch (reason) { error = externalErrorMessage(strings, reason) }
         finally { busy = false }
-        const job = activeJob(connection)
-        if (!unlockConnection && job && externalJobIsPaused(job)) await resumeJob(connection, job)
+        if (!unlockConnection) await resumeJobsWaitingOn(connection.id)
+    }
+
+    /** Resumes the paused jobs this connection's sign-in or key clears: its own, and those that read through it. */
+    async function resumeJobsWaitingOn(connectionId: string): Promise<void> {
+        for (const connection of storageState?.connections ?? []) {
+            const job = activeJob(connection)
+            if (job && externalJobIsPaused(job) && externalJobFixedOn(job) === connectionId) await resumeJob(connection, job)
+        }
     }
 
 
@@ -797,6 +804,15 @@
         return strings.cancelled
     }
 
+    /** A job's sentence on its card, naming the connection to sign in to or unlock when the job waits on another one. */
+    function jobLabelFor(connection: ExternalConnectionSummary, job: ExternalJobSummary): string {
+        const fixedOn = externalJobFixedOn(job)
+        if (fixedOn === connection.id) return jobLabel(job)
+        const other = storageState?.connections.find(item => item.id === fixedOn)
+        if (!other) return strings.failed
+        return (job.error?.action === 'unlock-key' ? strings.unlockKeyOther : strings.reauthenticateOther).replace('{0}', externalConnectionTitle(strings, other))
+    }
+
     function errorLabel(value?: ExternalJobSummary['error']): string {
         return externalErrorLabel(strings, value)
     }
@@ -957,10 +973,11 @@
             {@const ProviderIcon = providerIcon(connection.providerId)}
             {@const badge = connectionBadge(connection)}
             {@const failure = syncFailureFor(connection.id)}
-            {@const renewable = connection.status === 'reauth-required' || job?.error?.action === 'reauthenticate' || externalRenewalConnection(failure, connection.id) !== undefined}
-            {@const lockable = connection.status === 'key-locked' || job?.error?.action === 'unlock-key'}
+            {@const ownError = !job || externalJobFixedOn(job) === connection.id}
+            {@const renewable = connection.status === 'reauth-required' || (ownError && job?.error?.action === 'reauthenticate') || externalRenewalConnection(failure, connection.id) !== undefined}
+            {@const lockable = connection.status === 'key-locked' || (ownError && job?.error?.action === 'unlock-key')}
             {@const recheckable = job?.state === 'uncertain' && job.kind === 'backup'}
-            {@const retryable = !!job && externalJobIsPaused(job) && ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '') && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}
+            {@const retryable = !!job && externalJobIsPaused(job) && (!ownError || ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '')) && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}
             {@const remedy = renewable || lockable || recheckable || retryable}
             {@const syncTarget = storageState.selection.kind === 'external' && storageState.selection.connectionId === connection.id}
             {@const syncing = syncTarget && !!syncRunning[connection.id]}
@@ -989,7 +1006,7 @@
                         </div>
                     {/if}
                 {/if}
-                {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError && !unfinishedRestore(job)}<SettingNotice role="status" tone={job.state === 'cancelled' && !job.stoppedByApp ? 'info' : 'danger'} text={jobLabel(job)} />{/if}
+                {#if job && (!externalJobIsActive(job) || externalJobIsPaused(job)) && job.state !== 'succeeded' && !connection.lastError && !unfinishedRestore(job)}<SettingNotice role="status" tone={job.state === 'cancelled' && !job.stoppedByApp ? 'info' : 'danger'} text={jobLabelFor(connection, job)} />{/if}
 
                 {#if unfinishedRestore(job)}
                     <SettingNotice role="status" text={strings.restoreUnfinished} />

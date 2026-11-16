@@ -132,6 +132,11 @@ export function externalRenewalConnection(value: unknown, connectionId: string):
     return typeof named === 'string' && named ? named : connectionId
 }
 
+/** The connection whose sign-in or key clears a job's error: the one the error names, or the job's own. */
+export function externalJobFixedOn(job: ExternalJobSummary): string {
+    return job.error?.connectionId || job.connectionId
+}
+
 export function externalJobIsPaused(job: ExternalJobSummary): boolean {
     return job.state === 'waiting'
         && job.phase === 'paused'

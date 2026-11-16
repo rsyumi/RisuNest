@@ -118,6 +118,9 @@ export type ExternalProviderSecretInput =
     | { kind: 'gitlab'; token: string }
 
 export interface ExternalConnectionError {
+    /** The connection whose sign-in or key clears this error, when an operation hit it reading through a connection
+     * other than its own. */
+    connectionId?: string
     detail?: string
     httpStatus?: number
     code: string

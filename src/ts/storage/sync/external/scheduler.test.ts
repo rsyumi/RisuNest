@@ -327,16 +327,23 @@ describe('external storage scheduler', () => {
         expect(request).toHaveBeenCalledTimes(1)
     })
 
-    it('resumes a remediation-blocked latest target only after verified recovery', async () => {
+    it.each([
+        ['its own connection', { reason: 'reauthRequired' }, 'destination-1'],
+        // A backup reads an asset through the storage connection that holds it.
+        ['the connection its read was refused by', { reason: 'reauthRequired', error: {
+            code: 'reauthRequired', message: '', retryable: false, action: 'reauthenticate', connectionId: 'drive-2',
+        } }, 'drive-2'],
+    ] as const)('resumes a remediation-blocked latest target only after verified recovery of %s', async (_, blocked, recovers) => {
         const { scheduler, request } = harness()
-        request.mockResolvedValueOnce({ kind: 'blocked', reason: 'reauthRequired' } as never)
+        request.mockResolvedValueOnce({ kind: 'blocked', ...blocked } as never)
         scheduler.durableRevision('1')
         await vi.advanceTimersByTimeAsync(60_000)
         scheduler.durableRevision('9')
         scheduler.resume()
+        scheduler.recovered('unrelated')
         await vi.advanceTimersByTimeAsync(300_000)
         expect(request).toHaveBeenCalledTimes(1)
-        scheduler.recovered('destination-1')
+        scheduler.recovered(recovers)
         await vi.advanceTimersByTimeAsync(0)
         expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ targetRevision: '9' }))
         scheduler.stop()

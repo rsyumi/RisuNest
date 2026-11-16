@@ -98,7 +98,7 @@ import { alertConfirm, alertCheckboxConfirm } from 'src/ts/alert'
 import { language } from 'src/lang'
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
 import { refreshExternalStorageProductionState, requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory, requestExternalStorageRestore, stopExternalStorageRestore } from 'src/ts/storage/sync/external/production'
-import { externalErrorMessage, externalStorageStrings } from './strings'
+import { externalConnectionTitle, externalErrorMessage, externalStorageStrings } from './strings'
 import { externalSyncFailureText } from 'src/ts/storage/sync/syncStatusView'
 import type { ExternalConnectionSummary } from 'src/ts/storage/sync/external/types'
 import { notifySyncBindingChanged } from 'src/ts/storage/sync/bindingChanges'
@@ -1608,10 +1608,10 @@ describe('restoring access to a connection', () => {
     const syncConnection = () => ({ ...connection(10, 30), purpose: 'sync' as const, strategy: 'sequential' as const })
     const button = (label: string) => [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === label)
     const form = () => state.form as undefined | { renewalConnection?: { id: string }; oncancel(): void; onconnected(result: unknown): Promise<void> }
-    type SyncConnection = Omit<ReturnType<typeof syncConnection>, 'status'> & { status: ExternalConnectionSummary['status'] }
-    const view = (value: SyncConnection = syncConnection(), others: object[] = []) => ({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [value, ...others], jobs: [] })
-    async function show(value: SyncConnection = syncConnection(), others: object[] = []): Promise<void> {
-        state.getState.mockResolvedValue(view(value, others))
+    type SyncConnection = Omit<ReturnType<typeof syncConnection>, 'status' | 'purpose'> & Pick<ExternalConnectionSummary, 'status' | 'purpose'>
+    const view = (value: SyncConnection = syncConnection(), others: object[] = [], jobs: object[] = []) => ({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [value, ...others], jobs })
+    async function show(value: SyncConnection = syncConnection(), others: object[] = [], jobs: object[] = []): Promise<void> {
+        state.getState.mockResolvedValue(view(value, others, jobs))
         state.listHistory.mockResolvedValue({ items: [] })
         target = document.createElement('div')
         document.body.append(target)
@@ -1690,6 +1690,43 @@ describe('restoring access to a connection', () => {
         expect(other.textContent).toContain(externalSyncFailureText(strings, refused))
         renew(other)!.click(); await settle()
         expect(form()?.renewalConnection?.id).toBe('drive-2')
+    })
+
+    it.each([
+        ['signs in again', { code: 'reauthRequired', action: 'reauthenticate' }, 'reauth-required', 'reauthenticateOther', 'statusReauth'],
+        ['takes its recovery key', { code: 'repositoryKeyUnavailable', action: 'unlock-key' }, 'key-locked', 'unlockKeyOther', 'statusLocked'],
+    ] as const)('shows a backup a read through another storage stopped and resumes it once that storage %s', async (_, cause, status, notice, badge) => {
+        // The storage the backup read through is the sync connection here, so its renewal also syncs.
+        const refused = { ...cause, message: '', retryable: false, connectionId: 'connection-1' }
+        const drive = { ...syncConnection(), displayName: 'Drive', status, lastError: refused }
+        const job = { id: 'paused', connectionId: 'backup-2', kind: 'backup', state: 'waiting', phase: 'paused', reason: 'automatic',
+            completedBytes: '4', totalBytes: '10', completedItems: '1', startedAtMs: '1', updatedAtMs: '1', error: refused }
+        // A resumed backup runs on long after the sign-in.
+        vi.mocked(resumeExternalStorageJob).mockReturnValue(new Promise(() => {}))
+        await show(drive, [{ ...connection(10, 30), id: 'backup-2', displayName: 'Backup' }], [job])
+        const [other, backup] = [...target.querySelectorAll('article.card')]
+        const labels = (card: Element) => [...card.querySelectorAll('button')].map(item => item.textContent?.trim())
+        const press = (card: Element, label: string) => [...card.querySelectorAll('button')].find(item => item.textContent?.trim() === label)!.click()
+        expect(backup.textContent).toContain(strings[notice].replace('{0}', externalConnectionTitle(strings, drive)))
+        expect(backup.textContent).not.toContain(externalErrorMessage(strings, refused))
+        expect(labels(backup)).toContain(strings.retryAction)
+        expect(labels(backup)).not.toContain(strings.renew)
+        expect(labels(backup)).not.toContain(strings.unlock)
+        expect(other.querySelector('.card-status')?.textContent).toBe(strings[badge])
+
+        if (cause.action === 'reauthenticate') {
+            press(other, strings.renew); await settle()
+            expect(form()?.renewalConnection?.id).toBe('connection-1')
+            void form()!.onconnected({ connection: drive }); await settle()
+            expect(state.syncNow).toHaveBeenCalledExactlyOnceWith('connection-1')
+        } else {
+            press(other, strings.unlock); await settle()
+            const field = other.querySelector<HTMLInputElement>('.unlock-field input')!
+            field.value = 'synthetic-recovery'; field.dispatchEvent(new Event('input', { bubbles: true })); await settle()
+            press(other, strings.unlock); await settle()
+            expect(state.unlockConnection).toHaveBeenCalledExactlyOnceWith('connection-1', 'synthetic-recovery')
+        }
+        expect(resumeExternalStorageJob).toHaveBeenCalledExactlyOnceWith(job)
     })
 
     it('reads the history again once the recovery key unlocks the connection', async () => {
