@@ -800,6 +800,13 @@ describe('external storage production integration', () => {
             await refreshExternalStorageProductionState()
             await vi.advanceTimersByTimeAsync(60_000)
             expect(started('old-sync')).toBe(2)
+
+            // A storage that signed in again backs up its own changes too.
+            const before = started('drive-2')
+            mocks.revision = 10
+            mocks.listener?.(10)
+            await vi.advanceTimersByTimeAsync(60_000)
+            expect(started('drive-2') > before).toBe(after.length > 0)
         } finally {
             vi.useRealTimers()
         }
