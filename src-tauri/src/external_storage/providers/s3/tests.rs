@@ -1623,6 +1623,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
                     oauth_error: None,
                     oauth_error_description: None,
                     cause: Default::default(),
+                    connection_id: None,
                 },
             ),
             (
@@ -1636,6 +1637,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
                     oauth_error: None,
                     oauth_error_description: None,
                     cause: Default::default(),
+                    connection_id: None,
                 },
             ),
             (
@@ -1649,6 +1651,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
                     oauth_error: None,
                     oauth_error_description: None,
                     cause: Default::default(),
+                    connection_id: None,
                 },
             ),
             (
@@ -1662,6 +1665,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
                     oauth_error: None,
                     oauth_error_description: None,
                     cause: Default::default(),
+                    connection_id: None,
                 },
             ),
             (
@@ -1675,6 +1679,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
                     oauth_error: None,
                     oauth_error_description: None,
                     cause: Default::default(),
+                    connection_id: None,
                 },
             ),
             (
@@ -1688,6 +1693,7 @@ fn documented_failure_statuses_map_to_provider_kinds_without_a_server_message() 
                     oauth_error: None,
                     oauth_error_description: None,
                     cause: Default::default(),
+                    connection_id: None,
                 },
             ),
         ] {

@@ -427,6 +427,7 @@ pub(super) fn classify(
                 oauth_error: None,
                 oauth_error_description: None,
                 cause: Default::default(),
+                connection_id: None,
             };
         }
     }
@@ -438,6 +439,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         422 => ProviderError {
             kind: ErrorKind::PreconditionFailed,
@@ -446,6 +448,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         _ => common::classify_status(status, headers, now_ms),
     }

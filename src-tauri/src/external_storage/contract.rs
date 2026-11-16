@@ -76,6 +76,10 @@ pub(crate) struct ProviderError {
     /// A redacted cause shared by command replies, job failures and device logs.
     #[serde(default, rename = "detail", skip_serializing_if = "ErrorCause::is_none")]
     pub cause: ErrorCause,
+    /// The storage connection whose sign-in, key or address has to be fixed, for a
+    /// failure an operation hit reading through a connection other than its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
 }
 /// Diagnostic wording does not change an error's classification or equality.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -99,6 +103,7 @@ impl ProviderError {
             oauth_error: None,
             oauth_error_description: None,
             cause: ErrorCause::default(),
+            connection_id: None,
         }
     }
     /// Retains the failure reason without credentials or signed URL parameters.

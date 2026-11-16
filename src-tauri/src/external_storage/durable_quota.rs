@@ -150,6 +150,7 @@ impl MyboxBudget {
                         oauth_error: None,
                         oauth_error_description: None,
                         cause: Default::default(),
+                        connection_id: None,
                     };
                     if denied.as_ref().is_none_or(|previous| previous.retry_at_ms < error.retry_at_ms) {
                         denied = Some(error);

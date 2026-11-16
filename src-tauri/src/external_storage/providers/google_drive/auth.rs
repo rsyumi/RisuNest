@@ -196,6 +196,7 @@ async fn post_token(
             oauth_error,
             oauth_error_description,
             cause: Default::default(),
+            connection_id: None,
         });
     }
     Err(wire::classify(&mut response, dependencies.clock.now_ms(), cancel).await)
