@@ -88,6 +88,8 @@
     let historyError = $state<Record<string, string>>({})
     /** Cards whose history was read once, so a failing remote is not read again on every poll. */
     const historyRequested = new Set<string>()
+    /** Connections asked for a fresh history read while one ran. */
+    const historyReread = new Set<string>()
     let historyCursor = $state<Record<string, string | undefined>>({})
     let historyLoading = $state<Record<string, boolean>>({})
     let quota = $state<Record<string, ExternalQuotaSummary>>({})
@@ -579,7 +581,11 @@
 
 
     async function loadHistory(connection: ExternalConnectionSummary, append: boolean): Promise<void> {
-        if (historyLoading[connection.id]) return
+        if (historyLoading[connection.id]) {
+            // The read running may predate what this one follows, such as a renewed sign-in, so it reads once more.
+            if (!append) historyReread.add(connection.id)
+            return
+        }
         historyLoading[connection.id] = true
         try {
             let items = append ? history[connection.id] ?? [] : []
@@ -601,6 +607,8 @@
             historyError[connection.id] = externalErrorMessage(strings, reason)
         } finally {
             historyLoading[connection.id] = false
+            const latest = historyReread.delete(connection.id) ? storageState?.connections.find(item => item.id === connection.id) : undefined
+            if (latest) void loadHistory(latest, false)
         }
     }
 

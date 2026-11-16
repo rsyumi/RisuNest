@@ -1660,6 +1660,22 @@ describe('restoring access to a connection', () => {
         expect(target.textContent).toContain(strings.noSyncHistory)
     })
 
+    it('reads the history again when the read that ran during the sign-in fails after it', async () => {
+        state.failures.set('connection-1', { kind: 'reauthRequired' })
+        const refused = { kind: 'unauthorized', status: 401 }
+        let fail!: () => void
+        state.listHistory.mockImplementationOnce(() => new Promise((_, reject) => { fail = () => reject(refused) }))
+        await show()
+        button(strings.renew)!.click(); await settle()
+        await form()!.onconnected({ connection: syncConnection() }); await settle()
+        expect(state.listHistory).toHaveBeenCalledOnce()
+
+        fail(); await settle()
+        expect(state.listHistory).toHaveBeenCalledTimes(2)
+        expect(target.textContent).not.toContain(externalErrorMessage(strings, refused))
+        expect(target.textContent).toContain(strings.noSyncHistory)
+    })
+
     it('reads the history again once the recovery key unlocks the connection', async () => {
         const locked = { kind: 'repositoryKeyUnavailable', action: 'unlock-key' }
         state.listHistory.mockRejectedValueOnce(locked)
