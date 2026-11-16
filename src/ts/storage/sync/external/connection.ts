@@ -124,6 +124,14 @@ export function externalNeedsRenewal(value: unknown): boolean {
     return ['reauthRequired', 'unauthorized', EXTERNAL_ASSET_REAUTH_CODE].includes(externalErrorKind(value) ?? '')
 }
 
+/** The connection that has to sign in again, or take a new key, to clear a failure `connectionId` reported. An
+ * asset download reads every connection that holds a body, so its failure names the one that refused. */
+export function externalRenewalConnection(value: unknown, connectionId: string): string | undefined {
+    if (!externalNeedsRenewal(value)) return undefined
+    const named = (value as { connectionId?: unknown }).connectionId
+    return typeof named === 'string' && named ? named : connectionId
+}
+
 export function externalJobIsPaused(job: ExternalJobSummary): boolean {
     return job.state === 'waiting'
         && job.phase === 'paused'

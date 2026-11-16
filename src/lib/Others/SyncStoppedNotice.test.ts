@@ -86,9 +86,11 @@ it('leaves the stop to the plugin notice while plugins wait and omits the open s
 })
 
 it.each([
-    ['is marked', { status: 'reauth-required', lastError: { code: 'unauthorized', message: '', retryable: false, action: 'reauthenticate' } }, undefined],
-    ['failed a sync', { status: 'ready' }, { kind: 'reauthRequired' }],
-] as const)('offers to sign in again when an external connection %s for it', async (_, state, failure) => {
+    ['is marked', { status: 'reauth-required', lastError: { code: 'unauthorized', message: '', retryable: false, action: 'reauthenticate' } }, undefined, 'webdav-1'],
+    ['failed a sync', { status: 'ready' }, { kind: 'reauthRequired' }, 'webdav-1'],
+    // An asset download reads every storage connection that holds a body and names the one that refused.
+    ['failed an asset download through another storage', { status: 'ready' }, { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }, 'drive-2'],
+] as const)('offers to sign in again when an external connection %s for it', async (_, state, failure, target) => {
     const strings = externalStorageStrings('en')
     component = mount(SyncStoppedNotice, { target: document.body })
     const connection = { id: 'webdav-1', purpose: 'sync', ...state } as Partial<ExternalConnectionSummary> as ExternalConnectionSummary
@@ -99,7 +101,7 @@ it.each([
     expect(buttons.map(button => button.getAttribute('aria-label') ?? button.textContent?.trim())).toEqual([language.close, strings.renew])
 
     buttons[1].click(); await tick()
-    expect(get(externalRenewalRequest)).toBe('webdav-1')
+    expect(get(externalRenewalRequest)).toBe(target)
     expect([get(settingsOpen), get(SettingsMenuIndex), get(risuNestSettingsTabRequest)]).toEqual([true, 17, 'sync'])
 
     // The form takes the place the notice covers; closing it with sync still stopped brings the notice back.

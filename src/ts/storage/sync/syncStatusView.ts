@@ -1,6 +1,6 @@
 import { language } from 'src/lang'
 import { externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
-import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal } from './external/connection'
+import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal, externalRenewalConnection } from './external/connection'
 import type { ExternalOperationProgress } from './external/progress'
 import type { ExternalConnectionSummary, ExternalJobSummary } from './external/types'
 import { formatLevelLabel, registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
@@ -68,13 +68,17 @@ export function externalSyncStatusView(
     return { label: strings.statusReady, tone: 'connected', stopped: false }
 }
 
-/** The bound external connection that has to sign in again, or take a new key, before sync continues. */
+/** The external connection that has to sign in again, or take a new key, before sync continues: the bound one,
+ * or another storage connection an asset download read through. */
 export function externalRenewalTarget(source: SyncStatusSource | null | undefined, failure?: unknown): string | undefined {
     if (source?.target !== 'external') return undefined
     const { connection } = source
-    const renew = connection.status === 'reauth-required'
-        || [connection.lastError, source.job?.error, source.failure, failure].some(externalNeedsRenewal)
-    return renew ? connection.id : undefined
+    if (connection.status === 'reauth-required') return connection.id
+    for (const value of [connection.lastError, source.job?.error, source.failure, failure]) {
+        const target = externalRenewalConnection(value, connection.id)
+        if (target) return target
+    }
+    return undefined
 }
 
 /** The external card's sentence for a connection or job error. */

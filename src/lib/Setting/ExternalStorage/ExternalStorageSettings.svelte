@@ -24,7 +24,7 @@
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { language } from 'src/lang'
-    import { externalJobIsActive, externalJobIsPaused, externalJobProgress, externalNeedsRenewal, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
+    import { externalJobIsActive, externalJobIsPaused, externalJobProgress, externalRenewalConnection, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
     import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
     import {
         refreshExternalStorageProductionState,
@@ -834,9 +834,23 @@
         return connection.purpose === 'sync' && selection?.kind === 'external' && selection.connectionId === connection.id && !syncRunning[connection.id]
     }
 
+    /** This connection's sync failure, or one another connection's sync hit signing in to this one. */
+    function syncFailureFor(connectionId: string): unknown {
+        if (syncFailures.has(connectionId)) return syncFailures.get(connectionId)
+        for (const [owner, failure] of syncFailures) if (owner !== connectionId && externalRenewalConnection(failure, owner) === connectionId) return failure
+        return undefined
+    }
+
+    /** The connection a card's renewal signs in: its own, or the storage its sync stopped on. */
+    function renewalFor(connection: ExternalConnectionSummary, job: ExternalJobSummary | undefined): ExternalConnectionSummary | undefined {
+        if (connection.status === 'reauth-required' || job?.error?.action === 'reauthenticate') return connection
+        const target = externalRenewalConnection(syncFailureFor(connection.id), connection.id)
+        return target === connection.id ? connection : storageState?.connections.find(item => item.id === target)
+    }
+
     // The status button shows the same badge, so the mapping lives with the sync status view.
     function connectionBadge(connection: ExternalConnectionSummary) {
-        return externalSyncStatusView(strings, connection, activeJob(connection), externalProgressFor(progress, connection.id), syncStopped(connection), syncCatchingUp.has(connection.id), syncFailures.get(connection.id))
+        return externalSyncStatusView(strings, connection, activeJob(connection), externalProgressFor(progress, connection.id), syncStopped(connection), syncCatchingUp.has(connection.id), syncFailureFor(connection.id))
     }
 
     // A backup registers each pack as it seals it, so its upload has no total until it ends.
@@ -947,7 +961,8 @@
             {@const job = activeJob(connection)}
             {@const ProviderIcon = providerIcon(connection.providerId)}
             {@const badge = connectionBadge(connection)}
-            {@const renewable = connection.status === 'reauth-required' || job?.error?.action === 'reauthenticate' || externalNeedsRenewal(syncFailures.get(connection.id))}
+            {@const renewal = renewalFor(connection, job)}
+            {@const renewable = renewal !== undefined}
             {@const lockable = connection.status === 'key-locked' || job?.error?.action === 'unlock-key'}
             {@const recheckable = job?.state === 'uncertain' && job.kind === 'backup'}
             {@const retryable = !!job && externalJobIsPaused(job) && ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '') && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}
@@ -1021,7 +1036,7 @@
                         <SettingToggle showLabel label={strings.makeSyncTarget} disabled={busy} checked={syncRequest[connection.id] ?? syncing} onchange={enabled => setSyncBinding(connection, enabled)} />
                     {/if}
                     <div class="actions">
-                        {#if renewable}<SettingButton disabled={busy} onclick={() => renewalConnection = connection}>{strings.renew}</SettingButton>{/if}
+                        {#if renewable}<SettingButton disabled={busy} onclick={() => renewalConnection = renewal}>{strings.renew}</SettingButton>{/if}
                         {#if lockable}<SettingButton disabled={busy} onclick={() => unlockConnection = connection}>{strings.unlock}</SettingButton>{/if}
                         {#if recheckable && job}<SettingButton disabled={busy} onclick={() => resumeJob(connection, job)}>{strings.recheckPublication}</SettingButton>{/if}
                         {#if retryable && job}<SettingButton disabled={busy || Number(job.error?.retryAtMs ?? 0) > Date.now()} onclick={() => resumeJob(connection, job)}>{strings.retryAction}</SettingButton>{/if}

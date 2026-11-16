@@ -550,6 +550,16 @@ fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
         _=>crate::server_sync::SyncError::new("external-body-unavailable",502),
     }
 }
+/// Bodies come from every connection that holds them, so a sign-in failure
+/// names the connection that has to sign in again.
+fn source_error(connection_id:&str)->impl Fn(ProviderError)->crate::server_sync::SyncError+'_ {
+    move |error| {
+        let reauth=error.kind==ErrorKind::ReauthRequired;
+        let mut value=remote_error(error);
+        if reauth {value.connection_id=Some(connection_id.to_owned());}
+        value
+    }
+}
 pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTreeSet<String>,
     cancellation:Option<Arc<std::sync::atomic::AtomicBool>>,check:&dyn Fn()->crate::server_sync::Result<()>,
     opened:&mut dyn FnMut(&str,crate::server_sync::residency::HydrationOutcome))->crate::server_sync::Result<Vec<String>> {
@@ -655,7 +665,7 @@ pub(crate) fn hydrate_registered_many_scheduled(root:&Path,digests:&[String],pri
         before_group(first,opened)?;
         match work {
             Work::Standalone(sources)=>{
-                let connection=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
+                let connection=source_connection(&mut connections,&connection,&cancel).map_err(source_error(&connection.1))?;
                 hydrate_standalone(connection,sources,scratch.path(),&publisher,opened)?;
             }
             Work::Packed(outlines)=>{
@@ -672,7 +682,7 @@ pub(crate) fn hydrate_registered_many_scheduled(root:&Path,digests:&[String],pri
                 }
                 drop(sources);
                 if group.is_empty() {continue;}
-                let opened_source=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
+                let opened_source=source_connection(&mut connections,&connection,&cancel).map_err(source_error(&connection.1))?;
                 hydrate_pack_group(root,opened_source,group,scratch.path(),&publisher,opened)?;
             }
         }
@@ -761,7 +771,7 @@ fn hydrate_pack_group(root:&Path,connection:&OpenedSource,group:Vec<SharedPacked
         }).await
     });
     if let Some(error)=installer_error.borrow_mut().take() {return Err(error);}
-    result.map_err(remote_error)
+    result.map_err(source_error(&connection.connection.1))
 }
 /// Reads the standalone bodies of one connection under one lease, publishing
 /// them a batch at a time so the scratch directory holds at most one batch.
@@ -830,7 +840,7 @@ fn hydrate_standalone(connection:&OpenedSource,sources:Vec<Source>,scratch:&Path
         }).await
     });
     if let Some(error)=installer_error.borrow_mut().take() {return Err(error);}
-    result.map_err(remote_error)
+    result.map_err(source_error(&connection.connection.1))
 }
 /// A verified body waiting in scratch to be staged into the repository.
 struct StagedBody {

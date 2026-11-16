@@ -160,6 +160,28 @@ describe('external sync asset downloads', () => {
         await requestExternalLwwNow('sync'); await settle()
         expect(fixture.download).toHaveBeenCalledTimes(2)
     })
+    it('keeps a download stopped on another storage sign-in until that storage signs in again', async () => {
+        const storages = (sync: string, other: string) => ({ connections: [
+            { id: 'sync', providerId: 'webdav', purpose: 'sync', status: 'ready', lastVerifiedAtMs: sync },
+            { id: 'drive-2', providerId: 'google_drive', purpose: 'backup', status: 'ready', lastVerifiedAtMs: other },
+        ] } as unknown as ExternalStorageState)
+        const refused = { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }
+        fixture.download.mockRejectedValueOnce(refused)
+        dispose = await installExternalLwwAdapters(storages('1', '1')); await settle()
+        let failures: ReadonlyMap<string, unknown> = new Map()
+        const unsubscribe = subscribeExternalLwwFailures(value => { failures = value })
+        expect(failures.get('sync')).toEqual(refused)
+
+        // Signing in the sync connection again leaves the other storage's stop in place.
+        await refreshExternalLwwAdapters(storages('2', '1')); await vi.advanceTimersByTimeAsync(120_000); await settle()
+        expect(fixture.download).toHaveBeenCalledOnce()
+        expect(failures.get('sync')).toEqual(refused)
+
+        await refreshExternalLwwAdapters(storages('2', '2')); await settle()
+        expect(fixture.download).toHaveBeenCalledTimes(2)
+        expect(failures.has('sync')).toBe(false)
+        unsubscribe()
+    })
     it('cancels and settles the old download before completing a binding fence', async () => {
         let finish!: () => void
         fixture.download.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve }))

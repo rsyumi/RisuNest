@@ -1608,9 +1608,9 @@ describe('restoring access to a connection', () => {
     const button = (label: string) => [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === label)
     const form = () => state.form as undefined | { renewalConnection?: { id: string }; oncancel(): void; onconnected(result: unknown): Promise<void> }
     type SyncConnection = Omit<ReturnType<typeof syncConnection>, 'status'> & { status: ExternalConnectionSummary['status'] }
-    const view = (value: SyncConnection = syncConnection()) => ({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [value], jobs: [] })
-    async function show(value: SyncConnection = syncConnection()): Promise<void> {
-        state.getState.mockResolvedValue(view(value))
+    const view = (value: SyncConnection = syncConnection(), others: object[] = []) => ({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [value, ...others], jobs: [] })
+    async function show(value: SyncConnection = syncConnection(), others: object[] = []): Promise<void> {
+        state.getState.mockResolvedValue(view(value, others))
         state.listHistory.mockResolvedValue({ items: [] })
         target = document.createElement('div')
         document.body.append(target)
@@ -1674,6 +1674,20 @@ describe('restoring access to a connection', () => {
         expect(state.listHistory).toHaveBeenCalledTimes(2)
         expect(target.textContent).not.toContain(externalErrorMessage(strings, refused))
         expect(target.textContent).toContain(strings.noSyncHistory)
+    })
+
+    it('signs in the storage an asset download stopped on, from either card', async () => {
+        const drive = { ...connection(10, 30), id: 'drive-2', providerId: 'google_drive' as const, displayName: 'Drive' }
+        state.failures.set('connection-1', { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' })
+        await show(syncConnection(), [drive])
+        const cards = () => [...target.querySelectorAll('article.card')]
+        expect(cards().map(card => card.querySelector('.card-status')?.textContent)).toEqual([strings.statusReauth, strings.statusReauth])
+        for (const index of [0, 1]) {
+            const renew = [...cards()[index].querySelectorAll('button')].find(item => item.textContent?.trim() === strings.renew)!
+            renew.click(); await settle()
+            expect(form()?.renewalConnection?.id).toBe('drive-2')
+            form()!.oncancel(); await settle()
+        }
     })
 
     it('reads the history again once the recovery key unlocks the connection', async () => {
