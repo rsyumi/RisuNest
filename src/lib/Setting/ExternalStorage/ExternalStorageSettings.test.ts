@@ -99,6 +99,7 @@ import { language } from 'src/lang'
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
 import { refreshExternalStorageProductionState, requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory, requestExternalStorageRestore, stopExternalStorageRestore } from 'src/ts/storage/sync/external/production'
 import { externalErrorMessage, externalStorageStrings } from './strings'
+import { externalSyncFailureText } from 'src/ts/storage/sync/syncStatusView'
 import type { ExternalConnectionSummary } from 'src/ts/storage/sync/external/types'
 import { notifySyncBindingChanged } from 'src/ts/storage/sync/bindingChanges'
 import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
@@ -1676,18 +1677,19 @@ describe('restoring access to a connection', () => {
         expect(target.textContent).toContain(strings.noSyncHistory)
     })
 
-    it('signs in the storage an asset download stopped on, from either card', async () => {
+    it('shows an asset download stopped on another storage sign-in on that storage card only', async () => {
         const drive = { ...connection(10, 30), id: 'drive-2', providerId: 'google_drive' as const, displayName: 'Drive' }
-        state.failures.set('connection-1', { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' })
+        const refused = { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }
+        state.failures.set('connection-1', refused)
         await show(syncConnection(), [drive])
-        const cards = () => [...target.querySelectorAll('article.card')]
-        expect(cards().map(card => card.querySelector('.card-status')?.textContent)).toEqual([strings.statusReauth, strings.statusReauth])
-        for (const index of [0, 1]) {
-            const renew = [...cards()[index].querySelectorAll('button')].find(item => item.textContent?.trim() === strings.renew)!
-            renew.click(); await settle()
-            expect(form()?.renewalConnection?.id).toBe('drive-2')
-            form()!.oncancel(); await settle()
-        }
+        const [sync, other] = [...target.querySelectorAll('article.card')]
+        const renew = (card: Element) => [...card.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.renew)
+        expect([sync, other].map(card => card.querySelector('.card-status')?.textContent)).toEqual([strings.statusReady, strings.statusReauth])
+        expect(sync.textContent).not.toContain(externalSyncFailureText(strings, refused))
+        expect(renew(sync)).toBeUndefined()
+        expect(other.textContent).toContain(externalSyncFailureText(strings, refused))
+        renew(other)!.click(); await settle()
+        expect(form()?.renewalConnection?.id).toBe('drive-2')
     })
 
     it('reads the history again once the recovery key unlocks the connection', async () => {
