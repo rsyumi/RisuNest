@@ -1677,19 +1677,31 @@ describe('restoring access to a connection', () => {
         expect(target.textContent).toContain(strings.noSyncHistory)
     })
 
-    it('shows an asset download stopped on another storage sign-in on that storage card only', async () => {
+    it.each([
+        ['sign-in', { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }, 'statusReauth', 'renew', 'unlock'],
+        ['recovery key', { code: 'external-key-locked', status: 502, retryable: false, connectionId: 'drive-2' }, 'statusLocked', 'unlock', 'renew'],
+    ] as const)('shows an asset download stopped on another storage %s on that storage card only', async (_, refused, badge, offered, absent) => {
         const drive = { ...connection(10, 30), id: 'drive-2', providerId: 'google_drive' as const, displayName: 'Drive' }
-        const refused = { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }
         state.failures.set('connection-1', refused)
         await show(syncConnection(), [drive])
         const [sync, other] = [...target.querySelectorAll('article.card')]
-        const renew = (card: Element) => [...card.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.renew)
-        expect([sync, other].map(card => card.querySelector('.card-status')?.textContent)).toEqual([strings.statusReady, strings.statusReauth])
+        const find = (card: Element, label: string) => [...card.querySelectorAll('button')].find(item => item.textContent?.trim() === label)
+        expect([sync, other].map(card => card.querySelector('.card-status')?.textContent)).toEqual([strings.statusReady, strings[badge]])
         expect(sync.textContent).not.toContain(externalSyncFailureText(strings, refused))
-        expect(renew(sync)).toBeUndefined()
+        expect([find(sync, strings.renew), find(sync, strings.unlock), find(other, strings[absent])]).toEqual([undefined, undefined, undefined])
         expect(other.textContent).toContain(externalSyncFailureText(strings, refused))
-        renew(other)!.click(); await settle()
-        expect(form()?.renewalConnection?.id).toBe('drive-2')
+        find(other, strings[offered])!.click(); await settle()
+        if (offered === 'renew') expect(form()?.renewalConnection?.id).toBe('drive-2')
+        else expect(other.querySelector('.unlock-field input')).not.toBeNull()
+    })
+
+    it('offers the recovery key on the card when sync stopped on its own key', async () => {
+        const locked = { kind: 'repositoryKeyUnavailable' }
+        state.failures.set('connection-1', locked)
+        await show()
+        expect(target.querySelector('.card-status')?.textContent).toBe(strings.statusLocked)
+        expect(target.textContent).toContain(externalSyncFailureText(strings, locked))
+        expect([button(strings.unlock) !== undefined, button(strings.renew)]).toEqual([true, undefined])
     })
 
     it.each([

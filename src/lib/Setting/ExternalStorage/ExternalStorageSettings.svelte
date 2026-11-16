@@ -24,7 +24,7 @@
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { language } from 'src/lang'
-    import { externalJobFixedOn, externalJobIsActive, externalJobIsPaused, externalJobProgress, externalRenewalConnection, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
+    import { externalJobFixedOn, externalJobIsActive, externalJobIsPaused, externalJobProgress, externalNeedsUnlock, externalRemedyConnection, externalRenewalConnection, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
     import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
     import {
         refreshExternalStorageProductionState,
@@ -850,12 +850,12 @@
         return connection.purpose === 'sync' && selection?.kind === 'external' && selection.connectionId === connection.id && !syncRunning[connection.id]
     }
 
-    /** The sync failure a card shows: one that this connection's sign-in clears goes on this card, even when another
-     * connection's sync hit it, and on no other. */
+    /** The sync failure a card shows: one that this connection's sign-in or recovery key clears goes on this card, even
+     * when another connection's sync hit it, and on no other. */
     function syncFailureFor(connectionId: string): unknown {
         const own = syncFailures.get(connectionId)
-        if (own !== undefined && [undefined, connectionId].includes(externalRenewalConnection(own, connectionId))) return own
-        for (const [owner, failure] of syncFailures) if (owner !== connectionId && externalRenewalConnection(failure, owner) === connectionId) return failure
+        if (own !== undefined && [undefined, connectionId].includes(externalRemedyConnection(own, connectionId))) return own
+        for (const [owner, failure] of syncFailures) if (owner !== connectionId && externalRemedyConnection(failure, owner) === connectionId) return failure
         return undefined
     }
 
@@ -975,7 +975,7 @@
             {@const failure = syncFailureFor(connection.id)}
             {@const ownError = !job || externalJobFixedOn(job) === connection.id}
             {@const renewable = connection.status === 'reauth-required' || (ownError && job?.error?.action === 'reauthenticate') || externalRenewalConnection(failure, connection.id) !== undefined}
-            {@const lockable = connection.status === 'key-locked' || (ownError && job?.error?.action === 'unlock-key')}
+            {@const lockable = connection.status === 'key-locked' || (ownError && job?.error?.action === 'unlock-key') || externalNeedsUnlock(failure)}
             {@const recheckable = job?.state === 'uncertain' && job.kind === 'backup'}
             {@const retryable = !!job && externalJobIsPaused(job) && (!ownError || ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '')) && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}
             {@const remedy = renewable || lockable || recheckable || retryable}

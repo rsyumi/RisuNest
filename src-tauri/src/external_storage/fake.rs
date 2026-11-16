@@ -108,6 +108,7 @@ pub(super) struct FakeState {
     pub(super) container_delete_error: Option<ErrorKind>,
     scripted_pages: Vec<(Collection, Result<ObjectPage>)>,
     inventory_upload_failure: Option<ErrorKind>,
+    open_failure: Option<ErrorKind>,
     upload_failure: Option<(usize, ErrorKind)>,
     first_upload: Option<std::time::Instant>,
     sent_body_bytes: u64,
@@ -251,6 +252,11 @@ impl FakeProvider {
     pub(crate) fn upload_attempts(&self, object: &str) -> usize {
         self.state.lock().unwrap().upload_attempts.iter().filter(|id| id.as_str() == object).count()
     }
+    /// Fails every later open of the repository, as a connection whose key or
+    /// sign-in this device lacks does.
+    pub(crate) fn fail_open(&self, kind: ErrorKind) {
+        self.state.lock().unwrap().open_failure = Some(kind);
+    }
     pub(crate) fn fail_inventory_upload(&self, kind: ErrorKind) {
         self.state.lock().unwrap().inventory_upload_failure = Some(kind);
     }
@@ -384,6 +390,7 @@ impl Provider for FakeProvider {
         Box::pin(async move {
             self.requested();
             c.check()?;
+            if let Some(kind) = self.state.lock().unwrap().open_failure { return Err(ProviderError::new(kind)); }
             let mut capabilities = capabilities(self.cas);
             capabilities.max_stored_bytes = Some(self.object_limit);
             let mut repository = repository();

@@ -111,6 +111,21 @@ it.each([
     expect(notice()).not.toBeNull()
 })
 
+it.each([
+    ['its own recovery key', { kind: 'repositoryKeyUnavailable' }],
+    // An asset download reads every storage connection that holds a body and names the one without its recovery key.
+    ['the recovery key of another storage', { code: 'external-key-locked', status: 502, retryable: false, connectionId: 'drive-2' }],
+] as const)('reports a sync stopped on %s and opens the sync settings for it', async (_, failure) => {
+    const strings = externalStorageStrings('en')
+    component = mount(SyncStoppedNotice, { target: document.body })
+    const connection = { id: 'webdav-1', purpose: 'sync', status: 'ready' } as Partial<ExternalConnectionSummary> as ExternalConnectionSummary
+    await show({ target: 'external', connection, failure, syncStopped: false, refresh: () => {}, syncNow: async () => {} })
+    expect(notice()?.querySelector('p')?.textContent).toBe(strings.statusLocked)
+    expect(notice()?.textContent).toContain(strings.unlockKey)
+    const buttons = [...notice()!.querySelectorAll('button')]
+    expect(buttons.map(button => button.getAttribute('aria-label') ?? button.textContent?.trim())).toEqual([language.close, language.risuNest.tabs.sync])
+})
+
 it('stays hidden while the sync UI is turned off', async () => {
     DBState.db.risunestSyncStatusUi = false
     component = mount(SyncStoppedNotice, { target: document.body })

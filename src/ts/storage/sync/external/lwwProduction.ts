@@ -17,7 +17,7 @@ import { downloadRemoteAssets } from '../serverAssetResidency'
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../../libraryFileOperation'
 import { createLwwScheduler, failureKind, formatKinds, type LwwCall, type LwwOperation, type LwwTurn } from './lwwScheduler'
 import type { ExternalStorageState } from './types'
-import { EXTERNAL_ASSET_REAUTH_CODE, externalRenewalConnection } from './connection'
+import { EXTERNAL_ASSET_KEY_CODE, EXTERNAL_ASSET_REAUTH_CODE, externalRemedyConnection } from './connection'
 import { beginExternalProgress, clearExternalProgress, clearExternalSyncProgress, externalProgressFailure, type ExternalProgressRun } from './progress'
 
 interface Adapter { transport: SyncBindingTransport; scheduler: ReturnType<typeof createLwwScheduler>; recover(renewed: ReadonlySet<string>): boolean; stopHydration(): Promise<void>; resumeHydration(pendingOnly?: boolean, continuation?: boolean): void; hide(publish: boolean): Promise<void>; dispose(): void; state?: SyncBindingState; generation: number; foreground?: Promise<void>; recoveries?: ReadonlyMap<string, string> }
@@ -108,7 +108,7 @@ function createAdapter(connectionId: string): Adapter {
             if (Number.isFinite(deadline)) hydrationServiceRetryAt = Math.max(hydrationServiceRetryAt, deadline)
             hydrationRetryAt = Math.max(Date.now() + 20_000, hydrationServiceRetryAt)
             hydrationBlocked = failure?.retryable === false || ['reauthenticate', 'unlock-key', 'free-space', 'check-endpoint'].includes(failure?.action ?? '')
-                || ['unauthorized', 'reauthRequired', EXTERNAL_ASSET_REAUTH_CODE, 'deviceVaultUnavailable', 'repositoryKeyUnavailable', 'localStorageFull', 'localPermissionDenied', 'storageFull', 'endpointRejected', 'corrupt', 'repositoryMismatch'].includes(failure?.kind ?? failure?.code ?? '')
+                || ['unauthorized', 'reauthRequired', EXTERNAL_ASSET_REAUTH_CODE, EXTERNAL_ASSET_KEY_CODE, 'deviceVaultUnavailable', 'repositoryKeyUnavailable', 'localStorageFull', 'localPermissionDenied', 'storageFull', 'endpointRejected', 'corrupt', 'repositoryMismatch'].includes(failure?.kind ?? failure?.code ?? '')
             reportOperation('assets', error)
         }).finally(() => {
             joined.dispose()
@@ -316,20 +316,20 @@ function createAdapter(connectionId: string): Adapter {
         await scheduler.settled()
         await hydrating
     })
-    // A renewed sign-in or key clears the stops it caused at once rather than after the receive it starts. An asset
-    // download can stop on another storage connection, which only that connection's renewal clears.
+    // A renewed sign-in or recovery key clears the stops it caused at once rather than after the receive it starts. An
+    // asset download can stop on another storage connection, which only that connection's renewal or unlock clears.
     // Returns whether downloads resume.
     const recover = (renewed: ReadonlySet<string>) => {
         const before = operationFailures.size
         for (const [operation, error] of operationFailures) {
-            const target = externalRenewalConnection(error, connectionId)
+            const target = externalRemedyConnection(error, connectionId)
             if (target !== undefined && renewed.has(target)) operationFailures.delete(operation)
         }
         const cleared = operationFailures.size !== before
         if (cleared) reportOperations()
         const own = renewed.has(connectionId)
         if (own) scheduler.recovered()
-        return (own || cleared) && externalRenewalConnection(operationFailures.get('assets'), connectionId) === undefined
+        return (own || cleared) && externalRemedyConnection(operationFailures.get('assets'), connectionId) === undefined
     }
     const adapter: Adapter = { transport, scheduler, recover, stopHydration, resumeHydration, hide, generation: 0, dispose() { adapter.generation++; scheduler.stop(); void stopHydration(); active = undefined; reportFailure(connectionId); unregister(); unregisterGate(); clearExternalProgress(connectionId); if (adapters.get(connectionId) === adapter) adapters.delete(connectionId) } }
     return adapter

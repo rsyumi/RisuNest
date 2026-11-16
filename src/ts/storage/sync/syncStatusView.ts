@@ -1,6 +1,6 @@
 import { language } from 'src/lang'
 import { externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
-import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal, externalRenewalConnection } from './external/connection'
+import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal, externalNeedsUnlock, externalRenewalConnection } from './external/connection'
 import type { ExternalOperationProgress } from './external/progress'
 import type { ExternalConnectionSummary, ExternalJobSummary } from './external/types'
 import { formatLevelLabel, registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
@@ -52,8 +52,9 @@ export function externalSyncStatusView(
             : connection.status === 'key-locked' ? strings.statusLocked : strings.statusError
         return { label, tone: 'attention', stopped: true }
     }
-    // Sync stops on a sign-in failure without marking the connection.
+    // Sync stops on a sign-in or recovery key failure without marking the connection.
     if (externalNeedsRenewal(failure)) return { label: strings.statusReauth, tone: 'attention', stopped: true }
+    if (externalNeedsUnlock(failure)) return { label: strings.statusLocked, tone: 'attention', stopped: true }
     if (job && (job.state === 'uncertain' || externalJobIsPaused(job))) return { label: strings.statusError, tone: 'attention', stopped: false }
     if (operation?.state === 'running') {
         if (operation.stage === 'waiting') return { label: strings.transfer.waiting, tone: 'idle', stopped: false }

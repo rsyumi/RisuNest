@@ -548,15 +548,16 @@ fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
         ErrorKind::Cancelled=>crate::server_sync::SyncError::new("cancelled",409),
         // A 401 or 403 asks for the same remedy as an expired sign-in.
         ErrorKind::ReauthRequired|ErrorKind::Unauthorized=>crate::server_sync::SyncError::new("external-reauth-required",502),
+        ErrorKind::RepositoryKeyUnavailable|ErrorKind::RecoveryKeyMismatch=>crate::server_sync::SyncError::new("external-key-locked",502),
         _=>crate::server_sync::SyncError::new("external-body-unavailable",502),
     }
 }
-/// Bodies come from every connection that holds them, so a sign-in failure
-/// names the connection that has to sign in again.
+/// Bodies come from every connection that holds them, so a sign-in or key
+/// failure names the connection that has to sign in again or take its key.
 fn source_error(connection_id:&str)->impl Fn(ProviderError)->crate::server_sync::SyncError+'_ {
     move |error| {
         let mut value=remote_error(error);
-        if value.code=="external-reauth-required" {value.connection_id=Some(connection_id.to_owned());}
+        if ["external-reauth-required","external-key-locked"].contains(&value.code.as_str()) {value.connection_id=Some(connection_id.to_owned());}
         value
     }
 }

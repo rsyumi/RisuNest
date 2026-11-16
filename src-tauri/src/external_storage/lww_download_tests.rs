@@ -95,6 +95,18 @@ fn standalone_hydration_settles_successful_siblings_before_returning_a_download_
 }
 
 #[test]
+fn a_standalone_source_without_its_recovery_key_names_its_connection() {
+    runtime().block_on(async {
+        let f=CycleFixture::new();let provider=Arc::new(DownloadProvider::new(4,&[]));
+        let sources=sources(&f,&provider,1);provider.inner.fail_open(ErrorKind::RepositoryKeyUnavailable);
+        let _installed=install_test_source_connection(f.directory_b.path(),Arc::new(connection(&f,provider.clone(),None))).unwrap();
+        let root=f.directory_b.path().to_owned();let hashes=vec![sources[0].hash.clone()];
+        let refused=tokio::task::spawn_blocking(move || hydrate_registered_many(&root,&hashes,&BTreeSet::new(),None,&||Ok(()),&mut |_,_|{})).await.unwrap().unwrap_err();
+        assert_eq!((refused.code.as_str(),refused.connection_id.as_deref()),("external-key-locked",Some("receiver")));
+    });
+}
+
+#[test]
 fn standalone_connections_follow_display_rank_before_background_work() {
     let f=CycleFixture::new();
     let provider=Arc::new(DownloadProvider::new(4,&[]));

@@ -1,4 +1,4 @@
-import { EXTERNAL_ASSET_REAUTH_CODE, externalErrorKind } from 'src/ts/storage/sync/external/connection'
+import { EXTERNAL_ASSET_KEY_CODE, EXTERNAL_ASSET_REAUTH_CODE, externalErrorKind } from 'src/ts/storage/sync/external/connection'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
 export { externalErrorKind } from 'src/ts/storage/sync/external/connection'
@@ -530,6 +530,7 @@ function externalErrorSummary(strings: ExternalStorageStrings, value: unknown): 
         case 'alreadyConnected': return strings.connectionAlreadyAdded
         case 'unauthorized': return strings.credentialsRejected
         case EXTERNAL_ASSET_REAUTH_CODE: return strings.reauthenticate
+        case EXTERNAL_ASSET_KEY_CODE: return strings.unlockKey
         case 'reauthRequired': return [strings.reauthenticate, oauthSuffix, oauthDescriptionSuffix]
             .filter(Boolean)
             .join('\n')

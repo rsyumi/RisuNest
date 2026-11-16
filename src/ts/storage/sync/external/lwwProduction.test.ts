@@ -161,21 +161,23 @@ describe('external sync asset downloads', () => {
         expect(fixture.download).toHaveBeenCalledTimes(2)
     })
     it.each([
-        ['signs in again', '2'],
-        ['is removed', undefined],
-    ] as const)('keeps a download stopped on another storage sign-in until that storage %s', async (_, renewed) => {
+        ['sign-in', 'signs in again', 'external-reauth-required', '2'],
+        ['sign-in', 'is removed', 'external-reauth-required', undefined],
+        ['recovery key', 'takes its recovery key', 'external-key-locked', '2'],
+        ['recovery key', 'is removed', 'external-key-locked', undefined],
+    ] as const)('keeps a download stopped on another storage %s until that storage %s', async (_, __, code, renewed) => {
         const storages = (sync: string, other: string | undefined) => ({ connections: [
             { id: 'sync', providerId: 'webdav', purpose: 'sync', status: 'ready', lastVerifiedAtMs: sync },
             ...other === undefined ? [] : [{ id: 'drive-2', providerId: 'google_drive', purpose: 'backup', status: 'ready', lastVerifiedAtMs: other }],
         ] } as unknown as ExternalStorageState)
-        const refused = { code: 'external-reauth-required', status: 502, retryable: true, connectionId: 'drive-2' }
+        const refused = { code, status: 502, retryable: true, connectionId: 'drive-2' }
         fixture.download.mockRejectedValueOnce(refused)
         dispose = await installExternalLwwAdapters(storages('1', '1')); await settle()
         let failures: ReadonlyMap<string, unknown> = new Map()
         const unsubscribe = subscribeExternalLwwFailures(value => { failures = value })
         expect(failures.get('sync')).toEqual(refused)
 
-        // Signing in the sync connection again leaves the other storage's stop in place.
+        // Renewing the sync connection leaves the other storage's stop in place.
         await refreshExternalLwwAdapters(storages('2', '1')); await vi.advanceTimersByTimeAsync(120_000); await settle()
         expect(fixture.download).toHaveBeenCalledOnce()
         expect(failures.get('sync')).toEqual(refused)
@@ -399,16 +401,19 @@ describe('native external LWW adapter', () => {
         await vi.advanceTimersByTimeAsync(600_000); await settle()
         expect(receives()).toBe(refused)
     })
-    it('stops on an expired sign-in until the connection signs in again, then receives at once', async () => {
+    it.each([
+        ['an expired sign-in', 'signs in again', { kind: 'reauthRequired' }],
+        ['a missing recovery key', 'takes its recovery key', { kind: 'repositoryKeyUnavailable' }],
+    ] as const)('stops on %s until the connection %s, then receives at once', async (_, __, refusal) => {
         const signedIn = (verifiedAtMs: string) => ({ connections: [{ id: 'sync', providerId: 'google_drive', purpose: 'sync', status: 'ready', lastVerifiedAtMs: verifiedAtMs }] } as unknown as ExternalStorageState)
         dispose = await installExternalLwwAdapters(signedIn('1')); await settle()
         let failures: ReadonlyMap<string, unknown> = new Map()
         const unsubscribe = subscribeExternalLwwFailures(value => { failures = value })
         const receives = () => fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_receive').length
-        fixture.invoke.mockImplementation(async command => { if (command === 'external_lww_receive') throw { kind: 'reauthRequired' } })
+        fixture.invoke.mockImplementation(async command => { if (command === 'external_lww_receive') throw refusal })
         await vi.advanceTimersByTimeAsync(20_000); await settle()
         const refused = receives()
-        expect(failures.get('sync')).toEqual({ kind: 'reauthRequired' })
+        expect(failures.get('sync')).toEqual(refusal)
         // The sync failure leaves the connection unmarked, so reading the same state again changes nothing.
         await refreshExternalLwwAdapters(signedIn('1')); await vi.advanceTimersByTimeAsync(600_000); await settle()
         expect(receives()).toBe(refused)
@@ -419,7 +424,7 @@ describe('native external LWW adapter', () => {
             return command === 'external_lww_publish' ? { segments: '0', more: false } : undefined
         })
         await refreshExternalLwwAdapters(signedIn('2')); await vi.advanceTimersByTimeAsync(1_000); await settle()
-        // The stop clears with the new sign-in instead of after the receive it starts.
+        // The stop clears with the new sign-in or key instead of after the receive it starts.
         expect(receives()).toBe(refused + 1)
         expect(failures.has('sync')).toBe(false)
         fixture.invoke.mockImplementation(async command => command === 'external_lww_receive' ? null : command === 'external_lww_publish' ? { segments: '0', more: false } : undefined)
