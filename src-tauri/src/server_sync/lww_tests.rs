@@ -1791,7 +1791,7 @@ fn a_multi_page_bootstrap_from_cursor_zero_finishes_every_page() {
 fn a_bootstrap_reports_what_is_left_of_its_pin_in_every_session() {
     use super::progress::{within, ProgressLane};
     let server = LocalServerFixture::new();
-    ServerWriter::new(&server.server).push_units("first-library", "unit", 900);
+    ServerWriter::new(&server.server).push_units("first-library", "unit", 1100);
     raise_journal_floor(&server);
     let (_root, mut target) = local();
     server.client(&target);
@@ -1814,21 +1814,31 @@ fn a_bootstrap_reports_what_is_left_of_its_pin_in_every_session() {
     let (done, left) = page(&mut target);
     assert_eq!(done, 256);
     let total = done + left;
-    assert!(total >= 900, "{total}");
-    for pages in 2..=3 {
+    assert!(total >= 1100, "{total}");
+    for pages in 2..=4 {
         assert_eq!(page(&mut target), (256, total - 256 * pages));
     }
     assert_eq!(page(&mut target).1, 0);
-    assert_eq!(received_bootstrap_units(&target), 900);
+    assert_eq!(received_bootstrap_units(&target), 1100);
     assert_eq!(counts(&target), 0);
     // A bootstrap an earlier version began kept no count of what it received, so the rest of
     // its pages report no known work.
     page(&mut earlier);
+    let kept: (String, String, i64) = log(&earlier)
+        .query_row("SELECT pin,after_key,units FROM bootstrap_received", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap();
     log(&earlier).execute("DELETE FROM bootstrap_received", []).unwrap();
-    for _ in 2..=4 {
+    for _ in 2..=3 {
         assert_eq!(page(&mut earlier), (0, 0));
     }
-    assert_eq!(received_bootstrap_units(&earlier), 900);
+    // Nor does a count an earlier version left behind when it read further pages.
+    log(&earlier)
+        .execute("INSERT INTO bootstrap_received VALUES(?1,?2,?3)", rusqlite::params![kept.0, kept.1, kept.2])
+        .unwrap();
+    for _ in 4..=5 {
+        assert_eq!(page(&mut earlier), (0, 0));
+    }
+    assert_eq!(received_bootstrap_units(&earlier), 1100);
     assert_eq!(counts(&earlier), 0);
 }
 
