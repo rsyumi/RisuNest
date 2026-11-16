@@ -522,6 +522,8 @@
             await bridge.unlockConnection(connection.id, unlockKey)
             unlockKey = ''
             unlockConnection = undefined
+            // The history read while the key was locked is read again.
+            historyRequested.delete(connection.id)
             await refreshExternalStorageProductionState()
             await refresh(true)
         } catch (reason) { error = externalErrorMessage(strings, reason) }

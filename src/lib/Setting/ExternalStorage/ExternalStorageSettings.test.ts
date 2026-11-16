@@ -24,6 +24,7 @@ const state = vi.hoisted(() => ({
     setRetentionPolicy: vi.fn(),
     setTransferConcurrency: vi.fn(),
     listHistory: vi.fn(),
+    unlockConnection: vi.fn(),
     listConflicts: vi.fn(),
     recheckConflict: vi.fn(),
     deleteConflict: vi.fn(),
@@ -83,6 +84,7 @@ vi.mock('src/ts/storage/sync/external/bridge', () => ({
         setRetentionPolicy: state.setRetentionPolicy,
         setTransferConcurrency: state.setTransferConcurrency,
         listHistory: state.listHistory,
+        unlockConnection: state.unlockConnection,
         listConflicts: state.listConflicts,
         recheckConflict: state.recheckConflict,
         deleteConflict: state.deleteConflict,
@@ -97,6 +99,7 @@ import { language } from 'src/lang'
 import ExternalStorageSettings from './ExternalStorageSettings.svelte'
 import { refreshExternalStorageProductionState, requestExternalStorageNow, resumeExternalStorageJob, requestExternalStorageDeleteHistory, requestExternalStorageRestore, stopExternalStorageRestore } from 'src/ts/storage/sync/external/production'
 import { externalErrorMessage, externalStorageStrings } from './strings'
+import type { ExternalConnectionSummary } from 'src/ts/storage/sync/external/types'
 import { notifySyncBindingChanged } from 'src/ts/storage/sync/bindingChanges'
 import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
 
@@ -1600,12 +1603,14 @@ describe('a new connection', () => {
     })
 })
 
-describe('signing in again', () => {
+describe('restoring access to a connection', () => {
     const syncConnection = () => ({ ...connection(10, 30), purpose: 'sync' as const, strategy: 'sequential' as const })
     const button = (label: string) => [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === label)
     const form = () => state.form as undefined | { renewalConnection?: { id: string }; oncancel(): void; onconnected(result: unknown): Promise<void> }
-    async function show(): Promise<void> {
-        state.getState.mockResolvedValue({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [syncConnection()], jobs: [] })
+    type SyncConnection = Omit<ReturnType<typeof syncConnection>, 'status'> & { status: ExternalConnectionSummary['status'] }
+    const view = (value: SyncConnection = syncConnection()) => ({ supported: true, selection: { kind: 'external', connectionId: 'connection-1', selectionEpoch: '0', paused: false }, connections: [value], jobs: [] })
+    async function show(value: SyncConnection = syncConnection()): Promise<void> {
+        state.getState.mockResolvedValue(view(value))
         state.listHistory.mockResolvedValue({ items: [] })
         target = document.createElement('div')
         document.body.append(target)
@@ -1652,6 +1657,22 @@ describe('signing in again', () => {
         button(label())!.click(); await settle()
         await form()!.onconnected({ connection: syncConnection() }); await settle()
         expect(target.textContent).not.toContain(refused)
+        expect(target.textContent).toContain(strings.noSyncHistory)
+    })
+
+    it('reads the history again once the recovery key unlocks the connection', async () => {
+        const locked = { kind: 'repositoryKeyUnavailable', action: 'unlock-key' }
+        state.listHistory.mockRejectedValueOnce(locked)
+        await show({ ...syncConnection(), status: 'key-locked' })
+        expect(target.textContent).toContain(externalErrorMessage(strings, locked))
+
+        button(strings.unlock)!.click(); await settle()
+        const field = target.querySelector<HTMLInputElement>('.unlock-field input')!
+        field.value = 'synthetic-recovery'; field.dispatchEvent(new Event('input', { bubbles: true })); await settle()
+        state.getState.mockResolvedValue(view())
+        button(strings.unlock)!.click(); await settle()
+        expect(state.unlockConnection).toHaveBeenCalledExactlyOnceWith('connection-1', 'synthetic-recovery')
+        expect(target.textContent).not.toContain(externalErrorMessage(strings, locked))
         expect(target.textContent).toContain(strings.noSyncHistory)
     })
 
