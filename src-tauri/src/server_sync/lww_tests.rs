@@ -1791,10 +1791,12 @@ fn a_multi_page_bootstrap_from_cursor_zero_finishes_every_page() {
 fn a_bootstrap_reports_what_is_left_of_its_pin_in_every_session() {
     use super::progress::{within, ProgressLane};
     let server = LocalServerFixture::new();
-    ServerWriter::new(&server.server).push_units("first-library", "unit", 600);
+    ServerWriter::new(&server.server).push_units("first-library", "unit", 900);
     raise_journal_floor(&server);
     let (_root, mut target) = local();
     server.client(&target);
+    let (_earlier_root, mut earlier) = local();
+    server.client(&earlier);
     // Each page is read by a new client, as a later session would read it.
     let page = |target: &mut PersistentStore| {
         let lane = Arc::new(ProgressLane::default());
@@ -1805,19 +1807,29 @@ fn a_bootstrap_reports_what_is_left_of_its_pin_in_every_session() {
         let read = lane.snapshot("receive");
         (read.backlog_done, read.backlog_left)
     };
+    let log = |target: &PersistentStore| OperationLog::open(target.repository_root()).unwrap().0;
+    let counts = |target: &PersistentStore| -> i64 {
+        log(target).query_row("SELECT count(*) FROM bootstrap_received", [], |row| row.get(0)).unwrap()
+    };
     let (done, left) = page(&mut target);
     assert_eq!(done, 256);
     let total = done + left;
-    assert!(total >= 600, "{total}");
-    let (done, left) = page(&mut target);
-    assert_eq!((done, done + left), (256, total - 256));
-    let (_, left) = page(&mut target);
-    assert_eq!(left, 0);
-    assert_eq!(received_bootstrap_units(&target), 600);
-    let listed: i64 = OperationLog::open(target.repository_root()).unwrap().0
-        .query_row("SELECT count(*) FROM bootstrap_listed", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(listed, 0);
+    assert!(total >= 900, "{total}");
+    for pages in 2..=3 {
+        assert_eq!(page(&mut target), (256, total - 256 * pages));
+    }
+    assert_eq!(page(&mut target).1, 0);
+    assert_eq!(received_bootstrap_units(&target), 900);
+    assert_eq!(counts(&target), 0);
+    // A bootstrap an earlier version began kept no count of what it received, so the rest of
+    // its pages report no known work.
+    page(&mut earlier);
+    log(&earlier).execute("DELETE FROM bootstrap_received", []).unwrap();
+    for _ in 2..=4 {
+        assert_eq!(page(&mut earlier), (0, 0));
+    }
+    assert_eq!(received_bootstrap_units(&earlier), 900);
+    assert_eq!(counts(&earlier), 0);
 }
 
 #[test]
