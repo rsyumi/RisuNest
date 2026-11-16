@@ -988,7 +988,19 @@ pub(crate) async fn spool_verified_remote_body_observed(root:&Path,hash:&str,des
 pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation)->Result<tempfile::NamedTempFile> {
     spool_frozen_remote_body_observed(source,destination,cancel,None).await
 }
+/// The body comes from the connection that registered it, which can be another
+/// than the one the operation works on, so a failure that only that connection's
+/// sign-in or key clears names it.
 pub(super) async fn spool_frozen_remote_body_observed(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation,observer:Option<std::sync::Arc<dyn Fn(u64)+Send+Sync>>)->Result<tempfile::NamedTempFile> {
+    let connection_id=match source {FrozenBodySource::Standalone(source)=>&source.connection_id,FrozenBodySource::Packed(source)=>&source.connection_id};
+    spool_frozen_remote_body_from(source,destination,cancel,observer).await.map_err(|mut error| {
+        if matches!(error.kind,ErrorKind::ReauthRequired|ErrorKind::Unauthorized|ErrorKind::RepositoryKeyUnavailable|ErrorKind::RecoveryKeyMismatch) {
+            error.connection_id=Some(connection_id.clone());
+        }
+        error
+    })
+}
+async fn spool_frozen_remote_body_from(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation,observer:Option<std::sync::Arc<dyn Fn(u64)+Send+Sync>>)->Result<tempfile::NamedTempFile> {
     let high_water=std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let progress=|| {
         let observer=observer.clone(); let high_water=high_water.clone();
