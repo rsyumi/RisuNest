@@ -43,6 +43,8 @@ mod logical_records;
 mod lossless_f0;
 #[cfg(any(test, target_os = "macos"))]
 mod macos_lifecycle;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 pub mod native_file_jobs;
 pub(crate) mod native_log;
 mod diagnostics;
@@ -461,7 +463,9 @@ fn builder_with_main_window(
     }
     #[cfg(target_os = "macos")]
     {
-        builder = builder.manage(macos_lifecycle::ExitState::default());
+        builder = builder
+            .manage(macos_lifecycle::ExitState::default())
+            .menu(macos_menu::app_menu);
     }
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
