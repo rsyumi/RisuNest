@@ -280,5 +280,6 @@ pub(super) fn authorization_policy(
             .map(|scope| (*scope).to_owned())
             .collect(),
         picker: false,
+        login_hint: None,
     })
 }

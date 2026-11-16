@@ -47,6 +47,8 @@ struct PendingPreparation {
     account_label: Option<String>,
     transferred: bool,
     renewal: Option<String>,
+    /// The account a renewal has to sign in with, so the sign-in page selects it.
+    login_hint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -492,6 +494,7 @@ fn insert_preparation(
             account_label: None,
             transferred,
             renewal: None,
+            login_hint: None,
         },
     );
     Ok(result)
@@ -951,25 +954,34 @@ pub(crate) fn external_storage_prepare_renewal(
     logged("external_storage_prepare_renewal", (|| {
         let _cleanup_guard = state.admit()?;
         let stored = ConnectionStore::open(&connection_root(&app)?)?.read(&connection_id)?;
-        let preparation_id = uuid::Uuid::new_v4().to_string();
-        let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
-        let prepared = PreparedConnection {
-            preparation_id: preparation_id.clone(), expires_at_ms: expires_at_ms.to_string(),
-            endpoint: connection::stored_endpoint(&stored)?, capabilities: Some(stored.capabilities.clone()),
-            requires_o_auth: stored.config.oauth_profile.is_some(), requires_recovery_key: false,
-            requires_platform_o_auth_client: false, requires_folder_selection: false, oauth_project_hint: None,
-        };
-        let purpose = if stored.descriptor.publication_strategy.is_none() { ConnectionPurpose::Backup } else { ConnectionPurpose::Sync };
-        lock(&state.preparations)?.insert(preparation_id, PendingPreparation {
-            request: PrepareConnectionRequest { config: stored.config, mode: ConnectionOpenMode::Existing,
-                purpose, recovery_key: None, acknowledgements: vec![] },
-            expires_at_ms, recovery_key: None, expected_repository_id: Some(stored.descriptor.repository_id),
-            imported_credential: None, bound_credential: None, selected_folder_name: None,
-            imported_folder_name: None, account_label: None, transferred: false,
-            renewal: Some(connection_id),
-        });
-        Ok(prepared)
+        insert_renewal(&state, stored, connection_id)
     })())
+}
+
+fn insert_renewal(state: &ConnectionCommandState, stored: StoredConnection, connection_id: String) -> Result<PreparedConnection> {
+    let preparation_id = uuid::Uuid::new_v4().to_string();
+    let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
+    let prepared = PreparedConnection {
+        preparation_id: preparation_id.clone(), expires_at_ms: expires_at_ms.to_string(),
+        endpoint: connection::stored_endpoint(&stored)?, capabilities: Some(stored.capabilities.clone()),
+        requires_o_auth: stored.config.oauth_profile.is_some(), requires_recovery_key: false,
+        requires_platform_o_auth_client: false, requires_folder_selection: false, oauth_project_hint: None,
+    };
+    let purpose = if stored.descriptor.publication_strategy.is_none() { ConnectionPurpose::Backup } else { ConnectionPurpose::Sync };
+    lock(&state.preparations)?.insert(preparation_id, PendingPreparation {
+        request: PrepareConnectionRequest { config: stored.config, mode: ConnectionOpenMode::Existing,
+            purpose, recovery_key: None, acknowledgements: vec![] },
+        expires_at_ms, recovery_key: None, expected_repository_id: Some(stored.descriptor.repository_id),
+        imported_credential: None, bound_credential: None, selected_folder_name: None,
+        imported_folder_name: None, account_label: None, transferred: false,
+        renewal: Some(connection_id), login_hint: stored.labels.account,
+    });
+    Ok(prepared)
+}
+
+/// The account the provider's sign-in page selects for a renewal; a new connection has none.
+fn authorization_login_hint(state: &ConnectionCommandState, preparation_id: &str) -> Result<Option<String>> {
+    Ok(lock(&state.preparations)?.get(preparation_id).and_then(|preparation| preparation.login_hint.clone()))
 }
 
 #[tauri::command]
@@ -1186,6 +1198,7 @@ pub(crate) async fn external_storage_begin_authorization(
         } = request;
         let mut exchange_config =
             { authorization_config(&state, &preparation_id, current_platform_client_id)? };
+        let login_hint = authorization_login_hint(&state, &preparation_id)?;
         let provider = exchange_config.provider.clone();
         let (flow, authorization_url) = match provider.as_str() {
             "google_drive" => {
@@ -1194,6 +1207,7 @@ pub(crate) async fn external_storage_begin_authorization(
                         &exchange_config,
                         redirect,
                     )
+                    .map(|policy| policy.with_login_hint(login_hint))
                 })
                 .await?
             }
@@ -1203,6 +1217,7 @@ pub(crate) async fn external_storage_begin_authorization(
                         .location
                         .insert("redirectUri".into(), redirect.to_string());
                     providers::onedrive::authorization_policy(&exchange_config, platform_key())
+                        .map(|policy| policy.with_login_hint(login_hint))
                 })
                 .await?
             }
@@ -1244,11 +1259,13 @@ pub(crate) async fn external_storage_begin_authorization(
             current_platform_client_id,
         } = request;
         let config = { authorization_config(&state, &preparation_id, current_platform_client_id)? };
+        let login_hint = authorization_login_hint(&state, &preparation_id)?;
         let mut exchange_config = config;
         let flow = match exchange_config.provider.as_str() {
             "google_drive" => {
                 let (policy, callback_scheme) =
                     providers::google_drive::auth::ios_authorization_policy(&exchange_config)?;
+                let policy = policy.with_login_hint(login_hint);
                 super::oauth::IosWebAuthenticationAuthorization::start(policy, callback_scheme, true)?
             }
             "onedrive" => {
@@ -1256,7 +1273,8 @@ pub(crate) async fn external_storage_begin_authorization(
                     "redirectUri".into(),
                     providers::onedrive::IOS_REDIRECT_URI.into(),
                 );
-                let policy = providers::onedrive::authorization_policy(&exchange_config, "ios")?;
+                let policy = providers::onedrive::authorization_policy(&exchange_config, "ios")?
+                    .with_login_hint(login_hint);
                 let callback_scheme = policy.redirect_url.scheme().to_owned();
                 super::oauth::IosWebAuthenticationAuthorization::start(policy, callback_scheme, false)?
             }
@@ -1299,6 +1317,7 @@ pub(crate) async fn external_storage_begin_authorization(
             current_platform_client_id,
         } = request;
         let config = { authorization_config(&state, &preparation_id, current_platform_client_id)? };
+        let login_hint = authorization_login_hint(&state, &preparation_id)?;
         let authorization_id = uuid::Uuid::new_v4().to_string();
         let expires_at_ms = now_ms().saturating_add(PREPARATION_LIFETIME_MS);
         let on_ready: Box<dyn FnOnce() + Send> = Box::new({
@@ -1309,7 +1328,8 @@ pub(crate) async fn external_storage_begin_authorization(
         });
         let (authorization, authorization_url, authorization_state) = match config.provider.as_str() {
             "google_drive" => {
-                let policy = providers::google_drive::auth::android_web_authorization_policy(&config)?;
+                let policy = providers::google_drive::auth::android_web_authorization_policy(&config)?
+                    .with_login_hint(login_hint);
                 let (flow, url) = super::oauth::android_google_web_authorization(policy, on_ready)?;
                 (
                     PendingAuthorization::Google {
@@ -1328,7 +1348,8 @@ pub(crate) async fn external_storage_begin_authorization(
                     "redirectUri".into(),
                     super::oauth::ANDROID_ONEDRIVE_REDIRECT_URI.into(),
                 );
-                let policy = providers::onedrive::authorization_policy(&exchange_config, "android")?;
+                let policy = providers::onedrive::authorization_policy(&exchange_config, "android")?
+                    .with_login_hint(login_hint);
                 let (flow, url) = super::oauth::android_redirect_authorization(policy, on_ready)?;
                 (
                     PendingAuthorization::OneDrive {
@@ -2856,6 +2877,61 @@ mod tests {
         assert!(summary(&stored).is_ok());
     }
 
+    /// Renewal accepts only the account the connection holds, so its sign-in page opens on that account.
+    #[test]
+    fn a_renewal_sign_in_selects_the_account_the_connection_holds() {
+        let state = ConnectionCommandState::default();
+        let stored = StoredConnection {
+            id: "renewed".into(),
+            config: super::super::contract::ConnectionConfig {
+                provider: "webdav".into(),
+                profile: None,
+                endpoint: "https://dav.example.invalid/remote".into(),
+                account_id: "synthetic".into(),
+                location: BTreeMap::from([("root".into(), "RisuNest".into())]),
+                oauth_profile: None,
+            },
+            descriptor: Descriptor::new("synthetic-repository".into(), None).unwrap(),
+            descriptor_locator: super::super::fake::locator(),
+            provider_repository_id: "synthetic-provider-root".into(),
+            credential_ref: "credential".into(),
+            root_key_ref: "root-key".into(),
+            recovery_key_ref: "recovery-key".into(),
+            retention_policy: None, transfer_concurrency: None,
+            labels: ConnectionLabels::new(Some("synthetic@example.invalid".into()), None),
+            capabilities: super::super::fake::capabilities(false),
+            created_at_ms: 1,
+            verified_at_ms: 1,
+            last_sync_at_ms: None,
+            last_backup_at_ms: None,
+        };
+        let sign_in = |preparation_id: &str| {
+            let policy = super::super::auth::AuthorizationPolicy {
+                authorize_url: url::Url::parse("https://accounts.example.invalid/authorize").unwrap(),
+                client_id: "synthetic-public-client".into(),
+                redirect_url: url::Url::parse("http://127.0.0.1:52001/oauth").unwrap(),
+                scopes: vec!["synthetic.scope".into()],
+                picker: false,
+                login_hint: None,
+            }
+            .with_login_hint(authorization_login_hint(&state, preparation_id).unwrap());
+            let (_, url) = super::super::auth::PendingAuthorization::start(policy).unwrap();
+            url.query_pairs().filter(|(name, _)| name == "login_hint").map(|(_, value)| value.into_owned()).collect::<Vec<_>>()
+        };
+
+        let renewal = insert_renewal(&state, stored.clone(), "renewed".into()).unwrap();
+        assert_eq!(sign_in(&renewal.preparation_id), vec!["synthetic@example.invalid".to_owned()]);
+
+        let created = insert_preparation(&state, PrepareConnectionRequest {
+            config: stored.config,
+            mode: ConnectionOpenMode::Create,
+            purpose: ConnectionPurpose::Backup,
+            recovery_key: None,
+            acknowledgements: Vec::new(),
+        }, None, None, None, false).unwrap();
+        assert!(sign_in(&created.preparation_id).is_empty());
+    }
+
     /// The form sends S3 settings without an account, which the access key
     /// fills in only once the connection commits.
     #[test]
@@ -3177,6 +3253,7 @@ mod tests {
             account_label: None,
             transferred: true,
             renewal: None,
+            login_hint: None,
         };
 
         assert!(apply_recovery_platform_client(
