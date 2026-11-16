@@ -37,6 +37,7 @@ impl Store {
             return Err(Error::new("epoch-mismatch", 409));
         }
         let expires = super::uploads::now()? as u64 + ACCESS_LIFETIME_SECONDS;
+        let paths = self.object_paths();
         let mut grants = Vec::with_capacity(requests.len());
         for request in requests {
             request.validate()?;
@@ -52,7 +53,7 @@ impl Store {
             if request.object.size != size.into() {
                 return Err(Error::new("object-size-mismatch", 409));
             }
-            self.check_object_body(&db, &request.object.hash, size)?;
+            self.check_object_body(&db, &paths, &request.object.hash, size)?;
             let claims = MediaClaims {
                 library_id: head.library_id.clone(),
                 epoch: head.epoch.clone(),

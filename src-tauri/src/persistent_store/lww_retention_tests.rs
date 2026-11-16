@@ -104,7 +104,7 @@ fn polling_keeps_only_the_newest_finished_page_of_each_stream() {
 }
 
 #[test]
-fn pages_that_repeat_the_stream_cursor_stay_until_a_later_page_moves_it() {
+fn only_external_pages_that_repeat_the_cursor_stay_until_a_later_page_moves_it() {
     let (_dir, mut store) = store();
     let part = |store: &PersistentStore, index: u64, cursor: u64| page(store, &format!("group-{index}"), "external", Some(EXTERNAL_WRITER), cursor,
         vec![change(&["root", "language"], index + 1, serde_json::json!(format!("part-{index}")))]);
@@ -114,14 +114,45 @@ fn pages_that_repeat_the_stream_cursor_stay_until_a_later_page_moves_it() {
         let next = part(&store, index, 4);
         deliver(&mut store, &next, vec![]);
     }
-    assert_eq!(finished_receives(&store), ["group-0", "group-1", "group-2"]);
+    // A state bootstrap repeats the server cursor on every page but its last.
+    for index in 0..3u64 {
+        let bootstrap = page(&store, &format!("bootstrap-{index}"), "server", None, 7,
+            vec![change(&["root", "username"], index + 1, serde_json::json!(format!("bootstrap-{index}")))]);
+        deliver(&mut store, &bootstrap, vec![]);
+    }
+    assert_eq!(finished_receives(&store), ["bootstrap-2", "group-0", "group-1", "group-2"]);
     let revision = store.revision().unwrap();
     deliver(&mut store, &first, vec![]);
     assert_eq!(store.revision().unwrap(), revision);
     let last = part(&store, 3, 5);
     deliver(&mut store, &last, vec![]);
-    assert_eq!(finished_receives(&store), ["group-3"]);
+    assert_eq!(finished_receives(&store), ["bootstrap-2", "group-3"]);
     assert_eq!(store.read_root(None).unwrap().value["language"], "part-3");
+}
+
+#[test]
+fn finishing_a_page_of_an_external_group_costs_in_proportion_to_the_group() {
+    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    let (_dir, mut store) = store();
+    let mut steps = Vec::new();
+    for index in 0..48u64 {
+        let part = page(&store, &format!("group-{index:02}"), "external", Some(EXTERNAL_WRITER), 4,
+            vec![change(&["root", "language"], index + 1, serde_json::json!(format!("part-{index}")))]);
+        store.lww_stage_receive(&part).unwrap();
+        store.lww_apply_receive(&ApplyReceive { header: part.header.clone(), generating: vec![] }).unwrap();
+        let counted = Arc::new(AtomicUsize::new(0));
+        let counter = counted.clone();
+        store.device_store().unwrap().connection().progress_handler(8, Some(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            false
+        })).unwrap();
+        store.lww_finish_receive(&part.header).unwrap();
+        store.device_store().unwrap().connection().progress_handler(8, None::<fn() -> bool>).unwrap();
+        steps.push(counted.load(Ordering::Relaxed));
+    }
+    assert_eq!(finished_receives(&store).len(), 48);
+    // Comparing every retained page with every later one would cost the square of the group.
+    assert!(steps[47] <= steps[11] * 4, "{steps:?}");
 }
 
 #[test]

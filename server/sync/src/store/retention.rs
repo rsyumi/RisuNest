@@ -61,6 +61,7 @@ impl Store {
         if Self::read_head(&tx)?.epoch != epoch {
             return Err(Error::new("epoch-mismatch", 409));
         }
+        let paths = self.object_paths();
         let mut retained = Vec::with_capacity(objects.len());
         let mut seen = std::collections::BTreeSet::new();
         for object in objects {
@@ -84,7 +85,7 @@ impl Store {
             {
                 return Err(Error::new("object-size-mismatch", 409));
             }
-            self.check_object_body(&tx, &object.hash, size as u64)?;
+            self.check_object_body(&tx, &paths, &object.hash, size as u64)?;
             let retention_id = crate::identity::secret_token()?;
             tx.execute("INSERT INTO object_custody(device,hash,retention_id) VALUES(?1,?2,?3) ON CONFLICT(device,hash) DO UPDATE SET retention_id=excluded.retention_id",params![device.id,object.hash,retention_id])?;
             retained.push(RetainedObject {

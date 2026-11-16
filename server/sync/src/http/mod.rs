@@ -691,6 +691,7 @@ async fn missing(State(app): State<App>, body: Bytes) -> Result<Response> {
         return Err(Error::new("too-many-candidates", 400));
     }
     blocking(move || {
+        let paths = app.store.object_paths();
         let mut absent = Vec::new();
         for candidate in candidates {
             match app.store.object_size(&candidate.hash)? {
@@ -698,7 +699,7 @@ async fn missing(State(app): State<App>, body: Bytes) -> Result<Response> {
                 Some(size) if candidate.size != size.into() => {
                     return Err(Error::new("object-size-mismatch", 409))
                 }
-                Some(_) if !app.store.object_presence(&candidate.hash)? => {
+                Some(_) if !app.store.object_presence_in(&paths, &candidate.hash)? => {
                     absent.push(candidate.hash)
                 }
                 _ => (),

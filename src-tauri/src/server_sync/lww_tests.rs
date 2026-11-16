@@ -1788,6 +1788,61 @@ fn a_multi_page_bootstrap_from_cursor_zero_finishes_every_page() {
 }
 
 #[test]
+fn a_bootstrap_reports_what_is_left_of_its_pin_in_every_session() {
+    use super::progress::{within, ProgressLane};
+    let server = LocalServerFixture::new();
+    ServerWriter::new(&server.server).push_units("first-library", "unit", 1100);
+    raise_journal_floor(&server);
+    let (_root, mut target) = local();
+    server.client(&target);
+    let (_earlier_root, mut earlier) = local();
+    server.client(&earlier);
+    // Each page is read by a new client, as a later session would read it.
+    let page = |target: &mut PersistentStore| {
+        let lane = Arc::new(ProgressLane::default());
+        within(&lane, || {
+            let client = LocalServerFixture::reopen_client(target, Default::default())?;
+            receive_cycle(&client, target, &[])
+        }).unwrap();
+        let read = lane.snapshot("receive");
+        (read.backlog_done, read.backlog_left)
+    };
+    let log = |target: &PersistentStore| OperationLog::open(target.repository_root()).unwrap().0;
+    let counts = |target: &PersistentStore| -> i64 {
+        log(target).query_row("SELECT count(*) FROM bootstrap_received", [], |row| row.get(0)).unwrap()
+    };
+    let (done, left) = page(&mut target);
+    assert_eq!(done, 256);
+    let total = done + left;
+    assert!(total >= 1100, "{total}");
+    for pages in 2..=4 {
+        assert_eq!(page(&mut target), (256, total - 256 * pages));
+    }
+    assert_eq!(page(&mut target).1, 0);
+    assert_eq!(received_bootstrap_units(&target), 1100);
+    assert_eq!(counts(&target), 0);
+    // A bootstrap an earlier version began kept no count of what it received, so the rest of
+    // its pages report no known work.
+    page(&mut earlier);
+    let kept: (String, String, i64) = log(&earlier)
+        .query_row("SELECT pin,after_key,units FROM bootstrap_received", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap();
+    log(&earlier).execute("DELETE FROM bootstrap_received", []).unwrap();
+    for _ in 2..=3 {
+        assert_eq!(page(&mut earlier), (0, 0));
+    }
+    // Nor does a count an earlier version left behind when it read further pages.
+    log(&earlier)
+        .execute("INSERT INTO bootstrap_received VALUES(?1,?2,?3)", rusqlite::params![kept.0, kept.1, kept.2])
+        .unwrap();
+    for _ in 4..=5 {
+        assert_eq!(page(&mut earlier), (0, 0));
+    }
+    assert_eq!(received_bootstrap_units(&earlier), 1100);
+    assert_eq!(counts(&earlier), 0);
+}
+
+#[test]
 fn a_multi_page_bootstrap_from_a_received_cursor_keeps_it_until_the_last_page() {
     let server = LocalServerFixture::new();
     let writer = ServerWriter::new(&server.server);

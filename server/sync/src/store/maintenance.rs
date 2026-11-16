@@ -83,11 +83,12 @@ impl Store {
             scan.objects = None;
             scan.shard = scan.shard.wrapping_add(1);
         }
+        let paths = self.object_paths();
         for entry in entries {
             let entry = entry?;
             let hash = entry.file_name().to_string_lossy().into_owned();
             if risunest_sync_wire::validate_hash(&hash).is_err()
-                || entry.path() != self.object_path(&hash)?
+                || entry.path() != paths.path(&hash)?
             {
                 continue;
             }
@@ -248,6 +249,7 @@ impl Store {
         let mut removed = Vec::new();
         let mut directories = std::collections::BTreeSet::new();
         let mut obsolete = Vec::new();
+        let paths = self.object_paths();
         for (row, digest) in rows {
             let exists: bool = db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM objects WHERE hash=?1)",
@@ -258,7 +260,7 @@ impl Store {
                 obsolete.push(row);
                 continue;
             }
-            let path = self.object_path(&digest)?;
+            let path = paths.path(&digest)?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     directories.insert(path.parent().unwrap().to_owned());
