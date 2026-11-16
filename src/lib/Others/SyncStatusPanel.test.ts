@@ -10,7 +10,8 @@ import { get } from 'svelte/store'
 import { language } from 'src/lang'
 import { externalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
 import { syncStatusPanel } from 'src/ts/gui/syncStatusPanel'
-import { DBState } from 'src/ts/stores.svelte'
+import { DBState, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
+import { externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
 import { syncStatus, type SyncStatusSource } from 'src/ts/storage/sync/syncStatus'
 import type { ServerSyncView } from 'src/ts/storage/sync/syncStatusView'
 import type { ExternalConnectionSummary } from 'src/ts/storage/sync/external/types'
@@ -23,6 +24,8 @@ afterEach(async () => {
     component = undefined
     document.body.replaceChildren()
     syncStatus.set(null)
+    settingsOpen.set(false)
+    externalRenewalRequest.set(null)
     DBState.db.risunestSyncStatusUi = true
 })
 async function open(source: SyncStatusSource) {
@@ -88,4 +91,22 @@ it('reads external storage again when it opens and shows its last sync without p
         [language.risuNest.serverSync.lastSuccess, lastSuccess],
         [externalStorageStrings('en').thisDevice, language.risuNest.syncStatus.saved],
     ])
+})
+
+it('offers to sign in again in place of Sync Now while an external sync stops on its sign-in', async () => {
+    const strings = externalStorageStrings('en')
+    const connection = { id: 'drive-1', purpose: 'sync', status: 'ready' } as Partial<ExternalConnectionSummary> as ExternalConnectionSummary
+    await open({ target: 'external', connection, failure: { kind: 'reauthRequired' }, syncStopped: false, refresh: () => {}, syncNow: async () => {} })
+    const buttons = () => [...document.querySelectorAll('[data-sync-status-panel] .border-t button')].map(button => button.textContent?.trim())
+    expect(buttons()).toEqual([strings.renew, language.risuNest.tabs.sync])
+
+    ;[...document.querySelectorAll<HTMLButtonElement>('[data-sync-status-panel] button')].find(button => button.textContent?.trim() === strings.renew)!.click()
+    await tick()
+    expect(get(syncStatusPanel)).toBeNull()
+    expect(get(externalRenewalRequest)).toBe('drive-1')
+    expect([get(settingsOpen), get(SettingsMenuIndex)]).toEqual([true, 17])
+
+    syncStatus.set({ target: 'external', connection, syncStopped: false, refresh: () => {}, syncNow: async () => {} })
+    syncStatusPanel.set({ anchor: document.body.querySelector('button')!, placement: 'side' }); await tick()
+    expect(buttons()[0]).toBe(language.risuNest.serverSync.syncNow)
 })

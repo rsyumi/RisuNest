@@ -151,6 +151,7 @@ describe('external sync asset downloads', () => {
     it.each([
         { kind: 'localStorageFull', retryable: false },
         { code: 'asset-jobs-unresolved', status: 409, retryable: false },
+        { code: 'external-reauth-required', status: 502, retryable: true },
     ])('retries a blocked download only after recovery or an explicit request: %j', async failure => {
         fixture.download.mockRejectedValueOnce(failure)
         dispose = await installExternalLwwAdapters(state()); await settle()
@@ -341,6 +342,9 @@ describe('native external LWW adapter', () => {
         expect(failures.get('sync')).toEqual({ kind: 'previousStorageUnavailable' })
         transport.reportStopped!(new AggregateError([{ kind: 'corrupt' }], 'stopped'))
         expect(failures.get('sync')).toEqual({ kind: 'corrupt' })
+        // A renewed connection clears only a sign-in stop, so this one stays named.
+        await refreshExternalLwwAdapters({ connections: [{ id: 'sync', providerId: 'webdav', purpose: 'sync', lastVerifiedAtMs: '2' }] } as unknown as ExternalStorageState); await settle()
+        expect(failures.get('sync')).toEqual({ kind: 'corrupt' })
         unsubscribe()
     })
     it('keeps checking after clock skew and stops only on corruption', async () => {
@@ -370,6 +374,34 @@ describe('native external LWW adapter', () => {
         await vi.advanceTimersByTimeAsync(600_000); await settle()
         expect(receives()).toBe(refused)
     })
+    it('stops on an expired sign-in until the connection signs in again, then receives at once', async () => {
+        const signedIn = (verifiedAtMs: string) => ({ connections: [{ id: 'sync', providerId: 'google_drive', purpose: 'sync', status: 'ready', lastVerifiedAtMs: verifiedAtMs }] } as unknown as ExternalStorageState)
+        dispose = await installExternalLwwAdapters(signedIn('1')); await settle()
+        let failures: ReadonlyMap<string, unknown> = new Map()
+        const unsubscribe = subscribeExternalLwwFailures(value => { failures = value })
+        const receives = () => fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_receive').length
+        fixture.invoke.mockImplementation(async command => { if (command === 'external_lww_receive') throw { kind: 'reauthRequired' } })
+        await vi.advanceTimersByTimeAsync(20_000); await settle()
+        const refused = receives()
+        expect(failures.get('sync')).toEqual({ kind: 'reauthRequired' })
+        // The sync failure leaves the connection unmarked, so reading the same state again changes nothing.
+        await refreshExternalLwwAdapters(signedIn('1')); await vi.advanceTimersByTimeAsync(600_000); await settle()
+        expect(receives()).toBe(refused)
+
+        let release: (() => void) | undefined
+        fixture.invoke.mockImplementation(async command => {
+            if (command === 'external_lww_receive') { await new Promise<void>(resolve => { release = resolve }); return null }
+            return command === 'external_lww_publish' ? { segments: '0', more: false } : undefined
+        })
+        await refreshExternalLwwAdapters(signedIn('2')); await vi.advanceTimersByTimeAsync(1_000); await settle()
+        // The stop clears with the new sign-in instead of after the receive it starts.
+        expect(receives()).toBe(refused + 1)
+        expect(failures.has('sync')).toBe(false)
+        fixture.invoke.mockImplementation(async command => command === 'external_lww_receive' ? null : command === 'external_lww_publish' ? { segments: '0', more: false } : undefined)
+        release!(); await settle()
+        expect(failures.has('sync')).toBe(false)
+        unsubscribe()
+    })
     it('rechecks a library format stop natively on return to the screen and switches the library on request', async () => {
         dispose = await installExternalLwwAdapters(state()); await settle()
         let failures: ReadonlyMap<string, unknown> = new Map()
@@ -384,6 +416,10 @@ describe('native external LWW adapter', () => {
         const checks = () => fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_check_format')
         fixture.viewport!({}); await settle()
         expect(failures.get('sync')).toEqual(stop)
+        // A renewed connection leaves the stop and its switch in place instead of clearing them until the next check.
+        const renewed = refreshExternalLwwAdapters({ connections: [{ id: 'sync', providerId: 'webdav', purpose: 'sync', lastVerifiedAtMs: '2' }] } as unknown as ExternalStorageState)
+        expect(failures.get('sync')).toEqual(stop)
+        await renewed; await settle()
         await vi.advanceTimersByTimeAsync(120_000); await settle()
         expect(checks()).toHaveLength(0)
         // A body download that fails meanwhile does not hide the stop and its switch.

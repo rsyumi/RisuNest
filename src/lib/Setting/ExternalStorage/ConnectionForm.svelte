@@ -94,6 +94,10 @@
     let accepted = $state<string[]>([])
     let prepared = $state<PreparedExternalConnection | null>(null)
     let endpointConfirmed = $state(false)
+    // A renewal keeps the server and folder the user already confirmed when connecting.
+    const endpointReady = $derived(!!renewalConnection || endpointConfirmed)
+    let formElement = $state<HTMLFieldSetElement>()
+    let signInFocused = false
     let connectionSettingsPayload = $state('')
     let recoveryKey = $state('')
     let pendingAuthorizationId = $state<string | null>(null)
@@ -171,6 +175,16 @@
         : strings.connect)
 
     $effect(() => onbusychange(busy))
+
+    $effect(() => {
+        // The button that opened a renewal leaves with the list it was in, so focus moves to what signs in.
+        if (!renewalConnection || !prepared || busy || signInFocused) return
+        signInFocused = true
+        // A key-based provider needs its new key before the button can do anything.
+        const keyField = prepared.requiresOAuth ? undefined : definition.secretFields[0]?.key
+        void tick().then(() => (keyField ? document.getElementById(FIELD_ID + keyField) : formElement?.querySelector<HTMLElement>('[data-sign-in-action]'))
+            ?.focus({ preventScroll: true }))
+    })
 
     $effect(() => {
         if (!destroyed && !busy && readyAuthorizationId && readyAuthorizationId === pendingAuthorizationId) {
@@ -568,7 +582,7 @@
     }
 
     async function connect(): Promise<void> {
-        if (!prepared || !endpointConfirmed || busy) return
+        if (!prepared || !endpointReady || busy) return
         if (folderSelection && !folder) return
         if (!folderSelection && !prepared.requiresOAuth && !fromTransfer
             && reportMissingFields(definition.secretFields)) return
@@ -689,7 +703,7 @@
         <SettingButton variant="secondary" onclick={cancelPendingAuthorization}>{strings.cancel}</SettingButton>
     </div>
 {/if}
-<fieldset disabled={busy} class="form" data-external-storage-connection-form data-tone={tone}>
+<fieldset bind:this={formElement} disabled={busy} class="form" data-external-storage-connection-form data-tone={tone}>
     {#if !renewalConnection}
     <fieldset disabled={prepared !== null} class="contents">
     <section class="sub">
@@ -840,17 +854,17 @@
                     <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
                 </div>
             {:else}
-            <SettingToggle showLabel label={strings.confirmEndpoint} bind:checked={endpointConfirmed} />
+            {#if !renewalConnection}<SettingToggle showLabel label={strings.confirmEndpoint} bind:checked={endpointConfirmed} />{/if}
             {#if prepared.requiresPlatformOAuthClient}
                 <label class="field"><span>{googleAndroid ? strings.webOAuthClientId : strings.platformClientId}</span><TextInput className="disabled:opacity-50" fullwidth bind:value={currentPlatformClientId} /></label>
             {/if}
-            {#if endpointConfirmed && prepared.requiresOAuth && googleOAuth}
+            {#if endpointReady && prepared.requiresOAuth && googleOAuth}
                 <div class="fields two">
-                    <label class="field"><span>{strings.oauthClientSecret}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} />{#if renewalConnection}<small>{strings.renewalClientSecretHelp}</small>{/if}</label>
+                    <label class="field"><span>{strings.oauthClientSecret}{renewalConnection ? strings.optional : ''}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={oauthClientSecret} />{#if renewalConnection}<small>{strings.renewalClientSecretHelp}</small>{/if}</label>
                     {#if googleAndroid && pendingAuthorizationId}<label class="field"><span>{strings.manualOAuthCallback}</span><TextInput className="disabled:opacity-50" fullwidth hideText bind:value={manualOAuthCallback} /><small>{strings.manualOAuthHelp}</small></label>{/if}
                 </div>
             {/if}
-            {#if endpointConfirmed && !prepared.requiresOAuth && !fromTransfer}
+            {#if endpointReady && !prepared.requiresOAuth && !fromTransfer}
                 <div class="fields two">
                     {#each definition.secretFields as field (field.key)}
                         {@const help = externalFieldHelp(strings, providerId, field.key)}
@@ -873,8 +887,8 @@
             {/if}
             {#if authorizationStatus}<p class="sub-help" role="status">{authorizationStatus}</p>{/if}
             <div class="actions">
-                <SettingButton {busy} disabled={!endpointConfirmed || !authorizationAvailable || (prepared.requiresPlatformOAuthClient && !currentPlatformClientId.trim())} onclick={connect}>{connectLabel}</SettingButton>
-                <SettingButton variant="secondary" onclick={resetPrepared}>{strings.back}</SettingButton>
+                <SettingButton data-sign-in-action {busy} disabled={!endpointReady || !authorizationAvailable || (prepared.requiresPlatformOAuthClient && !currentPlatformClientId.trim())} onclick={connect}>{connectLabel}</SettingButton>
+                <SettingButton variant="secondary" onclick={resetPrepared}>{renewalConnection ? strings.cancel : strings.back}</SettingButton>
             </div>
             {#if !prepared.requiresOAuth && mode === 'create'}<p class="sub-help">{strings.connectHint}</p>{/if}
             {/if}

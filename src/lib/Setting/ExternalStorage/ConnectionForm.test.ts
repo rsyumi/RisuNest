@@ -1189,7 +1189,7 @@ describe('authorization waiting copy and renewal', () => {
         expect(target.textContent?.includes(strings.manualOAuthHelp)).toBe(platform === 'android' && provider === 'google_drive')
     })
 
-    it('renews an existing connection without editing its provider configuration', async () => {
+    it('renews an existing connection without editing its provider configuration or confirming its address again', async () => {
         const connected = vi.fn()
         const renewed = { id: 'existing', providerId: 'webdav', purpose: 'backup' } as import('src/ts/storage/sync/external/types').ExternalConnectionSummary
         state.prepareRenewal.mockResolvedValue({ ...prepared, requiresOAuth: false })
@@ -1198,11 +1198,10 @@ describe('authorization waiting copy and renewal', () => {
         await settle()
         expect(state.prepareRenewal).toHaveBeenCalledWith('existing')
         expect(target.querySelector('select')).toBeNull()
-        labelControl<HTMLInputElement>(strings.confirmEndpoint).click()
-        await settle()
-        const password = target.querySelector<HTMLInputElement>('input[type="password"]')!
-        expect(password).toBeDefined()
-        typeInto(password, 'synthetic-renewed-password')
+        expect(target.textContent).not.toContain(strings.confirmEndpoint)
+        const password = target.querySelector<HTMLInputElement>('input[type="password"]')
+        expect(document.activeElement).toBe(password)
+        typeInto(password!, 'synthetic-renewed-password')
         await settle()
         button(strings.connect).click()
         await settle()
@@ -1217,14 +1216,22 @@ describe('authorization waiting copy and renewal', () => {
     ])('reviews a signed-in renewal with the saved account and folder %#', async (repositoryHint, shown) => {
         const renewed = { id: 'existing', providerId: 'google_drive', purpose: 'backup' } as import('src/ts/storage/sync/external/types').ExternalConnectionSummary
         state.prepareRenewal.mockResolvedValue({ ...prepared, endpoint: { ...prepared.endpoint, accountHint: 'synthetic@example.invalid', repositoryHint } })
-        component = mount(ConnectionForm, { target, props: { strings, renewalConnection: renewed, onconnected: vi.fn(), oncancel: vi.fn() } })
+        const cancelled = vi.fn()
+        component = mount(ConnectionForm, { target, props: { strings, renewalConnection: renewed, onconnected: vi.fn(), oncancel: cancelled } })
         await settle()
         const terms = [...target.querySelectorAll('dt')]
         expect(terms.find(term => term.textContent === strings.account)?.nextElementSibling?.textContent).toBe('synthetic@example.invalid')
         expect(terms.find(term => term.textContent === strings.repository)?.nextElementSibling?.textContent).toBe(shown)
-        labelControl<HTMLInputElement>(strings.confirmEndpoint).click()
-        await settle()
-        expect(labelControl<HTMLInputElement>(strings.oauthClientSecret).closest('label')?.textContent).toContain(strings.renewalClientSecretHelp)
+        expect(target.textContent).not.toContain(strings.confirmEndpoint)
+        const secret = labelControl<HTMLInputElement>(strings.oauthClientSecret).closest('label')!
+        expect(secret.querySelector('span')?.textContent).toBe(strings.oauthClientSecret + strings.optional)
+        expect(secret.textContent).toContain(strings.renewalClientSecretHelp)
+        expect(button(strings.signIn).disabled).toBe(false)
+        expect(document.activeElement).toBe(button(strings.signIn))
+        // Leaving a renewal closes it; there is no earlier step to return to.
+        expect(() => button(strings.back)).toThrow()
+        button(strings.cancel).click(); await settle()
+        expect(cancelled).toHaveBeenCalledOnce()
     })
 })
 

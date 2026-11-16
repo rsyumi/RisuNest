@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte'
+    import { onDestroy, onMount, tick, untrack } from 'svelte'
     import ConnectionSettingsDialog from './ConnectionSettingsDialog.svelte'
     import { runWithMobileBackgroundTask, measuredTaskPercent } from 'src/ts/mobileBackgroundTask'
     import TextInput from 'src/lib/UI/GUI/TextInput.svelte'
@@ -24,7 +24,8 @@
     import BindingTargetSwitch from 'src/ts/storage/sync/BindingTargetSwitch.svelte'
     import { PREVIOUS_FILES_DOWNLOAD_FAILED } from 'src/ts/storage/sync/bindingFlow'
     import { language } from 'src/lang'
-    import { externalJobIsActive, externalJobIsPaused, externalJobProgress, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
+    import { externalJobIsActive, externalJobIsPaused, externalJobProgress, externalNeedsRenewal, mergeExternalHistoryItems } from 'src/ts/storage/sync/external/connection'
+    import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
     import {
         refreshExternalStorageProductionState,
         requestExternalStorageNow,
@@ -63,6 +64,8 @@
     let adding = $state(false)
     let addressConnection = $state<ExternalConnectionSummary | undefined>()
     let renewalConnection = $state<ExternalConnectionSummary | undefined>()
+    /** A finished renewal until the state read after it, so a notice for the stop it cleared does not flash back. */
+    let renewalSettling = $state(false)
     let unlockConnection = $state<ExternalConnectionSummary | undefined>()
     let unlockKey = $state('')
     let destroyed = false
@@ -271,21 +274,58 @@
         }, 1200)
     }
 
+    $effect(() => {
+        const connectionId = $externalRenewalRequest
+        if (!connectionId || !storageState || busy) return
+        untrack(() => {
+            externalRenewalRequest.set(null)
+            const connection = storageState?.connections.find(item => item.id === connectionId)
+            if (!connection) return
+            // A form already open keeps what it holds; the request only brings it into view.
+            if (!adding && !addressConnection && !renewalConnection) renewalConnection = connection
+            void tick().then(() => document.getElementById('risunest-external-storage')?.scrollIntoView({ block: 'start' }))
+        })
+    })
+
+    $effect(() => {
+        if (!renewalConnection && !renewalSettling) return
+        externalRenewalOpen.set(true)
+        return () => externalRenewalOpen.set(false)
+    })
+
+    function closeForm(): void {
+        adding = false
+        renewalConnection = undefined
+        addressConnection = undefined
+    }
+
     async function onConnected(result: ExternalConnectionResult): Promise<void> {
         busy = false
         adding = false
         const addressChanged = addressConnection !== undefined
         addressConnection = undefined
         const renewed = renewalConnection !== undefined
+        renewalSettling = renewed
         renewalConnection = undefined
         if (result.recovery) recoveryKey = result.recovery.key
-        await refreshExternalStorageProductionState()
-        await refresh()
+        // The history read with the old sign-in or address is read again with the new one.
+        if (renewed || addressChanged) historyRequested.delete(result.connection.id)
+        try {
+            await refreshExternalStorageProductionState()
+            await refresh()
+        } finally {
+            renewalSettling = false
+        }
         schedulePoll()
         if (addressChanged) return
         if (renewed) {
             const job = activeJob(result.connection)
             if (job && externalJobIsPaused(job)) await resumeJob(result.connection, job)
+            // Sync stopped on the failed sign-in; it runs now instead of at its next retry.
+            const selection = storageState?.selection
+            if (selection?.kind === 'external' && selection.connectionId === result.connection.id) {
+                void requestExternalLwwNow(result.connection.id).catch(() => {}).finally(() => refresh(true))
+            }
         } else if (result.connection.purpose === 'sync') {
             if (recoveryKey) pendingSyncStart = result.connection
             else await startSync(result.connection)
@@ -885,7 +925,7 @@
     {#if !storageState && busy}<p class="placeholder">{strings.loading}</p>
     {:else if storageState && !storageState.supported}<p class="placeholder">{strings.unsupported}</p>
     {:else if adding || renewalConnection || addressConnection}
-        <ConnectionForm {addressConnection} {renewalConnection} {strings} onconnected={onConnected} oncancel={() => { adding = false; renewalConnection = undefined; addressConnection = undefined }} onbusychange={value => busy = value} />
+        <ConnectionForm {addressConnection} {renewalConnection} {strings} onconnected={onConnected} oncancel={closeForm} onbusychange={value => busy = value} />
     {:else if storageState}
         {#if !storageState.connections.length}
             <div class="blank">
@@ -897,7 +937,7 @@
             {@const job = activeJob(connection)}
             {@const ProviderIcon = providerIcon(connection.providerId)}
             {@const badge = connectionBadge(connection)}
-            {@const renewable = connection.status === 'reauth-required' || job?.error?.action === 'reauthenticate'}
+            {@const renewable = connection.status === 'reauth-required' || job?.error?.action === 'reauthenticate' || externalNeedsRenewal(syncFailures.get(connection.id))}
             {@const lockable = connection.status === 'key-locked' || job?.error?.action === 'unlock-key'}
             {@const recheckable = job?.state === 'uncertain' && job.kind === 'backup'}
             {@const retryable = !!job && externalJobIsPaused(job) && ['retry', 'wait', 'free-space'].includes(job.error?.action ?? '') && ['backup', 'cleanup', 'restore', 'check-repository', 'pin-history', 'delete-history'].includes(job.kind)}

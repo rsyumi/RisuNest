@@ -5,7 +5,8 @@ import { mount, tick, unmount } from 'svelte'
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
 import { DBState, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
-import { activeRisuNestSettingsTab } from 'src/ts/setting/risuNestSettingsTabs'
+import { activeRisuNestSettingsTab, risuNestSettingsTabRequest } from 'src/ts/setting/risuNestSettingsTabs'
+import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
 import { pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import { externalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
 import { syncStatus, type SyncStatusSource } from 'src/ts/storage/sync/syncStatus'
@@ -22,6 +23,9 @@ afterEach(async () => {
     pluginStartupState.set({ phase: 'released', since: 0 })
     settingsOpen.set(false)
     activeRisuNestSettingsTab.set(null)
+    risuNestSettingsTabRequest.set(null)
+    externalRenewalRequest.set(null)
+    externalRenewalOpen.set(false)
     DBState.db.risunestSyncStatusUi = true
 })
 const server = (view: Partial<ServerSyncView>): SyncStatusSource => ({
@@ -81,13 +85,28 @@ it('leaves the stop to the plugin notice while plugins wait and omits the open s
     expect([...notice()!.querySelectorAll('button')].map(button => button.getAttribute('aria-label'))).toEqual([language.close])
 })
 
-it('reports an external connection that needs the user', async () => {
+it.each([
+    ['is marked', { status: 'reauth-required', lastError: { code: 'unauthorized', message: '', retryable: false, action: 'reauthenticate' } }, undefined],
+    ['failed a sync', { status: 'ready' }, { kind: 'reauthRequired' }],
+] as const)('offers to sign in again when an external connection %s for it', async (_, state, failure) => {
     const strings = externalStorageStrings('en')
     component = mount(SyncStoppedNotice, { target: document.body })
-    const connection = { id: 'webdav-1', purpose: 'sync', status: 'reauth-required', lastError: { code: 'unauthorized', message: '', retryable: false, action: 'reauthenticate' } } as Partial<ExternalConnectionSummary> as ExternalConnectionSummary
-    await show({ target: 'external', connection, syncStopped: false, refresh: () => {}, syncNow: async () => {} })
+    const connection = { id: 'webdav-1', purpose: 'sync', ...state } as Partial<ExternalConnectionSummary> as ExternalConnectionSummary
+    await show({ target: 'external', connection, failure, syncStopped: false, refresh: () => {}, syncNow: async () => {} })
     expect(notice()?.querySelector('p')?.textContent).toBe(strings.statusReauth)
     expect(notice()?.textContent).toContain(strings.reauthenticate)
+    const buttons = [...notice()!.querySelectorAll('button')]
+    expect(buttons.map(button => button.getAttribute('aria-label') ?? button.textContent?.trim())).toEqual([language.close, strings.renew])
+
+    buttons[1].click(); await tick()
+    expect(get(externalRenewalRequest)).toBe('webdav-1')
+    expect([get(settingsOpen), get(SettingsMenuIndex), get(risuNestSettingsTabRequest)]).toEqual([true, 17, 'sync'])
+
+    // The form takes the place the notice covers; closing it with sync still stopped brings the notice back.
+    externalRenewalOpen.set(true); await tick()
+    expect(notice()).toBeNull()
+    externalRenewalOpen.set(false); await tick()
+    expect(notice()).not.toBeNull()
 })
 
 it('stays hidden while the sync UI is turned off', async () => {

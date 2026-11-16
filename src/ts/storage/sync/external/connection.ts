@@ -114,6 +114,16 @@ export function externalErrorKind(value: unknown): string | undefined {
     return typeof kind === 'string' ? kind : undefined
 }
 
+/** The code an asset download reports when the provider asks to sign in again. */
+export const EXTERNAL_ASSET_REAUTH_CODE = 'external-reauth-required'
+
+/** Whether signing in again, or entering a new key for a key-based provider, clears this failure. */
+export function externalNeedsRenewal(value: unknown): boolean {
+    if (typeof value !== 'object' || value === null) return false
+    if ((value as { action?: unknown }).action === 'reauthenticate') return true
+    return ['reauthRequired', 'unauthorized', EXTERNAL_ASSET_REAUTH_CODE].includes(externalErrorKind(value) ?? '')
+}
+
 export function externalJobIsPaused(job: ExternalJobSummary): boolean {
     return job.state === 'waiting'
         && job.phase === 'paused'

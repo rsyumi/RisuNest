@@ -114,6 +114,8 @@ describe('externalErrorMessage', () => {
             strings.reauthenticate,
             strings.oauthErrorCode.replace('{0}', '<script>alert(1)</script>'),
         ].join('\n'))
+        // An asset download names the same stop with its own code.
+        expect(externalErrorMessage(strings, { code: 'external-reauth-required', status: 502, retryable: true })).toBe(strings.reauthenticate)
     })
 
     it('falls back for a local failure that carries no native kind', () => {

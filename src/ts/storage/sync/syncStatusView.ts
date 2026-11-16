@@ -1,6 +1,6 @@
 import { language } from 'src/lang'
 import { externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
-import { externalJobIsActive, externalJobIsPaused } from './external/connection'
+import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal } from './external/connection'
 import type { ExternalOperationProgress } from './external/progress'
 import type { ExternalConnectionSummary, ExternalJobSummary } from './external/types'
 import { formatLevelLabel, registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
@@ -52,6 +52,8 @@ export function externalSyncStatusView(
             : connection.status === 'key-locked' ? strings.statusLocked : strings.statusError
         return { label, tone: 'attention', stopped: true }
     }
+    // Sync stops on a sign-in failure without marking the connection.
+    if (externalNeedsRenewal(failure)) return { label: strings.statusReauth, tone: 'attention', stopped: true }
     if (job && (job.state === 'uncertain' || externalJobIsPaused(job))) return { label: strings.statusError, tone: 'attention', stopped: false }
     if (operation?.state === 'running') {
         if (operation.stage === 'waiting') return { label: strings.transfer.waiting, tone: 'idle', stopped: false }
@@ -64,6 +66,15 @@ export function externalSyncStatusView(
     if (catchingUp) return { label: strings.transfer.syncing, tone: 'working', stopped: false }
     if (syncStopped) return { label: strings.statusPaused, tone: 'paused', stopped: false }
     return { label: strings.statusReady, tone: 'connected', stopped: false }
+}
+
+/** The bound external connection that has to sign in again, or take a new key, before sync continues. */
+export function externalRenewalTarget(source: SyncStatusSource | null | undefined, failure?: unknown): string | undefined {
+    if (source?.target !== 'external') return undefined
+    const { connection } = source
+    const renew = connection.status === 'reauth-required'
+        || [connection.lastError, source.job?.error, source.failure, failure].some(externalNeedsRenewal)
+    return renew ? connection.id : undefined
 }
 
 /** The external card's sentence for a connection or job error. */
