@@ -639,14 +639,16 @@ fn visible_server_and_external_groups_start_in_display_order_without_splitting_s
 
 #[test]
 fn a_source_that_asks_to_sign_in_again_names_its_connection_and_other_failures_name_none() {
-    let received = received(&[2]);
-    let root = received.f.directory_b.path();
-    for pack in received.f.provider.objects_with_role(crate::external_storage::contract::ObjectRole::Pack) {
-        received.f.provider.fail_read(&pack, ErrorKind::ReauthRequired);
+    // A changed WebDAV password answers 401, which the provider reports as unauthorized.
+    for kind in [ErrorKind::ReauthRequired, ErrorKind::Unauthorized] {
+        let received = received(&[2]);
+        let root = received.f.directory_b.path();
+        for pack in received.f.provider.objects_with_role(crate::external_storage::contract::ObjectRole::Pack) {
+            received.f.provider.fail_read(&pack, kind);
+        }
+        let refused = serde_json::to_value(hydrate(root, &received.publications[0]).unwrap_err()).unwrap();
+        assert_eq!((&refused["code"], &refused["connectionId"]), (&serde_json::json!("external-reauth-required"), &serde_json::json!("receiver")), "{kind:?}");
     }
-    let refused = serde_json::to_value(hydrate(root, &received.publications[0]).unwrap_err()).unwrap();
-    assert_eq!(refused["code"], "external-reauth-required");
-    assert_eq!(refused["connectionId"], "receiver");
     let missing = serde_json::to_value(source_error("receiver")(ProviderError::new(ErrorKind::NotFound))).unwrap();
     assert_eq!(missing["code"], "external-body-unavailable");
     assert!(missing.get("connectionId").is_none());

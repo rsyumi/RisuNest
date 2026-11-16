@@ -546,7 +546,8 @@ fn hydration_error(_:impl std::fmt::Display)->crate::server_sync::SyncError {cra
 fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
     match error.kind {
         ErrorKind::Cancelled=>crate::server_sync::SyncError::new("cancelled",409),
-        ErrorKind::ReauthRequired=>crate::server_sync::SyncError::new("external-reauth-required",502),
+        // A 401 or 403 asks for the same remedy as an expired sign-in.
+        ErrorKind::ReauthRequired|ErrorKind::Unauthorized=>crate::server_sync::SyncError::new("external-reauth-required",502),
         _=>crate::server_sync::SyncError::new("external-body-unavailable",502),
     }
 }
@@ -554,9 +555,8 @@ fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
 /// names the connection that has to sign in again.
 fn source_error(connection_id:&str)->impl Fn(ProviderError)->crate::server_sync::SyncError+'_ {
     move |error| {
-        let reauth=error.kind==ErrorKind::ReauthRequired;
         let mut value=remote_error(error);
-        if reauth {value.connection_id=Some(connection_id.to_owned());}
+        if value.code=="external-reauth-required" {value.connection_id=Some(connection_id.to_owned());}
         value
     }
 }
