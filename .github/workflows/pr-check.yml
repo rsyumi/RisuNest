@@ -113,8 +113,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - name: Install native and WASM build dependencies
-        timeout-minutes: 15
-        run: sudo apt-get -o Acquire::Retries=2 --error-on=any update && sudo apt-get -o Acquire::Retries=2 install -y clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+        timeout-minutes: 20
+        run: bash scripts/install-apt-packages.sh clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
       - run: pnpm install --frozen-lockfile
       - name: Install the locked WASM binding generator
         shell: pwsh
