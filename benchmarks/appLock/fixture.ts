@@ -18,6 +18,7 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
     const report = sendReport ?? ((stage: string, result: unknown) => invoke(`${platform}_bench_report`, { stage, result }))
     const timed = phase === 'app-lock-timed' || phase === 'app-lock-timed-mutant'
     const ui = phase === 'app-lock-ui'
+    const inactive = phase === 'app-lock-inactive'
     const mutant = phase.endsWith('-mutant')
     Object.assign(window, { __risunestAppLockRemoveCover: mutant })
     let armed = false
@@ -25,9 +26,14 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
     let returned: AppLockLifecycle | null = null
     let blockedMs = 0
     let busyStartedAtMs: number | null = null
+    const trace: AppLockLifecycle[] = []
     // Install before the product subscribes so stale content remains painted while JS is busy.
     await createAppLockNativeAdapter().listen(snapshot => {
         if (!armed) return
+        if (inactive) {
+            trace.push(snapshot)
+            return
+        }
         if (!snapshot.active && !departure) departure = snapshot
         if (snapshot.active && departure && snapshot.epoch > departure.epoch) returned = snapshot
         if (ui || blockedMs !== 0 || (!timed && snapshot.active) || (timed && !snapshot.active)) return
@@ -55,11 +61,16 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
         && performance.getEntriesByName('boot:interactive').length > 0, 'Product content did not become ready')
     const index = DBState.db.characters.findIndex(character => character.chaId === 'char-a')
     if (index < 0 || !await changeChar(index)) throw new Error('Synthetic character did not open')
-    appLock.beginSetup()
-    for (const digit of '123456123456') await appLock.digit(digit)
-    if (!appLock.state.record.enabled || appLock.gated) throw new Error('Public PIN setup did not complete')
-    if (!await appLock.setTiming(timed ? 'after-1m' : 'immediate')) throw new Error('Lock timing did not save')
-    if (platform === 'ios' && !await appLock.setHideRecentsPreview(!ui)) throw new Error('Preview policy did not save')
+    const setUpPin = async () => {
+        appLock.beginSetup()
+        for (const digit of '123456123456') await appLock.digit(digit)
+        if (!appLock.state.record.enabled || appLock.gated) throw new Error('Public PIN setup did not complete')
+    }
+    if (!inactive) {
+        await setUpPin()
+        if (!await appLock.setTiming(timed ? 'after-1m' : 'immediate')) throw new Error('Lock timing did not save')
+    }
+    if (platform === 'ios' && !await appLock.setHideRecentsPreview(inactive || !ui)) throw new Error('Preview policy did not save')
     const main = document.querySelector('main')!
     const retained = document.createElement('section')
     retained.style.cssText = 'position:fixed;left:24px;top:96px;z-index:500;display:grid;gap:12px;background:#202020;padding:8px'
@@ -75,6 +86,15 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
     await frame()
     await appLock.rendered('Synthetic app lock')
     armed = true
+    if (inactive) {
+        try {
+            await inactiveDepartures()
+        } catch (error) {
+            status.textContent = 'verification-error:' + (error instanceof Error ? error.message : String(error))
+            throw error
+        }
+        return
+    }
     await report('app-lock-ready', { timed, mutant, pin: '123456', viewport: { width: innerWidth, height: innerHeight },
         marker: marker.getBoundingClientRect().toJSON(), epoch: appLock.state.epoch, hideRecentsPreview: appLock.state.record.hideRecentsPreview })
     await until(() => returned !== null && appLock.state.locked && appLock.state.flow === 'unlock'
@@ -103,5 +123,50 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
         if (!await appLock.setEnabled(false)) throw new Error('Synthetic lock cleanup failed')
         status.textContent = 'app-lock-retained'
         await report('complete', { passed: true, retained: true })
+    }
+
+    /** iOS: Notification Center over the app leaves it inactive without a background transition. */
+    async function inactiveDepartures() {
+        const steps = [
+            { name: 'preview', setUp: async () => {} },
+            { name: 'timed', setUp: async () => {
+                await setUpPin()
+                if (!await appLock.setTiming('after-1m')) throw new Error('Lock timing did not save')
+            } },
+            { name: 'immediate', setUp: async () => {
+                if (!await appLock.setTiming('immediate')) throw new Error('Lock timing did not save')
+            } },
+        ]
+        for (const step of steps) {
+            await step.setUp()
+            await frame()
+            await appLock.rendered('Synthetic app lock')
+            trace.length = 0
+            status.textContent = `app-lock-inactive-${step.name}-ready`
+            await report(`app-lock-inactive-${step.name}-ready`, { epoch: appLock.state.epoch, record: {
+                enabled: appLock.state.record.enabled, timing: appLock.state.record.timing,
+                hideRecentsPreview: appLock.state.record.hideRecentsPreview } })
+            let locked = false
+            await until(() => {
+                locked ||= appLock.state.locked
+                const away = trace.find(snapshot => !snapshot.active)
+                return away !== undefined && trace.some(snapshot => snapshot.active && snapshot.epoch > away.epoch)
+            }, `No departure and return for the ${step.name} step`, 120_000)
+            if (locked !== (step.name === 'immediate')) throw new Error(`The ${step.name} return ${locked ? 'locked' : 'did not lock'} the page`)
+            await until(() => appLock.state.active && !appLock.gated, `The ${step.name} return stayed gated`, 60_000)
+            // A cover without a lock decision comes off by itself after 3 s; wait past that to see which release ran.
+            await pause(3_500)
+            const away = trace.find(snapshot => !snapshot.active)!
+            const back = trace.find(snapshot => snapshot.active && snapshot.epoch > away.epoch)!
+            const unconfirmed = trace.find(snapshot => snapshot.releasedUnconfirmedAfterSeconds !== undefined)
+            await report(`app-lock-inactive-${step.name}-returned`, { trace: [...trace], awayMs: back.atMs - away.atMs })
+            if (unconfirmed) throw new Error(`The ${step.name} return released the cover without a confirmed frame`)
+            if (document.querySelector('main') !== main || !main.contains(retained) || draft.value !== 'retained synthetic draft 123456') {
+                throw new Error(`The ${step.name} return replaced the retained draft`)
+            }
+            status.textContent = `app-lock-inactive-${step.name}-returned`
+        }
+        if (!await appLock.setEnabled(false)) throw new Error('Synthetic lock cleanup failed')
+        await report('complete', { passed: true })
     }
 }

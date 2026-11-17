@@ -52,6 +52,8 @@ function fixture(options: { record?: unknown; timing?: AppLockTiming; nativeUnlo
         stored: () => stored,
         presented: () => presentedLocked,
         refresh() { listener(lifecycle) },
+        /** Delivers the iOS event for a cover the shell took off without a confirmed frame. */
+        releaseUnconfirmed(seconds: number) { listener({ ...lifecycle, releasedUnconfirmedAfterSeconds: seconds }) },
         emit(active: boolean, atMs: number, departedAtMs: number | null = lifecycle.departedAtMs) {
             miss(active, atMs, departedAtMs)
             listener(lifecycle)
@@ -394,7 +396,7 @@ describe('app lock controller', () => {
         } finally { vi.useRealTimers() }
     })
 
-    it('logs a return frame, policy update or frame confirmation that stays pending once per epoch', async () => {
+    it('logs a return frame, policy update or frame confirmation that stays pending once per epoch, and an unconfirmed cover release', async () => {
         vi.useFakeTimers()
         try {
             const f = fixture()
@@ -436,6 +438,9 @@ describe('app lock controller', () => {
             await f.controller.rendered('unlock')
             await vi.advanceTimersByTimeAsync(3000)
             expect(f.adapter.report).toHaveBeenCalledTimes(3)
+            f.releaseUnconfirmed(3)
+            expect(f.adapter.report).toHaveBeenCalledTimes(4)
+            expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock cover released after 3 s without a confirmed frame: epoch 6')
             f.controller.dispose()
         } finally { vi.useRealTimers() }
     })

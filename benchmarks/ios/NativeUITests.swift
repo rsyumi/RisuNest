@@ -704,6 +704,57 @@ final class NativeUITests: XCTestCase {
         attachScreenshot(app, name: "app-lock-retained-draft")
     }
 
+    func testAppLockInactiveDepartures() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "app-lock-inactive"
+        app.launch()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let texts = app.webViews.staticTexts
+        let failure = texts.containing(NSPredicate(format: "label BEGINSWITH %@", "verification-error:")).firstMatch
+        // Preview hiding with the lock off, a return before the one-minute limit, and an immediate lock.
+        for step in ["preview", "timed", "immediate"] {
+            let ready = texts["app-lock-inactive-\(step)-ready"]
+            XCTAssertTrue(ready.waitForExistence(timeout: 90), "\(step) step did not start")
+            // Notification Center over the app makes it inactive without a background transition.
+            springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0))
+                .press(forDuration: 0.1, thenDragTo: springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.75)))
+            let away = expectation(description: "Keep Notification Center over the app")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { away.fulfill() }
+            wait(for: [away], timeout: 5)
+            let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screen.name = "app-lock-inactive-\(step)-away"
+            screen.lifetime = .keepAlways
+            add(screen)
+            XCTAssertEqual(app.state, .runningForeground, "\(step) departure left the foreground")
+            springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.995))
+                .press(forDuration: 0.1, thenDragTo: springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)))
+            if step == "immediate" {
+                for digit in ["1", "2", "3", "4", "5", "6"] {
+                    let key = app.webViews.buttons[digit]
+                    if !key.waitForExistence(timeout: 30) { attachScreenshot(app, name: "app-lock-inactive-immediate-keypad-missing") }
+                    XCTAssertTrue(key.exists, "PIN keypad did not appear after the immediate return")
+                    key.tap()
+                }
+            }
+            // The native cover hides the page from accessibility, so the text appears only once it is off.
+            let returned = texts["app-lock-inactive-\(step)-returned"]
+            let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in returned.exists || failure.exists }, object: nil)
+            if XCTWaiter().wait(for: [settled], timeout: 45) != .completed || failure.exists {
+                attachScreenshot(app, name: "app-lock-inactive-\(step)-not-returned")
+                if failure.exists {
+                    let diagnostic = XCTAttachment(string: failure.label)
+                    diagnostic.lifetime = .keepAlways
+                    add(diagnostic)
+                }
+                XCTFail("\(step) return did not show the content")
+                return
+            }
+        }
+        XCTAssertEqual(app.webViews.textViews["Retained synthetic draft"].value as? String, "retained synthetic draft 123456")
+        attachScreenshot(app, name: "app-lock-inactive-retained-draft")
+    }
+
     func testProductKeyboard() throws {
         continueAfterFailure = false
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")

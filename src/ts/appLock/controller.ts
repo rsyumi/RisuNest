@@ -206,6 +206,9 @@ export class AppLockController {
 
     lifecycle(snapshot: AppLockLifecycle, refreshPresentation = false): void {
         if (this.disposed || snapshot.epoch < this.state.epoch) return
+        if (snapshot.releasedUnconfirmedAfterSeconds !== undefined) {
+            this.native.report(`app-lock cover released after ${snapshot.releasedUnconfirmedAfterSeconds} s without a confirmed frame: epoch ${snapshot.epoch}`)
+        }
         const changed = snapshot.epoch !== this.state.epoch || snapshot.active !== this.state.active
         if (!changed) {
             if (refreshPresentation && snapshot.active) {

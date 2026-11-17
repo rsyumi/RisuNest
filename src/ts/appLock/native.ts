@@ -14,6 +14,8 @@ export interface AppLockLifecycle {
     epoch: number
     atMs: number
     departedAtMs: number | null
+    /** Set by the iOS shell when it took off a cover whose frame was never confirmed. */
+    releasedUnconfirmedAfterSeconds?: number
 }
 export interface AppLockNativePolicy {
     enabled: boolean
