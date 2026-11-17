@@ -168,17 +168,30 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
             // Only the driver's tap after it came back marks the real return:
             // the shell can report the page active again while Notification Center still covers it.
             let tapped = false
-            const back = document.createElement('button')
-            back.textContent = `app-lock-inactive-${step.name}-back`
-            back.addEventListener('click', () => { tapped = true })
-            markers.append(back)
+            const showBack = (previous?: HTMLButtonElement) => {
+                previous?.remove()
+                const button = document.createElement('button')
+                button.textContent = `app-lock-inactive-${step.name}-back`
+                button.addEventListener('click', () => { tapped = true })
+                markers.append(button)
+                return button
+            }
+            let back = showBack()
             mark(`app-lock-inactive-${step.name}-ready`)
             await report(`app-lock-inactive-${step.name}-ready`, { epoch: appLock.state.epoch, record: {
                 enabled: appLock.state.record.enabled, timing: appLock.state.record.timing,
                 hideRecentsPreview: appLock.state.record.hideRecentsPreview } })
             let locked = false
+            let gated = false
             await until(() => {
                 locked ||= appLock.state.locked
+                // WebKit keeps content outside a closed modal dialog hidden from accessibility until it changes,
+                // so the button comes back as a new element once the PIN screen is gone.
+                if (appLock.gated) gated = true
+                else if (gated) {
+                    gated = false
+                    back = showBack(back)
+                }
                 return tapped
             }, `The driver did not return for the ${step.name} step`, 120_000)
             back.remove()
