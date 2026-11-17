@@ -668,8 +668,12 @@ mod platform {
 
     fn record_failure(operation: &str, cause: &str) -> Error {
         let message = format!("Secret Service {operation} failed: {cause}");
-        #[cfg(all(test, not(debug_assertions)))]
-        eprintln!("{message}");
+        // Bypass libtest capture: the call that precedes a daemon abort may belong to a passing test.
+        #[cfg(test)]
+        {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{message}");
+        }
         crate::native_log::log_global("warn", "device-secrets", message);
         unavailable()
     }
