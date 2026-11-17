@@ -1471,6 +1471,11 @@ impl PreparedRisuSaveExport {
         })
     }
 
+    /// The page document that acquired the exported lease.
+    pub(crate) fn owner(&self) -> Option<&str> {
+        self.reader.as_ref().and_then(|reader| reader.owner.as_deref())
+    }
+
     pub(crate) fn reader(&self) -> StoreResult<&RevisionReadLease> {
         self.reader.as_ref().ok_or_else(|| StoreError::Validation {
             message: "native export reader has already been released".to_owned(),
@@ -2529,9 +2534,32 @@ impl PersistentStore {
         self.checkpoint_after_release()
     }
 
+    /// Records the page document that acquired `lease`.
+    pub(crate) fn set_revision_owner(&mut self, lease: &str, owner: Option<String>) {
+        if let Some(reader) = self.revision_leases.get_mut(lease) {
+            reader.owner = owner;
+        }
+    }
+
     pub(crate) fn release_all_revision_leases(&mut self) -> StoreResult<()> {
+        self.release_revision_leases_where(|_| true)
+    }
+
+    /// Releases the leases of page documents other than `current`, keeping
+    /// those that named no document.
+    pub(crate) fn release_revision_leases_except(&mut self, current: &str) -> StoreResult<()> {
+        self.release_revision_leases_where(|owner| owner.is_some_and(|owner| owner != current))
+    }
+
+    fn release_revision_leases_where(&mut self, release: impl Fn(Option<&str>) -> bool) -> StoreResult<()> {
+        let leases = self
+            .revision_leases
+            .iter()
+            .filter(|(_, reader)| release(reader.owner.as_deref()))
+            .map(|(lease, _)| lease.clone())
+            .collect::<Vec<_>>();
         let mut first_error = None;
-        for (_, reader) in self.revision_leases.drain() {
+        for reader in leases.iter().filter_map(|lease| self.revision_leases.remove(lease)) {
             if let Err(error) = snapshot::close_revision(reader) {
                 if first_error.is_none() {
                     first_error = Some(error);

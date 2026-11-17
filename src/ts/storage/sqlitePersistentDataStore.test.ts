@@ -9,6 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 import { createMutationGatedPersistentDataStore } from './mutationGatedPersistentDataStore'
 import { createStorageMutationGate, createInRealmStorageLockManager } from './storageMutationGate'
 import { SqlitePersistentDataStore } from './sqlitePersistentDataStore'
+import { rendererDocument } from './rendererDocument'
 import { nativePersistentRevisionLease } from './nativePersistentExport'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 import { fixtureDatabase } from './tests/persistentDataFixtures'
@@ -126,7 +127,7 @@ describe('SqlitePersistentDataStore', () => {
         await expect(store.readPluginStorageValues(query)).resolves.toEqual(page)
         await expect(lease.readPluginStorageValues(query)).resolves.toEqual(page)
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_acquire_revision', { revision: 9 }],
+            ['pds_acquire_revision', { revision: 9, document: rendererDocument() }],
             ['pds_read_plugin_storage_page', { query }],
             ['pds_read_plugin_storage_page', { query, lease: 'plugin-page-lease' }],
         ])
@@ -202,7 +203,7 @@ describe('SqlitePersistentDataStore', () => {
         await store.materializeDatabase(9)
 
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_open'],
+            ['pds_open', { document: rendererDocument() }],
             ['pds_read_root', {}],
             ['pds_read_revision', {}],
             ['pds_query_presets', {}],
@@ -261,7 +262,7 @@ describe('SqlitePersistentDataStore', () => {
         await lease.readAssetAlias({ kind: 'inlay', key })
 
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_acquire_revision', { revision: 9 }],
+            ['pds_acquire_revision', { revision: 9, document: rendererDocument() }],
             ['pds_read_asset_alias', { kind: 'asset', key }],
             ['pds_read_asset_alias', { kind: 'inlay', key }],
             ['pds_read_asset_alias', { kind: 'asset', key, lease: 'lease-alias-kind' }],
@@ -282,7 +283,7 @@ describe('SqlitePersistentDataStore', () => {
         await lease.readAssetAliasesByKeys('inlay', keys)
 
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_acquire_revision', { revision: 9 }],
+            ['pds_acquire_revision', { revision: 9, document: rendererDocument() }],
             ['pds_read_asset_aliases_by_keys', { kind: 'asset', keys }],
             [
                 'pds_read_asset_aliases_by_keys',
@@ -588,7 +589,7 @@ describe('SqlitePersistentDataStore', () => {
         await lease.release()
 
         expect(mocks.invoke.mock.calls).toEqual([
-            ['pds_acquire_revision', { revision: 7 }],
+            ['pds_acquire_revision', { revision: 7, document: rendererDocument() }],
             ['pds_read_root', { lease: 'lease-7' }],
             ['pds_query_presets', { lease: 'lease-7' }],
             ['pds_read_preset', { id: '0', lease: 'lease-7' }],
@@ -653,7 +654,7 @@ describe('SqlitePersistentDataStore', () => {
 
         await store.open()
 
-        expect(mocks.invoke).toHaveBeenCalledWith('pds_open')
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_open', { document: rendererDocument() })
         expect(store.lastOpenResult).toEqual(openResult)
         mocks.invoke.mockResolvedValueOnce({ revision: 4 })
         await store.open()

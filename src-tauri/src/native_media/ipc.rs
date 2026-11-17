@@ -55,6 +55,7 @@ pub(crate) struct EncodedInlayIpcResult {
 
 struct Uploading {
     generation: u64,
+    owner: Option<String>,
     total_bytes: u64,
     received: u64,
     file: tempfile::NamedTempFile,
@@ -64,12 +65,14 @@ struct Uploading {
 
 struct Processing {
     generation: u64,
+    owner: Option<String>,
     reserved_bytes: u64,
     cancelled: bool,
 }
 
 struct Download {
     generation: u64,
+    owner: Option<String>,
     total_bytes: u64,
     sent: u64,
     file: tempfile::NamedTempFile,
@@ -82,6 +85,14 @@ enum Transfer {
 }
 
 impl Transfer {
+    fn owner_mut(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Uploading(upload) => &mut upload.owner,
+            Self::Processing(processing) => &mut processing.owner,
+            Self::Download(download) => &mut download.owner,
+        }
+    }
+
     fn reserved_bytes(&self) -> u64 {
         match self {
             Self::Uploading(upload) => upload.total_bytes,
@@ -146,6 +157,7 @@ impl TransferPool {
             id,
             Transfer::Uploading(Uploading {
                 generation: self.generation,
+                owner: None,
                 total_bytes,
                 received: 0,
                 file,
@@ -210,6 +222,7 @@ impl TransferPool {
             id.to_owned(),
             Transfer::Processing(Processing {
                 generation,
+                owner: upload.owner,
                 reserved_bytes: upload.total_bytes,
                 cancelled: false,
             }),
@@ -236,6 +249,7 @@ impl TransferPool {
             id.clone(),
             Transfer::Processing(Processing {
                 generation,
+                owner: None,
                 reserved_bytes,
                 cancelled: false,
             }),
@@ -305,6 +319,7 @@ impl TransferPool {
         let processing_generation = processing.generation;
         let reserved_bytes = processing.reserved_bytes;
         let cancelled = processing.cancelled;
+        let owner = processing.owner.clone();
         if cancelled || processing_generation != generation || generation != self.generation {
             self.finish_processing(processing_id);
             return Err("native media renderer session changed during processing".to_owned());
@@ -328,6 +343,7 @@ impl TransferPool {
             download_id,
             Transfer::Download(Download {
                 generation,
+                owner,
                 total_bytes,
                 sent: 0,
                 file,
@@ -392,6 +408,31 @@ impl TransferPool {
     fn finish_processing(&mut self, id: &str) {
         if matches!(self.transfers.get(id), Some(Transfer::Processing(_))) {
             self.cancel(id);
+        }
+    }
+
+    /// Records the page document that asked for the transfer `id`.
+    fn assign_owner(&mut self, id: &str, owner: Option<String>) {
+        if let Some(transfer) = self.transfers.get_mut(id) {
+            *transfer.owner_mut() = owner;
+        }
+    }
+
+    /// Ends the transfers that page documents other than `current` asked for.
+    /// An encoder that is still running stops at its next check.
+    fn release_owned_except(&mut self, current: &str) {
+        let mut removable = Vec::new();
+        for (id, transfer) in self.transfers.iter_mut() {
+            if !transfer.owner_mut().as_deref().is_some_and(|owner| owner != current) {
+                continue;
+            }
+            match transfer {
+                Transfer::Processing(processing) => processing.cancelled = true,
+                _ => removable.push(id.clone()),
+            }
+        }
+        for id in removable {
+            self.cancel(&id);
         }
     }
 
@@ -492,15 +533,23 @@ impl NativeMediaIpcState {
         Ok(())
     }
 
+    pub(crate) fn release_replaced_documents(&self, current: &str) -> Result<(), String> {
+        self.pool
+            .lock()
+            .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
+            .release_owned_except(current);
+        Ok(())
+    }
+
     /// Opens a streamed input upload the way `native_media_inlay_input_open` does.
     #[cfg(test)]
-    pub(crate) fn open_input_upload(&self, directory: &std::path::Path) -> Result<(), String> {
+    pub(crate) fn open_input_upload(&self, directory: &std::path::Path, owner: Option<&str>) -> Result<(), String> {
         let file = tempfile::NamedTempFile::new_in(directory).map_err(|error| error.to_string())?;
-        self.pool.lock().unwrap().open(
-            uuid::Uuid::new_v4().to_string(),
-            NATIVE_MEDIA_IPC_CHUNK_BYTES as u64 + 1,
-            file,
-        )
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut pool = self.pool.lock().unwrap();
+        pool.open(id.clone(), NATIVE_MEDIA_IPC_CHUNK_BYTES as u64 + 1, file)?;
+        pool.assign_owner(&id, owner.map(str::to_owned));
+        Ok(())
     }
 }
 
@@ -609,6 +658,7 @@ pub(crate) async fn native_media_inlay_input_open(
     upload_id: String,
     total_bytes: u64,
     binary: Option<bool>,
+    document: Option<String>,
 ) -> Result<NativeMediaInputOpened, String> {
     logged("native_media_inlay_input_open", async move {
         tauri::async_runtime::spawn_blocking(move || {
@@ -629,11 +679,14 @@ pub(crate) async fn native_media_inlay_input_open(
                     append_input(&receiver_app, &receiver_id, offset, bytes)
                 }))?)
             } else { None };
-            state
+            let mut pool = state
                 .pool
                 .lock()
-                .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
-                .open_with_capacity(upload_id, total_bytes, file, capacity, receiver)?;
+                .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?;
+            // Under the lock the release of a replaced page's transfers also takes.
+            let owner = TransferRequester { store: &app.state::<PersistentStoreState>(), document }.admit()?;
+            pool.open_with_capacity(upload_id.clone(), total_bytes, file, capacity, receiver)?;
+            pool.assign_owner(&upload_id, owner);
             Ok(NativeMediaInputOpened {
                 capacity,
             })
@@ -716,13 +769,15 @@ pub(crate) async fn native_media_encode_canvas_webp_finish(
 
 #[tauri::command(async)]
 pub(crate) async fn native_media_encode_canvas_webp(
-    app: AppHandle, data: Vec<u8>, width: u32, height: u32, quality: f32,
+    app: AppHandle, data: Vec<u8>, width: u32, height: u32, quality: f32, document: Option<String>,
 ) -> Result<EncodedInlayIpcResult, String> {
     logged("native_media_encode_canvas_webp", async move {
         tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app.state::<PersistentStoreState>().admit_renderer_operation()
+            let store = app.state::<PersistentStoreState>();
+            let _operation = store.admit_renderer_operation()
                 .map_err(|error| error.to_string())?;
-            encode_direct_request(&app.state::<NativeMediaIpcState>(), &data, EncodeRequest::CanvasWebp { width, height, quality })
+            let requester = TransferRequester { store: &store, document };
+            encode_direct_request(&app.state::<NativeMediaIpcState>(), &data, EncodeRequest::CanvasWebp { width, height, quality }, Some(requester))
         }).await.map_err(|error| format!("failed to join native canvas encoder: {error}"))?
     }.await)
 }
@@ -831,28 +886,51 @@ pub(crate) fn native_media_inlay_output_cancel(
     })())
 }
 
+/// The page document that asked for a transfer. One that a later page replaced gets none.
+pub(crate) struct TransferRequester<'a> {
+    pub(crate) store: &'a PersistentStoreState,
+    pub(crate) document: Option<String>,
+}
+
+impl TransferRequester<'_> {
+    /// Returns the owner to record. Callers hold the transfer lock, which the
+    /// release of a replaced page's transfers also takes.
+    fn admit(self) -> Result<Option<String>, String> {
+        self.store
+            .refuse_replaced_document(self.document.as_deref())
+            .map_err(|error| error.to_string())?;
+        Ok(self.document)
+    }
+}
+
 pub(super) fn encode_direct(
     state: &NativeMediaIpcState,
     id: &str,
     data: &[u8],
     name: &str,
     options: Option<InlayEncodeOptions>,
+    requester: Option<TransferRequester<'_>>,
 ) -> Result<EncodedInlayIpcResult, String> {
-    encode_direct_request(state, data, EncodeRequest::Inlay { id: id.to_owned(), name: name.to_owned(), options })
+    encode_direct_request(state, data, EncodeRequest::Inlay { id: id.to_owned(), name: name.to_owned(), options }, requester)
 }
 
 fn encode_direct_request(
-    state: &NativeMediaIpcState, data: &[u8], request: EncodeRequest,
+    state: &NativeMediaIpcState, data: &[u8], request: EncodeRequest, requester: Option<TransferRequester<'_>>,
 ) -> Result<EncodedInlayIpcResult, String> {
     let label = request.label();
     if data.len() > NATIVE_MEDIA_IPC_CHUNK_BYTES {
         return Err(format!("native {label} direct encoder input exceeds one IPC chunk"));
     }
-    let (output_id, generation) = state
-        .pool
-        .lock()
-        .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
-        .begin_direct_processing(data.len() as u64)?;
+    let (output_id, generation) = {
+        let mut pool = state
+            .pool
+            .lock()
+            .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?;
+        let owner = requester.map(TransferRequester::admit).transpose()?.flatten();
+        let begun = pool.begin_direct_processing(data.len() as u64)?;
+        pool.assign_owner(&begun.0, owner);
+        begun
+    };
     let _admission = state.admit_processing(&output_id)?;
     let encoded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         request.encode(data)
@@ -880,12 +958,12 @@ mod tests {
     fn canvas_encoding_returns_webp_and_releases_invalid_inputs() {
         let state = super::NativeMediaIpcState::default();
         let request = || super::EncodeRequest::CanvasWebp { width: 1, height: 1, quality: 0.85 };
-        let result = super::encode_direct_request(&state, &[20, 40, 80, 128], request()).unwrap();
+        let result = super::encode_direct_request(&state, &[20, 40, 80, 128], request(), None).unwrap();
         assert!(!result.source_kept);
         let decoded = image::load_from_memory(result.data.as_ref().unwrap()).unwrap().into_rgba8();
         assert_eq!(decoded.dimensions(), (1, 1));
         assert_eq!(decoded.get_pixel(0, 0)[3], 128);
-        assert!(super::encode_direct_request(&state, &[0; 3], request()).is_err());
+        assert!(super::encode_direct_request(&state, &[0; 3], request(), None).is_err());
         assert!(state.pool.lock().unwrap().transfers.is_empty());
         assert_eq!(state.pool.lock().unwrap().reserved_bytes, 0);
     }
@@ -900,7 +978,7 @@ mod tests {
                 let send = send.clone();
                 let state = &state;
                 scope.spawn(move || {
-                    send.send(super::encode_direct(state, "synthetic", b"original", "file.bin", None)).unwrap();
+                    send.send(super::encode_direct(state, "synthetic", b"original", "file.bin", None, None)).unwrap();
                 });
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -917,9 +995,59 @@ mod tests {
         });
         assert!(state.pool.lock().unwrap().transfers.is_empty());
         assert_eq!(state.pool.lock().unwrap().reserved_bytes, 0);
-        let result = super::encode_direct(&state, "next", b"original", "file.bin", None).unwrap();
+        let result = super::encode_direct(&state, "next", b"original", "file.bin", None, None).unwrap();
         assert!(result.source_kept && result.data.is_none());
         assert_eq!(result.output_size, b"original".len() as u64);
+    }
+
+    #[test]
+    fn a_later_page_document_ends_the_transfers_earlier_documents_asked_for() {
+        let store = crate::persistent_store::PersistentStoreState::default();
+        let state = super::NativeMediaIpcState::default();
+        let requester = |document: &str| Some(super::TransferRequester { store: &store, document: Some(document.to_owned()) });
+        let upload = |owner: Option<&str>| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut pool = state.pool.lock().unwrap();
+            pool.open(id.clone(), NATIVE_MEDIA_IPC_CHUNK_BYTES as u64 + 1, spool()).unwrap();
+            pool.assign_owner(&id, owner.map(str::to_owned));
+            id
+        };
+        assert!(store.claim_renderer_document("first").unwrap());
+        let outgoing = upload(Some("first"));
+        let unnamed = upload(None);
+        let admission = state.processing.lock().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for document in [Some("first"), None] {
+                let send = send.clone();
+                let state = &state;
+                scope.spawn(move || {
+                    send.send((document, super::encode_direct(state, "synthetic", b"original", "file.bin", None, document.and_then(requester)))).unwrap();
+                });
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.pool.lock().unwrap().transfers.len() != 4 {
+                assert!(std::time::Instant::now() < deadline, "workers did not reserve their inputs");
+                std::thread::yield_now();
+            }
+            assert!(store.claim_renderer_document("second").unwrap());
+            state.release_replaced_documents("second").unwrap();
+            drop(admission);
+            for _ in 0..2 {
+                let (document, result) = receive.recv().unwrap();
+                match document {
+                    Some(_) => assert!(result.err().expect("the replaced page's encoder ran").contains("cancelled")),
+                    None => assert!(result.unwrap().source_kept),
+                }
+            }
+        });
+        let mut pool = state.pool.lock().unwrap();
+        assert!(pool.append(&outgoing, 0, &[1]).is_err());
+        assert_eq!(pool.append(&unnamed, 0, &[1]).unwrap(), 1);
+        drop(pool);
+        let late = super::encode_direct(&state, "late", b"original", "file.bin", None, requester("first"));
+        assert!(late.err().expect("a replaced page started an encoder").contains("replaced"));
+        assert!(super::encode_direct(&state, "current", b"original", "file.bin", None, requester("second")).is_ok());
     }
 
     #[test]
@@ -929,7 +1057,7 @@ mod tests {
             let _guard = state.processing.lock().unwrap();
             panic!("synthetic worker failure");
         });
-        assert!(super::encode_direct(&state, "synthetic", b"original", "file.bin", None).is_err());
+        assert!(super::encode_direct(&state, "synthetic", b"original", "file.bin", None, None).is_err());
         assert!(state.pool.lock().unwrap().transfers.is_empty());
         assert_eq!(state.pool.lock().unwrap().reserved_bytes, 0);
     }

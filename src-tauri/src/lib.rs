@@ -1365,17 +1365,17 @@ mod header_map_tests {
         let outgoing = persistent.admit_renderer_operation().unwrap();
         reset_renderer_sessions(app.handle());
         // Admitted before the page started, the outgoing upload registers after it.
-        let filled = std::iter::from_fn(|| media.open_input_upload(directory.path()).ok()).count();
+        let filled = std::iter::from_fn(|| media.open_input_upload(directory.path(), None).ok()).count();
         assert!(filled > 0);
         // Another start leaves the uploads to the pending reset while the operation runs.
         reset_renderer_sessions(app.handle());
-        assert!(media.open_input_upload(directory.path()).is_err(), "a second start freed the running operation's uploads");
+        assert!(media.open_input_upload(directory.path(), None).is_err(), "a second start freed the running operation's uploads");
         drop(outgoing);
 
         // Admission reopens once the reset has finished.
         drop(persistent.admit_renderer_operation().unwrap());
         for _ in 0..filled {
-            media.open_input_upload(directory.path()).expect("the new document gets every upload slot");
+            media.open_input_upload(directory.path(), None).expect("the new document gets every upload slot");
         }
 
         // The next page starts while a capture waits for this document, which
@@ -1387,13 +1387,13 @@ mod header_map_tests {
                 std::thread::yield_now();
             }
             reset_renderer_sessions(app.handle());
-            while media.open_input_upload(directory.path()).is_ok() {}
+            while media.open_input_upload(directory.path(), None).is_ok() {}
             drop(outgoing);
             drop(capture.join().unwrap());
         });
         drop(persistent.admit_renderer_operation().unwrap());
         for _ in 0..filled {
-            media.open_input_upload(directory.path()).expect("the new document gets every upload slot after the capture");
+            media.open_input_upload(directory.path(), None).expect("the new document gets every upload slot after the capture");
         }
     }
 

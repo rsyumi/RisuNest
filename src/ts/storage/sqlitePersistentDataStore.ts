@@ -2,6 +2,7 @@ import { stableSelectionRoot, projectSelectionIndexes } from './persistentSelect
 import { jsonByteLength, prepareNativePersistenceValue, type PayloadTooLargeKind } from './nativePersistenceValue'
 import { invoke } from '@tauri-apps/api/core'
 import { nativeCommitTransport, STAGED_REQUEST_BYTES, type NativeCommitTransport } from './nativeCommitTransport'
+import { rendererDocument } from './rendererDocument'
 
 import type { Chat, Database, botPreset } from './database.svelte'
 import {
@@ -266,7 +267,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     constructor(private readonly transport: NativeCommitTransport = nativeCommitTransport) {}
 
     async open(): Promise<void> {
-        const result = await invokeStore<PersistentStoreOpenResult>('pds_open')
+        const result = await invokeStore<PersistentStoreOpenResult>('pds_open', { document: rendererDocument() })
         this.lastOpenResult = result
     }
 
@@ -528,6 +529,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     async acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease> {
         const { lease } = await invokeStore<{ lease: string }>('pds_acquire_revision', {
             revision,
+            document: rendererDocument(),
         })
         let released = false
         let releasePromise: Promise<void> | undefined

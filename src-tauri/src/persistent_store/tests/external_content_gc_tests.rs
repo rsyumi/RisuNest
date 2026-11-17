@@ -591,7 +591,7 @@ fn an_opened_store_collects_what_earlier_releases_left() {
     app.manage(crate::persistent_store::commands::PersistentStoreState::default());
     app.manage(crate::external_storage::job_store::JobCommandState::default());
     app.manage(crate::native_file_jobs::NativeFileJobState::initialize(root.join("native-file-jobs")));
-    crate::persistent_store::commands::open_for_renderer(app.handle(), &app.state()).unwrap();
+    crate::persistent_store::commands::open_for_renderer(app.handle(), &app.state(), None).unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while captures.iter().any(|capture| external.join(capture).exists()) {

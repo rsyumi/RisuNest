@@ -18,6 +18,7 @@ import {
     sealCasJob,
 } from './nativeAssetRepository'
 import { hashPayloadBytes, objectPhysicalKey, PayloadSizeMismatchError } from './payloadCas'
+import { rendererDocument } from './rendererDocument'
 import type { NativeByteInvoke } from './nativeAssetByteTransport'
 
 const P = NATIVE_CAS_READ_PART_BYTES
@@ -515,6 +516,10 @@ describe('native asset repository adapters', () => {
             'asset_cas_job_upload_cancel',
         ])
         expect(invoke).not.toHaveBeenCalledWith('asset_cas_job_prepare', expect.anything())
+        expect(invoke).toHaveBeenCalledWith('asset_cas_job_upload_open', expect.objectContaining({
+            sessionId: 'session-large',
+            document: rendererDocument(),
+        }))
         const chunks = invoke.mock.calls
             .filter(([command]) => command === 'asset_cas_job_upload_chunk')
             .map(([, args]) => (args?.data as number[]).length)
@@ -559,6 +564,7 @@ describe('native asset repository adapters', () => {
         expect(invoke).toHaveBeenCalledWith('native_media_encode_inlay_image', {
             id: 'inlay-id', data: [1, 2], name: 'Image',
             options: { format: 'png', quality: 12, maxDimension: 256, skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0 },
+            document: rendererDocument(),
         })
     })
 
@@ -690,6 +696,7 @@ describe('native asset repository adapters', () => {
                 format: 'original', quality: 85, maxDimension: 4_294_967_295,
                 skipReencode: true, animationDecodeBytes: 256 * 1024 * 1024, animationMaxFps: 0,
             },
+            document: rendererDocument(),
         })
     })
 
@@ -787,7 +794,7 @@ describe('native asset repository adapters', () => {
         await session.release('committed')
 
         expect(invoke.mock.calls).toEqual([
-            ['asset_cas_job_begin', { kind: 'direct-asset-or-inlay-write' }],
+            ['asset_cas_job_begin', { kind: 'direct-asset-or-inlay-write', document: rendererDocument() }],
             ['asset_cas_job_prepare', {
                 sessionId: 'asset-write-1',
                 data: [9, 8],
@@ -824,7 +831,7 @@ describe('native asset repository adapters', () => {
 
         expect(invoke.mock.calls[0]).toEqual([
             'asset_cas_job_begin',
-            { kind: 'cold-direct-write' },
+            { kind: 'cold-direct-write', document: rendererDocument() },
         ])
     })
 

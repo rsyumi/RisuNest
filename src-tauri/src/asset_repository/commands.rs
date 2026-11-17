@@ -15,7 +15,7 @@ use crate::native_log::logged;
 use crate::persistent_store::{self, PersistentStore, PersistentStoreState, StoreError};
 use crate::trust_boundary::is_lower_hex_256;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Cursor, ErrorKind};
 use std::sync::{Arc, Mutex, atomic::{AtomicU8, Ordering}};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,18 +28,46 @@ pub(crate) struct ContentDirectObject {
 }
 
 pub(crate) struct DurableCasJobState {
-    jobs: Mutex<HashMap<String, DurableCasJob>>,
+    jobs: Mutex<CasJobSessions>,
     uploads: Mutex<CasUploadPool>,
 }
 
 impl Default for DurableCasJobState {
     fn default() -> Self {
         Self {
-            jobs: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(CasJobSessions::default()),
             uploads: Mutex::new(CasUploadPool::default()),
         }
     }
 }
+
+/// The open job handles, and the page document that began each page session.
+#[derive(Default)]
+struct CasJobSessions {
+    handles: HashMap<String, DurableCasJob>,
+    /// Kept across a page reset, so a session that a late request of the
+    /// outgoing document opens again still ends with that document.
+    owners: HashMap<String, String>,
+    /// Sessions of a replaced page document. Their journals are released and
+    /// no later request recovers them.
+    replaced: HashSet<String>,
+}
+
+impl std::ops::Deref for CasJobSessions {
+    type Target = HashMap<String, DurableCasJob>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handles
+    }
+}
+
+impl std::ops::DerefMut for CasJobSessions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handles
+    }
+}
+
+const REPLACED_PAGE_CAS_JOB: &str = "a later page replaced the page that began this CAS job";
 
 /// What the journal sweep asks about the work that may still own a journal.
 pub(crate) struct CasJobOwnerProbe<'a> {
@@ -223,7 +251,7 @@ fn release_logged<R: tauri::Runtime>(app: &AppHandle<R>, abandoned: AbandonedCas
 impl DurableCasJobState {
     pub(crate) fn close_for_cleanup(&self) -> Result<(), String> {
         self.clear_uploads()?;
-        self.jobs.lock().map_err(|_| "cleanup-cas-busy")?.clear();
+        *self.jobs.lock().map_err(|_| "cleanup-cas-busy")? = CasJobSessions::default();
         Ok(())
     }
 
@@ -260,11 +288,56 @@ impl DurableCasJobState {
         self.jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?
+            .handles
             .clear();
         // Journals are listed now, before the new page can begin its own.
         let mut abandoned = AbandonedCasJobs::snapshot(root);
         abandoned.cleanup_uploads = true;
         Ok(abandoned)
+    }
+
+    /// Closes the sessions and uploads that page documents other than
+    /// `current` began, and releases their journals in the background.
+    pub(crate) fn release_replaced_documents<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        current: &str,
+    ) -> Result<(), String> {
+        let abandoned = self.take_replaced_documents(&repository_root(app)?, current)?;
+        if !abandoned.journal_ids.is_empty() {
+            self.release_in_background(app, abandoned);
+        }
+        Ok(())
+    }
+
+    fn take_replaced_documents(&self, root: &std::path::Path, current: &str) -> Result<AbandonedCasJobs, String> {
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|error| format!("CAS upload mutex poisoned: {error}"))?;
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+        let replaced = jobs
+            .owners
+            .iter()
+            .filter(|(_, owner)| owner.as_str() != current)
+            .map(|(session, _)| session.clone())
+            .collect::<Vec<_>>();
+        for session in &replaced {
+            jobs.owners.remove(session);
+            jobs.handles.remove(session);
+            jobs.replaced.insert(session.clone());
+            uploads.cancel_session(session);
+        }
+        uploads.cancel_owned_except(current);
+        Ok(AbandonedCasJobs {
+            root: root.to_owned(),
+            journal_ids: replaced,
+            listing_failure: None,
+            cleanup_uploads: false,
+        })
     }
 
     #[cfg(test)]
@@ -284,6 +357,8 @@ const MAX_TOTAL_CAS_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
 struct CasUpload {
     session_id: String,
+    /// The page document that opened the upload, when it named one.
+    owner: Option<String>,
     role: CasObjectRole,
     total_bytes: u64,
     state: AtomicU8,
@@ -360,11 +435,11 @@ impl CasUploadPool {
         role: CasObjectRole,
         total_bytes: u64,
     ) -> io::Result<()> {
-        self.open_with_capacity(cas, upload_id, session_id, role, total_bytes, CAS_UPLOAD_CHUNK_BYTES, None)
+        self.open_with_capacity(cas, upload_id, session_id, None, role, total_bytes, CAS_UPLOAD_CHUNK_BYTES, None)
     }
 
     fn open_with_capacity(
-        &mut self, cas: &PayloadCas, upload_id: String, session_id: String, role: CasObjectRole,
+        &mut self, cas: &PayloadCas, upload_id: String, session_id: String, owner: Option<String>, role: CasObjectRole,
         total_bytes: u64, capacity: usize, receiver: Option<Arc<crate::asset_byte_transport::AndroidReceiver>>,
     ) -> io::Result<()> {
         if uuid::Uuid::parse_str(&upload_id).is_err() {
@@ -400,7 +475,7 @@ impl CasUploadPool {
         self.uploads.insert(
             upload_id,
             Arc::new(CasUpload {
-                session_id, role, total_bytes,
+                session_id, owner, role, total_bytes,
                 state: AtomicU8::new(UPLOAD_RECEIVING), file: Mutex::new(Some(file)),
                 capacity, _receiver: receiver,
             }),
@@ -454,6 +529,17 @@ impl CasUploadPool {
         for (id, _) in removed { self.cancel(&id); }
     }
 
+    /// Cancels the uploads that page documents other than `current` opened.
+    fn cancel_owned_except(&mut self, current: &str) {
+        let replaced = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| upload.owner.as_deref().is_some_and(|owner| owner != current))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in replaced { self.cancel(&id); }
+    }
+
     fn clear(&mut self) {
         for (_, upload) in self.uploads.drain() { upload.cancel(); }
         self.parked.clear();
@@ -477,10 +563,13 @@ fn now_ms() -> Result<i64, String> {
 // returns the cached one. Shared by every command that needs the recovered
 // job, including those that also hold the job map or the store lock.
 fn recover_job<'a>(
-    jobs: &'a mut HashMap<String, DurableCasJob>,
+    jobs: &'a mut CasJobSessions,
     root: &std::path::Path,
     session_id: &str,
 ) -> Result<&'a mut DurableCasJob, String> {
+    if jobs.replaced.contains(session_id) {
+        return Err(REPLACED_PAGE_CAS_JOB.to_owned());
+    }
     if !jobs.contains_key(session_id) {
         let recovered = DurableCasJob::open(root, session_id).map_err(|error| error.to_string())?;
         jobs.insert(session_id.to_owned(), recovered);
@@ -509,27 +598,46 @@ fn with_recovered_job<T>(
 pub(crate) async fn asset_cas_job_begin(
     app: AppHandle,
     kind: CasJobKind,
+    document: Option<String>,
 ) -> Result<String, String> {
     logged("asset_cas_job_begin", async move {
-        tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app
-                .state::<PersistentStoreState>()
-                .admit_renderer_operation()
-                .map_err(|error| error.to_string())?;
-            let root = repository_root(&app)?;
-            let session_id = uuid::Uuid::new_v4().to_string();
-            let job = DurableCasJob::begin(&root, &session_id, kind, CasJobOwner::page_write(&session_id), now_ms()?)
-                .map_err(|error| error.to_string())?;
-            app.state::<DurableCasJobState>()
-                .jobs
-                .lock()
-                .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?
-                .insert(session_id.clone(), job);
-            Ok(session_id)
-        })
-        .await
-        .map_err(|error| format!("failed to join CAS job begin operation: {error}"))?
+        tauri::async_runtime::spawn_blocking(move || begin_page_job(&app, kind, document))
+            .await
+            .map_err(|error| format!("failed to join CAS job begin operation: {error}"))?
     }.await)
+}
+
+fn begin_page_job<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    kind: CasJobKind,
+    document: Option<String>,
+) -> Result<String, String> {
+    let store = app.state::<PersistentStoreState>();
+    let _operation = store
+        .admit_renderer_operation()
+        .map_err(|error| error.to_string())?;
+    let refuse = || store.refuse_replaced_document(document.as_deref()).map_err(|error| error.to_string());
+    refuse()?;
+    let root = repository_root(app)?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut job = DurableCasJob::begin(&root, &session_id, kind, CasJobOwner::page_write(&session_id), now_ms()?)
+        .map_err(|error| error.to_string())?;
+    let sessions = app.state::<DurableCasJobState>();
+    let mut jobs = sessions
+        .jobs
+        .lock()
+        .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+    // Checked again under the lock the release of a replaced page's sessions takes.
+    if let Err(error) = refuse() {
+        drop(jobs);
+        let _ = job.release(CasReleaseOutcome::Aborted);
+        return Err(error);
+    }
+    if let Some(document) = document {
+        jobs.owners.insert(session_id.clone(), document);
+    }
+    jobs.insert(session_id.clone(), job);
+    Ok(session_id)
 }
 
 #[tauri::command(async)]
@@ -570,6 +678,7 @@ pub(crate) async fn asset_cas_job_upload_open(
     role: CasObjectRole,
     total_bytes: u64,
     binary: Option<bool>,
+    document: Option<String>,
 ) -> Result<CasUploadOpened, String> {
     logged("asset_cas_job_upload_open", async move {
         tauri::async_runtime::spawn_blocking(move || {
@@ -588,6 +697,9 @@ pub(crate) async fn asset_cas_job_upload_open(
                 .jobs
                 .lock()
                 .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
+            app.state::<PersistentStoreState>()
+                .refuse_replaced_document(document.as_deref())
+                .map_err(|error| error.to_string())?;
             let job = recover_job(&mut jobs, &root, &session_id)?;
             if job.is_sealed() || job.is_released() {
                 return Err("sealed or released CAS job cannot accept an upload".to_owned());
@@ -604,7 +716,7 @@ pub(crate) async fn asset_cas_job_upload_open(
                 }))?)
             } else { None };
             uploads
-                .open_with_capacity(&cas, upload_id, session_id, role, total_bytes, capacity, receiver)
+                .open_with_capacity(&cas, upload_id, session_id, document, role, total_bytes, capacity, receiver)
                 .map_err(|error| error.to_string())?;
             Ok(CasUploadOpened {
                 capacity,
@@ -807,11 +919,15 @@ pub(crate) async fn asset_cas_job_release(
 }
 
 fn release_job(
-    jobs: &mut HashMap<String, DurableCasJob>,
+    jobs: &mut CasJobSessions,
     root: &std::path::Path,
     session_id: &str,
     outcome: CasReleaseOutcome,
 ) -> Result<(), String> {
+    // Its journal is already being released.
+    if jobs.replaced.contains(session_id) {
+        return Ok(());
+    }
     if !jobs.contains_key(session_id) {
         match DurableCasJob::open(root, session_id) {
             Ok(job) => { jobs.insert(session_id.to_owned(), job); }
@@ -823,7 +939,8 @@ fn release_job(
         .release(outcome)
         .map_err(|error| error.to_string());
     if jobs.get(session_id).is_some_and(DurableCasJob::is_released) {
-        jobs.remove(session_id);
+        jobs.handles.remove(session_id);
+        jobs.owners.remove(session_id);
     }
     result
 }
@@ -1209,7 +1326,7 @@ pub(crate) async fn asset_cas_job_finalize_content(
 fn seal_prepared_content_job_by_id(
     native_jobs: &NativeFileJobState,
     repository_root: &std::path::Path,
-    jobs: &mut HashMap<String, DurableCasJob>,
+    jobs: &mut CasJobSessions,
     store: &mut PersistentStore,
     session_id: &str,
     created_at_ms: i64,
@@ -1352,7 +1469,7 @@ mod tests {
                 CasJobKind::DirectAssetOrInlayWrite, crate::asset_repository::job_pins::CasJobOwner::for_test(), 1).unwrap();
             let object = job.prepare_bytes(&cas, b"synthetic activation", CasObjectRole::DirectObject).unwrap();
             if sealed { job.seal(&mut store, 0).unwrap(); }
-            let mut jobs = HashMap::from([("activation-failure".to_owned(), job)]);
+            let mut jobs = CasJobSessions { handles: HashMap::from([("activation-failure".to_owned(), job)]), ..Default::default() };
             release_job(&mut jobs, directory.path(), "activation-failure", CasReleaseOutcome::Aborted).unwrap();
             release_job(&mut jobs, directory.path(), "activation-failure", CasReleaseOutcome::Aborted).unwrap();
             assert!(jobs.is_empty());
@@ -1663,6 +1780,28 @@ mod tests {
             let owner = CasJobOwner::from_another_process(CasJobOwnerKind::ExternalPublication, "publication");
             drop(journal(&mut store, "page-start-publication", owner, true));
         }
+        let app = app_at(root);
+
+        // A page that starts before the renderer opens the store cannot judge the journal.
+        let error = release_abandoned(app.handle(), AbandonedCasJobs::snapshot(root)).unwrap_err();
+        assert!(error.contains("has not been opened"), "{error}");
+        assert_eq!(journal_ids(root), ["page-start-publication".to_owned()].into());
+        // That attempt is retried below, so it is not logged as a failure.
+        release_logged(app.handle(), AbandonedCasJobs::snapshot(root));
+        assert!(!crate::native_log::global_state().tail(None).iter()
+            .any(|entry| entry.message.contains("CAS jobs: page-start-publication")));
+
+        persistent_store::commands::open_for_renderer(app.handle(), &app.state(), None).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !journal_ids(root).is_empty() {
+            assert!(Instant::now() < deadline, "the journal stayed after the store opened");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A mock app over `root` with the store unopened and no CAS sessions.
+    fn app_at(root: &std::path::Path) -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -1679,23 +1818,61 @@ mod tests {
         });
         app.manage(PersistentStoreState::unopened_without_purge());
         app.manage(DurableCasJobState::default());
+        app
+    }
 
-        // A page that starts before the renderer opens the store cannot judge the journal.
-        let error = release_abandoned(app.handle(), AbandonedCasJobs::snapshot(root)).unwrap_err();
-        assert!(error.contains("has not been opened"), "{error}");
-        assert_eq!(journal_ids(root), ["page-start-publication".to_owned()].into());
-        // That attempt is retried below, so it is not logged as a failure.
-        release_logged(app.handle(), AbandonedCasJobs::snapshot(root));
-        assert!(!crate::native_log::global_state().tail(None).iter()
-            .any(|entry| entry.message.contains("CAS jobs: page-start-publication")));
+    #[test]
+    fn a_later_page_document_ends_the_cas_sessions_and_uploads_earlier_documents_left_open() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        let app = app_at(root);
+        let state = app.state::<DurableCasJobState>();
+        let cas = PayloadCas::new(root).unwrap();
+        let open = |document: &str| persistent_store::commands::open_for_renderer(app.handle(), &app.state(), Some(document));
+        let begin = |document: Option<&str>| begin_page_job(app.handle(), CasJobKind::DirectAssetOrInlayWrite, document.map(str::to_owned));
+        let upload = |session: &str, owner: Option<&str>| {
+            let id = uuid::Uuid::new_v4().to_string();
+            state.uploads.lock().unwrap()
+                .open_with_capacity(&cas, id.clone(), session.to_owned(), owner.map(str::to_owned), CasObjectRole::DirectObject, CAS_UPLOAD_CHUNK_BYTES as u64 + 1, CAS_UPLOAD_CHUNK_BYTES, None)
+                .unwrap();
+            id
+        };
+        let uploading = |id: &str| state.uploads.lock().unwrap().get(id).is_ok();
 
-        persistent_store::commands::open_for_renderer(app.handle(), &app.state()).unwrap();
+        open("first").unwrap();
+        let outgoing = begin(Some("first")).unwrap();
+        let unnamed = begin(None).unwrap();
+        // A page reset closes the handles, and a late request of the outgoing
+        // document opens its journal again before the reset releases it.
+        drop(state.take_abandoned(root).unwrap());
+        recover_job(&mut state.jobs.lock().unwrap(), root, &outgoing).unwrap();
+        recover_job(&mut state.jobs.lock().unwrap(), root, &unnamed).unwrap();
+        let outgoing_upload = upload(&outgoing, Some("first"));
+        let stray_upload = upload(&unnamed, Some("first"));
+        let unnamed_upload = upload(&unnamed, None);
+        open("first").unwrap();
+        assert!(uploading(&outgoing_upload) && uploading(&stray_upload));
 
+        open("second").unwrap();
+        assert!(!uploading(&outgoing_upload) && !uploading(&stray_upload));
+        assert!(uploading(&unnamed_upload));
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !journal_ids(root).is_empty() {
-            assert!(Instant::now() < deadline, "the journal stayed after the store opened");
+        while journal_ids(root) != [unnamed.clone()].into() {
+            assert!(Instant::now() < deadline, "the replaced page's journal stayed");
             thread::sleep(Duration::from_millis(20));
         }
+        let mut jobs = state.jobs.lock().unwrap();
+        assert_eq!(recover_job(&mut jobs, root, &outgoing).err().as_deref(), Some(REPLACED_PAGE_CAS_JOB));
+        release_job(&mut jobs, root, &outgoing, CasReleaseOutcome::Aborted).unwrap();
+        drop(jobs);
+        assert!(begin(Some("first")).unwrap_err().contains("replaced"));
+        assert_eq!(journal_ids(root), [unnamed.clone()].into());
+
+        // A session released as usual is not remembered for the next page.
+        let current = begin(Some("second")).unwrap();
+        release_job(&mut state.jobs.lock().unwrap(), root, &current, CasReleaseOutcome::Aborted).unwrap();
+        open("third").unwrap();
+        assert!(!state.jobs.lock().unwrap().replaced.contains(&current));
     }
 
     #[test]
@@ -1825,7 +2002,7 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let mut pool = CasUploadPool::default();
         let bytes: Vec<u8> = (0..BINARY_PART_BYTES + 17).map(|i| (i % 256) as u8).collect();
-        pool.open_with_capacity(&cas, id.clone(), "binary-session".to_owned(), CasObjectRole::DirectObject,
+        pool.open_with_capacity(&cas, id.clone(), "binary-session".to_owned(), None, CasObjectRole::DirectObject,
             bytes.len() as u64, BINARY_PART_BYTES, None).unwrap();
         let upload = pool.get(&id).unwrap();
         let weak = Arc::downgrade(&upload);
@@ -1950,7 +2127,7 @@ mod tests {
         let state = DurableCasJobState::default();
         let upload_id = uuid::Uuid::new_v4().to_string();
         let receiver = register_android_receiver(&upload_id, Arc::new(|offset: u64, _: &[u8]| Ok(offset))).unwrap();
-        state.uploads.lock().unwrap().open_with_capacity(&cas, upload_id.clone(), "session-maintenance".to_owned(),
+        state.uploads.lock().unwrap().open_with_capacity(&cas, upload_id.clone(), "session-maintenance".to_owned(), None,
             CasObjectRole::DirectObject, CAS_UPLOAD_CHUNK_BYTES as u64 + 1, CAS_UPLOAD_CHUNK_BYTES, Some(receiver)).unwrap();
         let staging_path = state.uploads.lock().unwrap().uploads[&upload_id].file.lock().unwrap().as_ref().unwrap().path().to_path_buf();
         let maintenance = store.acquire_raw_capture().unwrap();
@@ -2252,7 +2429,7 @@ mod tests {
             &[b"first exact asset", b"second exact asset"],
         );
         let mut store = PersistentStore::open(directory.path()).unwrap();
-        let mut recovered_jobs = HashMap::new();
+        let mut recovered_jobs = CasJobSessions::default();
 
         seal_prepared_content_job_by_id(
             &native_jobs,

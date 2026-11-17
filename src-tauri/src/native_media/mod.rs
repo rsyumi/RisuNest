@@ -724,14 +724,15 @@ pub(crate) async fn native_media_encode_inlay_image(
     data: Vec<u8>,
     name: String,
     options: Option<InlayEncodeOptions>,
+    document: Option<String>,
 ) -> Result<ipc::EncodedInlayIpcResult, String> {
     logged("native_media_encode_inlay_image", async move {
         if data.len() > ipc::NATIVE_MEDIA_IPC_CHUNK_BYTES {
             return Err("native Inlay direct encoder input exceeds one IPC chunk".to_owned());
         }
         tauri::async_runtime::spawn_blocking(move || {
-            let _operation = app
-                .state::<crate::persistent_store::PersistentStoreState>()
+            let store = app.state::<crate::persistent_store::PersistentStoreState>();
+            let _operation = store
                 .admit_renderer_operation()
                 .map_err(|error| error.to_string())?;
             ipc::encode_direct(
@@ -740,6 +741,7 @@ pub(crate) async fn native_media_encode_inlay_image(
                 &data,
                 &name,
                 options,
+                Some(ipc::TransferRequester { store: &store, document }),
             )
         })
         .await

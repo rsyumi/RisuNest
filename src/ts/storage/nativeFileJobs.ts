@@ -5,6 +5,7 @@ import { nativeRestoreDeadline, NativeRestoreControlTimeout, type NativeRestoreC
 import { exportIOSFile } from './iosFiles'
 import { MAX_CONTENT_METADATA_BYTES } from './contentImportLimits'
 import { invoke } from '@tauri-apps/api/core'
+import { rendererDocument } from './rendererDocument'
 
 import { isTauri } from '../platform'
 import type { PreparedNativeCharacterCardModule } from '../characterCards'
@@ -1473,7 +1474,7 @@ async function runNativeReplacementRestore(
             await invokeNative(dependencies,'native_device_backup_recovery_complete',{sessionId:status.deviceSessionId})
             portableDeviceAcknowledged=true
         }
-        const opened=await invokeNative(dependencies,'pds_open') as {revision?:unknown}
+        const opened=await invokeNative(dependencies,'pds_open',{document:rendererDocument()}) as {revision?:unknown}
         if (!Number.isSafeInteger(opened?.revision)||(opened.revision as number)<status.activationRevision!) throw new NativeFileJobError('invalid-activation-receipt','Persistent store opened before portable activation')
         const {refreshDeviceStateAfterRestore}=await import('./deviceStateRestore')
         await bounded(refreshDeviceStateAfterRestore(), 'device settings refresh')
