@@ -87,10 +87,19 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
     await appLock.rendered('Synthetic app lock')
     armed = true
     if (inactive) {
+        // Outside the gated content, and never overwritten, so the driver reads every step it waits for.
+        const markers = document.createElement('section')
+        markers.style.cssText = 'position:fixed;left:24px;bottom:24px;z-index:500;display:grid;background:#202020;padding:8px'
+        document.body.append(markers)
+        const mark = (text: string) => {
+            const line = document.createElement('span')
+            line.textContent = text
+            markers.append(line)
+        }
         try {
-            await inactiveDepartures()
+            await inactiveDepartures(mark)
         } catch (error) {
-            status.textContent = 'verification-error:' + (error instanceof Error ? error.message : String(error))
+            mark('verification-error:' + (error instanceof Error ? error.message : String(error)))
             throw error
         }
         return
@@ -126,7 +135,7 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
     }
 
     /** iOS: Notification Center over the app leaves it inactive without a background transition. */
-    async function inactiveDepartures() {
+    async function inactiveDepartures(mark: (text: string) => void) {
         const steps = [
             { name: 'preview', setUp: async () => {} },
             { name: 'timed', setUp: async () => {
@@ -142,7 +151,7 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
             await frame()
             await appLock.rendered('Synthetic app lock')
             trace.length = 0
-            status.textContent = `app-lock-inactive-${step.name}-ready`
+            mark(`app-lock-inactive-${step.name}-ready`)
             await report(`app-lock-inactive-${step.name}-ready`, { epoch: appLock.state.epoch, record: {
                 enabled: appLock.state.record.enabled, timing: appLock.state.record.timing,
                 hideRecentsPreview: appLock.state.record.hideRecentsPreview } })
@@ -151,20 +160,20 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
                 locked ||= appLock.state.locked
                 const away = trace.find(snapshot => !snapshot.active)
                 return away !== undefined && trace.some(snapshot => snapshot.active && snapshot.epoch > away.epoch)
-            }, `No departure and return for the ${step.name} step`, 120_000)
+            }, `No departure and return for the ${step.name} step`, 60_000)
             if (locked !== (step.name === 'immediate')) throw new Error(`The ${step.name} return ${locked ? 'locked' : 'did not lock'} the page`)
-            await until(() => appLock.state.active && !appLock.gated, `The ${step.name} return stayed gated`, 60_000)
+            await until(() => appLock.state.active && !appLock.gated, `The ${step.name} return stayed gated`, 45_000)
             // A cover without a lock decision comes off by itself after 3 s; wait past that to see which release ran.
             await pause(3_500)
             const away = trace.find(snapshot => !snapshot.active)!
             const back = trace.find(snapshot => snapshot.active && snapshot.epoch > away.epoch)!
-            const unconfirmed = trace.find(snapshot => snapshot.releasedUnconfirmedAfterSeconds !== undefined)
+            const unconfirmed = trace.find(snapshot => snapshot.unconfirmedRelease !== undefined)
             await report(`app-lock-inactive-${step.name}-returned`, { trace: [...trace], awayMs: back.atMs - away.atMs })
             if (unconfirmed) throw new Error(`The ${step.name} return released the cover without a confirmed frame`)
             if (document.querySelector('main') !== main || !main.contains(retained) || draft.value !== 'retained synthetic draft 123456') {
                 throw new Error(`The ${step.name} return replaced the retained draft`)
             }
-            status.textContent = `app-lock-inactive-${step.name}-returned`
+            mark(`app-lock-inactive-${step.name}-returned`)
         }
         if (!await appLock.setEnabled(false)) throw new Error('Synthetic lock cleanup failed')
         await report('complete', { passed: true })

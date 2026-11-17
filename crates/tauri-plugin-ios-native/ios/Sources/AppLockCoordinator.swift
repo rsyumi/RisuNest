@@ -24,6 +24,9 @@ final class AppLockCoordinator {
     private var promptInactive = false
     private var readyGeneration: UInt64 = 0
     private var unconfirmedRelease: DispatchWorkItem?
+    /// A release the page has not been sent in a policy answer yet. A launch cover can come off
+    /// before the page listens for events, so the next policy answer carries it as well.
+    private var unreportedRelease: UInt64?
     var hasOwnedFlow: () -> Bool = { false }
 
     private static func now() -> UInt64 {
@@ -56,7 +59,8 @@ final class AppLockCoordinator {
             NSLog("RisuNest app lock cover released after %.0f s without a confirmed frame", Self.unconfirmedCoverLimit)
             self.renderCover()
             // The page writes the release to the device log, which has no Swift entry point.
-            self.emit(releasedUnconfirmedAfterSeconds: Self.unconfirmedCoverLimit)
+            self.unreportedRelease = epoch
+            self.emit()
         }
         unconfirmedRelease = release
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.unconfirmedCoverLimit, execute: release)
@@ -176,10 +180,16 @@ final class AppLockCoordinator {
                        blue: CGFloat(rgb & 255) / 255, alpha: 1)
     }
 
-    private func emit(releasedUnconfirmedAfterSeconds: TimeInterval? = nil) {
-        var detail = state.snapshot(at: Self.now()).payload
-        if let seconds = releasedUnconfirmedAfterSeconds { detail["releasedUnconfirmedAfterSeconds"] = seconds }
-        guard let data = try? JSONSerialization.data(withJSONObject: detail),
+    private func lifecyclePayload() -> [String: Any] {
+        var payload = state.snapshot(at: Self.now()).payload
+        if let epoch = unreportedRelease {
+            payload["unconfirmedRelease"] = ["epoch": epoch, "afterSeconds": Int(Self.unconfirmedCoverLimit)] as [String: Any]
+        }
+        return payload
+    }
+
+    private func emit() {
+        guard let data = try? JSONSerialization.data(withJSONObject: lifecyclePayload()),
               let payload = String(data: data, encoding: .utf8) else { return }
         webView?.evaluateJavaScript("window.dispatchEvent(new CustomEvent('risunest-app-lock',{detail:\(payload)}))", completionHandler: nil)
     }
@@ -243,7 +253,8 @@ final class AppLockCoordinator {
         if state.policy.gateRequired != args.policy.gateRequired { readyGeneration &+= 1 }
         state.policy = args.policy
         renderCover()
-        invoke.resolve(state.snapshot(at: Self.now()).payload)
+        invoke.resolve(lifecyclePayload())
+        unreportedRelease = nil
     }
 
     func ready(_ invoke: Invoke) throws {

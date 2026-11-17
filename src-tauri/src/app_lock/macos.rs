@@ -61,7 +61,7 @@ thread_local! {
 
 impl State {
     fn snapshot(&self) -> LifecycleSnapshot {
-        LifecycleSnapshot { active: self.active, epoch: self.epoch, at_ms: now_ms(), departed_at_ms: self.departed_at_ms }
+        LifecycleSnapshot { active: self.active, epoch: self.epoch, at_ms: now_ms(), departed_at_ms: self.departed_at_ms, unconfirmed_release: None }
     }
 
     fn emit(&self) { let _ = self.app.emit(EVENT_NAME, self.snapshot()); }

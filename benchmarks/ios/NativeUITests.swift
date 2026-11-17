@@ -740,7 +740,8 @@ final class NativeUITests: XCTestCase {
             // The native cover hides the page from accessibility, so the text appears only once it is off.
             let returned = texts["app-lock-inactive-\(step)-returned"]
             let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in returned.exists || failure.exists }, object: nil)
-            if XCTWaiter().wait(for: [settled], timeout: 45) != .completed || failure.exists {
+            // Longer than every wait in the fixture, so its own error shows first.
+            if XCTWaiter().wait(for: [settled], timeout: 150) != .completed || failure.exists {
                 attachScreenshot(app, name: "app-lock-inactive-\(step)-not-returned")
                 if failure.exists {
                     let diagnostic = XCTAttachment(string: failure.label)

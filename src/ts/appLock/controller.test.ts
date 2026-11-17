@@ -52,8 +52,11 @@ function fixture(options: { record?: unknown; timing?: AppLockTiming; nativeUnlo
         stored: () => stored,
         presented: () => presentedLocked,
         refresh() { listener(lifecycle) },
-        /** Delivers the iOS event for a cover the shell took off without a confirmed frame. */
-        releaseUnconfirmed(seconds: number) { listener({ ...lifecycle, releasedUnconfirmedAfterSeconds: seconds }) },
+        /** Marks a cover the iOS shell took off without a confirmed frame, as its event or policy answers carry it. */
+        releaseUnconfirmed(event: boolean) {
+            lifecycle = { ...lifecycle, unconfirmedRelease: { epoch: lifecycle.epoch, afterSeconds: 3 } }
+            if (event) listener(lifecycle)
+        },
         emit(active: boolean, atMs: number, departedAtMs: number | null = lifecycle.departedAtMs) {
             miss(active, atMs, departedAtMs)
             listener(lifecycle)
@@ -396,7 +399,7 @@ describe('app lock controller', () => {
         } finally { vi.useRealTimers() }
     })
 
-    it('logs a return frame, policy update or frame confirmation that stays pending once per epoch, and an unconfirmed cover release', async () => {
+    it('logs a return frame, policy update or frame confirmation that stays pending once per epoch', async () => {
         vi.useFakeTimers()
         try {
             const f = fixture()
@@ -438,11 +441,26 @@ describe('app lock controller', () => {
             await f.controller.rendered('unlock')
             await vi.advanceTimersByTimeAsync(3000)
             expect(f.adapter.report).toHaveBeenCalledTimes(3)
-            f.releaseUnconfirmed(3)
-            expect(f.adapter.report).toHaveBeenCalledTimes(4)
-            expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock cover released after 3 s without a confirmed frame: epoch 6')
             f.controller.dispose()
         } finally { vi.useRealTimers() }
+    })
+
+    it('logs an iOS cover released without a confirmed frame once, from its event or a later policy answer', async () => {
+        const f = fixture()
+        // A launch cover can come off before the page listens; the first policy answer still carries it.
+        f.releaseUnconfirmed(false)
+        await f.controller.initialize()
+        expect(f.adapter.report).toHaveBeenCalledOnce()
+        expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock cover released after 3 s without a confirmed frame: epoch 0')
+        f.refresh()
+        f.emit(false, 1)
+        f.emit(true, 2)
+        f.releaseUnconfirmed(true)
+        expect(f.adapter.report).toHaveBeenCalledTimes(2)
+        expect(f.adapter.report).toHaveBeenLastCalledWith('app-lock cover released after 3 s without a confirmed frame: epoch 2')
+        await f.controller.rendered('unlock')
+        expect(f.adapter.report).toHaveBeenCalledTimes(2)
+        f.controller.dispose()
     })
 
     it('keeps a pending return separate from the native PIN gate so a pre-deadline return can present', async () => {
