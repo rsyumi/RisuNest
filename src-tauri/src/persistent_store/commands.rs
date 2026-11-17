@@ -881,8 +881,8 @@ pub(crate) fn commit_staged_replacement<R: tauri::Runtime>(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_open(
-    app: AppHandle,
+pub(crate) fn pds_open<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<'_, PersistentStoreState>,
     document: Option<String>,
 ) -> Result<PersistentStoreOpenResult, StoreError> {
@@ -3808,7 +3808,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path();
         let app = tauri::test::mock_builder()
-            .invoke_handler(tauri::generate_handler![pds_acquire_revision])
+            .invoke_handler(tauri::generate_handler![pds_open, pds_acquire_revision])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         app.manage(crate::app_paths::AppPaths {
@@ -3825,16 +3825,14 @@ mod tests {
         app.manage(PersistentStoreState::unopened_without_purge());
         app.manage(crate::native_media::ipc::NativeMediaIpcState::default());
         let media = app.state::<crate::native_media::ipc::NativeMediaIpcState>();
-        let open = |document: &str| open_for_renderer(app.handle(), &app.state(), Some(document));
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
-        // Through IPC, so the argument the page names is the one the command reads.
-        let acquire = |document: Option<&str>| {
-            let mut body = serde_json::json!({ "revision": 0 });
+        // Through IPC, so the argument the page names is the one each command reads.
+        let invoke = |cmd: &str, mut body: serde_json::Value, document: Option<&str>| {
             if let Some(document) = document {
                 body["document"] = document.into();
             }
             tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
-                cmd: "pds_acquire_revision".into(),
+                cmd: cmd.into(),
                 callback: tauri::ipc::CallbackFn(0),
                 error: tauri::ipc::CallbackFn(1),
                 url: if cfg!(any(windows, target_os = "android")) { "http://tauri.localhost" } else { "tauri://localhost" }.parse().unwrap(),
@@ -3842,7 +3840,11 @@ mod tests {
                 headers: Default::default(),
                 invoke_key: tauri::test::INVOKE_KEY.to_string(),
             })
-            .map(|response| response.deserialize::<LeaseResult>().unwrap())
+        };
+        let open = |document: &str| invoke("pds_open", serde_json::json!({}), Some(document)).map(drop);
+        let acquire = |document: Option<&str>| {
+            invoke("pds_acquire_revision", serde_json::json!({ "revision": 0 }), document)
+                .map(|response| response.deserialize::<LeaseResult>().unwrap())
         };
         let read = |lease: &LeaseResult| with_store_mutex(&app.state(), |store| store.read_root(Some(&lease.lease)).map(drop));
 
@@ -3866,7 +3868,7 @@ mod tests {
         assert!(matches!(read(&exporting), Err(StoreError::SnapshotReleased)));
         read(&unnamed).expect("a lease no page named waits for the page reset");
         assert!(acquire(Some("first")).unwrap_err().to_string().contains("replaced"));
-        assert!(matches!(open("first"), Err(StoreError::Validation { .. })));
+        assert!(open("first").unwrap_err().to_string().contains("replaced"));
         let current = acquire(Some("second")).unwrap();
         open("second").unwrap();
         read(&current).unwrap();
