@@ -97,9 +97,13 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
             markers.append(line)
         }
         try {
-            await inactiveDepartures(mark)
+            await inactiveDepartures(markers, mark)
         } catch (error) {
-            mark('verification-error:' + (error instanceof Error ? error.message : String(error)))
+            // The PIN setup screen is a modal dialog, which hides the markers from the driver.
+            appLock.cancelFlow()
+            const { active, locked, flow, epoch } = appLock.state
+            mark('verification-error:' + (error instanceof Error ? error.message : String(error))
+                + ' state=' + JSON.stringify({ active, locked, flow, epoch }) + ' trace=' + JSON.stringify(trace))
             throw error
         }
         return
@@ -134,23 +138,40 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
         await report('complete', { passed: true, retained: true })
     }
 
-    /** iOS: Notification Center over the app leaves it inactive without a background transition. */
-    async function inactiveDepartures(mark: (text: string) => void) {
+    /**
+     * iOS: the driver pulls Notification Center over the app and later peeks at the app switcher,
+     * returns, and then taps the page. Each departure runs with the lock off, set to 1 minute, and set to immediately.
+     */
+    async function inactiveDepartures(markers: HTMLElement, mark: (text: string) => void) {
+        const timing = (value: 'after-1m' | 'immediate') => async () => {
+            if (!await appLock.setTiming(value)) throw new Error('Lock timing did not save')
+        }
         const steps = [
             { name: 'preview', setUp: async () => {} },
             { name: 'timed', setUp: async () => {
                 await setUpPin()
-                if (!await appLock.setTiming('after-1m')) throw new Error('Lock timing did not save')
+                await timing('after-1m')()
             } },
-            { name: 'immediate', setUp: async () => {
-                if (!await appLock.setTiming('immediate')) throw new Error('Lock timing did not save')
+            { name: 'immediate', setUp: timing('immediate') },
+            { name: 'switcher-immediate', setUp: async () => {} },
+            { name: 'switcher-timed', setUp: timing('after-1m') },
+            { name: 'switcher-preview', setUp: async () => {
+                if (!await appLock.setEnabled(false)) throw new Error('Synthetic lock did not turn off')
             } },
         ]
         for (const step of steps) {
+            await until(() => appLock.state.active && !appLock.gated, `The page was not active before the ${step.name} step`, 45_000)
             await step.setUp()
             await frame()
             await appLock.rendered('Synthetic app lock')
             trace.length = 0
+            // Only the driver's tap after it came back marks the real return:
+            // the shell can report the page active again while Notification Center still covers it.
+            let tapped = false
+            const back = document.createElement('button')
+            back.textContent = `app-lock-inactive-${step.name}-back`
+            back.addEventListener('click', () => { tapped = true })
+            markers.append(back)
             mark(`app-lock-inactive-${step.name}-ready`)
             await report(`app-lock-inactive-${step.name}-ready`, { epoch: appLock.state.epoch, record: {
                 enabled: appLock.state.record.enabled, timing: appLock.state.record.timing,
@@ -158,17 +179,20 @@ export async function appLockFixture(platform: 'ios' | 'macos' | 'linux', phase:
             let locked = false
             await until(() => {
                 locked ||= appLock.state.locked
-                const away = trace.find(snapshot => !snapshot.active)
-                return away !== undefined && trace.some(snapshot => snapshot.active && snapshot.epoch > away.epoch)
-            }, `No departure and return for the ${step.name} step`, 60_000)
-            if (locked !== (step.name === 'immediate')) throw new Error(`The ${step.name} return ${locked ? 'locked' : 'did not lock'} the page`)
+                return tapped
+            }, `The driver did not return for the ${step.name} step`, 120_000)
+            back.remove()
             await until(() => appLock.state.active && !appLock.gated, `The ${step.name} return stayed gated`, 45_000)
             // A cover without a lock decision comes off by itself after 3 s; wait past that to see which release ran.
             await pause(3_500)
-            const away = trace.find(snapshot => !snapshot.active)!
-            const back = trace.find(snapshot => snapshot.active && snapshot.epoch > away.epoch)!
+            mark(`trace-${step.name}:` + JSON.stringify(trace.map(snapshot => [snapshot.epoch, snapshot.active ? 1 : 0, snapshot.atMs,
+                snapshot.departedAtMs, snapshot.unconfirmedRelease?.epoch ?? null])))
+            const away = trace.find(snapshot => !snapshot.active)
+            const reentered = away && trace.find(snapshot => snapshot.active && snapshot.epoch > away.epoch)
+            if (!away || !reentered) throw new Error(`No departure and return for the ${step.name} step`)
+            if (locked !== step.name.endsWith('immediate')) throw new Error(`The ${step.name} return ${locked ? 'locked' : 'did not lock'} the page`)
             const unconfirmed = trace.find(snapshot => snapshot.unconfirmedRelease !== undefined)
-            await report(`app-lock-inactive-${step.name}-returned`, { trace: [...trace], awayMs: back.atMs - away.atMs })
+            await report(`app-lock-inactive-${step.name}-returned`, { trace: [...trace], awayMs: reentered.atMs - away.atMs })
             if (unconfirmed) throw new Error(`The ${step.name} return released the cover without a confirmed frame`)
             if (document.querySelector('main') !== main || !main.contains(retained) || draft.value !== 'retained synthetic draft 123456') {
                 throw new Error(`The ${step.name} return replaced the retained draft`)
