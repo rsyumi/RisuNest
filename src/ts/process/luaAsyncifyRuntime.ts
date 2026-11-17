@@ -134,7 +134,8 @@ export class LuaAsyncifyRuntime {
         const address = this.engine.global.address
         this.lua.lua_rawgeti(address, LUA_REGISTRYINDEX, BigInt(this.gcControl))
         this.lua.lua_pushboolean(address, resume ? 1 : 0)
-        this.engine.global.assertOk(this.controlCall(address, 1, 0, 0, 0, null))
+        // A deadline that passes here must not unwind through a suspended host callback.
+        this.budget.runUninterrupted(() => this.engine.global.assertOk(this.controlCall(address, 1, 0, 0, 0, null)))
     }
 
     private pushReply(thread: LuaThread, value: unknown): void {

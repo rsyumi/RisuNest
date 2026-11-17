@@ -34,6 +34,7 @@ class LuaExecutionBudget {
     private readonly sourceDeadlines = new Map<number, number>()
     private readonly deadlines: number[] = []
     private readonly entered: number[] = []
+    private uninterrupted = 0
     private readonly originalToString: LuaWasm['luaL_tolstring']
 
     constructor(private readonly lua: LuaWasm) {
@@ -125,6 +126,16 @@ class LuaExecutionBudget {
         return owner.timedOut === true
     }
 
+    /** Runs fixed host-owned Lua, which calls no user code, without raising a timeout inside it. */
+    runUninterrupted<T>(run: () => T): T {
+        this.uninterrupted++
+        try {
+            return run()
+        } finally {
+            this.uninterrupted--
+        }
+    }
+
     didTimeout(engine: LuaEngine): boolean {
         return this.owner(engine.global.address)?.timedOut === true
     }
@@ -149,6 +160,8 @@ class LuaExecutionBudget {
                 if (entered !== undefined && entered !== address) {
                     this.lua.lua_sethook(entered, hook, LuaEventMasks.Count, 1)
                 }
+                // Host control code finishes; the entered thread raises on its next instruction.
+                if (this.uninterrupted) return
                 this.lua.lua_pushstring(address, 'thread timeout exceeded')
                 this.lua.lua_error(address)
             }
