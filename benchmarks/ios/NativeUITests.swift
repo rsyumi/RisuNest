@@ -712,6 +712,7 @@ final class NativeUITests: XCTestCase {
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let texts = app.webViews.staticTexts
         let failure = texts.containing(NSPredicate(format: "label BEGINSWITH %@", "verification-error:")).firstMatch
+        let cardPredicate = NSPredicate(format: "identifier CONTAINS %@ OR label == %@", "io.github.rsyumi.risunest.ios.bench", "RisuNest iOS Bench")
         // Preview hiding with the lock off, a return before the one-minute limit, and an immediate lock,
         // first under Notification Center and then from the app switcher.
         for step in ["preview", "timed", "immediate", "switcher-immediate", "switcher-timed", "switcher-preview"] {
@@ -738,8 +739,21 @@ final class NativeUITests: XCTestCase {
             // Recorded rather than asserted: whether this departure stays inactive depends on the iOS version.
             print("RISUNEST_APP_LOCK_INACTIVE step=\(step) away_state=\(app.state.rawValue)")
             if switcher {
-                // The app's own card sits in the middle of the switcher.
-                springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45)).tap()
+                // Other apps in the switcher move the app's card off the middle, so the largest element
+                // that names the app is the card. Its left part is on screen wherever the card sits.
+                let screenArea = springboard.frame.width * springboard.frame.height
+                let card = springboard.descendants(matching: .any).matching(cardPredicate).allElementsBoundByIndex
+                    .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+                guard let card, card.frame.width * card.frame.height > screenArea / 4 else {
+                    let tree = XCTAttachment(string: springboard.debugDescription)
+                    tree.name = "app-lock-inactive-\(step)-switcher"
+                    tree.lifetime = .keepAlways
+                    add(tree)
+                    XCTFail("\(step): the app's card is not in the app switcher")
+                    return
+                }
+                print("RISUNEST_APP_LOCK_INACTIVE step=\(step) card=\(card.identifier) frame=\(card.frame)")
+                card.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.5)).tap()
             } else {
                 springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.995))
                     .press(forDuration: 0.1, thenDragTo: springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)))
