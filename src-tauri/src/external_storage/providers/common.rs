@@ -24,6 +24,7 @@ pub(crate) fn error(kind: ErrorKind, status: u16) -> ProviderError {
         oauth_error: None,
         oauth_error_description: None,
         cause: Default::default(),
+        connection_id: None,
     }
 }
 fn io_error(error: std::io::Error, cancel: &Cancellation) -> ProviderError {
@@ -177,6 +178,7 @@ pub(crate) fn classify_status(
         oauth_error: None,
         oauth_error_description: None,
         cause: Default::default(),
+        connection_id: None,
     }
 }
 

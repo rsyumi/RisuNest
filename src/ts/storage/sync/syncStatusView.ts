@@ -1,6 +1,6 @@
 import { language } from 'src/lang'
-import { externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
-import { externalJobIsActive, externalJobIsPaused } from './external/connection'
+import { externalConnectionTitle, externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
+import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal, externalNeedsUnlock, externalRemedyConnection, externalRenewalConnection } from './external/connection'
 import type { ExternalOperationProgress } from './external/progress'
 import type { ExternalConnectionSummary, ExternalJobSummary } from './external/types'
 import { formatLevelLabel, registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
@@ -52,6 +52,9 @@ export function externalSyncStatusView(
             : connection.status === 'key-locked' ? strings.statusLocked : strings.statusError
         return { label, tone: 'attention', stopped: true }
     }
+    // Sync stops on a sign-in or recovery key failure without marking the connection.
+    if (externalNeedsRenewal(failure)) return { label: strings.statusReauth, tone: 'attention', stopped: true }
+    if (externalNeedsUnlock(failure)) return { label: strings.statusLocked, tone: 'attention', stopped: true }
     if (job && (job.state === 'uncertain' || externalJobIsPaused(job))) return { label: strings.statusError, tone: 'attention', stopped: false }
     if (operation?.state === 'running') {
         if (operation.stage === 'waiting') return { label: strings.transfer.waiting, tone: 'idle', stopped: false }
@@ -64,6 +67,19 @@ export function externalSyncStatusView(
     if (catchingUp) return { label: strings.transfer.syncing, tone: 'working', stopped: false }
     if (syncStopped) return { label: strings.statusPaused, tone: 'paused', stopped: false }
     return { label: strings.statusReady, tone: 'connected', stopped: false }
+}
+
+/** The external connection that has to sign in again, or take a new key, before sync continues: the bound one,
+ * or another storage connection an asset download read through. */
+export function externalRenewalTarget(source: SyncStatusSource | null | undefined, failure?: unknown): string | undefined {
+    if (source?.target !== 'external') return undefined
+    const { connection } = source
+    if (connection.status === 'reauth-required') return connection.id
+    for (const value of [connection.lastError, source.job?.error, source.failure, failure]) {
+        const target = externalRenewalConnection(value, connection.id)
+        if (target) return target
+    }
+    return undefined
 }
 
 /** The external card's sentence for a connection or job error. */
@@ -80,6 +96,12 @@ export function externalSyncFailureText(strings: ExternalStorageStrings, failure
     if (kind === 'clockSkew') return language.lwwSync.clockBlocked
     if (kind === 'previousStorageUnavailable') return language.lwwSync.previousStorageUnavailable
     return externalErrorMessage(strings, failure)
+}
+
+/** A sign-in or recovery key stop with the connection that clears it, so a closed notice returns when either changes. */
+function externalRemedyKey(failure: unknown, connectionId: string): string {
+    const remedy = externalRemedyConnection(failure, connectionId)
+    return remedy ? `${externalNeedsUnlock(failure) ? 'unlock' : 'renew'}:${remedy}` : ''
 }
 
 export interface SyncStatusDisplay extends SyncStatusView {
@@ -106,14 +128,17 @@ export function syncStatusDisplay(source: SyncStatusSource, strings: ExternalSto
             lastSuccessAt: view.lastSuccessAt,
         }
     } else {
-        const { connection } = source
+        const { connection, remedyConnection } = source
         const status = externalSyncStatusView(strings, connection, source.job, source.operation, source.syncStopped, source.catchingUp, source.failure)
         display = {
             ...status,
             title: strings.title,
             error: connection.lastError ? externalErrorLabel(strings, connection.lastError)
+                : remedyConnection ? (externalNeedsUnlock(source.failure) ? strings.unlockKeyOtherAssets : strings.reauthenticateOtherAssets)
+                    .replace('{0}', externalConnectionTitle(strings, remedyConnection))
                 : source.failure !== undefined ? externalSyncFailureText(strings, source.failure) : '',
-            stopKey: status.stopped ? `external:${connection.id}:${connection.status}:${connection.lastError?.code ?? externalFormatCode(source.failure) ?? ''}` : '',
+            stopKey: status.stopped ? `external:${connection.id}:${connection.status}:${connection.lastError?.code
+                ?? externalFormatCode(source.failure) ?? externalRemedyKey(source.failure, connection.id)}` : '',
             lastSuccessAt: connection.lastSyncAtMs ? Number(connection.lastSyncAtMs) : undefined,
         }
     }

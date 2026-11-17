@@ -1,4 +1,4 @@
-import { externalErrorKind } from 'src/ts/storage/sync/external/connection'
+import { EXTERNAL_ASSET_KEY_CODE, EXTERNAL_ASSET_REAUTH_CODE, externalErrorKind } from 'src/ts/storage/sync/external/connection'
 import { languageEnglish } from 'src/lang/en'
 import { languageKorean } from 'src/lang/ko'
 export { externalErrorKind } from 'src/ts/storage/sync/external/connection'
@@ -113,6 +113,10 @@ const english = {
     retry: 'Could not reach the repository. Check your internet connection and try again.', retryAction: 'Try again',
     reauthenticate: 'The sign-in expired or the key is no longer valid. Sign in again or enter a new key.',
     unlockKey: 'Enter the recovery key to use this repository.',
+    reauthenticateOther: 'Sign in to {0} again to continue this backup.',
+    unlockKeyOther: 'Enter the recovery key of {0} to continue this backup.',
+    reauthenticateOtherAssets: 'Sign in to {0} again to continue downloading assets.',
+    unlockKeyOtherAssets: 'Enter the recovery key of {0} to continue downloading assets.',
     resolveRequired: 'Resolve the conflict first. The Conflicts tab lets you choose which side to keep.',
     freeSpace: 'The repository is out of space. Free space on the service and try again.',
     credentialsRejected: 'The service did not accept this sign-in or key. Check what you entered and try again.',
@@ -317,6 +321,10 @@ const korean: typeof english = {
     retry: '저장소에 연결하지 못했습니다. 인터넷 연결을 확인하고 다시 시도하세요.', retryAction: '다시 시도',
     reauthenticate: '로그인이 만료되었거나 키가 더 이상 유효하지 않습니다. 다시 로그인하거나 새 키를 입력하세요.',
     unlockKey: '복구 키를 입력해야 이 저장소를 쓸 수 있습니다.',
+    reauthenticateOther: '{0}에 다시 로그인해야 이 백업을 이어갈 수 있습니다.',
+    unlockKeyOther: '{0}의 복구 키를 입력해야 이 백업을 이어갈 수 있습니다.',
+    reauthenticateOtherAssets: '{0}에 다시 로그인해야 에셋 다운로드를 이어갈 수 있습니다.',
+    unlockKeyOtherAssets: '{0}의 복구 키를 입력해야 에셋 다운로드를 이어갈 수 있습니다.',
     resolveRequired: '충돌을 먼저 해결하세요. 충돌 탭에서 어느 쪽을 남길지 고를 수 있습니다.',
     freeSpace: '저장소 공간이 부족합니다. 서비스에서 공간을 확보한 뒤 다시 시도하세요.',
     credentialsRejected: '서비스가 이 로그인이나 키를 받아들이지 않았습니다. 입력한 내용을 확인하고 다시 시도하세요.',
@@ -525,6 +533,8 @@ function externalErrorSummary(strings: ExternalStorageStrings, value: unknown): 
         case 'folderUnsupportedLocation': return strings.folderUnsupportedLocation
         case 'alreadyConnected': return strings.connectionAlreadyAdded
         case 'unauthorized': return strings.credentialsRejected
+        case EXTERNAL_ASSET_REAUTH_CODE: return strings.reauthenticate
+        case EXTERNAL_ASSET_KEY_CODE: return strings.unlockKey
         case 'reauthRequired': return [strings.reauthenticate, oauthSuffix, oauthDescriptionSuffix]
             .filter(Boolean)
             .join('\n')

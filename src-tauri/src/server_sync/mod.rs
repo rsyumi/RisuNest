@@ -50,6 +50,10 @@ pub(crate) struct SyncError {
     /// An activation failed before changing an already usable local library.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_local_ready: Option<bool>,
+    /// The external storage connection that refused a sign-in or has no key
+    /// on this device, for an operation that reads through more than one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
     /// Where the error was raised. Kept for the device log, never sent.
     #[serde(skip)]
     pub at: &'static std::panic::Location<'static>,
@@ -67,6 +71,7 @@ impl SyncError {
             status,
             retryable,
             startup_local_ready: None,
+            connection_id: None,
             at: std::panic::Location::caller(),
             cause: None,
         }

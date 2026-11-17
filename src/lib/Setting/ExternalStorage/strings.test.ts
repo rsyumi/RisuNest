@@ -114,6 +114,9 @@ describe('externalErrorMessage', () => {
             strings.reauthenticate,
             strings.oauthErrorCode.replace('{0}', '<script>alert(1)</script>'),
         ].join('\n'))
+        // An asset download names the same stops with its own codes.
+        expect(externalErrorMessage(strings, { code: 'external-reauth-required', status: 502, retryable: true })).toBe(strings.reauthenticate)
+        expect(externalErrorMessage(strings, { code: 'external-key-locked', status: 502, retryable: false })).toBe(strings.unlockKey)
     })
 
     it('falls back for a local failure that carries no native kind', () => {

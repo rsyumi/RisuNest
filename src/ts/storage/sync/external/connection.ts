@@ -114,6 +114,45 @@ export function externalErrorKind(value: unknown): string | undefined {
     return typeof kind === 'string' ? kind : undefined
 }
 
+/** The code an asset download reports when the provider asks to sign in again. */
+export const EXTERNAL_ASSET_REAUTH_CODE = 'external-reauth-required'
+/** The code an asset download reports when the storage that holds a body has no recovery key on this device. */
+export const EXTERNAL_ASSET_KEY_CODE = 'external-key-locked'
+
+/** Whether signing in again, or entering a new key for a key-based provider, clears this failure. */
+export function externalNeedsRenewal(value: unknown): boolean {
+    if (typeof value !== 'object' || value === null) return false
+    if ((value as { action?: unknown }).action === 'reauthenticate') return true
+    return ['reauthRequired', 'unauthorized', EXTERNAL_ASSET_REAUTH_CODE].includes(externalErrorKind(value) ?? '')
+}
+
+/** The connection that has to sign in again, or take a new key, to clear a failure `connectionId` reported. An
+ * asset download reads every connection that holds a body, so its failure names the one that refused. */
+export function externalRenewalConnection(value: unknown, connectionId: string): string | undefined {
+    return externalNeedsRenewal(value) ? namedConnection(value, connectionId) : undefined
+}
+
+/** Whether entering the recovery key clears this failure. */
+export function externalNeedsUnlock(value: unknown): boolean {
+    if (typeof value !== 'object' || value === null) return false
+    return ['repositoryKeyUnavailable', 'recoveryKeyMismatch', EXTERNAL_ASSET_KEY_CODE].includes(externalErrorKind(value) ?? '')
+}
+
+/** The connection whose sign-in or recovery key clears a failure `connectionId` reported, named the same way. */
+export function externalRemedyConnection(value: unknown, connectionId: string): string | undefined {
+    return externalNeedsRenewal(value) || externalNeedsUnlock(value) ? namedConnection(value, connectionId) : undefined
+}
+
+function namedConnection(value: unknown, connectionId: string): string {
+    const named = (value as { connectionId?: unknown }).connectionId
+    return typeof named === 'string' && named ? named : connectionId
+}
+
+/** The connection whose sign-in or key clears a job's error: the one the error names, or the job's own. */
+export function externalJobFixedOn(job: ExternalJobSummary): string {
+    return job.error?.connectionId || job.connectionId
+}
+
 export function externalJobIsPaused(job: ExternalJobSummary): boolean {
     return job.state === 'waiting'
         && job.phase === 'paused'

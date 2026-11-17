@@ -630,6 +630,7 @@ mod tests {
             redirect_url,
             scopes: vec!["synthetic.scope".into()],
             picker: false,
+            login_hint: None,
         })
     }
 

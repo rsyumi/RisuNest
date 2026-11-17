@@ -171,6 +171,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         403 => ProviderError {
             kind: ErrorKind::Unauthorized,
@@ -179,6 +180,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         429 => ProviderError {
             kind: ErrorKind::RateLimited,
@@ -187,6 +189,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         _ => common::classify_status(status, headers, now_ms),
     }

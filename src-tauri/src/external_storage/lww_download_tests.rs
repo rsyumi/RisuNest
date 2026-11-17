@@ -74,7 +74,7 @@ fn wrapped_remote_source_spooling_and_hydration_finish_with_one_body_slot() {
 fn standalone_hydration_settles_successful_siblings_before_returning_a_download_error() {
     runtime().block_on(async {
         let f=CycleFixture::new();let provider=Arc::new(DownloadProvider::new(4,&["body-0","body-1","body-2","body-3"]));
-        let sources=sources(&f,&provider,6);provider.inner.fail_read("body-1",ErrorKind::Transient);
+        let sources=sources(&f,&provider,6);provider.inner.fail_read("body-1",ErrorKind::ReauthRequired);
         let _installed=install_test_source_connection(f.directory_b.path(),Arc::new(connection(&f,provider.clone(),None))).unwrap();
         let root=f.directory_b.path().to_owned();let hashes=sources.iter().map(|s|s.hash.clone()).collect::<Vec<_>>();
         let task=tokio::task::spawn_blocking(move || {
@@ -84,12 +84,25 @@ fn standalone_hydration_settles_successful_siblings_before_returning_a_download_
         tokio::time::timeout(fake::DEADLOCK_TEST_BOUND,async {
             provider.started(4).await;provider.release("body-1");provider.completed(1).await;
             for id in ["body-0","body-2","body-3"] {provider.release(id);}
-            let (result,completed)=task.await.unwrap();assert!(result.is_err());
+            let (result,completed)=task.await.unwrap();
+            let refused=result.unwrap_err();assert_eq!((refused.code.as_str(),refused.connection_id.as_deref()),("external-reauth-required",Some("receiver")));
             assert_eq!(completed.into_iter().collect::<BTreeSet<_>>(),[0,2,3].into_iter().map(|i|sources[i].hash.clone()).collect());
         }).await.expect("failed hydration did not drain its siblings");
         assert_eq!(provider.inner.read_attempts("body-4"),0);assert_eq!(provider.inner.read_attempts("body-5"),0);
         let cas=crate::asset_repository::PayloadCas::new(f.directory_b.path()).unwrap();
         for index in [0,2,3] {assert!(cas.stat_object(&sources[index].hash).unwrap().is_some());}
+    });
+}
+
+#[test]
+fn a_standalone_source_without_its_recovery_key_names_its_connection() {
+    runtime().block_on(async {
+        let f=CycleFixture::new();let provider=Arc::new(DownloadProvider::new(4,&[]));
+        let sources=sources(&f,&provider,1);provider.inner.fail_open(ErrorKind::RepositoryKeyUnavailable);
+        let _installed=install_test_source_connection(f.directory_b.path(),Arc::new(connection(&f,provider.clone(),None))).unwrap();
+        let root=f.directory_b.path().to_owned();let hashes=vec![sources[0].hash.clone()];
+        let refused=tokio::task::spawn_blocking(move || hydrate_registered_many(&root,&hashes,&BTreeSet::new(),None,&||Ok(()),&mut |_,_|{})).await.unwrap().unwrap_err();
+        assert_eq!((refused.code.as_str(),refused.connection_id.as_deref()),("external-key-locked",Some("receiver")));
     });
 }
 

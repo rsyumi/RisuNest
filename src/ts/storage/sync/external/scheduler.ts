@@ -49,7 +49,8 @@ export function createExternalStorageScheduler(
     let suspended = false
     const refusals = new Map<string, number>()
     const retryNotBefore = new Map<string, number>()
-    const blocked = new Set<string>()
+    /** Each stopped destination, with the connection whose recovery lets it run again. */
+    const blocked = new Map<string, string>()
     const now = dependencies.now ?? (() => performance.now())
     const wallNow = dependencies.wallNow ?? Date.now
     const setTimer = dependencies.setTimer
@@ -152,7 +153,7 @@ export function createExternalStorageScheduler(
                     refusals.delete(key)
                     return
                 }
-                const stopRetry = () => { blocked.add(key) }
+                const stopRetry = () => { blocked.set(key, result.error?.connectionId || destination.connectionId) }
                 if (result.reason === 'publication-unknown' || result.error?.reason === 'publication-unknown') { stopRetry(); return }
                 const causeKind = result.error?.code ?? externalErrorKind('cause' in result ? result.cause : undefined) ?? result.reason
                 if (result.error?.retryable === false) {
@@ -253,6 +254,7 @@ export function createExternalStorageScheduler(
             scheduleNext()
         },
         recovered(connectionId: string): void {
+            for (const [key, waitsOn] of blocked) if (waitsOn === connectionId) blocked.delete(key)
             blocked.delete(`backup:${connectionId}`)
             refusals.delete(`backup:${connectionId}`)
             scheduleNext()

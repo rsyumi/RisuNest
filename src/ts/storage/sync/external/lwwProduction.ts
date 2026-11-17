@@ -17,9 +17,10 @@ import { downloadRemoteAssets } from '../serverAssetResidency'
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../../libraryFileOperation'
 import { createLwwScheduler, failureKind, formatKinds, type LwwCall, type LwwOperation, type LwwTurn } from './lwwScheduler'
 import type { ExternalStorageState } from './types'
+import { EXTERNAL_ASSET_KEY_CODE, EXTERNAL_ASSET_REAUTH_CODE, externalRemedyConnection } from './connection'
 import { beginExternalProgress, clearExternalProgress, clearExternalSyncProgress, externalProgressFailure, type ExternalProgressRun } from './progress'
 
-interface Adapter { transport: SyncBindingTransport; scheduler: ReturnType<typeof createLwwScheduler>; stopHydration(): Promise<void>; resumeHydration(pendingOnly?: boolean, continuation?: boolean): void; hide(publish: boolean): Promise<void>; dispose(): void; state?: SyncBindingState; generation: number; foreground?: Promise<void>; recovery?: string }
+interface Adapter { transport: SyncBindingTransport; scheduler: ReturnType<typeof createLwwScheduler>; recover(renewed: ReadonlySet<string>): boolean; stopHydration(): Promise<void>; resumeHydration(pendingOnly?: boolean, continuation?: boolean): void; hide(publish: boolean): Promise<void>; dispose(): void; state?: SyncBindingState; generation: number; foreground?: Promise<void>; recoveries?: ReadonlyMap<string, string> }
 const adapters = new Map<string, Adapter>()
 const failures = new Map<string, unknown>()
 const failureListeners = new Set<(failures: ReadonlyMap<string, unknown>) => void>()
@@ -77,12 +78,15 @@ function createAdapter(connectionId: string): Adapter {
     let hydrationServiceRetryAt = 0
     let hydrationBlocked = false
     const operationFailures = new Map<LwwOperation | 'assets', unknown>()
-    const reportOperation = (operation: LwwOperation | 'assets', error?: unknown) => {
-        if (error === undefined) operationFailures.delete(operation)
-        else operationFailures.set(operation, error)
+    const reportOperations = () => {
         const values = [...operationFailures.values()]
         // A format level stop stays reported with its switch while another operation fails.
         reportFailure(connectionId, values.find(value => formatKinds.includes(failureKind(value))) ?? values.at(-1))
+    }
+    const reportOperation = (operation: LwwOperation | 'assets', error?: unknown) => {
+        if (error === undefined) operationFailures.delete(operation)
+        else operationFailures.set(operation, error)
+        reportOperations()
     }
     /** `continuation` lets hydration that received pages or a manual sync requested start or continue while hidden. */
     const continueHydration = (continuation = false) => {
@@ -104,7 +108,7 @@ function createAdapter(connectionId: string): Adapter {
             if (Number.isFinite(deadline)) hydrationServiceRetryAt = Math.max(hydrationServiceRetryAt, deadline)
             hydrationRetryAt = Math.max(Date.now() + 20_000, hydrationServiceRetryAt)
             hydrationBlocked = failure?.retryable === false || ['reauthenticate', 'unlock-key', 'free-space', 'check-endpoint'].includes(failure?.action ?? '')
-                || ['unauthorized', 'reauthRequired', 'deviceVaultUnavailable', 'repositoryKeyUnavailable', 'localStorageFull', 'localPermissionDenied', 'storageFull', 'endpointRejected', 'corrupt', 'repositoryMismatch'].includes(failure?.kind ?? failure?.code ?? '')
+                || ['unauthorized', 'reauthRequired', EXTERNAL_ASSET_REAUTH_CODE, EXTERNAL_ASSET_KEY_CODE, 'deviceVaultUnavailable', 'repositoryKeyUnavailable', 'localStorageFull', 'localPermissionDenied', 'storageFull', 'endpointRejected', 'corrupt', 'repositoryMismatch'].includes(failure?.kind ?? failure?.code ?? '')
             reportOperation('assets', error)
         }).finally(() => {
             joined.dispose()
@@ -312,7 +316,22 @@ function createAdapter(connectionId: string): Adapter {
         await scheduler.settled()
         await hydrating
     })
-    const adapter: Adapter = { transport, scheduler, stopHydration, resumeHydration, hide, generation: 0, dispose() { adapter.generation++; scheduler.stop(); void stopHydration(); active = undefined; reportFailure(connectionId); unregister(); unregisterGate(); clearExternalProgress(connectionId); if (adapters.get(connectionId) === adapter) adapters.delete(connectionId) } }
+    // A renewed sign-in or recovery key clears the stops it caused at once rather than after the receive it starts. An
+    // asset download can stop on another storage connection, which only that connection's renewal or unlock clears.
+    // Returns whether downloads resume.
+    const recover = (renewed: ReadonlySet<string>) => {
+        const before = operationFailures.size
+        for (const [operation, error] of operationFailures) {
+            const target = externalRemedyConnection(error, connectionId)
+            if (target !== undefined && renewed.has(target)) operationFailures.delete(operation)
+        }
+        const cleared = operationFailures.size !== before
+        if (cleared) reportOperations()
+        const own = renewed.has(connectionId)
+        if (own) scheduler.recovered()
+        return (own || cleared) && externalRemedyConnection(operationFailures.get('assets'), connectionId) === undefined
+    }
+    const adapter: Adapter = { transport, scheduler, recover, stopHydration, resumeHydration, hide, generation: 0, dispose() { adapter.generation++; scheduler.stop(); void stopHydration(); active = undefined; reportFailure(connectionId); unregister(); unregisterGate(); clearExternalProgress(connectionId); if (adapters.get(connectionId) === adapter) adapters.delete(connectionId) } }
     return adapter
 }
 
@@ -323,11 +342,15 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
     const recovered = new Set<Adapter>()
     for (const [id, adapter] of adapters) if (!sync.has(id)) adapter.dispose()
     for (const id of sync) if (!adapters.has(id)) adapters.set(id, createAdapter(id))
-    for (const [id, adapter] of adapters) {
-        const connection = state.connections.find(value => value.id === id)
-        const recovery = JSON.stringify([connection?.status, connection?.lastError])
-        if (adapter.recovery !== undefined && adapter.recovery !== recovery) { adapter.scheduler.recovered(); recovered.add(adapter) }
-        adapter.recovery = recovery
+    // The verified time changes when a sign-in, key or address is renewed, which a sync failure leaves unmarked. A
+    // removed connection can no longer be signed in, so the stops it caused clear as well.
+    const recoveries = new Map(state.connections.map(connection => [connection.id, JSON.stringify([connection.status, connection.lastError, connection.lastVerifiedAtMs])]))
+    for (const adapter of adapters.values()) {
+        const previous = adapter.recoveries
+        adapter.recoveries = recoveries
+        if (!previous) continue
+        const renewed = new Set([...previous].filter(([id, recovery]) => recoveries.get(id) !== recovery).map(([id]) => id))
+        if (renewed.size && adapter.recover(renewed)) recovered.add(adapter)
     }
     const binding = await native.state()
     if (generation !== refreshGeneration) return

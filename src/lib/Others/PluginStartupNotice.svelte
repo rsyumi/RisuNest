@@ -13,7 +13,8 @@
     import { serverSyncErrorMessage } from 'src/ts/storage/sync/serverSyncErrorMessage'
     import { externalErrorMessage, externalStorageStrings } from '../Setting/ExternalStorage/strings'
     import { syncStatus } from 'src/ts/storage/sync/syncStatus'
-    import { syncStatusDisplay } from 'src/ts/storage/sync/syncStatusView'
+    import { externalRenewalTarget, syncStatusDisplay } from 'src/ts/storage/sync/syncStatusView'
+    import { externalRenewalOpen, openExternalRenewal } from 'src/ts/setting/externalRenewalRequest'
     import SettingButton from '../Setting/RisuNest/SettingButton.svelte'
 
     let { inline = false }: { inline?: boolean } = $props()
@@ -21,19 +22,24 @@
     // Closing holds for the current wait, stop or failure; the next one shows again.
     let dismissed = $state<{ phase: string; since: number; stop?: string }>()
     const failed = $derived($pluginStartupState.phase === 'failed')
+    const externalStrings = $derived(externalStorageStrings(DBState.db.language))
     const stopped = $derived.by(() => {
-        const display = $syncStatus && syncStatusDisplay($syncStatus, externalStorageStrings(DBState.db.language), false)
+        const display = $syncStatus && syncStatusDisplay($syncStatus, externalStrings, false)
         return display?.stopped ? display : undefined
     })
+    // Signing in again is what clears this stop, so it replaces the retry that would fail the same way.
+    const renewal = $derived(failed || stopped
+        ? externalRenewalTarget($syncStatus, $pluginStartupState.target === 'external' ? $pluginStartupState.error : undefined)
+        : undefined)
     const shown = $derived(!dismissed || dismissed.phase !== $pluginStartupState.phase || dismissed.since !== $pluginStartupState.since
         || (!!stopped && dismissed.stop !== stopped.stopKey))
     // With the sync UI turned off, only a failure or stop that holds plugins is reported.
-    const visible = $derived($pluginStartupState.phase !== 'released' && (inline || ($inlineShown === 0 && shown && (failed || !!stopped || (elapsed && (DBState.db.risunestSyncStatusUi ?? true))))))
+    const visible = $derived($pluginStartupState.phase !== 'released' && (inline || ($inlineShown === 0 && !$externalRenewalOpen && shown && (failed || !!stopped || (elapsed && (DBState.db.risunestSyncStatusUi ?? true))))))
     const error = $derived.by(() => {
         const value = $pluginStartupState.error
         const unavailable = value instanceof Error && value.message === 'Sync is unavailable'
         const message = stopped?.error ?? ($pluginStartupState.target === 'external'
-            ? externalErrorMessage(externalStorageStrings(DBState.db.language), unavailable ? undefined : value)
+            ? externalErrorMessage(externalStrings, unavailable ? undefined : value)
             : serverSyncErrorMessage(value))
         return failed && message === language.risuNest.serverSync.errorHelp ? '' : message
     })
@@ -67,9 +73,9 @@
                     <div role="alert">
                         <p class="font-semibold">{failed ? language.risuNest.pluginStartup.syncUnfinished : language.risuNest.pluginStartup.waiting}</p>
                         {#if stopped}<p class="mt-1 font-semibold">{stopped.label}</p>{/if}
-                        {#if error}<p class="mt-1 whitespace-pre-wrap text-sm text-textcolor/70">{error}</p>{/if}
+                        {#if error}<p class="mt-1 whitespace-pre-wrap wrap-anywhere text-sm text-textcolor/70">{error}</p>{/if}
                     </div>
-                    {#if !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
+                    {#if !renewal && !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
                         <button type="button" class="-my-2 min-h-11 text-sm text-subtext underline hover:text-textcolor" onclick={settings}>{language.risuNest.tabs.sync}</button>
                     {/if}
                 </div>
@@ -82,7 +88,11 @@
         </div>
         {#if failed || stopped}
             <div class="mt-2 flex flex-wrap items-center gap-2">
-                <SettingButton onclick={() => void retryPluginStartup()}>{language.retry}</SettingButton>
+                {#if renewal}
+                    <SettingButton onclick={() => renewal && openExternalRenewal(renewal)}>{externalStrings.renew}</SettingButton>
+                {:else}
+                    <SettingButton onclick={() => void retryPluginStartup()}>{language.retry}</SettingButton>
+                {/if}
                 <SettingButton variant="secondary" onclick={() => pluginStartupGate.loadOnce()}>{language.risuNest.pluginStartup.loadNow}</SettingButton>
             </div>
         {:else}

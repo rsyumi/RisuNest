@@ -112,6 +112,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         509 => ProviderError {
             kind: ErrorKind::RateLimited,
@@ -120,6 +121,7 @@ pub(super) fn classify(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         _ => common::classify_status(status, headers, now_ms),
     }
@@ -147,6 +149,7 @@ pub(super) fn classify_token(
             oauth_error: None,
             oauth_error_description: None,
             cause: Default::default(),
+            connection_id: None,
         },
         _ => classify(status, headers, now_ms),
     }

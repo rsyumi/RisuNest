@@ -1556,7 +1556,7 @@ impl ExternalLwwEngine {
             ErrorKind::Cancelled | ErrorKind::PreconditionFailed | ErrorKind::Corrupt
                 | ErrorKind::LocalStorageFull | ErrorKind::LocalPermissionDenied | ErrorKind::LocalFailure => error,
             _ => ProviderError { kind: ErrorKind::PreviousStorageUnavailable, http_status: None, retry_at_ms: None,
-                oauth_error: None, oauth_error_description: None, cause: error.cause },
+                oauth_error: None, oauth_error_description: None, cause: error.cause, connection_id: None },
         }
     }
     fn held_server_body_error(error: crate::server_sync::SyncError, cancel: &Cancellation) -> ProviderError {

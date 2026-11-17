@@ -277,8 +277,12 @@ pub(crate) fn external_storage_get_job<R: Runtime>(app: AppHandle<R>, job_id: St
     })())
 }
 fn apply_job_connection_status(connection: &mut Value, jobs: &[Value]) {
-    // State rows are newest first. A later successful retry clears an older error.
-    let Some(job) = jobs.iter().find(|job| job["connectionId"] == connection["id"]) else { return; };
+    // State rows are newest first, and each connection's newest job stands, so a later successful retry clears an
+    // older error. An error a job hit reading through another connection marks that connection instead of its own.
+    let mut newest = std::collections::BTreeSet::new();
+    let Some(job) = jobs.iter()
+        .filter(|job| newest.insert(job["connectionId"].to_string()))
+        .find(|job| job_fixed_on(job) == &connection["id"]) else { return; };
     if matches!(job["state"].as_str(), Some("succeeded" | "cancelled")) { return; }
     let verified = connection["lastVerifiedAtMs"].as_str().and_then(|value| value.parse::<u64>().ok());
     let failed = job["updatedAtMs"].as_str().and_then(|value| value.parse::<u64>().ok());
@@ -293,6 +297,11 @@ fn apply_job_connection_status(connection: &mut Value, jobs: &[Value]) {
     };
     connection["status"] = json!(status);
     connection["lastError"] = error.clone();
+}
+/// The connection whose sign-in, key or address clears a job's error.
+fn job_fixed_on(job: &Value) -> &Value {
+    let named = &job["error"]["connectionId"];
+    if named.is_string() { named } else { &job["connectionId"] }
 }
 
 fn job_summary(root: &std::path::Path, mut job: DurableJob) -> Value {
@@ -1062,6 +1071,7 @@ pub(crate) fn error_dto(error: &ProviderError) -> Value {
     if let Some(detail) = &error.cause.0 { value["detail"] = json!(detail); }
     if let Some(code) = &error.oauth_error { value["oauthError"] = json!(code); }
     if let Some(description) = &error.oauth_error_description { value["oauthErrorDescription"] = json!(description); }
+    if let Some(connection) = &error.connection_id { value["connectionId"] = json!(connection); }
     if let Some(at) = error.retry_at_ms {
         value["retryAtMs"] = json!(at.to_string());
     }
@@ -1902,6 +1912,18 @@ mod tests {
         apply_job_connection_status(&mut repaired,&jobs);
         assert_eq!(repaired["status"],"ready");
         assert!(repaired["lastError"].is_null());
+
+        // A job that failed reading through another connection marks that connection, not its own, until its own
+        // newer job succeeds.
+        let refused=error_dto(&ProviderError{connection_id:Some("x".into()),..ProviderError::new(ErrorKind::ReauthRequired)});
+        let failed=json!({"connectionId":"c","state":"waiting","updatedAtMs":"20","error":refused});
+        let marked=|jobs:&[Value]| ["x","c"].map(|id| {
+            let mut connection=json!({"id":id,"status":"ready","lastVerifiedAtMs":"10"});
+            apply_job_connection_status(&mut connection,jobs);
+            connection["status"].as_str().unwrap().to_owned()
+        });
+        assert_eq!(marked(std::slice::from_ref(&failed)),["reauth-required","ready"]);
+        assert_eq!(marked(&[json!({"connectionId":"c","state":"succeeded","updatedAtMs":"30"}),failed]),["ready","ready"]);
     }
 
     #[test]

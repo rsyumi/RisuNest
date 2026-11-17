@@ -21,6 +21,14 @@ pub(crate) struct AuthorizationPolicy {
     pub redirect_url: url::Url,
     pub scopes: Vec<String>,
     pub picker: bool,
+    /// The account a renewal has to sign in with, so the sign-in page selects it.
+    pub login_hint: Option<String>,
+}
+impl AuthorizationPolicy {
+    pub fn with_login_hint(mut self, login_hint: Option<String>) -> Self {
+        self.login_hint = login_hint;
+        self
+    }
 }
 pub(crate) struct PendingAuthorization {
     policy: AuthorizationPolicy,
@@ -59,6 +67,9 @@ impl PendingAuthorization {
             .append_pair("state", state.secret())
             .append_pair("code_challenge", challenge.as_str())
             .append_pair("code_challenge_method", "S256");
+        if let Some(login_hint) = policy.login_hint.as_deref().map(str::trim).filter(|hint| !hint.is_empty()) {
+            authorize.query_pairs_mut().append_pair("login_hint", login_hint);
+        }
         if policy.picker {
             authorize
                 .query_pairs_mut()
@@ -154,6 +165,7 @@ mod tests {
             redirect_url: url::Url::parse("risunest://oauth/callback").unwrap(),
             scopes: vec!["synthetic".into()],
             picker: false,
+            login_hint: None,
         }
     }
     #[test]

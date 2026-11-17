@@ -82,6 +82,10 @@ function recoverVerifiedConnections(current: ProductionRuntime, state: ExternalS
             current.scheduler.recovered(connection.id)
         }
     }
+    // A removed connection can no longer be signed in, so the backups that waited on it run again.
+    for (const previous of current.state.connections) {
+        if (!state.connections.some(connection => connection.id === previous.id)) current.scheduler.recovered(previous.id)
+    }
 }
 
 async function refreshForeground(current: ProductionRuntime): Promise<void> {
@@ -164,8 +168,9 @@ export function installExternalStorageProduction(): Promise<() => void> {
         disposers.push(controller.subscribe(snapshot => {
             for (const [connectionId, job] of snapshot.activeJobs) {
                 if (job.error?.action !== 'reauthenticate' && job.error?.action !== 'unlock-key') continue
+                const fixedOn = job.error.connectionId || connectionId
                 current.state = { ...current.state, connections: current.state.connections.map(connection =>
-                    connection.id === connectionId ? { ...connection, status: job.error?.action === 'reauthenticate' ? 'reauth-required' as const : 'key-locked' as const, lastError: job.error } : connection) }
+                    connection.id === fixedOn ? { ...connection, status: job.error?.action === 'reauthenticate' ? 'reauth-required' as const : 'key-locked' as const, lastError: job.error } : connection) }
             }
         }))
         disposers.push(subscribeLocalPersistentRevision(value => {

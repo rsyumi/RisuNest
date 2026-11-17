@@ -196,6 +196,7 @@ async fn post_token(
             oauth_error,
             oauth_error_description,
             cause: Default::default(),
+            connection_id: None,
         });
     }
     Err(wire::classify(&mut response, dependencies.clock.now_ms(), cancel).await)
@@ -430,6 +431,7 @@ pub(crate) fn authorization_policy(
         picker: config.location.get("space").map(String::as_str) != Some(config::APP_DATA_FOLDER)
             && !config.location.contains_key("folderId")
             && !config.location.contains_key("folderName"),
+        login_hint: None,
     })
 }
 
@@ -461,6 +463,7 @@ pub(crate) fn ios_authorization_policy(
         picker: config.location.get("space").map(String::as_str) != Some(config::APP_DATA_FOLDER)
             && !config.location.contains_key("folderId")
             && !config.location.contains_key("folderName"),
+        login_hint: None,
     };
     Ok((policy, callback_scheme))
 }
@@ -489,6 +492,7 @@ pub(crate) fn android_web_authorization_policy(
         picker: config.location.get("space").map(String::as_str) != Some(config::APP_DATA_FOLDER)
             && !config.location.contains_key("folderId")
             && !config.location.contains_key("folderName"),
+        login_hint: None,
     })
 }
 

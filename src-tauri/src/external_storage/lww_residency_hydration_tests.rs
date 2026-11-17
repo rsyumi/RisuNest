@@ -636,3 +636,30 @@ fn visible_server_and_external_groups_start_in_display_order_without_splitting_s
         assert!(crate::asset_repository::PayloadCas::new(root).unwrap().stat_object(&server_hash).unwrap().is_some());
     }
 }
+
+#[test]
+fn a_source_that_needs_its_sign_in_or_key_names_its_connection_and_other_failures_name_none() {
+    // A changed WebDAV password answers 401, which the provider reports as unauthorized. A recovery key this device
+    // lacks fails as the source connection opens.
+    for (kind, opening, code) in [
+        (ErrorKind::ReauthRequired, false, "external-reauth-required"),
+        (ErrorKind::Unauthorized, false, "external-reauth-required"),
+        (ErrorKind::RepositoryKeyUnavailable, true, "external-key-locked"),
+        (ErrorKind::RecoveryKeyMismatch, true, "external-key-locked"),
+    ] {
+        let received = received(&[2]);
+        let root = received.f.directory_b.path();
+        if opening {
+            received.f.provider.fail_open(kind);
+        } else {
+            for pack in received.f.provider.objects_with_role(crate::external_storage::contract::ObjectRole::Pack) {
+                received.f.provider.fail_read(&pack, kind);
+            }
+        }
+        let refused = serde_json::to_value(hydrate(root, &received.publications[0]).unwrap_err()).unwrap();
+        assert_eq!((&refused["code"], &refused["connectionId"]), (&serde_json::json!(code), &serde_json::json!("receiver")), "{kind:?}");
+    }
+    let missing = serde_json::to_value(source_error("receiver")(ProviderError::new(ErrorKind::NotFound))).unwrap();
+    assert_eq!(missing["code"], "external-body-unavailable");
+    assert!(missing.get("connectionId").is_none());
+}

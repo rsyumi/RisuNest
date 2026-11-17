@@ -546,8 +546,19 @@ fn hydration_error(_:impl std::fmt::Display)->crate::server_sync::SyncError {cra
 fn remote_error(error:ProviderError)->crate::server_sync::SyncError {
     match error.kind {
         ErrorKind::Cancelled=>crate::server_sync::SyncError::new("cancelled",409),
-        ErrorKind::ReauthRequired=>crate::server_sync::SyncError::new("external-reauth-required",502),
+        // A 401 or 403 asks for the same remedy as an expired sign-in.
+        ErrorKind::ReauthRequired|ErrorKind::Unauthorized=>crate::server_sync::SyncError::new("external-reauth-required",502),
+        ErrorKind::RepositoryKeyUnavailable|ErrorKind::RecoveryKeyMismatch=>crate::server_sync::SyncError::new("external-key-locked",502),
         _=>crate::server_sync::SyncError::new("external-body-unavailable",502),
+    }
+}
+/// Bodies come from every connection that holds them, so a sign-in or key
+/// failure names the connection that has to sign in again or take its key.
+fn source_error(connection_id:&str)->impl Fn(ProviderError)->crate::server_sync::SyncError+'_ {
+    move |error| {
+        let mut value=remote_error(error);
+        if ["external-reauth-required","external-key-locked"].contains(&value.code.as_str()) {value.connection_id=Some(connection_id.to_owned());}
+        value
     }
 }
 pub(crate) fn hydrate_registered_many(root:&Path,digests:&[String],priority:&BTreeSet<String>,
@@ -655,7 +666,7 @@ pub(crate) fn hydrate_registered_many_scheduled(root:&Path,digests:&[String],pri
         before_group(first,opened)?;
         match work {
             Work::Standalone(sources)=>{
-                let connection=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
+                let connection=source_connection(&mut connections,&connection,&cancel).map_err(source_error(&connection.1))?;
                 hydrate_standalone(connection,sources,scratch.path(),&publisher,opened)?;
             }
             Work::Packed(outlines)=>{
@@ -672,7 +683,7 @@ pub(crate) fn hydrate_registered_many_scheduled(root:&Path,digests:&[String],pri
                 }
                 drop(sources);
                 if group.is_empty() {continue;}
-                let opened_source=source_connection(&mut connections,&connection,&cancel).map_err(remote_error)?;
+                let opened_source=source_connection(&mut connections,&connection,&cancel).map_err(source_error(&connection.1))?;
                 hydrate_pack_group(root,opened_source,group,scratch.path(),&publisher,opened)?;
             }
         }
@@ -761,7 +772,7 @@ fn hydrate_pack_group(root:&Path,connection:&OpenedSource,group:Vec<SharedPacked
         }).await
     });
     if let Some(error)=installer_error.borrow_mut().take() {return Err(error);}
-    result.map_err(remote_error)
+    result.map_err(source_error(&connection.connection.1))
 }
 /// Reads the standalone bodies of one connection under one lease, publishing
 /// them a batch at a time so the scratch directory holds at most one batch.
@@ -830,7 +841,7 @@ fn hydrate_standalone(connection:&OpenedSource,sources:Vec<Source>,scratch:&Path
         }).await
     });
     if let Some(error)=installer_error.borrow_mut().take() {return Err(error);}
-    result.map_err(remote_error)
+    result.map_err(source_error(&connection.connection.1))
 }
 /// A verified body waiting in scratch to be staged into the repository.
 struct StagedBody {
@@ -978,7 +989,19 @@ pub(crate) async fn spool_verified_remote_body_observed(root:&Path,hash:&str,des
 pub(crate) async fn spool_frozen_remote_body(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation)->Result<tempfile::NamedTempFile> {
     spool_frozen_remote_body_observed(source,destination,cancel,None).await
 }
+/// The body comes from the connection that registered it, which can be another
+/// than the one the operation works on, so a failure that only that connection's
+/// sign-in or key clears names it.
 pub(super) async fn spool_frozen_remote_body_observed(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation,observer:Option<std::sync::Arc<dyn Fn(u64)+Send+Sync>>)->Result<tempfile::NamedTempFile> {
+    let connection_id=match source {FrozenBodySource::Standalone(source)=>&source.connection_id,FrozenBodySource::Packed(source)=>&source.connection_id};
+    spool_frozen_remote_body_from(source,destination,cancel,observer).await.map_err(|mut error| {
+        if matches!(error.kind,ErrorKind::ReauthRequired|ErrorKind::Unauthorized|ErrorKind::RepositoryKeyUnavailable|ErrorKind::RecoveryKeyMismatch) {
+            error.connection_id=Some(connection_id.clone());
+        }
+        error
+    })
+}
+async fn spool_frozen_remote_body_from(source:&FrozenBodySource,destination:&Path,cancel:&Cancellation,observer:Option<std::sync::Arc<dyn Fn(u64)+Send+Sync>>)->Result<tempfile::NamedTempFile> {
     let high_water=std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let progress=|| {
         let observer=observer.clone(); let high_water=high_water.clone();

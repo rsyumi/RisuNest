@@ -16,6 +16,8 @@ export type SyncStatusSource = { syncNow(): Promise<void> } & (
         operation?: ExternalOperationProgress
         /** The last failed sync attempt, until one succeeds. */
         failure?: unknown
+        /** Another storage connection whose sign-in or recovery key clears `failure`, which an asset download read through. */
+        remedyConnection?: ExternalConnectionSummary
         syncStopped: boolean
         /** The last receive left changes that the next receive continues at once. */
         catchingUp?: boolean

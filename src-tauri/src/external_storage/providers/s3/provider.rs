@@ -122,6 +122,7 @@ fn precondition(status: Option<u16>) -> ProviderError {
         oauth_error: None,
         oauth_error_description: None,
         cause: Default::default(),
+        connection_id: None,
     }
 }
 

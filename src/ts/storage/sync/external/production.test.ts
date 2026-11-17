@@ -1,6 +1,6 @@
 import type { MobileBackgroundTask, MobileTaskKind } from '../../../mobileBackgroundTask'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ExternalJobSummary, ExternalStorageState } from './types'
+import type { ExternalConnectionSummary, ExternalJobSummary, ExternalStorageState } from './types'
 import type { CommittedApplyOutcome } from '../../persistentDataRuntime'
 import { createLeaseStub, createStoreStub } from '../../persistentDataStore.testSupport'
 
@@ -760,6 +760,53 @@ describe('external storage production integration', () => {
             await vi.advanceTimersByTimeAsync(60_000)
             expect(mocks.bridge.startJob).toHaveBeenCalledTimes(2)
             expect(mocks.bridge.startJob).toHaveBeenLastCalledWith(expect.objectContaining({ targetRevision: '9' }))
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it.each([
+        ['signs in again', [{ lastVerifiedAtMs: '400000' }]],
+        ['is removed', []],
+    ] as const)('holds a backup that a read through another storage stopped until that storage %s', async (_, after) => {
+        vi.useFakeTimers()
+        try {
+            const drive = { ...initialState.connections[0], id: 'drive-2', displayName: 'Drive', lastVerifiedAtMs: '100' as const }
+            const withDrive = (others: readonly Partial<ExternalConnectionSummary>[]): ExternalStorageState =>
+                ({ ...initialState, connections: [initialState.connections[0], ...others.map(other => ({ ...drive, ...other }))] })
+            mocks.bridge.getState.mockResolvedValue(withDrive([{}]))
+            const refused: ExternalJobSummary = { ...succeeded('old-sync', '0'), state: 'waiting', phase: 'paused', result: undefined,
+                error: { code: 'reauthRequired', message: '', retryable: false, action: 'reauthenticate', connectionId: 'drive-2' } }
+            let refusing = true
+            mocks.bridge.startJob.mockImplementation(async request => {
+                if (request.connectionId !== 'old-sync' || !refusing) return succeeded(request.connectionId, request.targetRevision ?? '0')
+                refusing = false
+                return refused
+            })
+            const started = (id: string) => mocks.bridge.startJob.mock.calls.filter(([request]) => request.connectionId === id).length
+            const { installExternalStorageProduction, refreshExternalStorageProductionState } = await import('./production')
+            await installExternalStorageProduction()
+            mocks.listener?.(8)
+            await vi.advanceTimersByTimeAsync(60_000)
+            expect([started('old-sync'), started('drive-2')]).toEqual([1, 1])
+
+            // The refusing storage holds its own backups too until the state read after its renewal.
+            mocks.revision = 9
+            mocks.listener?.(9)
+            await vi.advanceTimersByTimeAsync(300_000)
+            expect([started('old-sync'), started('drive-2')]).toEqual([1, 1])
+
+            mocks.bridge.getState.mockResolvedValue(withDrive(after))
+            await refreshExternalStorageProductionState()
+            await vi.advanceTimersByTimeAsync(60_000)
+            expect(started('old-sync')).toBe(2)
+
+            // A storage that signed in again backs up its own changes too.
+            const before = started('drive-2')
+            mocks.revision = 10
+            mocks.listener?.(10)
+            await vi.advanceTimersByTimeAsync(60_000)
+            expect(started('drive-2') > before).toBe(after.length > 0)
         } finally {
             vi.useRealTimers()
         }

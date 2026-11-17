@@ -6,7 +6,8 @@ import { get } from 'svelte/store'
 import { changeLanguage, language } from 'src/lang'
 import { languageKorean } from 'src/lang/ko'
 import { DBState, settingsOpen, SettingsMenuIndex } from 'src/ts/stores.svelte'
-import { activeRisuNestSettingsTab } from 'src/ts/setting/risuNestSettingsTabs'
+import { activeRisuNestSettingsTab, risuNestSettingsTabRequest } from 'src/ts/setting/risuNestSettingsTabs'
+import { externalRenewalOpen, externalRenewalRequest } from 'src/ts/setting/externalRenewalRequest'
 import { configurePluginStartup, pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import PluginStartupNotice from './PluginStartupNotice.svelte'
 import { syncStatus, type SyncStatusSource } from 'src/ts/storage/sync/syncStatus'
@@ -26,6 +27,9 @@ afterEach(async () => {
     configurePluginStartup(() => false, async () => {})
     settingsOpen.set(false)
     activeRisuNestSettingsTab.set(null)
+    risuNestSettingsTabRequest.set(null)
+    externalRenewalRequest.set(null)
+    externalRenewalOpen.set(false)
     DBState.db.risunestSyncStatusUi = true
     vi.useRealTimers()
     changeLanguage('en')
@@ -160,6 +164,26 @@ it('carries the external stop label and action text while its own notice is hidd
     const display=syncStatusDisplay(source,externalStorageStrings(DBState.db.language),false)
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.error)
+    expect(labels()).toEqual([language.close, externalStorageStrings(DBState.db.language).renew, language.risuNest.pluginStartup.loadNow])
+})
+
+it('signs in again instead of retrying an external startup that failed on its sign-in, and steps aside while the form is open', async () => {
+    // Only the gate's error names the sign-in failure here.
+    syncStatus.set({ target: 'external', syncNow: async () => {}, refresh: () => {}, syncStopped: false,
+        connection: { id: 'synthetic', status: 'ready' } as ExternalConnectionSummary })
+    pluginStartupState.set({ phase: 'failed', since: Date.now(), target: 'external', error: { kind: 'reauthRequired' } })
+    await render()
+    const renew = externalStorageStrings(DBState.db.language).renew
+    expect(labels()).toEqual([language.close, renew, language.risuNest.pluginStartup.loadNow])
+    ;[...document.querySelectorAll<HTMLButtonElement>('aside button')].find(button => button.textContent?.trim() === renew)!.click()
+    expect(get(externalRenewalRequest)).toBe('synthetic')
+    expect([get(settingsOpen), get(SettingsMenuIndex), get(risuNestSettingsTabRequest)]).toEqual([true, 17, 'sync'])
+
+    // The form takes the top of the settings page; closing it with plugins still held brings the notice back.
+    externalRenewalOpen.set(true); await tick()
+    expect(document.querySelector('aside')).toBeNull()
+    externalRenewalOpen.set(false); await tick()
+    expect(document.querySelector('aside')).not.toBeNull()
 })
 
 it('suppresses the generic server error help under the unfinished notice', async () => {

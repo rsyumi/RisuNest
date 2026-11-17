@@ -59,45 +59,67 @@ mod upload_concurrency_tests {
         });
     }
 
+    const REMOTE_SOURCE: &str = "remote-packaging-source";
+
+    /// Backs up one asset that only the "receiver" connection holds, read
+    /// through that connection, which refuses the read with `refused` if given.
+    async fn package_remote_standalone(f: &crate::external_storage::lww_tests::CycleFixture, refused: Option<ErrorKind>) -> Result<CompletedSnapshot> {
+        use crate::external_storage::{lww_residency, lww_segment, previous_storage_tests,
+            connection_store::ConnectionStore, transfer_limit};
+        let root = f.directory_b.path();
+        let bytes = vec![73; 96 * 1024];
+        let id = REMOTE_SOURCE;
+        let digest = risunest_sync_wire::hash(&bytes);
+        let mut sealed = Vec::new();
+        lww_segment::seal_body_stream(&mut std::io::Cursor::new(&bytes), &mut sealed,
+            &f.receiver.library, id, &[7; 32], bytes.len() as u64).unwrap();
+        let source = lww_residency::Source { hash: digest, library_id: f.receiver.library.clone(),
+            connection_id: "receiver".into(), connection_root: root.into(), protected_segment: "synthetic-segment".into(),
+            body: lww_segment::LargeBody { object_id: id.into(), sha256: risunest_sync_wire::hash(&sealed),
+                byte_length: (sealed.len() as u64).into(), plaintext_byte_length: (bytes.len() as u64).into(),
+                locator: Some(RemoteLocator { connection_identity: f.receiver.repository.connection_identity.clone(),
+                    collection: None, object: id.into() }) } };
+        f.provider.seed(id, ObjectRole::Pack, sealed);
+        if let Some(kind) = refused { f.provider.fail_read(id, kind); }
+        lww_residency::register(root, &source).unwrap();
+        let mut connection = previous_storage_tests::receiver_connection(f);
+        connection.stored.transfer_concurrency = Some(1);
+        ConnectionStore::open(root).unwrap().insert(&connection.stored).unwrap();
+        connection.provider = transfer_limit::wrap(root, "receiver", connection.provider).unwrap();
+        let provider = connection.provider.clone();
+        let _installed = lww_residency::install_test_source_connection(root, Arc::new(connection)).unwrap();
+        let (capture, _) = captured_payloads(root, "remote-packaging", 1, b"synthetic record", &[&bytes]);
+        let meta = metadata("remote-packaging", &capture);
+        let mut transfer = journal(&root.join("remote-packaging-job"), "remote-packaging", &capture);
+        package_and_upload(capture, vec![], root, &root.join("remote-packaging-cache"), meta,
+            &[5; 32], limits(256 * 1024), None, &mut transfer, provider.as_ref(), &fake::repository(),
+            &PhaseProgress::silent(), &Cancellation::default()).await
+    }
+
     #[test]
     fn packaging_remote_standalone_source_does_not_nest_the_cpu_permit() {
-        use crate::external_storage::{lww_tests::CycleFixture, lww_residency, lww_segment,
-            previous_storage_tests, connection_store::ConnectionStore, transfer_limit};
         runtime().block_on(async {
-            let f = CycleFixture::new();
-            let root = f.directory_b.path();
-            let bytes = vec![73; 96 * 1024];
-            let id = "remote-packaging-source";
-            let digest = risunest_sync_wire::hash(&bytes);
-            let mut sealed = Vec::new();
-            lww_segment::seal_body_stream(&mut std::io::Cursor::new(&bytes), &mut sealed,
-                &f.receiver.library, id, &[7; 32], bytes.len() as u64).unwrap();
-            let source = lww_residency::Source { hash: digest, library_id: f.receiver.library.clone(),
-                connection_id: "receiver".into(), connection_root: root.into(), protected_segment: "synthetic-segment".into(),
-                body: lww_segment::LargeBody { object_id: id.into(), sha256: risunest_sync_wire::hash(&sealed),
-                    byte_length: (sealed.len() as u64).into(), plaintext_byte_length: (bytes.len() as u64).into(),
-                    locator: Some(RemoteLocator { connection_identity: f.receiver.repository.connection_identity.clone(),
-                        collection: None, object: id.into() }) } };
-            f.provider.seed(id, ObjectRole::Pack, sealed);
-            lww_residency::register(root, &source).unwrap();
-            let mut connection = previous_storage_tests::receiver_connection(&f);
-            connection.stored.transfer_concurrency = Some(1);
-            ConnectionStore::open(root).unwrap().insert(&connection.stored).unwrap();
-            connection.provider = transfer_limit::wrap(root, "receiver", connection.provider).unwrap();
-            let provider = connection.provider.clone();
-            let _installed = lww_residency::install_test_source_connection(root, Arc::new(connection)).unwrap();
-            let (capture, _) = captured_payloads(root, "remote-packaging", 1, b"synthetic record", &[&bytes]);
-            let meta = metadata("remote-packaging", &capture);
-            let mut transfer = journal(&root.join("remote-packaging-job"), "remote-packaging", &capture);
-            let result = tokio::time::timeout(FAMILY_TEST_BOUND,
-                package_and_upload(capture, vec![], root, &root.join("remote-packaging-cache"), meta,
-                    &[5; 32], limits(256 * 1024), None, &mut transfer, provider.as_ref(), &fake::repository(),
-                    &PhaseProgress::silent(), &Cancellation::default())).await
+            let f = crate::external_storage::lww_tests::CycleFixture::new();
+            let result = tokio::time::timeout(FAMILY_TEST_BOUND, package_remote_standalone(&f, None)).await
                 .expect("source hydration nested the preparation CPU permit").unwrap();
             assert!(packs_of(&result) >= 2);
-            assert!(f.provider.read_attempts(id) > 0);
-            assert_eq!(held_spool(&root.join("remote-packaging-job")), 0);
+            assert!(f.provider.read_attempts(REMOTE_SOURCE) > 0);
+            assert_eq!(held_spool(&f.directory_b.path().join("remote-packaging-job")), 0);
         });
+    }
+
+    /// A backup reads an asset through the connection that holds it, so a
+    /// failure only that connection's sign-in or key clears names it.
+    #[test]
+    fn a_remote_source_failure_names_its_connection_only_when_that_connection_has_to_be_fixed() {
+        for (kind, named) in [(ErrorKind::ReauthRequired, Some("receiver")), (ErrorKind::RepositoryKeyUnavailable, Some("receiver")), (ErrorKind::NotFound, None)] {
+            runtime().block_on(async {
+                let f = crate::external_storage::lww_tests::CycleFixture::new();
+                let refused = tokio::time::timeout(FAMILY_TEST_BOUND, package_remote_standalone(&f, Some(kind))).await
+                    .expect("a refused source stopped the backup from settling").unwrap_err();
+                assert_eq!(refused.connection_id.as_deref(), named, "{kind:?}");
+            });
+        }
     }
 
     #[test]
