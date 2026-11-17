@@ -158,7 +158,7 @@ ${selection}
 }
 ConvertTo-Json -Depth 8 -InputObject $result
 `);
-    const result = spawnSync('powershell.exe', ['-NoProfile', '-File', script], { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    const result = spawnSync('pwsh', ['-NoProfile', '-File', script], { encoding: 'utf8', timeout: 30000, windowsHide: true });
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     const [sameVersionRehearsal, legacyPrevious, resumablePrevious] = JSON.parse(result.stdout);
     assert.deepEqual(sameVersionRehearsal.map(item => [item.version, item.source]), [['1.0.4', 'sync-v1.0.4'], ['1.0.4', null]]);
