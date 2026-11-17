@@ -277,6 +277,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         reportFailure: fail,
         isBlocked: () => blocked,
         isWaiting: waiting,
+        /** Outage delays started since the last success; failures during one delay share it. */
+        outageAttempts: () => outageAttempt,
         /** The failure that stopped sync until a retry, or '' while it is not stopped. */
         blockedCode: () => blocked ? blockedCode : '',
         isRunning: () => !!sending || !!receiving || !!completingReceive || !!rechecking,

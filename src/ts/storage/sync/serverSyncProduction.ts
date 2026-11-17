@@ -75,6 +75,10 @@ let activating: Promise<void> | undefined
 let startupIdentity = ''
 let initialReceive = true
 let startupFailure: unknown
+// Launch requests retry quickly until one of them fails after its retries; later attempts wait for the scheduler.
+let startupRetriesSpent = false
+// An outage a launch request reported after its quick retries, so the notice does not wait for another round.
+let launchOutage = false
 let error = ''
 let serverUnavailable = false
 const recordFailure = (value: unknown) => {
@@ -126,7 +130,9 @@ const changed = () => {
     if (offlineNoticePending || offlineNoticeClaimed || !isTauri || document.visibilityState === 'hidden'
         || binding || (!context && persistedBinding?.target.kind !== 'server')
         || getDatabase().risunestSyncStatusUi === false
-        || !error || !serverUnavailable) return
+        || !error || !serverUnavailable
+        // After launch, an outage is shown once it outlasts the next automatic retry.
+        || !launchOutage && scheduler.outageAttempts() < 2) return
     offlineNoticePending = true
     // Native state survives a WebView reload, including iOS content-process recovery.
     void invoke<boolean>('server_sync_claim_offline_notice').then(claimed => {
@@ -259,17 +265,38 @@ const checkResumedReceiveContext = (c: BindingContext) => {
     if (!context) throw new Error(error || 'Sync binding is unavailable')
     checkReceiveContext(c)
 }
+const startupRetryDelays = [1_000, 2_000]
+// A retry starts only this soon after the first attempt, so a failure that was slow is reported as it is.
+const startupRetryWindow = 10_000
+const retriesQuickly = (value: unknown) => isServerSyncUnavailable(value) && serverSyncErrorCode(value) !== 'sync-retry-budget-exhausted'
+    && !(typeof value === 'object' && value !== null && 'status' in value && value.status === 429)
+/** Resolves false, without waiting further, once the binding it waits for is stopped or replaced. */
+function startupRetryWait(captured: BindingContext, delay: number): Promise<boolean> {
+    if (captured.signal.aborted) return Promise.resolve(false)
+    return new Promise(resolve => {
+        const stop = () => { clearTimeout(timer); resolve(false) }
+        const timer = setTimeout(() => { captured.signal.removeEventListener('abort', stop); resolve(captured === context) }, delay)
+        captured.signal.addEventListener('abort', stop, { once: true })
+    })
+}
 async function startupRequest<T>(captured: BindingContext, command: string, args: Record<string, unknown>): Promise<T> {
-    try {
-        const result = await invoke<T>(command, args)
-        if (captured === context) startupFailure = undefined
-        return result
-    } catch (value) {
-        if (captured === context && initialReceive) {
-            const activationReady = typeof value === 'object' && value !== null && 'startupLocalReady' in value && value.startupLocalReady === true
-            startupFailure = command !== 'server_sync_lww_activate' || activationReady ? value : undefined
+    const started = performance.now()
+    for (let attempt = 0; ; attempt++) {
+        try {
+            const result = await invoke<T>(command, args)
+            if (captured === context) startupFailure = undefined
+            return result
+        } catch (value) {
+            const delay = startupRetryDelays[attempt]
+            if (args.startup === true && !startupRetriesSpent && delay !== undefined && retriesQuickly(value)
+                && performance.now() + delay - started <= startupRetryWindow && await startupRetryWait(captured, delay)) continue
+            if (captured === context && args.startup === true && isServerSyncUnavailable(value)) { startupRetriesSpent = true; launchOutage = true }
+            if (captured === context && initialReceive) {
+                const activationReady = typeof value === 'object' && value !== null && 'startupLocalReady' in value && value.startupLocalReady === true
+                startupFailure = command !== 'server_sync_lww_activate' || activationReady ? value : undefined
+            }
+            throw value
         }
-        throw value
     }
 }
 function canStartPluginsOffline(value: unknown): boolean {
@@ -451,7 +478,7 @@ const scheduler = createServerSyncScheduler({
     disconnect: async () => { await invoke('server_sync_notify_stop'); await invoke('server_sync_cancel') },
     stopNotifications: async () => { await invoke('server_sync_notify_stop') },
     failed(value) { recordFailure(value); changed() },
-    recovered() { if (error && error !== hydrationError) { error = ''; changed() }; continueHydration() },
+    recovered() { launchOutage = false; if (error && error !== hydrationError) { error = ''; changed() }; continueHydration() },
     retrying: continueHydration,
     activity() { settleAttempt(); changed() },
 })
@@ -466,9 +493,9 @@ async function keepAssetsRemote(c: BindingContext): Promise<void> {
 // Scheduler blocks and errors belong to one binding authority and never carry over to another.
 const adoptSchedulerAuthority = (c: BindingContext) => {
     const identity = bindingIdentity(c.state)
-    if (startupIdentity !== identity) { startupIdentity = identity; initialReceive = true; startupFailure = undefined }
+    if (startupIdentity !== identity) { startupIdentity = identity; initialReceive = true; startupFailure = undefined; startupRetriesSpent = false; launchOutage = false }
     if (schedulerAuthority === c.state.targetAuthority) return
-    scheduler.reset(); error = ''; hydrationError = ''; schedulerAuthority = c.state.targetAuthority
+    scheduler.reset(); error = ''; hydrationError = ''; launchOutage = false; schedulerAuthority = c.state.targetAuthority
 }
 const transport: SyncBindingTransport = {
     heldForCommittedRestore: () => heldForCommittedRestore,
