@@ -381,10 +381,14 @@ describe('production server LWW composition', () => {
         f.database.risunestSyncStatusUi = false
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         const base = f.invoke.getMockImplementation()!
-        let offline = true
+        let offline = true, slow = false, connects = 0
         f.invoke.mockImplementation(async (command, args) => {
             if (command === 'server_sync_claim_offline_notice') return true
-            if (offline && ['server_sync_lww_activate', 'server_sync_lww_pull', 'server_sync_notify_start'].includes(command)) throw { code: 'server-unreachable', status: 503, retryable: true }
+            if (offline && ['server_sync_lww_activate', 'server_sync_lww_pull', 'server_sync_notify_start'].includes(command)) {
+                // While slow, a receive fails after 6 s and every connect after the first after 2 s.
+                if (slow && (command === 'server_sync_lww_pull' || connects++ > 0)) await new Promise(resolve => setTimeout(resolve, command === 'server_sync_lww_pull' ? 6000 : 2000))
+                throw { code: 'server-unreachable', status: 503, retryable: true }
+            }
             return base(command, args)
         })
         // A launch outage passes while the notice is off.
@@ -399,9 +403,11 @@ describe('production server LWW composition', () => {
         offline = false; await vi.advanceTimersByTimeAsync(5000); await settle()
         expect(production.getServerSyncController().snapshot().error).toBe('')
         expect(f.alert).not.toHaveBeenCalled()
-        offline = true; visible(false); await settle(); visible(true); await settle()
+        // A receive that began before the outage and fails after the retry started is not the retry failing.
+        offline = true; slow = true; visible(false); await settle(); visible(true); await settle()
+        await vi.advanceTimersByTimeAsync(6000)
         expect(f.alert).not.toHaveBeenCalled()
-        await vi.advanceTimersByTimeAsync(5000)
+        await vi.advanceTimersByTimeAsync(1000)
         expect(f.alert).toHaveBeenCalledExactlyOnceWith((await import('src/lang')).language.risuNest.serverSync.offlineNotice)
     })
     it('keeps startup closed across an empty intermediate page and projection, then stops at the first frontier', async () => {

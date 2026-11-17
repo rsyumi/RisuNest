@@ -24,7 +24,7 @@ describe('server LWW foreground scheduler', () => {
         const failure = { code: 'worker-unavailable', status: 503, retryable: true }
         f.push.mockRejectedValueOnce(failure)
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
-        expect(f.failed).toHaveBeenCalledWith(failure)
+        expect(f.failed).toHaveBeenCalledWith(failure, false)
         expect(f.scheduler.isBlocked()).toBe(false)
         if (trigger === 'edit') f.scheduler.localChange(true)
         else if (trigger === 'foreground') { await f.scheduler.foreground(false); await f.scheduler.foreground(true) }
@@ -507,7 +507,7 @@ describe('server LWW foreground scheduler', () => {
         rejectPush({ code: 'clock-skew', retryable: false }); await vi.advanceTimersByTimeAsync(0)
         await f.scheduler.conversationOpened()
         expect(f.retryClock).not.toHaveBeenCalled(); expect(f.scheduler.isBlocked()).toBe(true)
-        expect(f.failed).toHaveBeenLastCalledWith({ code: 'equal-stamp-integrity', retryable: false })
+        expect(f.failed).toHaveBeenLastCalledWith({ code: 'equal-stamp-integrity', retryable: false }, false)
         f.scheduler.dispose()
     })
 })

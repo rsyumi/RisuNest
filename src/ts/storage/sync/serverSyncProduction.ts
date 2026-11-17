@@ -77,8 +77,8 @@ let initialReceive = true
 let startupFailure: unknown
 // Launch requests retry quickly until one of them fails after its retries; later attempts wait for the scheduler.
 let startupRetriesSpent = false
-// An outage a launch request reported after its quick retries, so the notice does not wait for another round.
-let launchOutage = false
+// The outage outlasted a retry: a launch request's quick retries or the next automatic attempt.
+let outageConfirmed = false
 let error = ''
 let serverUnavailable = false
 const recordFailure = (value: unknown) => {
@@ -131,8 +131,7 @@ const changed = () => {
         || binding || (!context && persistedBinding?.target.kind !== 'server')
         || getDatabase().risunestSyncStatusUi === false
         || !error || !serverUnavailable
-        // After launch, an outage is shown once it outlasts the next automatic retry.
-        || !launchOutage && scheduler.outageAttempts() < 2) return
+        || !outageConfirmed) return
     offlineNoticePending = true
     // Native state survives a WebView reload, including iOS content-process recovery.
     void invoke<boolean>('server_sync_claim_offline_notice').then(claimed => {
@@ -266,7 +265,7 @@ const checkResumedReceiveContext = (c: BindingContext) => {
     checkReceiveContext(c)
 }
 const startupRetryDelays = [1_000, 2_000]
-// A retry starts only this soon after the first attempt, so a failure that was slow is reported as it is.
+// A retry starts only this soon after the first attempt, so a slow failure or a wait that ran late while the app was suspended ends the retries.
 const startupRetryWindow = 10_000
 // A server update, a rate limit and a spent retry budget keep their own waits.
 const retriesQuickly = (value: unknown) => isServerSyncUnavailable(value) && !['server-updating', 'sync-retry-budget-exhausted'].includes(serverSyncErrorCode(value))
@@ -290,8 +289,8 @@ async function startupRequest<T>(captured: BindingContext, command: string, args
         } catch (value) {
             const delay = startupRetryDelays[attempt]
             if (args.startup === true && !startupRetriesSpent && delay !== undefined && retriesQuickly(value)
-                && performance.now() + delay - started <= startupRetryWindow && await startupRetryWait(captured, delay)) continue
-            if (captured === context && args.startup === true && isServerSyncUnavailable(value)) { startupRetriesSpent = true; launchOutage = true }
+                && await startupRetryWait(captured, delay) && performance.now() - started <= startupRetryWindow) continue
+            if (captured === context && args.startup === true && isServerSyncUnavailable(value)) { startupRetriesSpent = true; outageConfirmed = true }
             if (captured === context && initialReceive) {
                 const activationReady = typeof value === 'object' && value !== null && 'startupLocalReady' in value && value.startupLocalReady === true
                 startupFailure = command !== 'server_sync_lww_activate' || activationReady ? value : undefined
@@ -478,8 +477,8 @@ const scheduler = createServerSyncScheduler({
     connect: async operationId => { if (context) { await ensureActivated(context); await invoke('server_sync_notify_start', { request: header(), operationId }) } },
     disconnect: async () => { await invoke('server_sync_notify_stop'); await invoke('server_sync_cancel') },
     stopNotifications: async () => { await invoke('server_sync_notify_stop') },
-    failed(value) { recordFailure(value); changed() },
-    recovered() { launchOutage = false; if (error && error !== hydrationError) { error = ''; changed() }; continueHydration() },
+    failed(value, retried) { if (retried) outageConfirmed = true; recordFailure(value); changed() },
+    recovered() { outageConfirmed = false; if (error && error !== hydrationError) { error = ''; changed() }; continueHydration() },
     retrying: continueHydration,
     activity() { settleAttempt(); changed() },
 })
@@ -494,9 +493,9 @@ async function keepAssetsRemote(c: BindingContext): Promise<void> {
 // Scheduler blocks and errors belong to one binding authority and never carry over to another.
 const adoptSchedulerAuthority = (c: BindingContext) => {
     const identity = bindingIdentity(c.state)
-    if (startupIdentity !== identity) { startupIdentity = identity; initialReceive = true; startupFailure = undefined; startupRetriesSpent = false; launchOutage = false }
+    if (startupIdentity !== identity) { startupIdentity = identity; initialReceive = true; startupFailure = undefined; startupRetriesSpent = false; outageConfirmed = false }
     if (schedulerAuthority === c.state.targetAuthority) return
-    scheduler.reset(); error = ''; hydrationError = ''; launchOutage = false; schedulerAuthority = c.state.targetAuthority
+    scheduler.reset(); error = ''; hydrationError = ''; outageConfirmed = false; schedulerAuthority = c.state.targetAuthority
 }
 const transport: SyncBindingTransport = {
     heldForCommittedRestore: () => heldForCommittedRestore,
