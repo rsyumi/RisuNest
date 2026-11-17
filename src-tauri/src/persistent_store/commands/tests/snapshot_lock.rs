@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn fixture() -> (tempfile::TempDir, tauri::App<tauri::test::MockRuntime>, String) {
+fn fixture() -> (tempfile::TempDir, crate::test_app::MockApp, String) {
     let directory = tempdir().unwrap();
     let mut store = PersistentStore::open(directory.path()).unwrap();
     let stage = store.replace_begin().unwrap();
@@ -27,8 +27,7 @@ fn fixture() -> (tempfile::TempDir, tauri::App<tauri::test::MockRuntime>, String
         rusqlite::params![generation, hash, bytes.len() as i64],
     ).unwrap();
     drop(Archive::open(&store.snapshots_dir).unwrap());
-    let app = tauri::test::mock_builder()
-        .build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+    let app = crate::test_app::mock_app();
     app.manage(PersistentStoreState::with_test_store(store));
     (directory, app, hash)
 }

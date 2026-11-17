@@ -1088,11 +1088,9 @@ fn cleanup_closes_the_device_database_and_reopens_only_a_fresh_store() {
 #[test]
 fn device_backup_commands_log_their_failures() {
     let root = tempfile::tempdir().unwrap();
-    let app = tauri::test::mock_builder()
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .unwrap();
-    tauri::Manager::manage(&app, state(root.path()));
-    let missing = native_device_backup_recovery_complete(app.handle().clone(), tauri::Manager::state(&app), "missing-session".into());
+    let app = crate::test_app::mock_app();
+    tauri::Manager::manage(&*app, state(root.path()));
+    let missing = native_device_backup_recovery_complete(app.handle().clone(), tauri::Manager::state(&*app), "missing-session".into());
     assert_eq!(missing.unwrap_err().code, "device-session-missing");
     let entry = crate::native_log::global_state()
         .tail(None)

@@ -1663,9 +1663,7 @@ mod tests {
             let owner = CasJobOwner::from_another_process(CasJobOwnerKind::ExternalPublication, "publication");
             drop(journal(&mut store, "page-start-publication", owner, true));
         }
-        let app = tauri::test::mock_builder()
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
+        let app = crate::test_app::mock_app();
         app.manage(crate::app_paths::AppPaths {
             data: root.to_owned(),
             data_entry: root.to_owned(),

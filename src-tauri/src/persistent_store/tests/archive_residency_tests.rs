@@ -306,9 +306,7 @@ fn the_restore_command_fetches_from_the_sync_server() {
     let server = LocalServerFixture::new();
     let (_root, store, before) = server_held_archive(&server);
     let revision = store.revision().expect("read revision");
-    let app = tauri::test::mock_builder()
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("build the app");
+    let app = crate::test_app::mock_app();
     app.manage(commands::PersistentStoreState::with_test_store(store));
     tauri::async_runtime::block_on(commands::restore_character(
         app.handle().clone(),

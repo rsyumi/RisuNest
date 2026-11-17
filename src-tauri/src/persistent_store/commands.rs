@@ -654,6 +654,13 @@ impl PersistentStoreState {
         Self { store: Mutex::new(Some(store)), ..Self::default() }
     }
 
+    /// Closes both stores, as device maintenance does, without its admission
+    /// drain, for a test whose mock app never drops its managed state.
+    pub(crate) fn close_for_test(&self) {
+        self.status_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        lock_store(&self.store).unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    }
+
     /// A store the renderer has not opened yet, whose opening starts no purge.
     pub(crate) fn unopened_without_purge() -> Self {
         Self { retired_purge_started: AtomicBool::new(true), ..Self::default() }
@@ -2884,9 +2891,7 @@ mod tests {
         let reader = rusqlite::Connection::open(&database_path).unwrap();
         reader.execute_batch("BEGIN; SELECT value FROM app_kv WHERE key = 'first';").unwrap();
         store.connection.execute("INSERT INTO app_kv VALUES ('second', '2')", []).unwrap();
-        let app = tauri::test::mock_builder()
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
+        let app = crate::test_app::mock_app();
         app.manage(PersistentStoreState::with_test_store(store));
 
         pds_checkpoint(app.state(), CheckpointMode::Truncate)
@@ -4029,9 +4034,7 @@ mod tests {
             .replace_put_root(&staging.staging_id, &json!({ "username": "synthetic" }))
             .expect("stage root");
         store.replace_commit(&staging.staging_id, Some(0)).expect("commit root");
-        let app = tauri::test::mock_builder()
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
+        let app = crate::test_app::mock_app();
         app.manage(PersistentStoreState::with_test_store(store));
         let root = pds_read_root(app.state(), None).expect("read root");
         assert_eq!(root.revision, 1);
@@ -4569,7 +4572,7 @@ mod tests {
             (held, remote, alias_object(&store, "assets/orphan.png").unwrap())
         };
         test_remote::keep_only_on_server(root, &remote);
-        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        let app = crate::test_app::mock_app();
         app.manage(crate::app_paths::AppPaths {
             data: root.to_owned(),
             data_entry: root.to_owned(),
@@ -4639,7 +4642,7 @@ mod tests {
         let keys = ["assets/only.png", "assets/second.png", "assets/shared.png", "assets/late.png", "sync-conflict-backups/a.risudat"]
             .map(str::to_owned).to_vec();
         let owner = || Some(DeletedOwnerAssets { keys: keys.clone(), started_at_ms });
-        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        let app = crate::test_app::mock_app();
         app.manage(PersistentStoreState { store: Mutex::new(Some(store)), ..PersistentStoreState::default() });
         let state = app.state::<PersistentStoreState>();
 

@@ -574,9 +574,7 @@ fn an_opened_store_collects_what_earlier_releases_left() {
     let external = root.join("external-storage").join("captures");
     assert!(captures.iter().all(|capture| external.join(capture).is_dir()));
 
-    let app = tauri::test::mock_builder()
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .unwrap();
+    let app = crate::test_app::mock_app();
     app.manage(crate::app_paths::AppPaths {
         data: root.to_owned(),
         data_entry: root.to_owned(),
