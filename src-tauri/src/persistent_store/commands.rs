@@ -1857,12 +1857,7 @@ pub(crate) fn pds_export_risu_save(
         })?;
         let outcome = prepared.create_attached_export(omit_account, account.as_ref());
         let reattach = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-            // A page that replaced the lease's page while it exported released its other leases.
-            if state.refuse_replaced_document(prepared.owner()).is_err() {
-                let mut prepared = prepared;
-                return prepared.release_reader();
-            }
-            store.reattach_risu_save_export(prepared)
+            reattach_export_lease(&state, store, prepared)
         });
         match (outcome, reattach) {
             (Ok(exported), Ok(())) => Ok(exported),
@@ -1875,6 +1870,19 @@ pub(crate) fn pds_export_risu_save(
             }),
         }
     })())
+}
+
+/// Puts an exported lease back, or releases it when a later page replaced the
+/// page that holds it, which released that page's other leases meanwhile.
+fn reattach_export_lease(
+    state: &PersistentStoreState,
+    store: &mut PersistentStore,
+    mut prepared: crate::persistent_store::PreparedRisuSaveExport,
+) -> StoreResult<()> {
+    if state.refuse_replaced_document(prepared.owner()).is_err() {
+        return prepared.release_reader();
+    }
+    store.reattach_risu_save_export(prepared)
 }
 
 #[tauri::command(async)]
@@ -3799,7 +3807,10 @@ mod tests {
     fn a_later_page_document_ends_what_earlier_documents_left_open_and_refuses_their_requests() {
         let directory = tempdir().unwrap();
         let root = directory.path();
-        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![pds_acquire_revision])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
         app.manage(crate::app_paths::AppPaths {
             data: root.to_owned(),
             data_entry: root.to_owned(),
@@ -3815,12 +3826,31 @@ mod tests {
         app.manage(crate::native_media::ipc::NativeMediaIpcState::default());
         let media = app.state::<crate::native_media::ipc::NativeMediaIpcState>();
         let open = |document: &str| open_for_renderer(app.handle(), &app.state(), Some(document));
-        let acquire = |document: Option<&str>| pds_acquire_revision(app.state(), 0, document.map(str::to_owned));
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        // Through IPC, so the argument the page names is the one the command reads.
+        let acquire = |document: Option<&str>| {
+            let mut body = serde_json::json!({ "revision": 0 });
+            if let Some(document) = document {
+                body["document"] = document.into();
+            }
+            tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+                cmd: "pds_acquire_revision".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(any(windows, target_os = "android")) { "http://tauri.localhost" } else { "tauri://localhost" }.parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            })
+            .map(|response| response.deserialize::<LeaseResult>().unwrap())
+        };
         let read = |lease: &LeaseResult| with_store_mutex(&app.state(), |store| store.read_root(Some(&lease.lease)).map(drop));
 
         open("first").unwrap();
         let outgoing = acquire(Some("first")).unwrap();
         let unnamed = acquire(None).unwrap();
+        let exporting = acquire(Some("first")).unwrap();
+        let export = with_store_mutex_mut(&app.state(), |store| store.detach_risu_save_export(&exporting.lease)).unwrap();
         let filled = std::iter::from_fn(|| media.open_input_upload(root, Some("first")).ok()).count();
         assert!(filled > 0);
         open("first").unwrap();
@@ -3831,8 +3861,11 @@ mod tests {
         open("second").unwrap();
         assert!(matches!(read(&outgoing), Err(StoreError::SnapshotReleased)));
         media.open_input_upload(root, None).expect("the replaced page's uploads stayed");
+        // A lease the replaced page was exporting is released when the export ends.
+        with_store_mutex_mut(&app.state(), |store| reattach_export_lease(&app.state(), store, export)).unwrap();
+        assert!(matches!(read(&exporting), Err(StoreError::SnapshotReleased)));
         read(&unnamed).expect("a lease no page named waits for the page reset");
-        assert!(matches!(acquire(Some("first")), Err(StoreError::Validation { .. })));
+        assert!(acquire(Some("first")).unwrap_err().to_string().contains("replaced"));
         assert!(matches!(open("first"), Err(StoreError::Validation { .. })));
         let current = acquire(Some("second")).unwrap();
         open("second").unwrap();
