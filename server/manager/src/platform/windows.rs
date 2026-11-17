@@ -181,24 +181,81 @@ pub(super) fn finish_update_helper(root: &Path, task_name: &str) -> Result<()> {
     if !valid_helper_task(root, task_name) {
         return Err("update-helper-task-invalid".into());
     }
-    native::on_com("update-helper-task-cleanup-failed", || unsafe {
+    native::on_com("update-helper-task-cleanup-failed", || {
         let (_service, folder) = connect()?;
-        if let Some(task) = get_task(&folder, task_name)? {
-            if !helper_owned(&task)? {
-                return Err(Failure {
-                    stage: "ownership",
-                    code: E_ACCESSDENIED,
-                });
-            }
-            folder.DeleteTask(&BSTR::from(task_name), 0).at("delete")?;
+        match get_task(&folder, task_name)? {
+            Some(task) => delete_helper(&folder, task_name, &task),
+            None => Ok(()),
         }
-        Ok(())
+    })
+}
+
+// A helper deletes its own task as it exits, so a task that disappears while
+// another process removes it has already been removed.
+fn unless_vanished(
+    folder: &ITaskFolder,
+    name: &str,
+    remove: impl FnOnce() -> NativeResult<()>,
+) -> NativeResult<()> {
+    remove().or_else(|failure| match get_task(folder, name) {
+        Ok(None) => Ok(()),
+        _ => Err(failure),
+    })
+}
+
+fn delete_helper(folder: &ITaskFolder, name: &str, task: &IRegisteredTask) -> NativeResult<()> {
+    unless_vanished(folder, name, || {
+        if !helper_owned(task)? {
+            return Err(Failure {
+                stage: "ownership",
+                code: E_ACCESSDENIED,
+            });
+        }
+        unsafe { folder.DeleteTask(&BSTR::from(name), 0) }.at("delete")
     })
 }
 
 fn stale_helper_date(date: &str, now: OffsetDateTime) -> bool {
     OffsetDateTime::parse(date, &Rfc3339)
         .is_ok_and(|date| now - date >= time::Duration::minutes(15))
+}
+
+fn remove_helper(
+    folder: &ITaskFolder,
+    name: &str,
+    task: &IRegisteredTask,
+    stale_only: bool,
+) -> NativeResult<()> {
+    unless_vanished(folder, name, || unsafe {
+        if !helper_owned(task)? {
+            return Ok(());
+        }
+        let instances = task.GetInstances(0).at("instances")?;
+        let count = instances.Count().at("instances")?;
+        if stale_only {
+            if task.State().at("state")? == TASK_STATE_RUNNING || count != 0 {
+                return Ok(());
+            }
+            let info = task
+                .Definition()
+                .at("read-definition")?
+                .RegistrationInfo()
+                .at("read-definition")?;
+            let date = native::read_string("read-definition", |value| info.Date(value))?;
+            if !stale_helper_date(&date, OffsetDateTime::now_utc()) {
+                return Ok(());
+            }
+        } else {
+            for index in 1..=count {
+                instances
+                    .get_Item(&VARIANT::from(index))
+                    .at("instances")?
+                    .Stop()
+                    .at("stop")?;
+            }
+        }
+        folder.DeleteTask(&BSTR::from(name), 0).at("delete")
+    })
 }
 
 fn remove_helpers(root: &Path, stale_only: bool) -> Result<()> {
@@ -214,39 +271,9 @@ fn remove_helpers(root: &Path, stale_only: bool) -> Result<()> {
             }
         }
         for name in names {
-            let Some(task) = get_task(&folder, &name)? else {
-                continue;
-            };
-            if !helper_owned(&task)? {
-                continue;
+            if let Some(task) = get_task(&folder, &name)? {
+                remove_helper(&folder, &name, &task, stale_only)?;
             }
-            let instances = task.GetInstances(0).at("instances")?;
-            let count = instances.Count().at("instances")?;
-            if stale_only {
-                if task.State().at("state")? == TASK_STATE_RUNNING || count != 0 {
-                    continue;
-                }
-                let info = task
-                    .Definition()
-                    .at("read-definition")?
-                    .RegistrationInfo()
-                    .at("read-definition")?;
-                let date = native::read_string("read-definition", |value| info.Date(value))?;
-                if !stale_helper_date(&date, OffsetDateTime::now_utc()) {
-                    continue;
-                }
-            } else {
-                for index in 1..=count {
-                    instances
-                        .get_Item(&VARIANT::from(index))
-                        .at("instances")?
-                        .Stop()
-                        .at("stop")?;
-                }
-            }
-            folder
-                .DeleteTask(&BSTR::from(name.as_str()), 0)
-                .at("delete")?;
         }
         Ok(())
     })
@@ -588,6 +615,97 @@ mod tests {
         ] {
             assert!(!valid_helper_task(root, &format!("{prefix}{invalid}")));
         }
+    }
+    #[test]
+    #[ignore = "requires the current-user Task Scheduler and creates only synthetic temporary tasks"]
+    fn helper_tasks_that_vanish_during_removal_count_as_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let task_name = || {
+            format!(
+                "{}{}",
+                helper_task_prefix(root.path()),
+                risunest_sync_server::management::discovery::request_id().unwrap()
+            )
+        };
+        let [early, late, live, foreign] = [(); 4].map(|()| task_name());
+        let outcome = native::on_com("synthetic-helper", || unsafe {
+            let (service, folder) = connect()?;
+            struct Cleanup(ITaskFolder, [String; 4]);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    for name in &self.1 {
+                        let _ = unsafe { self.0.DeleteTask(&BSTR::from(name.as_str()), 0) };
+                    }
+                }
+            }
+            let _cleanup = Cleanup(
+                folder.clone(),
+                [early.clone(), late.clone(), live.clone(), foreign.clone()],
+            );
+            let register = |name: &str, description: &str| -> NativeResult<IRegisteredTask> {
+                let definition = service.NewTask(0).at("definition")?;
+                definition
+                    .RegistrationInfo()
+                    .at("definition")?
+                    .SetDescription(&BSTR::from(description))
+                    .at("definition")?;
+                definition
+                    .Principal()
+                    .at("definition")?
+                    .SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN)
+                    .at("definition")?;
+                let action: IExecAction = definition
+                    .Actions()
+                    .at("definition")?
+                    .Create(TASK_ACTION_EXEC)
+                    .at("definition")?
+                    .cast()
+                    .at("definition")?;
+                action.SetPath(&BSTR::from("cmd.exe")).at("definition")?;
+                let empty = VARIANT::default();
+                folder
+                    .RegisterTaskDefinition(
+                        &BSTR::from(name),
+                        &definition,
+                        TASK_CREATE.0,
+                        &empty,
+                        &empty,
+                        TASK_LOGON_INTERACTIVE_TOKEN,
+                        &empty,
+                    )
+                    .at("register")
+            };
+            let report = |result: NativeResult<()>| {
+                result.map_err(|failure| native::diagnostic("cleanup", failure))
+            };
+            for name in [&early, &late, &live] {
+                register(name, HELPER_TASK_DESCRIPTION)?;
+            }
+            // The helper deletes its own task after another process looked it
+            // up: before the ownership check reads the stale handle, or after
+            // it, when only the deletion by name fails. A handle that still
+            // answers stands in for the second case.
+            let stale = get_task(&folder, &early)?.expect("registered helper task");
+            let answering = get_task(&folder, &live)?.expect("registered helper task");
+            for name in [&early, &late] {
+                folder
+                    .DeleteTask(&BSTR::from(name.as_str()), 0)
+                    .at("delete")?;
+            }
+            let mut removed = Vec::new();
+            for (name, task) in [(&early, &stale), (&late, &answering)] {
+                removed.push(report(remove_helper(&folder, name, task, false)));
+                removed.push(report(delete_helper(&folder, name, task)));
+            }
+            let foreign_task = register(&foreign, "RisuNest foreign helper")?;
+            let refused = report(delete_helper(&folder, &foreign, &foreign_task));
+            let kept = get_task(&folder, &foreign)?.is_some();
+            Ok((removed, refused, kept))
+        });
+        let (removed, refused, kept) = outcome.unwrap();
+        assert_eq!(removed, vec![Ok(()); 4]);
+        assert_eq!(refused, Err("cleanup:ownership:80070005".to_owned()));
+        assert!(kept);
     }
     #[test]
     fn helper_arguments_preserve_spaces_quotes_and_trailing_slashes() {

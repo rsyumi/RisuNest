@@ -796,14 +796,16 @@ jobs:
             'update_helper/installer_guard_records_restart_failure_after_accepted_corrupt_server_start',
             'manual_start/manual_start_is_independent_of_login_and_survives_registration_changes',
             'windows_platform/existing_task_ownership_and_update_schedule_remain_compatible',
-            'windows_platform/gui_autostart_preserves_the_command_and_existing_value_semantics'
+            'windows_platform/gui_autostart_preserves_the_command_and_existing_value_semantics',
+            'lib/platform::windows::tests::helper_tasks_that_vanish_during_removal_count_as_removed'
           )
           $logDirectory = Join-Path $env:RUNNER_TEMP 'sync-update-tests'
           New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
           foreach ($entry in $tests) {
             $target, $test = $entry -split '/', 2
-            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' --test $target $test -- --ignored --exact --nocapture 2>&1 |
-              Tee-Object -FilePath (Join-Path $logDirectory "$test.log") -OutVariable output | Out-Host
+            $selector = if ($target -eq 'lib') { @('--lib') } else { @('--test', $target) }
+            & cargo test --manifest-path server/manager/Cargo.toml --release --locked --target '${{ matrix.target }}' $selector $test -- --ignored --exact --nocapture 2>&1 |
+              Tee-Object -FilePath (Join-Path $logDirectory "$($test -replace '::', '-').log") -OutVariable output | Out-Host
             if ($LASTEXITCODE -ne 0) { throw "$test failed." }
             if (($output | Out-String) -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') {
               throw "$test did not execute exactly one passing test."

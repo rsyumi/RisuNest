@@ -491,14 +491,7 @@ fn finish_macos_update_helper(root: &Path, task_name: &str) -> Result<()> {
     if !valid_macos_helper_task(root, task_name) {
         return Err("update-helper-task-invalid".into());
     }
-    let path = macos_helper_plist(root, task_name);
-    let directory = path.parent().ok_or("update-helper-task-invalid")?;
-    if path.exists() {
-        fs::remove_file(&path).map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
-        File::open(directory)
-            .and_then(|value| value.sync_all())
-            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
-    }
+    remove_macos_helper_plist(&macos_helper_plist(root, task_name))?;
     let service = format!("{}/{}", launchd_user_domain()?, task_name);
     process("launchctl")
         .args(["bootout", &service])
@@ -536,34 +529,61 @@ fn cleanup_macos_update_helpers(root: &Path) -> Result<()> {
     }
     let domain = launchd_user_domain()?;
     for task in tasks {
-        let path = macos_helper_plist(root, &task);
-        let service = format!("{domain}/{task}");
-        let present = process("launchctl")
-            .args(["print", &service])
+        remove_macos_helper(
+            &format!("{domain}/{task}"),
+            &macos_helper_plist(root, &task),
+        )?;
+    }
+    Ok(())
+}
+
+// A helper removes its own plist and boots itself out as it exits, so a helper
+// that disappears while another process removes it has already been removed.
+#[cfg(target_os = "macos")]
+fn remove_macos_helper(service: &str, path: &Path) -> Result<()> {
+    if launchd_service_loaded(service)? {
+        let status = process("launchctl")
+            .args(["bootout", service])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?
-            .success();
-        if present {
-            let status = process("launchctl")
-                .args(["bootout", &service])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
-            if !status.success() {
+            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !status.success() && launchd_service_loaded(service)? {
+            if std::time::Instant::now() >= deadline {
                 return Err("update-helper-task-cleanup-failed".into());
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        fs::remove_file(&path).map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
-        File::open(&directory)
-            .and_then(|value| value.sync_all())
-            .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?;
     }
-    Ok(())
+    remove_macos_helper_plist(path)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_service_loaded(service: &str) -> Result<bool> {
+    Ok(process("launchctl")
+        .args(["print", service])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "update-helper-task-cleanup-failed".to_owned())?
+        .success())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_helper_plist(path: &Path) -> Result<()> {
+    let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+    match fs::remove_file(path) {
+        Err(error) if gone(&error) => return Ok(()),
+        result => result.map_err(|_| "update-helper-task-cleanup-failed".to_owned())?,
+    }
+    let directory = path.parent().ok_or("update-helper-task-cleanup-failed")?;
+    match File::open(directory).and_then(|value| value.sync_all()) {
+        Err(error) if !gone(&error) => Err("update-helper-task-cleanup-failed".into()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(windows)]
@@ -807,6 +827,21 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("background child was not reaped");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_helpers_that_removed_themselves_count_as_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let task = format!(
+            "{}{}",
+            macos_helper_prefix(root.path()),
+            risunest_sync_server::management::discovery::request_id().unwrap()
+        );
+        let path = macos_helper_plist(root.path(), &task);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let service = format!("{}/{task}", launchd_user_domain().unwrap());
+        assert_eq!(remove_macos_helper(&service, &path), Ok(()));
     }
 }
 
