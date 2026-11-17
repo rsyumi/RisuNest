@@ -23,6 +23,16 @@
       },
       "versions": [
         {
+          "version": "1.4.1",
+          "buildVersion": "1.4.1",
+          "date": "2026-11-17T15:42:24Z",
+          "localizedDescription": "### Improvements\n\n- Improved drag reordering and its UI in chats, lorebooks, presets, prompts, and more.\n- Fixed touch issues across the app, including dragging, and improved the touch UI.\n- Allowed long pressing to do what only a right click did, such as opening the pop-up editor and removing custom GUI elements.\n- Allowed keeping the desktop data folder in another location through a junction or symbolic link.\n- Improved signing in again to external storage.\n- Improved Sync server sync performance, and a brief connection failure no longer shows a warning.\n\n### Fixes\n\n- Fixed presets, prompts, trigger scripts, and similar lists not being reorderable by touch.\n- Fixed some Lua scripts with many local variables failing to run.\n- Fixed the message menu needing two taps to open after a tap elsewhere closed it.\n- Fixed bookmark, branch, and similar menu items on the first message causing errors.\n- Fixed the HypaV3 translate buttons not responding to a mouse in the desktop app on touch screens.\n- Fixed the progress not updating correctly during the first download from the Sync server.\n- Fixed sync error notices and resuming when several external storages are used.\n- Fixed Lua scripts occasionally losing their global variables after a timeout.\n- Fixed a duplicate Close Window item in the macOS menu bar.",
+          "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.4.1/RisuNest-1.4.1-ios-aarch64-unsigned.ipa",
+          "size": 79067784,
+          "sha256": "8c99175ef959f90b70fb9bf9008b54b2eb1b9abe380959c2f3a943c403abba9f",
+          "minOSVersion": "16.4"
+        },
+        {
           "version": "1.4.0",
           "buildVersion": "1.4.0",
           "date": "2026-11-10T19:17:21Z",
@@ -93,11 +103,11 @@
           "minOSVersion": "16.4"
         }
       ],
-      "version": "1.4.0",
-      "versionDate": "2026-11-10T19:17:21Z",
-      "versionDescription": "### New Features\n\n- Added a sidebar module menu and redesigned the module activation UI.\n\n### Improvements\n\n- Allowed importing several characters or modules at once.\n- Allowed turning off automatic snapshots and limiting how many are kept.\n- Improved the error log screen and added saving the whole log.\n- Added Data check repairs for the first preset or persona and module IDs.\n- Unused data is now cleaned up sooner.\n- Backup, export, and error log file names now use local time.\n- Failed RisuAI/PocketRisu compatible exports now name the cause.\n- Backup restore confirmation now lists attachment references without files.\n- Improved secondary text readability on RisuNest screens.\n- Improved storage screen loading, restore, import, and storage performance.\n- Improved error messages and logging.\n\n### Fixes\n\n- Fixed startup dialogs appearing before the app lock screen.\n- Fixed the reset and backup restore screens hidden behind the logo on iOS and macOS.\n- Fixed some chat message links reloading the app.\n- Fixed the persona prompt not being sent correctly with Bind Persona.\n- Fixed saves occasionally failing in chats using chat variables.\n- Fixed an error when stopping a Google or OpenAI response.\n- Fixed unused file cleanup deleting images used in archived characters' chats.\n- Fixed other operations stalling during snapshot work.\n- Fixed RisuAI/PocketRisu compatible exports failing with some settings.\n- Fixed some lorebook entries causing errors in the editor or the prompt.\n- Fixed notifications not being allowed from the iOS Platform page.\n- Fixed a debugging feature using extra memory on iOS.\n- Fixed the app possibly being force-closed on iOS when reloading.\n- Fixed UI issues in the pop-up editor.",
-      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.4.0/RisuNest-1.4.0-ios-aarch64-unsigned.ipa",
-      "size": 79003861
+      "version": "1.4.1",
+      "versionDate": "2026-11-17T15:42:24Z",
+      "versionDescription": "### Improvements\n\n- Improved drag reordering and its UI in chats, lorebooks, presets, prompts, and more.\n- Fixed touch issues across the app, including dragging, and improved the touch UI.\n- Allowed long pressing to do what only a right click did, such as opening the pop-up editor and removing custom GUI elements.\n- Allowed keeping the desktop data folder in another location through a junction or symbolic link.\n- Improved signing in again to external storage.\n- Improved Sync server sync performance, and a brief connection failure no longer shows a warning.\n\n### Fixes\n\n- Fixed presets, prompts, trigger scripts, and similar lists not being reorderable by touch.\n- Fixed some Lua scripts with many local variables failing to run.\n- Fixed the message menu needing two taps to open after a tap elsewhere closed it.\n- Fixed bookmark, branch, and similar menu items on the first message causing errors.\n- Fixed the HypaV3 translate buttons not responding to a mouse in the desktop app on touch screens.\n- Fixed the progress not updating correctly during the first download from the Sync server.\n- Fixed sync error notices and resuming when several external storages are used.\n- Fixed Lua scripts occasionally losing their global variables after a timeout.\n- Fixed a duplicate Close Window item in the macOS menu bar.",
+      "downloadURL": "https://github.com/rsyumi/RisuNest/releases/download/app-v1.4.1/RisuNest-1.4.1-ios-aarch64-unsigned.ipa",
+      "size": 79067784
     }
   ],
   "news": []
