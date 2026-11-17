@@ -360,9 +360,27 @@ describe('production server LWW composition', () => {
             if (first) { first = false; await new Promise(resolve => setTimeout(resolve, slow)) }
             throw { code: 'server-timeout', status: 503, retryable: true }
         })
-        const resumed = f.transport!.resumeBinding(bindingContext())
-        await vi.advanceTimersByTimeAsync(20_000); await resumed
+        let reported = false
+        const resumed = f.transport!.resumeBinding(bindingContext()).then(() => { reported = true })
+        // The failure is reported once no retry can start within the window, without waiting for one.
+        await vi.advanceTimersByTimeAsync(slow + 1000 * (attempts - 1)); await settle()
+        expect(reported).toBe(true)
+        await resumed
         expect(activations()).toBe(attempts)
+    })
+    it('does not retry a launch request when its wait ends after the 10 s window', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_activate') throw { code: 'server-unreachable', status: 503, retryable: true }
+            return base(command, args)
+        })
+        const resumed = f.transport!.resumeBinding(bindingContext())
+        await vi.advanceTimersByTimeAsync(500)
+        // The app is suspended while the first retry waits, so its timer fires late.
+        vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 60_000)
+        await vi.advanceTimersByTimeAsync(500); await resumed
+        expect(activations()).toBe(1)
     })
     it('stops retrying a launch request once its binding is stopped', async () => {
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
@@ -408,6 +426,22 @@ describe('production server LWW composition', () => {
         await vi.advanceTimersByTimeAsync(6000)
         expect(f.alert).not.toHaveBeenCalled()
         await vi.advanceTimersByTimeAsync(1000)
+        expect(f.alert).toHaveBeenCalledExactlyOnceWith((await import('src/lang')).language.risuNest.serverSync.offlineNotice)
+    })
+    it('shows the offline notice during use once the automatic asset download retry also fails', async () => {
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_claim_offline_notice') return true
+            if (command === 'server_sync_lww_hydrate') throw { code: 'server-unreachable', status: 503, retryable: true }
+            // The receive takes a moment, so the retried download fails before it succeeds.
+            if (command === 'server_sync_lww_pull') { await new Promise(resolve => setTimeout(resolve, 100)); return emptyReceive() }
+            return base(command, args)
+        })
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        expect(f.alert).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(5_100)
+        expect(hydrationCalls()).toHaveLength(2)
         expect(f.alert).toHaveBeenCalledExactlyOnceWith((await import('src/lang')).language.risuNest.serverSync.offlineNotice)
     })
     it('keeps startup closed across an empty intermediate page and projection, then stops at the first frontier', async () => {

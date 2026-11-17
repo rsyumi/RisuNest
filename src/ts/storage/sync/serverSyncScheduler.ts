@@ -209,6 +209,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     const recheck = (): Promise<boolean> => {
         if (!foreground || !blocked || !recheckFor(blockedCode) || !available()) return Promise.resolve(false)
         if (rechecking) return rechecking
+        const epoch = outageEpoch
         rechecking = (async () => {
             await Promise.allSettled([sending, receiving, disconnecting])
             const check = recheckFor(blockedCode)
@@ -218,7 +219,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             blocked = false; blockedCode = ''; sendRetryAttempt = 0
             connect(); void pull().catch(() => {}); void push().catch(() => {})
             return true
-        })().catch(error => { fail(error); return false }).finally(() => { rechecking = undefined; dependencies.activity?.() })
+        })().catch(error => { fail(error, undefined, epoch); return false }).finally(() => { rechecking = undefined; dependencies.activity?.() })
         dependencies.activity?.()
         return rechecking
     }
@@ -278,6 +279,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             }
         },
         reportFailure: fail,
+        /** Passed to reportFailure with a request that starts now, so its failure counts as a retry when it began during an outage. */
+        epoch: () => outageEpoch,
         isBlocked: () => blocked,
         isWaiting: waiting,
         /** The failure that stopped sync until a retry, or '' while it is not stopped. */

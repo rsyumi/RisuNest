@@ -265,7 +265,7 @@ const checkResumedReceiveContext = (c: BindingContext) => {
     checkReceiveContext(c)
 }
 const startupRetryDelays = [1_000, 2_000]
-// A retry starts only this soon after the first attempt, so a slow failure or a wait that ran late while the app was suspended ends the retries.
+// A retry starts only this soon after the first attempt: a slow failure is reported at once, and a wait that ran late while the app was suspended ends the retries.
 const startupRetryWindow = 10_000
 // A server update, a rate limit and a spent retry budget keep their own waits.
 const retriesQuickly = (value: unknown) => isServerSyncUnavailable(value) && !['server-updating', 'sync-retry-budget-exhausted'].includes(serverSyncErrorCode(value))
@@ -281,6 +281,7 @@ function startupRetryWait(captured: BindingContext, delay: number): Promise<bool
 }
 async function startupRequest<T>(captured: BindingContext, command: string, args: Record<string, unknown>): Promise<T> {
     const started = performance.now()
+    const withinWindow = (wait: number) => performance.now() + wait - started <= startupRetryWindow
     for (let attempt = 0; ; attempt++) {
         try {
             const result = await invoke<T>(command, args)
@@ -289,7 +290,7 @@ async function startupRequest<T>(captured: BindingContext, command: string, args
         } catch (value) {
             const delay = startupRetryDelays[attempt]
             if (args.startup === true && !startupRetriesSpent && delay !== undefined && retriesQuickly(value)
-                && await startupRetryWait(captured, delay) && performance.now() - started <= startupRetryWindow) continue
+                && withinWindow(delay) && await startupRetryWait(captured, delay) && withinWindow(0)) continue
             if (captured === context && args.startup === true && isServerSyncUnavailable(value)) { startupRetriesSpent = true; outageConfirmed = true }
             if (captured === context && initialReceive) {
                 const activationReady = typeof value === 'object' && value !== null && 'startupLocalReady' in value && value.startupLocalReady === true
@@ -340,6 +341,7 @@ function continueHydration(continuation = false): void {
     if ((!hydrationPending && !representativesPending) || !(foreground || continuation && continuing) || !context || context.signal.aborted || scheduler.isBlocked() || scheduler.isWaiting() || isLibraryFileOperationReserved()) return
     if (hydrating) { hydrationAgain = true; return }
     const captured = context
+    const epoch = scheduler.epoch()
     const representativesOnly = !hydrationPending
     hydrationPending = false
     representativesPending = false
@@ -354,7 +356,7 @@ function continueHydration(continuation = false): void {
         else hydrationPending = true
         if (serverSyncErrorCode(value) !== 'cancelled' && active() && !scheduler.isBlocked()) {
             recordFailure(value); hydrationError = error
-            if (isServerSyncUnavailable(value)) scheduler.reportFailure(value)
+            if (isServerSyncUnavailable(value)) scheduler.reportFailure(value, undefined, epoch)
         }
     }).finally(() => {
         hydrating = undefined

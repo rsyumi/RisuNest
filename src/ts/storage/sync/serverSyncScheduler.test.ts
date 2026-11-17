@@ -392,6 +392,15 @@ describe('server LWW foreground scheduler', () => {
         expect(f.scheduler.isBlocked()).toBe(false); expect(f.push).toHaveBeenCalledTimes(2)
         f.scheduler.dispose()
     })
+    it('reports a clock recheck that began after an outage delay as a retry', async () => {
+        const f = fixture(); f.push.mockRejectedValueOnce(new Error('clock-skew'))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        const outage = { code: 'server-unreachable', retryable: true }
+        f.retryClock.mockRejectedValue(outage)
+        await f.scheduler.conversationOpened(); expect(f.failed).toHaveBeenLastCalledWith(outage, false)
+        await f.scheduler.conversationOpened(); expect(f.failed).toHaveBeenLastCalledWith(outage, true)
+        f.scheduler.dispose()
+    })
     it('waits for the blocked connection cancellation before admitting clock repair', async () => {
         const f = fixture(); let stopped!: () => void
         f.disconnect.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
