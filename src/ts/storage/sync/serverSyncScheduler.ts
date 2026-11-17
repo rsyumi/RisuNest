@@ -11,7 +11,8 @@ export interface ServerSyncSchedulerDependencies {
     checkFormat?(): Promise<void>
     publishHidden?(): Promise<void>
     automaticSyncAvailable?(): boolean
-    failed(error: unknown): void
+    /** `retried` is true when the failed request began after an outage delay that no success has ended since. */
+    failed(error: unknown, retried: boolean): void
     recovered?(): void
     retrying?(): void
     /** Called after a send, receive or clock check starts or settles. */
@@ -105,13 +106,15 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         }
     }
     const blocks = (error: unknown) => (typeof error === 'object' && !!error && 'retryable' in error && error.retryable === false) || integrityCodes.includes(code(error))
-    const fail = (error: unknown, lane?: Lane) => {
+    const fail = (error: unknown, lane?: Lane, epoch?: number) => {
         if (isCancellation(error)) return
         if (blocked && !clockCodes.includes(blockedCode) && !formatCodes.includes(blockedCode)) return
         // A check that cannot reach the server keeps the format stop it already reports.
         if (blocked && formatCodes.includes(blockedCode) && !blocks(error)) return
         if (lane) failedLanes.add(lane)
         else if (isServerSyncUnavailable(error)) failedLanes.add('pull')
+        // Each outage delay since the last success advanced the epoch, so a request begun in one of them was a retry.
+        const retried = epoch !== undefined && epoch > outageEpoch - outageAttempt
         // Concurrent lane failures share one delay. Edits and foreground changes do not bypass it.
         if (isServerSyncUnavailable(error) && !waiting()) {
             outageEpoch++
@@ -125,7 +128,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             clear()
             void disconnect().catch(() => {})
         }
-        dependencies.failed(error)
+        dependencies.failed(error, retried)
     }
     const clear = () => { clearTimeout(pushTimer); clearTimeout(pullTimer); clearTimeout(retryTimer); clearTimeout(sendRetryTimer); clearTimeout(outageTimer) }
     const schedulePull = () => {
@@ -141,7 +144,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         if (sending) { pushAgain = true; return sending }
         const epoch = outageEpoch
         sending = dependencies.push().then(() => { sendRetryAttempt = 0; succeeded('push', epoch) }).catch(error => {
-            fail(error, 'push')
+            fail(error, 'push', epoch)
             if (foreground && !blocked && !waiting()) sendRetryTimer = setTimeout(() => { void push().catch(() => {}) }, Math.min(30_000, 1000 * 2 ** sendRetryAttempt++))
             throw error
         }).finally(() => {
@@ -159,7 +162,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         if (!completeAvailable && completingReceive) { pullAgain = true; return completingReceive }
         if (receiving) { pullAgain = true; return receiving }
         const epoch = outageEpoch
-        receiving = dependencies.pull(completeAvailable).then(() => succeeded('pull', epoch), error => { fail(error, 'pull'); throw error }).finally(() => {
+        receiving = dependencies.pull(completeAvailable).then(() => succeeded('pull', epoch), error => { fail(error, 'pull', epoch); throw error }).finally(() => {
             receiving = undefined
             if (pullAgain && foreground && !completingReceive) { pullAgain = false; void pull().catch(() => {}) }
             else schedulePull()
@@ -175,7 +178,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         if (disconnecting) { void disconnecting.then(connect, connect); return }
         if (connecting) return
         const epoch = outageEpoch
-        const attempt: Promise<void> = dependencies.connect(notificationOperationId ??= crypto.randomUUID()).then(() => succeeded('connect', epoch), error => { fail(error, 'connect'); socket(false) })
+        const attempt: Promise<void> = dependencies.connect(notificationOperationId ??= crypto.randomUUID()).then(() => succeeded('connect', epoch), error => { fail(error, 'connect', epoch); socket(false) })
             .finally(() => { if (connecting === attempt) connecting = undefined })
         connecting = attempt
     }
@@ -195,7 +198,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
         if (foreground || blocked || sending || !available() || waiting()) return
         pushAgain = false
         const epoch = outageEpoch
-        sending = dependencies.publishHidden!().then(() => { sendRetryAttempt = 0; succeeded('push', epoch) }, error => { fail(error, 'push') }).finally(() => {
+        sending = dependencies.publishHidden!().then(() => { sendRetryAttempt = 0; succeeded('push', epoch) }, error => { fail(error, 'push', epoch) }).finally(() => {
             sending = undefined
             if (pushAgain && foreground) { pushAgain = false; void push().catch(() => {}) }
             dependencies.activity?.()
@@ -206,6 +209,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
     const recheck = (): Promise<boolean> => {
         if (!foreground || !blocked || !recheckFor(blockedCode) || !available()) return Promise.resolve(false)
         if (rechecking) return rechecking
+        const epoch = outageEpoch
         rechecking = (async () => {
             await Promise.allSettled([sending, receiving, disconnecting])
             const check = recheckFor(blockedCode)
@@ -215,7 +219,7 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             blocked = false; blockedCode = ''; sendRetryAttempt = 0
             connect(); void pull().catch(() => {}); void push().catch(() => {})
             return true
-        })().catch(error => { fail(error); return false }).finally(() => { rechecking = undefined; dependencies.activity?.() })
+        })().catch(error => { fail(error, undefined, epoch); return false }).finally(() => { rechecking = undefined; dependencies.activity?.() })
         dependencies.activity?.()
         return rechecking
     }
@@ -275,6 +279,8 @@ export function createServerSyncScheduler(dependencies: ServerSyncSchedulerDepen
             }
         },
         reportFailure: fail,
+        /** Passed to reportFailure with a request that starts now, so its failure counts as a retry when it began during an outage. */
+        epoch: () => outageEpoch,
         isBlocked: () => blocked,
         isWaiting: waiting,
         /** The failure that stopped sync until a retry, or '' while it is not stopped. */

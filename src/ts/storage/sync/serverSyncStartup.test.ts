@@ -87,7 +87,15 @@ beforeEach(async () => {
 })
 afterEach(async () => { if (component) await ui.unmount(component); component = undefined; production.disposeNativeSyncBindings(); document.body.replaceChildren() })
 async function offlineStartup() {
-    await expect(production.installServerSyncProduction()).resolves.toBeUndefined()
+    // Activation retries after 1 s and 2 s before the launch failure counts. Only those waits run on a
+    // fake clock; the rest of each test keeps real timers.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+        const installed = production.installServerSyncProduction()
+        await vi.advanceTimersByTimeAsync(3_000)
+        await expect(installed).resolves.toBeUndefined()
+    } finally { vi.useRealTimers() }
+    expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(3)
     expect(commands()).not.toContain('server_sync_lww_fence')
     expect(commands()).not.toContain('server_sync_notify_start')
     expect(commands()).not.toContain('server_sync_lww_retry')
@@ -148,7 +156,8 @@ describe('persisted server offline startup', () => {
         expect(button(language.risuNest.serverSync.syncNow)).toBeDefined(); expect(button(language.risuNest.serverSync.disconnect)).toBeDefined()
         f.offline = false
         button(language.risuNest.serverSync.syncNow)!.click(); await settle()
-        expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(2)
+        // Three launch attempts, then one from Sync now.
+        expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(4)
         expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_retry', { request: { bindingAuthority: '4', requestId: expect.any(String) } })
         await vi.waitFor(() => expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: false, error: '' }))
     })
@@ -176,7 +185,8 @@ describe('persisted server offline startup', () => {
         expect(commands()).not.toContain('server_sync_lww_retry'); expect(commands()).not.toContain('server_sync_configure')
         f.offline = false; await production.retryServerSync()
         expect(production.getServerSyncController().snapshot()).toMatchObject({ status: { bound: true }, paused: false, error: '' })
-        expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(3)
+        // Three launch attempts, then one for each manual retry, which does not retry quickly again.
+        expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(5)
     })
     it('preserves native accepted-clock refusal after resumed activation and does not recheck it on foreground return', async () => {
         await offlineStartup(); f.offline = false; f.repairError = { code: 'accepted-clock-correction-required', retryable: false }
@@ -188,19 +198,25 @@ describe('persisted server offline startup', () => {
         expect(commands()).not.toContain('server_sync_notify_start')
     })
     it.each([
-        { code: 'server-timeout', status: 503, retryable: true },
-        { code: 'directory-unreachable', status: 503, retryable: true },
-        { code: 'server-response-error', status: 502, retryable: true },
-        { code: 'sync-retry-budget-exhausted', status: 503, retryable: true },
+        { failure: { code: 'server-timeout', status: 503, retryable: true }, attempts: 3 },
+        { failure: { code: 'directory-unreachable', status: 503, retryable: true }, attempts: 3 },
+        { failure: { code: 'server-response-error', status: 502, retryable: true }, attempts: 3 },
+        // A server update, retries already spent and rate limits are not retried quickly.
+        { failure: { code: 'server-updating', status: 503, retryable: true }, attempts: 1 },
+        { failure: { code: 'sync-retry-budget-exhausted', status: 503, retryable: true }, attempts: 1 },
         // The activation's server check answered with a rate limit or a coded server failure.
-        { code: 'server-response-error', status: 429, retryable: true, startupLocalReady: true },
-        { code: 'worker-unavailable', status: 503, retryable: true, startupLocalReady: false },
-    ])('automatically activates the persisted binding after transient $code ($status) recovers', async failure => {
+        { failure: { code: 'server-response-error', status: 429, retryable: true, startupLocalReady: true }, attempts: 1 },
+        { failure: { code: 'worker-unavailable', status: 503, retryable: true, startupLocalReady: false }, attempts: 3 },
+    ])('automatically activates the persisted binding after transient $failure.code ($failure.status) recovers', async ({ failure, attempts }) => {
         vi.useFakeTimers()
         try {
             f.activationError = failure
             Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
-            await expect(production.installServerSyncProduction()).resolves.toBeUndefined()
+            const installed = production.installServerSyncProduction()
+            // Quick launch retries wait 1 s and then 2 s.
+            await vi.advanceTimersByTimeAsync(attempts === 3 ? 3_000 : 0)
+            await expect(installed).resolves.toBeUndefined()
+            expect(commands().filter(command => command === 'server_sync_lww_activate')).toHaveLength(attempts)
             const transfers = () => commands().filter(command => ['server_sync_lww_push', 'server_sync_lww_pull', 'server_sync_lww_hydrate', 'server_sync_notify_start'].includes(command))
             expect(transfers()).toEqual([])
             expect(commands()).not.toContain('pds_lww_switch_target')

@@ -24,7 +24,7 @@ describe('server LWW foreground scheduler', () => {
         const failure = { code: 'worker-unavailable', status: 503, retryable: true }
         f.push.mockRejectedValueOnce(failure)
         await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
-        expect(f.failed).toHaveBeenCalledWith(failure)
+        expect(f.failed).toHaveBeenCalledWith(failure, false)
         expect(f.scheduler.isBlocked()).toBe(false)
         if (trigger === 'edit') f.scheduler.localChange(true)
         else if (trigger === 'foreground') { await f.scheduler.foreground(false); await f.scheduler.foreground(true) }
@@ -392,6 +392,15 @@ describe('server LWW foreground scheduler', () => {
         expect(f.scheduler.isBlocked()).toBe(false); expect(f.push).toHaveBeenCalledTimes(2)
         f.scheduler.dispose()
     })
+    it('reports a clock recheck that began after an outage delay as a retry', async () => {
+        const f = fixture(); f.push.mockRejectedValueOnce(new Error('clock-skew'))
+        await f.scheduler.foreground(true); await vi.advanceTimersByTimeAsync(0)
+        const outage = { code: 'server-unreachable', retryable: true }
+        f.retryClock.mockRejectedValue(outage)
+        await f.scheduler.conversationOpened(); expect(f.failed).toHaveBeenLastCalledWith(outage, false)
+        await f.scheduler.conversationOpened(); expect(f.failed).toHaveBeenLastCalledWith(outage, true)
+        f.scheduler.dispose()
+    })
     it('waits for the blocked connection cancellation before admitting clock repair', async () => {
         const f = fixture(); let stopped!: () => void
         f.disconnect.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
@@ -507,7 +516,7 @@ describe('server LWW foreground scheduler', () => {
         rejectPush({ code: 'clock-skew', retryable: false }); await vi.advanceTimersByTimeAsync(0)
         await f.scheduler.conversationOpened()
         expect(f.retryClock).not.toHaveBeenCalled(); expect(f.scheduler.isBlocked()).toBe(true)
-        expect(f.failed).toHaveBeenLastCalledWith({ code: 'equal-stamp-integrity', retryable: false })
+        expect(f.failed).toHaveBeenLastCalledWith({ code: 'equal-stamp-integrity', retryable: false }, false)
         f.scheduler.dispose()
     })
 })
