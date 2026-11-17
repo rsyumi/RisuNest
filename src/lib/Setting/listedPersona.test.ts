@@ -15,6 +15,7 @@ vi.mock('src/ts/stores.svelte', () => ({
     },
 }))
 vi.mock('src/ts/persona', () => ({ changeUserPersona: mocks.change }))
+import { DBState } from 'src/ts/stores.svelte'
 import ListedPersona from './listedPersona.svelte'
 let instance: ReturnType<typeof mount> | undefined
 afterEach(async () => {
@@ -36,16 +37,25 @@ it('binds a persona through the chat callback without changing global selection'
     expect(mocks.select).toHaveBeenCalledWith(1)
     expect(mocks.change).not.toHaveBeenCalled()
 })
-it('offers inheritance only in chat binding mode', async () => {
-    instance = mount(ListedPersona, {
-        target: document.body,
-        props: { bindingMode: true, onSelect: mocks.select, close: mocks.close },
-    })
-    const button = [...document.querySelectorAll('button')].find((button) =>
-        button.textContent?.startsWith(languageEnglish.inheritPersona),
-    )!
-    expect(button.textContent).toBe(`${languageEnglish.inheritPersona} (Persona A)`)
+it('offers inheritance with the current persona note only in chat binding mode', async () => {
+    const inheritButton = () => {
+        instance = mount(ListedPersona, {
+            target: document.body,
+            props: { bindingMode: true, onSelect: mocks.select, close: mocks.close },
+        })
+        return [...document.querySelectorAll('button')].find((button) =>
+            button.textContent?.startsWith(languageEnglish.inheritPersona),
+        )!
+    }
+    DBState.db.userNote = 'Current note'
+    let button = inheritButton()
+    expect(button.textContent).toBe(`${languageEnglish.inheritPersona} (Persona A) / Current note`)
     button.click()
     await tick()
     expect(mocks.select).toHaveBeenCalledWith(-1)
+    await unmount(instance!)
+    document.body.replaceChildren()
+    DBState.db.userNote = ''
+    button = inheritButton()
+    expect(button.textContent).toBe(`${languageEnglish.inheritPersona} (Persona A)`)
 })

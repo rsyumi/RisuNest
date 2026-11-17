@@ -36,8 +36,9 @@ const button = () => document.querySelector<HTMLButtonElement>(`button[title="${
 beforeEach(async () => {
     DBState.db = {
         username: 'Bobby',
+        userNote: 'current note',
         selectedPersona: 1,
-        personas: [{ id: 'p1', name: 'Alice', note: 'note' }, { name: 'Bob' }],
+        personas: [{ id: 'p1', name: 'Alice', note: 'note' }, { id: 'p2', name: 'Bob' }],
         characters: [{ chatPage: 0, chats: [{ id: 'chat' }] }],
     } as unknown as typeof DBState.db
     instance = mount(PersonaBind, { target: document.body })
@@ -50,18 +51,27 @@ afterEach(async () => {
     vi.clearAllMocks()
 })
 
-it('shows the header, the current persona while unbound and the bound persona with its note', async () => {
+it('shows the header, the current persona with its note while unbound and the bound persona with its own note', async () => {
     expect(document.body.textContent).toContain(languageEnglish.personaBinding)
     expect(button().textContent).toContain(`${languageEnglish.inheritPersona} (Bobby)`)
+    expect(button().textContent).toContain('(current note)')
     expect(button().classList.contains('border-selected')).toBe(false)
     chat().bindedPersona = 'p1'
     await tick()
     expect(button().textContent).toContain('Alice')
     expect(button().textContent).toContain('(note)')
+    expect(button().textContent).not.toContain('current note')
     expect(button().classList.contains('border-selected')).toBe(true)
+    chat().bindedPersona = 'p2'
+    await tick()
+    expect(button().textContent?.trim()).toBe('Bob')
     chat().bindedPersona = 'missing'
     await tick()
-    expect(button().textContent).toContain(languageEnglish.missingBoundPersona)
+    expect(button().textContent?.trim()).toBe(languageEnglish.missingBoundPersona)
+    chat().bindedPersona = undefined
+    DBState.db.userNote = ''
+    await tick()
+    expect(button().textContent?.trim()).toBe(`${languageEnglish.inheritPersona} (Bobby)`)
 })
 
 it('opens the persona list in binding mode and persists the selection', async () => {
