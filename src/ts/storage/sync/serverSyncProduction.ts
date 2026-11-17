@@ -268,7 +268,8 @@ const checkResumedReceiveContext = (c: BindingContext) => {
 const startupRetryDelays = [1_000, 2_000]
 // A retry starts only this soon after the first attempt, so a failure that was slow is reported as it is.
 const startupRetryWindow = 10_000
-const retriesQuickly = (value: unknown) => isServerSyncUnavailable(value) && serverSyncErrorCode(value) !== 'sync-retry-budget-exhausted'
+// A server update, a rate limit and a spent retry budget keep their own waits.
+const retriesQuickly = (value: unknown) => isServerSyncUnavailable(value) && !['server-updating', 'sync-retry-budget-exhausted'].includes(serverSyncErrorCode(value))
     && !(typeof value === 'object' && value !== null && 'status' in value && value.status === 429)
 /** Resolves false, without waiting further, once the binding it waits for is stopped or replaced. */
 function startupRetryWait(captured: BindingContext, delay: number): Promise<boolean> {

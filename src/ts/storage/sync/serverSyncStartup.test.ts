@@ -201,7 +201,8 @@ describe('persisted server offline startup', () => {
         { failure: { code: 'server-timeout', status: 503, retryable: true }, attempts: 3 },
         { failure: { code: 'directory-unreachable', status: 503, retryable: true }, attempts: 3 },
         { failure: { code: 'server-response-error', status: 502, retryable: true }, attempts: 3 },
-        // Retries already spent and rate limits are not retried quickly.
+        // A server update, retries already spent and rate limits are not retried quickly.
+        { failure: { code: 'server-updating', status: 503, retryable: true }, attempts: 1 },
         { failure: { code: 'sync-retry-budget-exhausted', status: 503, retryable: true }, attempts: 1 },
         // The activation's server check answered with a rate limit or a coded server failure.
         { failure: { code: 'server-response-error', status: 429, retryable: true, startupLocalReady: true }, attempts: 1 },
