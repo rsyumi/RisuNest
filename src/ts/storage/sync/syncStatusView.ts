@@ -1,6 +1,6 @@
 import { language } from 'src/lang'
-import { externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
-import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal, externalNeedsUnlock, externalRenewalConnection } from './external/connection'
+import { externalConnectionTitle, externalErrorKind, externalErrorMessage, type ExternalStorageStrings } from 'src/lib/Setting/ExternalStorage/strings'
+import { externalJobIsActive, externalJobIsPaused, externalNeedsRenewal, externalNeedsUnlock, externalRemedyConnection, externalRenewalConnection } from './external/connection'
 import type { ExternalOperationProgress } from './external/progress'
 import type { ExternalConnectionSummary, ExternalJobSummary } from './external/types'
 import { formatLevelLabel, registrationCodes, serverSyncErrorMessage } from './serverSyncErrorMessage'
@@ -98,6 +98,12 @@ export function externalSyncFailureText(strings: ExternalStorageStrings, failure
     return externalErrorMessage(strings, failure)
 }
 
+/** A sign-in or recovery key stop with the connection that clears it, so a closed notice returns when either changes. */
+function externalRemedyKey(failure: unknown, connectionId: string): string {
+    const remedy = externalRemedyConnection(failure, connectionId)
+    return remedy ? `${externalNeedsUnlock(failure) ? 'unlock' : 'renew'}:${remedy}` : ''
+}
+
 export interface SyncStatusDisplay extends SyncStatusView {
     /** The settings group title of the bound target. */
     title: string
@@ -122,14 +128,17 @@ export function syncStatusDisplay(source: SyncStatusSource, strings: ExternalSto
             lastSuccessAt: view.lastSuccessAt,
         }
     } else {
-        const { connection } = source
+        const { connection, remedyConnection } = source
         const status = externalSyncStatusView(strings, connection, source.job, source.operation, source.syncStopped, source.catchingUp, source.failure)
         display = {
             ...status,
             title: strings.title,
             error: connection.lastError ? externalErrorLabel(strings, connection.lastError)
+                : remedyConnection ? (externalNeedsUnlock(source.failure) ? strings.unlockKeyOtherAssets : strings.reauthenticateOtherAssets)
+                    .replace('{0}', externalConnectionTitle(strings, remedyConnection))
                 : source.failure !== undefined ? externalSyncFailureText(strings, source.failure) : '',
-            stopKey: status.stopped ? `external:${connection.id}:${connection.status}:${connection.lastError?.code ?? externalFormatCode(source.failure) ?? ''}` : '',
+            stopKey: status.stopped ? `external:${connection.id}:${connection.status}:${connection.lastError?.code
+                ?? externalFormatCode(source.failure) ?? externalRemedyKey(source.failure, connection.id)}` : '',
             lastSuccessAt: connection.lastSyncAtMs ? Number(connection.lastSyncAtMs) : undefined,
         }
     }

@@ -73,7 +73,7 @@
                     <div role="alert">
                         <p class="font-semibold">{failed ? language.risuNest.pluginStartup.syncUnfinished : language.risuNest.pluginStartup.waiting}</p>
                         {#if stopped}<p class="mt-1 font-semibold">{stopped.label}</p>{/if}
-                        {#if error}<p class="mt-1 whitespace-pre-wrap text-sm text-textcolor/70">{error}</p>{/if}
+                        {#if error}<p class="mt-1 whitespace-pre-wrap wrap-anywhere text-sm text-textcolor/70">{error}</p>{/if}
                     </div>
                     {#if !renewal && !($settingsOpen && $SettingsMenuIndex === 17 && $activeRisuNestSettingsTab === 'sync')}
                         <button type="button" class="-my-2 min-h-11 text-sm text-subtext underline hover:text-textcolor" onclick={settings}>{language.risuNest.tabs.sync}</button>

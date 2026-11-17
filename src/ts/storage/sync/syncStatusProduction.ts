@@ -1,7 +1,7 @@
 import { subscribeSyncReceiveCompleted } from './bindingChanges'
 import { createNativeSyncBindingBridge } from './bindingNative'
 import { getExternalStorageBridge } from './external/bridge'
-import { externalJobIsPaused } from './external/connection'
+import { externalJobIsPaused, externalRemedyConnection } from './external/connection'
 import { isExternalLwwRunning, requestExternalLwwNow, subscribeExternalLwwCatchUp, subscribeExternalLwwFailures } from './external/lwwProduction'
 import { externalProgressFor, externalSyncAttempt, subscribeExternalProgress, type ExternalOperationProgress } from './external/progress'
 import { getServerSyncController, retryServerSync } from './serverSyncProduction'
@@ -31,8 +31,10 @@ function externalSource(connectionId: string, emit: (value: SyncStatusSource | n
                     if (!connection) { last = undefined; emit(null); continue }
                     const job = state.jobs.find(item => item.connectionId === connectionId && (item.state === 'uncertain' || externalJobIsPaused(item)))
                     const selected = state.selection.kind === 'external' && state.selection.connectionId === connectionId
+                    const remedy = externalRemedyConnection(failure, connectionId)
+                    const remedyConnection = remedy === connectionId ? undefined : state.connections.find(item => item.id === remedy)
                     last = {
-                        target: 'external', connection, job, operation, failure, catchingUp, refresh: read,
+                        target: 'external', connection, job, operation, failure, remedyConnection, catchingUp, refresh: read,
                         syncStopped: connection.purpose === 'sync' && selected && !isExternalLwwRunning(connectionId),
                         syncNow: () => requestExternalLwwNow(connectionId),
                     }
