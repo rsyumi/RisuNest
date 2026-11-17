@@ -598,7 +598,7 @@ mod platform {
         let connection = match Connection::new_session() {
             Ok(connection) => connection,
             Err(error) if missing_bus(&error) => return Ok(Backend::PrivateFile),
-            Err(_) => return Err(unavailable()),
+            Err(error) => return Err(bus_failed("connection", &error)),
         };
         let bus = connection.with_proxy(
             "org.freedesktop.DBus",
@@ -611,13 +611,13 @@ mod platform {
                 "NameHasOwner",
                 ("org.freedesktop.secrets",),
             )
-            .map_err(|_| unavailable())?;
+            .map_err(|error| bus_failed("lookup", &error))?;
         let present = if owned {
             true
         } else {
             let (names,): (Vec<String>,) = bus
                 .method_call("org.freedesktop.DBus", "ListActivatableNames", ())
-                .map_err(|_| unavailable())?;
+                .map_err(|error| bus_failed("lookup", &error))?;
             names.iter().any(|name| name == "org.freedesktop.secrets")
         };
         Ok(if present {
@@ -666,12 +666,20 @@ mod platform {
         .to_owned()
     }
 
-    fn failed(operation: &str, error: keyring::Error) -> Error {
-        let message = format!("Secret Service {operation} failed: {}", failure_cause(&error));
+    fn record_failure(operation: &str, cause: &str) -> Error {
+        let message = format!("Secret Service {operation} failed: {cause}");
         #[cfg(all(test, not(debug_assertions)))]
         eprintln!("{message}");
         crate::native_log::log_global("warn", "device-secrets", message);
         unavailable()
+    }
+
+    fn failed(operation: &str, error: keyring::Error) -> Error {
+        record_failure(operation, &failure_cause(&error))
+    }
+
+    fn bus_failed(operation: &str, error: &dbus::Error) -> Error {
+        record_failure(operation, error.name().unwrap_or("unnamed-dbus-error"))
     }
 
     fn entry(purpose: Purpose, id: &str) -> Result<keyring::Entry> {
