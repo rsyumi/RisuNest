@@ -645,14 +645,43 @@ mod platform {
         }
     }
 
+    /// The D-Bus error name, or else the keyring error kind, behind a failed Secret Service call.
+    fn failure_cause(error: &keyring::Error) -> String {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = source {
+            if let Some(name) = current.downcast_ref::<dbus::Error>().and_then(dbus::Error::name) {
+                return name.to_owned();
+            }
+            source = current.source();
+        }
+        match error {
+            keyring::Error::NoStorageAccess(_) => "no-storage-access",
+            keyring::Error::PlatformFailure(_) => "platform-failure",
+            keyring::Error::BadEncoding(_) => "bad-encoding",
+            keyring::Error::TooLong(..) => "too-long",
+            keyring::Error::Invalid(..) => "invalid",
+            keyring::Error::Ambiguous(_) => "ambiguous",
+            _ => "other",
+        }
+        .to_owned()
+    }
+
+    fn failed(operation: &str, error: keyring::Error) -> Error {
+        let message = format!("Secret Service {operation} failed: {}", failure_cause(&error));
+        #[cfg(all(test, not(debug_assertions)))]
+        eprintln!("{message}");
+        crate::native_log::log_global("warn", "device-secrets", message);
+        unavailable()
+    }
+
     fn entry(purpose: Purpose, id: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(&service_name(purpose), id).map_err(|_| unavailable())
+        keyring::Entry::new(&service_name(purpose), id).map_err(|error| failed("entry", error))
     }
 
     fn read_error(error: keyring::Error) -> Error {
         match error {
             keyring::Error::NoEntry => missing(),
-            _ => unavailable(),
+            error => failed("read", error),
         }
     }
 
@@ -674,6 +703,43 @@ mod platform {
         assert!(service_name(Purpose::Provider).starts_with("io.github.rsyumi.risunest.test."));
     }
 
+    #[test]
+    fn unavailable_secret_service_calls_log_their_cause() {
+        let timed_out = dbus::Error::new_custom("org.freedesktop.DBus.Error.NoReply", "synthetic timeout");
+        let wrapped = dbus_secret_service_failure(timed_out);
+        assert_eq!(read_error(keyring::Error::PlatformFailure(wrapped)), Error::Unavailable);
+        assert_eq!(
+            read_error(keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("synthetic")))),
+            Error::Unavailable
+        );
+        let messages = crate::native_log::global_state()
+            .tail(None)
+            .into_iter()
+            .filter(|entry| entry.target == "device-secrets")
+            .map(|entry| entry.message)
+            .collect::<Vec<_>>();
+        assert!(messages.contains(&"Secret Service read failed: org.freedesktop.DBus.Error.NoReply".to_owned()), "{messages:?}");
+        assert!(messages.contains(&"Secret Service read failed: no-storage-access".to_owned()), "{messages:?}");
+    }
+
+    /// Wraps a D-Bus error the way the Secret Service client does before keyring boxes it.
+    #[cfg(test)]
+    fn dbus_secret_service_failure(error: dbus::Error) -> Box<dyn std::error::Error + Send + Sync> {
+        #[derive(Debug)]
+        struct ClientError(dbus::Error);
+        impl std::fmt::Display for ClientError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "DBus error: {}", self.0)
+            }
+        }
+        impl std::error::Error for ClientError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        Box::new(ClientError(error))
+    }
+
     pub fn write_new(_: &Path, purpose: Purpose, id: &str, bytes: &[u8]) -> Result<()> {
         match entry(purpose, id)?.get_secret() {
             Ok(_) => return Err(unavailable()),
@@ -682,7 +748,7 @@ mod platform {
         }
         entry(purpose, id)?
             .set_secret(bytes)
-            .map_err(|_| unavailable())
+            .map_err(|error| failed("write", error))
     }
 
     pub fn read(_: &Path, purpose: Purpose, id: &str) -> Result<Vec<u8>> {
@@ -693,13 +759,13 @@ mod platform {
         entry(purpose, id)?.get_secret().map_err(read_error)?;
         entry(purpose, id)?
             .set_secret(bytes)
-            .map_err(|_| unavailable())
+            .map_err(|error| failed("write", error))
     }
 
     pub fn remove(_: &Path, purpose: Purpose, id: &str) -> Result<()> {
         match entry(purpose, id)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err(unavailable()),
+            Err(error) => Err(failed("remove", error)),
         }
     }
 }
