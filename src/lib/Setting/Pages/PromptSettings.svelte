@@ -5,7 +5,7 @@
     import { tokenizePreset, type PromptItem } from "src/ts/process/prompt";
     import { templateCheck } from "src/ts/process/templates/templateCheck";
     
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";

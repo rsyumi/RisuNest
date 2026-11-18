@@ -1,6 +1,6 @@
 <script lang="ts">
     import { language } from 'src/lang';
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import Accordion from 'src/lib/UI/Accordion.svelte';
     import CheckInput from 'src/lib/UI/GUI/CheckInput.svelte';
     import AllSeperateParameters from 'src/lib/Others/AllSeperateParameters.svelte';

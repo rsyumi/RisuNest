@@ -4,7 +4,8 @@
     import SegmentedControl from "src/lib/UI/GUI/SegmentedControl.svelte";
     import SliderInput from "src/lib/UI/GUI/SliderInput.svelte";
     import ModelList from "src/lib/UI/ModelList.svelte";
-    import { DBState, easyPanelStore } from "src/ts/stores.svelte";
+    import { easyPanelStore } from "src/ts/stores.svelte";
+    import { presetEditorDBState as DBState } from "src/ts/storage/presetEditor.svelte";
     import Help from "../Help.svelte";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";

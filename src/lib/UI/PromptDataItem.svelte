@@ -8,7 +8,7 @@
     import CheckInput from "./GUI/CheckInput.svelte";
     import { ArrowDown, ArrowUp, XIcon } from "@lucide/svelte";
     import TextInput from "./GUI/TextInput.svelte";
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { RISU_PROMPT_DRAG_TYPE } from "src/ts/dragTypes";
     
     interface Props {

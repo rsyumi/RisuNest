@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { DBState } from 'src/ts/stores.svelte'
+  import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte'
   import Check from "src/lib/UI/GUI/CheckInput.svelte"
   import Accordion from 'src/lib/UI/Accordion.svelte'
   import { language } from 'src/lang'

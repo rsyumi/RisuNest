@@ -3,7 +3,8 @@
     import { language } from "src/lang";
     import Help from "src/lib/Others/Help.svelte";
     import { selectSingleFile } from "src/ts/util";
-    import { DBState, selectedCharID } from 'src/ts/stores.svelte';
+    import { selectedCharID } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { saveAsset, downloadFile, globalFetch } from "src/ts/globalApi.svelte";
     import { isTauri } from "src/ts/platform"
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
@@ -60,9 +61,9 @@
     });
 
     async function getMaxMemoryRatio(): Promise<number> {
-        const promptTemplateToken = await tokenizePreset(DBState.db.promptTemplate);
+        const promptTemplateToken = await tokenizePreset(DBState.db.promptTemplate, false, DBState.db);
         const char = DBState.db.characters[$selectedCharID];
-        const charToken = await getCharToken(char);
+        const charToken = await getCharToken(char, DBState.db);
         const maxLoreToken = char.loreSettings?.tokenBudget ?? DBState.db.loreBookToken;
         const maxResponse = DBState.db.maxResponse;
         const requiredToken = promptTemplateToken + charToken.persistant + Math.min(charToken.dynamic, maxLoreToken) + maxResponse * 3;

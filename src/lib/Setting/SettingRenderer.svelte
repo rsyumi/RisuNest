@@ -1,7 +1,7 @@
 <script lang="ts">
     import type { SettingItem, SettingContext } from 'src/ts/setting/types';
     import type { LLMModel } from 'src/ts/model/types';
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { getModelInfo } from 'src/ts/model/modellist';
     import { settingRegistry } from 'src/ts/setting/settingRegistry';
     import { checkCondition } from 'src/ts/setting/utils';
