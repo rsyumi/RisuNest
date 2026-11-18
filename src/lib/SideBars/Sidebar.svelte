@@ -1,5 +1,4 @@
 <script lang="ts">
-    import { imageAliases } from "src/ts/media/imageFormats"
     import {
     CharEmotion,
     DynamicGUI,
@@ -26,8 +25,6 @@
     Settings,
     ListIcon,
     LayoutGridIcon,
-    FolderIcon,
-    FolderOpenIcon,
     HomeIcon,
     WrenchIcon,
     User2Icon,
@@ -44,11 +41,9 @@
     import SidebarAvatar from "./SidebarAvatar.svelte";
     import SyncStatusButton from "./SyncStatusButton.svelte";
     import BaseRoundedButton from "../UI/BaseRoundedButton.svelte";
-    import { getCharacterIndexObject, selectSingleFile } from "src/ts/util";
+    import { getCharacterIndexObject } from "src/ts/util";
     import { v4 } from "uuid";
-    import { checkCharOrder, getFileSrc } from "src/ts/globalApi.svelte";
-    import { saveImage } from "src/ts/storage/database.svelte";
-    import { alertInput, alertSelect } from "src/ts/alert";
+    import { checkCharOrder } from "src/ts/globalApi.svelte";
     import SideChatList from "./SideChatList.svelte";
 
   import { sideBarSize } from "src/ts/gui/guisize";
@@ -60,6 +55,9 @@
   import { clearCharacterSelection } from "../workingSetNavigation";
   import { onDestroy } from "svelte";
   import { RepresentativeImageList } from "src/ts/ui/representativeImagePriority";
+  import FolderIconFace from "./FolderIconFace.svelte";
+  import { folderManager, openFolderManager } from "src/ts/gui/folderManager.svelte";
+  import { applyFolderDraft, folderFillImage, folderFrameImage, resolveFolderAppearance, type FolderAppearance } from "src/ts/gui/folderAppearance";
   const imagePriority = new RepresentativeImageList(false);
   onDestroy(() => imagePriority.dispose());
   $effect(() => imagePriority.setOrder(charImages.flatMap(char => char.type === 'normal'
@@ -79,7 +77,7 @@
   }
 
   type sortTypeNormal = { type:'normal',img: string, index: number, name:string }
-  type sortType =  sortTypeNormal|{type:'folder',folder:sortTypeNormal[],id:string, name:string, color:string, img?:string}
+  type sortType =  sortTypeNormal|{type:'folder',folder:sortTypeNormal[],id:string, name:string, color:string, img?:string, appearance:FolderAppearance}
   let charImages: sortType[] = $state([]);
   let IconRounded = $state(false)
   let openFolders:string[] = $state([])
@@ -110,7 +108,9 @@
         }
       }
       else{
-        const folder = id
+        // The folder being edited shows its unsaved draft.
+        const folder = folderManager.folderId === id.id && folderManager.draft ? applyFolderDraft(id, folderManager.draft) : id
+        const appearance = resolveFolderAppearance(folder)
         let folderCharImages: sortTypeNormal[] = []
         for(const id of folder.data){
           const index = idObject[id] ?? -1
@@ -129,8 +129,9 @@
           type: "folder",
           id: folder.id,
           name: folder.name,
-          color: folder.color,
-          img: folder.imgFile,
+          color: appearance.preset,
+          img: appearance.iconType === 'image' ? folder.imgFile : undefined,
+          appearance,
         });
       }
     }
@@ -303,7 +304,7 @@
     }
     if(typeof (target) === 'string'){
       const newFolder:folder = {
-        name: "New Folder",
+        name: language.risuNest.folderManager.defaultName,
         data: [main, target],
         color: "",
         id: v4()
@@ -644,6 +645,7 @@
         <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div
             role="button" tabindex="0"
+            class={char.type === 'folder' && folderManager.folderId === char.id ? 'rounded-md outline-2 outline-offset-2 outline-borderc' : undefined}
             onclick={() => {
               if(char.type === "normal"){
                 changeChar(char.index, {reseter});
@@ -669,62 +671,15 @@
           {:else if char.type === "folder"}
             {#key char.color}
             {#key char.name}
-              <SidebarAvatar {imagePriority} imageReference={char.img} src="slot" size="56" rounded={IconRounded} bordered name={char.name} color={char.color} backgroundimg={() => char.img ? getCharImage(char.img, "plain") : ""}
-              oncontextmenu={async (e) => {
+              <SidebarAvatar {imagePriority} imageReference={char.img} src="slot" size="56" rounded={IconRounded} bordered name={char.name} color={char.color} fill={folderFillImage(char.appearance)} backgroundimg={() => char.img ? getCharImage(char.img, "plain") : ""}
+              oncontextmenu={(e) => {
                 e.preventDefault()
-                const sel = parseInt(await alertSelect([language.renameFolder,language.changeFolderColor,language.changeFolderImage,language.cancel]))
-                if(sel === 0){
-                  const v = await alertInput(language.changeFolderName, [], char.name)
-                  const db = DBState.db
-                  if(v){
-                    const oder = db.characterOrder[ind]
-                    if(typeof(oder) === 'string'){
-                      return
-                    }
-                    oder.name = v
-                    db.characterOrder[ind] = oder
-                  }
+                if(char.type !== 'folder'){
+                  return
                 }
-                else if(sel === 1){
-                  const colors = ["red","green","blue","yellow","indigo","purple","pink","default"]
-                  const sel = parseInt(await alertSelect(colors))
-                  const db = DBState.db
-                  const oder = db.characterOrder[ind]
-                  if(typeof(oder) === 'string'){
-                    return
-                  }
-                  oder.color = colors[sel].toLocaleLowerCase()
-                  db.characterOrder[ind] = oder
-                }
-                else if(sel === 2) {
-                  const sel = parseInt(await alertSelect(['Reset to Default Image', 'Select Image File']))
-                  const db = DBState.db
-                  const oder = db.characterOrder[ind]
-                  if(typeof(oder) === 'string'){
-                    return
-                  }
-
-                  switch (sel) {
-                    case 0:
-                      oder.imgFile = null
-                      oder.img = ''
-                      break;
-                  
-                    case 1:
-                      const folderImage = await selectSingleFile(imageAliases, { image: true })
-
-                      if(!folderImage) {
-                        return
-                      }
-
-                      const folderImageData = await saveImage(folderImage.data)
-
-                      oder.imgFile = folderImageData
-                      oder.img = await getFileSrc(folderImageData)
-                      db.characterOrder[ind] = oder
-                      break;
-                  }
-                }
+                const tile = e.currentTarget.getBoundingClientRect()
+                const column = e.currentTarget.closest('.rs-sidebar')?.getBoundingClientRect()
+                openFolderManager(char.id, { top: tile.top, right: column?.right ?? tile.right })
               }}
               onClick={() => {
                 if(char.type !== 'folder'){
@@ -738,15 +693,7 @@
                 }
                 openFolders = openFolders
               }}>
-                {#if DBState.db.showFolderName}
-                  <div class="h-full w-full flex justify-center items-center">
-                    <span class="hyphens-auto truncate font-bold">{char.name}</span>
-                  </div>
-                {:else if openFolders.includes(char.id)}
-                  <FolderOpenIcon />
-                {:else}
-                  <FolderIcon />
-                {/if}
+                <FolderIconFace appearance={char.appearance} round={IconRounded} open={openFolders.includes(char.id)} />
               </SidebarAvatar>
             {/key}
             {/key}
@@ -765,7 +712,7 @@
             char.color === 'purple' ? 'bg-purple-700/20' :
             char.color === 'pink' ? 'bg-pink-700/20' :
             'bg-darkbg/20'
-          }"></div>
+          }" style:background-color={char.appearance.stops ? 'transparent' : undefined} style:background-image={folderFrameImage(char.appearance)}></div>
           <div class="h-4 min-h-4 w-14 relative z-10" role="listitem" data-sidebar-drop ondragover={(e) => {
             const drag = getCurrentSidebarDrag(e)
             if(!drag){ return }
