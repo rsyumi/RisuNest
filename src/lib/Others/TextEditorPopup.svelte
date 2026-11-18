@@ -193,7 +193,7 @@
             {/if}
             {#if previewing && Preview}
                 <div class="absolute inset-0 flex flex-col">
-                    <Preview value={draft} />
+                    <Preview value={draft} presetEditor={request.presetEditor} />
                 </div>
             {/if}
         </div>

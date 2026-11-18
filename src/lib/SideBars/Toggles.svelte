@@ -5,7 +5,7 @@
     import { parseToggleSyntax } from "src/ts/util";
     import { language } from "src/lang";
     import type { PromptItem } from "src/ts/process/prompt";
-    import { getCurrentCharacter, getCurrentChat, type character } from "src/ts/storage/database.svelte";
+    import { getCurrentCharacter, getCurrentChat, type character, type Database } from "src/ts/storage/database.svelte";
     import SwitchInput from "../UI/GUI/SwitchInput.svelte";
     import ToggleItems from './ToggleItems.svelte'
     import ModelBind from './ModelBind.svelte'
@@ -23,9 +23,12 @@
     interface Props {
         chara?: character
         noContainer?: boolean
+        /** The preset whose toggles show; the applied preset unless the settings window's preview passes the one it edits. */
+        presetDatabase?: Database
     }
 
-    let { chara = $bindable(), noContainer }: Props = $props();
+    let { chara = $bindable(), noContainer, presetDatabase }: Props = $props();
+    let presetFields = $derived(presetDatabase ?? DBState.db)
 
     const jailbreakToggleToken = '{{jbtoggled}}'
     const usesJailbreakToggle = (value?: string) =>
@@ -51,9 +54,9 @@
         })
 
     let hasJailbreakPrompt = $derived.by(() => {
-        const template = DBState.db.promptTemplate
+        const template = presetFields.promptTemplate
         if (!template) {
-            return (DBState.db.jailbreak ?? '').trim().length > 0
+            return (presetFields.jailbreak ?? '').trim().length > 0
         }
         return templateUsesJailbreakToggle(template)
     })
@@ -73,7 +76,7 @@
     })
 
     let groupedToggles = $derived(groupSidebarToggles(parseToggleSyntax(
-        DBState.db.customPromptTemplateToggle + '\n' +
+        presetFields.customPromptTemplateToggle + '\n' +
         getModuleToggles() + '\n' +
         charToggle
     )))

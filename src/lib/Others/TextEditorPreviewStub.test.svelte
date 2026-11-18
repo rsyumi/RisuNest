@@ -1,5 +1,5 @@
 <script lang="ts">
-    let { value }: { value: string } = $props()
+    let { value, presetEditor = false }: { value: string; presetEditor?: boolean } = $props()
 </script>
 
-<div data-preview-stub>{value}</div>
+<div data-preview-stub data-preset-editor={presetEditor}>{value}</div>

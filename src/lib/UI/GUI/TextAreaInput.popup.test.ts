@@ -15,6 +15,8 @@ vi.mock('src/ts/stores.svelte', async () => {
     return {
         DBState: { db: { hotkeys: [], longPressToPopupEditor: false } },
         disableHighlight: writable(false),
+        settingsOpen: writable(false), MobileGUI: writable(false), MobileGUIStack: writable(0),
+        MobileSideBar: writable(0), selectedCharID: writable(0),
     }
 })
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
@@ -25,7 +27,7 @@ vi.mock('src/ts/util', () => ({ sleep: async () => {} }))
 import TextAreaInput from './TextAreaInput.svelte'
 import TextAreaInputInsidePopupHarness from './TextAreaInputInsidePopupHarness.test.svelte'
 import { textEditorPopup } from 'src/ts/gui/textEditorPopup.svelte'
-import { DBState } from 'src/ts/stores.svelte'
+import { DBState, settingsOpen } from 'src/ts/stores.svelte'
 
 let component: ReturnType<typeof mount> | undefined
 
@@ -35,6 +37,7 @@ afterEach(async () => {
     textEditorPopup.request = null
     hotkey.matches = false
     DBState.db.longPressToPopupEditor = false
+    settingsOpen.set(false)
     document.body.replaceChildren()
 })
 
@@ -52,7 +55,14 @@ describe('text area popup editor button', () => {
         const { expand } = await input({})
         expect(expand).not.toBeNull()
         expand.click()
-        expect(textEditorPopup.request).toMatchObject({ value: 'Field text', language: 'markdown', preview: true })
+        expect(textEditorPopup.request).toMatchObject({ value: 'Field text', language: 'markdown', preview: true, presetEditor: false })
+    })
+
+    it('previews with the preset the settings window edits when opened from it', async () => {
+        settingsOpen.set(true)
+        const { expand } = await input({})
+        expand.click()
+        expect(textEditorPopup.request).toMatchObject({ preview: true, presetEditor: true })
     })
 
     it('opens the popup editor in the field language from the popup editor hotkey', async () => {
