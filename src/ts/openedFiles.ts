@@ -1,4 +1,3 @@
-import { readFile } from '@tauri-apps/plugin-fs'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { alertError } from './alert'
@@ -15,60 +14,31 @@ export const OPENED_FILES_EVENT = 'risu-opened-files'
 /** Desktop command that returns the pending opened files and clears them in the same call. */
 export const OPENED_FILES_TAKE_COMMAND = 'opened_files_take'
 
-export type OpenedFileImporter = (name: string, data: Uint8Array) => Promise<void | 'failed'>
+/** Hands the files of one opening over to the intake, which reports how each of them ended. */
+export type OpenedFilesDelivery = (paths: string[]) => Promise<void>
 
-/** Imports several opened characters or modules in one operation. */
-export interface OpenedContentBatchImporter {
-    accepts(path: string): boolean
-    /** Reports how the batch ended itself. */
-    importBatch(paths: string[]): Promise<void>
-}
-
-let openedPathImporter: ((path: string) => Promise<boolean | 'failed'>) | undefined
-let openedFileImporter: OpenedFileImporter | null = null
-let openedContentBatchImporter: OpenedContentBatchImporter | undefined
+let openedFilesDelivery: OpenedFilesDelivery | null = null
 let domListener: ((event: Event) => void) | null = null
 let queue: Promise<void> = Promise.resolve()
 
 /**
- * Reads and imports every opened file in order. A failing file is reported and skipped so the
- * remaining files still arrive. Two or more characters or modules are imported together after the
- * other files, so a backup in the same delivery is restored first.
+ * Delivers the files of one opening together, after the previous opening was handled. Each file is
+ * settled once the delivery has ended, also when it failed.
  */
 export async function consumeOpenedFiles(files: string[]): Promise<void> {
-    const importer = openedFileImporter
-    if (!importer || !Array.isArray(files)) {
+    const deliver = openedFilesDelivery
+    if (!deliver || !Array.isArray(files)) {
         return
     }
-    const batchImporter = openedContentBatchImporter
     const run = queue.then(async () => {
         const opened = files.filter((file) => typeof file === 'string' && file.length > 0)
-        const content = batchImporter ? opened.filter((file) => batchImporter.accepts(file)) : []
-        const batched = new Set(content.length > 1 ? content : [])
-        for (const file of opened) {
-            if (batched.has(file)) continue
-            try {
-                const nativeResult = await openedPathImporter?.(file)
-                if (nativeResult === 'failed') continue
-                if (!nativeResult) {
-                    const data = await readFile(file)
-                    if (await importer(file, data) === 'failed') continue
-                }
-            } catch (error) {
-                alertError(
-                    `Failed to open the selected file: ${file}\n${error}`,
-                )
-            } finally {
-                await settleOpenedFile(file)
-            }
-        }
-        if (!batchImporter || !batched.size) return
+        if (!opened.length) return
         try {
-            await batchImporter.importBatch([...batched])
+            await deliver(opened)
         } catch (error) {
-            alertError(`Failed to open the selected files: ${[...batched].join(', ')}\n${error}`)
+            alertError(`Failed to open the selected files: ${opened.join(', ')}\n${error}`)
         } finally {
-            for (const file of batched) await settleOpenedFile(file)
+            for (const file of opened) await settleOpenedFile(file)
         }
     })
     queue = run.catch(() => {})
@@ -93,14 +63,8 @@ async function settleOpenedFile(file: string): Promise<void> {
  * Wires every path a file association can take: the Android cold start injection, the Android warm
  * start DOM event, and the desktop launch arguments plus single instance forwarding.
  */
-export function registerOpenedFileListeners(
-    importFile: OpenedFileImporter,
-    importPath?: (path: string) => Promise<boolean | 'failed'>,
-    contentBatch?: OpenedContentBatchImporter,
-): void {
-    openedFileImporter = importFile
-    openedPathImporter = importPath
-    openedContentBatchImporter = contentBatch
+export function registerOpenedFileListeners(deliver: OpenedFilesDelivery): void {
+    openedFilesDelivery = deliver
     if (domListener) {
         return
     }

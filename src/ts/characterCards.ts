@@ -24,7 +24,6 @@ import { open } from "./storage/fileSelection"
 import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_SITE_URL } from "./realmEndpoints"
 import { registerOpenedFileListeners } from "./openedFiles"
 import { type DeviceMarkerStorage } from './storage/deviceMarkers'
-import { importDesktopNativeCharacterPathInOperation } from './storage/nativeCharacterImportOperation'
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import { importContentBatch } from './storage/contentImportBatch'
 import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from './storage/nativeFileJobManager'
@@ -136,7 +135,7 @@ export async function importCharacter() {
                     context,
                     paths,
                     (path) => ({ name: path.split(/[\\/]/).at(-1) || path }),
-                    (path) => importDesktopCharacterPath(path, context),
+                    (path) => importCharacterPathInOperation(path, context),
                 ),
                 { presentation: 'dialog', format: 'content' },
             )
@@ -168,13 +167,21 @@ export async function importCharacter() {
     }
 }
 
-async function importDesktopCharacterPath(path: string, context: SharedNativeFileOperationContext): Promise<string | null> {
+/**
+ * Imports the character file at `path` inside the caller's operation and records where it went.
+ * `displayName` names a copy after the user's own file.
+ */
+export async function importCharacterPathInOperation(
+    path: string,
+    context: SharedNativeFileOperationContext,
+    displayName = path.split(/[\\/]/).at(-1) || path,
+): Promise<string | null> {
     const outcome = await importDesktopNativeCharacterPath(path, {
         readDesktopPath: readFile,
         nativeEnabled: () => nativeCharacterContentImportEnabled,
-        nativeImport: (input) => importPreparedNativeCharacterContent(input, { signal: context.signal, onStatus: context.onStatus }),
-        legacyImport: async ({ name, data }) => {
-            const importedIndex = await importCharacterProcess({ name, data })
+        nativeImport: (input) => importPreparedNativeCharacterContent({ ...input, displayName }, { signal: context.signal, onStatus: context.onStatus }),
+        legacyImport: async ({ data }) => {
+            const importedIndex = await importCharacterProcess({ name: displayName, data })
             return typeof importedIndex === 'number'
                 ? (getDatabase().characters[importedIndex]?.chaId ?? null)
                 : null
@@ -185,40 +192,8 @@ async function importDesktopCharacterPath(path: string, context: SharedNativeFil
     }
     if (outcome.kind !== 'imported') return null
     checkCharOrder()
+    context.setLocation({ kind: 'character', chaId: outcome.value })
     return outcome.value
-}
-
-/** Characters and modules a desktop or iOS file association hands over. */
-function isOpenedContentPath(path: string): boolean {
-    return (isTauriDesktop || isTauriIOS) && /\.(json|png|charx|jpe?g|risum)$/i.test(path)
-}
-
-async function importOpenedContentPaths(paths: string[]): Promise<void> {
-    const callStartedAt = Date.now()
-    try {
-        await runSharedNativeFileOperation(
-            'import',
-            'opened-content',
-            (context) => importContentBatch(
-                context,
-                paths,
-                (path) => ({ name: path.split(/[\\/]/).at(-1) || path }),
-                async (path) => {
-                    if (!/\.risum$/i.test(path)) return importDesktopCharacterPath(path, context)
-                    const { importPreparedNativeModuleContent } = await import('./process/modules')
-                    const result = await importPreparedNativeModuleContent(
-                        { source: { type: 'desktopPath', path }, displayName: path.split(/[\\/]/).at(-1) || path },
-                        { signal: context.signal, onStatus: context.onStatus },
-                    )
-                    return result.kind === 'imported' ? result.value : null
-                },
-            ),
-            { presentation: 'dialog', format: 'content' },
-        )
-    } catch (error) {
-        const { presentFileOperationError } = await import('./storage/fileOperationErrorPresentation')
-        presentFileOperationError('import', error, callStartedAt)
-    }
 }
 
 export async function importCharacterProcess<T extends boolean = false>(f: {
@@ -772,37 +747,11 @@ export async function characterURLImport() {
         })
     }
 
-    registerOpenedFileListeners(importFile, async (path) => {
-        if ((isTauriDesktop || isTauriIOS) && /\.(risunest|risudat|bin)$/i.test(path)) {
-            const { restoreBackupFromNativeSource } = await import('./storage/portableBackupFileRouteProduction.svelte')
-            await restoreBackupFromNativeSource({type:'desktopPath',path})
-            return true
-        }
-        if (!isOpenedContentPath(path)) return false
-        if (/\.risum$/i.test(path)) {
-            const { importPreparedNativeModuleContent } = await import(
-                './process/modules'
-            )
-            await importPreparedNativeModuleContent({
-                source: { type: 'desktopPath', path },
-                displayName: path.split(/[\\/]/).at(-1)!,
-            })
-        } else {
-            let legacyFailed = false
-            const outcome = await importDesktopNativeCharacterPathInOperation(path, {
-                readDesktopPath: readFile,
-                nativeEnabled: () => nativeCharacterContentImportEnabled,
-                nativeImport: importPreparedNativeCharacterContent,
-                legacyImport: async ({ name, data }) => {
-                    const index = await importCharacterProcess({ name, data })
-                    if (typeof index !== 'number' || index < 0) { legacyFailed = true; return null }
-                    return getDatabase().characters[index]?.chaId ?? null
-                },
-            })
-            if (legacyFailed || outcome.kind === 'failed') return 'failed'
-        }
-        return true
-    }, { accepts: isOpenedContentPath, importBatch: importOpenedContentPaths })
+    // Files a file association or share hands over arrive together as one intake delivery.
+    registerOpenedFileListeners(async (paths) => {
+        const { submitImportDelivery } = await import('./importIntake/intake')
+        await submitImportDelivery({ origin: 'opened', sources: paths.map(path => ({ type: 'path', path })) })
+    })
 
     async function importFile(name: string, data: Uint8Array): Promise<void | 'failed'> {
         if (

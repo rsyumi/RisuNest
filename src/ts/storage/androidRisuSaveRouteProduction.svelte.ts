@@ -36,8 +36,50 @@ import {
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 import { createPortableExportIntentStore } from './deviceBackup/job'
+import type { ImportIntakeDelivery, ImportIntakeSource } from '../importIntake/types'
 
 let disposeSpoolListener: (() => void) | undefined
+
+export interface AndroidSpoolBatchRouting {
+    /** Spools that arrive before first setup keep their own handling. */
+    firstSetupDone(): Promise<boolean>
+    loadIntake(): Promise<(delivery: ImportIntakeDelivery) => Promise<void>>
+    /** The handling before first setup. */
+    dispatch(batch: AndroidSpoolBatch): Promise<void>
+}
+
+/**
+ * Hands each opened or shared spool batch to the import intake as one delivery, in arrival order.
+ * A content picker result that outlived its page keeps the destination chosen in the picker.
+ */
+export function createAndroidSpoolBatchRouter(
+    routing: AndroidSpoolBatchRouting,
+): (batch: AndroidSpoolBatch) => Promise<void> {
+    const submittedTokens = new Set<string>()
+    let order = Promise.resolve()
+    return (batch) => {
+        const routed = order.then(async () => {
+            if (!await routing.firstSetupDone()) {
+                void routing.dispatch(batch)
+                return
+            }
+            const submit = await routing.loadIntake()
+            const fresh = batch.ready.filter((source) => !submittedTokens.has(source.token))
+            for (const source of fresh) submittedTokens.add(source.token)
+            const picked = fresh.filter((source) => source.importDestination)
+            if (picked.length) void routing.dispatch({ ...batch, ready: picked, failures: [] })
+            const sources: ImportIntakeSource[] = [
+                ...fresh
+                    .filter((source) => !source.importDestination)
+                    .map((spool) => ({ type: 'androidSpool' as const, spool })),
+                ...batch.failures.map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
+            ]
+            if (sources.length) void submit({ origin: 'opened', sources })
+        })
+        order = routed.catch(() => {})
+        return routed
+    }
+}
 
 export interface AndroidOpenedSpoolDispatchDependencies {
     enqueueRestore(batch: AndroidSpoolBatch): Promise<void>
@@ -335,7 +377,12 @@ export function registerAndroidRisuSaveRoute(): void {
         reportCharacterError: showAndroidFileError,
         reportDestinationRequired: showDestinationRequired,
     })
+    const routeSpoolBatch = createAndroidSpoolBatchRouter({
+        firstSetupDone: async () => (await import('./database.svelte')).getDatabase().didFirstSetup,
+        loadIntake: async () => (await import('../importIntake/intake')).submitImportDelivery,
+        dispatch: dispatcher.enqueue,
+    })
     disposeSpoolListener = listenAndroidSpoolBatches((batch) => {
-        void dispatcher.enqueue(batch)
+        void routeSpoolBatch(batch).catch((error) => showAndroidFileError(error))
     })
 }
