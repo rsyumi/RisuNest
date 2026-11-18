@@ -1979,6 +1979,13 @@ export const languageEnglish = {
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
         presetList: {
+            noMatch: 'No presets match the search.',
+            export: 'Export',
+            import: 'Import',
+            compare: 'Compare',
+            compareHint: 'Select two presets to compare.',
+            inherit: 'Use current preset',
+            chatPreset: 'Current chat',
         },
         promptList: {
         },
