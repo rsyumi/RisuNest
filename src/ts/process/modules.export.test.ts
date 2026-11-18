@@ -86,6 +86,7 @@ import {
 import { alertConfirm, alertError, alertNormal } from '../alert'
 import { StdioModuleImportError } from './mcp/moduleImport'
 import { convertExternalLorebook } from './lorebook.svelte'
+import { decodeRPack } from '../rpack/rpack_js'
 
 describe('legacy module export', () => {
     beforeEach(() => {
@@ -280,6 +281,8 @@ describe('legacy module export', () => {
             id: 'source-module-id',
             name: 'Byte exact module',
             description: 'Legacy asset roundtrip',
+            updateBase: 'asset://base',
+            updateLineage: 'author-module',
             assets: [
                 ['ordinary-asset-a', 'asset://source-a', 'bin', 'first-tail', { rank: 1 }],
                 ['ordinary-asset-b', 'asset://source-b', 'dat', 'second-tail', { rank: 2 }],
@@ -287,7 +290,12 @@ describe('legacy module export', () => {
         }
 
         const exported = await exportModuleLegacy(module, { alertEnd: false, saveData: false })
-        const imported = await readModule(Buffer.from(exported))
+        const file = Buffer.from(exported)
+        const main = JSON.parse(new TextDecoder().decode(await decodeRPack(file.subarray(6, 6 + file.readUInt32LE(2)))))
+        expect(main.module).not.toHaveProperty('updateBase')
+        expect(module.updateBase).toBe('asset://base')
+        const imported = await readModule(file)
+        expect(imported.updateLineage).toBe('author-module')
 
         expect(mocks.readImage.mock.calls.map(([source]) => source)).toEqual([
             'asset://source-a',

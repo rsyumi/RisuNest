@@ -65,7 +65,7 @@ async function editSecondModule() {
     instance = mount(ModuleSettings, { target: document.body })
     await tick()
     const row = [...document.querySelectorAll('span')].find(span => span.textContent === 'Second')!.parentElement!
-    row.querySelectorAll<HTMLButtonElement>('button')[2].click()
+    row.querySelectorAll<HTMLButtonElement>('button')[3].click()
     await tick()
 }
 
@@ -130,7 +130,7 @@ it('does not remove the last module when a pending deletion target has already d
     instance = mount(ModuleSettings, { target: document.body })
     await tick()
     const row = [...document.querySelectorAll('span')].find(span => span.textContent === 'First')!.parentElement!
-    row.querySelectorAll<HTMLButtonElement>('button')[3].click()
+    row.querySelectorAll<HTMLButtonElement>('button')[4].click()
     DBState.db.modules.splice(0, 1)
     await tick()
     confirm(true)
@@ -147,7 +147,7 @@ it('deletes the assets of a removed module once the removal is saved', async () 
     instance = mount(ModuleSettings, { target: document.body })
     await tick()
     const row = [...document.querySelectorAll('span')].find(span => span.textContent === 'First')!.parentElement!
-    row.querySelectorAll<HTMLButtonElement>('button')[3].click()
+    row.querySelectorAll<HTMLButtonElement>('button')[4].click()
     await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases', {
         expectedRevision: 1, owner: { keys: ['assets/first-map.png'], startedAtMs: expect.any(Number) },
     }))

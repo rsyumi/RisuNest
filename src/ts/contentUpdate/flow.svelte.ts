@@ -1,0 +1,524 @@
+// Adapted from RisuBard (https://github.com/rpaddict/RisuBard, src/ts/characterUpdateFlow.svelte.ts), GPL-3.0.
+
+import { language } from 'src/lang'
+import { alertClear, alertError } from '../alert'
+import { loadAsset, saveAsset } from '../globalApi.svelte'
+import { DBState } from '../stores.svelte'
+import type { character } from '../storage/database.svelte'
+import type { RisuModule } from '../process/modules'
+import type { CharacterDetail } from '../storage/persistentDataStore'
+import { isConversationStreaming } from '../storage/streamingConversationRegistry'
+import {
+    getCatalogConversationCount,
+    isArchivedCharacter,
+    isCatalogCharacterStub,
+    isWorkingSetCharacterStub,
+    patchWorkingSetCharacterDetail,
+} from '../storage/workingSetCatalog'
+import {
+    mutateCharacterDetailFields,
+    mutatePersistentCharacterDetail,
+    readPersistentCharacterDetail,
+} from '../storage/persistentDataRuntime.svelte'
+import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from '../storage/characterOrderMutation'
+import { editableText, editedValue, isEditable, loreFolderNames } from './view'
+import {
+    CHARACTER_UPDATE,
+    MODULE_UPDATE,
+    UPDATE_BASE_EXTENSION_KEY,
+    applyUpdate,
+    baseSnapshot,
+    findCharacterUpdateCandidates,
+    findModuleUpdateCandidates,
+    isInstalledModule,
+    planUpdate,
+    unresolvedItems,
+    type UpdateCandidate,
+    type UpdateChoice,
+    type UpdatePlan,
+    type UpdateSide,
+    type UpdateSpec,
+} from './merge'
+
+export type UpdateKind = 'character' | 'module'
+
+export interface ContentUpdateCandidate extends UpdateCandidate {
+    creator?: string
+}
+
+export interface ContentUpdateRequest {
+    kind: UpdateKind
+    incomingName: string
+    candidates: ContentUpdateCandidate[]
+    /** Every other installed entity, for choosing one the matcher did not find. */
+    others: { id: string, name: string }[]
+}
+
+type Decision = { kind: 'new' } | { kind: 'cancel' } | { kind: 'update', id: string, plan: UpdatePlan, choices: Record<string, UpdateChoice> }
+
+/** A side, or 'edit' for the text the user wrote (kept in edits). */
+export type UpdatePick = UpdateSide | 'edit'
+
+/** What differs between updating a character and updating a module. */
+interface Entity<T extends object> {
+    kind: UpdateKind
+    spec: UpdateSpec
+    /** The installed entity as stored, or null when it is gone. */
+    read(id: string): Promise<T | null>
+    name(value: T): string
+    baseKey(value: T): string | undefined
+    /** Format upgrades the app applies on its own, so they do not read as the user's edits. */
+    normalize<P extends Partial<T>>(value: P): Promise<P>
+    /** Busy right now: updating would race a running request. */
+    busy(id: string): boolean
+}
+
+function residentCharacter(id: string): character | undefined {
+    return DBState.db.characters.find((value) => value?.chaId === id) as character | undefined
+}
+
+/** Characters an update can target: no groups, trash, archived or app-owned characters. */
+function updatableCharacters(excludeId: string) {
+    const out: { id: string, name: string, count: number }[] = []
+    for (const value of DBState.db.characters) {
+        if (!value?.chaId || value.chaId === excludeId || value.chaId.startsWith('§')) continue
+        if ((value.type as string) === 'group' || value.trashTime || isArchivedCharacter(value)) continue
+        out.push({ id: value.chaId, name: value.name ?? '', count: getCatalogConversationCount(value) })
+    }
+    return out
+}
+
+const characters: Entity<CharacterDetail> = {
+    kind: 'character',
+    spec: CHARACTER_UPDATE,
+    read: async (id) => {
+        const stored = await readPersistentCharacterDetail(id, 'content-update-read')
+        return stored ? structuredClone(stored) : null
+    },
+    name: (value) => value.name ?? '',
+    baseKey: (value) => {
+        const key = value.extentions?.[UPDATE_BASE_EXTENSION_KEY]
+        return typeof key === 'string' ? key : undefined
+    },
+    normalize: async (value) => {
+        // The upgrades opening a character applies (lorebook version, inlay screen defaults).
+        const [{ updateLorebooks }, { updateInlayScreen }] = await Promise.all([import('../characters'), import('../process/inlayScreen')])
+        if (Array.isArray(value.globalLore)) value.globalLore = updateLorebooks(value.globalLore)
+        if (!value.newGenData && value.viewScreen) updateInlayScreen(value as unknown as character)
+        return value
+    },
+    busy: (id) => {
+        const value = residentCharacter(id)
+        if (!value || isWorkingSetCharacterStub(value)) return false
+        return (value.chats ?? []).some((chat) => chat?.id && isConversationStreaming(chat.id))
+    },
+}
+
+const modules: Entity<RisuModule> = {
+    kind: 'module',
+    spec: MODULE_UPDATE,
+    read: async (id) => {
+        const value = (DBState.db.modules ?? []).find((module) => module?.id === id)
+        return value ? structuredClone($state.snapshot(value)) as RisuModule : null
+    },
+    name: (value) => value.name ?? '',
+    baseKey: (value) => value.updateBase,
+    normalize: async (value) => {
+        const { updateLorebooks } = await import('../characters')
+        if (Array.isArray(value.lorebook)) value.lorebook = updateLorebooks(value.lorebook)
+        return value
+    },
+    busy: () => false,
+}
+
+class ContentUpdateDialogState {
+    request = $state.raw<ContentUpdateRequest | null>(null)
+    step = $state<'choose' | 'review'>('choose')
+    target = $state('')
+    targetName = $state('')
+    plan = $state.raw<UpdatePlan | null>(null)
+    choices = $state<Record<string, UpdatePick>>({})
+    /** Text the user wrote for items picked as 'edit'. */
+    edits = $state<Record<string, string>>({})
+    /** Lore folder id to title, for grouping entries. */
+    folders = $state.raw<Map<string, string>>(new Map())
+    /** Where the base came from: the install record, an earlier file, or nowhere. */
+    baseSource = $state<{ kind: 'record' | 'file' | 'none', name?: string }>({ kind: 'none' })
+    showAll = $state(false)
+    /** The target is generating a response: updating now would race it. */
+    targetBusy = $state(false)
+    busy = $state(false)
+    error = $state('')
+}
+
+/** State of the "update an installed character or module?" dialog shown while importing. */
+export const contentUpdateDialog = new ContentUpdateDialogState()
+
+let pending: { entity: Entity<any>, incoming: object, resolve: (decision: Decision) => void } | null = null
+
+function finish(decision: Decision) {
+    const current = pending
+    pending = null
+    contentUpdateDialog.request = null
+    contentUpdateDialog.plan = null
+    contentUpdateDialog.choices = {}
+    contentUpdateDialog.edits = {}
+    current?.resolve(decision)
+}
+
+async function loadUpdateBase<T extends object>(entity: Entity<T>, key: string | undefined): Promise<Partial<T> | null> {
+    if (!key) return null
+    try {
+        const data = await loadAsset(key)
+        if (!data) return null
+        const base = JSON.parse(new TextDecoder().decode(data))
+        return base && typeof base === 'object' && !Array.isArray(base) ? await entity.normalize(base) : null
+    } catch (error) {
+        // A base that did not reach this device compares as no base.
+        console.warn('Update base could not be read', error)
+        return null
+    }
+}
+
+async function saveUpdateBase<T extends object>(spec: UpdateSpec, value: T): Promise<string> {
+    try {
+        const data = new TextEncoder().encode(JSON.stringify(baseSnapshot(spec, value)))
+        return await saveAsset(data, '', 'base.json')
+    } catch (error) {
+        console.warn('Update base could not be saved', error)
+        return ''
+    }
+}
+
+export function selectContentUpdateTarget(id: string) {
+    if (contentUpdateDialog.busy) return
+    contentUpdateDialog.target = id
+}
+
+/** Compares the chosen entity with the import and opens the review step. */
+export async function reviewContentUpdate() {
+    const dialog = contentUpdateDialog
+    if (!pending || dialog.busy) return
+    const { entity, incoming } = pending
+    const target = dialog.target
+    dialog.busy = true
+    dialog.error = ''
+    try {
+        const value = await entity.read(target)
+        if (!value) throw new Error(language.errors.noData)
+        const base = await loadUpdateBase(entity, entity.baseKey(value))
+        const mine = await entity.normalize(value)
+        if (!pending || dialog.target !== target) return
+        dialog.plan = planUpdate(entity.spec, mine, incoming, base)
+        dialog.baseSource = { kind: base ? 'record' : 'none' }
+        dialog.folders = loreFolderNames((mine as any).globalLore ?? (mine as any).lorebook, (incoming as any).globalLore ?? (incoming as any).lorebook)
+        dialog.choices = {}
+        dialog.edits = {}
+        dialog.showAll = false
+        dialog.targetName = entity.name(mine)
+        dialog.targetBusy = entity.busy(target)
+        dialog.step = 'review'
+    } catch (error) {
+        dialog.error = error instanceof Error ? error.message : String(error)
+    } finally {
+        dialog.busy = false
+    }
+}
+
+export function backToContentUpdateTargets() {
+    if (contentUpdateDialog.busy) return
+    contentUpdateDialog.step = 'choose'
+    contentUpdateDialog.plan = null
+    contentUpdateDialog.error = ''
+}
+
+export function setContentUpdateChoice(id: string, pick: UpdatePick) {
+    const dialog = contentUpdateDialog
+    if (pick === 'edit' && dialog.edits[id] === undefined) {
+        // Start from the user's version: usually the one they already rewrote.
+        const item = dialog.plan?.items.find((entry) => entry.id === id)
+        if (!item || !isEditable(item)) return
+        dialog.edits = { ...dialog.edits, [id]: editableText(item, 'mine') }
+    }
+    dialog.choices = { ...dialog.choices, [id]: pick }
+}
+
+export function setContentUpdateEdit(id: string, text: string) {
+    contentUpdateDialog.edits = { ...contentUpdateDialog.edits, [id]: text }
+}
+
+/**
+ * Gives the listed items the same side, for a section or a search result.
+ * Items the user rewrote keep their text.
+ */
+export function chooseContentUpdateMany(ids: string[], side: UpdateSide) {
+    const next = { ...contentUpdateDialog.choices }
+    for (const id of ids) if (next[id] !== 'edit') next[id] = side
+    contentUpdateDialog.choices = next
+}
+
+/**
+ * Uses an earlier file of this character or module as the base, for an install
+ * that has no record of the version it came from. Fields the file does not
+ * carry count as unchanged by the user.
+ */
+export async function loadContentUpdateBaseFile() {
+    const dialog = contentUpdateDialog
+    if (!pending || dialog.busy) return
+    const { selectSingleFile } = await import('../util')
+    const file = await selectSingleFile(['charx', 'png', 'json', 'risum', 'jpg', 'jpeg'])
+    if (!file || !pending) return
+    const { entity, incoming } = pending
+    const target = dialog.target
+    dialog.busy = true
+    dialog.error = ''
+    try {
+        const value = await entity.read(target)
+        if (!value) throw new Error(language.errors.noData)
+        const mine = await entity.normalize(value)
+        // The card readers load only when a file is chosen.
+        const { readUpdateBaseFile } = await import('./baseFile')
+        const parsed = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
+        const base = { ...baseSnapshot(entity.spec, mine), ...parsed }
+        const plan = planUpdate(entity.spec, mine, incoming, base)
+        const ids = new Set(plan.items.map((item) => item.id))
+        dialog.plan = plan
+        dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id]) => ids.has(id)))
+        dialog.baseSource = { kind: 'file', name: file.name }
+    } catch (error) {
+        const unsupported = await import('./baseFile').then(
+            ({ UnsupportedUpdateBaseFileError }) => error instanceof UnsupportedUpdateBaseFileError,
+            () => false,
+        )
+        const text = language.risuNest.contentUpdate
+        dialog.error = unsupported
+            ? text.baseFileUnsupported
+            : `${text.baseFileFailed} ${error instanceof Error ? error.message : String(error)}`
+    } finally {
+        dialog.busy = false
+    }
+}
+
+export function chooseContentUpdate(kind: 'new' | 'cancel' | 'update') {
+    const dialog = contentUpdateDialog
+    if (!pending || dialog.busy) return
+    if (kind !== 'update') return finish({ kind })
+    const plan = dialog.plan
+    if (!plan) return
+    if (pending.entity.busy(dialog.target)) {
+        dialog.targetBusy = true
+        return
+    }
+    const picks = $state.snapshot(dialog.choices)
+    if (unresolvedItems(plan).some((item) => !picks[item.id])) return
+    const choices: Record<string, UpdateChoice> = {}
+    for (const item of plan.items) {
+        const pick = picks[item.id]
+        if (pick === 'edit') choices[item.id] = { value: editedValue(item, dialog.edits[item.id] ?? editableText(item, 'mine')) }
+        else if (pick) choices[item.id] = pick
+    }
+    finish({ kind: 'update', id: dialog.target, plan, choices })
+}
+
+async function withCreators(candidates: UpdateCandidate[]): Promise<ContentUpdateCandidate[]> {
+    return Promise.all(candidates.slice(0, 20).map(async (candidate) => {
+        try {
+            const detail = await readPersistentCharacterDetail(candidate.id, 'content-update-candidates')
+            return detail?.creator ? { ...candidate, creator: detail.creator } : candidate
+        } catch {
+            return candidate
+        }
+    }))
+}
+
+function ask<T extends object>(
+    entity: Entity<T>,
+    incoming: T,
+    candidates: ContentUpdateCandidate[],
+    others: { id: string, name: string }[],
+    forcedId: string | null,
+): Promise<Decision> {
+    if (pending) finish({ kind: 'cancel' })
+    alertClear()
+    const listed = new Set(candidates.map((candidate) => candidate.id))
+    const dialog = contentUpdateDialog
+    dialog.step = 'choose'
+    dialog.target = forcedId ?? candidates[0]?.id ?? ''
+    dialog.plan = null
+    dialog.choices = {}
+    dialog.edits = {}
+    dialog.showAll = false
+    dialog.targetBusy = false
+    dialog.busy = false
+    dialog.error = ''
+    dialog.request = {
+        kind: entity.kind,
+        incomingName: entity.name(incoming),
+        candidates,
+        others: others.filter((other) => !listed.has(other.id)).sort((a, b) => a.name.localeCompare(b.name)),
+    }
+    const decision = new Promise<Decision>((resolve) => { pending = { entity, incoming, resolve } })
+    // The update action names its target, so the review opens right away.
+    if (forcedId) void reviewContentUpdate()
+    return decision
+}
+
+let forcedTarget: { kind: UpdateKind, id: string } | null = null
+
+/**
+ * Runs an import whose first character or module updates the named one
+ * instead of being matched by name. Imports after the first match as usual.
+ */
+export async function importAsContentUpdate<R>(kind: UpdateKind, id: string, run: () => Promise<R>): Promise<R> {
+    forcedTarget = { kind, id }
+    try {
+        return await run()
+    } finally {
+        forcedTarget = null
+    }
+}
+
+function takeForcedTarget(kind: UpdateKind): string | null {
+    if (forcedTarget?.kind !== kind) return null
+    const id = forcedTarget.id
+    forcedTarget = null
+    return id
+}
+
+function replaceDetailFields(target: Record<string, unknown>, source: Record<string, unknown>, fixed: ReadonlySet<string>) {
+    for (const key of Object.keys(target)) {
+        if (!fixed.has(key) && !Object.hasOwn(source, key)) delete target[key]
+    }
+    for (const [key, value] of Object.entries(source)) {
+        if (!fixed.has(key) && value !== undefined) target[key] = structuredClone(value)
+    }
+}
+
+const characterIdentity = new Set(['chaId', 'chats', 'chatFolders'])
+
+/**
+ * Turns the just-imported character into the trashed copy of the installed
+ * one as it was, then writes the merged version to the installed one. The copy
+ * goes first so that a failure in between never loses the user's version.
+ */
+async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: character, baseKey: string): Promise<string> {
+    const targetId = decision.id
+    const stored = await characters.read(targetId)
+    if (!stored) throw new Error(language.errors.noData)
+    const previous = structuredClone(stored)
+    const merged = applyUpdate(CHARACTER_UPDATE, await characters.normalize(stored), incoming as CharacterDetail, decision.plan, decision.choices)
+    merged.extentions = { ...(merged.extentions ?? {}) }
+    if (baseKey) merged.extentions[UPDATE_BASE_EXTENSION_KEY] = baseKey
+    else delete merged.extentions[UPDATE_BASE_EXTENSION_KEY]
+
+    const text = language.risuNest.contentUpdate
+    const backedUp = await mutatePersistentCharacterDetail(incoming.chaId, 'content-update-backup', ({ root, character }) => {
+        replaceDetailFields(character as unknown as Record<string, unknown>, previous as unknown as Record<string, unknown>, characterIdentity)
+        character.name = `${previous.name ?? ''} ${text.backupSuffix}`.trim()
+        // The copy holds one empty chat, so it opens on that one.
+        character.chatPage = 0
+        if (character.extentions) delete character.extentions[UPDATE_BASE_EXTENSION_KEY]
+        removeCharacterIdFromOrder(root, incoming.chaId)
+        character.trashTime = Date.now()
+    })
+    if (!backedUp) throw new Error(language.errors.noData)
+    const updated = await mutateCharacterDetailFields(targetId, 'content-update', ({ character }) => {
+        replaceDetailFields(character as unknown as Record<string, unknown>, merged as unknown as Record<string, unknown>, characterIdentity)
+    })
+    if (!updated) {
+        // The installed character went away meanwhile: the import stays a new character.
+        await mutatePersistentCharacterDetail(incoming.chaId, 'content-update-restore', ({ root, character }) => {
+            replaceDetailFields(character as unknown as Record<string, unknown>, incoming as unknown as Record<string, unknown>, characterIdentity)
+            appendCharacterIdToOrder(root, incoming.chaId)
+        })
+        throw new Error(language.errors.noData)
+    }
+    const live = residentCharacter(targetId)
+    if (live && isCatalogCharacterStub(live)) patchWorkingSetCharacterDetail(live, merged)
+    return targetId
+}
+
+/**
+ * Before an imported character commits: offers to update an installed
+ * character it looks like a new version of. `commit` stores the import as a
+ * new character. Returns the id the import ended as (the updated character
+ * when the user chose to update), or null when the user cancelled the import.
+ */
+export async function commitImportedCharacter(incoming: character, commit: (value: character) => Promise<unknown>): Promise<string | null> {
+    const forcedId = takeForcedTarget('character')
+    const installed = updatableCharacters(incoming.chaId)
+    const target = forcedId && installed.some((entry) => entry.id === forcedId) ? forcedId : null
+    const candidates = target ? [] : findCharacterUpdateCandidates(installed, incoming.name ?? '')
+    const baseKey = await saveUpdateBase(CHARACTER_UPDATE, incoming)
+    let decision: Decision = { kind: 'new' }
+    if (target || candidates.length) {
+        await characters.normalize(incoming)
+        const listed = target ? installed.filter((entry) => entry.id === target).map((entry) => ({ ...entry, reason: 'name' as const })) : candidates
+        decision = await ask(characters, incoming as CharacterDetail, await withCreators(listed), installed, target)
+        if (decision.kind === 'cancel') return null
+    }
+    if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
+    await commit(incoming)
+    if (decision.kind !== 'update') return incoming.chaId
+    try {
+        return await foldCharacterUpdate(decision, incoming, baseKey)
+    } catch (error) {
+        console.error(error)
+        alertError(`${language.risuNest.contentUpdate.failed}\n${error instanceof Error ? error.message : String(error)}`)
+        return incoming.chaId
+    }
+}
+
+/** Replaces the installed module with the merged one and removes the just-imported module. */
+async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: RisuModule, baseKey: string, stored: RisuModule): Promise<string> {
+    const list = DBState.db.modules
+    const merged = applyUpdate(MODULE_UPDATE, await modules.normalize(stored), incoming, decision.plan, decision.choices)
+    if (baseKey) merged.updateBase = baseKey
+    else delete merged.updateBase
+    const index = list.findIndex((module) => module?.id === decision.id)
+    if (index < 0) throw new Error(language.errors.noData)
+    list[index] = merged
+    const imported = list.findIndex((module) => module?.id === incoming.id)
+    if (imported >= 0) list.splice(imported, 1)
+    return decision.id
+}
+
+/**
+ * Before an imported module is added: offers to update an installed module
+ * instead. The installed module keeps its id, so the characters, chats and
+ * enabled list that point to it keep working. `commit` adds the import as a
+ * new module. Returns the id the import ended as, or null when cancelled.
+ */
+export async function commitImportedModule(incoming: RisuModule, commit: (value: RisuModule) => Promise<unknown>): Promise<string | null> {
+    const forcedId = takeForcedTarget('module')
+    const installed = (DBState.db.modules ?? []).filter((module) => isInstalledModule(module) && module.id !== incoming.id)
+    const forced = forcedId ? installed.find((module) => module.id === forcedId) : undefined
+    const candidates = forced ? [] : findModuleUpdateCandidates(installed, incoming)
+    delete incoming.updateBase
+    const baseKey = await saveUpdateBase(MODULE_UPDATE, incoming)
+    let decision: Decision = { kind: 'new' }
+    if (forced || candidates.length) {
+        await modules.normalize(incoming)
+        const listed: ContentUpdateCandidate[] = forced
+            ? [{ id: forced.id, name: forced.name ?? '', reason: 'name', count: forced.lorebook?.length ?? 0 }]
+            : candidates
+        decision = await ask(modules, incoming, listed, installed.map((module) => ({ id: module.id, name: module.name ?? '' })), forced?.id ?? null)
+        if (decision.kind === 'cancel') return null
+    }
+    if (baseKey) incoming.updateBase = baseKey
+    if (decision.kind !== 'update') {
+        await commit(incoming)
+        return incoming.id
+    }
+    // Read before the import commits: a module the user removed meanwhile installs the import as new.
+    const stored = await modules.read(decision.id)
+    await commit(incoming)
+    if (!stored) return incoming.id
+    try {
+        return await foldModuleUpdate(decision, incoming, baseKey, stored)
+    } catch (error) {
+        console.error(error)
+        alertError(`${language.risuNest.contentUpdate.failed}\n${error instanceof Error ? error.message : String(error)}`)
+        return incoming.id
+    }
+}

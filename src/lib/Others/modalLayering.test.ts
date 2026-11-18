@@ -12,6 +12,7 @@ const onboardingModal = readFileSync('src/lib/Others/OnboardingModal.svelte', 'u
 const nativeFileJobDialog = readFileSync('src/lib/Others/NativeFileJobDialog.svelte', 'utf8')
 const persistentWorkingSetRecovery = readFileSync('src/lib/Others/PersistentWorkingSetRecovery.svelte', 'utf8')
 const updatePopup = readFileSync('src/lib/Others/UpdatePopup.svelte', 'utf8')
+const contentUpdateDialog = readFileSync('src/lib/Others/ContentUpdateDialog.svelte', 'utf8')
 const popupEditor = readFileSync('src/lib/Others/PopupEditor.svelte', 'utf8')
 const textEditorPopup = readFileSync('src/lib/Others/TextEditorPopup.svelte', 'utf8')
 const promptDiffModal = readFileSync('src/lib/Others/PromptDiffModal.svelte', 'utf8')
@@ -77,6 +78,7 @@ const workDialogSources: Record<string, string> = {
 const coveringDialogSources: Record<string, string> = {
     'UpdatePopup.svelte': updatePopup,
     'PersistentWorkingSetRecovery.svelte': persistentWorkingSetRecovery,
+    'ContentUpdateDialog.svelte': contentUpdateDialog,
 }
 
 // Vitest serves CSS modules as empty strings, so read the stylesheet from disk.
@@ -149,6 +151,10 @@ describe('modal layering', () => {
         expect(styles).toMatch(/@utility z-work-dialog-recovery \{\s*z-index: 1100;\s*\}/)
         expect(count(updatePopup, 'z-work-dialog-update')).toBe(1)
         expect(count(persistentWorkingSetRecovery, 'z-work-dialog-recovery')).toBe(1)
+        expect(count(contentUpdateDialog, 'z-work-dialog-content-update')).toBe(1)
+        const contentUpdateLayer = utilityZIndex('z-work-dialog-content-update')
+        expect(contentUpdateLayer).toBeGreaterThan(1000)
+        expect(contentUpdateLayer).toBeLessThan(utilityZIndex('z-work-dialog-recovery'))
         for (const [name, source] of Object.entries(coveringDialogSources)) {
             expect(/z-\[\d+\]/.test(source), `${name} still writes its z-index out`).toBe(false)
             expect(count(source, 'z-modal'), name).toBe(0)

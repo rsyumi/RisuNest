@@ -5,7 +5,7 @@
     import Button from "src/lib/UI/GUI/Button.svelte";
     import ModuleMenu from "src/lib/Setting/Pages/Module/ModuleMenu.svelte";
     import { exportModule, exportModuleLegacy, importModule, type RisuModule } from "src/ts/process/modules";
-    import { SquarePen, TrashIcon, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints, UserIcon } from "@lucide/svelte";
+    import { SquarePen, TrashIcon, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints, UserIcon, RefreshCwIcon } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { tooltip } from "src/ts/gui/tooltip";
     import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
@@ -104,6 +104,13 @@
                                     }
                                 }}>
                                     <Share2Icon size={18}/>
+                                </button>
+                                <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer" use:tooltip={language.risuNest.contentUpdate.updateAction} aria-label={language.risuNest.contentUpdate.updateAction} onclick={async (e) => {
+                                    e.stopPropagation()
+                                    const { importAsContentUpdate } = await import('src/ts/contentUpdate/flow.svelte')
+                                    await importAsContentUpdate('module', rmodule.id, () => importModule())
+                                }}>
+                                    <RefreshCwIcon size={18}/>
                                 </button>
                                 <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer" use:tooltip={language.edit} onclick={async (e) => {
                                     e.stopPropagation()

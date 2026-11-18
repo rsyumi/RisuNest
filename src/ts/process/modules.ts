@@ -22,6 +22,7 @@ import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } f
 import { assertModuleMCPImportAllowed, StdioModuleImportError } from './mcp/moduleImport'
 import { selectConversationModules } from './moduleSelection'
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
+import { markModuleImport } from '../contentUpdate/merge'
 
 export interface MCPModule{
     url: string
@@ -43,6 +44,10 @@ export interface RisuModule{
     customModuleToggle?:string
     mcp?:MCPModule
     icon?:string
+    /** Asset key of the module as last installed from a file, compared on the next update. */
+    updateBase?:string
+    /** Id the module had in the file it was installed from, so a later version finds it. */
+    updateLineage?:string
 }
 
 export async function importPreparedNativeModuleContent(
@@ -142,6 +147,8 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
 
     const assets = module.assets ?? []
     module = safeStructuredClone(module)
+    // The update base is an asset key of this device; it means nothing in the file.
+    delete module.updateBase
     module.assets ??= []
     module.assets = module.assets.map((asset) => {
         const retained = safeStructuredClone(asset)
@@ -315,9 +322,19 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
         alertClear()
     }
 
+    markModuleImport(module)
     module.id = v4()
     delete module.mcp
     return module
+}
+
+/** Adds an imported module, or updates the installed one it is a new version of when the user chooses that. */
+async function commitImportedModuleData(module: RisuModule): Promise<boolean> {
+    const { commitImportedModule } = await import('../contentUpdate/flow.svelte')
+    const id = await commitImportedModule(module, async (value) => {
+        DBState.db.modules.push(value)
+    })
+    return id !== null
 }
 
 export async function importModule() {
@@ -405,7 +422,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 return false
             }
             const module = convertCharacterToModule(char)
-            DBState.db.modules.push(module)
+            if (!await commitImportedModuleData(module)) return false
         } catch (error) {
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
@@ -418,8 +435,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
         try {
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
-            DBState.db.modules.push(module)
-            return true
+            return await commitImportedModuleData(module)
         } catch (error) {
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
@@ -434,6 +450,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 alertError(language.errors.noData)
                 return false
             }
+            markModuleImport(importData)
             importData.id = v4()
             delete importData.mcp
 
@@ -443,8 +460,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                     return false
                 }
             }
-            DBState.db.modules.push(importData)
-            return true
+            return await commitImportedModuleData(importData)
         }
         // importData.type === 'risu' in conflict with HypaV3 preset exports
         // difference: record vs. array

@@ -276,6 +276,8 @@ fn write_projected_risum(
     let object = module
         .as_object_mut()
         .ok_or_else(|| invalid_input("pinned root module must be an object"))?;
+    // The update base is an asset key of this device; it means nothing in the file.
+    object.remove("updateBase");
     let assets = object
         .get_mut("assets")
         .map(|value| {
@@ -680,7 +682,7 @@ mod tests {
             .unwrap();
         let root = json!({"modules": [
             {"name": "wrong", "id": "module-0"},
-            {"name": "selected", "id": "module-1", "assets": [
+            {"name": "selected", "id": "module-1", "updateBase": "assets/base.json", "updateLineage": "author-module", "assets": [
                 ["first", shared.key, "BIN", {"tail": 1}],
                 ["second", shared.key, "bin", null],
                 ["empty", empty.key, "bin", "tail"]
@@ -740,6 +742,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.metadata["module"]["name"], "selected");
+        assert!(parsed.metadata["module"].get("updateBase").is_none());
+        assert_eq!(parsed.metadata["module"]["updateLineage"], "author-module");
         assert_eq!(
             parsed.metadata["module"]["assets"][0][3],
             json!({"tail": 1})

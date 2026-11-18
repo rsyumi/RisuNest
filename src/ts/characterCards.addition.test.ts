@@ -180,6 +180,7 @@ import {
 } from './storage/nativeFileJobManager'
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
+import { UPDATE_BASE_EXTENSION_KEY } from './contentUpdate/merge'
 
 describe('character card additions', () => {
     beforeEach(() => {
@@ -275,6 +276,23 @@ describe('character card additions', () => {
         const second = mocks.commitDetachedCharacter.mock.calls.at(-1)?.[0]
         expect(first).toBeDefined()
         expect(second).toEqual(first)
+    })
+
+    it('does not install a declined V2 JSON card through the old-format reader', async () => {
+        const card = {
+            spec: 'chara_card_v2', spec_version: '2.0',
+            name: 'Synthetic', description: 'Description', first_mes: 'Hello',
+            data: {
+                name: 'Synthetic', description: 'Description', first_mes: 'Hello',
+                personality: '', scenario: '', mes_example: '', creator_notes: '',
+                system_prompt: '', post_history_instructions: '', alternate_greetings: [],
+                tags: [], creator: '', character_version: '', extensions: { risuai: { lowLevelAccess: true } },
+            },
+        }
+        mocks.alertConfirm.mockResolvedValue(false)
+        await importCharacterProcess({ name: 'synthetic.json', data: new TextEncoder().encode(JSON.stringify(card)) })
+        expect(mocks.alertConfirm).toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
     })
 
     it('preserves browser malformed-byte replacement in JSON cards', async () => {
@@ -1052,6 +1070,13 @@ describe('character card additions', () => {
         })
         expect(String(failure)).toContain('404')
         expect(mocks.downloads).toHaveLength(2)
+    })
+
+    it.each(['v2', 'v3'] as const)('leaves the update record of the installed character out of a %s card', async (spec) => {
+        await exportCharacterCard(plainCharacter({ extentions: { color: 'red', [UPDATE_BASE_EXTENSION_KEY]: 'assets/base.json' } }), 'json', { spec })
+        const card = exportedJson(0)
+        expect(card.data.extensions.color).toBe('red')
+        expect(card.data.extensions).not.toHaveProperty(UPDATE_BASE_EXTENSION_KEY)
     })
 
     it('carries the onboarding through a V3 card export and import', async () => {

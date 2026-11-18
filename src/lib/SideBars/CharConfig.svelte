@@ -20,7 +20,7 @@
     import BarIcon from "./BarIcon.svelte";
     import { selectMultipleFile, selectSingleFile } from "../../ts/util";
     import Help from "../Others/Help.svelte";
-    import { exportChar } from "src/ts/characterCards";
+    import { exportChar, importCharacter } from "src/ts/characterCards";
     import { getElevenTTSVoices, getWebSpeechTTSVoices, getVOICEVOXVoices, oaiVoices, getNovelAIVoices } from "src/ts/process/tts";
     import { getFileSrc, saveAsset } from "src/ts/globalApi.svelte";
 
@@ -671,6 +671,12 @@
             const res = await exportChar($selectedCharID)
         }} className="mt-2">{language.exportCharacter}</Button>
     {/if}
+
+    <Button size="sm" onclick={async () => {
+        const characterId = DBState.db.characters[$selectedCharID].chaId
+        const { importAsContentUpdate } = await import('src/ts/contentUpdate/flow.svelte')
+        await importAsContentUpdate('character', characterId, () => importCharacter())
+    }} className="mt-2">{language.risuNest.contentUpdate.updateAction}</Button>
 
     {#if archiveIsAvailable()}
         <Button onclick={async () => {

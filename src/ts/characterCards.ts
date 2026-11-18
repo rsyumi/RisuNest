@@ -40,6 +40,7 @@ import { presentContentExportError } from './storage/fileOperationErrorPresentat
 import { beginMobileBackgroundTask, type MobileBackgroundTask } from './mobileBackgroundTask'
 import { filterBlockedRealmCards, isRealmCreatorBlocked } from './realmBlocking'
 import { normalizeOnboarding } from './onboarding'
+import { UPDATE_BASE_EXTENSION_KEY } from './contentUpdate/merge'
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -266,15 +267,17 @@ export async function importCharacterProcess<T extends boolean = false>(f: {
                 (character) => character.chaId === importedId,
             ) as any
         }
+        // A declined card must not fall through to the old-format reader below.
+        if (da?.spec === 'chara_card_v2' || da?.spec === 'chara_card_v3') {
+            return null
+        }
         if (
             (da.char_name || da.name) &&
             (da.char_persona || da.description) &&
             (da.char_greeting || da.first_mes)
         ) {
-            const importedId = await commitDetachedCharacter(
-                convertOffSpecCards(da),
-                'import-character-card',
-            )
+            const importedId = await commitImportedCharacterCard(convertOffSpecCards(da))
+            if (!importedId) return null
             alertNormal(language.importedCharacter)
             return getDatabase().characters.findIndex(
                 (character) => character.chaId === importedId,
@@ -571,10 +574,10 @@ export async function importCharacterProcess<T extends boolean = false>(f: {
     if (parsed.spec !== 'chara_card_v2' && parsed.spec !== 'chara_card_v3') {
         const charaData: OldTavernChar = parsed
         const imgp = await saveAsset(img)
-        const importedId = await commitDetachedCharacter(
+        const importedId = await commitImportedCharacterCard(
             convertOffSpecCards(charaData, imgp),
-            'import-character-card',
         )
+        if (!importedId) return null
         alertNormal(language.importedCharacter)
         return getDatabase().characters.findIndex(
             (character) => character.chaId === importedId,
@@ -1585,12 +1588,19 @@ async function importCharacterCardSpecWithPolicy<T extends boolean = false>(
         return char as any
     }
 
-    await commitDetachedCharacter(char, 'import-character-card')
+    const importedId = await commitImportedCharacterCard(char)
+    if (!importedId) return false
     alertNormal(language.importedCharacter)
-    return char.chaId as any
+    return importedId as any
 }
 
-function convertCharbook(arg:{
+/** Commits an imported character, or the installed one it updates when the user chooses that. */
+async function commitImportedCharacterCard(char: character): Promise<string | null> {
+    const { commitImportedCharacter } = await import('./contentUpdate/flow.svelte')
+    return commitImportedCharacter(char, (value) => commitDetachedCharacter(value, 'import-character-card'))
+}
+
+export function convertCharbook(arg:{
     lorebook:loreBook[]
     charbook:CharacterBook
     loresettings:loreSettings
@@ -1787,7 +1797,7 @@ function createBaseV2(char:character) {
 
     if(char.extentions){
         for(const key in char.extentions){
-            if(key === 'risuai' || key === 'depth_prompt'){
+            if(key === 'risuai' || key === 'depth_prompt' || key === UPDATE_BASE_EXTENSION_KEY){
                 continue
             }
             card.data.extensions[key] = char.extentions[key]
@@ -2230,7 +2240,7 @@ export function createBaseV3(char:character){
 
     if(char.extentions){
         for(const key in char.extentions){
-            if(key === 'risuai' || key === 'depth_prompt'){
+            if(key === 'risuai' || key === 'depth_prompt' || key === UPDATE_BASE_EXTENSION_KEY){
                 continue
             }
             card.data.extensions[key] = char.extentions[key]

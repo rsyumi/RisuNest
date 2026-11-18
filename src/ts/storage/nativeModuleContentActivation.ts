@@ -3,6 +3,7 @@ import { language } from '../../lang'
 import { v4 } from 'uuid'
 
 import type { RisuModule } from '../process/modules'
+import { markModuleImport } from '../contentUpdate/merge'
 import { assertModuleMCPImportAllowed } from '../process/mcp/moduleImport'
 import type { AssetAlias } from './persistentDataStore'
 import type {
@@ -24,12 +25,36 @@ export interface NativeModuleContentActivationDependencies {
     confirmLowLevelAccess(): Promise<boolean>
     createId(): string
     append(input: PreparedRootModuleAppend, signal?: AbortSignal): Promise<void>
+    /**
+     * Adds the module through `commit`, or offers to update an installed one instead.
+     * Resolves the id the import ended as, or null when the user cancelled it.
+     */
+    commitImport?(
+        module: RisuModule,
+        commit: (value: RisuModule) => Promise<unknown>,
+    ): Promise<string | null>
 }
 
 const productionDependencies: NativeModuleContentActivationDependencies = {
     confirmLowLevelAccess: () => alertConfirm(language.lowLevelAccessConfirm),
     createId: v4,
     append: appendPersistentRootModule,
+    commitImport: async (module, commit) => {
+        const { commitImportedModule } = await import('../contentUpdate/flow.svelte')
+        return commitImportedModule(module, commit)
+    },
+}
+
+async function commitModule(
+    dependencies: NativeModuleContentActivationDependencies,
+    module: RisuModule,
+    commit: (value: RisuModule) => Promise<void>,
+): Promise<string | null> {
+    if (!dependencies.commitImport) {
+        await commit(module)
+        return module.id
+    }
+    return dependencies.commitImport(module, commit)
 }
 
 function requireRisum(content: PreparedNativeContent): PreparedNativeRisumContent {
@@ -71,20 +96,23 @@ export async function activatePreparedNativeModuleContent(
             assetAliases,
             lifecycle.prepareOwnerManifestAndSeal,
         )
+        let moduleId: string | null
         try {
-            signal?.throwIfAborted()
-            await dependencies.append(
-                {
-                    module,
-                    assetAliases,
-                    ownerHead: {
-                        present: true,
-                        manifestHash: head.manifestHash!,
-                        entryCount: head.entryCount,
+            moduleId = await commitModule(dependencies, module, async (value) => {
+                signal?.throwIfAborted()
+                await dependencies.append(
+                    {
+                        module: value,
+                        assetAliases,
+                        ownerHead: {
+                            present: true,
+                            manifestHash: head.manifestHash!,
+                            entryCount: head.entryCount,
+                        },
                     },
-                },
-                signal,
-            )
+                    signal,
+                )
+            })
         } catch (error) {
             if (
                 error instanceof PersistentRootModuleAppendRejectedError ||
@@ -96,7 +124,7 @@ export async function activatePreparedNativeModuleContent(
             }
             throw error
         }
-        return { moduleId: module.id }
+        return moduleId ? { moduleId } : null
     }
     const content = requireRisum(prepared)
     const module = structuredClone(content.metadata) as unknown as RisuModule
@@ -104,8 +132,8 @@ export async function activatePreparedNativeModuleContent(
     if (module.lowLevelAccess && !(await dependencies.confirmLowLevelAccess()))
         return null
 
-    const moduleId = dependencies.createId()
-    module.id = moduleId
+    markModuleImport(module)
+    module.id = dependencies.createId()
     delete module.mcp
     if (Object.hasOwn(module, 'assets')) {
         if (
@@ -155,34 +183,36 @@ export async function activatePreparedNativeModuleContent(
         if (!previous) assetAliasesByKey.set(alias.key, alias)
     }
     const assetAliases = [...assetAliasesByKey.values()]
-    if (!lifecycle.sealPreparedContent) {
+    const sealPreparedContent = lifecycle.sealPreparedContent
+    if (!sealPreparedContent) {
         throw new TypeError(
             'Prepared RISUM content cannot seal its native roots',
         )
     }
-    signal?.throwIfAborted()
-    await lifecycle.sealPreparedContent()
-    if (signal?.aborted) {
-        try {
-            await lifecycle.abortPreparedContent?.()
-        } catch {}
-        signal.throwIfAborted()
-    }
+    let moduleId: string | null
+    let sealed = false
     try {
-        await dependencies.append(
-            { module, assetAliases, ownerHead: content.ownerHead },
-            signal,
-        )
+        moduleId = await commitModule(dependencies, module, async (value) => {
+            signal?.throwIfAborted()
+            await sealPreparedContent()
+            sealed = true
+            // A cancel after sealing is undone below, with the rejected appends.
+            signal?.throwIfAborted()
+            await dependencies.append(
+                { module: value, assetAliases, ownerHead: content.ownerHead },
+                signal,
+            )
+        })
     } catch (error) {
-        if (
+        if (sealed && (
             error instanceof PersistentRootModuleAppendRejectedError ||
             (signal?.aborted && error === signal.reason)
-        ) {
+        )) {
             try {
                 await lifecycle.abortPreparedContent?.()
             } catch {}
         }
         throw error
     }
-    return { moduleId }
+    return moduleId ? { moduleId } : null
 }
