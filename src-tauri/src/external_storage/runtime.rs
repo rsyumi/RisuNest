@@ -1874,7 +1874,7 @@ mod tests {
     fn a_held_device_store_write_does_not_fail_the_state_read() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+        let app = crate::test_app::mock_app();
         app.manage(persistent_store::commands::PersistentStoreState::with_test_store(PersistentStore::open(root).unwrap()));
         let jobs = JobCommandState::default();
         jobs.root.set(root.to_owned()).unwrap();

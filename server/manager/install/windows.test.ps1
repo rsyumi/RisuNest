@@ -659,6 +659,14 @@ FunctionEnd
                         if ($LASTEXITCODE -ne 0) { throw 'Frozen Sync installer generation failed.' }
                     } finally { $env:CARGO_TARGET_DIR = $priorTarget; Pop-Location }
                     $frozenSource = [IO.File]::ReadAllText((Join-Path $generatedRoot 'installer.nsi'))
+                    $frozenSource += @"
+
+Function un.onUninstFailed
+  FileOpen `$0 "$failureFile" w
+  FileWriteUTF16LE `$0 "`$SyncFailureMessage"
+  FileClose `$0
+FunctionEnd
+"@
                     $frozenFixture = Compile-Template $frozenName $frozenSource
                     $releasedManager = Join-Path $frozenBundle 'risunest-sync-manager.exe'
                     if (!$resumable) {
@@ -687,11 +695,25 @@ FunctionEnd
                             } elseif (Test-Path $retry) { throw 'A legacy frozen command created resumable artifacts.' }
                         } finally { $heldMarker.Dispose() }
                         $retryArgs = if ($retryMode -eq 'force') { @('/S', '/FORCE', '/DELETEAPPDATA') } else { @('/S') }
+                        Remove-Item -LiteralPath $failureFile -ErrorAction SilentlyContinue
                         Run-Installer $frozenUninstaller $retryArgs 0 $releasedInstallerTimeoutSeconds
                         $removedDeadline = [DateTime]::UtcNow.AddSeconds(30)
                         while (((Test-Path $syncInstall) -or (Test-Path $instanceRecord)) -and [DateTime]::UtcNow -lt $removedDeadline) { Start-Sleep -Milliseconds 50 }
-                        if (Test-Path $syncInstall) { throw "Frozen $retryMode removal left the installation directory." }
-                        if (Test-Path $instanceRecord) { throw "Frozen $retryMode removal left its registration." }
+                        $left = @(if (Test-Path $syncInstall) { 'the installation directory' }) + @(if (Test-Path $instanceRecord) { 'its registration' })
+                        if ($left) {
+                            # Without _?= the uninstaller exits at once and a TEMP copy removes the installation, so its exit code says nothing.
+                            # That removal may still be running, so no single detail may stop the report.
+                            $files = @(Get-ChildItem -LiteralPath $syncInstall -Recurse -Force -Name -ErrorAction SilentlyContinue) -join ', '
+                            if (!$files) { $files = 'none' }
+                            $processes = try { @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { ($_.CommandLine -and $_.CommandLine.Contains($syncInstall)) -or $_.Name -like 'risunest-sync*' } | ForEach-Object { "$($_.Name) $($_.ProcessId)" }) -join ', ' } catch { "unavailable ($($_.Exception.Message))" }
+                            if (!$processes) { $processes = 'none' }
+                            $lateDeadline = [DateTime]::UtcNow.AddSeconds(60)
+                            while (((Test-Path $syncInstall) -or (Test-Path $instanceRecord)) -and [DateTime]::UtcNow -lt $lateDeadline) { Start-Sleep -Milliseconds 200 }
+                            $late = if ((Test-Path $syncInstall) -or (Test-Path $instanceRecord)) { 'still present 60 s later' } else { 'gone within 60 s more' }
+                            $failure = if (!(Test-Path $failureFile)) { 'none recorded' } else { try { "$(Get-Content -LiteralPath $failureFile -Raw -Encoding Unicode -ErrorAction Stop)".Trim() } catch { "unreadable ($($_.Exception.Message))" } }
+                            if (!$failure) { $failure = 'empty' }
+                            throw "$frozenName $retryMode removal left $($left -join ' and ') after 30 s ($late). Uninstaller failure: $failure. Remaining files: $files. Related processes: $processes."
+                        }
                         if ((Test-Path $data) -ne ($retryMode -eq 'normal')) { throw 'Frozen removal did not honor its data choice.' }
                         Run-Installer $syncFixture @('/S', '/NS', "/D=$syncInstall") 0 $releasedInstallerTimeoutSeconds
                         Run-Installer (Join-Path $syncInstall 'uninstall.exe') @('/S', "_?=$syncInstall") 0 $releasedInstallerTimeoutSeconds

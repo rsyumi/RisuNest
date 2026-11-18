@@ -125,7 +125,7 @@ SectionEnd
       assert.notEqual(result.status, 0, `${name}: incomplete localization compiled`);
       assert.match(`${result.stdout}\n${result.stderr}`, /6040|7025/);
     }
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test("NSIS executes app cleanup only on explicit removal and retains retry capability on failure", { skip }, async () => {

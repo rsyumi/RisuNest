@@ -57,6 +57,7 @@ dist.zip
 !/scripts/prepareAndroidGenerated.mjs
 !/scripts/compatibleExport*.mjs
 !/scripts/linux-native-tests.sh
+!/scripts/install-apt-packages.sh
 !/scripts/ios-native-tests.sh
 !/scripts/linux-package-smoke.py
 !/scripts/testExternalStorageCore.ps1

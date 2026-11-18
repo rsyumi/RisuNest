@@ -831,8 +831,7 @@ final class NativeUITests: XCTestCase {
         attachScreenshot(app, name: "07-risunest-ios-platform")
     }
 
-    func testNativePickersAndNotifications() throws {
-        continueAfterFailure = false
+    private func launchPickerContracts() -> XCUIApplication {
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
         app.launchEnvironment["RISUNEST_IOS_PHASE"] = "ui"
         app.launch()
@@ -840,6 +839,30 @@ final class NativeUITests: XCTestCase {
         let ready = app.webViews.staticTexts["ui-ready"].waitForExistence(timeout: 30)
         logSyntheticStep(app, step: 201, reached: ready)
         XCTAssertTrue(ready)
+        return app
+    }
+
+    // The permission prompt appears once per simulator, so a retry of the other native steps must not depend on it.
+    func testNativeNotifications() throws {
+        continueAfterFailure = false
+        let app = launchPickerContracts()
+        logSyntheticStep(app, step: 204, reached: false)
+        app.webViews.buttons["Allow notifications"].tap()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = springboard.alerts.buttons["Allow"]
+        let prompted = allow.waitForExistence(timeout: 15)
+        logSyntheticStep(app, step: 204, reached: prompted)
+        XCTAssertTrue(prompted)
+        allow.tap()
+        logSyntheticStep(app, step: 205, reached: false)
+        let permitted = app.webViews.staticTexts["notifications-allowed"].waitForExistence(timeout: 10)
+        logSyntheticStep(app, step: 205, reached: permitted)
+        XCTAssertTrue(permitted)
+    }
+
+    func testNativePickersAndLinks() throws {
+        continueAfterFailure = false
+        let app = launchPickerContracts()
 
         logSyntheticStep(app, step: 202, reached: false)
         app.webViews.buttons["Import synthetic file"].tap()
@@ -855,18 +878,6 @@ final class NativeUITests: XCTestCase {
         logSyntheticStep(app, step: 203, reached: exported)
         XCTAssertTrue(exported)
 
-        logSyntheticStep(app, step: 204, reached: false)
-        app.webViews.buttons["Allow notifications"].tap()
-        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let allow = springboard.alerts.buttons["Allow"]
-        let prompted = allow.waitForExistence(timeout: 15)
-        logSyntheticStep(app, step: 204, reached: prompted)
-        XCTAssertTrue(prompted)
-        allow.tap()
-        logSyntheticStep(app, step: 205, reached: false)
-        let permitted = app.webViews.staticTexts["notifications-allowed"].waitForExistence(timeout: 10)
-        logSyntheticStep(app, step: 205, reached: permitted)
-        XCTAssertTrue(permitted)
         logSyntheticStep(app, step: 206, reached: false)
         app.webViews.buttons["Open synthetic link"].tap()
         let safari = XCUIApplication(bundleIdentifier: "com.apple.mobilesafari")

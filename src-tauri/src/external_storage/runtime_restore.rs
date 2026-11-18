@@ -1683,8 +1683,8 @@ pub(super) mod tests {
     }
 
     /// A running app whose renderer has its store open at `root`.
-    fn restore_app(root:&Path)->tauri::App<tauri::test::MockRuntime> {
-        let app=tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+    fn restore_app(root:&Path)->crate::test_app::MockApp {
+        let app=crate::test_app::mock_app();
         app.manage(PersistentStoreState::with_test_store(PersistentStore::open(root).unwrap()));
         app.manage(crate::native_file_jobs::NativeFileJobState::initialize(root.join("native-file-jobs")));
         let jobs=super::super::job_store::JobCommandState::default();

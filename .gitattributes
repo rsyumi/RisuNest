@@ -3,6 +3,7 @@
 src-tauri/gen/android/app/src/main/AndroidManifest.xml -whitespace
 scripts/linux-*.sh text eol=lf
 scripts/retry-command.sh text eol=lf
+scripts/install-apt-packages.sh text eol=lf
 scripts/linux-*.py text eol=lf
 # Build tools write these with LF.
 src-tauri/Cargo.toml text eol=lf

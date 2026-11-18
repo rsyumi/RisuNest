@@ -657,12 +657,12 @@ mod tests {
     use super::super::residency::AssetPolicy;
     use tauri::test::MockRuntime;
     const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-    fn mock_app(store: PersistentStore) -> tauri::App<MockRuntime> {
+    fn mock_app(store: PersistentStore) -> crate::test_app::MockApp {
         let root = store.repository_root().to_owned();
         mock_app_with(PersistentStoreState::with_test_store(store), &root)
     }
-    fn mock_app_with(store: PersistentStoreState, root: &std::path::Path) -> tauri::App<MockRuntime> {
-        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
+    fn mock_app_with(store: PersistentStoreState, root: &std::path::Path) -> crate::test_app::MockApp {
+        let app = crate::test_app::mock_app();
         app.manage(store);
         app.manage(crate::native_file_jobs::NativeFileJobState::initialize(root.join("native-file-jobs")));
         app.manage(ServerSyncCommandState::default());

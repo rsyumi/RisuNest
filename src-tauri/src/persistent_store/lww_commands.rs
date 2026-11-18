@@ -134,16 +134,16 @@ mod tests {
     #[test]
     fn binding_and_outbox_reads_leave_the_bridge_thread_while_the_store_is_held() {
         let directory = tempfile::tempdir().unwrap();
-        let app = tauri::test::mock_builder()
+        let app = crate::test_app::MockApp::new(tauri::test::mock_builder()
             .invoke_handler(tauri::generate_handler![
                 crate::persistent_store::sync_selection::pds_lww_binding_state,
                 crate::persistent_store::sync_selection::pds_lww_binding_content,
                 pds_lww_read_outbox,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .unwrap();
+            .unwrap());
         app.manage(PersistentStoreState::with_test_store(PersistentStore::open(directory.path()).unwrap()));
-        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&*app, "main", Default::default()).build().unwrap();
         let (state, content, authority) = with_store_mut(app.state(), |store| {
             Ok((store.lww_binding_state()?, store.lww_binding_content()?, store.lww_binding_authority()?))
         }).unwrap();

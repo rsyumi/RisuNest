@@ -275,14 +275,32 @@ test("iOS portable source tests run before the simulator release gate", () => {
   assert.throws(() => verify(job.replace("pnpm ios:test:portable-source", "")));
 });
 
-test("APT retries downloads internally and failed index refreshes remain failures", () => {
-  for (const name of ["release", "native-check", "linux-package-check", "pr-check"]) {
-    const contents = readFileSync(new URL(`../../.github/workflows/${name}.yml`, import.meta.url), "utf8");
-    const commands = contents.match(/sudo apt-get[^\n&]*/g) ?? [];
-    assert.ok(commands.length >= 2, name);
-    for (const command of commands) {
-      assert.match(command, /-o Acquire::Retries=2/);
-      if (/\bupdate\b/.test(command)) assert.match(command, /--error-on=any/);
+// Release jobs build an older source with the current workflow, so they run the workflow's installer.
+function assertBoundedAptInstalls(name, contents) {
+  assert.doesNotMatch(contents, /apt-get/, name);
+  const steps = contents.replace(/\r\n/g, "\n").split(/^      - /m);
+  const installs = steps.flatMap((step, index) => step.includes("install-apt-packages.sh ") ? [index] : []);
+  assert.ok(installs.length >= 1, name);
+  for (const index of installs) {
+    const step = steps[index];
+    assert.match(step, /timeout-minutes: 20\n/, name);
+    if (name !== "release") {
+      assert.match(step, /run: bash scripts\/install-apt-packages\.sh /, name);
+      continue;
     }
+    const checkout = steps[index - 1];
+    assert.match(checkout, /uses: actions\/checkout@/, name);
+    assert.match(checkout, /ref: "\$\{\{ github\.workflow_sha \}\}"/, name);
+    assert.match(checkout, /sparse-checkout: scripts\/install-apt-packages\.sh,/, name);
+    assert.equal(/\n\s+if: (.+)/.exec(checkout)?.[1], /\n\s+if: (.+)/.exec(step)?.[1], name);
+    assert.match(step, /mv \.workflow-apt\/scripts\/install-apt-packages\.sh "\$RUNNER_TEMP\/" && rm -rf \.workflow-apt\n\s+bash "\$RUNNER_TEMP\/install-apt-packages\.sh" /, name);
   }
+}
+
+test("APT packages install through the bounded mirror fallback", () => {
+  for (const name of ["release", "native-check", "linux-package-check", "pr-check"]) {
+    assertBoundedAptInstalls(name, readFileSync(new URL(`../../.github/workflows/${name}.yml`, import.meta.url), "utf8"));
+  }
+  const sourceInstaller = workflow.replaceAll('bash "$RUNNER_TEMP/install-apt-packages.sh"', "bash scripts/install-apt-packages.sh");
+  assert.throws(() => assertBoundedAptInstalls("release", sourceInstaller));
 });
