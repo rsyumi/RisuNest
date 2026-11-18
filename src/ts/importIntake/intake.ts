@@ -1,6 +1,7 @@
 import { get } from 'svelte/store'
 import { alertError } from '../alert'
 import { alertStore } from '../alertQueue'
+import { isAppLockInputBlocked, waitForAppLockInputUnblocked } from '../appLock/input'
 import { isTauri } from '../platform'
 import { DBState, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
 import { AndroidSafSourceError } from '../storage/androidSafBridge'
@@ -77,9 +78,10 @@ export function submitImportDelivery(delivery: ImportIntakeDelivery): Promise<vo
     return run
 }
 
-/** Waits until no alert dialog is open or queued, no file operation runs and no outcome is shown. */
+/** Waits until the app lock is gone, no alert dialog is open or queued, no file operation runs and no outcome is shown. */
 async function waitForImportIdle(): Promise<void> {
-    while (alertStore.hasDialogs() || get(nativeFileOperation) || get(nativeFileOperationOutcome)) {
+    while (isAppLockInputBlocked() || alertStore.hasDialogs() || get(nativeFileOperation) || get(nativeFileOperationOutcome)) {
+        await waitForAppLockInputUnblocked()
         await alertStore.idle()
         await waitForNativeFileOperationIdle()
     }

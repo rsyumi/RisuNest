@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
     appendLorebook: vi.fn(),
     restore: vi.fn(),
     restoreAndroid: vi.fn(),
+    importPlugin: vi.fn(async () => true),
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -87,6 +88,7 @@ vi.mock('../process/lorebook.svelte', () => ({
     lorebookFileEntries: (imported: { data: unknown[] }) => imported.data,
     appendCharacterLorebook: mocks.appendLorebook,
 }))
+vi.mock('../plugins/plugins.svelte', () => ({ importPlugin: mocks.importPlugin }))
 vi.mock('../storage/portableBackupFileRouteProduction.svelte', () => ({ restoreBackupFromNativeSource: mocks.restore }))
 vi.mock('../storage/androidRisuSaveRouteProduction.svelte', () => ({
     restoreAndroidOpenedBackupSource: mocks.restoreAndroid,
@@ -110,6 +112,7 @@ import {
 import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'
 import { loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
 import { handleAppDrop } from './drop'
+import { pluginInstallDialog } from './pluginInstall'
 import { installImportIntake, submitImportDelivery } from './intake'
 import { importDropOverlayVisible, importSheet, resolveImportSheet } from './sheetStore'
 import type { ImportIntakeDelivery, ImportSheetDecision, ImportSheetRequest } from './types'
@@ -245,6 +248,37 @@ describe('one dropped file', () => {
         expect(mocks.characterPath).not.toHaveBeenCalled()
         expect(outcomes).toEqual([expect.objectContaining({ state: 'cancelled' })])
         expect(inboxCopies()).toEqual([])
+    })
+})
+
+describe('plugin files', () => {
+    const pluginCode = ['//@name synthetic_helper', '//@display-name Synthetic Helper', '//@api 3.0', ''].join('\n')
+
+    it('installs a dropped plugin once the user confirms it in the plugin dialog', async () => {
+        const delivered = submitImportDelivery(drop(dropped('helper.js', pluginCode)))
+        await vi.waitFor(() => expect(get(pluginInstallDialog)).not.toBeNull())
+        const active = get(pluginInstallDialog)!
+        expect(active.prompt).toEqual(expect.objectContaining({
+            fileName: 'helper.js',
+            header: expect.objectContaining({ name: 'synthetic_helper', displayName: 'Synthetic Helper' }),
+        }))
+        await active.install()
+        await delivered
+        expect(mocks.importPlugin).toHaveBeenCalledExactlyOnceWith(pluginCode, { isTypescript: false, confirmed: true })
+        expect(mocks.classifyRequests).toEqual([])
+        expect(get(pluginInstallDialog)).toBeNull()
+    })
+
+    it('refuses a plugin for another API version, and a plugin file that was opened or shared', async () => {
+        classify('shared.js', { kind: 'script', format: 'js' })
+        await submitImportDelivery(drop(dropped('old.js', ['//@name old_helper', '//@api 2.1', ''].join('\n'))))
+        await submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path: '/opened/shared.js' }] })
+        expect(mocks.alertError.mock.calls).toEqual([
+            [`old.js\n${language.risuNest.plugins.unsupportedApiVersionInstall.replace('{version}', '2.1')}`],
+            [`shared.js\n${language.risuNest.importDialog.reasonUnsupportedFormat}`],
+        ])
+        expect(get(pluginInstallDialog)).toBeNull()
+        expect(mocks.importPlugin).not.toHaveBeenCalled()
     })
 })
 
@@ -413,6 +447,10 @@ describe('holding', () => {
             await runSharedNativeFileOperation('import', 'synthetic', async () => 'done', { presentation: 'dialog' })
             expect(get(nativeFileOperationOutcome)).not.toBeNull()
             return async () => dismissNativeFileOperationOutcome()
+        }],
+        ['the app lock', async () => {
+            setAppLockInputBlocked(true, false)
+            return async () => setAppLockInputBlocked(false, false)
         }],
     ])('waits for %s before it starts', async (_, block) => {
         classify('card.png', { kind: 'character', format: 'png' })
