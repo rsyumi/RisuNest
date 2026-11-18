@@ -477,8 +477,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 lorebook: lores,
                 id: v4(),
             }
-            DBState.db.modules.push(importModule)
-            return true
+            return await commitImportedModuleData(importModule)
         }
         if (importData.entries) {
             const lores: loreBook[] = convertExternalLorebook(
@@ -492,8 +491,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 lorebook: lores,
                 id: v4(),
             }
-            DBState.db.modules.push(importModule)
-            return true
+            return await commitImportedModuleData(importModule)
         }
         if (importData.type === 'regex' && importData.data) {
             const regexs: customscript[] = importData.data
@@ -504,8 +502,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 regex: regexs,
                 id: v4(),
             }
-            DBState.db.modules.push(importModule)
-            return true
+            return await commitImportedModuleData(importModule)
         }
     } catch (error) {
         console.error(error)

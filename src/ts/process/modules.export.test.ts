@@ -72,6 +72,8 @@ vi.mock('../characterCards', () => ({
     exportCharacterCard: vi.fn(),
     importCharacterProcess: vi.fn(),
 }))
+// The lorebook upgrade the update flow applies, without the app state its module loads.
+vi.mock('../characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
 
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
@@ -116,6 +118,19 @@ describe('legacy module export', () => {
         await importModuleData({ name: 'synthetic.json', data: Uint8Array.of(0xff), parsedJson: { value } })
         expect(first).toBeDefined()
         expect(DBState.db.modules[0]).toEqual(first)
+    })
+
+    it('offers a lorebook file picked for a module update as that update', async () => {
+        DBState.db.modules = [{ id: 'installed', name: 'Lore', description: '', lorebook: [] }]
+        const { chooseContentUpdate, contentUpdateDialog, importAsContentUpdate } = await import('../contentUpdate/flow.svelte')
+        const data = new TextEncoder().encode(JSON.stringify({ type: 'risu', data: [{ key: 'synthetic', content: 'lore' }] }))
+        const imported = importAsContentUpdate('module', 'installed', () => importModuleData({ name: 'synthetic.json', data }))
+        await vi.waitFor(() => expect(contentUpdateDialog.request && !contentUpdateDialog.busy).toBe(true))
+        expect(contentUpdateDialog.request?.kind).toBe('module')
+        expect(contentUpdateDialog.target).toBe('installed')
+        chooseContentUpdate('cancel')
+        expect(await imported).toBe(false)
+        expect(DBState.db.modules.map((module) => module.id)).toEqual(['installed'])
     })
 
     it('preserves browser malformed-byte replacement in JSON modules', async () => {
