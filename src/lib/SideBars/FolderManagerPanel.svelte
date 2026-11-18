@@ -137,23 +137,25 @@
         else draft.textColor = value
     }
 
-    /** Resolves false when the chosen image could not be read or stored. */
+    /** Resolves false when no file arrived: none was chosen, or it was not an image or could not be read or stored. */
     let choosingImage: Promise<boolean> | null = null
 
     function chooseImage() {
         choosingImage ??= pickImage()
-            .then(() => true, (error) => { alertError(error); return false })
+            .catch((error) => { alertError(error); return false })
             .finally(() => { choosingImage = null })
     }
 
     async function pickImage() {
         const opened = folderManager.draft
+        const before = opened?.imgFile
+        // Null also follows a format error, which selectSingleFile has already shown.
         const file = await selectSingleFile(imageAliases, { image: true })
-        if (!file) return
+        if (!file) return false
         const saved = await saveImage(file.data)
-        // The panel may have closed, opened again or left 이미지 meanwhile.
-        if (folderManager.draft !== opened || opened?.iconType !== 'image') return
-        opened.imgFile = saved
+        // The panel may have closed, opened again, left 이미지 or removed the image meanwhile.
+        if (folderManager.draft === opened && opened?.iconType === 'image' && opened.imgFile === before) opened.imgFile = saved
+        return true
     }
 
     async function save() {
