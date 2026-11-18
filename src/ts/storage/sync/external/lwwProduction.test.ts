@@ -824,9 +824,11 @@ describe('bounded production calls and lifecycle ownership', () => {
             ['the start', 'hidden away'],
             ['the start', 'hidden away and back while it waits'],
             ['the start', 'back before the expiry arrives'],
+            ['the start', 'kept away and back as the start ends'],
         ] as const)('holds routine sync after %s outlives its background time until the app returns (%s)', async (entry, order) => {
             const android = order === 'kept away' || order === 'kept away before the binding resumes' || order === 'back and kept away again'
-            const backBeforeItEnds = order === 'back before the expiry arrives' || order === 'hidden away and back while it waits'
+                || order === 'kept away and back as the start ends'
+            const backBeforeItEnds = order === 'back before the expiry arrives' || order === 'hidden away and back while it waits' || order === 'kept away and back as the start ends'
             fixture.os = android ? 'android' : 'ios'
             const expire = expiringHolds()
             if (entry !== 'the start') { dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle() }
@@ -842,6 +844,12 @@ describe('bounded production calls and lifecycle ownership', () => {
                 const resume = fixture.resumeCurrent.getMockImplementation()!
                 fixture.resumeCurrent.mockImplementation(async target => { await checking; await resume(target) })
             } else checked()
+            // The start still waits to hear device changes after the binding resumed.
+            let listened = () => {}
+            if (order === 'kept away and back as the start ends') {
+                const listening = new Promise<void>(resolve => { listened = resolve })
+                fixture.listen.mockImplementationOnce(async () => { await listening; return () => {} })
+            }
             const resumed = entry === 'the start' ? installExternalLwwAdapters(state()).then(value => { dispose = value })
                 : drain ? drain.resumeAfterExitCancel!() : (returnToApp(), show('visible'))
             await settle()
@@ -851,14 +859,16 @@ describe('bounded production calls and lifecycle ownership', () => {
             else if (!android) show('hidden')
             expire()
             if (order === 'hidden away and back while it waits') show('visible')
-            checked(); release(); await resumed
+            checked(); release()
+            if (order === 'kept away and back as the start ends') { for (let i = 0; i < 6; i++) await settle(); returnToApp(); listened() }
+            await resumed
             if (!backBeforeItEnds) {
                 expect(await synced()).toBe(false)
                 if (android) returnToApp(); else show('visible')
             }
             expect(await synced()).toBe(true)
         })
-        it('keeps routine sync stopped after its own hold expires away, also when the network returns, until the app returns', async () => {
+        it('keeps routine sync stopped after its own hold expires away, also when the network returns or the page is hidden, until the app returns', async () => {
             fixture.os = 'android'
             const expire = expiringHolds()
             dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle()
@@ -867,8 +877,32 @@ describe('bounded production calls and lifecycle ownership', () => {
             expire(); release(); await synced()
             window.dispatchEvent(new Event('online'))
             expect(await synced()).toBe(false)
-            returnToApp()
+            // Android stops keeping the page shortly after, while the app stays away.
+            show('hidden'); for (let i = 0; i < 6; i++) await settle()
+            expect(fixture.invoke.mock.calls.some(([command]) => command === 'external_lww_publish')).toBe(false)
+            show('visible'); returnToApp()
             expect(await synced()).toBe(true)
+        })
+        it.each([
+            ['stays', 1],
+            ['is kept away until its time runs out', 2],
+            ['leaves the screen', 2],
+        ] as const)('resumes routine sync after the return to the screen when the app %s while it resumes', async (away, passes) => {
+            fixture.os = 'android'
+            const expire = expiringHolds()
+            dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle()
+            show('hidden'); for (let i = 0; i < 6; i++) await settle()
+            fixture.invoke.mockClear()
+            // Android tells a return from a hidden page twice: the page becomes visible, and the app starts.
+            const release = gate('external_lww_receive')
+            show('visible'); returnToApp(); for (let i = 0; i < 6; i++) await settle()
+            if (away === 'is kept away until its time runs out') { expire(); returnToApp() }
+            if (away === 'leaves the screen') { show('hidden'); show('visible'); returnToApp() }
+            release(); for (let i = 0; i < 6; i++) await settle()
+            expect(fixture.invoke.mock.calls.filter(([command]) => command === 'external_lww_resume')).toHaveLength(passes)
+            fixture.invoke.mockClear()
+            fixture.revision!(14, 'local'); await vi.advanceTimersByTimeAsync(600_000)
+            expect(fixture.invoke.mock.calls.some(([command]) => command === 'external_lww_publish')).toBe(true)
         })
         it('while a cancelled exit waits to resume sync', async () => {
             const held = track()

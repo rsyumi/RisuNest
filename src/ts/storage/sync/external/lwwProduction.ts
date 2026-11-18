@@ -62,7 +62,9 @@ let refreshGeneration = 0
 // Sync's background time ran out while the app was away, so routine sync waits for the return. Android expires a hold
 // only while the app is away, also when it keeps the page running and visible; elsewhere the page is hidden then.
 let outOfTime = false
-const ranOutOfTime = () => { if (isTauriAndroid || document.visibilityState === 'hidden') outOfTime = true }
+// Departures the page noticed, so a return pass that began before one runs again after the return that follows it.
+let departures = 0
+const ranOutOfTime = () => { if (isTauriAndroid || document.visibilityState === 'hidden') { outOfTime = true; departures++ } }
 /** Whether routine sync may start: off screen, only while sync's background time lasts. */
 const routineMayStart = () => foregroundAvailable() && !outOfTime
 
@@ -418,7 +420,45 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
 export async function installExternalLwwAdapters(state: ExternalStorageState, resumeBound = true): Promise<() => void> {
     if (!isTauri) return () => {}
     resumeBoundTarget = resumeBound
-    let foreground = () => {}
+    let hiddenFlushed = document.visibilityState === 'hidden'
+    let wasOnline = navigator.onLine
+    let disposed = false
+    const foreground = () => {
+        if (disposed || isLibraryFileOperationReserved()) return
+        const wentOffline = !navigator.onLine && wasOnline
+        wasOnline = navigator.onLine
+        const flushHidden = document.visibilityState === 'hidden' && !hiddenFlushed
+        hiddenFlushed = document.visibilityState === 'hidden'
+        if (flushHidden) departures++
+        for (const adapter of adapters.values()) if (adapter.state) {
+            if (document.visibilityState === 'hidden' || !navigator.onLine) {
+                if (wentOffline) { adapter.generation++; adapter.scheduler.stop(); void adapter.stopHydration() }
+                // Running sends, receives and hydration continue hidden; the scheduler's hold covers the publication,
+                // which waits for the return once that time ran out.
+                else if (flushHidden) void adapter.hide(navigator.onLine && !outOfTime).catch(() => {})
+            }
+            else if (!adapter.foreground) {
+                adapter.generation++
+                adapter.scheduler.pauseAutomatic()
+                const generation = adapter.generation
+                const departed = departures
+                const authority = adapter.state.targetAuthority
+                adapter.foreground = holdThroughDeparture(async () => {
+                    await adapter.scheduler.settled()
+                    if (adapters.get(adapter.state?.target.kind === 'external' ? adapter.state.target.connectionId : '') !== adapter
+                        || generation !== adapter.generation || document.visibilityState === 'hidden' || !navigator.onLine) return
+                    const current = await native.state()
+                    if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
+                    await invoke('external_lww_resume', { connectionId: current.target.connectionId })
+                    if (generation === adapter.generation && routineMayStart()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
+                }).catch(() => {}).finally(() => {
+                    adapter.foreground = undefined
+                    // The return after a departure during the pass found it still running.
+                    if ((generation !== adapter.generation || departed !== departures) && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
+                })
+            }
+        }
+    }
     // A return clears a background time that ran out, also one during the start below. A page Android keeps running
     // off screen stays visible, so it hears the return only from the app's own start.
     const visibility = () => { if (document.visibilityState !== 'hidden') outOfTime = false; foreground() }
@@ -443,41 +483,6 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
         lastConversation = identity
         for (const adapter of adapters.values()) if (adapter.state) void adapter.scheduler.conversationOpened()
     })
-    let hiddenFlushed = document.visibilityState === 'hidden'
-    let wasOnline = navigator.onLine
-    let disposed = false
-    foreground = () => {
-        if (disposed || isLibraryFileOperationReserved()) return
-        const wentOffline = !navigator.onLine && wasOnline
-        wasOnline = navigator.onLine
-        const flushHidden = document.visibilityState === 'hidden' && !hiddenFlushed
-        hiddenFlushed = document.visibilityState === 'hidden'
-        for (const adapter of adapters.values()) if (adapter.state) {
-            if (document.visibilityState === 'hidden' || !navigator.onLine) {
-                if (wentOffline) { adapter.generation++; adapter.scheduler.stop(); void adapter.stopHydration() }
-                // Running sends, receives and hydration continue hidden; the scheduler's hold covers the publication.
-                else if (flushHidden) void adapter.hide(navigator.onLine).catch(() => {})
-            }
-            else if (!adapter.foreground) {
-                adapter.generation++
-                adapter.scheduler.pauseAutomatic()
-                const generation = adapter.generation
-                const authority = adapter.state.targetAuthority
-                adapter.foreground = holdThroughDeparture(async () => {
-                    await adapter.scheduler.settled()
-                    if (adapters.get(adapter.state?.target.kind === 'external' ? adapter.state.target.connectionId : '') !== adapter
-                        || generation !== adapter.generation || document.visibilityState === 'hidden' || !navigator.onLine) return
-                    const current = await native.state()
-                    if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
-                    await invoke('external_lww_resume', { connectionId: current.target.connectionId })
-                    if (generation === adapter.generation && routineMayStart()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
-                }).catch(() => {}).finally(() => {
-                    adapter.foreground = undefined
-                    if (generation !== adapter.generation && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
-                })
-            }
-        }
-    }
     window.addEventListener('online', foreground)
     window.addEventListener('offline', foreground)
     const releaseFileOperation = subscribeLibraryFileOperationReleased(() => {
