@@ -15,6 +15,8 @@
     bordered?: boolean;
     color?: string;
     backgroundimg?: ImageSource;
+    /** Opaque folder colour or gradient, painted over the preset class. */
+    fill?: string;
     children?: import('svelte').Snippet;
     oncontextmenu?: (event: MouseEvent & {
         currentTarget: EventTarget & HTMLDivElement;
@@ -33,6 +35,7 @@
     bordered = false,
     color = '',
     backgroundimg = '',
+    fill,
     children,
     oncontextmenu,
     chaId,
@@ -95,6 +98,7 @@
         style:width={size + "px"}
         style:height={size + "px"}
         style:minWidth={size + "px"}
+        style:background-image={fill}
         class:rounded-md={!rounded} class:rounded-full={rounded}
       ></div>
       {:then resolvedBgImg}
@@ -112,7 +116,7 @@
         style:width={size + "px"}
         style:height={size + "px"}
         style:minWidth={size + "px"}
-        style:background-image={resolvedBgImg ? `url('${resolvedBgImg}')` : undefined}
+        style:background-image={resolvedBgImg ? `url('${resolvedBgImg}')` : fill}
         style:background-size={resolvedBgImg ? "cover" : undefined}
         style:background-position={resolvedBgImg ? "center" : undefined}
         class:rounded-md={!rounded} class:rounded-full={rounded}
@@ -136,6 +140,7 @@
         style:width={size + "px"}
         style:height={size + "px"}
         style:minWidth={size + "px"}
+        style:background-image={fill}
         class:rounded-md={!rounded} class:rounded-full={rounded}
       >
         {@render children?.()}

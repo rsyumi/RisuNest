@@ -10,7 +10,7 @@ export function sidebarProductBoundaries(): Plugin {
             const adapter = resolve(import.meta.dirname, 'sidebarProductAdapters.svelte.ts').replaceAll('\\', '/')
             if (owner?.endsWith('/src/lib/SideBars/SidebarAvatar.svelte') && source.endsWith('/tooltip')) return stubbed(this, adapter, source, importer!, options)
             if (!owner?.endsWith('/src/lib/SideBars/Sidebar.svelte')) return null
-            if (/(stores\.svelte|database\.svelte|characters|lang|util|globalApi\.svelte|alert|guisize|workingSetNavigation)$/.test(source)) return stubbed(this, adapter, source, importer!, options)
+            if (/(stores\.svelte|database\.svelte|characters|lang|util|globalApi\.svelte|folderManager\.svelte|guisize|workingSetNavigation)$/.test(source)) return stubbed(this, adapter, source, importer!, options)
             if (/\.svelte$/.test(source) && !/(stores|database)\.svelte$/.test(source)) {
                 return /Sidebar(Avatar|Indicator)\.svelte$/.test(source) ? null : resolve(import.meta.dirname, 'Empty.svelte').replaceAll('\\', '/')
             }
