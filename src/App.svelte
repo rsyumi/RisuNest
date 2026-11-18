@@ -59,6 +59,8 @@
     import SyncStatusPanel from './lib/Others/SyncStatusPanel.svelte';
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
+    import { bindPresetFromList, presetListBinding } from './ts/chatBindings.svelte';
+    import { getAppliedPresetId } from './ts/storage/presetEditor.svelte';
     import { restoreFocusAfterInputBlock } from './ts/ui/restoreFocusAfterInputBlock';
     import { backNavigationLayer, handleRootBack } from './ts/ui/modalNavigation';
 
@@ -195,6 +197,10 @@
         (settingsPromise ??= import('./lib/Setting/Settings.svelte'))
     const loadGridChars = (_retry: number) =>
         (gridCharsPromise ??= import('./lib/Others/GridCatalog.svelte'))
+    // The binding row opens the list in bind mode; any way of closing it ends that mode.
+    $effect(() => {
+        if (!$openPresetList) presetListBinding.target = null
+    })
     const loadPresetManager = (_retry: number) =>
         (presetManagerPromise ??= import('./lib/Setting/PresetManager.svelte'))
     const loadListedPersona = (_retry: number) =>
@@ -470,6 +476,10 @@
         {:then module}
             {@const PresetManager = module.default}
             <PresetManager
+                mode={presetListBinding.target ? 'bind' : 'select'}
+                boundId={presetListBinding.target?.conversation.promptPresetId}
+                chatPresetId={getAppliedPresetId()}
+                onBind={bindPresetFromList}
                 close={() => {
                     $openPresetList = false
                 }}

@@ -1825,6 +1825,9 @@ export const languageKorean = {
             caption: '설명',
         },
         presetBinding: {
+            label: '프리셋 바인딩',
+            missing: '바인딩한 프리셋 없음 · 현재 프리셋 사용',
+            saveFailed: '프리셋 바인딩을 저장하지 못했습니다.',
         },
         moduleScope: {
             info: '글로벌은 모든 채팅, 캐릭터는 이 캐릭터의 모든 채팅, 채팅은 현재 채팅에 모듈을 적용합니다.',

@@ -39,8 +39,8 @@
   let { onGoBack = () => {}, mode = 'independent', subMenu = $bindable(0) }: Props = $props();
 
     async function executeTokenize(prest: PromptItem[]){
-        tokens = await tokenizePreset(prest, true)
-        extokens = await tokenizePreset(prest, false)
+        tokens = await tokenizePreset(prest, true, DBState.db)
+        extokens = await tokenizePreset(prest, false, DBState.db)
     }
 
     $effect.pre(() => {

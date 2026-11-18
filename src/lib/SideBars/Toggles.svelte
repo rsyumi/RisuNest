@@ -10,6 +10,7 @@
     import ToggleItems from './ToggleItems.svelte'
     import ModelBind from './ModelBind.svelte'
     import PersonaBind from './PersonaBind.svelte'
+    import PresetBind from './PresetBind.svelte'
     import ToggleBind from './ToggleBind.svelte'
     import CustomSideBar from "./CustomSidebar.svelte";
     import { getGlobalChatVar, isLocallyHandledGlobalChatVar } from "src/ts/parser/chatVar.svelte";
@@ -194,6 +195,7 @@
 <div class="flex flex-col gap-4 w-full mt-3">
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
+    <PresetBind />
     {#if DBState.db.customSidebarItems?.length}<CustomSideBar />{/if}
     <ToggleBind values={toggleEditor.values} unpinKeys={toggleEditor.unpinKeys} onApplyPreset={applyTogglePreset} bind:saving={savingToggles} />
 </div>

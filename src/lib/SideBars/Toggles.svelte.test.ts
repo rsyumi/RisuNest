@@ -40,6 +40,7 @@ vi.mock('src/ts/util', () => ({
 }))
 vi.mock('./ModelBind.svelte', () => ({ default: () => {} }))
 vi.mock('./PersonaBind.svelte', () => ({ default: () => {} }))
+vi.mock('./PresetBind.svelte', () => ({ default: () => {} }))
 // The binding controls are covered by Chat.windowedInteractions.test.ts; here they expose what they receive.
 vi.mock('./ToggleBind.svelte', () => ({ default: (_anchor: unknown, props: typeof toggleBind.props) => { toggleBind.props = props } }))
 vi.mock('./CustomSidebar.svelte', () => ({ default: () => {} }))

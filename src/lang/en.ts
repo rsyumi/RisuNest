@@ -2003,6 +2003,9 @@ export const languageEnglish = {
             caption: 'Caption',
         },
         presetBinding: {
+            label: 'Preset binding',
+            missing: 'Preset unavailable, using current preset',
+            saveFailed: 'Could not save the preset binding.',
         },
         moduleScope: {
             info: 'Global applies a module to every chat, Character to every chat with this character, and Chat to this chat only.',
