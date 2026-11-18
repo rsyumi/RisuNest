@@ -207,17 +207,18 @@ describe('character update', () => {
         expect(await releasedKeys()).toEqual(['assets/third.png'])
     })
 
-    it('asks about the fields an earlier file does not carry, such as the portrait', async () => {
-        install(card('old', 'Luna', { desc: 'old', image: 'assets/mine.png' }))
-        const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'new', image: 'assets/new.png' }), commitCharacter)
+    it('asks about the assets an earlier file does not carry, ones the user removed too', async () => {
+        install(card('old', 'Luna', { desc: 'old', image: '', additionalAssets: [] }))
+        const map = ['map', 'assets/map.png', 'png']
+        const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'new', image: 'assets/new.png', additionalAssets: [map] }), commitCharacter)
         await opened()
         await reviewContentUpdate()
         const earlier = { spec: 'chara_card_v2', data: { name: 'Luna', description: 'old' } }
         vi.mocked(selectSingleFile).mockResolvedValueOnce({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify(earlier)) })
         await loadContentUpdateBaseFile()
         expect(contentUpdateDialog.baseSource.kind).toBe('file')
-        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.status])).toEqual([
-            ['name', 'update'], ['desc', 'update'], ['image', 'conflict'],
+        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.status, item.choice])).toEqual([
+            ['name', 'update', 'theirs'], ['desc', 'update', 'theirs'], ['image', 'differs', null], ['additionalAssets', 'differs', null],
         ])
         chooseContentUpdate('cancel')
         expect(await pending).toBeNull()
@@ -228,7 +229,8 @@ describe('character update', () => {
         mocks.details.get('first').lowLevelAccess = true
         const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
         const update = async (id: string) => {
-            const pending = commitImportedCharacter(card(id, 'Luna v1.1', { lowLevelAccess: false, triggerscript: [trigger] }), commitCharacter)
+            // A card without the field, as older cards come.
+            const pending = commitImportedCharacter(card(id, 'Luna v1.1', { triggerscript: [trigger] }), commitCharacter)
             await opened()
             await reviewContentUpdate()
             chooseContentUpdate('update')
@@ -287,6 +289,8 @@ describe('character update', () => {
         chooseContentUpdate('update')
         expect(await pending).toBe(restored ? 'next' : null)
         expect(mocks.alertError).toHaveBeenCalledOnce()
+        const text = language.risuNest.contentUpdate
+        expect(mocks.alertError.mock.calls[0][0].split('\n')[0]).toBe(restored ? text.failed : text.notUpdated)
         const kept = mocks.details.get('next')
         if (restored) expect(kept).toMatchObject({ name: 'Luna v2', desc: 'b' })
         expect(kept.trashTime === undefined).toBe(restored)
@@ -322,6 +326,21 @@ describe('module update', () => {
         const base = JSON.parse(new TextDecoder().decode(mocks.assets.get(mocks.db.modules[0].updateBase!)))
         expect(base).toEqual({ description: 'new', name: 'Renamed Lore', lorebook: [], updateLineage: 'file-1' })
         expect(await releasedKeys()).toContain(firstBase)
+    })
+
+    it('asks before low-level access the user turned on covers triggers from an import that leaves it out', async () => {
+        await commitImportedModule(imported('file-3', { name: 'Lua Pack', trigger: [] }), commitModule)
+        mocks.db.modules[0].lowLevelAccess = true
+        const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
+        mocks.alertConfirm.mockResolvedValueOnce(false)
+        const pending = commitImportedModule(imported('file-3', { name: 'Lua Pack', trigger: [trigger] } as Partial<RisuModule>), commitModule)
+        await opened()
+        await reviewContentUpdate()
+        chooseContentUpdate('update')
+        expect(await pending).toBeNull()
+        expect(mocks.alertConfirm).toHaveBeenCalledOnce()
+        expect(mocks.db.modules).toHaveLength(1)
+        expect(mocks.db.modules[0]).toMatchObject({ lowLevelAccess: true, trigger: [] })
     })
 
     it('installs the import as new when the installed module was removed before the update', async () => {

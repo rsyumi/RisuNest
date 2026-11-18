@@ -187,7 +187,7 @@ export type UpdateChoice = UpdateSide | { value: unknown }
 export interface UpdateItem {
     id: string
     field: string
-    /** Item key inside a list or the extensions map; empty for a whole field. */
+    /** Item key inside a list or the extensions map; empty for a whole field or a list's order. */
     key: string
     status: UpdateItemStatus
     mine: unknown
@@ -245,6 +245,9 @@ function reordered(list: Map<string, unknown>, base: Map<string, unknown>): bool
     return false
 }
 
+/** Entry names in list order, shown for the order of a list itself. */
+const entryNames = (list: Map<string, unknown>) => [...list.values()].map((entry: any) => String(entry?.comment || entry?.name || entry?.in || entry?.[0] || ''))
+
 /**
  * Compares the installed entity (mine), the import (theirs) and the import as
  * it was installed (base, null when unknown). Fields the import does not set
@@ -269,7 +272,12 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         if (keyOf || silentKeys) {
             const read = keyOf ? (value: unknown) => keyed(keyOf, value) : mapEntries
             const mineMap = read(m), theirsMap = read(t), baseMap = read(b)
-            if (keyOf && reordered(mineMap, baseMap) && !reordered(theirsMap, baseMap)) keepOrder.push(field)
+            const mineReordered = !!keyOf && reordered(mineMap, baseMap)
+            if (mineReordered && !reordered(theirsMap, baseMap)) keepOrder.push(field)
+            // Both reordered it: the user picks whose order the list follows.
+            else if (mineReordered && reordered(mineMap, theirsMap)) {
+                items.push({ id: field, field, key: '', status: 'conflict', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: true, choice: null })
+            }
             for (const key of new Set([...theirsMap.keys(), ...mineMap.keys(), ...baseMap.keys()])) {
                 if (!mineMap.has(key) && !theirsMap.has(key)) continue
                 if (silentKeys?.has(key)) continue
@@ -344,7 +352,7 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
         if (has(spec.lists, field)) {
-            result[field] = mergeList(spec.lists[field], spec.lore.has(field), m, t, fieldChoices, plan.keepOrder?.includes(field))
+            result[field] = mergeList(spec.lists[field], spec.lore.has(field), m, t, fieldChoices, plan.keepOrder?.includes(field) || fieldChoices.get('') === 'mine')
         } else if (has(spec.maps, field)) {
             const silentKeys = spec.maps[field]
             const out: Record<string, unknown> = {}

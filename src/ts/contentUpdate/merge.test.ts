@@ -137,16 +137,22 @@ describe('applyUpdate', () => {
         expect(merged.extentions).toEqual({ color: 'blue', mood: 'mine', [UPDATE_BASE_EXTENSION_KEY]: 'assets/new.json' })
     })
 
-    it('keeps the order of whichever side reordered the list, and the author order when both did', () => {
+    it('keeps the order of whichever side reordered the list, and asks whose order when both did', () => {
         const regex = (comment: string) => ({ comment, type: 'editoutput', in: comment, out: '' })
-        const order = (merged: any) => merged.customscript.map((script: any) => script.comment)
-        const merge = (base: string[], mine: string[], theirs: string[]) => {
-            const [b, m, t] = [base, mine, theirs].map((list) => ({ name: 'Luna', customscript: list.map(regex) }))
-            return order(applyUpdate(CHARACTER_UPDATE, m as any, t as any, planUpdate(CHARACTER_UPDATE, m as any, t as any, b as any)))
+        const plan = (base: string[], mine: string[], theirs: string[]) => {
+            const [b, m, t] = [base, mine, theirs].map((list) => ({ name: 'Luna', customscript: list.map(regex) })) as any[]
+            return { m, t, plan: planUpdate(CHARACTER_UPDATE, m, t, b) }
         }
-        expect(merge(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'N', 'C'])).toEqual(['C', 'A', 'B', 'N'])
-        expect(merge(['A', 'B', 'C'], ['A', 'B', 'C', 'Own'], ['B', 'A', 'C'])).toEqual(['B', 'A', 'C', 'Own'])
-        expect(merge(['A', 'B', 'C'], ['C', 'B', 'A'], ['B', 'A', 'C'])).toEqual(['B', 'A', 'C'])
+        const merge = (lists: ReturnType<typeof plan>, choices = {}) =>
+            applyUpdate(CHARACTER_UPDATE, lists.m, lists.t, lists.plan, choices).customscript.map((script: any) => script.comment)
+        expect(merge(plan(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'N', 'C']))).toEqual(['C', 'A', 'B', 'N'])
+        expect(merge(plan(['A', 'B', 'C'], ['A', 'B', 'C', 'Own'], ['B', 'A', 'C']))).toEqual(['B', 'A', 'C', 'Own'])
+        expect(plan(['A', 'B', 'C'], ['B', 'A', 'C'], ['B', 'A', 'C']).plan.items).toEqual([])
+
+        const both = plan(['A', 'B', 'C'], ['B', 'A', 'C'], ['A', 'C', 'B'])
+        expect(both.plan.items).toMatchObject([{ id: 'customscript', status: 'conflict', choice: null, mine: ['B', 'A', 'C'], theirs: ['A', 'C', 'B'] }])
+        expect(merge(both, { customscript: 'mine' })).toEqual(['B', 'A', 'C'])
+        expect(merge(both, { customscript: 'theirs' })).toEqual(['A', 'C', 'B'])
     })
 
     it('tells apart assets that share a name from one named like a second copy', () => {

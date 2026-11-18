@@ -22,7 +22,7 @@ import {
 } from '../storage/persistentDataRuntime.svelte'
 import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from '../storage/deletedOwnerAssetCleanup'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from '../storage/characterOrderMutation'
-import { editableText, editedValue, isEditable, loreFolderNames } from './view'
+import { editableText, editedValue, isEditable, loreFolderNames, updateGroupOf } from './view'
 import {
     CHARACTER_UPDATE,
     MODULE_UPDATE,
@@ -69,7 +69,10 @@ interface Entity<T extends object> {
     read(id: string): Promise<T | null>
     name(value: T): string
     baseKey(value: T): string | undefined
-    /** Format upgrades the app applies on its own, so they do not read as the user's edits. */
+    /**
+     * Format upgrades the app applies on its own, so they do not read as the user's edits.
+     * Low-level access left out is off, so the access the user turned on is always compared.
+     */
     normalize<P extends Partial<T>>(value: P): Promise<P>
     /** Busy right now: updating would race a running request. */
     busy(id: string): boolean
@@ -107,6 +110,7 @@ const characters: Entity<CharacterDetail> = {
         const [{ updateLorebooks }, { updateInlayScreen }] = await Promise.all([import('../characters'), import('../process/inlayScreen')])
         if (Array.isArray(value.globalLore)) value.globalLore = updateLorebooks(value.globalLore)
         if (!value.newGenData && value.viewScreen) updateInlayScreen(value as unknown as character)
+        value.lowLevelAccess = !!value.lowLevelAccess
         return value
     },
     // From the start of a request, before a first token or without streaming.
@@ -125,6 +129,7 @@ const modules: Entity<RisuModule> = {
     normalize: async (value) => {
         const { updateLorebooks } = await import('../characters')
         if (Array.isArray(value.lorebook)) value.lorebook = updateLorebooks(value.lorebook)
+        value.lowLevelAccess = !!value.lowLevelAccess
         return value
     },
     busy: () => false,
@@ -294,8 +299,8 @@ export function chooseContentUpdateMany(ids: string[], side: UpdateSide) {
 
 /**
  * Uses an earlier file of this character or module as the base, for an install
- * that has no record of the version it came from. Fields the file does not
- * carry, such as asset paths, are empty in that base, so one both sides set is asked about.
+ * that has no record of the version it came from. The file's assets are not
+ * read, so an asset the two sides differ on, a removed one too, is asked about.
  */
 export async function loadContentUpdateBaseFile() {
     const dialog = contentUpdateDialog
@@ -315,6 +320,7 @@ export async function loadContentUpdateBaseFile() {
         const { readUpdateBaseFile } = await import('./baseFile')
         const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
         const plan = planUpdate(entity.spec, mine, incoming, base)
+        for (const item of plan.items) if (updateGroupOf(item) === 'asset') Object.assign(item, { status: 'differs', baseKnown: false, choice: null })
         const ids = new Set(plan.items.map((item) => item.id))
         dialog.plan = plan
         dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id]) => ids.has(id)))
@@ -501,10 +507,12 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
         return await foldCharacterUpdate(decision, incoming, baseKey)
     } catch (error) {
         console.error(error)
-        alertError(`${language.risuNest.contentUpdate.failed}\n${error instanceof Error ? error.message : String(error)}`)
         // The import is a new character unless it stayed the trashed copy of the installed one.
         const kept = await characters.read(incoming.chaId).catch(() => null)
-        return kept && !kept.trashTime ? incoming.chaId : null
+        const installed = !!kept && !kept.trashTime
+        const text = language.risuNest.contentUpdate
+        alertError(`${installed ? text.failed : text.notUpdated}\n${error instanceof Error ? error.message : String(error)}`)
+        return installed ? incoming.chaId : null
     }
 }
 

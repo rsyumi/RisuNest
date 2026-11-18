@@ -1868,6 +1868,7 @@ export const languageKorean = {
             moduleBackupNote: '업데이트한 모듈은 이전 상태로 되돌릴 수 없습니다.',
             busy: '이 캐릭터가 응답을 생성하고 있습니다. 응답이 끝난 뒤 업데이트해주세요.',
             failed: '업데이트하지 못했으며, 가져온 파일은 새로 설치되었습니다.',
+            notUpdated: '업데이트하지 못했습니다.',
             update: '업데이트',
             back: '뒤로',
             backupSuffix: '(업데이트 전)',

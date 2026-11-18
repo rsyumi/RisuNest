@@ -2046,6 +2046,7 @@ export const languageEnglish = {
             moduleBackupNote: 'An updated module cannot be returned to its earlier state.',
             busy: 'This character is generating a response. Update it after the response finishes.',
             failed: 'The update failed, and the imported file was installed as new.',
+            notUpdated: 'The update failed.',
             update: 'Update',
             back: 'Back',
             backupSuffix: '(before update)',
