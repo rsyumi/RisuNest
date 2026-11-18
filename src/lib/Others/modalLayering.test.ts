@@ -7,10 +7,13 @@ const alertComp = readFileSync('src/lib/Others/AlertComp.svelte', 'utf8')
 const customSidebarConfig = readFileSync('src/lib/Others/CustomSidebarConfig.svelte', 'utf8')
 const categoryManagerModal = readFileSync('src/lib/Others/HypaV3Modal/category-manager-modal.svelte', 'utf8')
 const tagManagerModal = readFileSync('src/lib/Others/HypaV3Modal/tag-manager-modal.svelte', 'utf8')
+const importDropOverlay = readFileSync('src/lib/Others/ImportDropOverlay.svelte', 'utf8')
+const importIntakeSheet = readFileSync('src/lib/Others/ImportIntakeSheet.svelte', 'utf8')
 const irisModal = readFileSync('src/lib/Others/IrisModal.svelte', 'utf8')
 const onboardingModal = readFileSync('src/lib/Others/OnboardingModal.svelte', 'utf8')
 const nativeFileJobDialog = readFileSync('src/lib/Others/NativeFileJobDialog.svelte', 'utf8')
 const persistentWorkingSetRecovery = readFileSync('src/lib/Others/PersistentWorkingSetRecovery.svelte', 'utf8')
+const pluginInstallDialog = readFileSync('src/lib/Others/PluginInstallDialog.svelte', 'utf8')
 const updatePopup = readFileSync('src/lib/Others/UpdatePopup.svelte', 'utf8')
 const popupEditor = readFileSync('src/lib/Others/PopupEditor.svelte', 'utf8')
 const textEditorPopup = readFileSync('src/lib/Others/TextEditorPopup.svelte', 'utf8')
@@ -35,7 +38,9 @@ const observer = readFileSync('src/ts/observer.svelte.ts', 'utf8')
  * Full-screen modals (alerts, confirmations, permission prompts, pickers) sit on the shared
  * `z-modal` layer above the z-[1000] work dialogs. The two work dialogs that have to cover
  * the z-[1000] ones name their layer instead of writing it out: `z-work-dialog-update` for
- * the update dialog and `z-work-dialog-recovery` for the working-set recovery. In-screen
+ * the update dialog, `z-work-dialog-recovery` for the working-set recovery and
+ * `z-work-dialog-plugin` for the plugin install dialog over the import sheet. The drop overlay
+ * sits on `z-drop-overlay` above every work dialog and below the modals. In-screen
  * layers such as chat overlay buttons, context menus, drag ghosts, and the text area stack
  * keep their local z-index so their internal ordering (for example the z-100 autocomplete
  * above the z-50 editor) survives. The code block menu is appended to the body and opens over
@@ -71,12 +76,15 @@ const inScreenSources: Record<string, string> = {
 
 const workDialogSources: Record<string, string> = {
     'NativeFileJobDialog.svelte': nativeFileJobDialog,
+    'ImportIntakeSheet.svelte': importIntakeSheet,
     'ChatScreens/ChatScreenshotDialog.svelte': chatScreenshotDialog,
 }
 
 const coveringDialogSources: Record<string, string> = {
     'UpdatePopup.svelte': updatePopup,
     'PersistentWorkingSetRecovery.svelte': persistentWorkingSetRecovery,
+    'PluginInstallDialog.svelte': pluginInstallDialog,
+    'ImportDropOverlay.svelte': importDropOverlay,
 }
 
 // Vitest serves CSS modules as empty strings, so read the stylesheet from disk.
@@ -149,6 +157,11 @@ describe('modal layering', () => {
         expect(styles).toMatch(/@utility z-work-dialog-recovery \{\s*z-index: 1100;\s*\}/)
         expect(count(updatePopup, 'z-work-dialog-update')).toBe(1)
         expect(count(persistentWorkingSetRecovery, 'z-work-dialog-recovery')).toBe(1)
+        expect(count(pluginInstallDialog, 'z-work-dialog-plugin')).toBe(1)
+        expect(count(importDropOverlay, 'z-drop-overlay')).toBe(1)
+        expect(utilityZIndex('z-work-dialog-plugin')).toBeGreaterThan(1000)
+        expect(utilityZIndex('z-drop-overlay')).toBeGreaterThan(utilityZIndex('z-work-dialog-recovery'))
+        expect(utilityZIndex('z-drop-overlay')).toBeLessThan(utilityZIndex('z-modal'))
         for (const [name, source] of Object.entries(coveringDialogSources)) {
             expect(/z-\[\d+\]/.test(source), `${name} still writes its z-index out`).toBe(false)
             expect(count(source, 'z-modal'), name).toBe(0)

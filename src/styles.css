@@ -531,6 +531,16 @@ select optgroup {
   z-index: 1100;
 }
 
+/* The plugin install dialog opens over the import sheet, and the drop overlay shows over every
+   work dialog while files are dragged in. Both stay below z-modal. */
+@utility z-work-dialog-plugin {
+  z-index: 1050;
+}
+
+@utility z-drop-overlay {
+  z-index: 1200;
+}
+
 /* A QR scan shows the camera behind the transparent web view, so only its overlay is painted. */
 html[data-risunest-qr-scan],
 html[data-risunest-qr-scan] body {

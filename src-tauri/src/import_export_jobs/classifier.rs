@@ -90,7 +90,7 @@ pub fn classify_content(
     })
 }
 
-fn probe_charx(
+pub(crate) fn probe_charx(
     reader: &mut (impl Read + Seek),
     metadata_limit: u64,
     max_entries: usize,

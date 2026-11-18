@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const runtime = vi.hoisted(() => ({
     flushPendingData: vi.fn(async (_reason: string) => undefined),
     readPreset: vi.fn(async (_id: string): Promise<{ revision: number, value: unknown } | null> => null),
+    mutatePresets: vi.fn(),
 }))
 
 vi.mock('../parser/parser.svelte', async () => (await import('../parser/parser.testSupport')).parserStubModule())
 vi.mock('./persistentDataRuntime.svelte', async (importOriginal) => ({
     ...await importOriginal<typeof import('./persistentDataRuntime.svelte')>(),
     flushPendingData: runtime.flushPendingData,
+    mutatePersistentPresets: runtime.mutatePresets,
     getPersistentDataRuntime: () => ({ store: { readPreset: runtime.readPreset } }),
 }))
 
@@ -22,6 +24,7 @@ import {
     carryPresetBinding,
     getDatabase,
     getEffectivePresetId,
+    importPreset,
     normalizeDatabaseDefaults,
     setDatabase,
     setEffectivePresetOverride,
@@ -242,5 +245,17 @@ describe('conversation preset binding', () => {
 
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
+    })
+})
+
+describe('preset file import', () => {
+    it('reports the index of the preset it added', async () => {
+        runtime.mutatePresets.mockImplementation(async (_reason: string, mutate: (state: unknown) => void) => {
+            const database = getDatabase()
+            mutate({ root: database, presets: database.botPresets })
+        })
+        const data = new TextEncoder().encode(JSON.stringify({ name: 'Imported C', mainPrompt: 'Prompt C' }))
+        await expect(importPreset({ name: 'synthetic.json', data })).resolves.toBe(2)
+        expect(getDatabase().botPresets[2]).toMatchObject({ name: 'Imported C', mainPrompt: 'Prompt C' })
     })
 })

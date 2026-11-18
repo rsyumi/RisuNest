@@ -7,6 +7,8 @@ vi.mock('./libraryCharacters', () => ({hasLibraryCharacters:characters}))
 import {confirmUpstreamLibraryReplacement} from './upstreamReplacement'
 import {language} from '../../lang'
 
+const details = [{label:language.risuNest.importIntake.detailFile,value:'synthetic.risunest · 1.0 KiB'},{label:language.risuNest.importIntake.detailKind,value:language.risuNest.importIntake.kindBackupPortable}]
+
 beforeEach(() => {
     characters.mockReset().mockResolvedValue(true)
 })
@@ -18,8 +20,9 @@ afterEach(() => {
 describe('upstream import acknowledgement', () => {
     it.each([false,true])('requires a checked acknowledgement and includes every warning, bound=%s', async bound => {
         dialog.mockResolvedValueOnce({confirmed:true,checked:true})
-        await expect(confirmUpstreamLibraryReplacement(bound,['cold warning','inlay warning'])).resolves.toBe(true)
+        await expect(confirmUpstreamLibraryReplacement(bound,['cold warning','inlay warning'],{details})).resolves.toBe(true)
         expect(dialog).toHaveBeenLastCalledWith(expect.objectContaining({
+            details,
             description:[bound ? language.lwwSync.restoreDescriptionBound : language.lwwSync.restoreDescription,'cold warning','inlay warning'].join('\n\n'),
             checkboxLabel:language.lwwSync.restoreAcknowledge,requireChecked:true,
         }))
@@ -30,7 +33,7 @@ describe('upstream import acknowledgement', () => {
     })
     it.each([false,true])('restores without asking when the library holds no character, bound=%s', async bound => {
         characters.mockResolvedValue(false)
-        await expect(confirmUpstreamLibraryReplacement(bound)).resolves.toBe(true)
+        await expect(confirmUpstreamLibraryReplacement(bound,[],{details})).resolves.toBe(true)
         expect(characters).toHaveBeenCalledOnce()
         expect(dialog).not.toHaveBeenCalled()
         expect(actionDialog).not.toHaveBeenCalled()
@@ -38,9 +41,10 @@ describe('upstream import acknowledgement', () => {
     it.each([[false,true],[true,false]])('shows only the backup warnings when the library holds no character, bound=%s answer=%s', async (bound, answer) => {
         characters.mockResolvedValue(false)
         actionDialog.mockResolvedValueOnce(answer)
-        await expect(confirmUpstreamLibraryReplacement(bound,['cold warning','inlay warning'])).resolves.toBe(answer)
+        await expect(confirmUpstreamLibraryReplacement(bound,['cold warning','inlay warning'],{details})).resolves.toBe(answer)
         expect(dialog).not.toHaveBeenCalled()
         expect(actionDialog).toHaveBeenCalledExactlyOnceWith({
+            details,
             title:language.lwwSync.restoreTitle, description:['cold warning','inlay warning'].join('\n\n'),
             actionLabel:language.lwwSync.restoreAction, cancelLabel:language.lwwSync.cancelAction,
         })

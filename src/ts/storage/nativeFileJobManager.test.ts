@@ -15,6 +15,7 @@ import {
     recordRecoveredNativeFileOperation,
     runExternalAndroidNativeFileOperation,
     runSharedNativeFileOperation,
+    waitForNativeFileOperationIdle,
     type NativeFileOperationOutcome,
     type SharedNativeFileOperationContext,
 } from './nativeFileJobManager'
@@ -480,6 +481,7 @@ describe('renderer-lifetime native file job manager', () => {
             context.beginBatch(3)
             context.beginBatchItem(1, { name: 'first.charx', bytes: 128 })
             context.onStatus(finished)
+            context.setLocation({ kind: 'character', chaId: 'first' })
             context.recordBatchItem('first.charx', { imported: true })
             context.beginBatchItem(2, { name: 'broken.charx' })
             const running = get(nativeFileOperation)
@@ -487,6 +489,7 @@ describe('renderer-lifetime native file job manager', () => {
             expect(running?.status).toBeUndefined()
             expect(running?.observedStages).toEqual([])
             expect(running?.batch).toMatchObject({ index: 2, total: 3, imported: 1 })
+            context.setLocation({ kind: 'module' })
             context.recordBatchItem('broken.charx', { error: failure })
             context.beginBatchItem(3, { name: 'declined.charx' })
             context.recordBatchItem('declined.charx', { imported: false })
@@ -499,6 +502,27 @@ describe('renderer-lifetime native file job manager', () => {
             warningCodes: ['cleanup-failed'],
             batch: { total: 3, imported: 1, failures: [{ name: 'broken.charx', error }], declined: ['declined.charx'] },
         })
+        // Each file keeps its own ending; a location set before a failure is not carried to the next file.
+        expect(get(nativeFileOperationOutcome)?.batch?.entries).toEqual([
+            { name: 'first.charx', state: 'imported', location: { kind: 'character', chaId: 'first' } },
+            { name: 'broken.charx', state: 'failed', error },
+            { name: 'declined.charx', state: 'declined' },
+        ])
+
+        dismissNativeFileOperationOutcome()
+        await runSharedNativeFileOperation('import', 'content:one', async context => {
+            context.setLocation({ kind: 'preset' })
+            return 'preset-1'
+        }, { presentation: 'dialog', format: 'content' })
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ state: 'succeeded', location: { kind: 'preset' } })
+        let idle = false
+        const waiting = waitForNativeFileOperationIdle().then(() => { idle = true })
+        await new Promise(resolve => setTimeout(resolve, 0))
+        // The shown outcome still covers the screen.
+        expect(idle).toBe(false)
+        dismissNativeFileOperationOutcome()
+        await waiting
+        expect(idle).toBe(true)
 
         dismissNativeFileOperationOutcome()
         await runSharedNativeFileOperation('import', 'content-picker', async context => {

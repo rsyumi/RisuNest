@@ -9,8 +9,10 @@
     import LoreBookList from "./LoreBookList.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import { selectedCharID } from "src/ts/stores.svelte";
+    import { openedImportResult } from "src/ts/importIntake/sheetStore";
 
     let submenu = $state(0)
+    $effect(() => { if ($openedImportResult?.kind === 'character-lorebook') submenu = 0 })
     interface Props {
         globalMode?: boolean;
     }

@@ -2555,10 +2555,11 @@ export async function readPresetBodies(ids: readonly number[], expectedNames: Pr
 }
 
 
+/** Adds the preset a file holds and returns its index in the preset list; undefined when no file was chosen. */
 export async function importPreset(f:{
     name:string
     data:Uint8Array
-}|null = null){
+}|null = null): Promise<number | undefined>{
     if(!f){
         f = await selectSingleFile(["json", "preset", "risupreset", "risup"])
     }
@@ -2604,8 +2605,7 @@ export async function importPreset(f:{
         pr.NAISettings.mirostat_lr = pre.parameters.mirostat_lr
         pr.NAISettings.mirostat_tau = pre.parameters.mirostat_tau
         pr.name = pre.name ?? "Imported"
-        await addPreset(pr)
-        return
+        return await addPreset(pr)
     }
 
     if(Array.isArray(pre?.prompt_order?.[0]?.order) && Array.isArray(pre?.prompts)){
@@ -2710,12 +2710,11 @@ export async function importPreset(f:{
         }
         pr.promptTemplate = normalizePromptTemplate(pr.promptTemplate)
         pr.name = "Imported ST Preset"
-        await addPreset(pr)
-        return
+        return await addPreset(pr)
     }
     importMessageNameSettings(pre)
     pre.name ??= "Imported"
-    await addPreset(pre)
+    return await addPreset(pre)
 }
 
 function normalizePromptRole(role: unknown): 'user'|'bot'|'system'|null {

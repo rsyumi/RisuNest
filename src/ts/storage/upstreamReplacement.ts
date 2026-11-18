@@ -1,3 +1,4 @@
+import type { AlertConfirmDetail } from '../alert'
 import type { PersistentDataRuntime, PersistentDestructiveReplacementFence } from './persistentDataRuntime'
 import type {PersistentMutationToken} from './saveCoordinator'
 
@@ -47,10 +48,12 @@ export async function acquireUpstreamImportPause(runtime: UpstreamReplacementRun
     }
 }
 
-export async function confirmUpstreamLibraryReplacement(bound: boolean, warnings: string[] = [], options: { firstRun?: boolean } = {}): Promise<boolean> {
+/** `details` names the file a restore reads; a restore without a file leaves it out. */
+export async function confirmUpstreamLibraryReplacement(bound: boolean, warnings: string[] = [], options: { firstRun?: boolean; details?: AlertConfirmDetail[] } = {}): Promise<boolean> {
     const [alert, { language }, { hasLibraryCharacters }] = await Promise.all([
         import('../alert'), import('../../lang'), import('./libraryCharacters'),
     ])
+    const details = options.details?.length ? { details: options.details } : {}
     // Keep first-run intent across staging, independently of library reads.
     if ((!bound && options.firstRun) || !await hasLibraryCharacters()) {
         return warnings.length === 0 || await alert.alertActionConfirm({
@@ -58,6 +61,7 @@ export async function confirmUpstreamLibraryReplacement(bound: boolean, warnings
             description: warnings.join('\n\n'),
             actionLabel: language.lwwSync.restoreAction,
             cancelLabel: language.lwwSync.cancelAction,
+            ...details,
         })
     }
     return (await alert.alertCheckboxConfirm({
@@ -67,5 +71,6 @@ export async function confirmUpstreamLibraryReplacement(bound: boolean, warnings
         actionLabel: language.lwwSync.restoreAction,
         cancelLabel: language.lwwSync.cancelAction,
         requireChecked: true,
+        ...details,
     })).confirmed
 }

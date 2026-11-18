@@ -1877,6 +1877,9 @@ describe('native file jobs', () => {
         ])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
         expect(JSON.stringify(calls)).not.toContain('databaseBytes')
+        // An account restore reads no file, so its confirmation names none.
+        expect(restoreAlerts.checkbox).toHaveBeenCalledOnce()
+        expect(restoreAlerts.checkbox.mock.calls[0][0]).not.toHaveProperty('details')
     })
 
     it('returns a missing official snapshot without taking the replacement fence', async () => {
@@ -5178,13 +5181,14 @@ it.each(['both', 'cold', 'inlay', 'characters', 'pluginStorage', 'missingAssets'
     const preview = { unavailableColdKeys: kind === 'inlay' || omissionsOnly ? [] : ['missing'], characterNames: ['Synthetic'], invalidInlays: kind === 'cold' || omissionsOnly ? [] : ['inlay_aa.risuinlay'], omissions }
     const host = createNativeJobHost([{ ...status('waitingForInput'), phase: 'awaiting-activation', incompleteRestorePreview: preview }, status('cancelled')])
     const acquire = vi.fn()
+    const details = [{ label: language.risuNest.importIntake.detailFile, value: 'synthetic.bin' }, { label: language.risuNest.importIntake.detailKind, value: language.risuNest.importIntake.kindBackupLocal }]
     await expect(runNativeLegacyLocalBackupRestore(
-        restoreRuntime(17, { acquire }), { type: 'desktopPath', path: 'synthetic.bin' }, {}, host.dependencies,
+        restoreRuntime(17, { acquire }), { type: 'desktopPath', path: 'synthetic.bin' }, { confirmationDetails: details }, host.dependencies,
     )).rejects.toMatchObject({ name: 'AbortError' })
     expect(acquire).not.toHaveBeenCalled()
     expect(restoreAlerts.checkbox).toHaveBeenCalledTimes(1)
     expect(restoreAlerts.confirm).not.toHaveBeenCalled()
-    expect(restoreAlerts.checkbox).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true }))
+    expect(restoreAlerts.checkbox).toHaveBeenCalledWith(expect.objectContaining({ requireChecked: true, details }))
     const description = restoreAlerts.checkbox.mock.calls[0][0].description
     if (kind === 'characters') expect(description).toContain(language.portableBackup.omittedRestoreData.excludedCharacters(3))
     else expect(description).not.toContain(language.portableBackup.omittedRestoreData.excludedCharacters(0))

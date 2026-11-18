@@ -114,8 +114,9 @@ export async function importDesktopNativeCharacterFromPicker<T>(
 export async function importDesktopNativeCharacterPath<T>(
     path: string,
     dependencies: NativeCharacterFileRoutePathDependencies<T>,
+    /** The name the importers go by, which can differ from the file's own when its content decided the format. */
+    displayName = fileNameFromPath(path),
 ): Promise<NativeCharacterFileRouteResult<T>> {
-    const displayName = fileNameFromPath(path)
     if (!isNativeCharacterCandidate(displayName) || !dependencies.nativeEnabled()) {
         return importLegacy(path, displayName, dependencies)
     }

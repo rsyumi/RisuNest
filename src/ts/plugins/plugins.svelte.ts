@@ -31,6 +31,7 @@ import {
     registerPluginStorageLifecycle,
 } from "./pluginStorageStore";
 import { UNOWNED_PLUGIN_OWNER } from "./pluginOwner";
+import { compareVersions, parsePluginHeader, stripPluginBom } from "./pluginHeader";
 import { applyPluginDatabaseUpdate } from "./pluginDatabaseAccess";
 import type { ChatOutputListener } from './pluginChatOutputListeners'
 
@@ -68,19 +69,6 @@ export async function createBlankPlugin(){
 Risuai.log("Hello from New Plugin!");
 `.trim()
     )
-}
-
-const compareVersions = (v1: string, v2: string): 0|1|-1 => {
-    const v1parts = v1.split('.').map(Number);
-    const v2parts = v2.split('.').map(Number);
-    const len = Math.max(v1parts.length, v2parts.length);
-    for (let i = 0; i < len; i++) {
-        const part1 = v1parts[i] || 0;
-        const part2 = v2parts[i] || 0;
-        if (part1 > part2) return 1;
-        if (part1 < part2) return -1;
-    }
-    return 0;
 }
 
 const updateCache = new Map<string, { version: string, updateURL: string } | undefined>();
@@ -159,6 +147,8 @@ export async function importPlugin(code:string|null = null, argu:{
     isTypescript?: boolean
     installIfMissing?: string
     deferReload?: boolean
+    /** The caller already asked about replacing a plugin with the same name. */
+    confirmed?: boolean
 } = {}): Promise<boolean> {
     try {
         const authorityEpoch = getPersistentStorageAuthorityEpoch()
@@ -179,200 +169,42 @@ export async function importPlugin(code:string|null = null, argu:{
                 isTypescript = true
             }
             //support utf-8 with BOM or without BOM
-            jsFile = Buffer.from(f.data).toString('utf-8').replace(/^\uFEFF/gm, "");
+            jsFile = stripPluginBom(Buffer.from(f.data).toString('utf-8'));
         }
         else{
             jsFile = code
         }
 
-        const splitedJs = jsFile.split('\n')
-        let name = ''
-        for (const line of splitedJs) {
-            if (line.startsWith('//@name')) {
-                name = line.slice(7).trim()
-                break
-            }
-        }
+        const { header, error: headerError } = parsePluginHeader(jsFile)
+        const name = header.name
 
-        const showError = (msg: string) => {
+        const showError = (msg: string, pluginName = name) => {
             if(argu.isHotReload || argu.installIfMissing){
-                console.error(`Plugin "${name}" error: ${msg}`)
+                console.error(`Plugin "${pluginName}" error: ${msg}`)
             }
             else{
                 alertError(msg)
             }
         }
 
-        let displayName: string = undefined
-        let arg: { [key: string]: 'int' | 'string' | string[] } = {}
-        let realArg: { [key: string]: number | string } = {}
-        let argMeta: { [key: string]: {[key:string]:string} } = {}
-        let customLink: ProviderPluginCustomLink[] = []
-        let updateURL: string = ''
-        let versionOfPlugin: string = '' //This is the version of the plugin itself, not the API version
-        let apiVersion = '2.0'
-        let ipcList: string[] = []
-        for (const line of splitedJs) {
-            if (line.startsWith('//@name')) {
-                const provied = line.slice(7)
-                if (provied === '') {
-                    showError('plugin name must be longer than 0, did you put it correctly?')
-                    return false
-                }
-                name = provied.trim()
-            }
-            if(line.startsWith('//@api')){
-                const proviedVersions = line.slice(6).trim().split(' ')
-                const supportedVersions = ['2.0','2.1','3.0']
-                for(const ver of proviedVersions){
-                    if(supportedVersions.includes(ver)){
-                        apiVersion = ver
-                        break
-                    }
-                    else{
-                        console.warn(`Plugin API version "${ver}" is not supported.`)
-                    }
-                }
-            }
-            if (line.startsWith('//@display-name')) {
-                const provied = line.slice('//@display-name'.length + 1)
-                if (provied === '') {
-                    showError('plugin display name must be longer than 0, did you put it correctly?')
-                    return false
-                }
-                displayName = provied.trim()
-            }
-
-            if (line.startsWith('//@link')) {
-                const link = line.split(" ")[1]
-                if (!link || link === '') {
-                    showError('plugin link is empty, did you put it correctly?')
-                    return false
-                }
-                if (!link.startsWith('https')) {
-                    showError('plugin link must start with https, did you check it?')
-                    return false
-                }
-                const hoverText = line.split(' ').slice(2).join(' ').trim()
-                if (hoverText === '') {
-                    // OK, no hover text. It's fine.
-                    customLink.push({
-                        link: link,
-                        hoverText: undefined
-                    });
-                }
-                else
-                    customLink.push({
-                        link: link,
-                        hoverText: hoverText || undefined
-                    });
-            }
-            if (line.startsWith('//@risu-arg') || line.startsWith('//@arg')) {
-                const provied = line.trim().split(' ')
-                if (provied.length < 3) {
-                    showError('plugin argument is incorrect, did you put space in argument name?')
-                    return false
-                }
-                const provKey = provied[1]
-
-                if (provied[2] !== 'int' && provied[2] !== 'string') {
-                    showError(`plugin argument type is "${provied[2]}", which is an unknown type.`)
-                    return false
-                }
-                if (provied[2] === 'int') {
-                    arg[provKey] = 'int'
-                    realArg[provKey] = 0
-                }
-                else if (provied[2] === 'string') {
-                    arg[provKey] = 'string'
-                    realArg[provKey] = ''
-                }
-
-                if(provied.length > 3){
-                    const meta: {[key:string]:string} = {}
-                    //Compatibility layer for unofficial meta
-                    let metaStr = provied.slice(3).join(' ').replace(
-                        /{{(.+?)(::?(.+?))?}}/g,
-                        (a,g1:string,g2,g3:string) => {
-                            console.log(g1,g3)
-                            meta[g1] = g3 || '1'
-                            return ''
-                        }
-                    ).trim()
-
-                    if(metaStr){
-                        meta['description'] = metaStr
-                    }
-
-                    argMeta[provKey] = meta
-                }
-            }
-
-            if(line.startsWith('//@update-url')){
-                updateURL = line.split(' ')[1]
-
-                try {
-                    const url = new URL(updateURL)
-                    if(url.protocol !== 'https:'){
-                        showError('plugin update URL must start with https, did you put it correctly?')
-                        return false
-                    }
-                } catch (error) {
-                    showError('plugin update URL is not a valid URL, did you put it correctly?')
-                    return false
-                }
-            }
-
-            if(line.startsWith('//@version')){
-                versionOfPlugin = line.split(' ').slice(1).join(' ').trim()
-
-                const versionLocation = jsFile.indexOf('//@version')
-                const numberOfBytesBefore = new TextEncoder().encode(jsFile.slice(0, versionLocation) + line).length
-                if(numberOfBytesBefore > 500){
-                    showError('plugin version declaration must be within the first 512 Bytes of the file for proper parsing. move //@version line to the top of the file.')
-                    return false
-                }
-            }
-
-            if(line.startsWith('//@allowed-ipc')){
-                const provied = line.trim().split(' ')
-                if(provied.length < 2){
-                    showError('plugin allowed IPC declaration is incorrect, did you put space after //@allowed-ipc?')
-                    return false
-                }
-
-                const allowedIPCList = provied.slice(1)
-
-                ipcList.push(...allowedIPCList)
-            }
-        }
-
-        if (name.length === 0) {
-            showError('plugin name not found, did you put it correctly?')
+        if (headerError) {
+            showError(headerError.message, headerError.name)
             return false
         }
 
-        if (name === '*') {
-            showError('plugin name cannot be "*".')
-            return false
+        const apiVersion = header.apiVersion
+        const realArg: { [key: string]: number | string } = {}
+        for (const [key, type] of Object.entries(header.arguments)) {
+            realArg[key] = type === 'int' ? 0 : ''
         }
 
-        if(updateURL && versionOfPlugin.length === 0){
-            showError('plugin version not found, did you put it correctly? It is required when update URL is provided.')
-            return false
-        }
 
-        if(versionOfPlugin && compareVersions(versionOfPlugin, '0.0.1') === -1){
-            showError('plugin version must be at least 0.0.1')
-            return false
-        }
-
-        
         if(isTypescript){
             try {
-                jsFile = await pluginCodeTranspiler(jsFile)                
+                jsFile = await pluginCodeTranspiler(jsFile)
             } catch (error) {
                 showError('Failed to transpile TypeScript code: ' + error.message)
+                return false
             }
         }
 
@@ -390,14 +222,14 @@ export async function importPlugin(code:string|null = null, argu:{
             name: name,
             script: jsFile,
             realArg: realArg,
-            arguments: arg,
-            displayName: displayName,
+            arguments: header.arguments,
+            displayName: header.displayName,
             version: '3.0',
-            customLink: customLink,
-            argMeta: argMeta,
-            versionOfPlugin: versionOfPlugin,
-            updateURL: updateURL,
-            allowedIPC: ipcList,
+            customLink: header.customLink,
+            argMeta: header.argMeta,
+            versionOfPlugin: header.versionOfPlugin,
+            updateURL: header.updateURL,
+            allowedIPC: header.allowedIPC,
             enabled: true
         }
 
@@ -415,7 +247,7 @@ export async function importPlugin(code:string|null = null, argu:{
         }
 
 
-        if(!isUpdate && oldPluginIndex !== -1){
+        if(!isUpdate && !argu.confirmed && oldPluginIndex !== -1){
             const c = await alertConfirm(language.duplicatePluginFoundUpdateIt)
             if(!c){
                 return false
@@ -427,6 +259,14 @@ export async function importPlugin(code:string|null = null, argu:{
         oldPluginIndex = db.plugins.findIndex((p: RisuPlugin) => p.name === pluginData.name)
         if(argu.installIfMissing && oldPluginIndex !== -1) return false
         if(oldPluginIndex !== -1){
+            // Keep the user's values for arguments the new version declares with the same type.
+            const previous: Partial<RisuPlugin> | undefined = db.plugins[oldPluginIndex]
+            for (const [key, type] of Object.entries(pluginData.arguments)) {
+                const value = previous?.realArg?.[key]
+                if (previous?.arguments?.[key] === type && value !== undefined && value !== null) {
+                    pluginData.realArg[key] = value
+                }
+            }
             db.plugins[oldPluginIndex] = pluginData;
         }
         else if(!isUpdate || argu.isHotReload){

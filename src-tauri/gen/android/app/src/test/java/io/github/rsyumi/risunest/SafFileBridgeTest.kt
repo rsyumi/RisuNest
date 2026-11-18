@@ -745,6 +745,40 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `an opened intent reserves each spool before a replay can offer it`() {
+    val root = temporaryDirectory()
+    val token = "44444444-4444-4444-8444-444444444444"
+    val store = SafSpoolStore(
+      root = root,
+      atomicPublisher = testAtomicPublisher,
+      tokenFactory = { UUID.fromString(token) },
+    )
+    val source = object : SafInputSource {
+      override val operationId = "c".repeat(64)
+      override val displayName = "card.json"
+      override val totalBytes = 1L
+      override fun open(): InputStream = ByteArrayInputStream(byteArrayOf(1))
+    }
+    val reserved = mutableSetOf<String>()
+    val offeredAtReservation = mutableListOf<Boolean>()
+    fun share() = store.spool(listOf(source), beforePublish = { reservedToken ->
+      offeredAtReservation += store.listReady().any { it.token == reservedToken && !store.isDelivered(it.token) }
+      reserved += reservedToken
+    })
+
+    val first = share()
+    assertEquals(SafSpoolBatch(emptyList(), emptyList()), replayReadySpoolBatch(store, reserved))
+    markSpoolBatchDelivered(store, first)
+    // Opening the same source again reserves it before its earlier delivery is forgotten.
+    assertEquals(first.ready, share().ready)
+    assertEquals(listOf(false, false), offeredAtReservation)
+    assertEquals(SafSpoolBatch(emptyList(), emptyList()), replayReadySpoolBatch(store, reserved))
+
+    reserved.clear()
+    assertEquals(first.ready, replayReadySpoolBatch(store, reserved).ready)
+  }
+
+  @Test
   fun `a spool that cannot be marked is withdrawn and reported`() {
     val root = temporaryDirectory()
     val store = SafSpoolStore(root, atomicPublisher = testAtomicPublisher)

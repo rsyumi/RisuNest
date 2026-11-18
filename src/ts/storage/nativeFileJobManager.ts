@@ -54,11 +54,30 @@ export interface NativeFileOperationState {
     partialWritesPossible: boolean
     waitingForSync?: boolean
     batch?: NativeFileOperationBatch
+    /** Where the file of a single-file import went. */
+    location?: NativeFileOperationImportLocation
 }
 
 export interface NativeFileOperationBatchFailure {
     name: string
     error: NativeFileOperationError
+}
+
+/** Where an imported file went, shown with the result and used to open it. */
+export type NativeFileOperationImportLocation =
+    | { kind: 'character'; chaId: string }
+    | { kind: 'module' }
+    | { kind: 'module-from-charx' }
+    | { kind: 'module-from-lorebook' }
+    | { kind: 'preset' }
+    | { kind: 'character-lorebook'; chaId: string; characterName: string }
+
+/** How one batch file ended, in the order the files ended. */
+export interface NativeFileOperationBatchEntry {
+    name: string
+    state: 'imported' | 'failed' | 'declined'
+    location?: NativeFileOperationImportLocation
+    error?: NativeFileOperationError
 }
 
 /** Several files imported one after another in one operation. */
@@ -72,6 +91,8 @@ export interface NativeFileOperationBatch {
     declined: string[]
     /** Warnings of the files already finished. */
     warningCodes: string[]
+    /** Every finished file, including the ones refused before the batch started. */
+    entries?: NativeFileOperationBatchEntry[]
 }
 
 export type NativeFileOperationOutcomeState = 'succeeded' | 'failed' | 'cancelled'
@@ -101,6 +122,8 @@ export interface NativeFileOperationOutcome {
     partialWritesPossible: boolean
     interruption?: 'background-expired'
     batch?: Omit<NativeFileOperationBatch, 'index' | 'warningCodes'>
+    /** Where the file of a successful single-file import went. */
+    location?: NativeFileOperationImportLocation
 }
 
 export interface SharedNativeFileOperationContext {
@@ -118,6 +141,11 @@ export interface SharedNativeFileOperationContext {
     beginBatchItem(index: number, source: NativeFileOperationSource): void
     /** Records how one batch file ended; a failed file does not stop the batch. */
     recordBatchItem(name: string, result: { imported: boolean } | { error: unknown }): void
+    /**
+     * Records where the imported file went: the batch file in progress, which its next imported
+     * `recordBatchItem` takes, or the whole operation outside a batch.
+     */
+    setLocation(location: NativeFileOperationImportLocation): void
 }
 
 export interface SharedNativeFileOperationOptions {
@@ -201,7 +229,8 @@ function backgroundTaskPercent({ kind, phase, progress, detail }: NativeFileJobS
         ? measuredTaskPercent(detail.stageCompleted, detail.stageTotal) : percent
 }
 
-function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFileOperationError {
+/** The code and message a failed operation or batch file reports for `error`. */
+export function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFileOperationError {
     if (error instanceof NativeFileJobActivationCommittedError || error instanceof NativeFileJobActivationUnresolvedError) {
         const cause = error.cause
         return {
@@ -236,7 +265,10 @@ function outcomeFromSettlement(
 ): NativeFileOperationOutcome | null {
     const statusWarnings = mergeWarningCodes(state.batch?.warningCodes ?? [], state.status?.result?.warningCodes ?? [])
     const batch = state.batch
-        ? { total: state.batch.total, imported: state.batch.imported, failures: state.batch.failures, declined: state.batch.declined }
+        ? {
+            total: state.batch.total, imported: state.batch.imported, failures: state.batch.failures, declined: state.batch.declined,
+            ...(state.batch.entries ? { entries: state.batch.entries } : {}),
+        }
         : undefined
     const base = {
         kind: state.kind,
@@ -281,6 +313,7 @@ function outcomeFromSettlement(
         ...base,
         state: 'succeeded',
         warningCodes: mergeWarningCodes(stringWarningCodes(settlement.value), statusWarnings),
+        ...(state.location ? { location: state.location } : {}),
     }
 }
 
@@ -377,6 +410,7 @@ function runSharedNativeFileOperationWithAdmission<T>(
         partialWritesPossible: false,
     }
     if (presentation === 'dialog') nativeFileOperationOutcome.set(null)
+    let batchItemLocation: NativeFileOperationImportLocation | undefined
     const cancel = () => {
         if (activeController !== controller) return
         controller.abort()
@@ -425,11 +459,12 @@ function runSharedNativeFileOperationWithAdmission<T>(
         },
         protect: () => {},
         beginBatch: total => {
-            if (activeController === controller) updateActiveState({ batch: { index: 0, total, imported: 0, failures: [], declined: [], warningCodes: [] } })
+            if (activeController === controller) updateActiveState({ batch: { index: 0, total, imported: 0, failures: [], declined: [], warningCodes: [], entries: [] } })
         },
         beginBatchItem: (index, source) => {
             const batch = activeController === controller ? activeState?.batch : undefined
             if (!batch) return
+            batchItemLocation = undefined
             const finished = activeState?.status?.result?.warningCodes ?? []
             updateActiveState({
                 source, status: undefined, observedStages: [],
@@ -439,10 +474,26 @@ function runSharedNativeFileOperationWithAdmission<T>(
         recordBatchItem: (name, result) => {
             const batch = activeController === controller ? activeState?.batch : undefined
             if (!batch) return
-            updateActiveState({ batch: 'error' in result
-                ? { ...batch, failures: [...batch.failures, { name, error: outcomeError(kind, result.error) }] }
-                : result.imported ? { ...batch, imported: batch.imported + 1 }
-                : { ...batch, declined: [...batch.declined, name] } })
+            const location = batchItemLocation
+            batchItemLocation = undefined
+            const entries = batch.entries ?? []
+            if ('error' in result) {
+                const error = outcomeError(kind, result.error)
+                updateActiveState({ batch: {
+                    ...batch,
+                    failures: [...batch.failures, { name, error }],
+                    entries: [...entries, { name, state: 'failed', error }],
+                } })
+                return
+            }
+            updateActiveState({ batch: result.imported
+                ? { ...batch, imported: batch.imported + 1, entries: [...entries, { name, state: 'imported', ...(location ? { location } : {}) }] }
+                : { ...batch, declined: [...batch.declined, name], entries: [...entries, { name, state: 'declined' }] } })
+        },
+        setLocation: location => {
+            if (activeController !== controller || !activeState) return
+            if (activeState.batch) batchItemLocation = location
+            else updateActiveState({ location })
         },
     }
     let taskSignal = controller.signal
@@ -527,6 +578,25 @@ export function runExternalAndroidNativeFileOperation<T>(
 export async function waitForActiveNativeFileOperation(): Promise<void> {
     while (activeOperation) {
         try { await activeOperation } catch {}
+    }
+}
+
+/** Waits until no operation runs and no outcome is shown, so a new dialog will not cover either. */
+export async function waitForNativeFileOperationIdle(): Promise<void> {
+    while (true) {
+        await waitForActiveNativeFileOperation()
+        const outcome = get(nativeFileOperationOutcome)
+        if (!outcome) {
+            if (!activeOperation) return
+            continue
+        }
+        let unsubscribe: (() => void) | undefined
+        await new Promise<void>(resolve => {
+            unsubscribe = nativeFileOperationOutcome.subscribe(current => {
+                if (current !== outcome) resolve()
+            })
+        })
+        unsubscribe?.()
     }
 }
 

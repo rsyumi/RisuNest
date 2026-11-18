@@ -1,6 +1,7 @@
 import { language } from 'src/lang'
 
 import type {
+    NativeFileOperationImportLocation,
     NativeFileOperationKind,
     NativeFileOperationOutcome,
     NativeFileOperationState,
@@ -38,12 +39,23 @@ export interface NativeFileJobDialogCounter {
     value: string
 }
 
+export interface NativeFileJobDialogBatchEntry {
+    name: string
+    state: 'imported' | 'failed' | 'declined'
+    /** Where an imported file went or why a failed file was not imported; empty for a declined file. */
+    detail: string
+}
+
 export interface NativeFileJobDialogTerminal {
     state: 'succeeded' | 'failed' | 'cancelled'
     summary: string
     reason: string
-    /** The library item whose data the export could not write. */
+    /** The library item whose data the export could not write, or where a single imported file went. */
     location: string
+    /** What Open goes to after a single imported file; null when there is nothing to open. */
+    openLocation: NativeFileOperationImportLocation | null
+    /** Every finished file of a batch that records them, in the order they finished; null otherwise. */
+    entries: NativeFileJobDialogBatchEntry[] | null
     /** Files of a batch that were not imported, with why; a declined file has no reason of its own here. */
     failedFiles: { name: string; reason: string }[]
     details: string
@@ -192,6 +204,14 @@ export function formatBytes(bytes: number): string {
         unit += 1
     }
     return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`
+}
+
+/** The kind of backup file, as the native backup format probe reports it. */
+export function backupKindLabel(format: 'portable' | 'block-risu-save' | 'local-backup'): string {
+    const copy = language.risuNest.importIntake
+    return format === 'portable' ? copy.kindBackupPortable
+        : format === 'block-risu-save' ? copy.kindBackupRisuSave
+        : copy.kindBackupLocal
 }
 
 export function formatElapsed(milliseconds: number): string {
@@ -570,6 +590,25 @@ export function failureLocation(owner?: NativeFileJobFailureOwner): string {
     return owner.kind === 'chat' ? fillTemplate(template, owner.character ?? '', owner.name) : fillTemplate(template, owner.name)
 }
 
+/** Where an imported file went, as the result names it. */
+export function importLocationText(location: NativeFileOperationImportLocation): string {
+    const copy = language.risuNest.importIntake
+    switch (location.kind) {
+        case 'character':
+            return copy.locationCharacter
+        case 'module':
+            return copy.locationModule
+        case 'module-from-charx':
+            return copy.locationModuleFromCharx
+        case 'module-from-lorebook':
+            return copy.locationModuleFromLorebook
+        case 'preset':
+            return copy.locationPreset
+        case 'character-lorebook':
+            return fillTemplate(copy.locationCharacterLorebook, location.characterName)
+    }
+}
+
 export function failureReason(code: string, direction: 'import' | 'export' = 'import', itemKind?: string): string {
     const copy = language.risuNest.importDialog
     switch (code) {
@@ -844,6 +883,7 @@ export function buildNativeFileJobDialogModel(
         let summary: string
         let reason = ''
         let location = ''
+        let openLocation: NativeFileOperationImportLocation | null = null
         if (exporting) {
             if (outcome.state === 'succeeded') {
                 summary = copy.resultExportSucceeded
@@ -858,6 +898,11 @@ export function buildNativeFileJobDialogModel(
             }
         } else if (outcome.state === 'succeeded') {
             summary = restarting ? copy.resultRestarting : copy.resultSucceeded
+            // Only a single import reports a location; a batch names each file's in its entries.
+            if (outcome.location) {
+                location = importLocationText(outcome.location)
+                openLocation = outcome.location
+            }
         } else if (outcome.state === 'cancelled') {
             summary = outcome.partialWritesPossible
                 ? copy.resultCancelledPartial
@@ -945,6 +990,14 @@ export function buildNativeFileJobDialogModel(
                 summary,
                 reason,
                 location,
+                openLocation,
+                entries: batch?.entries?.length ? batch.entries.map(entry => ({
+                    name: entry.name,
+                    state: entry.state,
+                    detail: entry.state === 'imported' ? entry.location ? importLocationText(entry.location) : ''
+                        : entry.state === 'failed' && entry.error ? failureReason(entry.error.code, 'import', entry.error.itemKind)
+                        : '',
+                })) : null,
                 failedFiles: batch ? [
                     ...batch.failures.map(failure => ({
                         name: failure.name,
