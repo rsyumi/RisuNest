@@ -36,6 +36,7 @@ import {
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 import { createPortableExportIntentStore } from './deviceBackup/job'
+import { handOverOpenedFiles, settleOpenedFilesAfter } from '../openedFiles'
 import type { ImportIntakeDelivery, ImportIntakeSource } from '../importIntake/types'
 
 let disposeSpoolListener: (() => void) | undefined
@@ -49,7 +50,8 @@ export interface AndroidSpoolBatchRouting {
 }
 
 /**
- * Hands each opened or shared spool batch to the import intake as one delivery, in arrival order.
+ * Hands each opened or shared spool batch to the import intake as one delivery, in arrival order,
+ * together with the opened files of the same intent that Android copied instead of spooling.
  * A content picker result that outlived its page keeps the destination chosen in the picker.
  */
 export function createAndroidSpoolBatchRouter(
@@ -57,24 +59,33 @@ export function createAndroidSpoolBatchRouter(
 ): (batch: AndroidSpoolBatch) => Promise<void> {
     const submittedTokens = new Set<string>()
     let order = Promise.resolve()
-    return (batch) => {
+    return ({ openedPaths = [], ...batch }) => {
         const routed = order.then(async () => {
             if (!await routing.firstSetupDone()) {
+                // These files keep the handling they had as their own opened-files event.
+                if (openedPaths.length) handOverOpenedFiles(openedPaths)
                 void routing.dispatch(batch)
                 return
             }
-            const submit = await routing.loadIntake()
-            const fresh = batch.ready.filter((source) => !submittedTokens.has(source.token))
-            for (const source of fresh) submittedTokens.add(source.token)
-            const picked = fresh.filter((source) => source.importDestination)
-            if (picked.length) void routing.dispatch({ ...batch, ready: picked, failures: [] })
-            const sources: ImportIntakeSource[] = [
-                ...fresh
-                    .filter((source) => !source.importDestination)
-                    .map((spool) => ({ type: 'androidSpool' as const, spool })),
-                ...batch.failures.map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
-            ]
-            if (sources.length) void submit({ origin: 'opened', sources })
+            let delivery: Promise<void> | undefined
+            try {
+                const submit = await routing.loadIntake()
+                const fresh = batch.ready.filter((source) => !submittedTokens.has(source.token))
+                for (const source of fresh) submittedTokens.add(source.token)
+                const picked = fresh.filter((source) => source.importDestination)
+                if (picked.length) void routing.dispatch({ ...batch, ready: picked, failures: [] })
+                const sources: ImportIntakeSource[] = [
+                    ...fresh
+                        .filter((source) => !source.importDestination)
+                        .map((spool) => ({ type: 'androidSpool' as const, spool })),
+                    ...openedPaths.map((path) => ({ type: 'path' as const, path })),
+                    ...batch.failures.map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
+                ]
+                if (sources.length) delivery = submit({ origin: 'opened', sources })
+            } finally {
+                // Settled as the opened-files handling settles them, once this delivery has ended.
+                if (openedPaths.length) void settleOpenedFilesAfter(openedPaths, async () => await delivery)
+            }
         })
         order = routed.catch(() => {})
         return routed

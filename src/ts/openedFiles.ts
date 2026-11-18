@@ -33,16 +33,36 @@ export async function consumeOpenedFiles(files: string[]): Promise<void> {
     const run = queue.then(async () => {
         const opened = files.filter((file) => typeof file === 'string' && file.length > 0)
         if (!opened.length) return
-        try {
-            await deliver(opened)
-        } catch (error) {
-            alertError(`Failed to open the selected files: ${opened.join(', ')}\n${error}`)
-        } finally {
-            for (const file of opened) await settleOpenedFile(file)
-        }
+        await settleOpenedFilesAfter(opened, () => deliver(opened))
     })
     queue = run.catch(() => {})
     await run
+}
+
+/**
+ * Runs the delivery that holds these opened files, then settles each of them once it has ended,
+ * also when it failed. An Android share whose other files were spooled delivers its opened files
+ * with that spool batch, and they are settled here as well.
+ */
+export async function settleOpenedFilesAfter(files: string[], delivery: () => Promise<void>): Promise<void> {
+    try {
+        await delivery()
+    } catch (error) {
+        alertError(`Failed to open the selected files: ${files.join(', ')}\n${error}`)
+    } finally {
+        for (const file of files) await settleOpenedFile(file)
+    }
+}
+
+/**
+ * Hands opened files over as the Android opened-files event does: to the listener when one is
+ * registered, otherwise to the startup queue it drains.
+ */
+export function handOverOpenedFiles(files: string[]): void {
+    const event = new CustomEvent(OPENED_FILES_EVENT, { detail: { files }, cancelable: true })
+    if (!window.dispatchEvent(event)) return
+    const holder = window as Window & { tauriOpenedFiles?: unknown }
+    holder.tauriOpenedFiles = (Array.isArray(holder.tauriOpenedFiles) ? holder.tauriOpenedFiles : []).concat(files)
 }
 
 async function settleOpenedFile(file: string): Promise<void> {
