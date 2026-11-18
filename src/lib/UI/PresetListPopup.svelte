@@ -15,7 +15,7 @@
 </script>
 
 <script lang="ts" generics="T extends { name: string }">
-    import type { Snippet } from 'svelte'
+    import { untrack, type Snippet } from 'svelte'
     import CheckIcon from '@lucide/svelte/icons/check'
     import ChevronDownIcon from '@lucide/svelte/icons/chevron-down'
     import ChevronUpIcon from '@lucide/svelte/icons/chevron-up'
@@ -108,6 +108,16 @@
             .filter(({ preset }) => !filter || filter(preset)),
     )
     let sortable = $derived(!!dragType && movable)
+    let dialog = $state<HTMLElement>()
+    /** The dialog's height when filtering began, kept so a search does not move the dialog under the field. */
+    let filteringHeight = $state<number | null>(null)
+    $effect.pre(() => {
+        const filtering = listScroll && visible.length < (presets?.length ?? 0)
+        untrack(() => {
+            if (!filtering) filteringHeight = null
+            else if (filteringHeight === null && dialog) filteringHeight = dialog.offsetHeight
+        })
+    })
     let dragged: T | null = null
     let dragFrom = $state<number | null>(null)
     /** The gap a drop would move the dragged row into, from 0 to the list length. */
@@ -249,7 +259,9 @@
 
 <div class="{layer} bg-black/50 flex justify-center items-center p-4" use:modalNavigation={{ close: dismiss }}>
     <div
+        bind:this={dialog}
         class="relative z-10 bg-darkbg text-textcolor rounded-md flex flex-col {width} max-w-full max-h-full"
+        style:min-height={filteringHeight === null ? null : `min(${filteringHeight}px, 100%)`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -260,7 +272,7 @@
                 <XIcon size={24} />
             </button>
         </div>
-        <div class="flex flex-col gap-3 px-4 pb-4 {listScroll ? 'min-h-0' : 'overflow-y-auto'}">
+        <div class="flex flex-col gap-3 px-4 pb-4 {listScroll ? 'min-h-0 flex-1' : 'overflow-y-auto'}">
             {@render header?.(guarded)}
             {#if leading}
                 <div class="flex flex-col gap-1">
@@ -270,10 +282,10 @@
             {#if !presets?.length}
                 {#if empty}<p class="text-textcolor2 text-sm m-0">{empty}</p>{/if}
             {:else if visible.length === 0}
-                <p class="text-textcolor2 text-sm m-0">{emptyFiltered ?? empty}</p>
+                <p class="text-textcolor2 text-sm m-0 {listScroll ? 'flex-1' : ''}">{emptyFiltered ?? empty}</p>
             {:else}
                 <div
-                    class="flex flex-col gap-1 {listScroll ? 'overflow-y-auto min-h-0' : ''} {dragType ? 'py-1 -my-1' : ''}"
+                    class="flex flex-col gap-1 {listScroll ? 'overflow-y-auto min-h-0 flex-1' : ''} {dragType ? 'py-1 -my-1' : ''}"
                     role="list"
                     use:touchDrag={dragType ? { item: '[data-preset-item]', ghost: '[data-preset-row]' } : null}
                     ondragleave={(event) => {

@@ -224,10 +224,13 @@
         </label>
     {/snippet}
     {#snippet rowLeading(preset: NamedPreset, index: number)}
-        {#if index < 9}
-            <span class="shrink-0 w-5 text-right text-xs text-subtext tabular-nums">{index + 1}</span>
-        {:else}
-            <span class="shrink-0 w-5" aria-hidden="true"></span>
+        <!-- The Ctrl+number shortcuts change the selection, so binding shows no numbers. -->
+        {#if mode !== 'bind'}
+            {#if index < 9}
+                <span class="shrink-0 w-5 text-right text-xs text-subtext tabular-nums">{index + 1}</span>
+            {:else}
+                <span class="shrink-0 w-5" aria-hidden="true"></span>
+            {/if}
         {/if}
         {#if preset.image}
             <img

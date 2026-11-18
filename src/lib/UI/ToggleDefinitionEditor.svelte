@@ -107,7 +107,7 @@
 
 {#snippet row(line: ToggleLine, nested: boolean, first: boolean, last: boolean)}
     {@const fields = toggleLineFields(line.raw)}
-    <div class="grid items-center gap-x-2 gap-y-1.5 rounded-md border border-darkborderc bg-darkbg px-2 py-1.5 grid-cols-[minmax(0,1fr)_auto] @md/rows:grid-cols-[7.5rem_minmax(0,1fr)_auto]">
+    <div class="grid items-center gap-x-2 gap-y-1.5 rounded-md border border-darkborderc bg-darkbg px-2 py-1.5 grid-cols-[minmax(0,1fr)_auto] @md/rows:grid-cols-[9rem_minmax(0,1fr)_auto]">
         <SelectInput size="sm" className="min-w-0" ariaLabel={language.type} value={line.kind ?? 'switch'} onchange={(event) => {
             commit(setToggleRowKind(lines, line.id, event.currentTarget.value as RowKind))
         }}>
