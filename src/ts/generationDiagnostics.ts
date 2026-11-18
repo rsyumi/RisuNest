@@ -17,7 +17,7 @@ export type GenerationFailureReason =
     | 'fenced' | 'error' | 'stream-error'
 export type GenerationLifecycleEvent =
     | 'active' | 'background' | 'start' | 'stop' | 'freeze' | 'resume'
-    | 'exit' | 'expiry' | 'memory-warning' | 'trim-memory'
+    | 'exit' | 'expiry' | 'memory-warning' | 'trim-memory' | 'online' | 'offline'
 export type GenerationDiagnosticFallback =
     | 'none' | 'compatibility' | 'missing-capture' | 'unsupported' | 'unknown'
     | 'selected-conversation-unavailable' | 'standard-hypa-v3-disabled'
@@ -64,6 +64,14 @@ export interface GenerationListenerPayloadDiagnostic {
     conversations?: number
     messages?: number
     messageCharacters?: number
+}
+
+/** One external sync receive or publish run: pages received or segments published, and how it ended. */
+export interface SyncRunDiagnostic {
+    operation: 'receive' | 'publish'
+    count: number
+    more: boolean
+    outcome: 'complete' | 'failed' | 'cancelled'
 }
 
 export interface GenerationDiagnosticTrace {
@@ -172,6 +180,10 @@ export function createGenerationDiagnostics(options: { enabled: boolean; invoke:
         },
         lifecycle(event: GenerationLifecycleEvent, trimLevel?: number): void {
             send({ kind: 'lifecycle', event, ...(trimLevel === undefined ? {} : { trimLevel }) })
+        },
+        /** Native code keeps only the runs made while the app is off screen. */
+        syncRun(value: SyncRunDiagnostic): void {
+            send({ kind: 'sync-run', target: 'external', operation: value.operation, count: value.count, more: value.more, outcome: value.outcome })
         },
     }
 }

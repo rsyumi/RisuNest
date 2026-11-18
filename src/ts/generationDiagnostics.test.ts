@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createGenerationDiagnostics, type GenerationDiagnosticAdmission, type GenerationListenerPayloadDiagnostic } from './generationDiagnostics'
+import { createGenerationDiagnostics, type GenerationDiagnosticAdmission, type GenerationListenerPayloadDiagnostic, type SyncRunDiagnostic } from './generationDiagnostics'
 
 describe('generation diagnostic boundary', () => {
     it('drops early events and correlates later events with the native document and generation', async () => {
@@ -58,6 +58,9 @@ describe('generation diagnostic boundary', () => {
             listeners: 2, fullHistoryListeners: 1, conversations: 3, messages: 40, messageCharacters: 900,
             characterName: 'PRIVATE_CONTENT_CANARY',
         } as GenerationListenerPayloadDiagnostic)
+        diagnostics.syncRun({
+            operation: 'receive', count: 2, more: true, outcome: 'complete', connectionId: 'PRIVATE_CONTENT_CANARY',
+        } as SyncRunDiagnostic)
         expect(JSON.stringify(events)).not.toContain('PRIVATE_CONTENT_CANARY')
         expect(events[1]).toMatchObject({ documentSequence: 3, generationSequence: 1, historyLimitMultiplier: 1.5 })
         expect(events[2]).toMatchObject({ expectedRevision: 5, acknowledgedRevision: 6 })
@@ -65,6 +68,10 @@ describe('generation diagnostic boundary', () => {
         expect(events[3]).toEqual({
             kind: 'listener-payload', documentSequence: 3, eventSequence: 3, generationSequence: 1,
             listeners: 2, fullHistoryListeners: 1, conversations: 3, messages: 40, messageCharacters: 900,
+        })
+        expect(events[4]).toEqual({
+            kind: 'sync-run', documentSequence: 3, eventSequence: 4, target: 'external',
+            operation: 'receive', count: 2, more: true, outcome: 'complete',
         })
     })
 

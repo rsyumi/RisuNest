@@ -241,11 +241,15 @@ export function registerLifecycleCommitListeners(
     // Chromium freezes a hidden page and resumes it on return; Android IPC sends the freeze before the page stops.
     const onFreeze = () => generationDiagnostics.lifecycle('freeze')
     const onResume = () => generationDiagnostics.lifecycle('resume')
+    const onOnline = () => generationDiagnostics.lifecycle('online')
+    const onOffline = () => generationDiagnostics.lifecycle('offline')
 
     window.addEventListener('pagehide', onPageHide)
     document.addEventListener('visibilitychange', onVisibilityChange)
     document.addEventListener('freeze', onFreeze)
     document.addEventListener('resume', onResume)
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
     window.addEventListener('risu-native-lifecycle', onNativeLifecycle)
     setNativeExitListenerReady(true)
 
@@ -255,6 +259,8 @@ export function registerLifecycleCommitListeners(
         document.removeEventListener('visibilitychange', onVisibilityChange)
         document.removeEventListener('freeze', onFreeze)
         document.removeEventListener('resume', onResume)
+        window.removeEventListener('online', onOnline)
+        window.removeEventListener('offline', onOffline)
         window.removeEventListener('risu-native-lifecycle', onNativeLifecycle)
     }
 }

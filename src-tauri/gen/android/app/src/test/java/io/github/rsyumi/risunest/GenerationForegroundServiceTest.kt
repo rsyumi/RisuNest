@@ -18,7 +18,8 @@ class GenerationForegroundServiceTest {
 
   private class Hosted(onHeldChanged: (Boolean) -> Unit = {}) {
     val heldChanges = mutableListOf<Boolean>()
-    val registry = BackgroundTaskRegistry { heldChanges.add(it); onHeldChanged(it) }
+    val records = mutableListOf<BackgroundWorkRecord>()
+    val registry = BackgroundTaskRegistry({ records.add(it) }) { heldChanges.add(it); onHeldChanged(it) }
     val lifecycle = GenerationForegroundLifecycle()
     var starts = 0
     var stops = 0
@@ -69,7 +70,7 @@ class GenerationForegroundServiceTest {
     assertEquals(1, host.stops)
     val restore = taskId(3)
     host.begin(restore, "restore")
-    host.registry.clear(notify = true)
+    host.registry.clear(BACKGROUND_EXPIRED_TIMEOUT)
     assertEquals(listOf(restore), host.expired)
     assertFalse(host.end(restore))
     assertTrue(host.registry.snapshot().isEmpty())
@@ -163,7 +164,7 @@ class GenerationForegroundServiceTest {
     val host = Hosted()
     host.begin(taskId(1), "sync", deferred = true)
     host.begin(taskId(2), "backup")
-    host.registry.clear(notify = true)
+    host.registry.clear(BACKGROUND_EXPIRED_DESTROYED)
     assertEquals(listOf(taskId(2)), host.expired)
     host.registry.promote(host.start)
     assertEquals(listOf(BackgroundTaskStatus("sync")), host.registry.snapshot())
@@ -173,6 +174,41 @@ class GenerationForegroundServiceTest {
     host.begin(taskId(3), "backup")
     host.registry.clearAll()
     assertEquals(listOf(true, false, true, false), host.heldChanges)
+  }
+
+  @Test
+  fun `the app log hears departures, holds that begin and end off screen, and expiry`() {
+    val host = Hosted()
+    host.registry.promote(host.start)
+    host.registry.demote(host.stop)
+    host.begin(taskId(1), "sync", deferred = true)
+    host.begin(taskId(2), "backup", deferred = true)
+    host.begin(taskId(3), "generation", deferred = true)
+    assertTrue(host.end(taskId(3)))
+    host.registry.promote(host.start)
+    assertTrue(host.end(taskId(2)))
+    assertTrue(host.end(taskId(1)))
+    host.refuse = BACKGROUND_REFUSED
+    assertEquals(BACKGROUND_REFUSED, host.begin(taskId(4), "sync", deferred = true))
+    host.refuse = null
+    host.registry.demote(host.stop)
+    host.registry.promote(host.start)
+    host.registry.clear(BACKGROUND_EXPIRED_TIMEOUT)
+    // A service destroyed after its holds expired ends nothing more.
+    host.registry.clear(BACKGROUND_EXPIRED_DESTROYED)
+    assertEquals(listOf(
+      BackgroundWorkRecord("promote", 0, emptyList(), "none"),
+      BackgroundWorkRecord("demote", 0, emptyList()),
+      BackgroundWorkRecord("promote", 2, listOf("backup", "sync"), BACKGROUND_ACTIVE),
+      BackgroundWorkRecord("idle", 0, emptyList()),
+      BackgroundWorkRecord("held", 1, listOf("sync"), BACKGROUND_REFUSED),
+      BackgroundWorkRecord("demote", 1, listOf("sync")),
+      BackgroundWorkRecord("promote", 1, listOf("sync"), BACKGROUND_ACTIVE),
+      BackgroundWorkRecord("expire", 1, listOf("sync"), BACKGROUND_EXPIRED_TIMEOUT),
+    ), host.records)
+    assertEquals(listOf(taskId(4)), host.expired)
+    assertEquals("""{"stage":"promote","holds":2,"kinds":["backup","sync"],"outcome":"active"}""", host.records[2].json())
+    assertEquals("""{"stage":"idle","holds":0,"kinds":[]}""", host.records[3].json())
   }
 
   private class Delays {

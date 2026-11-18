@@ -25,6 +25,9 @@ internal const val BACKGROUND_DEFERRED = "deferred"
 internal const val BACKGROUND_REFUSED = "background"
 internal const val BACKGROUND_FAILED = "failed"
 internal const val BACKGROUND_INVALID = "invalid"
+internal const val BACKGROUND_EXPIRED_TIMEOUT = "timeout"
+internal const val BACKGROUND_EXPIRED_DESTROYED = "destroyed"
+private const val BACKGROUND_NONE = "none"
 private val BACKGROUND_TASK_KINDS = setOf("backup", "restore", "sync", "import", "export", "maintenance", "generation")
 
 internal class GenerationForegroundLifecycle {
@@ -132,12 +135,29 @@ internal class GenerationForegroundLifecycle {
 
 internal data class BackgroundTaskStatus(val kind: String, val percent: Int = -1, val userInitiated: Boolean = false)
 
+/** A line for the app log: what happened to the page's holds, with how many there were and their kinds. */
+internal data class BackgroundWorkRecord(val stage: String, val holds: Int, val kinds: List<String>, val outcome: String? = null) {
+  // Every value is a fixed code, so none needs escaping.
+  fun json(): String = buildString {
+    append("{\"stage\":\"").append(stage).append("\",\"holds\":").append(holds).append(",\"kinds\":[")
+    kinds.joinTo(this, ",") { "\"$it\"" }
+    append(']')
+    if (outcome != null) append(",\"outcome\":\"").append(outcome).append('"')
+    append('}')
+  }
+}
+
 /**
  * Holds owned by the page. A deferred hold takes service time only while promoted, which is while the app is off screen.
  * [onHeldChanged] hears when the page starts or stops holding any work, deferred or not, protected or not; it hears
  * that the last hold ended before that hold's service time ends, so it can keep the service from stopping.
+ * [record] hears each departure and return, the first hold that begins and the last that ends off screen, and holds
+ * that expire.
  */
-internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Unit = {}) {
+internal class BackgroundTaskRegistry(
+  private val record: (BackgroundWorkRecord) -> Unit = {},
+  private val onHeldChanged: (Boolean) -> Unit = {},
+) {
   private class Entry(val kind: String, val deferred: Boolean, val userInitiated: Boolean, val onExpired: (String) -> Unit) {
     var percent = -1
     var holding = false
@@ -150,6 +170,10 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
 
   private fun reportHeld(before: Boolean) {
     if (held != before) runCatching { onHeldChanged(held) }
+  }
+
+  private fun log(stage: String, entries: Collection<Entry>, outcome: String? = null) {
+    runCatching { record(BackgroundWorkRecord(stage, entries.size, entries.map { it.kind }.distinct().sorted(), outcome)) }
   }
 
   /** [start] starts or joins the service and returns null, or the reason the platform refused it. */
@@ -167,6 +191,12 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
     tasks[id] = entry
     reportHeld(before = tasks.size > 1)
     if (deferred && visible) return BACKGROUND_DEFERRED
+    val result = protect(entry, start, refresh)
+    if (!visible && tasks.size == 1) log("held", tasks.values, result)
+    return result
+  }
+
+  private fun protect(entry: Entry, start: () -> String?, refresh: () -> Unit): String {
     // A refused hold stays registered, so the next time the app leaves the screen protects it.
     start()?.let { return it }
     entry.holding = true
@@ -189,6 +219,7 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
   fun end(id: String, stop: () -> Boolean): Boolean {
     val entry = tasks.remove(id) ?: return false
     reportHeld(before = true)
+    if (!visible && tasks.isEmpty()) log("idle", emptyList())
     if (entry.holding) stop()
     return true
   }
@@ -197,12 +228,15 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
   fun promote(start: () -> String?, refresh: () -> Unit = {}) {
     visible = false
     var promoted = false
+    var refusal: String? = null
     for (entry in tasks.values.filter { !it.holding }) {
-      if (start() != null) break
+      refusal = start()
+      if (refusal != null) break
       entry.holding = true
       promoted = true
     }
     if (promoted) runCatching(refresh)
+    log("promote", tasks.values, refusal ?: if (tasks.values.any { it.holding }) BACKGROUND_ACTIVE else BACKGROUND_NONE)
   }
 
   /** The app returned to the screen: deferred holds give their service time back. */
@@ -210,6 +244,7 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
     visible = true
     val promoted = tasks.values.filter { it.deferred && it.holding }
     promoted.forEach { it.holding = false }
+    log("demote", tasks.values)
     promoted.forEach { stop() }
   }
 
@@ -221,12 +256,18 @@ internal class BackgroundTaskRegistry(private val onHeldChanged: (Boolean) -> Un
   fun snapshot(): List<BackgroundTaskStatus> =
     tasks.values.filter { it.holding }.map { BackgroundTaskStatus(it.kind, it.percent, it.userInitiated) }
 
-  /** Ends the holds the service protected, as when its time runs out or it is destroyed. */
-  fun clear(notify: Boolean = false) {
+  /**
+   * Ends the holds the service protected. [expiry] names why their time ended, when its time runs out or it is
+   * destroyed; their owners hear only then.
+   */
+  fun clear(expiry: String? = null) {
     val before = held
     val ended = tasks.filterValues { it.holding }
     ended.keys.forEach(tasks::remove)
-    if (notify) ended.forEach { (id, entry) -> runCatching { entry.onExpired(id) } }
+    if (expiry != null) {
+      if (ended.isNotEmpty()) log("expire", ended.values, expiry)
+      ended.forEach { (id, entry) -> runCatching { entry.onExpired(id) } }
+    }
     reportHeld(before)
   }
 
@@ -303,14 +344,20 @@ internal class PageKeptActivePolicy(
 private fun startNotAllowed(error: Exception): Boolean =
   error.javaClass.name == "android.app.ForegroundServiceStartNotAllowedException"
 
-/** Writes a refused service start to the app log the user can export. */
+/** Writes refused service starts and what happened to background holds to the app log the user can export. */
 @Keep
 internal object BackgroundServiceLog {
   external fun recordRefused(foreground: Boolean, background: Boolean)
 
+  external fun recordWork(record: String)
+
   fun refused(foreground: Boolean, error: Exception) {
     // JVM tests run without the native library.
     runCatching { recordRefused(foreground, startNotAllowed(error)) }
+  }
+
+  fun work(record: BackgroundWorkRecord) {
+    runCatching { recordWork(record.json()) }
   }
 }
 
@@ -395,7 +442,7 @@ class GenerationForegroundService : Service() {
       lifecycle.serviceDestroyed(activatedToken, startId)
     } == true
     if (instance === this) instance = null
-    if (destroyed) background.clear(notify = true)
+    if (destroyed) background.clear(BACKGROUND_EXPIRED_DESTROYED)
     releaseWakeLock()
     super.onDestroy()
   }
@@ -405,7 +452,7 @@ class GenerationForegroundService : Service() {
       token = activatedToken,
       startId = startId,
       stopTimedOut = {
-        background.clear(notify = true)
+        background.clear(BACKGROUND_EXPIRED_TIMEOUT)
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelfResult(startId)
@@ -509,7 +556,7 @@ class GenerationForegroundService : Service() {
   companion object {
     private val lifecycle = GenerationForegroundLifecycle()
     private var heldObserver: ((Boolean) -> Unit)? = null
-    private val background = BackgroundTaskRegistry { held -> heldObserver?.invoke(held) }
+    private val background = BackgroundTaskRegistry(BackgroundServiceLog::work) { held -> heldObserver?.invoke(held) }
     private var instance: GenerationForegroundService? = null
 
     /** [observer] hears at once and on every change whether the page holds background work. */
