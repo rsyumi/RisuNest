@@ -1810,8 +1810,18 @@ export const languageKorean = {
             chatPreset: '현재 채팅',
         },
         promptList: {
+            count: '프롬프트 {0}개',
         },
         toggleEditor: {
+            view: '커스텀 토글 보기',
+            raw: '원문',
+            switch: '스위치',
+            select: '선택',
+            text: '텍스트',
+            textarea: '여러 줄 텍스트',
+            group: '그룹',
+            divider: '구분선',
+            caption: '설명',
         },
         presetBinding: {
         },

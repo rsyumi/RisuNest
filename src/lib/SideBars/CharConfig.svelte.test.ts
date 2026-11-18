@@ -38,6 +38,11 @@ vi.mock('./Toggles.svelte', () => ({ default: () => {} }))
 vi.mock('../UI/GUI/TextAreaInput.svelte', () => ({ default: () => {} }))
 vi.mock('../UI/GUI/MultiLangInput.svelte', () => ({ default: () => {} }))
 vi.mock('../Others/Help.svelte', () => ({ default: () => {} }))
+// The editor itself is covered by ToggleDefinitionEditor.svelte.test.ts; here it exposes what it receives.
+const toggleEditor = vi.hoisted(() => ({ props: {} as { value?: unknown, onChange?: (value: string) => void } }))
+vi.mock('../UI/ToggleDefinitionEditor.svelte', () => ({
+    default: (_anchor: unknown, props: typeof toggleEditor.props) => { toggleEditor.props = props },
+}))
 vi.mock('src/lib/Gallery/AssetGallery.svelte', () => ({ default: () => {} }))
 
 let instance: ReturnType<typeof mount> | undefined
@@ -177,4 +182,16 @@ it('offers the asset style with new image handling even when the asset prompt is
     DBState.db.newImageHandlingBeta = false
     await tick()
     expect(assetStyle()).toBeUndefined()
+})
+
+it('edits the selected character custom toggles through the toggle editor', async () => {
+    DBState.db.characters.forEach(character => Object.assign(character, {
+        customModuleToggle: `${character.chaId}=On`, bias: [], alternateGreetings: [], personality: '', scenario: '',
+        additionalData: {}, depth_prompt: { depth: 0, prompt: '' },
+    }))
+    selectedCharID.set(1)
+    await setup(2)
+    expect(toggleEditor.props.value).toBe('Second=On')
+    toggleEditor.props.onChange!('edited=Edited')
+    expect(DBState.db.characters.map(character => character.customModuleToggle)).toEqual(['First=On', 'edited=Edited'])
 })

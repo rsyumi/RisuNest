@@ -1988,8 +1988,18 @@ export const languageEnglish = {
             chatPreset: 'Current chat',
         },
         promptList: {
+            count: '{0} prompts',
         },
         toggleEditor: {
+            view: 'Custom toggle view',
+            raw: 'Raw',
+            switch: 'Switch',
+            select: 'Select',
+            text: 'Text',
+            textarea: 'Multiline text',
+            group: 'Group',
+            divider: 'Divider',
+            caption: 'Caption',
         },
         presetBinding: {
         },
