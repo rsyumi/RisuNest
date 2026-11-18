@@ -77,7 +77,7 @@
 
     let groupedToggles = $derived(groupSidebarToggles(parseToggleSyntax(
         presetFields.customPromptTemplateToggle + '\n' +
-        getModuleToggles() + '\n' +
+        getModuleToggles(presetFields) + '\n' +
         charToggle
     )))
 
