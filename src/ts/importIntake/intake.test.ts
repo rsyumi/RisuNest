@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     discarded: [] as string[],
     discardResult: true,
     writeHook: undefined as (() => void) | undefined,
+    classifyHook: undefined as ((displayName: string) => void) | undefined,
     alertError: vi.fn(),
     characterPath: vi.fn(),
     characterProcess: vi.fn(),
@@ -33,6 +34,7 @@ vi.mock('@tauri-apps/api/core', () => ({
         if (command === 'import_intake_classify') {
             const sources = args.request.sources as Array<{ source: unknown; displayName: string }>
             mocks.classifyRequests.push(sources)
+            for (const { displayName } of sources) mocks.classifyHook?.(displayName)
             return sources.map(({ displayName }) => mocks.classified.get(displayName)
                 ?? { kind: 'unsupported', refusal: 'unsupported-format' })
         }
@@ -111,6 +113,7 @@ import {
     type NativeFileOperationOutcome,
 } from '../storage/nativeFileJobManager'
 import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
+import { NativeFileJobError } from '../storage/nativeFileJobs'
 import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'
 import { loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
 import { handleAppDrop } from './drop'
@@ -148,6 +151,7 @@ beforeEach(() => {
     mocks.removed.length = 0
     mocks.classified.clear()
     mocks.classifyRequests.length = 0
+    mocks.classifyHook = undefined
     mocks.spools.clear()
     mocks.discarded.length = 0
     mocks.discardResult = true
@@ -241,24 +245,34 @@ describe('one dropped file', () => {
 
     it('alerts the name and the reason of a file it cannot import', async () => {
         classify('photo.jpg', { kind: 'unsupported', refusal: 'plain-jpeg' })
-        classify('huge.json', { kind: 'unsupported', refusal: 'too-large' })
+        classify('huge.png', { kind: 'unsupported', refusal: 'png-without-card' })
+        classify('shared.json', { kind: 'unsupported', refusal: 'too-large' })
+        const hugeJson = dropped('huge.json', '\n  {"name":"synthetic"}')
+        const hugePng = dropped('huge.png', 'synthetic image')
         const hugePlugin = dropped('huge.js', '//@name synthetic_huge\n//@api 3.0\n')
-        Object.defineProperty(hugePlugin, 'size', { value: MAX_CONTENT_METADATA_BYTES + 1 })
+        for (const file of [hugeJson, hugePng, hugePlugin]) Object.defineProperty(file, 'size', { value: MAX_CONTENT_METADATA_BYTES + 1 })
+        const copyHugeJson = vi.spyOn(hugeJson, 'stream')
         const readHugePlugin = vi.spyOn(hugePlugin, 'text')
         await submitImportDelivery(drop(dropped('photo.jpg')))
         await submitImportDelivery(drop(dropped('notes.txt')))
-        await submitImportDelivery(drop(dropped('huge.json')))
+        await submitImportDelivery(drop(hugeJson))
+        await submitImportDelivery(drop(hugePng))
         await submitImportDelivery(drop(hugePlugin))
+        await submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path: '/opened/shared.json' }] })
         expect(mocks.alertError.mock.calls).toEqual([
             [`photo.jpg\n${language.risuNest.importDialog.reasonPlainJpeg}`],
             [`notes.txt\n${language.risuNest.importDialog.reasonUnsupportedFormat}`],
             [`huge.json\n${failureReason('payload-too-large', 'import', 'content')}`],
+            [`huge.png\n${language.risuNest.importIntake.reasonPngWithoutCard}`],
             [`huge.js\n${failureReason('payload-too-large', 'import', 'content')}`],
+            [`shared.json\n${failureReason('payload-too-large', 'import', 'content')}`],
         ])
+        // A dropped JSON file over the limit is refused before it is copied; another large file is copied.
+        expect(copyHugeJson).not.toHaveBeenCalled()
         expect(readHugePlugin).not.toHaveBeenCalled()
         expect(get(pluginInstallDialog)).toBeNull()
         // A file of an unknown extension is never copied or read.
-        expect(mocks.classifyRequests.flat().map(({ displayName }) => displayName)).toEqual(['photo.jpg', 'huge.json'])
+        expect(mocks.classifyRequests.flat().map(({ displayName }) => displayName)).toEqual(['photo.jpg', 'huge.png', 'shared.json'])
         expect(outcomes).toEqual([])
         expect(inboxCopies()).toEqual([])
     })
@@ -268,6 +282,20 @@ describe('one dropped file', () => {
         await submitImportDelivery(drop(dropped('card.png')))
         expect(mocks.classifyRequests).toEqual([])
         expect(mocks.characterPath).not.toHaveBeenCalled()
+        expect(outcomes).toEqual([expect.objectContaining({ state: 'cancelled' })])
+        expect(inboxCopies()).toEqual([])
+    })
+
+    it('reads no further file once the delivery is cancelled during a classification', async () => {
+        classify('first.png', { kind: 'character', format: 'png' })
+        classify('second.png', { kind: 'character', format: 'png' })
+        const second = dropped('second.png')
+        const copySecond = vi.spyOn(second, 'stream')
+        mocks.classifyHook = () => cancelActiveNativeFileOperation()
+        await submitImportDelivery(drop(dropped('first.png'), second))
+        expect(mocks.classifyRequests.flat().map(({ displayName }) => displayName)).toEqual(['first.png'])
+        expect(copySecond).not.toHaveBeenCalled()
+        expect(get(importSheet)).toBeNull()
         expect(outcomes).toEqual([expect.objectContaining({ state: 'cancelled' })])
         expect(inboxCopies()).toEqual([])
     })
@@ -321,6 +349,27 @@ describe('destination choices', () => {
             state: 'succeeded', location: { kind: 'character-lorebook', chaId: 'alice', characterName: 'Alice' },
         })])
         expect(inboxCopies()).toEqual([])
+    })
+
+    it('reports an empty lorebook as imported into the character and a character removed meanwhile as failed', async () => {
+        mocks.db.characters = [{ chaId: 'alice', name: 'Alice' }]
+        selectedCharID.set(0)
+        classify('empty.json', { kind: 'lorebook', format: 'json' })
+        classify('book.json', { kind: 'lorebook', format: 'json' })
+        const toCharacter = ({ items, defaults }: ImportSheetRequest) => [{ id: items[0].id, ...defaults[items[0].id] }]
+        let delivered = submitImportDelivery(drop(dropped('empty.json', '{"type":"risu","data":[]}')))
+        await answerSheet(toCharacter)
+        await delivered
+        expect(outcomes).toEqual([expect.objectContaining({
+            state: 'succeeded', location: { kind: 'character-lorebook', chaId: 'alice', characterName: 'Alice' },
+        })])
+
+        dismissNativeFileOperationOutcome()
+        mocks.appendLorebook.mockResolvedValueOnce(false)
+        delivered = submitImportDelivery(drop(dropped('book.json', '{"type":"risu","data":[{"key":"synthetic"}]}')))
+        await answerSheet(toCharacter)
+        await delivered
+        expect(outcomes.at(-1)).toEqual(expect.objectContaining({ state: 'failed', error: expect.objectContaining({ code: 'revision-conflict' }) }))
     })
 
     it.each([
@@ -569,7 +618,7 @@ describe('Android shares', () => {
             spool('backup-token', 'backup.risunest'),
             spool('card-token', 'card.json', '{"name":"Synthetic"}'),
             { type: 'path', path: presetPath },
-            { type: 'androidSpoolFailure', failure: { displayName: 'broken.png', code: 'source-copy-failed' } },
+            { type: 'failed', name: 'broken.png', code: 'source-copy-failed' },
         ] })
         const request = await answerSheet(({ items }) => items.filter(item => !item.refusal).map(item => ({ id: item.id })))
         await delivered
@@ -578,11 +627,11 @@ describe('Android shares', () => {
             ['backup.risunest', 'backup-with-other-files'], ['card.json', undefined], ['preset.risup', undefined],
             ['broken.png', 'read-failed'],
         ])
-        expect(mocks.classifyRequests).toEqual([[
-            { source: { type: 'androidSpool', token: 'backup-token' }, displayName: 'backup.risunest' },
-            { source: { type: 'androidSpool', token: 'card-token' }, displayName: 'card.json' },
-            { source: { type: 'desktopPath', path: presetPath }, displayName: 'preset.risup' },
-        ]])
+        expect(mocks.classifyRequests).toEqual([
+            [{ source: { type: 'androidSpool', token: 'backup-token' }, displayName: 'backup.risunest' }],
+            [{ source: { type: 'androidSpool', token: 'card-token' }, displayName: 'card.json' }],
+            [{ source: { type: 'desktopPath', path: presetPath }, displayName: 'preset.risup' }],
+        ])
         // The batch outcome reports the import, so the card importer stays quiet.
         expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.json', data: encode('{"name":"Synthetic"}'), quiet: true })
         expect(mocks.preset).toHaveBeenCalledExactlyOnceWith({ name: 'preset.risup', data: encode('synthetic preset') })
@@ -600,13 +649,14 @@ describe('Android shares', () => {
         expect(mocks.removed).toEqual([])
     })
 
-    it('restores a lone shared backup and leaves its spool to the restore', async () => {
+    it('releases a lone shared backup when its restore is refused before it starts', async () => {
         classify('backup.risunest', { kind: 'backup', format: 'portable' })
+        mocks.restoreAndroid.mockRejectedValueOnce(new NativeFileJobError('generation-active', 'generation-active'))
         await submitImportDelivery({ origin: 'opened', sources: [spool('backup-token', 'backup.risunest', 'synthetic backup')] })
         expect(mocks.restoreAndroid).toHaveBeenCalledExactlyOnceWith({
             source: { type: 'androidSpool', token: 'backup-token' }, displayName: 'backup.risunest', bytes: 16,
         })
-        expect(mocks.discarded).toEqual([])
+        expect(mocks.discarded).toEqual(['backup-token'])
     })
 
     it('names an opened cache copy after the shared file', async () => {

@@ -24,7 +24,7 @@ import {
     createAndroidRisuSaveSpoolRoute,
     type AndroidRisuSaveRestoreInput,
 } from './androidRisuSaveRoute'
-import { runExternalAndroidNativeFileOperation } from './nativeFileJobManager'
+import { runExternalAndroidNativeFileOperation, waitForNativeFileOperationIdle } from './nativeFileJobManager'
 import type { NativeAndroidCharacterSpoolResult } from './nativeCharacterFileRoute'
 import {
     NativeFileJobActivationCommittedError,
@@ -38,7 +38,7 @@ import {
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 import { createPortableExportIntentStore } from './deviceBackup/job'
-import { handOverOpenedFiles, settleOpenedFilesAfter } from '../openedFiles'
+import { handOverOpenedFiles, openedFileSource, settleOpenedFilesAfter } from '../openedFiles'
 import type { ImportIntakeDelivery, ImportIntakeSource } from '../importIntake/types'
 
 let disposeSpoolListener: (() => void) | undefined
@@ -65,12 +65,12 @@ export function createAndroidSpoolBatchRouter(
     routing: AndroidSpoolBatchRouting,
 ): (batch: AndroidSpoolBatch) => Promise<void> {
     const submittedTokens = new Set<string>()
-    let order = Promise.resolve()
-    return ({ openedPaths = [], ...batch }) => {
-        const routed = order.then(async () => {
+    let queue = Promise.resolve()
+    return ({ openedFiles = [], order, ...batch }) => {
+        const routed = queue.then(async () => {
             if (!await routing.firstSetupDone()) {
                 // These files keep the handling they had as their own opened-files event.
-                if (openedPaths.length) handOverOpenedFiles(openedPaths)
+                if (openedFiles.length) handOverOpenedFiles(openedFiles)
                 void routing.dispatch(batch)
                 return
             }
@@ -87,20 +87,36 @@ export function createAndroidSpoolBatchRouter(
                     ...fresh
                         .filter((source) => !source.importDestination)
                         .map((spool) => ({ type: 'androidSpool' as const, spool })),
-                    ...openedPaths.map((path) => ({ type: 'path' as const, path })),
+                    ...openedFiles.map(openedFileSource),
                     ...batch.failures
                         .filter((failure) => !pickerFailures.includes(failure))
-                        .map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
+                        .map(({ displayName, code }) => ({ type: 'failed' as const, name: displayName, code })),
                 ]
-                if (sources.length) delivery = submit({ origin: 'opened', sources })
+                if (sources.length) delivery = submit({ origin: 'opened', sources: inOpeningOrder(sources, order) })
             } finally {
                 // Settled as the opened-files handling settles them, once this delivery has ended.
-                if (openedPaths.length) void settleOpenedFilesAfter(openedPaths, async () => await delivery)
+                if (openedFiles.length) void settleOpenedFilesAfter(openedFiles, async () => await delivery)
             }
         })
-        order = routed.catch(() => {})
+        queue = routed.catch(() => {})
         return routed
     }
+}
+
+/**
+ * Puts the sources in the order Android opened them. Batches that reached the page together carry
+ * their orders one after another, so a repeated name takes the next position it has.
+ */
+function inOpeningOrder(sources: ImportIntakeSource[], order: string[] | undefined): ImportIntakeSource[] {
+    if (!order?.length) return sources
+    const positions = new Map<string, number[]>()
+    order.forEach((key, position) => positions.set(key, [...positions.get(key) ?? [], position]))
+    const key = (source: ImportIntakeSource) => source.type === 'androidSpool' ? source.spool.token
+        : source.type === 'path' ? source.path : source.type === 'failed' ? source.name : ''
+    return sources
+        .map(source => ({ source, position: positions.get(key(source))?.shift() ?? Infinity }))
+        .sort((a, b) => a.position - b.position)
+        .map(({ source }) => source)
 }
 
 export interface AndroidOpenedSpoolDispatchDependencies {
@@ -348,6 +364,19 @@ export async function restoreAndroidOpenedBackupSource({
     )
 }
 
+/** Restores a backup shared before first setup and releases its spool if the restore never took it. */
+export async function restoreAndroidBackupSpool(input: AndroidRisuSaveRestoreInput): Promise<void> {
+    const startedAt = Date.now()
+    try {
+        await restoreAndroidOpenedBackupSource(input)
+    } catch (error) {
+        showAndroidFileError(error, startedAt)
+    }
+    // A restore can read its spool until its outcome and any retry from it are gone.
+    await waitForNativeFileOperationIdle()
+    if (input.source.type === 'androidSpool') await discardAndroidSafSource(input.source.token).catch(() => false)
+}
+
 export function registerAndroidRisuSaveRoute(): void {
     if (!isTauriAndroid || !isAndroidSafFileJobsEnabled() || disposeSpoolListener) return
 
@@ -381,14 +410,7 @@ export function registerAndroidRisuSaveRoute(): void {
                 alertError(`${source.displayName}: ${failureReason('discard-failed')}`)
             }
         },
-        restore: async (input) => {
-            const startedAt = Date.now()
-            try {
-                await restoreAndroidOpenedBackupSource(input)
-            } catch (error) {
-                showAndroidFileError(error, startedAt)
-            }
-        },
+        restore: restoreAndroidBackupSpool,
         unsupported: showUnsupportedSpool,
         failed: showSpoolFailure,
         onError: (_source, error) => showAndroidFileError(error),

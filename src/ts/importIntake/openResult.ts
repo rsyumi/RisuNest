@@ -1,13 +1,21 @@
 import { get } from 'svelte/store'
 import type { NativeFileOperationImportLocation } from '../storage/nativeFileJobManager'
 import {
+    bookmarkListOpen,
     botMakerMode,
     CharConfigSubMenu,
+    customSideBarConfigDialogStore,
     DBState,
+    easyPanelStore,
+    hypaV3ModalOpen,
+    irisStore,
+    loadoutModalStore,
     MobileGUI,
     MobileSideBar,
+    moduleScopeMenuOpen,
     openPersonaList,
     openPresetList,
+    popUpEditorStore,
     QuickSettings,
     settingsOpen,
     SettingsMenuIndex,
@@ -24,12 +32,12 @@ export function openImportResult(location: NativeFileOperationImportLocation): v
         case 'module':
         case 'module-from-charx':
         case 'module-from-lorebook':
-            closeLists()
+            closeOverlays()
             SettingsMenuIndex.set(MODULE_SETTINGS_PAGE)
             settingsOpen.set(true)
             return
         case 'preset':
-            openPersonaList.set(false)
+            closeOverlays()
             openPresetList.set(true)
             return
         case 'character':
@@ -39,10 +47,10 @@ export function openImportResult(location: NativeFileOperationImportLocation): v
     }
 }
 
-/** Closes the preset and persona lists, which show over every screen. */
-function closeLists(): void {
-    openPresetList.set(false)
-    openPersonaList.set(false)
+/** Closes the lists and panels that show over every screen and lose nothing when closed. */
+function closeOverlays(): void {
+    for (const open of [openPresetList, openPersonaList, bookmarkListOpen, moduleScopeMenuOpen, hypaV3ModalOpen]) open.set(false)
+    for (const panel of [easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore]) panel.open = false
 }
 
 async function openCharacter(location: Extract<NativeFileOperationImportLocation, { chaId: string }>): Promise<void> {
@@ -51,7 +59,7 @@ async function openCharacter(location: Extract<NativeFileOperationImportLocation
     const { changeChar } = await import('../characters')
     // A refused selection (a running generation, an archived character) leaves the screen as it was.
     if (!await changeChar(index)) return
-    closeLists()
+    closeOverlays()
     settingsOpen.set(false)
     openedImportResult.set({ kind: location.kind })
     if (location.kind === 'character') {

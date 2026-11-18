@@ -51,6 +51,7 @@ vi.mock('./portableBackupFileRouteProduction.svelte', () => ({
 }))
 vi.mock('./nativeFileJobManager', () => ({
     runExternalAndroidNativeFileOperation: backupMocks.externalManager,
+    waitForNativeFileOperationIdle: async () => {},
 }))
 
 import { language } from 'src/lang'
@@ -65,6 +66,7 @@ import {
     dispatchAndroidOpenedSpoolBatch,
     importAndroidOpenedPreparedContent,
     restoreAndroidOpenedBackupSource,
+    restoreAndroidBackupSpool,
     registerAndroidRisuSaveRoute,
     createAndroidSpoolBatchRouter,
     androidFirstSetupFinished,
@@ -224,6 +226,22 @@ describe('Android opened spool production route', () => {
         expect(alertNormal).toHaveBeenCalledExactlyOnceWith(language.risuSaveCleanupWarning)
     })
 
+    it('releases a shared backup spool that its restore refused before taking it', async () => {
+        const { NativeFileJobError } = await import('./nativeFileJobs')
+        const discarded: string[] = []
+        vi.stubGlobal('window', { RisuSafBridge: { discardSource: (token: string) => { discarded.push(token); return true } } })
+        try {
+            backupMocks.restore.mockReset().mockRejectedValue(new NativeFileJobError('generation-active', 'generation-active'))
+            await restoreAndroidBackupSpool({
+                source: { type: 'androidSpool', token: '11111111-1111-4111-8111-111111111111' },
+                displayName: 'shared.risunest',
+            })
+            expect(discarded).toEqual(['11111111-1111-4111-8111-111111111111'])
+        } finally {
+            vi.unstubAllGlobals()
+        }
+    })
+
     it('keeps the inactive content capability fallback out of the restore discard path', async () => {
         const enqueueRestore = vi.fn(async () => undefined)
         const importCharacter = vi.fn(async () => ({
@@ -304,7 +322,7 @@ describe('Android opened spool production route', () => {
             { origin: 'opened', sources: [
                 { type: 'androidSpool', spool: save },
                 { type: 'androidSpool', spool: card },
-                { type: 'androidSpoolFailure', failure: broken },
+                { type: 'failed', name: broken.displayName, code: broken.code },
             ] },
             { origin: 'opened', sources: [{ type: 'androidSpool', spool: book }] },
         ])
@@ -325,7 +343,7 @@ describe('Android opened spool production route', () => {
         expect(await androidFirstSetupFinished()).toBe(false)
     })
 
-    it('joins the opened files of a share into its delivery and acknowledges them once it ended', async () => {
+    it('joins the opened files of a share into its delivery in opening order and acknowledges them once it ended', async () => {
         const acknowledgeOpenedFile = vi.fn((_path: string) => {})
         const holder: EventTarget & { tauriOpenedFiles?: unknown } =
             Object.assign(new EventTarget(), { RisuLifecycleBridge: { acknowledgeOpenedFile } })
@@ -348,23 +366,28 @@ describe('Android opened spool production route', () => {
         const earlyPreset = '/cache/opened_files/1-0-early.risup'
         const preset = '/cache/opened_files/2-1-preset.risup'
         const script = '/cache/opened_files/2-2-plugin.js'
+        const uncopied = { name: 'uncopied.risup', code: 'source-copy-failed' }
         const alone = '/cache/opened_files/3-0-alone.risupreset'
         try {
             // Before first setup the copied files wait for the opened-files listener, as their own event did.
-            await route({ requestId: 'early', ready: [early], failures: [], openedPaths: [earlyPreset] })
+            await route({ requestId: 'early', ready: [early], failures: [], openedFiles: [earlyPreset, uncopied] })
             expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'early', ready: [early], failures: [] })
-            expect(holder.tauriOpenedFiles).toEqual([earlyPreset])
+            expect(holder.tauriOpenedFiles).toEqual([earlyPreset, uncopied])
 
             firstSetupDone = true
-            await route({ requestId: 'share', ready: [save], failures: [broken], openedPaths: [preset, script] })
+            await route({
+                requestId: 'share', ready: [save], failures: [broken], openedFiles: [preset, uncopied, script],
+                order: [preset, save.token, uncopied.name, broken.displayName, script],
+            })
             // A spool the page already received leaves the copied files of its intent to arrive alone.
-            await route({ requestId: 'paths', ready: [], failures: [], openedPaths: [alone] })
+            await route({ requestId: 'paths', ready: [], failures: [], openedFiles: [alone] })
             expect(deliveries).toEqual([
                 { origin: 'opened', sources: [
-                    { type: 'androidSpool', spool: save },
                     { type: 'path', path: preset },
+                    { type: 'androidSpool', spool: save },
+                    { type: 'failed', ...uncopied },
+                    { type: 'failed', name: broken.displayName, code: broken.code },
                     { type: 'path', path: script },
-                    { type: 'androidSpoolFailure', failure: broken },
                 ] },
                 { origin: 'opened', sources: [{ type: 'path', path: alone }] },
             ])
@@ -376,7 +399,7 @@ describe('Android opened spool production route', () => {
             ends[0]()
             await vi.waitFor(() => expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path))
                 .toEqual([alone, preset, script]))
-            expect(holder.tauriOpenedFiles).toEqual([earlyPreset])
+            expect(holder.tauriOpenedFiles).toEqual([earlyPreset, uncopied])
             expect(dispatch).toHaveBeenCalledOnce()
         } finally {
             vi.unstubAllGlobals()

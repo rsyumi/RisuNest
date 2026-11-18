@@ -26,12 +26,13 @@ let consumeOpenedFiles: typeof api.consumeOpenedFiles
 let registerOpenedFileListeners: typeof api.registerOpenedFileListeners
 let OPENED_FILES_EVENT: typeof api.OPENED_FILES_EVENT
 let OPENED_FILES_TAKE_COMMAND: typeof api.OPENED_FILES_TAKE_COMMAND
+type OpenedFile = import('./openedFiles').OpenedFile
 const domListeners: Array<[string, EventListenerOrEventListenerObject]> = []
 
 function deliverySpy() {
-    const delivered: string[][] = []
-    const deliver = vi.fn(async (paths: string[]) => {
-        delivered.push(paths)
+    const delivered: OpenedFile[][] = []
+    const deliver = vi.fn(async (files: OpenedFile[]) => {
+        delivered.push(files)
     })
     return { delivered, deliver }
 }
@@ -69,57 +70,57 @@ describe('opened file delivery', () => {
         vi.restoreAllMocks()
     })
 
-    it('delivers each iOS cold and warm open together and discards its staged files afterwards', async () => {
+    it('delivers each iOS cold and warm open with the files it could not prepare and discards its staged files afterwards', async () => {
         mocks.ios = true
         let take = 0
+        const unprepared = { name: 'unprepared.risunest', code: 'source-copy-failed' }
         mocks.invoke.mockImplementation(async command => {
             if (command.endsWith('take_opened_files')) return { files: ++take === 1
-                ? [{ path: '/staged/first.charx' }, { path: '/staged/broken.risum' }]
-                : [{ path: '/staged/last.charx' }] }
+                ? [{ path: '/staged/first.charx' }, unprepared, { path: '/staged/broken.risum' }]
+                : [unprepared] }
         })
-        const delivered: string[][] = []
-        const discardsBeforeDelivery: number[] = []
-        registerOpenedFileListeners(async (paths) => {
-            delivered.push(paths)
-            discardsBeforeDelivery.push(mocks.invoke.mock.calls.filter(([command]) => command.endsWith('discard_file')).length)
-            if (paths.some(path => path.includes('broken'))) throw new Error('synthetic failure')
+        const delivered: OpenedFile[][] = []
+        registerOpenedFileListeners(async (files) => {
+            delivered.push(files)
+            expect(mocks.invoke.mock.calls.filter(([command]) => command.endsWith('discard_file'))).toEqual([])
+            if (files.includes('/staged/broken.risum')) throw new Error('synthetic failure')
         })
         window.dispatchEvent(new Event('risunest-ios-opened-files'))
         await vi.waitFor(() => expect(delivered).toHaveLength(2))
         await flush()
-        expect(delivered).toEqual([['/staged/first.charx', '/staged/broken.risum'], ['/staged/last.charx']])
-        expect(discardsBeforeDelivery).toEqual([0, 2])
+        // A file that could not be prepared stays in its opening, also when it is the only one.
+        expect(delivered).toEqual([['/staged/first.charx', unprepared, '/staged/broken.risum'], [unprepared]])
         expect(mocks.listen).not.toHaveBeenCalled()
         expect(mocks.invoke.mock.calls.filter(([command]) => command.endsWith('discard_file'))
-            .map(([, args]) => args)).toEqual(delivered.flat().map(path => ({ path })))
+            .map(([, args]) => args)).toEqual([{ path: '/staged/first.charx' }, { path: '/staged/broken.risum' }])
         expect(mocks.alertError).toHaveBeenCalledOnce()
         expect(String(mocks.alertError.mock.calls[0][0])).toContain('/staged/broken.risum')
     })
 
-    it('acknowledges Android opened files only after their delivery ended, and runs deliveries in order', async () => {
+    it('hands each Android opening over as it arrives and acknowledges its files only after its own delivery ended', async () => {
         mocks.android = true
         const acknowledgeOpenedFile = vi.fn((_path: string) => {})
         window.RisuLifecycleBridge = { acknowledgeOpenedFile }
-        const started: string[][] = []
-        let complete!: () => void
-        registerOpenedFileListeners((paths) => {
-            started.push(paths)
-            return new Promise<void>(resolve => { complete = resolve })
+        const started: OpenedFile[][] = []
+        const completions: Array<() => void> = []
+        registerOpenedFileListeners((files) => {
+            started.push(files)
+            return new Promise<void>(resolve => { completions.push(resolve) })
         })
-        const first = consumeOpenedFiles(['/cache/opened_files/card.charx', '/cache/opened_files/preset.risup'])
+        const uncopied = { name: 'uncopied.risup', code: 'source-copy-failed' }
+        const first = consumeOpenedFiles(['/cache/opened_files/card.charx', uncopied])
         const second = consumeOpenedFiles(['/cache/opened_files/later.charx'])
         await flush()
-        expect(started).toEqual([['/cache/opened_files/card.charx', '/cache/opened_files/preset.risup']])
+        // The intake queues openings with dropped files in arrival order, so the second does not wait here.
+        expect(started).toEqual([['/cache/opened_files/card.charx', uncopied], ['/cache/opened_files/later.charx']])
         expect(acknowledgeOpenedFile).not.toHaveBeenCalled()
-        complete()
-        await first
-        await flush()
-        expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path))
-            .toEqual(['/cache/opened_files/card.charx', '/cache/opened_files/preset.risup'])
-        expect(started).toHaveLength(2)
-        complete()
+        completions[1]()
         await second
-        expect(acknowledgeOpenedFile).toHaveBeenLastCalledWith('/cache/opened_files/later.charx')
+        expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path)).toEqual(['/cache/opened_files/later.charx'])
+        completions[0]()
+        await first
+        expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path))
+            .toEqual(['/cache/opened_files/later.charx', '/cache/opened_files/card.charx'])
     })
 
     it('drains the Android cold start injection once and delivers a warm start with its files', async () => {

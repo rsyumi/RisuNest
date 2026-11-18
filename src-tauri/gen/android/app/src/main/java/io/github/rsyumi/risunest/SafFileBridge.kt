@@ -971,25 +971,47 @@ private fun spoolFailuresJson(failures: List<SafSpoolFailure>): String =
     "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
   }
 
+/** One opened file outside the spool allowlist: its copy, or a file that could not be copied. */
+internal sealed interface OpenedFileEntry {
+  data class Copied(val path: String) : OpenedFileEntry
+  data class Failed(val displayName: String, val code: String) : OpenedFileEntry
+}
+
+internal fun openedFileEntryJson(entry: OpenedFileEntry): String = when (entry) {
+  is OpenedFileEntry.Copied -> jsonString(entry.path)
+  is OpenedFileEntry.Failed -> "{\"name\":${jsonString(entry.displayName)},\"code\":${jsonString(entry.code)}}"
+}
+
+/** What the page sorts an opened file by: a spool token, a copied path, or the name of a failed file. */
+internal fun openedFileOrderKey(entry: OpenedFileEntry): String = when (entry) {
+  is OpenedFileEntry.Copied -> entry.path
+  is OpenedFileEntry.Failed -> entry.displayName
+}
+
 /**
- * [openedPaths] are the copied files of the same opened intent that are outside the spool allowlist,
- * so the page receives every file of the intent as one delivery.
+ * [openedFiles] are the files of the same opened intent outside the spool allowlist, so the page
+ * receives every file of the intent as one delivery, in [order]. Batches that reach the page together
+ * carry their orders one after another.
  */
 internal fun androidSpoolBatchScript(
   requestId: String,
   batch: SafSpoolBatch,
-  openedPaths: List<String> = emptyList(),
+  openedFiles: List<OpenedFileEntry> = emptyList(),
+  order: List<String> = batch.ready.map { it.token } + openedFiles.map(::openedFileOrderKey) +
+    batch.failures.map { it.displayName },
 ): String {
   val ready = spoolReadyJson(batch.ready)
   val failures = spoolFailuresJson(batch.failures)
-  val paths = openedPaths.joinToString(",", transform = ::jsonString)
+  val opened = openedFiles.joinToString(",", transform = ::openedFileEntryJson)
+  val keys = order.joinToString(",", transform = ::jsonString)
   val value = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]," +
-    "\"openedPaths\":[$paths]}"
+    "\"openedFiles\":[$opened],\"order\":[$keys]}"
   val pending = "{" +
     "\"requestId\":${jsonString(requestId)}," +
     "\"ready\":[...(window.tauriOpenedFileSpools?.ready??[]),...[$ready]]," +
     "\"failures\":[...(window.tauriOpenedFileSpools?.failures??[]),...[$failures]]," +
-    "\"openedPaths\":[...(window.tauriOpenedFileSpools?.openedPaths??[]),...[$paths]]}"
+    "\"openedFiles\":[...(window.tauriOpenedFileSpools?.openedFiles??[]),...[$opened]]," +
+    "\"order\":[...(window.tauriOpenedFileSpools?.order??[]),...[$keys]]}"
   return "window.tauriOpenedFileSpools=$pending;" +
     "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$value}));"
 }

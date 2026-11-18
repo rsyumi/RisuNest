@@ -141,11 +141,18 @@ class MainActivityBehaviorTest {
 
   @Test
   fun `ready document delivery dispatches opened files and falls back to its startup queue`() {
-    val script = openedFilesEventScript(listOf("/data/cache/opened_files/1-0-preset.risup"))
+    val script = openedFilesEventScript(listOf(
+      OpenedFileEntry.Copied("/data/cache/opened_files/1-0-preset.risup"),
+      OpenedFileEntry.Failed("broken.risup", "source-copy-failed"),
+    ))
 
     assertEquals(true, script.contains("new CustomEvent('risu-opened-files'"))
     assertEquals(true, script.contains("cancelable:true"))
-    assertEquals(true, script.contains("\"/data/cache/opened_files/1-0-preset.risup\""))
+    // A file that could not be copied stays in its opening, so the page refuses it there.
+    assertEquals(
+      true,
+      script.contains("var files=[\"/data/cache/opened_files/1-0-preset.risup\",{\"name\":\"broken.risup\",\"code\":\"source-copy-failed\"}];"),
+    )
     assertEquals(true, script.contains("if(window.dispatchEvent(event)){"))
     assertEquals(true, script.contains("window.tauriOpenedFiles="))
     // Delivery never replaces an earlier undrained startup batch.
@@ -156,8 +163,8 @@ class MainActivityBehaviorTest {
   fun `ready document delivery escapes opened file paths`() {
     assertEquals(
       true,
-      openedFilesEventScript(listOf("C:\\opened\nfile.risup"))
-        .contains("\"C:\\\\opened\\u000afile.risup\""),
+      openedFilesEventScript(listOf(OpenedFileEntry.Copied("C:\\opened\nfile.risup")))
+        .contains("\"C:\\\\opened\\nfile.risup\""),
     )
   }
 
@@ -510,7 +517,7 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `an opened intent that spooled files delivers its copied paths inside its spool batch`() {
+  fun `an opened intent that spooled files delivers its other files inside its spool batch in opening order`() {
     val spool = SafSpoolReady(
       token = "11111111-1111-4111-8111-111111111111",
       displayName = "backup.risunest",
@@ -519,11 +526,15 @@ class MainActivityBehaviorTest {
     )
     val failure = SafSpoolFailure("broken.png", "source-copy-failed")
     val preset = "/data/cache/opened_files/${"a".repeat(64)}-1-preset.risup"
+    val opened = listOf(OpenedFileEntry.Copied(preset), OpenedFileEntry.Failed("lost.risup", "source-copy-failed"))
     val readyJson = "[{\"token\":\"${spool.token}\",\"displayName\":\"backup.risunest\",\"bytes\":9," +
       "\"totalBytes\":9,\"importDestination\":null}]"
     val failuresJson = "[{\"displayName\":\"broken.png\",\"code\":\"source-copy-failed\"}]"
+    val openedJson = "[\"$preset\",{\"name\":\"lost.risup\",\"code\":\"source-copy-failed\"}]"
+    val order = listOf(preset, spool.token, "lost.risup", "broken.png")
+    val orderJson = "[\"$preset\",\"${spool.token}\",\"lost.risup\",\"broken.png\"]"
 
-    val joined = openedIntentScripts("request-1", SafSpoolBatch(listOf(spool), listOf(failure)), listOf(preset), spooled = true)
+    val joined = openedIntentScripts("request-1", SafSpoolBatch(listOf(spool), listOf(failure)), opened, order, spooled = true)
 
     assertEquals(1, joined.size)
     assertEquals(false, joined.single().contains("risu-opened-files"))
@@ -531,18 +542,25 @@ class MainActivityBehaviorTest {
       true,
       joined.single().contains(
         "new CustomEvent('risu-android-spool-ready',{detail:{\"requestId\":\"request-1\"," +
-          "\"ready\":$readyJson,\"failures\":$failuresJson,\"openedPaths\":[\"$preset\"]}})",
+          "\"ready\":$readyJson,\"failures\":$failuresJson,\"openedFiles\":$openedJson,\"order\":$orderJson}})",
       ),
     )
-    // A late listener reads the same paths from the startup value, after any earlier undrained ones.
+    // A late listener reads the same files and order from the startup value, after any earlier undrained ones.
     assertEquals(
       true,
-      joined.single().contains("\"openedPaths\":[...(window.tauriOpenedFileSpools?.openedPaths??[]),...[\"$preset\"]]"),
+      joined.single().contains("\"openedFiles\":[...(window.tauriOpenedFileSpools?.openedFiles??[]),...$openedJson]"),
+    )
+    assertEquals(true, joined.single().contains("\"order\":[...(window.tauriOpenedFileSpools?.order??[]),...$orderJson]"))
+    // A batch without an opening order lists its files as the page groups them, so undrained batches stay in sequence.
+    assertEquals(
+      true,
+      androidSpoolBatchScript("replay", SafSpoolBatch(listOf(spool), listOf(failure)), opened)
+        .contains("\"order\":[\"${spool.token}\",\"$preset\",\"lost.risup\",\"broken.png\"]}"),
     )
 
     // An intent without spooled files keeps its own opened-files event.
-    val copiedOnly = openedIntentScripts("request-2", SafSpoolBatch(emptyList(), emptyList()), listOf(preset), spooled = false)
-    assertEquals(listOf(openedFilesEventScript(listOf(preset)), androidSpoolBatchScript("request-2", SafSpoolBatch(emptyList(), emptyList()))), copiedOnly)
+    val copiedOnly = openedIntentScripts("request-2", SafSpoolBatch(emptyList(), emptyList()), opened, listOf(preset, "lost.risup"), spooled = false)
+    assertEquals(listOf(openedFilesEventScript(opened), androidSpoolBatchScript("request-2", SafSpoolBatch(emptyList(), emptyList()))), copiedOnly)
     assertEquals(false, copiedOnly.last().contains(preset))
   }
 

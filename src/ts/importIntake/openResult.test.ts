@@ -6,13 +6,21 @@ vi.mock('src/ts/stores.svelte', async () => (await import('./openResult.testSupp
 vi.mock('../characters', () => ({ changeChar: navigation.changeChar }) satisfies Partial<typeof import('../characters')>)
 
 import {
+    bookmarkListOpen,
     botMakerMode,
     CharConfigSubMenu,
+    customSideBarConfigDialogStore,
     DBState,
+    easyPanelStore,
+    hypaV3ModalOpen,
+    irisStore,
+    loadoutModalStore,
     MobileGUI,
     MobileSideBar,
+    moduleScopeMenuOpen,
     openPersonaList,
     openPresetList,
+    popUpEditorStore,
     QuickSettings,
     settingsOpen,
     SettingsMenuIndex,
@@ -20,6 +28,9 @@ import {
 } from 'src/ts/stores.svelte'
 import { openImportResult } from './openResult'
 import { openedImportResult } from './sheetStore'
+
+const overlayStores = [bookmarkListOpen, moduleScopeMenuOpen, hypaV3ModalOpen]
+const overlayPanels = [easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore]
 
 /** Lets the selection that `openImportResult` started finish. */
 const settled = () => new Promise(resolve => setTimeout(resolve))
@@ -30,6 +41,7 @@ function screen() {
         settingsPage: get(SettingsMenuIndex),
         presetList: get(openPresetList),
         personaList: get(openPersonaList),
+        overlays: [...overlayStores.map(open => get(open)), ...overlayPanels.map(panel => panel.open)].some(Boolean),
         opened: get(openedImportResult),
         tab: get(CharConfigSubMenu),
         characterPanel: get(botMakerMode),
@@ -44,9 +56,11 @@ beforeEach(() => {
     DBState.db.characters = [{ chaId: 'first' }, { chaId: 'imported' }] as typeof DBState.db.characters
     settingsOpen.set(true)
     SettingsMenuIndex.set(2)
-    // Both lists show over every screen until the Open button closes them.
+    // The lists and panels show over every screen until the Open button closes them.
     openPresetList.set(true)
     openPersonaList.set(true)
+    for (const open of overlayStores) open.set(true)
+    for (const panel of overlayPanels) panel.open = true
     openedImportResult.set(null)
     CharConfigSubMenu.set(0)
     botMakerMode.set(false)
@@ -59,13 +73,13 @@ beforeEach(() => {
 describe('opening an import result', () => {
     it.each(['module', 'module-from-charx', 'module-from-lorebook'] as const)('opens the module settings page for %s', kind => {
         openImportResult({ kind })
-        expect(screen()).toMatchObject({ settingsOpen: true, settingsPage: 14, presetList: false, personaList: false, opened: null })
+        expect(screen()).toMatchObject({ settingsOpen: true, settingsPage: 14, presetList: false, personaList: false, overlays: false, opened: null })
         expect(navigation.changeChar).not.toHaveBeenCalled()
     })
 
     it('opens the preset list', () => {
         openImportResult({ kind: 'preset' })
-        expect(screen()).toMatchObject({ presetList: true, personaList: false, settingsOpen: true, settingsPage: 2, opened: null })
+        expect(screen()).toMatchObject({ presetList: true, personaList: false, overlays: false, settingsOpen: true, settingsPage: 2, opened: null })
     })
 
     it.each([false, true])('selects an imported character and leaves settings for its chat, mobile %s', async mobile => {
@@ -74,7 +88,7 @@ describe('opening an import result', () => {
         await vi.waitFor(() => expect(navigation.changeChar).toHaveBeenCalledExactlyOnceWith(1))
         await settled()
         expect(screen()).toEqual({
-            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, opened: { kind: 'character' }, tab: 0,
+            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, opened: { kind: 'character' }, tab: 0,
             characterPanel: false, sidebar: false, quickSettings: true, mobilePanel: 0,
         })
     })
@@ -84,7 +98,7 @@ describe('opening an import result', () => {
         await vi.waitFor(() => expect(navigation.changeChar).toHaveBeenCalledExactlyOnceWith(1))
         await settled()
         expect(screen()).toEqual({
-            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, opened: { kind: 'character-lorebook' }, tab: 3,
+            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, opened: { kind: 'character-lorebook' }, tab: 3,
             characterPanel: true, sidebar: true, quickSettings: false, mobilePanel: 1,
         })
     })
@@ -95,7 +109,7 @@ describe('opening an import result', () => {
         await vi.waitFor(() => expect(navigation.changeChar).toHaveBeenCalledExactlyOnceWith(1))
         await settled()
         expect(screen()).toEqual({
-            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, opened: { kind: 'character-lorebook' }, tab: 3,
+            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, opened: { kind: 'character-lorebook' }, tab: 3,
             characterPanel: false, sidebar: false, quickSettings: true, mobilePanel: 2,
         })
     })

@@ -1,3 +1,4 @@
+import type { OpenedFile } from '../openedFiles'
 import { withLibraryFileSelection } from './libraryFileOperation'
 import '../androidNativeControl'
 import { BackupSourceCopyError } from './backupSourceCopyFailure'
@@ -29,8 +30,10 @@ export interface AndroidSpoolBatch {
     requestId: string
     ready: AndroidSpoolReady[]
     failures: AndroidSpoolFailure[]
-    /** Copied files of the same opened intent that are outside the spool allowlist. */
-    openedPaths?: string[]
+    /** Files of the same opened intent outside the spool allowlist: their copies, or the ones that could not be copied. */
+    openedFiles?: OpenedFile[]
+    /** The spool tokens, copied paths and failed file names in the order the files were opened. */
+    order?: string[]
 }
 
 export interface AndroidSpoolListenerDependencies {

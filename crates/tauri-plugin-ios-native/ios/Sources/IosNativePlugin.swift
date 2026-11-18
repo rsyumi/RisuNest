@@ -513,7 +513,7 @@ final class IosNativePlugin: Plugin, UIDocumentPickerDelegate, ASWebAuthenticati
                     if let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
                         try? NativeFileState.removeStagedInboxSource(url, inbox: documents.appendingPathComponent("Inbox", isDirectory: true))
                     }
-                } catch { entries.append(["error": "The selected file could not be prepared for import"]) }
+                } catch { entries.append(["name": url.lastPathComponent, "code": "source-copy-failed"]) }
             }
             DispatchQueue.main.async {
                 self.openedFiles.append(contentsOf: entries)

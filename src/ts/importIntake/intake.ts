@@ -5,7 +5,6 @@ import { alertStore } from '../alertQueue'
 import { isAppLockInputBlocked, waitForAppLockInputUnblocked } from '../appLock/input'
 import { isTauri } from '../platform'
 import { DBState, loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
-import { AndroidSafSourceError } from '../storage/androidSafBridge'
 import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
 import { presentFileOperationError } from '../storage/fileOperationErrorPresentation'
 import { copyFileToContentInbox, openContentInbox } from '../storage/nativeContentFile'
@@ -175,7 +174,7 @@ async function handleDelivery(delivery: ImportIntakeDelivery, id: number): Promi
             }
             // A direct import continues in the dialog that showed the copy.
             context.setSource(describeIntakeItem(plan.item))
-            return importIntakeItem(plan.item, plan.decision, context, state.ledger)
+            return importIntakeItem(plan.item, plan.decision, context)
         })
         if (planned.plan) await carryOut(planned.plan, state)
     } catch (error) {
@@ -187,63 +186,15 @@ async function handleDelivery(delivery: ImportIntakeDelivery, id: number): Promi
 
 /**
  * Classifies every file of the delivery, in delivery order. Dropped files are first copied into the
- * inbox inside the caller's operation; a file that cannot be copied or read is refused.
+ * inbox inside the caller's operation, whose cancel stops before the next file; a file that cannot
+ * be copied or read is refused.
  */
 async function readDelivery(state: DeliveryState, context?: SharedNativeFileOperationContext): Promise<ImportIntakeItem[]> {
-    const { delivery, ledger } = state
     const items: ImportIntakeItem[] = []
-    const pending: { index: number; item: Omit<ImportIntakeItem, 'kind'>; request: NativeImportIntakeSource }[] = []
-    let inbox: string | undefined
-    for (const [index, source] of delivery.sources.entries()) {
-        const name = importSourceName(source)
-        const id = `${state.id}:${index}`
-        if (source.type === 'file') {
-            const item = { id, name, bytes: source.file.size, source }
-            if (needsCopy(source)) {
-                if (!context) throw new Error('A dropped file is copied inside an operation')
-                context.setSource({ name, bytes: source.file.size })
-                try {
-                    inbox ??= await openContentInbox()
-                    const inboxPath = await copyFileToContentInbox(inbox, source.file, { signal: context.signal, onStatus: context.onStatus })
-                    ledger.addCopy(inboxPath)
-                    pending.push({
-                        index,
-                        item: { ...item, source: { ...source, inboxPath } },
-                        request: { source: { type: 'desktopPath', path: inboxPath }, displayName: name },
-                    })
-                } catch (error) {
-                    if (context.signal.aborted) throw error
-                    items[index] = { ...item, kind: 'unsupported', refusal: { code: 'read-failed', error } }
-                }
-            } else if (DROP_SCRIPT_EXTENSIONS.has(lowercaseExtension(name))) {
-                items[index] = await readPluginCandidate(item, source.file)
-            } else {
-                items[index] = { ...item, kind: 'unsupported', refusal: { code: 'unsupported-format' } }
-            }
-            continue
-        }
-        if (source.type === 'androidSpoolFailure') {
-            const error = new AndroidSafSourceError(source.failure.code, `${name}: ${source.failure.code}`)
-            items[index] = { id, name, source, kind: 'unsupported', refusal: { code: 'read-failed', error } }
-            continue
-        }
-        if (source.type === 'androidSpool') ledger.addSpool(source.spool)
-        pending.push({
-            index,
-            item: { id, name, source, ...(source.type === 'androidSpool' ? { bytes: source.spool.bytes } : {}) },
-            request: { source: nativeImportSource(source)!, displayName: name },
-        })
-    }
-    if (pending.length) {
-        let results: NativeImportIntakeClassification[]
-        try {
-            results = await classifyNativeImportSources(pending.map(entry => entry.request))
-        } catch (error) {
-            results = pending.map(() => ({ kind: 'unsupported', refusal: 'read-failed', message: String(error) }))
-        }
-        pending.forEach((entry, position) => {
-            items[entry.index] = classifiedItem(entry.item, results[position], state.moduleScreen)
-        })
+    const inbox: { path?: string } = {}
+    for (const [index, source] of state.delivery.sources.entries()) {
+        context?.signal.throwIfAborted()
+        items.push(await readSource(state, `${state.id}:${index}`, source, inbox, context))
     }
     context?.signal.throwIfAborted()
     if (items.length > 1) {
@@ -251,10 +202,74 @@ async function readDelivery(state: DeliveryState, context?: SharedNativeFileOper
         for (const [index, item] of items.entries()) {
             if (item.kind !== 'backup' || item.refusal) continue
             items[index] = { ...item, refusal: { code: 'backup-with-other-files' } }
-            ledger.markRefusedBackup(item.source)
+            state.ledger.markRefusedBackup(item.source)
         }
     }
     return items
+}
+
+async function readSource(
+    state: DeliveryState,
+    id: string,
+    source: ImportIntakeSource,
+    inbox: { path?: string },
+    context?: SharedNativeFileOperationContext,
+): Promise<ImportIntakeItem> {
+    const name = importSourceName(source)
+    if (source.type === 'failed') {
+        const error = new NativeFileJobError(source.code, `${name}: ${source.code}`)
+        return { id, name, source, kind: 'unsupported', refusal: { code: 'read-failed', error } }
+    }
+    if (source.type !== 'file') {
+        if (source.type === 'androidSpool') state.ledger.addSpool(source.spool)
+        const item = { id, name, source, ...(source.type === 'androidSpool' ? { bytes: source.spool.bytes } : {}) }
+        return classify(item, { source: nativeImportSource(source)!, displayName: name }, state.moduleScreen)
+    }
+    const item = { id, name, bytes: source.file.size, source }
+    if (DROP_SCRIPT_EXTENSIONS.has(lowercaseExtension(name))) return readPluginCandidate(item, source.file)
+    if (!needsCopy(source)) return { ...item, kind: 'unsupported', refusal: { code: 'unsupported-format' } }
+    if (!context) throw new Error('A dropped file is copied inside an operation')
+    // The JSON importers stop at the import limit, so such a file is refused before it is copied.
+    if (source.file.size > MAX_CONTENT_METADATA_BYTES && await opensJsonObject(source.file)) {
+        return { ...item, kind: 'unsupported', refusal: tooLargeRefusal() }
+    }
+    context.setSource({ name, bytes: source.file.size })
+    let inboxPath: string
+    try {
+        inbox.path ??= await openContentInbox()
+        inboxPath = await copyFileToContentInbox(inbox.path, source.file, { signal: context.signal, onStatus: context.onStatus })
+    } catch (error) {
+        if (context.signal.aborted) throw error
+        return { ...item, kind: 'unsupported', refusal: { code: 'read-failed', error } }
+    }
+    state.ledger.addCopy(inboxPath)
+    const copied = { ...item, source: { ...source, inboxPath } }
+    return classify(copied, { source: { type: 'desktopPath', path: inboxPath }, displayName: name }, state.moduleScreen)
+}
+
+/** Whether the first byte after leading whitespace opens a JSON object, which is what makes the native classifier read JSON. */
+async function opensJsonObject(file: File): Promise<boolean> {
+    try {
+        const prefix = new Uint8Array(await file.slice(0, 64 * 1024).arrayBuffer())
+        return prefix.find(byte => ![0x20, 0x09, 0x0a, 0x0d].includes(byte)) === 0x7b
+    } catch {
+        // The copy that follows reports a file that cannot be read.
+        return false
+    }
+}
+
+async function classify(
+    item: Omit<ImportIntakeItem, 'kind'>,
+    request: NativeImportIntakeSource,
+    moduleScreen: boolean,
+): Promise<ImportIntakeItem> {
+    let result: NativeImportIntakeClassification | undefined
+    try {
+        [result] = await classifyNativeImportSources([request])
+    } catch (error) {
+        result = { kind: 'unsupported', refusal: 'read-failed', message: String(error) }
+    }
+    return classifiedItem(item, result, moduleScreen)
 }
 
 function classifierRefusal(result: NativeImportIntakeClassification | undefined): ImportIntakeRefusal {
@@ -371,7 +386,7 @@ async function carryOut(plan: DeliveryPlan, state: DeliveryState): Promise<void>
         case 'import':
             await runIntakeOperation(`import-intake:${state.id}:import`, (context) => {
                 context.setSource(describeIntakeItem(plan.item))
-                return importIntakeItem(plan.item, plan.decision, context, state.ledger)
+                return importIntakeItem(plan.item, plan.decision, context)
             })
             return
         case 'sheet': {
@@ -384,11 +399,11 @@ async function carryOut(plan: DeliveryPlan, state: DeliveryState): Promise<void>
                     : []
             })
             if (!rows.length) return
-            await runIntakeOperation(`import-intake:${state.id}:batch`, context => importIntakeRows(context, rows, state.ledger))
+            await runIntakeOperation(`import-intake:${state.id}:batch`, context => importIntakeRows(context, rows))
             return
         }
         case 'backup':
-            await restoreBackup(plan.item, state)
+            await restoreBackup(plan.item)
             return
         case 'plugin':
             await waitForImportIdle()
@@ -397,25 +412,25 @@ async function carryOut(plan: DeliveryPlan, state: DeliveryState): Promise<void>
     }
 }
 
-async function restoreBackup(item: ImportIntakeItem, state: DeliveryState): Promise<void> {
+/** The delivery keeps the source, so a restore refused before it took the source still releases it. */
+async function restoreBackup(item: ImportIntakeItem): Promise<void> {
     const source = item.source
     if (source.type === 'androidSpool') {
-        state.ledger.claim(source)
         const { restoreAndroidOpenedBackupSource, showAndroidFileError } = await import('../storage/androidRisuSaveRouteProduction.svelte')
         await restoreWhenIdle(() => restoreAndroidOpenedBackupSource({
             source: { type: 'androidSpool', token: source.spool.token },
             displayName: source.spool.displayName,
             bytes: source.spool.bytes,
         }), showAndroidFileError)
-        return
+    } else {
+        const native = nativeImportSource(source)
+        if (native?.type !== 'desktopPath') return
+        const { restoreBackupFromNativeSource } = await import('../storage/portableBackupFileRouteProduction.svelte')
+        // The item name, not the path's, since an inbox copy or an Android copy prefixes the file it holds.
+        const sourceInfo = { name: item.name, ...(item.bytes === undefined ? {} : { bytes: item.bytes }) }
+        await restoreWhenIdle(() => restoreBackupFromNativeSource(native, { sourceInfo }),
+            (error, startedAt) => presentFileOperationError('import', error, startedAt))
     }
-    const native = nativeImportSource(source)
-    if (native?.type !== 'desktopPath') return
-    const { restoreBackupFromNativeSource } = await import('../storage/portableBackupFileRouteProduction.svelte')
-    // The item name, not the path's, since an inbox copy or an Android copy prefixes the file it holds.
-    const sourceInfo = { name: item.name, ...(item.bytes === undefined ? {} : { bytes: item.bytes }) }
-    await restoreWhenIdle(() => restoreBackupFromNativeSource(native, { sourceInfo }),
-        (error, startedAt) => presentFileOperationError('import', error, startedAt))
     // A portable restore can still read its source while its outcome offers to retry the missing
     // bodies, so the source stays until that outcome and any retry from it are gone.
     await waitForNativeFileOperationIdle()

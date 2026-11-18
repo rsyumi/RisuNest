@@ -353,6 +353,26 @@ describe('common backup file production route', () => {
         expect(m.beginReplacement).not.toHaveBeenCalled()
     })
 
+    it('refuses a second given backup while another restore runs instead of reporting the first one for it', async () => {
+        const manager = await vi.importActual<typeof import('./nativeFileJobManager')>('./nativeFileJobManager')
+        m.manager.mockImplementation(manager.runSharedNativeFileOperation)
+        let finishFirst!: () => void
+        m.portable.mockImplementationOnce(() => new Promise(resolve => { finishFirst = () => resolve(result) }))
+        const first = restoreBackupFromNativeSource({ type: 'desktopPath', path: 'C:/synthetic/first.risunest' })
+        await vi.waitFor(() => expect(m.portable).toHaveBeenCalledOnce())
+        await expect(restoreBackupFromNativeSource({ type: 'desktopPath', path: 'C:/synthetic/second.risunest' }))
+            .rejects.toBeInstanceOf(manager.NativeFileOperationBusyError)
+        finishFirst()
+        await expect(first).resolves.toEqual(result)
+        manager.dismissNativeFileOperationOutcome()
+        await expect(restoreBackupFromNativeSource({ type: 'desktopPath', path: 'C:/synthetic/second.risunest' })).resolves.toEqual(result)
+        expect(m.portable.mock.calls.map(call => call[1])).toEqual([
+            { type: 'desktopPath', path: 'C:/synthetic/first.risunest' },
+            { type: 'desktopPath', path: 'C:/synthetic/second.risunest' },
+        ])
+        manager.dismissNativeFileOperationOutcome()
+    })
+
     it('native cancellation discards the unclaimed Android source', async () => {
         m.invoke.mockResolvedValue('local-backup')
         m.legacy.mockResolvedValueOnce(null)
