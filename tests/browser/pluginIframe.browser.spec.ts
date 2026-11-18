@@ -116,7 +116,7 @@ for (const { method, forceFallback } of canvasEncoderCases) {
         await expect.poll(() => page.evaluate(() => window.boundary.localResult)).toEqual({ type: 'image/webp', width: 4, height: 3, nativeExposed: false })
         const requests = await page.evaluate(() => (window as any).canvasEncodeRequests)
         if (!forceFallback && browserType === 'image/webp') expect(requests).toEqual([])
-        else expect(requests).toEqual([{ data: Array.from({ length: 12 }, () => [0, 128, 255, 128]).flat(), width: 4, height: 3, quality: 0.85 }])
+        else expect(requests).toEqual([{ data: Array.from({ length: 12 }, () => [0, 128, 255, 128]).flat(), width: 4, height: 3, quality: 0.85, document: expect.any(String) }])
     })
 }
 

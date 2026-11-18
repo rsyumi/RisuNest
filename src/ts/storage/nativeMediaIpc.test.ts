@@ -6,6 +6,7 @@ import {
     consumeBoundedNativeMediaOutput,
     invokeWithBoundedNativeMediaInput,
 } from './nativeMediaIpc'
+import { rendererDocument } from './rendererDocument'
 
 describe('native media IPC', () => {
     it('does not open an upload after a failed capability probe and can retry the probe', async () => {
@@ -126,6 +127,7 @@ describe('native media IPC', () => {
         expect(invoke).toHaveBeenCalledWith('direct', {
             id: 'image',
             data: [1, 2, 3],
+            document: rendererDocument(),
         })
     })
 
@@ -160,6 +162,7 @@ describe('native media IPC', () => {
             'finish',
             'native_media_inlay_input_cancel',
         ])
+        expect(calls[0][1]).toMatchObject({ document: rendererDocument() })
         expect((calls[1][1]!.data as number[]).length).toBe(NATIVE_MEDIA_IPC_CHUNK_BYTES)
         expect(calls[2][1]).toMatchObject({
             offset: NATIVE_MEDIA_IPC_CHUNK_BYTES,

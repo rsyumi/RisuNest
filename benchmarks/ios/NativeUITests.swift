@@ -704,6 +704,106 @@ final class NativeUITests: XCTestCase {
         attachScreenshot(app, name: "app-lock-retained-draft")
     }
 
+    func testAppLockInactiveDepartures() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")
+        app.launchEnvironment["RISUNEST_IOS_PHASE"] = "app-lock-inactive"
+        app.launch()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let texts = app.webViews.staticTexts
+        let failure = texts.containing(NSPredicate(format: "label BEGINSWITH %@", "verification-error:")).firstMatch
+        let cardPredicate = NSPredicate(format: "identifier CONTAINS %@ OR label == %@", "io.github.rsyumi.risunest.ios.bench", "RisuNest iOS Bench")
+        // Preview hiding with the lock off, a return before the one-minute limit, and an immediate lock,
+        // first under Notification Center and then from the app switcher.
+        var inactiveOnly: [String] = []
+        for step in ["preview", "timed", "immediate", "switcher-immediate", "switcher-timed", "switcher-preview"] {
+            let ready = texts["app-lock-inactive-\(step)-ready"]
+            XCTAssertTrue(ready.waitForExistence(timeout: 90), "\(step) step did not start")
+            let switcher = step.hasPrefix("switcher-")
+            if switcher {
+                // Holding the home gesture halfway up opens the app switcher without leaving the app.
+                springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.995))
+                    .press(forDuration: 0.1, thenDragTo: springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.6)),
+                           withVelocity: .slow, thenHoldForDuration: 1)
+            } else {
+                // Notification Center over the app, which leaves it inactive where iOS does not move it to the background.
+                springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0))
+                    .press(forDuration: 0.1, thenDragTo: springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.75)))
+            }
+            let away = expectation(description: "Stay away from the app")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { away.fulfill() }
+            wait(for: [away], timeout: 5)
+            let screen = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            screen.name = "app-lock-inactive-\(step)-away"
+            screen.lifetime = .keepAlways
+            add(screen)
+            // Whether a departure stays inactive depends on the iOS version, so each one is recorded and
+            // the test fails below only when none of them left the app in the foreground.
+            let awayState = app.state
+            print("RISUNEST_APP_LOCK_INACTIVE step=\(step) away_state=\(awayState.rawValue)")
+            if awayState == .runningForeground { inactiveOnly.append(step) }
+            if switcher {
+                // Other apps in the switcher move the app's card off the middle, so the largest element
+                // that names the app is the card. Its left part is on screen wherever the card sits.
+                let screenArea = springboard.frame.width * springboard.frame.height
+                let card = springboard.descendants(matching: .any).matching(cardPredicate).allElementsBoundByIndex
+                    .max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+                guard let card, card.frame.width * card.frame.height > screenArea / 4 else {
+                    let tree = XCTAttachment(string: springboard.debugDescription)
+                    tree.name = "app-lock-inactive-\(step)-switcher"
+                    tree.lifetime = .keepAlways
+                    add(tree)
+                    XCTFail("\(step): the app's card is not in the app switcher")
+                    return
+                }
+                print("RISUNEST_APP_LOCK_INACTIVE step=\(step) card=\(card.identifier) frame=\(card.frame)")
+                card.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.5)).tap()
+            } else {
+                springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.995))
+                    .press(forDuration: 0.1, thenDragTo: springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.25)))
+            }
+            if step.hasSuffix("immediate") {
+                for digit in ["1", "2", "3", "4", "5", "6"] {
+                    let key = app.webViews.buttons[digit]
+                    if !key.waitForExistence(timeout: 30) { attachScreenshot(app, name: "app-lock-inactive-\(step)-keypad-missing") }
+                    XCTAssertTrue(key.exists, "PIN keypad did not appear after the immediate return")
+                    key.tap()
+                }
+            }
+            // The native cover hides the page from accessibility, so the button appears only once it is off.
+            // Tapping it tells the fixture that this return is the real one.
+            let back = app.webViews.buttons["app-lock-inactive-\(step)-back"]
+            if back.waitForExistence(timeout: 60) { back.tap() }
+            let returned = texts["app-lock-inactive-\(step)-returned"]
+            let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in returned.exists || failure.exists }, object: nil)
+            // Longer than every wait in the fixture, so its own error shows first.
+            if XCTWaiter().wait(for: [settled], timeout: 150) != .completed || failure.exists {
+                attachScreenshot(app, name: "app-lock-inactive-\(step)-not-returned")
+                if failure.exists {
+                    print("RISUNEST_APP_LOCK_INACTIVE step=\(step) \(failure.label)")
+                    let diagnostic = XCTAttachment(string: failure.label)
+                    diagnostic.lifetime = .keepAlways
+                    add(diagnostic)
+                }
+                XCTFail("\(step) return did not show the content")
+                return
+            }
+            // The next step's PIN setup screen can hide the markers for a moment.
+            let traceLine = texts.containing(NSPredicate(format: "label BEGINSWITH %@", "trace-\(step):")).firstMatch
+            XCTAssertTrue(traceLine.waitForExistence(timeout: 30), "\(step) trace is missing")
+            let trace = traceLine.label
+            print("RISUNEST_APP_LOCK_INACTIVE step=\(step) \(trace)")
+            let traceAttachment = XCTAttachment(string: trace)
+            traceAttachment.name = "app-lock-inactive-\(step)-trace"
+            traceAttachment.lifetime = .keepAlways
+            add(traceAttachment)
+        }
+        print("RISUNEST_APP_LOCK_INACTIVE inactive_only=\(inactiveOnly.joined(separator: ","))")
+        XCTAssertFalse(inactiveOnly.isEmpty, "No departure left the app in the foreground, so none was inactive only")
+        XCTAssertEqual(app.webViews.textViews["Retained synthetic draft"].value as? String, "retained synthetic draft 123456")
+        attachScreenshot(app, name: "app-lock-inactive-retained-draft")
+    }
+
     func testProductKeyboard() throws {
         continueAfterFailure = false
         let app = XCUIApplication(bundleIdentifier: "io.github.rsyumi.risunest.ios.bench")

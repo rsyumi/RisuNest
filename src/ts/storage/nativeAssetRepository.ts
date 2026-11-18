@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { nativeAssetByteSender, type NativeByteInvoke } from './nativeAssetByteTransport'
+import { rendererDocument } from './rendererDocument'
 
 import {
     defaultInlayEncodeOptions,
@@ -140,7 +141,7 @@ export async function beginCasJob(
     invokeCommand: InvokeCommand = invoke,
 ): Promise<string> {
     return pinSessionId(
-        await invokeCommand('asset_cas_job_begin', { kind }),
+        await invokeCommand('asset_cas_job_begin', { kind, document: rendererDocument() }),
         'Native CAS job begin',
     )
 }
@@ -170,6 +171,7 @@ export async function prepareCasObject(
                 role,
                 totalBytes: data.byteLength,
                 binary: sender.binary,
+                document: rendererDocument(),
             }) as { capacity?: unknown }
             if (opened.capacity !== sender.capacity) {
                 throw new TypeError('Native CAS upload returned an invalid chunk capacity')

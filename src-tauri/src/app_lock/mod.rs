@@ -98,6 +98,16 @@ pub(crate) struct LifecycleSnapshot {
     pub epoch: u64,
     pub at_ms: u64,
     pub departed_at_ms: Option<u64>,
+    /// A cover the iOS shell took off without a confirmed frame, for the page to log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unconfirmed_release: Option<UnconfirmedRelease>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UnconfirmedRelease {
+    pub epoch: u64,
+    pub after_seconds: u64,
 }
 
 struct SetupState(Result<(), String>);

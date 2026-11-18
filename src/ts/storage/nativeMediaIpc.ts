@@ -1,4 +1,5 @@
 import { nativeAssetByteSender, type NativeByteInvoke } from './nativeAssetByteTransport'
+import { rendererDocument } from './rendererDocument'
 
 export const NATIVE_MEDIA_IPC_CHUNK_BYTES = 64 * 1024
 export const MAX_NATIVE_MEDIA_TRANSFER_BYTES = 512 * 1024 * 1024
@@ -76,6 +77,7 @@ export async function invokeWithBoundedNativeMediaInput<T>(
         return await invokeCommand(command.directCommand, {
             ...command.args,
             data: Array.from(data),
+            document: rendererDocument(),
         }) as T
     }
 
@@ -86,6 +88,7 @@ export async function invokeWithBoundedNativeMediaInput<T>(
             uploadId,
             totalBytes: data.byteLength,
             binary: sender.binary,
+            document: rendererDocument(),
         }) as { capacity?: unknown }
         if (opened?.capacity !== sender.capacity) {
             throw new TypeError('Native media input upload returned an invalid chunk capacity')

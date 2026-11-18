@@ -17,7 +17,7 @@ impl Default for Lifecycle {
 
 impl Lifecycle {
     pub fn snapshot(&self, now: u64) -> LifecycleSnapshot {
-        LifecycleSnapshot { active: self.active, epoch: self.epoch, at_ms: now, departed_at_ms: self.departed_at_ms }
+        LifecycleSnapshot { active: self.active, epoch: self.epoch, at_ms: now, departed_at_ms: self.departed_at_ms, unconfirmed_release: None }
     }
 
     pub fn transition(&mut self, active: bool, now: u64) -> Option<LifecycleSnapshot> {

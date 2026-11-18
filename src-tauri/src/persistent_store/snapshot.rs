@@ -116,6 +116,8 @@ pub(crate) struct RevisionReadLease {
     repository_root: PathBuf,
     active_readers: Arc<ActiveReaderRegistry>,
     transaction_open: bool,
+    /// The page document that acquired the lease, when it named one.
+    pub(crate) owner: Option<String>,
     #[cfg(test)]
     pub(crate) acquired_at: Instant,
 }
@@ -320,6 +322,7 @@ pub(super) fn acquire_revision(
             repository_root,
             active_readers,
             transaction_open: true,
+            owner: None,
             #[cfg(test)]
             acquired_at,
         },

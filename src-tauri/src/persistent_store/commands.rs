@@ -23,7 +23,7 @@ use super::{
     SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -44,7 +44,36 @@ pub(crate) struct PersistentStoreState {
     renderer_gate: Arc<RendererGate>,
     archive_operations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     retired_purge_started: AtomicBool,
+    renderer_documents: Mutex<RendererDocuments>,
 }
+
+/// Page documents name themselves when they open sessions that outlive a
+/// command. A document that a later one replaced in `pds_open` gets no new
+/// session, even when its command reaches the store after the page reset.
+#[derive(Default)]
+struct RendererDocuments {
+    current: Option<String>,
+    replaced: VecDeque<String>,
+    /// A page started after `current` opened the store.
+    page_started: bool,
+}
+
+impl RendererDocuments {
+    fn replace(&mut self, document: String) {
+        self.replaced.push_back(document);
+        if self.replaced.len() > REPLACED_RENDERER_DOCUMENTS {
+            self.replaced.pop_front();
+        }
+    }
+}
+
+/// The creation time a page document puts before the first `-` of its name.
+fn renderer_document_created(document: &str) -> Option<u64> {
+    document.split_once('-')?.0.parse().ok()
+}
+
+/// Earlier documents have no command left to send long before this many reloads.
+const REPLACED_RENDERER_DOCUMENTS: usize = 64;
 
 struct ArchiveOperationGuard<'a> {
     state: &'a PersistentStoreState,
@@ -198,6 +227,12 @@ impl Drop for DeviceMaintenanceGuard {
     }
 }
 
+fn replaced_document_error() -> StoreError {
+    StoreError::Validation {
+        message: "a later page replaced the page that sent this request".to_owned(),
+    }
+}
+
 fn renderer_gate_error() -> StoreError {
     StoreError::Validation {
         message: "persistent storage is unavailable during device backup maintenance".to_owned(),
@@ -249,6 +284,59 @@ impl PersistentStoreState {
             message: format!("persistent store mutex poisoned: {error}"),
         })?;
         Ok(operation())
+    }
+
+    /// Makes `document` the page document that opened the store. Returns
+    /// whether that replaced another, whose sessions the caller then releases.
+    /// A replaced document's late open is refused. Takes no other lock, since
+    /// session opens check it under their own.
+    pub(crate) fn claim_renderer_document(&self, document: &str) -> StoreResult<bool> {
+        let mut documents = self.renderer_documents.lock().map_err(|error| StoreError::Store {
+            message: format!("renderer document mutex poisoned: {error}"),
+        })?;
+        if documents.current.as_deref() == Some(document) {
+            return Ok(false);
+        }
+        if documents.replaced.iter().any(|replaced| replaced == document) {
+            return Err(replaced_document_error());
+        }
+        // The first open of an outgoing page can run after the open of the page
+        // that replaced it. With no page start since the current document opened,
+        // an earlier creation time marks such a page.
+        let created = renderer_document_created(document);
+        if !documents.page_started
+            && created.is_some_and(|created| {
+                documents.current.as_deref().and_then(renderer_document_created).is_some_and(|current| created < current)
+            })
+        {
+            documents.replace(document.to_owned());
+            return Err(replaced_document_error());
+        }
+        documents.page_started = false;
+        if let Some(previous) = documents.current.replace(document.to_owned()) {
+            documents.replace(previous);
+        }
+        Ok(true)
+    }
+
+    /// Whether a later page document replaced `document` in `pds_open`.
+    pub(crate) fn is_replaced_document(&self, document: &str) -> bool {
+        self.renderer_documents
+            .lock()
+            .is_ok_and(|documents| documents.replaced.iter().any(|replaced| replaced == document))
+    }
+
+    /// Refuses a session for a page document that a later one replaced. Callers
+    /// hold the lock of the sessions they add to, which the release also takes.
+    pub(crate) fn refuse_replaced_document(&self, document: Option<&str>) -> StoreResult<()> {
+        let Some(document) = document else { return Ok(()) };
+        let documents = self.renderer_documents.lock().map_err(|error| StoreError::Store {
+            message: format!("renderer document mutex poisoned: {error}"),
+        })?;
+        if documents.replaced.iter().any(|replaced| replaced == document) {
+            return Err(replaced_document_error());
+        }
+        Ok(())
     }
 
     pub(crate) fn maintenance_active(&self) -> bool {
@@ -454,6 +542,9 @@ impl PersistentStoreState {
     /// `finish_renderer_reset` drops the returned guard. During other
     /// maintenance, the reset starts when that maintenance ends.
     pub(crate) fn begin_renderer_reset(&self) -> StoreResult<RendererReset> {
+        if let Ok(mut documents) = self.renderer_documents.lock() {
+            documents.page_started = true;
+        }
         let mut state = self
             .renderer_gate
             .state
@@ -585,6 +676,7 @@ impl Default for PersistentStoreState {
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
             retired_purge_started: AtomicBool::new(false),
+            renderer_documents: Mutex::new(RendererDocuments::default()),
         }
     }
 }
@@ -832,21 +924,29 @@ pub(crate) fn commit_staged_replacement<R: tauri::Runtime>(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_open(
-    app: AppHandle,
+pub(crate) fn pds_open<R: tauri::Runtime>(
+    app: AppHandle<R>,
     state: State<'_, PersistentStoreState>,
+    document: Option<String>,
 ) -> Result<PersistentStoreOpenResult, StoreError> {
-    logged("pds_open", open_for_renderer(&app, &state))
+    logged("pds_open", open_for_renderer(&app, &state, document.as_deref()))
 }
 
 /// Opens the store the renderer works through and starts the work that waits for it.
+/// A page `document` that replaces another releases the sessions the other left open.
 pub(crate) fn open_for_renderer<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &PersistentStoreState,
+    document: Option<&str>,
 ) -> StoreResult<PersistentStoreOpenResult> {
     let operation_guard = state.admit_renderer_operation()?;
     let app_data_dir = crate::app_paths::data_root(app).map_err(|message| StoreError::Store { message })?;
     let (opened, first_open) = open_renderer_persistent_store_admitted(state, &operation_guard, &app_data_dir)?;
+    if let Some(document) = document {
+        if state.claim_renderer_document(document)? {
+            release_replaced_document_sessions(app, state, &operation_guard);
+        }
+    }
     start_retired_purge(app, state);
     // A page that starts before the store opens cannot judge the asset journals
     // whose owners only the store records, so they are judged again now.
@@ -859,6 +959,33 @@ pub(crate) fn open_for_renderer<R: tauri::Runtime>(
         crate::external_storage::leftovers::collect_released_content_later(app);
     }
     Ok(opened)
+}
+
+/// Releases what earlier page documents left open. The page reset clears all
+/// of it too, but an outgoing document's request can open a session after it.
+/// Each release asks under its own lock which documents were replaced, so one
+/// that runs late leaves the sessions of the current document alone.
+fn release_replaced_document_sessions<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &PersistentStoreState,
+    operation_guard: &RendererOperationGuard,
+) {
+    let replaced = |document: &str| state.is_replaced_document(document);
+    if let Err(error) = with_store_mutex_mut_admitted(state, operation_guard, |store| {
+        store.release_revision_leases_of(&replaced)
+    }) {
+        crate::nlog!("warn", "Revision leases of a replaced page await the next page start: {error}");
+    }
+    if let Some(cas) = app.try_state::<crate::asset_repository::commands::DurableCasJobState>() {
+        if let Err(error) = cas.release_replaced_documents(app, &replaced) {
+            crate::nlog!("warn", "Asset uploads of a replaced page await the next page start: {error}");
+        }
+    }
+    if let Some(media) = app.try_state::<crate::native_media::ipc::NativeMediaIpcState>() {
+        if let Err(error) = media.release_replaced_documents(&replaced) {
+            crate::nlog!("warn", "Media transfers of a replaced page await the next page start: {error}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1740,8 +1867,15 @@ pub(crate) fn pds_materialize(
 pub(crate) fn pds_acquire_revision(
     state: State<'_, PersistentStoreState>,
     revision: i64,
+    document: Option<String>,
 ) -> Result<LeaseResult, StoreError> {
-    logged("pds_acquire_revision", with_store_mut(state, |store| store.acquire_revision(revision)))
+    logged("pds_acquire_revision", with_store_mutex_mut(&state, |store| {
+        // Under the store lock, which the release of a replaced page's leases also takes.
+        state.refuse_replaced_document(document.as_deref())?;
+        let acquired = store.acquire_revision(revision)?;
+        store.set_revision_owner(&acquired.lease, document);
+        Ok(acquired)
+    }))
 }
 
 #[tauri::command(async)]
@@ -1768,7 +1902,7 @@ pub(crate) fn pds_export_risu_save(
         })?;
         let outcome = prepared.create_attached_export(omit_account, account.as_ref());
         let reattach = with_store_mutex_mut_admitted(&state, &operation_guard, |store| {
-            store.reattach_risu_save_export(prepared)
+            reattach_export_lease(&state, store, prepared)
         });
         match (outcome, reattach) {
             (Ok(exported), Ok(())) => Ok(exported),
@@ -1781,6 +1915,19 @@ pub(crate) fn pds_export_risu_save(
             }),
         }
     })())
+}
+
+/// Puts an exported lease back, or releases it when a later page replaced the
+/// page that holds it, which released that page's other leases meanwhile.
+fn reattach_export_lease(
+    state: &PersistentStoreState,
+    store: &mut PersistentStore,
+    mut prepared: crate::persistent_store::PreparedRisuSaveExport,
+) -> StoreResult<()> {
+    if state.refuse_replaced_document(prepared.owner()).is_err() {
+        return prepared.release_reader();
+    }
+    store.reattach_risu_save_export(prepared)
 }
 
 #[tauri::command(async)]
@@ -3699,6 +3846,104 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn a_later_page_document_ends_what_earlier_documents_left_open_and_refuses_their_requests() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let app = crate::test_app::MockApp::new(tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![pds_open, pds_acquire_revision])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap());
+        app.manage(crate::app_paths::AppPaths {
+            data: root.to_owned(),
+            data_entry: root.to_owned(),
+            webview: None,
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            cleanup_control: root.join("cleanup"),
+            tauri_derived: Vec::new(),
+            install: None,
+            integration: None,
+        });
+        app.manage(PersistentStoreState::unopened_without_purge());
+        app.manage(crate::native_media::ipc::NativeMediaIpcState::default());
+        let media = app.state::<crate::native_media::ipc::NativeMediaIpcState>();
+        let webview = tauri::WebviewWindowBuilder::new(&*app, "main", Default::default()).build().unwrap();
+        // Through IPC, so the argument the page names is the one each command reads.
+        let invoke = |cmd: &str, mut body: serde_json::Value, document: Option<&str>| {
+            if let Some(document) = document {
+                body["document"] = document.into();
+            }
+            tauri::test::get_ipc_response(&webview, tauri::webview::InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: if cfg!(any(windows, target_os = "android")) { "http://tauri.localhost" } else { "tauri://localhost" }.parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            })
+        };
+        let open = |document: &str| invoke("pds_open", serde_json::json!({}), Some(document)).map(drop);
+        let acquire = |document: Option<&str>| {
+            invoke("pds_acquire_revision", serde_json::json!({ "revision": 0 }), document)
+                .map(|response| response.deserialize::<LeaseResult>().unwrap())
+        };
+        let read = |lease: &LeaseResult| with_store_mutex(&app.state(), |store| store.read_root(Some(&lease.lease)).map(drop));
+
+        open("first").unwrap();
+        let outgoing = acquire(Some("first")).unwrap();
+        let unnamed = acquire(None).unwrap();
+        let exporting = acquire(Some("first")).unwrap();
+        let export = with_store_mutex_mut(&app.state(), |store| store.detach_risu_save_export(&exporting.lease)).unwrap();
+        let filled = std::iter::from_fn(|| media.open_input_upload(root, Some("first")).ok()).count();
+        assert!(filled > 0);
+        open("first").unwrap();
+        read(&outgoing).expect("opening again from the same page released its lease");
+        assert!(media.open_input_upload(root, None).is_err(), "opening again from the same page ended its uploads");
+        drop(acquire(Some("first")).expect("opening again from the same page retired it"));
+
+        open("second").unwrap();
+        assert!(matches!(read(&outgoing), Err(StoreError::SnapshotReleased)));
+        media.open_input_upload(root, None).expect("the replaced page's uploads stayed");
+        // A lease the replaced page was exporting is released when the export ends.
+        with_store_mutex_mut(&app.state(), |store| reattach_export_lease(&app.state(), store, export)).unwrap();
+        assert!(matches!(read(&exporting), Err(StoreError::SnapshotReleased)));
+        read(&unnamed).expect("a lease no page named waits for the page reset");
+        assert!(acquire(Some("first")).unwrap_err().to_string().contains("replaced"));
+        assert!(open("first").unwrap_err().to_string().contains("replaced"));
+        let current = acquire(Some("second")).unwrap();
+        open("second").unwrap();
+        read(&current).unwrap();
+        // A cleanup that runs after the current page acquired a lease leaves it.
+        release_replaced_document_sessions(app.handle(), &app.state(), &app.state::<PersistentStoreState>().admit_renderer_operation().unwrap());
+        read(&current).expect("a late cleanup released the current page's lease");
+
+        // Names start with their creation time. With no page start since the current
+        // document opened, an earlier page's first open ran late and is refused.
+        open("2000-later").unwrap();
+        assert!(open("1000-earlier").unwrap_err().to_string().contains("replaced"));
+        assert!(acquire(Some("1000-earlier")).unwrap_err().to_string().contains("replaced"));
+        let later = acquire(Some("2000-later")).unwrap();
+        open("2000-later").unwrap();
+        read(&later).unwrap();
+        // After a page start the next document is the later page, whatever its clock says.
+        app.state::<PersistentStoreState>().reset_renderer_session().unwrap();
+        open("500-after-reset").unwrap();
+
+        // Replacing a page that holds no lease leaves the WAL to the usual checkpoints.
+        let wal_path = root.join("persistent/persistent.sqlite-wal");
+        with_store_mutex(&app.state(), |store| {
+            store.connection.execute_batch("PRAGMA wal_autocheckpoint = 0; INSERT INTO app_kv VALUES ('wal', '1');").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let written = fs::metadata(&wal_path).unwrap().len();
+        assert!(written > 0);
+        open("600-next").unwrap();
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), written);
+    }
+
     fn reset_started(reset: StoreResult<RendererReset>) -> DeviceMaintenanceGuard {
         match reset.unwrap() {
             RendererReset::Started(maintenance) => maintenance,
@@ -4310,6 +4555,7 @@ mod tests {
             renderer_gate: Arc::new(RendererGate::default()),
             archive_operations: Mutex::new(HashMap::new()),
             retired_purge_started: AtomicBool::new(false),
+            renderer_documents: Mutex::new(RendererDocuments::default()),
         });
         let barrier = Arc::new(Barrier::new(3));
         let active = Arc::new(AtomicUsize::new(0));
@@ -4585,7 +4831,7 @@ mod tests {
             integration: None,
         });
         app.manage(PersistentStoreState::default());
-        open_for_renderer(app.handle(), &app.state()).unwrap();
+        open_for_renderer(app.handle(), &app.state(), None).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !recorded(root, &held) {

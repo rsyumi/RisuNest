@@ -37,6 +37,7 @@ import {
     markBootSuspect,
 } from 'src/ts/storage/bootAttempt'
 import { decideBoot } from 'src/ts/storage/recoveryMode.svelte'
+import { rendererDocument } from 'src/ts/storage/rendererDocument'
 
 const strings = languageEnglish.risuNest.recovery
 
@@ -165,7 +166,7 @@ describe('RecoveryShell', () => {
         const body = await setup()
         expect(body.querySelector('[data-data-health]')).toBeTruthy()
         // The start that would have opened it is exactly what this shell replaced.
-        expect(core.invoke).toHaveBeenCalledWith('pds_open')
+        expect(core.invoke).toHaveBeenCalledWith('pds_open', { document: rendererDocument() })
         expect(maintenance.getNativeDataHealthResult).toHaveBeenCalled()
         expect(
             core.invoke.mock.invocationCallOrder[0],

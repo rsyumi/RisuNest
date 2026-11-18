@@ -10,6 +10,7 @@
     import RisuNestDataHealth from 'src/lib/Setting/Pages/RisuNestDataHealth.svelte'
     import LocalDataReset from 'src/lib/Setting/RisuNest/LocalDataReset.svelte'
     import { isTauri } from 'src/ts/platform'
+    import { rendererDocument } from 'src/ts/storage/rendererDocument'
     import type { BootStage } from 'src/ts/bootFailureClassification'
     import { exportOriginalData } from 'src/ts/storage/rawRecoveryExport'
     import {
@@ -53,7 +54,7 @@
     // The data check needs it and nothing else here does, so it opens it and stops there.
     let opened: Promise<void> | null = null
     const openStore = (): Promise<void> => {
-        opened ??= invoke<unknown>('pds_open').then(() => undefined).catch(error => { opened = null; throw error })
+        opened ??= invoke<unknown>('pds_open', { document: rendererDocument() }).then(() => undefined).catch(error => { opened = null; throw error })
         return opened
     }
 
