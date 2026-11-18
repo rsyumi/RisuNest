@@ -4,6 +4,9 @@ import { get } from 'svelte/store'
 const navigation = vi.hoisted(() => ({ changeChar: vi.fn<(index: number) => Promise<boolean>>() }))
 vi.mock('src/ts/stores.svelte', async () => (await import('./openResult.testSupport')).importStoresModule())
 vi.mock('../characters', () => ({ changeChar: navigation.changeChar }) satisfies Partial<typeof import('../characters')>)
+vi.mock('../characterCards', async () => ({
+    showRealmInfoStore: (await import('svelte/store')).writable(null),
+}) satisfies Partial<typeof import('../characterCards')>)
 
 import {
     bookmarkListOpen,
@@ -24,8 +27,10 @@ import {
     QuickSettings,
     settingsOpen,
     SettingsMenuIndex,
+    ShowRealmFrameStore,
     sideBarStore,
 } from 'src/ts/stores.svelte'
+import { showRealmInfoStore, type hubType } from '../characterCards'
 import { openImportResult } from './openResult'
 import { openedImportResult } from './sheetStore'
 
@@ -41,7 +46,9 @@ function screen() {
         settingsPage: get(SettingsMenuIndex),
         presetList: get(openPresetList),
         personaList: get(openPersonaList),
-        overlays: [...overlayStores.map(open => get(open)), ...overlayPanels.map(panel => panel.open)].some(Boolean),
+        overlays: [
+            ...overlayStores.map(open => get(open)), ...overlayPanels.map(panel => panel.open), get(ShowRealmFrameStore), get(showRealmInfoStore),
+        ].some(Boolean),
         opened: get(openedImportResult),
         tab: get(CharConfigSubMenu),
         characterPanel: get(botMakerMode),
@@ -61,6 +68,8 @@ beforeEach(() => {
     openPersonaList.set(true)
     for (const open of overlayStores) open.set(true)
     for (const panel of overlayPanels) panel.open = true
+    ShowRealmFrameStore.set('character')
+    showRealmInfoStore.set({ name: 'Synthetic' } as hubType)
     openedImportResult.set(null)
     CharConfigSubMenu.set(0)
     botMakerMode.set(false)

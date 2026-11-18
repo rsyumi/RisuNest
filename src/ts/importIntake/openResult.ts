@@ -1,4 +1,5 @@
 import { get } from 'svelte/store'
+import { showRealmInfoStore } from '../characterCards'
 import type { NativeFileOperationImportLocation } from '../storage/nativeFileJobManager'
 import {
     bookmarkListOpen,
@@ -19,6 +20,7 @@ import {
     QuickSettings,
     settingsOpen,
     SettingsMenuIndex,
+    ShowRealmFrameStore,
     sideBarStore,
 } from '../stores.svelte'
 import { openedImportResult } from './sheetStore'
@@ -51,6 +53,8 @@ export function openImportResult(location: NativeFileOperationImportLocation): v
 function closeOverlays(): void {
     for (const open of [openPresetList, openPersonaList, bookmarkListOpen, moduleScopeMenuOpen, hypaV3ModalOpen]) open.set(false)
     for (const panel of [easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore]) panel.open = false
+    ShowRealmFrameStore.set('')
+    showRealmInfoStore.set(null)
 }
 
 async function openCharacter(location: Extract<NativeFileOperationImportLocation, { chaId: string }>): Promise<void> {

@@ -26,6 +26,7 @@ export async function importStoresModule() {
         QuickSettings: { open: false, index: 0 },
         settingsOpen: writable(false),
         SettingsMenuIndex: writable(-1),
+        ShowRealmFrameStore: writable(''),
         sideBarStore: writable(false),
     } satisfies Partial<Stores>
 }
