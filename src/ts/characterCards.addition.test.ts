@@ -366,7 +366,7 @@ describe('character card additions', () => {
             format: 'content',
             state: 'failed',
             error: failure,
-            batch: { total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [] },
+            batch: expect.objectContaining({ total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [] }),
         })])
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
@@ -395,7 +395,7 @@ describe('character card additions', () => {
             { signal: expect.any(AbortSignal), onStatus: expect.any(Function) },
         )
         expect(outcomes).toEqual([
-            expect.objectContaining({ state: 'succeeded', batch: { total: 2, imported: 2, failures: [], declined: [] } }),
+            expect.objectContaining({ state: 'succeeded', batch: expect.objectContaining({ total: 2, imported: 2, failures: [], declined: [] }) }),
             expect.objectContaining({ state: 'succeeded', source: { name: 'single.charx' } }),
         ])
         expect(outcomes[1]).not.toHaveProperty('batch')

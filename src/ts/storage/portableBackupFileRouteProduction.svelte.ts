@@ -49,6 +49,8 @@ export type BackupSourceFactory = (
 export type BackupRestoreResult = NativeFileJobResult
 export interface BackupRestoreOptions extends NativeFileRestoreJobOptions {
     onSource?(source: SourceInfo): void
+    /** The name and size to show for a `desktopPath` source that is a copy of the user's file. */
+    sourceInfo?: SourceInfo
 }
 
 function combineSignals(...signals: (AbortSignal | undefined)[]) {
@@ -261,7 +263,7 @@ async function restoreBackupFromSource(
                 context.protect()
                 if (input.type === 'androidSeekable' || input.type === 'iosScoped' || input.type === 'savedConflict') selectedCustody = input
                 if (input.type === 'desktopPath')
-                    onSource(await nativeRestoreDeadline(describeDesktopSource(input.path), 'source metadata', undefined, undefined, undefined, joined.signal))
+                    onSource(options.sourceInfo ?? await nativeRestoreDeadline(describeDesktopSource(input.path), 'source metadata', undefined, undefined, undefined, joined.signal))
                 checkSignal(joined.signal)
                 const format = await nativeRestoreDeadline(invoke<
                     | 'portable'
