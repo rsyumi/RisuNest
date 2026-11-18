@@ -46,7 +46,7 @@
     }
 
     function isCharx(item: ImportIntakeItem): boolean {
-        return item.kind === 'character' && (item.format === 'charx' || request?.defaults[item.id]?.charxAs !== undefined)
+        return item.kind === 'character' && item.format === 'charx'
     }
 
     function charxOf(item: ImportIntakeItem): CharxChoice {

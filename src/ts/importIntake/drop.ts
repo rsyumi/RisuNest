@@ -99,15 +99,21 @@ export async function handleAppDrop(e: DragEvent): Promise<void> {
  * `submit` as one delivery in drop order. Returns the disposer.
  */
 export function installImportDropListeners(submit: (delivery: ImportIntakeDelivery) => void): () => void {
-    let depth = 0
+    // Elements the drag is over. One removed during the drag gets its dragleave while detached, which
+    // never reaches the document, so it is dropped once it is no longer connected.
+    const entered = new Set<EventTarget>()
+    const dragInside = () => {
+        for (const target of entered) if (target instanceof Node && !target.isConnected) entered.delete(target)
+        return entered.size > 0
+    }
     const hide = () => {
-        depth = 0
+        entered.clear()
         importDropOverlayVisible.set(false)
     }
     const onDragEnter = (e: DragEvent) => {
         if (!isFileDrag(e)) return
         e.preventDefault()
-        depth++
+        if (e.target) entered.add(e.target)
         importDropOverlayVisible.set(importDropsAccepted())
     }
     const onDragOver = (e: DragEvent) => {
@@ -115,12 +121,12 @@ export function installImportDropListeners(submit: (delivery: ImportIntakeDelive
         e.preventDefault()
         const accepted = importDropsAccepted()
         if (e.dataTransfer) e.dataTransfer.dropEffect = accepted ? 'copy' : 'none'
-        importDropOverlayVisible.set(accepted && depth > 0)
+        importDropOverlayVisible.set(accepted && dragInside())
     }
     const onDragLeave = (e: DragEvent) => {
         if (!isFileDrag(e)) return
-        depth = Math.max(0, depth - 1)
-        if (!depth) importDropOverlayVisible.set(false)
+        if (e.target) entered.delete(e.target)
+        if (!dragInside()) importDropOverlayVisible.set(false)
     }
     const onDrop = (e: DragEvent) => {
         if (!isFileDrag(e)) return

@@ -45,6 +45,19 @@ describe('native character file route', () => {
         expect(deps.legacyImport).not.toHaveBeenCalled()
     })
 
+    it('routes a card by the name its content was classified under', async () => {
+        const deps = dependencies()
+
+        await expect(importDesktopNativeCharacterPath('C:/opened/card.risudat', deps, 'card.risudat.png'))
+            .resolves.toEqual({ kind: 'imported', mode: 'native', value: 'native-card' })
+
+        expect(deps.nativeImport).toHaveBeenCalledWith({
+            source: { type: 'desktopPath', path: 'C:/opened/card.risudat' },
+            displayName: 'card.risudat.png',
+        })
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
+
     it('falls back to the existing PNG importer when the native parser reaches its bounded limit', async () => {
         const deps = dependencies({
             nativeImport: vi.fn(async () => {

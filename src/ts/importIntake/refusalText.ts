@@ -16,7 +16,9 @@ export function importIntakeRefusalText(refusal: ImportIntakeRefusal): string {
             return language.risuNest.importIntake.reasonBackupWithOtherFiles
         case 'plugin-api-version':
             return language.risuNest.plugins.unsupportedApiVersionInstall.replace('{version}', refusal.version)
-        case 'read-failed':
-            return failureReason(outcomeError('import', refusal.error).code, 'import')
+        case 'read-failed': {
+            const error = outcomeError('import', refusal.error)
+            return failureReason(error.code, 'import', error.itemKind)
+        }
     }
 }

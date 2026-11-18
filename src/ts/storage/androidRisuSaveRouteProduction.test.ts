@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
 
 const backupMocks = vi.hoisted(() => ({
     presented: vi.fn(),
@@ -10,7 +11,11 @@ const backupMocks = vi.hoisted(() => ({
     prepare: vi.fn(),
     activateCharacter: vi.fn(),
     activateModule: vi.fn(),
+    database: { didFirstSetup: false },
 }))
+vi.mock('./database.svelte', () => ({
+    getDatabase: () => backupMocks.database as ReturnType<typeof import('./database.svelte')['getDatabase']>,
+}) satisfies Partial<typeof import('./database.svelte')>)
 
 vi.mock('../gui/nativeFileJobDialogModel', () => ({ failureReason: backupMocks.reason }))
 vi.mock('./fileOperationErrorPresentation', () => ({ fileOperationErrorWasPresented: backupMocks.presented }))
@@ -62,6 +67,7 @@ import {
     restoreAndroidOpenedBackupSource,
     registerAndroidRisuSaveRoute,
     createAndroidSpoolBatchRouter,
+    androidFirstSetupFinished,
     type AndroidOpenedSpoolDispatchDependencies,
 } from './androidRisuSaveRouteProduction.svelte'
 import type { ImportIntakeDelivery } from '../importIntake/types'
@@ -188,10 +194,10 @@ describe('Android opened spool production route', () => {
                 return { warningCodes: [] }
             })
 
-            await restoreAndroidOpenedBackupSource({ source, displayName })
+            await restoreAndroidOpenedBackupSource({ source, displayName, bytes: 2048 })
 
             expect(backupMocks.restore).toHaveBeenCalledExactlyOnceWith(expect.any(Function))
-            expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: displayName })
+            expect(onSource).toHaveBeenCalledExactlyOnceWith({ name: displayName, bytes: 2048 })
             expect(backupMocks.externalManager).not.toHaveBeenCalled()
             expect(alertConfirm).not.toHaveBeenCalled()
             expect(alertNormal).toHaveBeenCalledExactlyOnceWith(language.risuSaveImportComplete)
@@ -276,6 +282,7 @@ describe('Android opened spool production route', () => {
         const book = { token: 'book-token', displayName: 'book.lorebook', bytes: 10 }
         const picked = { token: 'picked-token', displayName: 'picked.charx', bytes: 20, importDestination: 'module' as const }
         const broken = { displayName: 'broken.png', code: 'source-copy-failed' }
+        const lost = { displayName: 'lost.charx', code: 'source-copy-failed' }
 
         // Spools that arrive before first setup keep their own handling.
         const early = { requestId: 'early', ready: [save], failures: [] }
@@ -285,11 +292,12 @@ describe('Android opened spool production route', () => {
 
         firstSetupDone = true
         dispatch.mockClear()
-        const first = route({ requestId: 'first', ready: [save, card, picked], failures: [broken] })
+        const first = route({ requestId: 'first', ready: [save, card], failures: [broken] })
         const second = route({ requestId: 'second', ready: [card, book], failures: [] })
         await vi.waitFor(() => expect(releaseFirst).toBeDefined())
         releaseFirst()
         await Promise.all([first, second])
+        await route({ requestId: 'picker', ready: [picked], failures: [lost] })
         await route({ requestId: 'empty', ready: [book], failures: [] })
 
         expect(deliveries).toEqual([
@@ -300,8 +308,21 @@ describe('Android opened spool production route', () => {
             ] },
             { origin: 'opened', sources: [{ type: 'androidSpool', spool: book }] },
         ])
-        // A content picker result that outlived its page keeps the destination chosen in the picker.
-        expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'first', ready: [picked], failures: [] })
+        // A content picker result that outlived its page keeps the destination chosen in the picker, and its failures.
+        expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'picker', ready: [picked], failures: [lost] })
+    })
+
+    it('treats first setup as unfinished while a restored onboarding stays on screen', async () => {
+        backupMocks.database.didFirstSetup = true
+        onboardingHold.set(true)
+        try {
+            expect(await androidFirstSetupFinished()).toBe(false)
+        } finally {
+            onboardingHold.set(false)
+        }
+        expect(await androidFirstSetupFinished()).toBe(true)
+        backupMocks.database.didFirstSetup = false
+        expect(await androidFirstSetupFinished()).toBe(false)
     })
 
     it('joins the opened files of a share into its delivery and acknowledges them once it ended', async () => {

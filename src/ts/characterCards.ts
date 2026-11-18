@@ -186,7 +186,7 @@ export async function importCharacterPathInOperation(
                 ? (getDatabase().characters[importedIndex]?.chaId ?? null)
                 : null
         },
-    })
+    }, displayName)
     if (outcome.kind === 'destination-required') {
         throw new NativeFileJobError('destination-required', language.risuNest.importDialog.reasonPlainJpeg)
     }
@@ -198,7 +198,19 @@ export async function importCharacterPathInOperation(
 
 type CharacterCardSpecImporter = typeof importCharacterCardSpec
 
-export async function importCharacterProcess<T extends boolean = false>(f: {
+export async function importCharacterProcess<T extends boolean = false>(
+    f: Parameters<typeof importCharacterWithNotices<T>>[0],
+): ReturnType<typeof importCharacterWithNotices<T>> {
+    if (!f.quiet) return importCharacterWithNotices(f)
+    // The success notice also closes the loading and progress notices, so a quiet import closes them itself.
+    try {
+        return await importCharacterWithNotices(f)
+    } finally {
+        alertClear()
+    }
+}
+
+async function importCharacterWithNotices<T extends boolean = false>(f: {
     name: string
     data: Uint8Array | File | ReadableStream<Uint8Array>
     parsedJson?: ParsedImportJson

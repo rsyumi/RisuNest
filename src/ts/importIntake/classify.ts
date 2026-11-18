@@ -7,7 +7,7 @@ export interface NativeImportIntakeClassification {
     kind: 'character' | 'module' | 'lorebook' | 'preset' | 'backup' | 'script' | 'unsupported'
     format?: ImportIntakeFormat
     /** Unsupported files only. */
-    refusal?: 'unsupported-format' | 'plain-jpeg' | 'png-without-card' | 'read-failed'
+    refusal?: 'unsupported-format' | 'plain-jpeg' | 'png-without-card' | 'read-failed' | 'too-large'
     /** Present for `read-failed`. */
     message?: string
     bytes?: number

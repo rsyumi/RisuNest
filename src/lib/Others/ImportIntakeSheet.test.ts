@@ -122,9 +122,9 @@ describe('import sheet', () => {
 
     it('starts from the defaults and imports them unchanged', async () => {
         const { settled, decided } = open({
-            items: [charx, lorebook, item('jpeg', 'Night.jpg', { kind: 'character', format: 'jpeg-charx' })],
+            items: [charx, lorebook],
             lorebookCharacter: selected,
-            defaults: { charx: { charxAs: 'character' }, lorebook: { lorebookTarget: { type: 'new-module' } }, jpeg: { charxAs: 'module' } },
+            defaults: { charx: { charxAs: 'character' }, lorebook: { lorebookTarget: { type: 'new-module' } } },
         })
         expect(row('lorebook').querySelector('select')!.value).toBe('new-module')
         footerButton(intake.importAction).click()
@@ -132,7 +132,6 @@ describe('import sheet', () => {
         expect(decided()).toEqual([
             { id: 'charx', charxAs: 'character' },
             { id: 'lorebook', lorebookTarget: { type: 'new-module' } },
-            { id: 'jpeg', charxAs: 'module' },
         ])
     })
 

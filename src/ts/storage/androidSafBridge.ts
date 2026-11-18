@@ -73,7 +73,7 @@ export function listenAndroidSpoolBatches(
 }
 
 export interface AndroidSpoolConsumer {
-    restore(input: { source: NativeFileJobSource; displayName: string }): Promise<void>
+    restore(input: { source: NativeFileJobSource; displayName: string; bytes: number }): Promise<void>
     unsupported(source: AndroidSpoolReady): void
     failed?(failure: AndroidSpoolFailure): void
 }
@@ -107,6 +107,7 @@ export async function consumeAndroidSpoolBatch(
         await consumer.restore({
             source: { type: 'androidSpool', token: source.token },
             displayName: source.displayName,
+            bytes: source.bytes,
         })
     }
 }

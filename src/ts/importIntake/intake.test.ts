@@ -106,6 +106,7 @@ import {
     dismissNativeFileOperationOutcome,
     nativeFileOperation,
     nativeFileOperationOutcome,
+    NativeFileOperationBusyError,
     runSharedNativeFileOperation,
     type NativeFileOperationOutcome,
 } from '../storage/nativeFileJobManager'
@@ -227,16 +228,29 @@ describe('one dropped file', () => {
         }
     })
 
+    it.each([
+        ['card.risudat', 'png', 'card.risudat.png'],
+        ['card.bin', 'jpeg-charx', 'card.bin.jpeg'],
+        ['card.JPG', 'jpeg-charx', 'card.JPG'],
+    ] as const)('hands %s to the importer under a name of the format its content shows', async (name, format, importName) => {
+        classify(name, { kind: 'character', format })
+        await submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path: `C:/opened/${name}` }] })
+        expect(mocks.characterPath).toHaveBeenCalledExactlyOnceWith(`C:/opened/${name}`, expect.anything(), importName)
+    })
+
     it('alerts the name and the reason of a file it cannot import', async () => {
         classify('photo.jpg', { kind: 'unsupported', refusal: 'plain-jpeg' })
+        classify('huge.json', { kind: 'unsupported', refusal: 'too-large' })
         await submitImportDelivery(drop(dropped('photo.jpg')))
         await submitImportDelivery(drop(dropped('notes.txt')))
+        await submitImportDelivery(drop(dropped('huge.json')))
         expect(mocks.alertError.mock.calls).toEqual([
             [`photo.jpg\n${language.risuNest.importDialog.reasonPlainJpeg}`],
             [`notes.txt\n${language.risuNest.importDialog.reasonUnsupportedFormat}`],
+            [`huge.json\n${failureReason('payload-too-large', 'import', 'content')}`],
         ])
         // A file of an unknown extension is never copied or read.
-        expect(mocks.classifyRequests.flat().map(({ displayName }) => displayName)).toEqual(['photo.jpg'])
+        expect(mocks.classifyRequests.flat().map(({ displayName }) => displayName)).toEqual(['photo.jpg', 'huge.json'])
         expect(outcomes).toEqual([])
         expect(inboxCopies()).toEqual([])
     })
@@ -299,6 +313,20 @@ describe('destination choices', () => {
             state: 'succeeded', location: { kind: 'character-lorebook', chaId: 'alice', characterName: 'Alice' },
         })])
         expect(inboxCopies()).toEqual([])
+    })
+
+    it.each([
+        ['nothing', undefined],
+        ['the playground', { chaId: '§playground', name: 'Playground' }],
+    ])('imports a lone lorebook into a new module without asking while %s is selected', async (_name, character) => {
+        mocks.db.characters = character ? [character] : []
+        selectedCharID.set(character ? 0 : -1)
+        classify('book.json', { kind: 'lorebook', format: 'json' })
+        await submitImportDelivery(drop(dropped('book.json', '{"type":"risu","data":[{"key":"synthetic"}]}')))
+
+        expect(get(importSheet)).toBeNull()
+        expect(mocks.moduleData).toHaveBeenCalledOnce()
+        expect(mocks.appendLorebook).not.toHaveBeenCalled()
     })
 
     it('points CharX and lorebook defaults at modules for a module name or a drop on the module settings page', async () => {
@@ -426,10 +454,33 @@ describe('backups', () => {
         expect(mocks.removed).toEqual([copy])
     })
 
-    it('restores a lone opened backup from its path and keeps the file', async () => {
+    it('restores a backup once an operation that started before it has ended', async () => {
         classify('backup.risunest', { kind: 'backup', format: 'portable' })
+        let finishOther: (() => void) | undefined
+        mocks.restore.mockImplementationOnce(async () => {
+            // Another file operation started between the idle check and the restore.
+            void runSharedNativeFileOperation('import', 'other', () => new Promise<string>(resolve => { finishOther = () => resolve('done') }), { presentation: 'dialog' })
+            throw new NativeFileOperationBusyError()
+        })
+        const delivered = submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path: 'C:/opened/backup.risunest' }] })
+        await vi.waitFor(() => expect(finishOther).toBeDefined())
+        expect(mocks.restore).toHaveBeenCalledOnce()
+
+        finishOther!()
+        await vi.waitFor(() => expect(get(nativeFileOperationOutcome)).not.toBeNull())
+        dismissNativeFileOperationOutcome()
+        await delivered
+        expect(mocks.restore).toHaveBeenCalledTimes(2)
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it('restores a lone opened backup from its path and keeps the file', async () => {
+        classify('backup.risunest', { kind: 'backup', format: 'portable', bytes: 4096 })
         await submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path: 'C:/opened/backup.risunest' }] })
-        expect(mocks.restore).toHaveBeenCalledExactlyOnceWith({ type: 'desktopPath', path: 'C:/opened/backup.risunest' }, {})
+        expect(mocks.restore).toHaveBeenCalledExactlyOnceWith(
+            { type: 'desktopPath', path: 'C:/opened/backup.risunest' },
+            { sourceInfo: { name: 'backup.risunest', bytes: 4096 } },
+        )
         expect(mocks.removed).toEqual([])
     })
 })
@@ -451,6 +502,10 @@ describe('holding', () => {
         ['the app lock', async () => {
             setAppLockInputBlocked(true, false)
             return async () => setAppLockInputBlocked(false, false)
+        }],
+        ['loading', async () => {
+            loadedStore.set(false)
+            return async () => loadedStore.set(true)
         }],
     ])('waits for %s before it starts', async (_, block) => {
         classify('card.png', { kind: 'character', format: 'png' })
@@ -539,9 +594,9 @@ describe('Android shares', () => {
 
     it('restores a lone shared backup and leaves its spool to the restore', async () => {
         classify('backup.risunest', { kind: 'backup', format: 'portable' })
-        await submitImportDelivery({ origin: 'opened', sources: [spool('backup-token', 'backup.risunest')] })
+        await submitImportDelivery({ origin: 'opened', sources: [spool('backup-token', 'backup.risunest', 'synthetic backup')] })
         expect(mocks.restoreAndroid).toHaveBeenCalledExactlyOnceWith({
-            source: { type: 'androidSpool', token: 'backup-token' }, displayName: 'backup.risunest',
+            source: { type: 'androidSpool', token: 'backup-token' }, displayName: 'backup.risunest', bytes: 16,
         })
         expect(mocks.discarded).toEqual([])
     })
@@ -554,6 +609,16 @@ describe('Android shares', () => {
         expect(mocks.classifyRequests).toEqual([[{ source: { type: 'desktopPath', path }, displayName: 'preset.risup' }]])
         expect(mocks.preset).toHaveBeenCalledExactlyOnceWith({ name: 'preset.risup', data: encode('synthetic preset') })
         expect(mocks.removed).toEqual([])
+    })
+
+    it('names a restored cache copy after the shared file', async () => {
+        classify('backup.risunest', { kind: 'backup', format: 'portable', bytes: 16 })
+        const path = `/data/cache/opened_files/${'a'.repeat(64)}-0-backup.risunest`
+        await submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path }] })
+        expect(mocks.restore).toHaveBeenCalledExactlyOnceWith(
+            { type: 'desktopPath', path },
+            { sourceInfo: { name: 'backup.risunest', bytes: 16 } },
+        )
     })
 })
 
@@ -587,6 +652,21 @@ describe('drops on the window', () => {
         expect(get(importDropOverlayVisible)).toBe(false)
         await vi.waitFor(() => expect(outcomes).toHaveLength(1))
         expect(mocks.characterPath).toHaveBeenCalledOnce()
+    })
+
+    it('hides the overlay when the drag leaves after the element it entered first was removed', () => {
+        const first = document.createElement('div')
+        const second = document.createElement('div')
+        document.body.append(first, second)
+        first.dispatchEvent(dragEvent('dragenter', []))
+        first.remove()
+        second.dispatchEvent(dragEvent('dragenter', []))
+        // The removed element's dragleave is dispatched while it is detached, so it never reaches the document.
+        first.dispatchEvent(dragEvent('dragleave', []))
+        expect(get(importDropOverlayVisible)).toBe(true)
+        second.dispatchEvent(dragEvent('dragleave', []))
+        expect(get(importDropOverlayVisible)).toBe(false)
+        second.remove()
     })
 
     it.each([

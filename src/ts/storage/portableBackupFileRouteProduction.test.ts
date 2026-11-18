@@ -333,10 +333,10 @@ describe('common backup file production route', () => {
         await restoreBackupFromNativeSource({ type: 'desktopPath', path: 'C:/synthetic/inbox/copy' }, { sourceInfo: { name: 'dropped.risunest', bytes: 2048 } })
         expect(m.portable.mock.calls[0][2].confirmationDetails[0]).toEqual({ label: language.risuNest.importIntake.detailFile, value: 'dropped.risunest · 2.0 KiB' })
         await restoreBackupFromNativeSource(async ({ onSource }) => {
-            onSource({ name: 'shared.risunest' })
+            onSource({ name: 'shared.risunest', bytes: 4096 })
             return { type: 'androidSpool', token: 'synthetic-spool' }
         })
-        expect(m.portable.mock.calls[1][2].confirmationDetails[0]).toEqual({ label: language.risuNest.importIntake.detailFile, value: 'shared.risunest' })
+        expect(m.portable.mock.calls[1][2].confirmationDetails[0]).toEqual({ label: language.risuNest.importIntake.detailFile, value: 'shared.risunest · 4.0 KiB' })
         await restoreBackupFromNativeSource(async ({ onSource }) => {
             onSource({ name: '2026-11-01 12:00', bytes: 2048 })
             return { type: 'savedConflict', token: 'synthetic-conflict' }

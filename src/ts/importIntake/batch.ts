@@ -35,6 +35,19 @@ function jsonImportName(name: string): string {
     return /\.json$/i.test(name) ? name.replace(/\.json$/i, '.json') : `${name}.json`
 }
 
+function characterImportName(item: ImportIntakeItem): string {
+    switch (item.format) {
+        case 'png':
+            return /\.png$/i.test(item.name) ? item.name : `${item.name}.png`
+        case 'charx':
+            return /\.charx$/i.test(item.name) ? item.name : `${item.name}.charx`
+        case 'jpeg-charx':
+            return /\.jpe?g$/i.test(item.name) ? item.name : `${item.name}.jpeg`
+        default:
+            return jsonImportName(item.name)
+    }
+}
+
 function presetImportName(item: ImportIntakeItem): string {
     if (item.format === 'risup' || item.format === 'risupreset') {
         const extension = `.${item.format}`
@@ -98,7 +111,7 @@ async function importCharacter(
     const source = nativeImportSource(item.source)
     if (source?.type === 'desktopPath') {
         const { importCharacterPathInOperation } = await import('../characterCards')
-        return importCharacterPathInOperation(source.path, context, item.name)
+        return importCharacterPathInOperation(source.path, context, characterImportName(item))
     }
     if (!source) throw new Error(`${item.name} cannot be imported`)
     const [{ importCharacterProcess, importPreparedNativeCharacterContent }, { getDatabase }, { checkCharOrder }] = await Promise.all([
@@ -110,11 +123,11 @@ async function importCharacter(
     if (item.format === 'json') {
         // JSON spools keep the JavaScript converter, as the Android content picker does.
         const data = await readImportSourceBytes(item.source, ledger, context.signal)
-        const index = await importCharacterProcess({ name: jsonImportName(item.name), data, quiet: true })
+        const index = await importCharacterProcess({ name: characterImportName(item), data, quiet: true })
         characterId = typeof index === 'number' ? getDatabase().characters[index]?.chaId ?? null : null
     } else {
         ledger.claim(item.source)
-        const result = await importPreparedNativeCharacterContent({ source, displayName: item.name }, nativeOptions(context))
+        const result = await importPreparedNativeCharacterContent({ source, displayName: characterImportName(item) }, nativeOptions(context))
         characterId = result.kind === 'imported' ? result.value : null
     }
     if (!characterId) return null

@@ -1,3 +1,5 @@
+import { get } from 'svelte/store'
+import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
 import { failureReason } from '../gui/nativeFileJobDialogModel'
 import { fileOperationErrorWasPresented } from './fileOperationErrorPresentation'
 import { Mutex } from '../mutex'
@@ -41,6 +43,11 @@ import type { ImportIntakeDelivery, ImportIntakeSource } from '../importIntake/t
 
 let disposeSpoolListener: (() => void) | undefined
 
+/** Whether first setup is finished and the onboarding is gone. A restore during onboarding sets `didFirstSetup` while the onboarding stays. */
+export async function androidFirstSetupFinished(): Promise<boolean> {
+    return (await import('./database.svelte')).getDatabase().didFirstSetup && !get(onboardingHold)
+}
+
 export interface AndroidSpoolBatchRouting {
     /** Spools that arrive before first setup keep their own handling. */
     firstSetupDone(): Promise<boolean>
@@ -73,13 +80,17 @@ export function createAndroidSpoolBatchRouter(
                 const fresh = batch.ready.filter((source) => !submittedTokens.has(source.token))
                 for (const source of fresh) submittedTokens.add(source.token)
                 const picked = fresh.filter((source) => source.importDestination)
-                if (picked.length) void routing.dispatch({ ...batch, ready: picked, failures: [] })
+                // A content picker result arrives as a batch of its own, so its failures stay with it.
+                const pickerFailures = batch.ready.some((source) => source.importDestination) ? batch.failures : []
+                if (picked.length) void routing.dispatch({ ...batch, ready: picked, failures: pickerFailures })
                 const sources: ImportIntakeSource[] = [
                     ...fresh
                         .filter((source) => !source.importDestination)
                         .map((spool) => ({ type: 'androidSpool' as const, spool })),
                     ...openedPaths.map((path) => ({ type: 'path' as const, path })),
-                    ...batch.failures.map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
+                    ...batch.failures
+                        .filter((failure) => !pickerFailures.includes(failure))
+                        .map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
                 ]
                 if (sources.length) delivery = submit({ origin: 'opened', sources })
             } finally {
@@ -321,11 +332,12 @@ export function showDestinationRequired(source: AndroidSpoolReady, startedAt: nu
 export async function restoreAndroidOpenedBackupSource({
     source,
     displayName,
+    bytes,
 }: AndroidRisuSaveRestoreInput): Promise<void> {
     const { restoreBackupFromNativeSource } =
         await import('./portableBackupFileRouteProduction.svelte')
     const result = await restoreBackupFromNativeSource(async ({ onSource }) => {
-        onSource({ name: displayName })
+        onSource({ name: displayName, bytes })
         return source
     })
     if (!result) return
@@ -389,7 +401,7 @@ export function registerAndroidRisuSaveRoute(): void {
         reportDestinationRequired: showDestinationRequired,
     })
     const routeSpoolBatch = createAndroidSpoolBatchRouter({
-        firstSetupDone: async () => (await import('./database.svelte')).getDatabase().didFirstSetup,
+        firstSetupDone: androidFirstSetupFinished,
         loadIntake: async () => (await import('../importIntake/intake')).submitImportDelivery,
         dispatch: dispatcher.enqueue,
     })

@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
     alertError: vi.fn(),
     alertNormal: vi.fn(),
     alertRisuServiceTOS: vi.fn(),
+    /** The loading or progress notice on screen, which only a dialog or a clear closes. */
+    status: null as unknown,
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
     saveAsset: vi.fn(),
     charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
@@ -56,9 +58,10 @@ vi.mock('./alert', () => ({
     alertInput: vi.fn(),
     alertMd: vi.fn(),
     alertNormal: mocks.alertNormal,
-    alertStore: { set: vi.fn() },
+    alertClear: () => { mocks.status = null },
+    alertStore: { set: (value: { type: string }) => { mocks.status = ['wait', 'progress'].includes(value.type) ? value : null } },
     alertTOS: vi.fn(), alertRisuServiceTOS: mocks.alertRisuServiceTOS,
-    alertWait: vi.fn(),
+    alertWait: (msg: string) => { mocks.status = { type: 'wait', msg } },
 }))
 vi.mock('./util', () => ({
     checkNullish: (value: unknown) => value === null || value === undefined,
@@ -195,6 +198,7 @@ describe('character card additions', () => {
         mocks.downloads = []
         mocks.nativeDesktopResult = { kind: 'cancelled' }
         mocks.desktopPickerPaths = []
+        mocks.status = null
         vi.clearAllMocks()
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertCardExport.mockResolvedValue({ type: 'cancelled' })
@@ -295,6 +299,22 @@ describe('character card additions', () => {
         expect(mocks.alertNormal.mock.calls).toEqual([[language.importedCharacter]])
     })
 
+    it.each([
+        ['imports', 'AQID'],
+        ['fails', '__asset:missing'],
+    ])('closes the progress notice when a quiet card import %s', async (outcome, emotion) => {
+        const card = { spec: 'chara_card_v2', spec_version: '2.0', data: {
+            name: 'Synthetic', description: 'Description', first_mes: 'Hello', personality: '', scenario: '',
+            mes_example: '', creator_notes: '', system_prompt: '', post_history_instructions: '',
+            alternate_greetings: [], tags: [], creator: '', character_version: '',
+            extensions: { risuai: { emotions: [['happy', emotion]] } },
+        } }
+        const imported = importCharacterProcess({ name: 'synthetic.json', data: new TextEncoder().encode(JSON.stringify(card)), quiet: true })
+        if (outcome === 'imports') await expect(imported).resolves.toBe(0)
+        else await expect(imported).rejects.toThrow('missing')
+        expect(mocks.status).toBeNull()
+    })
+
     it('preserves browser malformed-byte replacement in JSON cards', async () => {
         const prefix = new TextEncoder().encode('{"name":"')
         const suffix = new TextEncoder().encode('","description":"Synthetic","first_mes":"Hello"}')
@@ -344,11 +364,13 @@ describe('character card additions', () => {
             1,
             'C:\\chosen\\card.png',
             expect.any(Object),
+            'card.png',
         )
         expect(mocks.importDesktopNativeCharacterPath).toHaveBeenNthCalledWith(
             2,
             'C:\\chosen\\card.charx',
             expect.any(Object),
+            'card.charx',
         )
     })
 
@@ -380,6 +402,7 @@ describe('character card additions', () => {
             3,
             'C:\\chosen\\last.charx',
             expect.any(Object),
+            'last.charx',
         )
         const failure = { code: 'import-error', message: error.message, recoveryRequired: false }
         expect(outcomes).toEqual([expect.objectContaining({

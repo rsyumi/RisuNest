@@ -40,7 +40,7 @@ export interface PluginHeaderParse {
 
 /** Removes a UTF-8 BOM at the start of any line, as the plugin file picker always has. */
 export function stripPluginBom(code: string): string {
-    return code.replace(/^﻿/gm, '')
+    return code.replace(/^\uFEFF/gm, '')
 }
 
 const supportedApiVersions = ['2.0', '2.1', '3.0']

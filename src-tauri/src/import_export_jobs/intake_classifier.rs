@@ -30,6 +30,8 @@ const ZIP64_EXTRA_ID: u16 = 0x0001;
 const PORTABLE_FORMAT_ENTRY: &[u8] = b"format.json";
 const PORTABLE_FORMAT_MAX_BYTES: u64 = 16 * 1024;
 const JSON_READ_BUFFER_BYTES: usize = 64 * 1024;
+/// The JSON importers stop at this size, and the classifier would hold a long string whole.
+const JSON_MAX_BYTES: u64 = super::MAX_CONTENT_METADATA_BYTES as u64;
 const UNCLASSIFIED_SOURCE_MESSAGE: &str = "this source cannot be classified in place";
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +83,7 @@ pub(crate) enum IntakeRefusal {
     PlainJpeg,
     PngWithoutCard,
     ReadFailed,
+    TooLarge,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -233,7 +236,7 @@ fn classify_file(
     if has_charx_card(file)? {
         return Ok(Found::Content(Kind::Character, Format::Charx));
     }
-    if let Some(found) = classify_json(file)? {
+    if let Some(found) = classify_json(file, file_length)? {
         return Ok(found);
     }
     Ok(match extension {
@@ -396,7 +399,7 @@ fn read_full(reader: &mut impl Read, output: &mut [u8]) -> io::Result<bool> {
 
 /// Classifies a JSON object by its top-level keys; `None` when the file does not open an object.
 /// A byte order mark is not skipped because the importers reject it.
-fn classify_json(file: &mut File) -> io::Result<Option<Found>> {
+fn classify_json(file: &mut File, file_length: u64) -> io::Result<Option<Found>> {
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::with_capacity(JSON_READ_BUFFER_BYTES, file);
     loop {
@@ -413,6 +416,9 @@ fn classify_json(file: &mut File) -> io::Result<Option<Found>> {
                 reader.consume(index);
                 if !opens_object {
                     return Ok(None);
+                }
+                if file_length > JSON_MAX_BYTES {
+                    return Ok(Some(Found::Refused(IntakeRefusal::TooLarge)));
                 }
                 break;
             }
@@ -1057,6 +1063,27 @@ mod tests {
             })
             .collect();
         assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    #[test]
+    fn a_json_object_over_the_import_limit_is_refused_unread() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("huge.json");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(br#"{"spec":"chara_card_v2","description":""#).unwrap();
+        file.set_len(JSON_MAX_BYTES + 1).unwrap();
+        drop(file);
+        let small = br#"{"spec":"chara_card_v2","data":{}}"#.to_vec();
+        let mut sources = vec![json!({ "source": { "type": "desktopPath", "path": path }, "displayName": "huge.json" })];
+        sources.extend(desktop_sources(directory.path(), &[("card.json", small.clone())]));
+
+        let response = respond(directory.path(), sources);
+
+        assert_eq!(
+            response[0],
+            json!({ "kind": "unsupported", "refusal": "too-large", "bytes": JSON_MAX_BYTES + 1 }),
+        );
+        assert_eq!(response[1], with_bytes(content("character", "json"), small.len()));
     }
 
     #[test]

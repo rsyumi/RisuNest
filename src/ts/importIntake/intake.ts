@@ -1,9 +1,10 @@
+import { tick } from 'svelte'
 import { get } from 'svelte/store'
 import { alertError } from '../alert'
 import { alertStore } from '../alertQueue'
 import { isAppLockInputBlocked, waitForAppLockInputUnblocked } from '../appLock/input'
 import { isTauri } from '../platform'
-import { DBState, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
+import { DBState, loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
 import { AndroidSafSourceError } from '../storage/androidSafBridge'
 import { presentFileOperationError } from '../storage/fileOperationErrorPresentation'
 import { copyFileToContentInbox, openContentInbox } from '../storage/nativeContentFile'
@@ -78,9 +79,28 @@ export function submitImportDelivery(delivery: ImportIntakeDelivery): Promise<vo
     return run
 }
 
-/** Waits until the app lock is gone, no alert dialog is open or queued, no file operation runs and no outcome is shown. */
+/** Resolves once the app has finished loading. */
+function waitForLoaded(): Promise<void> {
+    return new Promise(resolve => {
+        let stop: (() => void) | undefined
+        stop = loadedStore.subscribe(loaded => {
+            if (!loaded) return
+            stop?.()
+            resolve()
+        })
+        if (get(loadedStore)) stop()
+    })
+}
+
+/**
+ * Waits until the app has loaded, the app lock is gone, no alert dialog is open or queued, no file operation runs
+ * and no outcome is shown.
+ */
 async function waitForImportIdle(): Promise<void> {
-    while (isAppLockInputBlocked() || alertStore.hasDialogs() || get(nativeFileOperation) || get(nativeFileOperationOutcome)) {
+    while (!get(loadedStore) || isAppLockInputBlocked() || alertStore.hasDialogs() || get(nativeFileOperation) || get(nativeFileOperationOutcome)) {
+        // The app lock comes up once loading ends, so a file opened at startup waits for both.
+        await waitForLoaded()
+        await tick()
         await waitForAppLockInputUnblocked()
         await alertStore.idle()
         await waitForNativeFileOperationIdle()
@@ -102,6 +122,26 @@ async function runIntakeOperation<T>(
             }, { presentation: 'dialog', format: 'content' })
         } catch (error) {
             if (started || !(error instanceof NativeFileOperationBusyError)) throw error
+        }
+    }
+}
+
+/** Runs a restore once the app is idle, again when another file operation started first. */
+async function restoreWhenIdle(
+    restore: () => Promise<unknown>,
+    present: (error: unknown, startedAt: number) => void,
+): Promise<void> {
+    while (true) {
+        await waitForImportIdle()
+        const startedAt = Date.now()
+        try {
+            await restore()
+            return
+        } catch (error) {
+            // The restore asks for confirmation inside its operation, so a busy refusal has asked nothing yet.
+            if (error instanceof NativeFileOperationBusyError) continue
+            present(error, startedAt)
+            return
         }
     }
 }
@@ -220,6 +260,9 @@ function classifierRefusal(result: NativeImportIntakeClassification | undefined)
     if (!result || result.refusal === 'read-failed') {
         return { code: 'read-failed', error: new NativeFileJobError('source-read-failed', result?.message ?? '') }
     }
+    if (result.refusal === 'too-large') {
+        return { code: 'read-failed', error: new NativeFileJobError('payload-too-large', 'JSON file exceeds the import limit', [], 'content') }
+    }
     return { code: result.kind === 'unsupported' && result.refusal ? result.refusal : 'unsupported-format' }
 }
 
@@ -263,10 +306,11 @@ async function readPluginCandidate(item: Omit<ImportIntakeItem, 'kind'>, file: F
     }
 }
 
-/** The selected character a lorebook can go to. */
+/** The selected character a lorebook can go to; the playground is not one. */
 function lorebookCharacter(): { chaId: string; name: string } | undefined {
     const character = DBState.db.characters?.[get(selectedCharID)]
-    return character ? { chaId: character.chaId, name: character.name } : undefined
+    if (!character || character.chaId === '§playground') return undefined
+    return { chaId: character.chaId, name: character.name }
 }
 
 function planDelivery(items: ImportIntakeItem[], state: DeliveryState): DeliveryPlan {
@@ -349,32 +393,24 @@ async function carryOut(plan: DeliveryPlan, state: DeliveryState): Promise<void>
 }
 
 async function restoreBackup(item: ImportIntakeItem, state: DeliveryState): Promise<void> {
-    await waitForImportIdle()
-    const startedAt = Date.now()
     const source = item.source
     if (source.type === 'androidSpool') {
         state.ledger.claim(source)
         const { restoreAndroidOpenedBackupSource, showAndroidFileError } = await import('../storage/androidRisuSaveRouteProduction.svelte')
-        try {
-            await restoreAndroidOpenedBackupSource({
-                source: { type: 'androidSpool', token: source.spool.token },
-                displayName: source.spool.displayName,
-            })
-        } catch (error) {
-            showAndroidFileError(error, startedAt)
-        }
+        await restoreWhenIdle(() => restoreAndroidOpenedBackupSource({
+            source: { type: 'androidSpool', token: source.spool.token },
+            displayName: source.spool.displayName,
+            bytes: source.spool.bytes,
+        }), showAndroidFileError)
         return
     }
     const native = nativeImportSource(source)
     if (native?.type !== 'desktopPath') return
     const { restoreBackupFromNativeSource } = await import('../storage/portableBackupFileRouteProduction.svelte')
-    try {
-        await restoreBackupFromNativeSource(native, source.type === 'file'
-            ? { sourceInfo: { name: item.name, ...(item.bytes === undefined ? {} : { bytes: item.bytes }) } }
-            : {})
-    } catch (error) {
-        presentFileOperationError('import', error, startedAt)
-    }
+    // The item name, not the path's, since an inbox copy or an Android copy prefixes the file it holds.
+    const sourceInfo = { name: item.name, ...(item.bytes === undefined ? {} : { bytes: item.bytes }) }
+    await restoreWhenIdle(() => restoreBackupFromNativeSource(native, { sourceInfo }),
+        (error, startedAt) => presentFileOperationError('import', error, startedAt))
     // A portable restore can still read its source while its outcome offers to retry the missing
     // bodies, so the source stays until that outcome and any retry from it are gone.
     await waitForNativeFileOperationIdle()

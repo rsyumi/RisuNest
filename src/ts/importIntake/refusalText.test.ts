@@ -9,5 +9,7 @@ describe('import intake refusal text', () => {
             .toBe(language.risuNest.plugins.unsupportedApiVersionInstall.replace('{version}', '2.1'))
         expect(importIntakeRefusalText({ code: 'read-failed', error: new NativeFileJobError('source-read-failed', 'denied') }))
             .toBe(language.risuNest.importDialog.reasonIo)
+        expect(importIntakeRefusalText({ code: 'read-failed', error: new NativeFileJobError('payload-too-large', 'synthetic', [], 'content') }))
+            .toBe(language.risuNest.importDialog.reasonTooLarge.replace('{0}', language.risuNest.importDialog.tooLargeItems.content))
     })
 })
