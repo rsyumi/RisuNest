@@ -287,7 +287,8 @@ private const val PAGE_KEPT_SERVICE_LINGER_MILLIS = 5_000L
  * It starts only while the activity is resumed, so a hold the page begins after it went hidden off screen cannot
  * make it visible again, and it ends a moment after the last hold, so work that follows at once stays covered.
  * Off screen, the service stays up from the last hold until a moment after the release, since the app cannot start
- * it again from the background; [keepService] returns what lets it stop, or null when no service runs.
+ * it again from the background; [keepService] returns what lets it stop, or null when no service runs. A page that was
+ * never kept, because its holds began off screen, keeps the service for the same moment after each last hold.
  */
 internal class PageKeptActivePolicy(
   private val apply: (Boolean) -> Unit,
@@ -313,6 +314,11 @@ internal class PageKeptActivePolicy(
   fun onHeldChanged(held: Boolean) {
     this.held = held
     update()
+    if (held || kept || resumed) return
+    if (serviceKept == null) serviceKept = keepService()
+    if (serviceKept == null) return
+    removeCallbacks(letServiceStop)
+    postDelayed(letServiceStop, serviceLingerMillis)
   }
 
   fun onResumedChanged(resumed: Boolean) {

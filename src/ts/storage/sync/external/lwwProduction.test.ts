@@ -726,7 +726,7 @@ describe('bounded production calls and lifecycle ownership', () => {
             await whileWaiting(release, () => expect(held()).toBeGreaterThan(0), installing)
             expect(held()).toBe(0)
         })
-        it('while the plugin startup receive runs beside an idle scheduler, unless the page is already hidden', async () => {
+        it('while the plugin startup receive runs beside an idle scheduler, also when it starts off screen', async () => {
             const held = track()
             dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle()
             expect(held()).toBe(0)
@@ -736,11 +736,11 @@ describe('bounded production calls and lifecycle ownership', () => {
                 expect(held()).toBe(1)
             }, fixture.registrations.get('sync')!.receiveAvailableChanges!(context()))
             expect(held()).toBe(0)
-            vi.mocked(beginDeferredMobileBackgroundTask).mockClear()
+            // Left during launch: the page is hidden before the receive begins.
             Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
             release = gate('external_lww_receive')
-            await whileWaiting(release, () => expect(beginDeferredMobileBackgroundTask).not.toHaveBeenCalled(),
-                fixture.registrations.get('sync')!.receiveAvailableChanges!(context()))
+            await whileWaiting(release, () => expect(held()).toBe(1), fixture.registrations.get('sync')!.receiveAvailableChanges!(context()))
+            expect(held()).toBe(0)
         })
         it('while the return to the screen waits to resume', async () => {
             const held = track()

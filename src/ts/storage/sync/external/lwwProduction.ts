@@ -61,12 +61,12 @@ let resumeBoundTarget = true
 let refreshGeneration = 0
 
 /**
- * Keeps the page running if the app leaves the screen during sync work outside the scheduler, such as waiting to start
- * or resume it, so the scheduler starts on the page and takes over the hold. A page already off screen cannot be kept,
- * so work that begins there holds nothing.
+ * Holds sync work outside the scheduler, such as waiting to start or resume it. If the app leaves the screen during
+ * the work, the page keeps running, so the scheduler starts on it and takes over the hold. Work that begins off
+ * screen, as when the app is left during launch, asks for the service at once; the page stays hidden, so only that
+ * work continues.
  */
 function holdThroughDeparture<T>(work: () => Promise<T>): Promise<T> {
-    if (document.visibilityState === 'hidden') return work()
     const hold = beginDeferredMobileBackgroundTask('sync')
     return work().finally(() => { void Promise.resolve(hold).then(task => task.dispose()) })
 }

@@ -271,6 +271,8 @@ class GenerationForegroundServiceTest {
     delays.elapse()
     assertEquals(0, host.stops)
     assertTrue(host.end(taskId(3)))
+    assertEquals(0, host.stops)
+    delays.elapse()
     assertEquals(1, host.stops)
     assertEquals(listOf(true, false), kept)
 
@@ -296,7 +298,34 @@ class GenerationForegroundServiceTest {
     delays.elapse()
     assertEquals(2, host.stops)
     assertTrue(host.end(taskId(6)))
+    delays.elapse()
     assertEquals(3, host.stops)
+  }
+
+  @Test
+  fun `a page left before its work began keeps the service a moment after each hold so the next hold joins it`() {
+    val delays = Delays()
+    val kept = mutableListOf<Boolean>()
+    lateinit var policy: PageKeptActivePolicy
+    val host = Hosted { policy.onHeldChanged(it) }
+    policy = PageKeptActivePolicy({ kept.add(it) }, host::keepService, delays.post, delays.remove)
+    policy.onResumedChanged(true)
+    policy.onResumedChanged(false)
+    host.registry.promote(host.start)
+    // The first hold begins off screen while the platform still allows a start.
+    assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(1), "sync", deferred = true))
+    host.refuse = BACKGROUND_REFUSED
+    assertTrue(host.end(taskId(1)))
+    assertEquals(0, host.stops)
+    assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(2), "sync", deferred = true))
+    assertEquals(1, host.starts)
+    delays.elapse()
+    assertEquals(0, host.stops)
+    assertTrue(host.end(taskId(2)))
+    assertEquals(0, host.stops)
+    delays.elapse()
+    assertEquals(1, host.stops)
+    assertEquals(emptyList<Boolean>(), kept)
   }
 
   @Test
