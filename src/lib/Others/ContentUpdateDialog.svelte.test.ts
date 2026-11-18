@@ -10,7 +10,7 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     loadAsset: async () => null,
     saveAsset: async () => 'assets/base.json',
 }))
-vi.mock('src/ts/alert', () => ({ alertClear: vi.fn(), alertError: vi.fn() }))
+vi.mock('src/ts/alert', () => ({ alertClear: vi.fn(), alertError: vi.fn(), alertConfirm: vi.fn() }))
 vi.mock('src/ts/stores.svelte', () => ({ DBState: { db: mocks.db } }))
 vi.mock('src/ts/characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
 vi.mock('src/ts/process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
@@ -29,6 +29,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
 import { language } from 'src/lang'
 import ContentUpdateDialog from './ContentUpdateDialog.svelte'
 import { commitImportedCharacter, contentUpdateDialog } from 'src/ts/contentUpdate/flow.svelte'
+import { registerGeneratingConversation } from 'src/ts/storage/generatingConversationRegistry'
 
 let instance: ReturnType<typeof mount> | undefined
 afterEach(async () => {
@@ -58,6 +59,12 @@ it('names fields as the character editor does and updates once every difference 
     button(text.scopeTheirs).click()
     flushSync()
     expect(button(text.update).disabled).toBe(false)
+    // A request for the character holds the update back only until it ends.
+    const release = registerGeneratingConversation({ characterId: 'installed', conversationId: 'chat' })
+    button(text.update).click()
+    flushSync()
+    expect(document.body.textContent).toContain(text.busy)
+    release()
     button(text.update).click()
     expect(await result).toBe('installed')
     expect(mocks.details.get('installed')).toMatchObject({ name: 'Luna v2', creatorNotes: 'new note', chats: [{ id: 'chat' }] })

@@ -13,7 +13,7 @@ import { decodeRPack } from '../rpack/rpack_js'
 
 // Reads an earlier version of a character or module file as the base of an
 // update, without installing it or saving its assets. Only the text the card
-// carries is read; the caller fills the rest from the installed entity.
+// carries is read, so asset fields compare as empty in the base.
 
 export class UnsupportedUpdateBaseFileError extends Error {
     constructor() {
@@ -156,7 +156,8 @@ export async function readUpdateBaseFile(kind: 'character' | 'module', file: { n
         if (!card) throw new UnsupportedUpdateBaseFileError()
         return defined(cardToCharacter(card, module))
     }
-    if (!module && card) module = convertCharacterToModule(cardToCharacter(card, null) as character)
+    // A card, CHARX ones included, imports as a module through the character it holds.
+    if (card) module = convertCharacterToModule(cardToCharacter(card, module) as character)
     if (!module) throw new UnsupportedUpdateBaseFileError()
     const out: Record<string, unknown> = { ...module }
     for (const key of moduleIgnored) delete out[key]

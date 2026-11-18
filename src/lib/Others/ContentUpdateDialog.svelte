@@ -420,7 +420,7 @@
                 {:else}
                     <!-- No "install as new" here: it would sit where "Next" was, so a double click would pick it. -->
                     <SettingButton variant="secondary" disabled={dialog.busy} onclick={() => backToContentUpdateTargets()}>{text.back}</SettingButton>
-                    <SettingButton busy={dialog.busy} disabled={!counts || counts.unresolved > 0 || dialog.targetBusy} onclick={() => chooseContentUpdate('update')}>{text.update}</SettingButton>
+                    <SettingButton busy={dialog.busy} disabled={!counts || counts.unresolved > 0} onclick={() => chooseContentUpdate('update')}>{text.update}</SettingButton>
                 {/if}
             </footer>
         </div>

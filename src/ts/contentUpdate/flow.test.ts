@@ -6,7 +6,10 @@ const mocks = vi.hoisted(() => ({
     root: { characterOrder: [] as any[] },
     db: { characters: [] as any[], modules: [] as any[], enabledModules: [] as string[] },
     alertError: vi.fn(),
+    alertConfirm: vi.fn(async () => true),
     missingTarget: false,
+    /** Write reasons that fail. */
+    failing: new Set<string>(),
 }))
 const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
@@ -21,11 +24,13 @@ vi.mock('../globalApi.svelte', () => ({
         return key
     },
 }))
-vi.mock('../alert', () => ({ alertClear: vi.fn(), alertError: mocks.alertError }))
+vi.mock('../alert', () => ({ alertClear: vi.fn(), alertError: mocks.alertError, alertConfirm: mocks.alertConfirm }))
 vi.mock('../stores.svelte', () => ({ DBState: { db: mocks.db } }))
 vi.mock('../characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
 vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
+// The earlier-file reader's lorebook converter, without the app state its module loads.
+vi.mock('../characterCards', () => ({ convertCharbook: vi.fn() }))
 vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
     assetAliasCleanupTarget: (await import('../storage/deletedOwnerAssetCleanup.testSupport')).createAssetAliasCleanupTarget,
     readPersistentCharacterDetail: async (id: string) => {
@@ -34,16 +39,18 @@ vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
         const { chats: _chats, ...rest } = detail
         return structuredClone(rest)
     },
-    mutatePersistentCharacterDetail: async (id: string, _reason: string, mutate: (state: any) => void) => {
+    mutatePersistentCharacterDetail: async (id: string, reason: string, mutate: (state: any) => void) => {
         const detail = mocks.details.get(id)
+        if (mocks.failing.has(reason)) throw new Error('write failed')
         if (!detail) return false
         const character = structuredClone(detail)
         mutate({ root: mocks.root, character })
         mocks.details.set(id, editableDetail(detail, character))
         return true
     },
-    mutateCharacterDetailFields: async (id: string, _reason: string, mutate: (state: any) => void) => {
+    mutateCharacterDetailFields: async (id: string, reason: string, mutate: (state: any) => void) => {
         const detail = mocks.details.get(id)
+        if (mocks.failing.has(reason)) throw new Error('write failed')
         if (!detail || mocks.missingTarget) return false
         const character = structuredClone(detail)
         mutate({ character })
@@ -60,10 +67,12 @@ import {
     commitImportedModule,
     contentUpdateDialog,
     importAsContentUpdate,
+    loadContentUpdateBaseFile,
     reviewContentUpdate,
     setContentUpdateChoice,
 } from './flow.svelte'
-import { clearStreamingConversation, setStreamingConversation } from '../storage/streamingConversationRegistry'
+import { selectSingleFile } from '../util'
+import { registerGeneratingConversation } from '../storage/generatingConversationRegistry'
 import type { RisuModule } from '../process/modules'
 
 /** Like the native store, which refuses a detail write that touches these fields. */
@@ -113,7 +122,9 @@ beforeEach(() => {
     mocks.db.modules = []
     mocks.db.enabledModules = []
     mocks.missingTarget = false
+    mocks.failing.clear()
     mocks.alertError.mockClear()
+    mocks.alertConfirm.mockReset().mockResolvedValue(true)
     platform.runtime = 'web'
     core.invoke.mockClear()
     commitCharacter.mockClear()
@@ -135,11 +146,11 @@ describe('character update', () => {
 
     it('updates only what the author changed, keeps the user edits and chats, and trashes the old card', async () => {
         platform.runtime = 'tauri'
-        await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm' }), commitCharacter)
+        await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm', backgroundHTML: '<b>' }), commitCharacter)
         mocks.details.get('first').personality = 'brave'
         const firstBase = mocks.details.get('first').extentions[UPDATE_BASE_EXTENSION_KEY]
         // A stored import may not carry a type yet, unlike the installed card.
-        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm' })
+        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm', backgroundHTML: undefined })
         const pending = commitImportedCharacter(second as any, commitCharacter)
         await opened()
         expect(contentUpdateDialog.request?.candidates.map((candidate) => candidate.id)).toEqual(['first'])
@@ -150,6 +161,7 @@ describe('character update', () => {
 
         const updated = mocks.details.get('first')
         expect(updated).toMatchObject({ name: 'Luna v1.1', desc: 'new', personality: 'brave', chats: [{ id: 'first-chat' }] })
+        expect(updated).not.toHaveProperty('backgroundHTML')
         const backup = mocks.details.get('second')
         expect(backup).toMatchObject({ chaId: 'second', name: `Luna v1.0 ${language.risuNest.contentUpdate.backupSuffix}`, desc: 'old', personality: 'brave', chats: [{ id: 'second-chat' }] })
         expect(backup.trashTime).toEqual(expect.any(Number))
@@ -183,13 +195,52 @@ describe('character update', () => {
         expect(await asNew).toBe('next')
         expect(mocks.details.get('old').name).toBe('Luna')
 
+        platform.runtime = 'tauri'
         const assetsBefore = mocks.assets.size
-        const cancelled = commitImportedCharacter(card('third', 'Luna v3'), commitCharacter)
+        const cancelled = commitImportedCharacter(card('third', 'Luna v3', { image: 'assets/third.png' }), commitCharacter)
         await opened()
         chooseContentUpdate('cancel')
         expect(await cancelled).toBeNull()
         expect(mocks.details.has('third')).toBe(false)
         expect(mocks.assets.size).toBe(assetsBefore)
+        // The card reader saved its assets already; they go when nothing uses them.
+        expect(await releasedKeys()).toEqual(['assets/third.png'])
+    })
+
+    it('asks about the fields an earlier file does not carry, such as the portrait', async () => {
+        install(card('old', 'Luna', { desc: 'old', image: 'assets/mine.png' }))
+        const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'new', image: 'assets/new.png' }), commitCharacter)
+        await opened()
+        await reviewContentUpdate()
+        const earlier = { spec: 'chara_card_v2', data: { name: 'Luna', description: 'old' } }
+        vi.mocked(selectSingleFile).mockResolvedValueOnce({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify(earlier)) })
+        await loadContentUpdateBaseFile()
+        expect(contentUpdateDialog.baseSource.kind).toBe('file')
+        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.status])).toEqual([
+            ['name', 'update'], ['desc', 'update'], ['image', 'conflict'],
+        ])
+        chooseContentUpdate('cancel')
+        expect(await pending).toBeNull()
+    })
+
+    it('asks before low-level access the user turned on covers triggers the update takes', async () => {
+        await commitImportedCharacter(card('first', 'Luna v1.0', { lowLevelAccess: false, triggerscript: [] }), commitCharacter)
+        mocks.details.get('first').lowLevelAccess = true
+        const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
+        const update = async (id: string) => {
+            const pending = commitImportedCharacter(card(id, 'Luna v1.1', { lowLevelAccess: false, triggerscript: [trigger] }), commitCharacter)
+            await opened()
+            await reviewContentUpdate()
+            chooseContentUpdate('update')
+            return await pending
+        }
+        mocks.alertConfirm.mockResolvedValueOnce(false)
+        expect(await update('declined')).toBeNull()
+        expect(mocks.details.has('declined')).toBe(false)
+        expect(mocks.details.get('first').triggerscript).toEqual([])
+        expect(await update('accepted')).toBe('first')
+        expect(mocks.alertConfirm).toHaveBeenCalledTimes(2)
+        expect(mocks.details.get('first')).toMatchObject({ lowLevelAccess: true, triggerscript: [trigger] })
     })
 
     it('opens the review of the named character for the update action, whatever the import is called', async () => {
@@ -203,9 +254,9 @@ describe('character update', () => {
         expect(mocks.details.get('old')).toMatchObject({ name: 'Moon', desc: 'b' })
     })
 
-    it('does not update a character while it is generating a response', async () => {
+    it('does not update a character while a request for it runs, streamed or not', async () => {
         install(card('old', 'Luna', { desc: 'a' }))
-        setStreamingConversation('old-chat', undefined)
+        const release = registerGeneratingConversation({ characterId: 'old', conversationId: 'old-chat' })
         try {
             const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'b' }), commitCharacter)
             await opened()
@@ -214,28 +265,32 @@ describe('character update', () => {
             for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
             chooseContentUpdate('update')
             expect(contentUpdateDialog.request).not.toBeNull()
-            clearStreamingConversation('old-chat')
+            release()
             chooseContentUpdate('update')
             expect(await pending).toBe('old')
         } finally {
-            clearStreamingConversation('old-chat')
+            release()
         }
     })
 
-    it('keeps the import as a new character when the installed one is gone at the update', async () => {
+    it.each([
+        ['is gone', () => { mocks.missingTarget = true }, true],
+        ['cannot be written', () => { mocks.failing.add('content-update') }, true],
+        ['cannot be written and the import not restored', () => { mocks.failing.add('content-update').add('content-update-restore') }, false],
+    ])('keeps the import as a new character only once it is back, when the installed one %s', async (_case, fail, restored) => {
         install(card('old', 'Luna', { desc: 'a' }))
         const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'b' }), commitCharacter)
         await opened()
         await reviewContentUpdate()
         for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
-        mocks.missingTarget = true
+        fail()
         chooseContentUpdate('update')
-        expect(await pending).toBe('next')
+        expect(await pending).toBe(restored ? 'next' : null)
         expect(mocks.alertError).toHaveBeenCalledOnce()
         const kept = mocks.details.get('next')
-        expect(kept).toMatchObject({ name: 'Luna v2', desc: 'b' })
-        expect(kept.trashTime).toBeUndefined()
-        expect(mocks.root.characterOrder).toEqual(['old', 'next'])
+        if (restored) expect(kept).toMatchObject({ name: 'Luna v2', desc: 'b' })
+        expect(kept.trashTime === undefined).toBe(restored)
+        expect(mocks.root.characterOrder).toEqual(restored ? ['old', 'next'] : ['old'])
     })
 })
 

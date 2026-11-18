@@ -1,18 +1,17 @@
 // Adapted from RisuBard (https://github.com/rpaddict/RisuBard, src/ts/characterUpdateFlow.svelte.ts), GPL-3.0.
 
 import { language } from 'src/lang'
-import { alertClear, alertError } from '../alert'
+import { alertClear, alertConfirm, alertError } from '../alert'
 import { loadAsset, saveAsset } from '../globalApi.svelte'
 import { DBState } from '../stores.svelte'
 import type { character } from '../storage/database.svelte'
 import type { RisuModule } from '../process/modules'
 import type { CharacterDetail } from '../storage/persistentDataStore'
-import { isConversationStreaming } from '../storage/streamingConversationRegistry'
+import { generatingConversations } from '../storage/generatingConversationRegistry'
 import {
     getCatalogConversationCount,
     isArchivedCharacter,
     isCatalogCharacterStub,
-    isWorkingSetCharacterStub,
     patchWorkingSetCharacterDetail,
 } from '../storage/workingSetCatalog'
 import {
@@ -37,6 +36,7 @@ import {
     unresolvedItems,
     type UpdateCandidate,
     type UpdateChoice,
+    type UpdateItem,
     type UpdatePlan,
     type UpdateSide,
     type UpdateSpec,
@@ -109,11 +109,8 @@ const characters: Entity<CharacterDetail> = {
         if (!value.newGenData && value.viewScreen) updateInlayScreen(value as unknown as character)
         return value
     },
-    busy: (id) => {
-        const value = residentCharacter(id)
-        if (!value || isWorkingSetCharacterStub(value)) return false
-        return (value.chats ?? []).some((chat) => chat?.id && isConversationStreaming(chat.id))
-    },
+    // From the start of a request, before a first token or without streaming.
+    busy: (id) => generatingConversations.snapshot().some((target) => target.characterId === id),
 }
 
 const modules: Entity<RisuModule> = {
@@ -210,6 +207,24 @@ function releaseUnusedAssets(startedAtMs: number, ...values: unknown[]) {
     scheduleDeletedOwnerAssetCleanup(collectOwnedAssetKeys(...values), startedAtMs, 'content-update', () => assetAliasCleanupTarget())
 }
 
+/** Ends an import the user cancelled: the assets its file saved go once nothing uses them. */
+function cancelImport(incoming: object): null {
+    releaseUnusedAssets(Date.now(), incoming)
+    return null
+}
+
+/**
+ * Low-level access the user turned on would also cover the triggers the update
+ * takes from the import, so it is confirmed as for an import that asks for it.
+ */
+async function confirmLowLevelAccess(decision: Decision, triggerField: string): Promise<boolean> {
+    if (decision.kind !== 'update') return true
+    const taken = (item: UpdateItem) => (decision.choices[item.id] ?? item.choice) !== 'mine'
+    const access = decision.plan.items.find((item) => item.field === 'lowLevelAccess')
+    if (!access?.mine || taken(access) || !decision.plan.items.some((item) => item.field === triggerField && taken(item))) return true
+    return await alertConfirm(language.lowLevelAccessConfirm)
+}
+
 export function selectContentUpdateTarget(id: string) {
     if (contentUpdateDialog.busy) return
     contentUpdateDialog.target = id
@@ -280,7 +295,7 @@ export function chooseContentUpdateMany(ids: string[], side: UpdateSide) {
 /**
  * Uses an earlier file of this character or module as the base, for an install
  * that has no record of the version it came from. Fields the file does not
- * carry count as unchanged by the user.
+ * carry, such as asset paths, are empty in that base, so one both sides set is asked about.
  */
 export async function loadContentUpdateBaseFile() {
     const dialog = contentUpdateDialog
@@ -298,8 +313,7 @@ export async function loadContentUpdateBaseFile() {
         const mine = await entity.normalize(value)
         // The card readers load only when a file is chosen.
         const { readUpdateBaseFile } = await import('./baseFile')
-        const parsed = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
-        const base = { ...baseSnapshot(entity.spec, mine), ...parsed }
+        const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
         const plan = planUpdate(entity.spec, mine, incoming, base)
         const ids = new Set(plan.items.map((item) => item.id))
         dialog.plan = plan
@@ -325,10 +339,8 @@ export function chooseContentUpdate(kind: 'new' | 'cancel' | 'update') {
     if (kind !== 'update') return finish({ kind })
     const plan = dialog.plan
     if (!plan) return
-    if (pending.entity.busy(dialog.target)) {
-        dialog.targetBusy = true
-        return
-    }
+    dialog.targetBusy = pending.entity.busy(dialog.target)
+    if (dialog.targetBusy) return
     const picks = $state.snapshot(dialog.choices)
     if (unresolvedItems(plan).some((item) => !picks[item.id])) return
     const choices: Record<string, UpdateChoice> = {}
@@ -407,7 +419,7 @@ function takeForcedTarget(kind: UpdateKind): string | null {
 
 function replaceDetailFields(target: Record<string, unknown>, source: Record<string, unknown>, fixed: ReadonlySet<string>) {
     for (const key of Object.keys(target)) {
-        if (!fixed.has(key) && !Object.hasOwn(source, key)) delete target[key]
+        if (!fixed.has(key) && source[key] === undefined) delete target[key]
     }
     for (const [key, value] of Object.entries(source)) {
         if (!fixed.has(key) && value !== undefined) target[key] = structuredClone(value)
@@ -446,14 +458,14 @@ async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' 
     if (!backedUp) throw new Error(language.errors.noData)
     const updated = await mutateCharacterDetailFields(targetId, 'content-update', ({ character }) => {
         replaceDetailFields(character as unknown as Record<string, unknown>, merged as unknown as Record<string, unknown>, characterIdentity)
-    })
-    if (!updated) {
-        // The installed character went away meanwhile: the import stays a new character.
+    }).catch((error: unknown) => error)
+    if (updated !== true) {
+        // The write failed or the installed character went away: the import stays a new character.
         await mutatePersistentCharacterDetail(incoming.chaId, 'content-update-restore', ({ root, character }) => {
             replaceDetailFields(character as unknown as Record<string, unknown>, incoming as unknown as Record<string, unknown>, characterIdentity)
             appendCharacterIdToOrder(root, incoming.chaId)
         })
-        throw new Error(language.errors.noData)
+        throw updated instanceof Error ? updated : new Error(language.errors.noData)
     }
     const live = residentCharacter(targetId)
     if (live && isCatalogCharacterStub(live)) patchWorkingSetCharacterDetail(live, merged)
@@ -479,7 +491,7 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
         await characters.normalize(incoming)
         const listed = target ? installed.filter((entry) => entry.id === target).map((entry) => ({ ...entry, reason: 'name' as const })) : candidates
         decision = await ask(characters, incoming as CharacterDetail, await withCreators(listed), installed, target)
-        if (decision.kind === 'cancel') return null
+        if (decision.kind === 'cancel' || !await confirmLowLevelAccess(decision, 'triggerscript')) return cancelImport(incoming)
     }
     const baseKey = await saveUpdateBase(baseData)
     if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
@@ -490,7 +502,9 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
     } catch (error) {
         console.error(error)
         alertError(`${language.risuNest.contentUpdate.failed}\n${error instanceof Error ? error.message : String(error)}`)
-        return incoming.chaId
+        // The import is a new character unless it stayed the trashed copy of the installed one.
+        const kept = await characters.read(incoming.chaId).catch(() => null)
+        return kept && !kept.trashTime ? incoming.chaId : null
     }
 }
 
@@ -530,7 +544,7 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
             ? [{ id: forced.id, name: forced.name ?? '', reason: 'name', count: forced.lorebook?.length ?? 0 }]
             : candidates
         decision = await ask(modules, incoming, listed, installed.map((module) => ({ id: module.id, name: module.name ?? '' })), forced?.id ?? null)
-        if (decision.kind === 'cancel') return null
+        if (decision.kind === 'cancel' || !await confirmLowLevelAccess(decision, 'trigger')) return cancelImport(incoming)
     }
     const baseKey = await saveUpdateBase(baseData)
     if (baseKey) incoming.updateBase = baseKey
