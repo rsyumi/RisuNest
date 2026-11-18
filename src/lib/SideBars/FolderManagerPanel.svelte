@@ -2,6 +2,7 @@
     import ColorPicker from 'svelte-awesome-color-picker'
     import { tick } from 'svelte'
     import { language } from 'src/lang'
+    import { alertError } from 'src/ts/alert'
     import { getCharImage } from 'src/ts/characters'
     import { imageAliases } from 'src/ts/media/imageFormats'
     import { saveImage } from 'src/ts/storage/database.svelte'
@@ -93,15 +94,13 @@
     }
 
     // A folder without its own colours starts them from what it shows, and they follow that until they are changed.
-    let colorSeed: string | null = null
-    let textSeed: string | null = null
+    const edited = new Set<Picker>()
 
     function chooseColorMode(mode: FolderColorMode) {
         if (draft.colorMode === 'preset' && mode !== 'preset' && stored && !resolveFolderAppearance(stored).stops) {
             const base = folderPresetBaseHex(draft.preset, theme)
-            if (colorSeed === null || draft.solid === colorSeed) draft.solid = base
-            if (colorSeed === null || draft.gradient[0] === colorSeed) draft.gradient[0] = base
-            colorSeed = base
+            if (!edited.has('solid')) draft.solid = base
+            if (!edited.has('start')) draft.gradient[0] = base
         }
         draft.colorMode = mode
         openPicker = null
@@ -111,8 +110,7 @@
         if (mode === 'manual' && draft.textMode === 'auto' && appearance && stored && !resolveFolderAppearance(stored).textColor) {
             const automatic = folderTextStyle({ ...appearance, textColor: null }).color
                 ?? normalizeHexColor(getComputedStyle(document.documentElement).getPropertyValue('--risu-theme-textcolor')) ?? '#ffffff'
-            if (textSeed === null || draft.textColor === textSeed) draft.textColor = automatic
-            textSeed = automatic
+            if (!edited.has('text')) draft.textColor = automatic
         }
         draft.textMode = mode
         if (mode === 'auto' && openPicker === 'text') openPicker = null
@@ -131,36 +129,41 @@
 
     function setPickerColor(picker: Picker, hex: string | null) {
         const value = normalizeHexColor(hex)
-        if (!value) return
+        if (!value || value === pickerColor(picker)) return
+        edited.add(picker)
         if (picker === 'solid') draft.solid = value
         else if (picker === 'start') draft.gradient[0] = value
         else if (picker === 'end') draft.gradient[1] = value
         else draft.textColor = value
     }
 
-    let choosingImage: Promise<void> | null = null
+    /** Resolves false when the chosen image could not be read or stored. */
+    let choosingImage: Promise<boolean> | null = null
 
     function chooseImage() {
-        choosingImage ??= pickImage().finally(() => { choosingImage = null })
+        choosingImage ??= pickImage()
+            .then(() => true, (error) => { alertError(error); return false })
+            .finally(() => { choosingImage = null })
     }
 
     async function pickImage() {
-        const folderId = folderManager.folderId
+        const opened = folderManager.draft
         const file = await selectSingleFile(imageAliases, { image: true })
         if (!file) return
         const saved = await saveImage(file.data)
-        if (folderManager.folderId !== folderId || !folderManager.draft) return
-        folderManager.draft.imgFile = saved
-        folderManager.draft.iconType = 'image'
+        // The panel may have closed, opened again or left 이미지 meanwhile.
+        if (folderManager.draft !== opened || opened?.iconType !== 'image') return
+        opened.imgFile = saved
     }
 
     async function save() {
         if (saving) return
         saving = true
+        const opened = folderManager.draft
         try {
-            // A chosen image may still be reading or saving; the folder is saved with it.
-            await choosingImage?.catch(() => {})
-            await saveFolderManager()
+            // A chosen image may still be reading or saving; the folder is saved with it, or stays open when it failed.
+            if (choosingImage && !await choosingImage) return
+            await saveFolderManager(opened)
         } finally {
             saving = false
         }

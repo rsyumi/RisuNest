@@ -29,4 +29,24 @@ describe('saveFolderManager', () => {
         await saving
         expect(DBState.db.characterOrder).toEqual([{ ...original, name: '로맨스', data: ['a', 'b'], imgFile: 'assets/new.png', img: 'blob:new' }, 'x'])
     })
+
+    it('writes nothing once its manager was closed and leaves the folder opened since alone', async () => {
+        const first: folder = { name: '판타지', data: ['a'], color: 'blue', id: 'f1' }
+        const second: folder = { name: '로맨스', data: ['b'], color: 'red', id: 'f2' }
+        DBState.db.characterOrder = [first, second]
+        openFolderManager('f1', { top: 0, right: 0 })
+        const firstDraft = folderManager.draft!
+        firstDraft.name = '바뀐 이름'
+        firstDraft.imgFile = 'assets/new.png'
+        firstDraft.iconType = 'image'
+        const saving = saveFolderManager(firstDraft)
+        openFolderManager('f2', { top: 0, right: 0 })
+        folderManager.draft!.name = '편집 중'
+        fileSource.resolve('blob:new')
+        await saving
+        // A save the closed manager started only after waiting for its image.
+        await saveFolderManager(firstDraft)
+        expect(DBState.db.characterOrder).toEqual([first, second])
+        expect(folderManager).toMatchObject({ folderId: 'f2', draft: { name: '편집 중' } })
+    })
 })

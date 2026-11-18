@@ -36,6 +36,8 @@ describe('fitFolderIconText', () => {
         expect(fit('현대판타지로맨스2').lines).toEqual(['현대판', '타지로', '맨스2'])
         expect(fit('가나다라마바12345').lines).toEqual(['가나다', '라마', '바12345'])
         expect(fit('AI RP 가나다라마바사아').lines).toEqual(['AI RP 가나', '다라마', '바사아'])
+        expect(fit('시즌1.25').lines).toEqual(['시즌1.25'])
+        expect(fit('시즌1,234').lines).toEqual(['시즌1,234'])
     })
 
     it('counts graphemes, so an emoji sequence is never split', () => {

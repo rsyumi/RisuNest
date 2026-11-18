@@ -63,16 +63,17 @@ function wordLayouts(words: string[], count: number, measure: MeasureLine): stri
 }
 
 const unbreakable = /[\p{Script=Latin}\p{Nd}]/u
+const closing = /^[\p{Pe}\p{Pf}\p{Po}]$/u
 
 function syllableLayout(words: string[], count: number): Layout | null {
-    // Other characters may break between any two and drop the spaces between them.
-    // Latin words and numbers never break and keep the spaces beside them.
+    // Other characters may break between any two and drop the spaces between them. Closing punctuation stays with what
+    // precedes it, and Latin words and numbers (1.25 and 1,234 included) never break and keep the spaces beside them.
     const units: string[] = []
     let spaced = false
     for (const unit of graphemes(words.join(' '))) {
         if (unit === ' ') { spaced = true; continue }
         const last = units.at(-1) ?? ''
-        if (unbreakable.test(unit) && unbreakable.test(last)) units[units.length - 1] = last + (spaced ? ' ' : '') + unit
+        if (last && (closing.test(unit) || (unbreakable.test(unit) && unbreakable.test(last)))) units[units.length - 1] = last + (spaced ? ' ' : '') + unit
         else units.push(spaced && (unbreakable.test(unit) || unbreakable.test(last)) ? ` ${unit}` : unit)
         spaced = false
     }

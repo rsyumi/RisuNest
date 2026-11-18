@@ -47,16 +47,21 @@ export function closeFolderManager() {
     folderManager.draft = null
 }
 
-/** Writes the draft to the folder in one assignment and closes the manager. */
-export async function saveFolderManager() {
+/**
+ * Writes `opened`, the draft that was open when saving began, to its folder in one assignment and closes the manager.
+ * Nothing is written once that draft's manager was closed, so a later one is never saved or closed by it.
+ */
+export async function saveFolderManager(opened = folderManager.draft) {
+    if (!opened || folderManager.draft !== opened) return
     const folderId = folderManager.folderId
-    const draft = folderManager.draft ? $state.snapshot(folderManager.draft) as FolderDraft : null
+    const draft = $state.snapshot(opened) as FolderDraft
     const found = folderId ? findFolder(folderId) : null
-    if (!folderId || !draft || !found) {
+    if (!folderId || !found) {
         closeFolderManager()
         return
     }
     const img = draft.imgFile && draft.imgFile !== found.folder.imgFile ? await getFileSrc(draft.imgFile) : undefined
+    if (folderManager.draft !== opened) return
     // The folder may have moved or changed its characters while the image source resolved.
     const current = findFolder(folderId)
     if (current) {
