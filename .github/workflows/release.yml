@@ -310,9 +310,14 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Check out this workflow's APT installer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: { ref: "${{ github.workflow_sha }}", path: .workflow-apt, sparse-checkout: scripts/install-apt-packages.sh, sparse-checkout-cone-mode: false, persist-credentials: false }
       - name: Install native GUI test dependencies
         timeout-minutes: 20
-        run: bash scripts/install-apt-packages.sh pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
+        run: |
+          mv .workflow-apt/scripts/install-apt-packages.sh "$RUNNER_TEMP/" && rm -rf .workflow-apt
+          bash "$RUNNER_TEMP/install-apt-packages.sh" pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
       - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
       - run: pnpm --dir server/manager/gui --ignore-workspace check
       - run: pnpm --dir server/manager/gui --ignore-workspace test
@@ -345,9 +350,14 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: wasm32-unknown-unknown }
+      - name: Check out this workflow's APT installer
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: { ref: "${{ github.workflow_sha }}", path: .workflow-apt, sparse-checkout: scripts/install-apt-packages.sh, sparse-checkout-cone-mode: false, persist-credentials: false }
       - name: Install native and WASM build dependencies
         timeout-minutes: 20
-        run: bash scripts/install-apt-packages.sh clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
+        run: |
+          mv .workflow-apt/scripts/install-apt-packages.sh "$RUNNER_TEMP/" && rm -rf .workflow-apt
+          bash "$RUNNER_TEMP/install-apt-packages.sh" clang llvm pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev gnome-keyring dbus-x11
       - run: pnpm install --frozen-lockfile
       - name: Install the locked WASM binding generator
         shell: pwsh
@@ -427,10 +437,16 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
         with: { targets: "${{ matrix.target }}" }
+      - name: Check out this workflow's APT installer
+        if: runner.os == 'Linux'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with: { ref: "${{ github.workflow_sha }}", path: .workflow-apt, sparse-checkout: scripts/install-apt-packages.sh, sparse-checkout-cone-mode: false, persist-credentials: false }
       - name: Install Linux package dependencies
         if: runner.os == 'Linux'
         timeout-minutes: 20
-        run: bash scripts/install-apt-packages.sh build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64 gnome-keyring dbus-x11 xvfb
+        run: |
+          mv .workflow-apt/scripts/install-apt-packages.sh "$RUNNER_TEMP/" && rm -rf .workflow-apt
+          bash "$RUNNER_TEMP/install-apt-packages.sh" build-essential pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev patchelf desktop-file-utils shared-mime-info xdg-utils libfuse2t64 gnome-keyring dbus-x11 xvfb
       - run: pnpm install --frozen-lockfile
       - name: Use a temporary directory without symlinked ancestors
         if: runner.os == 'macOS'
