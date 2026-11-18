@@ -135,6 +135,18 @@ impl Projector {
                 }
             }
             &external
+        } else if name == "Chat"
+            && matches!(self.target, CompatibilityTarget::PocketRisu)
+            && value.get("promptPresetId").is_some_and(Value::is_string)
+        {
+            // PocketRisu reads a chat's preset binding, and an empty one as unbound, from bindedBotPreset.
+            external = value.clone();
+            if let Some(object) = external.as_object_mut() {
+                if let Some(id) = object.shift_remove("promptPresetId") {
+                    object.insert("bindedBotPreset".to_owned(), id);
+                }
+            }
+            &external
         } else { value };
         let (mut value, losses) = project_node(&self.schema, node, value, 0).map_err(|rejection| {
             let owner = matches!(name, "Database" | "DataBase").then(|| rejection.root_owner(value)).flatten();
@@ -1165,6 +1177,25 @@ mod tests {
             .get("bindedPersona")
             .is_none());
         assert_eq!(projector.losses.0["unavailable-persona-binding"], 1);
+    }
+
+    #[test]
+    fn compatible_chat_preset_bindings_follow_each_target() {
+        let mut pocket = Projector::new(CompatibilityTarget::PocketRisu).unwrap();
+        for (source, expected) in [
+            (json!({"promptPresetId":"preset","bindedBotPreset":"leftover"}), json!({"bindedBotPreset":"preset"})),
+            (json!({"promptPresetId":"","bindedBotPreset":"leftover"}), json!({"bindedBotPreset":""})),
+            (json!({"bindedBotPreset":"leftover"}), json!({"bindedBotPreset":"leftover"})),
+        ] {
+            assert_eq!(pocket.project("Chat", &source).unwrap(), expected);
+        }
+        assert!(pocket.losses.0.is_empty());
+        let mut risuai = Projector::new(CompatibilityTarget::RisuAi).unwrap();
+        assert_eq!(
+            risuai.project("Chat", &json!({"promptPresetId":"preset","bindedBotPreset":"leftover"})).unwrap(),
+            json!({})
+        );
+        assert_eq!(risuai.losses.0["unsupported-structural-field"], 2);
     }
 
     #[test]

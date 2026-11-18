@@ -450,6 +450,25 @@ describe('RisuSave persistent store adapter', () => {
         await expect(decodeRisuSave(exported)).resolves.toEqual(database)
     })
 
+    it('exports chat preset bindings without a bindedBotPreset that a restore would bind', async () => {
+        const database = structuredClone(risuSaveFixtureDatabase)
+        const presetId = database.botPresets[0]['id'] as string
+        const bound = Object.assign(structuredClone(database.characters[0].chats[0]),
+            { id: 'chat-bound', promptPresetId: presetId, bindedBotPreset: 'leftover-bound' })
+        Object.assign(database.characters[0].chats[0], { bindedBotPreset: 'leftover' })
+        database.characters[0].chats.push(bound)
+        const store = new IndexedDbPersistentDataStore('risu-save-preset-binding', new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(database)
+
+        const decoded = await decodeRisuSave(await concatenate(streamRisuSaveFromStore(store, imported.revision)))
+
+        const [leftover, kept] = decoded.characters[0].chats
+        expect(leftover.id).toBe('chat-fixture')
+        expect(leftover).not.toHaveProperty('promptPresetId')
+        expect(kept.promptPresetId).toBe(presetId)
+    })
+
     it('streams deterministic bytes for the same revision', async () => {
         const store = new IndexedDbPersistentDataStore(
             'risu-save-deterministic-export',
