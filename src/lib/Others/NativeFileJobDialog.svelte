@@ -60,6 +60,13 @@
         }
     })
 
+    function dismiss(): void {
+        void Promise.resolve(dismissNativeFileOperationOutcome()).catch(async error => {
+            const { alertError } = await import('src/ts/alert')
+            alertError(failureReason(error?.code ?? ''))
+        })
+    }
+
     async function copyDetails(): Promise<void> {
         const details = model.terminal ? detailsText : ''
         if (!details) return
@@ -112,7 +119,27 @@
                     {#if model.terminal.location}
                         <p class="text-subtext break-words">{model.terminal.location}</p>
                     {/if}
-                    {#if model.terminal.failedFiles.length > 0}
+                    {#if model.terminal.entries}
+                        <ul class="mt-1 flex max-h-60 flex-col gap-1.5 overflow-y-auto" data-testid="native-file-job-batch-entries">
+                            {#each model.terminal.entries as entry, index (index)}
+                                <li class="flex items-start gap-2" data-entry-state={entry.state}>
+                                    {#if entry.state === 'imported'}
+                                        <CheckIcon size={16} class="mt-0.5 shrink-0 text-success-500" />
+                                    {:else if entry.state === 'failed'}
+                                        <XIcon size={16} class="mt-0.5 shrink-0 text-danger-400" />
+                                    {:else}
+                                        <span class="size-4 shrink-0" aria-hidden="true"></span>
+                                    {/if}
+                                    <span class="flex min-w-0 flex-col">
+                                        <span class="truncate">{entry.name}</span>
+                                        {#if entry.detail}
+                                            <span class="text-subtext break-words">{entry.detail}</span>
+                                        {/if}
+                                    </span>
+                                </li>
+                            {/each}
+                        </ul>
+                    {:else if model.terminal.failedFiles.length > 0}
                         <ul class="mt-1 flex max-h-40 flex-col gap-1 overflow-y-auto" data-testid="native-file-job-failed-files">
                             {#each model.terminal.failedFiles as file, index (index)}
                                 <li class="flex flex-col">
@@ -237,10 +264,14 @@
                         {#if retryAvailable}
                             <SettingButton variant="secondary" onclick={() => {void retryPortableRestoreBodiesFromOutcome().catch(() => {})}}>{language.retry}</SettingButton>
                         {/if}
-                        <SettingButton onclick={() => {void Promise.resolve(dismissNativeFileOperationOutcome()).catch(async error => {
-                            const { alertError } = await import('src/ts/alert')
-                            alertError(failureReason(error?.code ?? ''))
-                        })}}>{copy.close}</SettingButton>
+                        {#if model.terminal?.openLocation}
+                            {@const target = model.terminal.openLocation}
+                            <SettingButton variant="secondary" onclick={() => {
+                                void import('src/ts/importIntake/openResult').then(({ openImportResult }) => openImportResult(target))
+                                dismiss()
+                            }}>{language.risuNest.importIntake.open}</SettingButton>
+                        {/if}
+                        <SettingButton onclick={dismiss}>{copy.close}</SettingButton>
                     {/if}
                 </footer>
             {/if}
