@@ -1,3 +1,16 @@
+<script module lang="ts">
+    // A web font that finishes loading changes every width, so every face measures again.
+    let fontsLoaded = $state(0)
+    let watchingFonts = false
+
+    function watchFonts() {
+        if (watchingFonts || !document.fonts) return
+        watchingFonts = true
+        document.fonts.addEventListener?.('loadingdone', () => { fontsLoaded++ })
+        document.fonts.ready.then(() => { fontsLoaded++ })
+    }
+</script>
+
 <script lang="ts">
     import FolderIcon from '@lucide/svelte/icons/folder'
     import FolderOpenIcon from '@lucide/svelte/icons/folder-open'
@@ -14,24 +27,17 @@
 
     let element: HTMLDivElement | undefined = $state()
     let font = $state('')
-    let fontEpoch = $state(0)
 
     $effect(() => {
         if (!element) return
+        watchFonts()
+        void fontsLoaded
         font = getComputedStyle(element).fontFamily
-        let live = true
-        // A web font that finishes loading changes every width.
-        document.fonts?.ready.then(() => {
-            if (!live || !element) return
-            font = getComputedStyle(element).fontFamily
-            fontEpoch++
-        })
-        return () => { live = false }
     })
 
     const text = $derived(folderTextStyle(appearance))
     const fit = $derived.by(() => {
-        void fontEpoch
+        void fontsLoaded
         return fitFolderIconText(appearance.text, round, canvasLineMeasure(font))
     })
 </script>

@@ -58,6 +58,10 @@ describe('stored folder appearance', () => {
         expect(resolveFolderAppearance(stored({ color: '', colorStops: ['#zzzzzz'], colorAngle: 30, textColor: 'white', iconText: '  ' })))
             .toMatchObject({ preset: 'default', stops: null, angle: 135, textColor: null, text: '판타지' })
         expect(resolveFolderAppearance(stored({ iconText: '판타\n지' })).text).toBe('판타\n지')
+        // Upstream's image reset leaves this shape; it shows the name and saves back unchanged.
+        const reset = stored({ imgFile: null as unknown as string, img: '' })
+        expect(resolveFolderAppearance(reset).iconType).toBe('text')
+        expect(applyFolderDraft(reset, folderDraftFrom(reset, theme))).toEqual(reset)
     })
 
     it('saves only what differs from the absent meaning and keeps every other key', () => {

@@ -56,7 +56,7 @@
   import { onDestroy } from "svelte";
   import { RepresentativeImageList } from "src/ts/ui/representativeImagePriority";
   import FolderIconFace from "./FolderIconFace.svelte";
-  import { folderManager, openFolderManager } from "src/ts/gui/folderManager.svelte";
+  import { findFolder, folderManager, openFolderManager } from "src/ts/gui/folderManager.svelte";
   import { applyFolderDraft, folderFillImage, folderFrameImage, resolveFolderAppearance, type FolderAppearance } from "src/ts/gui/folderAppearance";
   const imagePriority = new RepresentativeImageList(false);
   onDestroy(() => imagePriority.dispose());
@@ -77,7 +77,18 @@
   }
 
   type sortTypeNormal = { type:'normal',img: string, index: number, name:string }
-  type sortType =  sortTypeNormal|{type:'folder',folder:sortTypeNormal[],id:string, name:string, color:string, img?:string, appearance:FolderAppearance}
+  type folderTile = { name:string, color:string, img?:string, appearance:FolderAppearance }
+  type sortType =  sortTypeNormal|({type:'folder',folder:sortTypeNormal[],id:string} & folderTile)
+  function folderTile(folder:folder):folderTile {
+    const appearance = resolveFolderAppearance(folder)
+    return { name: folder.name, color: appearance.preset, img: appearance.iconType === 'image' ? folder.imgFile : undefined, appearance }
+  }
+  // The folder being edited shows its unsaved draft. Only its own tile follows the draft, so the list is not rebuilt on every edit.
+  const editedTile = $derived.by(() => {
+    const draft = folderManager.draft
+    const found = folderManager.folderId && draft ? findFolder(folderManager.folderId) : null
+    return found && draft ? { id: found.folder.id, ...folderTile(applyFolderDraft(found.folder, draft)) } : null
+  })
   let charImages: sortType[] = $state([]);
   let IconRounded = $state(false)
   let openFolders:string[] = $state([])
@@ -108,9 +119,7 @@
         }
       }
       else{
-        // The folder being edited shows its unsaved draft.
-        const folder = folderManager.folderId === id.id && folderManager.draft ? applyFolderDraft(id, folderManager.draft) : id
-        const appearance = resolveFolderAppearance(folder)
+        const folder = id
         let folderCharImages: sortTypeNormal[] = []
         for(const id of folder.data){
           const index = idObject[id] ?? -1
@@ -128,10 +137,7 @@
           folder: folderCharImages,
           type: "folder",
           id: folder.id,
-          name: folder.name,
-          color: appearance.preset,
-          img: appearance.iconType === 'image' ? folder.imgFile : undefined,
-          appearance,
+          ...folderTile(folder),
         });
       }
     }
@@ -669,9 +675,10 @@
               {imagePriority} imageReference={char.img}
             />
           {:else if char.type === "folder"}
+            {@const tile = editedTile?.id === char.id ? editedTile : char}
             {#key char.color}
             {#key char.name}
-              <SidebarAvatar {imagePriority} imageReference={char.img} src="slot" size="56" rounded={IconRounded} bordered name={char.name} color={char.color} fill={folderFillImage(char.appearance)} backgroundimg={() => char.img ? getCharImage(char.img, "plain") : ""}
+              <SidebarAvatar {imagePriority} imageReference={tile.img} src="slot" size="56" rounded={IconRounded} bordered name={tile.name} color={tile.color} fill={folderFillImage(tile.appearance)} backgroundimg={() => tile.img ? getCharImage(tile.img, "plain") : ""}
               oncontextmenu={(e) => {
                 e.preventDefault()
                 if(char.type !== 'folder'){
@@ -693,7 +700,7 @@
                 }
                 openFolders = openFolders
               }}>
-                <FolderIconFace appearance={char.appearance} round={IconRounded} open={openFolders.includes(char.id)} />
+                <FolderIconFace appearance={tile.appearance} round={IconRounded} open={openFolders.includes(char.id)} />
               </SidebarAvatar>
             {/key}
             {/key}
@@ -701,18 +708,19 @@
         </div>
       </div>
       {#if char.type === 'folder' && openFolders.includes(char.id)}
+        {@const tile = editedTile?.id === char.id ? editedTile : char}
         {#key char.color}
         <div class="p-1 flex flex-col items-center py-1 mt-1 rounded-lg relative">
           <div class="absolute top-0 left-1 border border-selected w-full h-full rounded-lg z-0 {
-            char.color === 'red' ? 'bg-red-700/20' :
-            char.color === 'yellow' ? 'bg-yellow-700/20' :
-            char.color === 'green' ? 'bg-green-700/20' :
-            char.color === 'blue' ? 'bg-blue-700/20' :
-            char.color === 'indigo' ? 'bg-indigo-700/20' :
-            char.color === 'purple' ? 'bg-purple-700/20' :
-            char.color === 'pink' ? 'bg-pink-700/20' :
+            tile.color === 'red' ? 'bg-red-700/20' :
+            tile.color === 'yellow' ? 'bg-yellow-700/20' :
+            tile.color === 'green' ? 'bg-green-700/20' :
+            tile.color === 'blue' ? 'bg-blue-700/20' :
+            tile.color === 'indigo' ? 'bg-indigo-700/20' :
+            tile.color === 'purple' ? 'bg-purple-700/20' :
+            tile.color === 'pink' ? 'bg-pink-700/20' :
             'bg-darkbg/20'
-          }" style:background-color={char.appearance.stops ? 'transparent' : undefined} style:background-image={folderFrameImage(char.appearance)}></div>
+          }" style:background-color={tile.appearance.stops ? 'transparent' : undefined} style:background-image={folderFrameImage(tile.appearance)}></div>
           <div class="h-4 min-h-4 w-14 relative z-10" role="listitem" data-sidebar-drop ondragover={(e) => {
             const drag = getCurrentSidebarDrag(e)
             if(!drag){ return }

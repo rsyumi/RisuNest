@@ -62,14 +62,21 @@
     const left = $derived(Math.max(8, Math.min((folderManager.anchor?.right ?? 80) + 8, innerWidth - 368)))
     // Placed once by its first height, so an opening colour picker scrolls the body instead of moving the panel.
     const top = $derived(Math.max(8, Math.min((folderManager.anchor?.top ?? 8) - 12, innerHeight - openedHeight - 8)))
+    // Styles are read once: a style read after every edit recalculates the styles of the whole sidebar.
+    const theme = themeColors()
+    let panelFont = $state('')
     const clipped = $derived.by(() => {
-        if (!appearance || appearance.iconType !== 'text' || !panel) return false
-        return fitFolderIconText(appearance.text, round, canvasLineMeasure(getComputedStyle(panel).fontFamily)).clipped
+        if (!appearance || appearance.iconType !== 'text' || !panelFont) return false
+        return fitFolderIconText(appearance.text, round, canvasLineMeasure(panelFont)).clipped
     })
     const lowContrast = $derived.by(() => {
         if (!appearance || draft.textMode !== 'manual') return false
-        const contrast = chosenTextContrast(appearance, themeColors())
+        const contrast = chosenTextContrast(appearance, theme)
         return contrast !== null && contrast < minimumTextContrast
+    })
+
+    $effect(() => {
+        if (panel) panelFont = getComputedStyle(panel).fontFamily
     })
 
     $effect(() => {
@@ -88,7 +95,7 @@
     function chooseColorMode(mode: FolderColorMode) {
         // A folder that never had its own colour starts from the preset it shows.
         if (draft.colorMode === 'preset' && mode !== 'preset' && stored && !resolveFolderAppearance(stored).stops) {
-            const base = folderPresetBaseHex(draft.preset, themeColors())
+            const base = folderPresetBaseHex(draft.preset, theme)
             draft.solid = base
             draft.gradient[0] = base
         }
