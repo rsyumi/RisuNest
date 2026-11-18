@@ -32,6 +32,9 @@ let applied: { db: Database; id: string | undefined } | null = null
 let settingsWindow: { readonly current: boolean } | undefined
 let watchingSettingsWindow = false
 let applyEditor: ApplyPreset | undefined
+type LoadPreset = (db: Database, presetId: string) => Promise<boolean>
+let loadEditor: LoadPreset | undefined
+let loading: string | null = null
 const editors = new WeakMap<Database, Database>()
 
 const clone = <T>(value: T): T => value === undefined ? value : safeStructuredClone(value)
@@ -76,6 +79,19 @@ function openView(db: Database, presetId: string, apply: ApplyPreset): void {
     signal.view++
 }
 
+/** Reads the body of a selected catalog stub, which preset settings edit once it is loaded. */
+function loadSelection(db: Database, presetId: string): void {
+    if (!loadEditor || loading === presetId) return
+    loading = presetId
+    loadEditor(db, presetId).then((loaded) => {
+        loading = null
+        if (loaded) refresh()
+    }, (error) => {
+        loading = null
+        console.error(error)
+    })
+}
+
 /**
  * Keeps a view of the selected preset while preset settings show and another preset is applied,
  * and writes and drops it once either stops.
@@ -84,9 +100,8 @@ function refresh(): void {
     untrack(() => {
         const db = DBState.db
         const selection = db?.botPresets?.[db.botPresetsId]
-        const candidate = selection?.id && selection.id !== peekEffectivePresetId(db) && isLoadedPreset(selection)
-            ? selection.id : null
-        if (candidate && !watchingSettingsWindow) {
+        const other = selection?.id && selection.id !== peekEffectivePresetId(db) ? selection.id : null
+        if (other && !watchingSettingsWindow) {
             watchingSettingsWindow = true
             let subscribed = false
             settingsWindowStore().subscribe(() => {
@@ -94,8 +109,10 @@ function refresh(): void {
             })
             subscribed = true
         }
-        const wanted = candidate && applyEditor && isPresetEditorOpen() ? candidate : null
+        const shown = other && applyEditor && isPresetEditorOpen() ? other : null
+        const wanted = shown && isLoadedPreset(db, shown) ? shown : null
         if (view && (view.db !== db || view.presetId !== wanted)) closeView()
+        if (shown && !wanted) loadSelection(db, shown)
         if (!wanted) return
         if (view) derivePresetMirrorView(db, view, applyEditor!)
         else openView(db, wanted, applyEditor!)
@@ -135,8 +152,9 @@ export function flushPresetEditorEdits(db: Database = DBState.db): void {
  * Follows a derive of the preset mirrors: publishes the applied preset and, while preset settings
  * show, gives them a view of the selected preset whenever another preset is applied.
  */
-export function syncPresetEditorTarget(db: Database, apply: ApplyPreset): void {
+export function syncPresetEditorTarget(db: Database, apply: ApplyPreset, load?: LoadPreset): void {
     applyEditor = apply
+    loadEditor = load
     const appliedId = peekEffectivePresetId(db)
     if (applied?.db !== db || applied.id !== appliedId) {
         applied = { db, id: appliedId }
@@ -156,6 +174,15 @@ function routedView(root: Database, key: string): EditorView | null {
     if (!current) return null
     const flag = protectedPresetGroups[key as ProtectedPresetField]
     return flag && (root as unknown as Fields)[flag] ? null : current
+}
+
+/** Preset settings take no input for a selected preset whose view waits for its body. */
+function awaitsView(root: Database, key: string): boolean {
+    const flag = protectedPresetGroups[key as ProtectedPresetField]
+    const routed = Object.hasOwn(presetMirrorMap, key) && !(flag && (root as unknown as Fields)[flag])
+    if (!routed && !Object.values(protectedPresetGroups).includes(key as never)) return false
+    const selection = root.botPresets?.[root.botPresetsId]
+    return !editingView(root) && !!selection?.id && selection.id !== peekEffectivePresetId(root) && isPresetEditorOpen()
 }
 
 function protectedFields(flag: string): string[] {
@@ -196,6 +223,7 @@ function editorDatabase(root: Database): Database {
                     routed.values[key] = value
                     return true
                 }
+                if (awaitsView(target, key)) return true
                 const current = Object.values(protectedPresetGroups).includes(key as never) ? editingView(target) : null
                 if (current && Boolean(value) !== Boolean((target as unknown as Fields)[key])) {
                     setProtectionFlag(target, current, key, value)
@@ -210,6 +238,7 @@ function editorDatabase(root: Database): Database {
                 delete routed.values[key as string]
                 return true
             }
+            if (typeof key === 'string' && awaitsView(target, key)) return true
             return Reflect.deleteProperty(target, key)
         },
     })

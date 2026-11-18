@@ -29,9 +29,8 @@ import {
     setDatabase,
     setEffectivePresetOverride,
 } from './database.svelte'
-import { getEffectivePresetOverride } from './effectiveIdentityState'
 import { derivePersistentIdentityMirrors } from './persistentIdentityHooks'
-import { isLoadedPreset } from './persistentDataRuntime.svelte'
+import { getEffectivePresetOverride, isLoadedPreset } from './effectiveIdentityState'
 
 function presetDatabase(): Database {
     const database = normalizeDatabaseDefaults({} as Database)
@@ -66,6 +65,7 @@ beforeEach(() => {
 
 describe('preset chain override activation', () => {
     it('activates the preset the index named when the library changes during the flush', async () => {
+        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
         const added = { ...structuredClone(stored.get('preset-a')!), id: 'preset-c', name: 'Preset C', mainPrompt: 'Prompt C' }
         stored.set(added.id, added)
         runtime.flushPendingData.mockImplementation(async () => {
@@ -81,8 +81,8 @@ describe('preset chain override activation', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 
-    it('keeps a loaded preset record that is edited while its stored value is read', async () => {
-        stored.get('preset-b')!.mainPrompt = 'Stored B'
+    it('keeps a preset record loaded and edited while its stored value is read', async () => {
+        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
         const read = deferred()
         const readStored = runtime.readPreset.getMockImplementation()!
         runtime.readPreset.mockImplementation(async (id) => {
@@ -92,9 +92,9 @@ describe('preset chain override activation', () => {
 
         const activation = activatePresetOverride(1)
         await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
+        getDatabase().botPresets[1] = { ...structuredClone(stored.get('preset-b')!), mainPrompt: 'Edited B' }
         const record = getDatabase().botPresets[1]
-        expect(isLoadedPreset(record)).toBe(true)
-        record.mainPrompt = 'Edited B'
+        expect(isLoadedPreset(getDatabase(), 'preset-b')).toBe(true)
         read.resolve()
         await activation
 
@@ -106,7 +106,7 @@ describe('preset chain override activation', () => {
 
     it('installs the stored value when the record is still a catalog stub', async () => {
         getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
-        expect(isLoadedPreset(getDatabase().botPresets[1])).toBe(false)
+        expect(isLoadedPreset(getDatabase(), 'preset-b')).toBe(false)
 
         await activatePresetOverride(1)
 
@@ -133,6 +133,7 @@ describe('preset chain override activation', () => {
 
         const presetB = stored.get('preset-b')!
         stored.delete('preset-b')
+        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
         await expect(activatePresetOverride(1)).rejects.toThrow('Preset was not found')
 
         stored.set('preset-b', presetB)
@@ -245,6 +246,34 @@ describe('conversation preset binding', () => {
 
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
+    })
+
+    it.each(['chain', 'request'] as const)('reads the body into a library that replaced the one being read (%s)', async (path) => {
+        const stub = () => ({ id: 'preset-b', name: 'Preset B' }) as botPreset
+        const owner = () => [{ type: 'character', chaId: 'character', name: 'Character', chatPage: 0,
+            chats: [conversation('target', 'preset-b')] } as unknown as character]
+        getDatabase().botPresets[1] = stub()
+        getDatabase().characters = owner()
+        const read = deferred()
+        const previous = { revision: 1, value: structuredClone(stored.get('preset-b')!) }
+        runtime.readPreset.mockImplementationOnce(async () => {
+            await read.promise
+            return previous
+        })
+        const activation = path === 'chain' ? activatePresetOverride(1)
+            : activateRequestPresetBinding({ characterId: 'character', conversationId: 'target' })
+        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
+        stored.get('preset-b')!.mainPrompt = 'Replacement B'
+        const replacement = presetDatabase()
+        replacement.botPresets[1] = stub()
+        replacement.characters = owner()
+        setDatabase(replacement)
+        read.resolve()
+        await activation
+
+        expect(getDatabase().botPresets[1].mainPrompt).toBe('Replacement B')
+        expect(getEffectivePresetId()).toBe('preset-b')
+        expect(getDatabase().mainPrompt).toBe('Replacement B')
     })
 })
 

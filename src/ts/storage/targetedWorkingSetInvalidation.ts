@@ -179,7 +179,7 @@ export async function applyTargetedWorkingSetInvalidation(
         (getCatalogPresetMetadata(previous.botPresets)?.activeConfiguredIndex ?? null) !==
             (previous.botPresets[selectedPresetIndex] ? selectedPresetIndex : null)) {
         const presets = await readPinnedActivePreset(reader, botPresetsId)
-        botPresets = createCatalogPresetWorkingSet(presets.catalog, presets.active)
+        botPresets = createCatalogPresetWorkingSet(presets.catalog, presets.active, presets.resident)
     } else {
         botPresets = advanceCatalogPresetWorkingSetRevision(previous.botPresets, reader.revision)
     }

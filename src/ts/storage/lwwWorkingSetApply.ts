@@ -1,5 +1,5 @@
 import { sharedRootFields } from './persistentRootFields'
-import { createCatalogCharacterStub, createPresetCatalogWorkingSetFromValues, isCatalogPresetWorkingSet } from './workingSetCatalog'
+import { createCatalogCharacterStub, createPresetCatalogWorkingSetFromValues, isCatalogPresetWorkingSet, markCatalogPresetLoaded } from './workingSetCatalog'
 import { createConversationSummaryStub, createConversationSummaryFromMetadata } from './conversationResidency'
 import type { Chat, Database, botPreset, character } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
@@ -116,6 +116,7 @@ export async function applyLwwWorkingSetUnits(
                             database.botPresets[index] = canonicalClone(preset.value)
                             baseline.presetRecords.push(canonicalClone(preset.value))
                         }
+                        markCatalogPresetLoaded(database.botPresets, root.botPresetsId)
                     }
                 }
             }

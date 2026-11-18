@@ -10,7 +10,7 @@ import PresetHeader from './PresetHeader.svelte'
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     const DBState = $state({ db: {} })
-    return { DBState, openPresetList: writable(false) }
+    return { DBState, openPresetList: writable(false), settingsOpen: writable(false), MobileGUI: writable(false), MobileGUIStack: writable(0), MobileSideBar: writable(0), selectedCharID: writable(0) }
 })
 
 let instance: ReturnType<typeof mount> | undefined

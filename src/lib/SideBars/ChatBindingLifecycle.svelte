@@ -74,7 +74,7 @@
         const chat = character?.chats?.[character.chatPage]
         const id = chat?.promptPresetId
         // Follows the bound preset being added, removed or replaced by its stored body.
-        if (id) void isLoadedPreset(db.botPresets?.find((preset) => preset?.id === id))
+        if (id) void isLoadedPreset(db, id)
         if (!db || $doingChat) return
         untrack(() => applyConversationPresetBinding(db, chat)).catch((error) => console.error(error))
     })

@@ -14,7 +14,7 @@ import {
     TARGETED_INVALIDATION_KEY_LIMIT,
     type TargetedWorkingSetInvalidationOptions,
 } from './targetedWorkingSetInvalidation'
-import { getCatalogPresetMetadata, projectPinnedScalableWorkingSet } from './workingSetCatalog'
+import { getCatalogPresetMetadata, isCatalogPresetLoaded, projectPinnedScalableWorkingSet } from './workingSetCatalog'
 
 vi.mock('./database.svelte', () => ({
     getDatabase: () => {
@@ -669,6 +669,8 @@ describe('targeted invalidation equals a full reprojection', () => {
         expect(result!.database.botPresets[0]).toBe(previous.botPresets[0])
         expect(getCatalogPresetMetadata(result!.database.botPresets)?.catalogRevision).toBe(2)
         expect(getCatalogPresetMetadata(previous.botPresets)?.catalogRevision).toBe(1)
+        // The reader names presets by their configured index.
+        expect(isCatalogPresetLoaded(result!.database.botPresets, String(previous.botPresetsId))).toBe(true)
     })
 
     it('reprojects only the root when a committed change set contains no character or preset changes', async () => {

@@ -215,6 +215,7 @@ describe('working-set catalog', () => {
             activeConfiguredIndex: 1,
             catalogRevision: 7,
             residency: 'selected-only',
+            loaded: new Set(['preset-b']),
         })
         expect(JSON.stringify(presets)).not.toContain('selected-only')
     })

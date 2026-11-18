@@ -25,6 +25,7 @@ import {
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { projectSelectionIndexes } from './persistentSelectionBoundary'
 import type { WorkingSetResidencyRegistry } from './workingSetResidency'
+import { getResidentPresetIds } from './persistentIdentityHooks'
 
 type CompleteCharacter = character
 
@@ -66,6 +67,8 @@ export interface CatalogPresetMetadata {
     activeConfiguredIndex: number | null
     catalogRevision: number
     residency: 'selected-only'
+    /** Presets whose stored body the working set holds; every other entry is a summary. */
+    loaded: Set<string>
 }
 
 type CatalogPresetWorkingSet = Database['botPresets'] & {
@@ -219,6 +222,7 @@ export function hydrateWorkingSetCharacterDetail(
 export function createCatalogPresetWorkingSet(
     catalog: PresetCatalog,
     active: ActiveCatalogPreset | null,
+    resident: readonly ActiveCatalogPreset[] = [],
 ): Database['botPresets'] {
     const presets: Database['botPresets'] = []
     for (const summary of catalog.items) {
@@ -228,7 +232,8 @@ export function createCatalogPresetWorkingSet(
             ...(summary.image === undefined ? {} : { image: summary.image }),
         } as unknown as Database['botPresets'][number]
     }
-    if (active) presets[active.summary.configuredIndex] = active.value
+    const bodies = active ? [...resident, active] : resident
+    for (const body of bodies) presets[body.summary.configuredIndex] = body.value
 
     Object.defineProperty(presets, catalogPresetMetadata, {
         configurable: false,
@@ -237,6 +242,7 @@ export function createCatalogPresetWorkingSet(
             activeConfiguredIndex: active?.summary.configuredIndex ?? null,
             catalogRevision: catalog.revision,
             residency: 'selected-only',
+            loaded: new Set(bodies.map((body) => body.summary.id)),
         } satisfies CatalogPresetMetadata,
         writable: false,
     })
@@ -260,12 +266,12 @@ export function createPresetCatalogWorkingSetFromValues(
     const activeSummary = catalog.items.find(
         (summary) => typeof activeConfiguredIndex === 'string' ? summary.id === activeConfiguredIndex : summary.configuredIndex === activeConfiguredIndex,
     )
+    const resident = new Set(getResidentPresetIds())
+    const body = (summary: PresetSummary): ActiveCatalogPreset => ({ summary, value: { ...presets[summary.configuredIndex] } })
     return createCatalogPresetWorkingSet(
         catalog,
-        activeSummary ? {
-            summary: activeSummary,
-            value: { ...presets[activeSummary.configuredIndex] },
-        } : null,
+        activeSummary ? body(activeSummary) : null,
+        catalog.items.filter((summary) => summary !== activeSummary && resident.has(summary.id)).map(body),
     )
 }
 
@@ -285,7 +291,7 @@ export function advanceCatalogPresetWorkingSetRevision(
     Object.defineProperty(advanced, catalogPresetMetadata, {
         configurable: false,
         enumerable: false,
-        value: { ...metadata, catalogRevision: revision } satisfies CatalogPresetMetadata,
+        value: { ...metadata, catalogRevision: revision, loaded: new Set(metadata.loaded) } satisfies CatalogPresetMetadata,
         writable: false,
     })
     return advanced
@@ -294,6 +300,15 @@ export function advanceCatalogPresetWorkingSetRevision(
 export function isCatalogPresetWorkingSet(presets: Database['botPresets']): boolean {
     if (!presets) return false
     return getCatalogPresetMetadata(presets)?.residency === 'selected-only'
+}
+
+/** Whether a working set holds a preset's stored body; only a catalog working set holds summaries. */
+export function isCatalogPresetLoaded(presets: Database['botPresets'], id: string): boolean {
+    return getCatalogPresetMetadata(presets)?.loaded.has(id) ?? true
+}
+
+export function markCatalogPresetLoaded(presets: Database['botPresets'], id: string): void {
+    getCatalogPresetMetadata(presets)?.loaded.add(id)
 }
 
 export function hasIncompletePersistentWorkingSet(
@@ -344,25 +359,27 @@ async function readPinnedPresets(
     return { catalog, values }
 }
 
+/** Reads the preset catalog with the body of the selected preset and of the presets applied in its place. */
 export async function readPinnedActivePreset(
     reader: PersistentRevisionReader,
     configuredIndex: number | string,
-): Promise<{ catalog: PresetCatalog; active: ActiveCatalogPreset | null }> {
+): Promise<{ catalog: PresetCatalog; active: ActiveCatalogPreset | null; resident: ActiveCatalogPreset[] }> {
     const catalog = await reader.queryPresets()
     assertPinnedRevision(reader.revision, catalog.revision, 'Preset catalog')
+    const read = async (summary: PresetSummary): Promise<ActiveCatalogPreset> => {
+        const preset = await reader.readPreset(summary.id)
+        if (!preset) throw new Error(`Missing preset ${summary.id}`)
+        assertPinnedRevision(reader.revision, preset.revision, `Preset ${summary.id}`)
+        return { summary, value: preset.value }
+    }
     const summary = catalog.items.find((candidate) =>
         typeof configuredIndex === 'string' ? candidate.id === configuredIndex : candidate.configuredIndex === configuredIndex)
-    if (!summary) return { catalog, active: null }
-    const preset = await reader.readPreset(summary.id)
-    if (!preset) throw new Error(`Missing preset ${summary.id}`)
-    assertPinnedRevision(reader.revision, preset.revision, `Preset ${summary.id}`)
-    return {
-        catalog,
-        active: {
-            summary,
-            value: preset.value,
-        },
+    const residentIds = new Set(getResidentPresetIds())
+    const resident: ActiveCatalogPreset[] = []
+    for (const item of catalog.items) {
+        if (item !== summary && residentIds.has(item.id)) resident.push(await read(item))
     }
+    return { catalog, active: summary ? await read(summary) : null, resident }
 }
 
 async function readPinnedPluginStorage(
@@ -556,6 +573,7 @@ export async function projectPinnedScalableWorkingSet(
         botPresets: createCatalogPresetWorkingSet(
             presets.catalog,
             presets.active,
+            presets.resident,
         ),
         characters,
     } as Database)

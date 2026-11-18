@@ -26,7 +26,7 @@ function apply(db: Database, preset: botPreset): void {
     }
 }
 
-function open(names: string[], bound: string): Database['botPresets'] {
+function open(names: string[], bound: string, load?: (db: Database, id: string) => Promise<boolean>): Database['botPresets'] {
     DBState.db = {
         botPresetsId: 0,
         botPresets: names.map(name => ({ id: name, name, mainPrompt: `Prompt ${name}` })),
@@ -34,7 +34,7 @@ function open(names: string[], bound: string): Database['botPresets'] {
     } as unknown as Database
     observeEffectivePresetDerive({
         beforeDerive: flushPresetEditorEdits,
-        afterDerive: (db) => syncPresetEditorTarget(db, apply),
+        afterDerive: (db) => syncPresetEditorTarget(db, apply, load),
     })
     setEffectivePresetBinding(DBState.db, bound, apply)
     return DBState.db.botPresets
@@ -89,4 +89,30 @@ it('keeps edits across a selection change and a binding change while preset sett
     expect(DBState.db.mainPrompt).toBe('Edited other')
     expect(presetEditorDBState.db.mainPrompt).toBe('Edited other')
     expect(presets.map(preset => preset.mainPrompt)).toEqual(['Edited selected', 'Edited other', 'Prompt bound'])
+})
+
+it('takes no settings input for a selected catalog stub and edits the selection once its body is read', async () => {
+    let land: (() => void) | undefined
+    const presets = open(['selected', 'bound'], 'bound', (db, id) => new Promise((resolve) => {
+        land = () => {
+            db.botPresets[0] = { id, name: id, mainPrompt: `Prompt ${id}` } as botPreset
+            resolve(true)
+        }
+    }))
+    presets[0] = { id: 'selected', name: 'selected' } as botPreset
+    deriveEffectivePresetMirrors(DBState.db, apply)
+    settingsOpen.set(true)
+    presetEditorDBState.db.mainPrompt = 'Typed while reading'
+    expect(DBState.db.mainPrompt).toBe('Prompt bound')
+    delete (presetEditorDBState.db as Partial<Database>).mainPrompt
+    expect(DBState.db.mainPrompt).toBe('Prompt bound')
+    presetEditorDBState.db.doNotChangeFallbackModels = true
+    expect(DBState.db.doNotChangeFallbackModels).toBeFalsy()
+
+    land!()
+    await vi.waitFor(() => expect(presetEditorDBState.db.mainPrompt).toBe('Prompt selected'))
+    presetEditorDBState.db.mainPrompt = 'Edited selected'
+    settingsOpen.set(false)
+    expect(presets[0].mainPrompt).toBe('Edited selected')
+    expect(presets[1].mainPrompt).toBe('Prompt bound')
 })
