@@ -2,7 +2,7 @@ import { joinAbortSignals } from '../../../abortSignals'
 import { notifySyncReceiveCompleted } from '../bindingChanges'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { isTauri } from '../../../platform'
+import { isTauri, isTauriAndroid } from '../../../platform'
 import { generationDiagnostics, type SyncRunDiagnostic } from '../../../generationDiagnostics'
 import { beginDeferredMobileBackgroundTask, runWithMobileBackgroundTask, type MobileBackgroundTask } from '../../../mobileBackgroundTask'
 import { generatingConversations } from '../../generatingConversationRegistry'
@@ -59,30 +59,32 @@ const foregroundAvailable = () => document.visibilityState !== 'hidden' && netwo
 // but leaves the bound target stopped until the user starts it.
 let resumeBoundTarget = true
 let refreshGeneration = 0
+// Android keeps a page that holds work running off screen, where it stays visible, so the app's own stop and start
+// tell that it left and returned; elsewhere the page is hidden while the app is away.
+let nativeAway = false
+// Sync's background time ran out while the app was away, so routine sync waits for the return.
+let outOfTime = false
+const ranOutOfTime = () => { if (document.visibilityState === 'hidden' || isTauriAndroid && nativeAway) outOfTime = true }
+const returned = () => { nativeAway = false; outOfTime = false }
+/** Whether routine sync may start: off screen, only while sync's background time lasts. */
+const routineMayStart = () => foregroundAvailable() && !outOfTime
 
 /**
  * Holds sync work outside the scheduler, such as waiting to start or resume it. If the app leaves the screen during
  * the work, the page keeps running, so the scheduler starts on it and takes over the hold. Work that begins off
  * screen asks for the service at once; the page stays hidden, so only that work continues. `expired` aborts when the
- * hold's background time runs out. `onScreen` tells whether the work may start routine sync: once the time runs out,
- * only after the page was hidden at some point during the hold, since a page kept running off screen stays visible.
+ * hold's background time runs out, and routine sync then waits for the app to return.
  */
-function holdThroughDeparture<T>(work: (expired: AbortSignal, onScreen: () => boolean) => Promise<T>): Promise<T> {
+function holdThroughDeparture<T>(work: (expired: AbortSignal) => Promise<T>): Promise<T> {
     const hold = beginDeferredMobileBackgroundTask('sync')
     const expiry = new AbortController()
-    let wasHidden = document.visibilityState === 'hidden'
-    const seen = () => { wasHidden ||= document.visibilityState === 'hidden' }
-    document.addEventListener('visibilitychange', seen)
     void Promise.resolve(hold).then(task => {
         const signal = task.signal
-        if (signal?.aborted) expiry.abort(signal.reason)
-        else signal?.addEventListener('abort', () => expiry.abort(signal.reason), { once: true })
+        const expire = () => { ranOutOfTime(); expiry.abort(signal?.reason) }
+        if (signal?.aborted) expire()
+        else signal?.addEventListener('abort', expire, { once: true })
     })
-    const onScreen = () => foregroundAvailable() && (!expiry.signal.aborted || wasHidden)
-    return work(expiry.signal, onScreen).finally(() => {
-        document.removeEventListener('visibilitychange', seen)
-        void Promise.resolve(hold).then(task => task.dispose())
-    })
+    return work(expiry.signal).finally(() => { void Promise.resolve(hold).then(task => task.dispose()) })
 }
 
 const receivedBodyReferences = (request: LwwStageReceive) => request.changes.some(change => {
@@ -176,6 +178,7 @@ function createAdapter(connectionId: string): Adapter {
         // Hydration and manual requests hold their own time; returning to the screen resumes routine sync.
         void Promise.resolve(current).then(task => task.signal?.addEventListener('abort', () => {
             if (hold !== current) return
+            ranOutOfTime()
             hidePublication?.abort(task.signal?.reason)
             scheduler.expire()
         }, { once: true }))
@@ -300,7 +303,7 @@ function createAdapter(connectionId: string): Adapter {
             if ((cause as { name?: unknown } | null)?.name !== 'AbortError') reportFailure(connectionId, cause)
         },
         publishInitialSharedState: async binding => { await publish(binding, false) },
-        resumeBinding: binding => holdThroughDeparture(async (_expired, onScreen) => {
+        resumeBinding: binding => holdThroughDeparture(async () => {
             const generation = ++adapter.generation
             scheduler.stop()
             await Promise.all([scheduler.settled(), stopHydration()])
@@ -318,7 +321,7 @@ function createAdapter(connectionId: string): Adapter {
             active = binding
             adapter.state = binding.state
             scheduler.recovered()
-            if (onScreen()) { scheduler.start(); resumeHydration() }
+            if (routineMayStart()) { scheduler.start(); resumeHydration() }
         }),
         async fenceOldJobs(binding) {
             adapter.generation++
@@ -418,7 +421,16 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
 export async function installExternalLwwAdapters(state: ExternalStorageState, resumeBound = true): Promise<() => void> {
     if (!isTauri) return () => {}
     resumeBoundTarget = resumeBound
-    await refreshExternalLwwAdapters(state)
+    let foreground = () => {}
+    // A page Android keeps running off screen stays visible, so it hears the app leave and return only from native code.
+    const lifecycle = (event: Event) => {
+        const reason = (event as CustomEvent<{ reason?: unknown } | null>).detail?.reason
+        if (!isTauriAndroid || reason !== 'start' && reason !== 'stop') return
+        if (reason === 'stop') nativeAway = true
+        else { returned(); foreground() }
+    }
+    window.addEventListener('risu-native-lifecycle', lifecycle)
+    try { await refreshExternalLwwAdapters(state) } catch (error) { window.removeEventListener('risu-native-lifecycle', lifecycle); throw error }
     const dirty = (generation = false) => { for (const adapter of adapters.values()) if (adapter.state) adapter.scheduler.dirty(generation) }
     const disposeRevision = subscribeLocalPersistentRevision((_revision, cause) => dirty(cause === 'generation-complete'))
     const disposeDevice = await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => dirty())
@@ -435,7 +447,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
     let hiddenFlushed = document.visibilityState === 'hidden'
     let wasOnline = navigator.onLine
     let disposed = false
-    const foreground = () => {
+    foreground = () => {
         if (disposed || isLibraryFileOperationReserved()) return
         const wentOffline = !navigator.onLine && wasOnline
         wasOnline = navigator.onLine
@@ -452,14 +464,14 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                 adapter.scheduler.pauseAutomatic()
                 const generation = adapter.generation
                 const authority = adapter.state.targetAuthority
-                adapter.foreground = holdThroughDeparture(async (_expired, onScreen) => {
+                adapter.foreground = holdThroughDeparture(async () => {
                     await adapter.scheduler.settled()
                     if (adapters.get(adapter.state?.target.kind === 'external' ? adapter.state.target.connectionId : '') !== adapter
                         || generation !== adapter.generation || document.visibilityState === 'hidden' || !navigator.onLine) return
                     const current = await native.state()
                     if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
                     await invoke('external_lww_resume', { connectionId: current.target.connectionId })
-                    if (generation === adapter.generation && onScreen()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
+                    if (generation === adapter.generation && routineMayStart()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
                 }).catch(() => {}).finally(() => {
                     adapter.foreground = undefined
                     if (generation !== adapter.generation && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
@@ -467,7 +479,8 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
             }
         }
     }
-    document.addEventListener('visibilitychange', foreground)
+    const visibility = () => { if (document.visibilityState !== 'hidden') returned(); foreground() }
+    document.addEventListener('visibilitychange', visibility)
     window.addEventListener('online', foreground)
     window.addEventListener('offline', foreground)
     const releaseFileOperation = subscribeLibraryFileOperationReleased(() => {
@@ -479,8 +492,9 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
         disposed = true
         releaseFileOperation()
         disposeRevision(); disposeDevice(); disposeConversation()
-        document.removeEventListener('visibilitychange', foreground)
+        document.removeEventListener('visibilitychange', visibility); window.removeEventListener('risu-native-lifecycle', lifecycle)
         window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground)
+        returned()
         refreshGeneration++
         for (const adapter of [...adapters.values()]) adapter.dispose()
         resumeBoundTarget = true
@@ -547,7 +561,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
             } catch (error) { return { kind: 'blocked', reason: (error as { kind?: string })?.kind ?? 'sync-unavailable' } }
         },
         async cancel() { adapter.generation++; adapter.scheduler.stop(); const hydration = adapter.stopHydration(); await invoke('external_lww_fence', { connectionId, newDevice: false }); await Promise.all([adapter.scheduler.settled(), hydration]) },
-        resumeAfterExitCancel: () => holdThroughDeparture(async (_expired, onScreen) => {
+        resumeAfterExitCancel: () => holdThroughDeparture(async () => {
             const generation = ++adapter.generation
             await adapter.scheduler.settled()
             if (adapters.get(connectionId) !== adapter || !adapter.state) return
@@ -556,7 +570,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
             if (generation !== adapter.generation || binding.target.kind !== 'external' || binding.target.connectionId !== connectionId
                 || binding.targetAuthority !== authority || binding.selectionEpoch !== selectionEpoch) return
             await invoke('external_lww_resume', { connectionId })
-            if (generation === adapter.generation && adapters.get(connectionId) === adapter && onScreen()) { adapter.scheduler.start(); adapter.resumeHydration() }
+            if (generation === adapter.generation && adapters.get(connectionId) === adapter && routineMayStart()) { adapter.scheduler.start(); adapter.resumeHydration() }
         }),
     }
 }

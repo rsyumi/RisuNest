@@ -56,15 +56,18 @@ export async function mobileDeferredHoldsSettled(): Promise<void> {
 let iosEntryExpiryHeard = false
 /**
  * Deferred holds run on the assertion iOS takes when the app leaves the screen, so its expiry ends them, also when the
- * page missed that departure during startup. A task the page began ends only its own work, and an expiry heard back on
- * screen arrived late.
+ * page missed that departure during startup. Once the page heard a departure, only that departure's assertion counts.
+ * A task the page began ends only its own work, and an expiry heard back on screen arrived late.
  */
 function hearIOSEntryExpiry(): void {
     if (iosEntryExpiryHeard) return
     iosEntryExpiryHeard = true
+    let entry: string | undefined
     window.addEventListener('risunest-ios-lifecycle', event => {
         const detail = (event as CustomEvent<{ event?: string; id?: string }>).detail
-        if (detail?.event !== 'expired' || !detail.id || isIOSTaskBegun(detail.id) || document.visibilityState !== 'hidden') return
+        if (detail?.event === 'background') entry = detail.id ?? ''
+        if (detail?.event !== 'expired' || !detail.id || entry !== undefined && detail.id !== entry
+            || isIOSTaskBegun(detail.id) || document.visibilityState !== 'hidden') return
         for (const hold of iosDeferredHolds) hold.controller.abort(new BackgroundExecutionExpiredError())
     })
 }
