@@ -16,8 +16,6 @@
     type CharxChoice = NonNullable<ImportSheetRowDecision['charxAs']>
     type LorebookChoice = ImportIntakeLorebookTarget['type']
 
-    const copy = language.risuNest.importIntake
-
     // Choices made in the open sheet. Row ids repeat across deliveries, so a new sheet starts over from its defaults.
     let choicesOf: ActiveImportSheet | null = null
     let included = $state<Record<string, boolean>>({})
@@ -76,7 +74,7 @@
     function kindText(item: ImportIntakeItem): string {
         switch (item.kind) {
             case 'character':
-                return isCharx(item) ? copy.kindCharx : language.character
+                return isCharx(item) ? language.risuNest.importIntake.kindCharx : language.character
             case 'module':
                 return language.module
             case 'lorebook':
@@ -189,16 +187,16 @@
                                     {:else if item.kind === 'plugin'}
                                         {#if installs[item.id] === 'installed'}
                                             <span class="inline-flex items-center gap-1 text-sm text-subtext">
-                                                <CheckIcon size={15} class="text-success-500" aria-hidden="true" />{copy.installed}
+                                                <CheckIcon size={15} class="text-success-500" aria-hidden="true" />{language.risuNest.importIntake.installed}
                                             </span>
                                         {:else}
-                                            <SettingButton variant="secondary" size="sm" busy={installs[item.id] === 'installing'} onclick={() => install(item)}>{copy.install}</SettingButton>
+                                            <SettingButton variant="secondary" size="sm" busy={installs[item.id] === 'installing'} onclick={() => install(item)}>{language.risuNest.importIntake.install}</SettingButton>
                                         {/if}
                                     {:else if isCharx(item)}
                                         <div class="w-full @xl:w-auto">
                                             <SegmentedButtons
                                                 role="radiogroup"
-                                                label={fillTemplate(copy.charxAsLabel, item.name)}
+                                                label={fillTemplate(language.risuNest.importIntake.charxAsLabel, item.name)}
                                                 value={charxOf(item)}
                                                 options={[{ value: 'character', label: language.character }, { value: 'module', label: language.module }]}
                                                 onchange={value => { charxChoices[item.id] = value }}
@@ -209,13 +207,13 @@
                                             <SelectInput
                                                 size="sm"
                                                 className="w-full @xl:w-auto"
-                                                ariaLabel={fillTemplate(copy.destinationLabel, item.name)}
+                                                ariaLabel={fillTemplate(language.risuNest.importIntake.destinationLabel, item.name)}
                                                 value={lorebookOf(item)}
                                                 onchange={event => { lorebookChoices[item.id] = event.currentTarget.value === 'character' ? 'character' : 'new-module' }}>
                                                 {#if request.lorebookCharacter}
-                                                    <OptionInput value="character">{fillTemplate(copy.destinationCharacter, request.lorebookCharacter.name)}</OptionInput>
+                                                    <OptionInput value="character">{fillTemplate(language.risuNest.importIntake.destinationCharacter, request.lorebookCharacter.name)}</OptionInput>
                                                 {/if}
-                                                <OptionInput value="new-module">{copy.destinationNewModule}</OptionInput>
+                                                <OptionInput value="new-module">{language.risuNest.importIntake.destinationNewModule}</OptionInput>
                                             </SelectInput>
                                         </div>
                                     {/if}
@@ -229,7 +227,7 @@
                         <SettingButton onclick={cancel}>{language.risuNest.importDialog.close}</SettingButton>
                     {:else}
                         <SettingButton variant="secondary" onclick={cancel}>{language.cancel}</SettingButton>
-                        <SettingButton disabled={chosen.length === 0} onclick={importChosen}>{copy.importAction}</SettingButton>
+                        <SettingButton disabled={chosen.length === 0} onclick={importChosen}>{language.risuNest.importIntake.importAction}</SettingButton>
                     {/if}
                 </footer>
             </div>

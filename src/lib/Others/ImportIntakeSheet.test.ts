@@ -3,7 +3,7 @@ import { flushSync, mount, tick, unmount } from 'svelte'
 
 vi.mock('src/ts/stores.svelte', async () => (await import('src/ts/importIntake/openResult.testSupport')).importStoresModule())
 
-import { language } from 'src/lang'
+import { changeLanguage, language } from 'src/lang'
 import { fillTemplate } from 'src/ts/gui/nativeFileJobDialogModel'
 import { importDropOverlayVisible, openImportSheet } from 'src/ts/importIntake/sheetStore'
 import type { ImportIntakeItem, ImportSheetDecision, ImportSheetRequest } from 'src/ts/importIntake/types'
@@ -201,6 +201,20 @@ describe('import sheet', () => {
         footerButton(dialog.close).click()
         await settled
         expect(decided()).toBeNull()
+    })
+
+    it('uses the language chosen after the app started', () => {
+        changeLanguage('ko')
+        try {
+            expect(language.risuNest.importIntake.importAction).not.toBe(intake.importAction)
+            open({ items: [character, plugin, lorebook], lorebookCharacter: selected })
+            expect(footer()).toEqual([language.cancel, language.risuNest.importIntake.importAction])
+            expect(row('plugin').querySelector('button')!.textContent!.trim()).toBe(language.risuNest.importIntake.install)
+            expect(row('lorebook').querySelector('select')!.getAttribute('aria-label'))
+                .toBe(fillTemplate(language.risuNest.importIntake.destinationLabel, 'Harbor.json'))
+        } finally {
+            changeLanguage('en')
+        }
     })
 
     it('installs a plugin from its row, holds the sheet while installing, and leaves it out of the import', async () => {
