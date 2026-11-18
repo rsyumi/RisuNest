@@ -29,7 +29,7 @@ export default defineConfig(({ mode }) => {
                     if (/(^|\/)(stores\.svelte|util|alert|lang|database\.svelte|tokenizer|scripts|prompt|templateCheck)$/.test(source)) {
                         return adapter('dragDropAdapters.svelte.ts')
                     }
-                    if (/(Help|TextAreaInput|ModelList|AuxModelSelectors)\.svelte$/.test(source)) {
+                    if (/(Help|TextAreaInput|ToggleDefinitionEditor|ModelList|AuxModelSelectors)\.svelte$/.test(source)) {
                         return resolve(import.meta.dirname, 'Empty.svelte').replaceAll('\\', '/')
                     }
                 }

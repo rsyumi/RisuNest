@@ -13,6 +13,7 @@
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
+    import ToggleDefinitionEditor from "src/lib/UI/ToggleDefinitionEditor.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
     import Accordion from "src/lib/UI/Accordion.svelte";
@@ -272,8 +273,9 @@
         <OptionInput value="system">System</OptionInput>
         <OptionInput value="assistant">assistant</OptionInput>
     </SelectInput>
-    <span class="text-textcolor mt-4">{language.customPromptTemplateToggle} <Help key='customPromptTemplateToggle' /></span>
-    <TextAreaInput bind:value={DBState.db.customPromptTemplateToggle}/>
+    <ToggleDefinitionEditor className="mt-4" value={DBState.db.customPromptTemplateToggle} onChange={(text) => {
+        DBState.db.customPromptTemplateToggle = text
+    }} />
     <span class="text-textcolor mt-4">{language.defaultVariables} <Help key='defaultVariables' /></span>
     <TextAreaInput bind:value={DBState.db.templateDefaultVariables}/>
     <span class="text-textcolor mt-4">{language.predictedOutput}</span>

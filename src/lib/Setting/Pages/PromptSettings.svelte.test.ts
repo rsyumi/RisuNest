@@ -6,7 +6,10 @@ import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
 import { language } from 'src/lang'
 import PromptSettings from './PromptSettings.svelte'
 
-const mocks = vi.hoisted(() => ({ confirm: vi.fn(async (_message: string) => true) }))
+const mocks = vi.hoisted(() => ({
+    confirm: vi.fn(async (_message: string) => true),
+    toggleEditor: { props: {} as { value?: unknown, onChange?: (value: string) => void } },
+}))
 
 vi.mock('src/ts/stores.svelte', () => {
     const DBState = $state({ db: {} })
@@ -19,6 +22,10 @@ vi.mock('src/lib/Others/Help.svelte', () => ({ default: () => {} }))
 vi.mock('src/lib/UI/GUI/TextAreaInput.svelte', () => ({ default: () => {} }))
 vi.mock('src/lib/UI/ModelList.svelte', () => ({ default: () => {} }))
 vi.mock('./Model/AuxModelSelectors.svelte', () => ({ default: () => {} }))
+// The editor itself is covered by ToggleDefinitionEditor.svelte.test.ts; here it exposes what it receives.
+vi.mock('src/lib/UI/ToggleDefinitionEditor.svelte', () => ({
+    default: (_anchor: unknown, props: typeof mocks.toggleEditor.props) => { mocks.toggleEditor.props = props },
+}))
 
 let instance: ReturnType<typeof mount>
 function header(name: string) {
@@ -215,5 +222,17 @@ describe('prompt list', () => {
         expect(summary(language.formating.description)).toEqual([
             `${language.formating.description}${language.systemPrompt}`, language.formating.description, language.systemPrompt, '[Info] {{slot}}',
         ])
+    })
+})
+
+describe('custom toggles', () => {
+    it('edits the preset custom toggles through the toggle editor', async () => {
+        DBState.db.customPromptTemplateToggle = 'a=A'
+        const settingsTab = [...document.querySelectorAll('button')].find(button => button.textContent?.trim() === language.settings)!
+        settingsTab.click()
+        await tick()
+        expect(mocks.toggleEditor.props.value).toBe('a=A')
+        mocks.toggleEditor.props.onChange!('b=B\n=G=group')
+        expect(DBState.db.customPromptTemplateToggle).toBe('b=B\n=G=group')
     })
 })
