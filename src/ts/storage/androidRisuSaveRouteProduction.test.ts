@@ -304,6 +304,64 @@ describe('Android opened spool production route', () => {
         expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'first', ready: [picked], failures: [] })
     })
 
+    it('joins the opened files of a share into its delivery and acknowledges them once it ended', async () => {
+        const acknowledgeOpenedFile = vi.fn((_path: string) => {})
+        const holder: EventTarget & { tauriOpenedFiles?: unknown } =
+            Object.assign(new EventTarget(), { RisuLifecycleBridge: { acknowledgeOpenedFile } })
+        vi.stubGlobal('window', holder)
+        const dispatch = vi.fn(async () => {})
+        const deliveries: ImportIntakeDelivery[] = []
+        const ends: Array<() => void> = []
+        let firstSetupDone = false
+        const route = createAndroidSpoolBatchRouter({
+            firstSetupDone: async () => firstSetupDone,
+            loadIntake: async () => (delivery) => {
+                deliveries.push(delivery)
+                return new Promise<void>(resolve => { ends.push(resolve) })
+            },
+            dispatch,
+        })
+        const early = { token: 'early-token', displayName: 'early.risunest', bytes: 30 }
+        const save = { token: 'save-token', displayName: 'backup.risunest', bytes: 30 }
+        const broken = { displayName: 'broken.png', code: 'source-copy-failed' }
+        const earlyPreset = '/cache/opened_files/1-0-early.risup'
+        const preset = '/cache/opened_files/2-1-preset.risup'
+        const script = '/cache/opened_files/2-2-plugin.js'
+        const alone = '/cache/opened_files/3-0-alone.risupreset'
+        try {
+            // Before first setup the copied files wait for the opened-files listener, as their own event did.
+            await route({ requestId: 'early', ready: [early], failures: [], openedPaths: [earlyPreset] })
+            expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'early', ready: [early], failures: [] })
+            expect(holder.tauriOpenedFiles).toEqual([earlyPreset])
+
+            firstSetupDone = true
+            await route({ requestId: 'share', ready: [save], failures: [broken], openedPaths: [preset, script] })
+            // A spool the page already received leaves the copied files of its intent to arrive alone.
+            await route({ requestId: 'paths', ready: [], failures: [], openedPaths: [alone] })
+            expect(deliveries).toEqual([
+                { origin: 'opened', sources: [
+                    { type: 'androidSpool', spool: save },
+                    { type: 'path', path: preset },
+                    { type: 'path', path: script },
+                    { type: 'androidSpoolFailure', failure: broken },
+                ] },
+                { origin: 'opened', sources: [{ type: 'path', path: alone }] },
+            ])
+            await vi.waitFor(() => expect(ends).toHaveLength(2))
+            expect(acknowledgeOpenedFile).not.toHaveBeenCalled()
+
+            ends[1]()
+            await vi.waitFor(() => expect(acknowledgeOpenedFile).toHaveBeenCalledOnce())
+            ends[0]()
+            await vi.waitFor(() => expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path))
+                .toEqual([alone, preset, script]))
+            expect(holder.tauriOpenedFiles).toEqual([earlyPreset])
+            expect(dispatch).toHaveBeenCalledOnce()
+        } finally {
+            vi.unstubAllGlobals()
+        }
+    })
+
     it('restores shared backups first and imports the other files together in one batch', async () => {
         const calls: string[] = []
         const error = new Error('synthetic batch failure')

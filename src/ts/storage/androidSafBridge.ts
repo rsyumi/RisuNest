@@ -29,6 +29,8 @@ export interface AndroidSpoolBatch {
     requestId: string
     ready: AndroidSpoolReady[]
     failures: AndroidSpoolFailure[]
+    /** Copied files of the same opened intent that are outside the spool allowlist. */
+    openedPaths?: string[]
 }
 
 export interface AndroidSpoolListenerDependencies {
