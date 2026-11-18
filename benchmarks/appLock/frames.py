@@ -310,6 +310,26 @@ def departure_frames(video, screenshot):
     return matches, count
 
 
+def settled_screenshot(device, path, timeout=30):
+    # A cold-launched app can show an empty page for seconds, so wait until the content below the status bar has
+    # contrast and two captures in a row agree.
+    previous = None
+    deadline = time.monotonic() + timeout
+    while True:
+        time.sleep(.5)
+        subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(path)], check=True)
+        info = metadata(path)
+        width, height = int(info['width']), int(info['height'])
+        top = height // 6
+        current = next(frames(path, [0, top, width, height - top], scale=(90, round((height - top) * 90 / width))))
+        if (previous is not None and contrast(current) > 64
+                and sum(abs(left - right) for left, right in zip(current, previous)) / len(current) < 2):
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError('Departure screen did not settle')
+        previous = current
+
+
 def run_ios_phase(device, identifier, container, artifacts, phase, departure_screen):
     if list(container.rglob('verification-' + phase + '.jsonl')):
         raise RuntimeError('Refusing an existing app-lock verification phase')
@@ -384,8 +404,7 @@ def run_ios(device, artifacts):
     departure_screen = artifacts / 'departure-screen.png'
     subprocess.run(['xcrun', 'simctl', 'terminate', device, 'com.apple.Preferences'], check=False)
     subprocess.run(['xcrun', 'simctl', 'launch', device, 'com.apple.Preferences'], check=True)
-    time.sleep(2)
-    subprocess.run(['xcrun', 'simctl', 'io', device, 'screenshot', str(departure_screen)], check=True)
+    settled_screenshot(device, departure_screen)
     outcomes = []
     failures = []
     # Later phases still run after a failure so every phase leaves its recording.
