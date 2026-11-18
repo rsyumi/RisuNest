@@ -12,6 +12,7 @@
         nativeFileJobHost,
         nativeFileOperation,
         nativeFileOperationOutcome,
+        type NativeFileOperationImportLocation,
     } from 'src/ts/storage/nativeFileJobManager'
 
     import { retrySnapshotRestoreBodiesFromOutcome } from 'src/ts/storage/nativePersistentMaintenance'
@@ -65,6 +66,11 @@
             const { alertError } = await import('src/ts/alert')
             alertError(failureReason(error?.code ?? ''))
         })
+    }
+
+    function openResult(location: NativeFileOperationImportLocation): void {
+        void import('src/ts/importIntake/openResult').then(({ openImportResult }) => openImportResult(location))
+        dismiss()
     }
 
     async function copyDetails(): Promise<void> {
@@ -265,11 +271,7 @@
                             <SettingButton variant="secondary" onclick={() => {void retryPortableRestoreBodiesFromOutcome().catch(() => {})}}>{language.retry}</SettingButton>
                         {/if}
                         {#if model.terminal?.openLocation}
-                            {@const target = model.terminal.openLocation}
-                            <SettingButton variant="secondary" onclick={() => {
-                                void import('src/ts/importIntake/openResult').then(({ openImportResult }) => openImportResult(target))
-                                dismiss()
-                            }}>{language.risuNest.importIntake.open}</SettingButton>
+                            <SettingButton variant="secondary" onclick={() => openResult(model.terminal!.openLocation!)}>{language.risuNest.importIntake.open}</SettingButton>
                         {/if}
                         <SettingButton onclick={dismiss}>{copy.close}</SettingButton>
                     {/if}
