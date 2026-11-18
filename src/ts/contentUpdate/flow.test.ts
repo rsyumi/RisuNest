@@ -238,6 +238,7 @@ describe('character update', () => {
             const pending = commitImportedCharacter(card(id, 'Luna v1.1', { triggerscript }), commitCharacter)
             await opened()
             await reviewContentUpdate()
+            for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
             chooseContentUpdate('update')
             return await pending
         }
@@ -252,6 +253,13 @@ describe('character update', () => {
         expect(await update('removed', [])).toBe('first')
         expect(mocks.alertConfirm).toHaveBeenCalledTimes(2)
         expect(mocks.details.get('first').triggerscript).toEqual([])
+        // Nor does taking the author's order of triggers the user reordered too.
+        const [a, b, c] = ['a', 'b', 'c'].map((comment) => ({ ...trigger, comment }))
+        expect(await update('three', [a, b, c])).toBe('first')
+        mocks.details.get('first').triggerscript = [b, a, c]
+        expect(await update('reordered', [a, c, b])).toBe('first')
+        expect(mocks.alertConfirm).toHaveBeenCalledTimes(3)
+        expect(mocks.details.get('first').triggerscript).toEqual([a, c, b])
     })
 
     it('opens the review of the named character for the update action, whatever the import is called', async () => {
