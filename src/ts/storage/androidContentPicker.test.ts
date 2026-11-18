@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
     invoke: vi.fn(), discard: vi.fn(), character: vi.fn(), module: vi.fn(), pick: vi.fn(),
     controller: new AbortController(), events: [] as string[],
     beginBatch: vi.fn(), beginBatchItem: vi.fn(), recordBatchItem: vi.fn(),
+    location: vi.fn(), nativeCharacter: vi.fn(), nativeModule: vi.fn(),
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('./androidSafBridge', async original => ({
@@ -22,6 +23,7 @@ vi.mock('./nativeFileJobManager', () => {
             signal: mocks.controller.signal, setSource: vi.fn(), onStatus: vi.fn(),
             protect: () => { if (options?.protectAfterPicker) hold() },
             beginBatch: mocks.beginBatch, beginBatchItem: mocks.beginBatchItem, recordBatchItem: mocks.recordBatchItem,
+            setLocation: mocks.location,
         })
     }
     return {
@@ -31,8 +33,12 @@ vi.mock('./nativeFileJobManager', () => {
             run(operation, options),
     }
 })
-vi.mock('../characterCards', () => ({ importCharacterProcess: mocks.character }))
-vi.mock('../process/modules', () => ({ importModuleData: mocks.module }))
+vi.mock('../characterCards', () => ({
+    importCharacterProcess: mocks.character, importPreparedNativeCharacterContent: mocks.nativeCharacter,
+}))
+vi.mock('../process/modules', () => ({
+    importModuleData: mocks.module, importPreparedNativeModuleContent: mocks.nativeModule,
+}))
 vi.mock('./database.svelte', () => ({ getDatabase: () => ({ characters: [{ chaId: 'imported-character' }] }) }))
 import { NativeFileJobError } from './nativeFileJobs'
 import {
@@ -48,7 +54,9 @@ beforeEach(() => {
     mocks.controller = new AbortController()
     mocks.events.length = 0
     mocks.character.mockResolvedValue(0)
-    mocks.module.mockResolvedValue(true)
+    mocks.module.mockResolvedValue({ kind: 'module-from-lorebook' })
+    mocks.nativeCharacter.mockResolvedValue({ kind: 'imported', value: 'native-character' })
+    mocks.nativeModule.mockResolvedValue({ kind: 'imported', value: 'native-module' })
     mocks.pick.mockResolvedValue({ sources: [source], failures: [] })
     Object.assign(window, { RisuSafBridge: { discardSource: mocks.discard } })
 })
@@ -76,6 +84,24 @@ describe('Android bounded JSON compatibility replay', () => {
         expect(mocks.invoke).toHaveBeenCalledTimes(2)
         expect(mocks.invoke).toHaveBeenCalledWith('native_content_source_metadata', { token: source.token })
         expect(mocks.discard).toHaveBeenCalledTimes(2)
+        const location = destination === 'module'
+            ? { kind: 'module-from-lorebook' }
+            : { kind: 'character', chaId: 'imported-character' }
+        expect(mocks.location.mock.calls).toEqual([[location], [location]])
+    })
+    it.each([
+        ['character', 'card.charx', { kind: 'character', chaId: 'native-character' }],
+        ['module', 'card.charx', { kind: 'module-from-charx' }],
+        ['character', 'book.risum', { kind: 'module' }],
+    ] as const)('records where a native %s import of %s went', async (destination, displayName, location) => {
+        mocks.pick.mockResolvedValue({ sources: [{ ...source, displayName }], failures: [] })
+        await importAndroidContentFromPicker(destination)
+        expect(mocks.location).toHaveBeenCalledExactlyOnceWith(location)
+        mocks.location.mockClear()
+        mocks.nativeCharacter.mockResolvedValue({ kind: 'declined' })
+        mocks.nativeModule.mockResolvedValue({ kind: 'declined' })
+        await importAndroidContentFromPicker(destination)
+        expect(mocks.location).not.toHaveBeenCalled()
     })
     it.each(['oversized', 'unreadable'])('preserves the bounded native reader rejection for %s JSON', async (reason) => {
         const error = new Error(reason)
@@ -92,6 +118,7 @@ describe('Android bounded JSON compatibility replay', () => {
         expect(mocks.character).toHaveBeenCalledWith({
             name: source.displayName,
             data: new TextEncoder().encode(text),
+            quiet: true,
         })
     })
     it('accepts the bytes as a number array', async () => {

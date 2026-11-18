@@ -15,10 +15,8 @@
     import { onboardingHold } from './lib/Others/Onboarding/onboardingGate';
     import BookmarkList from './lib/Others/BookmarkList.svelte';
     import ModuleScopeMenu from './lib/Setting/Pages/Module/ModuleScopeMenu.svelte';
-    import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
-    import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
-    import { readModule } from './ts/process/modules';
-    import { alertNormal } from './ts/alert';
+    import { showRealmInfoStore } from './ts/characterCards';
+    import { getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { showsDialog } from './ts/alertQueue';
     import { language } from './lang';
     import RealmFrame from './lib/UI/Realm/RealmFrame.svelte';
@@ -26,7 +24,6 @@
     import MobileHeader from './lib/Mobile/MobileHeader.svelte';
     import MobileBody from './lib/Mobile/MobileBody.svelte';
     import MobileFooter from './lib/Mobile/MobileFooter.svelte';
-    import { checkCharOrder } from './ts/globalApi.svelte';
     import { ArrowUpIcon, GlobeIcon, PlusIcon } from '@lucide/svelte';
     import { hypaV3ModalOpen, hypaV3ProgressStore } from "./ts/stores.svelte";
     import HypaV3Modal from './lib/Others/HypaV3Modal.svelte';
@@ -43,10 +40,12 @@
     import IrisModal from './lib/Others/IrisModal.svelte';
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
-    import { RISU_APP_INTERNAL_DRAG_TYPE, RISU_SIDEBAR_DRAG_TYPE } from './ts/dragTypes';
+    import { handleAppDragOver, handleAppDragStart, handleAppDrop } from './ts/importIntake/drop';
+    import { openedImportResult } from './ts/importIntake/sheetStore';
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
+    import ImportIntakeHost from './lib/Others/ImportIntakeHost.svelte';
     import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import RecoveryShell from './lib/Others/RecoveryShell.svelte';
     import BootFailurePanel from './lib/Others/BootFailurePanel.svelte';
@@ -209,69 +208,16 @@
 
     let didFirstSetup: boolean  = $derived(DBState.db?.didFirstSetup)
     let gridOpen = $state(false)
+    $effect(() => { if ($openedImportResult) gridOpen = false })
     let aprilFools = $state(new Date().getMonth() === 3 && new Date().getDate() === 1)
     let aprilFoolsPage = $state(0)
-
-    const getMainDropEffect = (e:DragEvent): DataTransfer['dropEffect'] => {
-        const types = Array.from(e.dataTransfer?.types ?? [])
-        if(types.includes(RISU_SIDEBAR_DRAG_TYPE)){
-            return 'none'
-        }
-        if(types.includes(RISU_APP_INTERNAL_DRAG_TYPE)){
-            return 'none'
-        }
-        return types.includes('Files') ? 'copy' : 'none'
-    }
-
-    const markAppInternalDrag = (e:DragEvent) => {
-        e.dataTransfer?.setData(RISU_APP_INTERNAL_DRAG_TYPE, 'true')
-    }
 
 </script>
 
 <ChatBindingLifecycle />
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<main inert={$persistentWorkingSetInputBlocked || appLockVisible} class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={(e) => {
-    const dropEffect = getMainDropEffect(e)
-    e.preventDefault()
-    e.dataTransfer.dropEffect = dropEffect
-}} ondragstart={markAppInternalDrag} ondrop={async (e) => {
-    const types = Array.from(e.dataTransfer.types ?? [])
-    if (types.includes(RISU_APP_INTERNAL_DRAG_TYPE) || types.includes(RISU_SIDEBAR_DRAG_TYPE)) {
-        e.preventDefault()
-        return
-    }
-    const file = e.dataTransfer.files[0]
-    if (!file) {
-        e.preventDefault()
-        return
-    }
-    e.preventDefault()
-    const name = file.name.toLowerCase()
-
-    if (name.endsWith('.risup')) {
-        const data = new Uint8Array(await file.arrayBuffer())
-        await importPreset({ name: file.name, data })
-        alertNormal(language.successImport)
-    } else if (name.endsWith('.risum')) {
-        if (isTauri) {
-            const { importNativeContentFile } = await import('./ts/storage/nativeContentFile')
-            await importNativeContentFile(file, 'module')
-            return
-        }
-        const data = new Uint8Array(await file.arrayBuffer())
-        const module = await readModule(Buffer.from(data))
-        DBState.db.modules.push(module)
-        alertNormal(language.successImport)
-    } else {
-        await importCharacterProcess({
-            name: file.name,
-            data: file
-        })
-        checkCharOrder()
-    }
-}}>
+<main inert={$persistentWorkingSetInputBlocked || appLockVisible} class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={handleAppDragOver} ondragstart={handleAppDragStart} ondrop={handleAppDrop}>
     {#if !import.meta.env.VITE_RISU_LEGAL_CONFIGURED}
         <Legal />
     {:else if aprilFools}
@@ -533,6 +479,7 @@
         <FolderManagerPanel />
     {/if}
     <NativeFileJobDialog />
+    <ImportIntakeHost />
     <UpdatePopup />
 </main>
 <SyncExitDialog aboveAppLock={appLockVisible} />

@@ -510,6 +510,43 @@ class MainActivityBehaviorTest {
   }
 
   @Test
+  fun `an opened intent that spooled files delivers its copied paths inside its spool batch`() {
+    val spool = SafSpoolReady(
+      token = "11111111-1111-4111-8111-111111111111",
+      displayName = "backup.risunest",
+      bytes = 9,
+      totalBytes = 9,
+    )
+    val failure = SafSpoolFailure("broken.png", "source-copy-failed")
+    val preset = "/data/cache/opened_files/${"a".repeat(64)}-1-preset.risup"
+    val readyJson = "[{\"token\":\"${spool.token}\",\"displayName\":\"backup.risunest\",\"bytes\":9," +
+      "\"totalBytes\":9,\"importDestination\":null}]"
+    val failuresJson = "[{\"displayName\":\"broken.png\",\"code\":\"source-copy-failed\"}]"
+
+    val joined = openedIntentScripts("request-1", SafSpoolBatch(listOf(spool), listOf(failure)), listOf(preset), spooled = true)
+
+    assertEquals(1, joined.size)
+    assertEquals(false, joined.single().contains("risu-opened-files"))
+    assertEquals(
+      true,
+      joined.single().contains(
+        "new CustomEvent('risu-android-spool-ready',{detail:{\"requestId\":\"request-1\"," +
+          "\"ready\":$readyJson,\"failures\":$failuresJson,\"openedPaths\":[\"$preset\"]}})",
+      ),
+    )
+    // A late listener reads the same paths from the startup value, after any earlier undrained ones.
+    assertEquals(
+      true,
+      joined.single().contains("\"openedPaths\":[...(window.tauriOpenedFileSpools?.openedPaths??[]),...[\"$preset\"]]"),
+    )
+
+    // An intent without spooled files keeps its own opened-files event.
+    val copiedOnly = openedIntentScripts("request-2", SafSpoolBatch(emptyList(), emptyList()), listOf(preset), spooled = false)
+    assertEquals(listOf(openedFilesEventScript(listOf(preset)), androidSpoolBatchScript("request-2", SafSpoolBatch(emptyList(), emptyList()))), copiedOnly)
+    assertEquals(false, copiedOnly.last().contains(preset))
+  }
+
+  @Test
   fun `backup source picker uses its dedicated event without changing opened file state`() {
     val script = androidBackupSourcePickedScript(
       requestId = "11111111-1111-4111-8111-111111111111",
@@ -777,6 +814,32 @@ class MainActivityBehaviorTest {
     val again = replayLegacyOpenedFiles(directory, emptySet())
     assertEquals(listOf(waiting.absolutePath), again.deliver)
     assertEquals(listOf("current.risup"), again.interrupted)
+  }
+
+  @Test
+  fun `legacy replay leaves the files an opened intent reserved until the intent gives them back`() {
+    val directory = temporaryFolder.newFolder("reserved-legacy")
+    val handedOff = mutableSetOf<String>()
+    val received = java.io.File(directory, "${"b".repeat(64)}-0-received.risup")
+    val copying = java.io.File(directory, "${"a".repeat(64)}-0-preset.risup")
+    handedOff += received.absolutePath
+    java.io.File(directory, "${received.name}.delivered").writeText("")
+    val reservation = OpenedFileReservation(handedOff, mutableSetOf())
+    for (file in listOf(received, copying)) {
+      reservation.reservePath(file.absolutePath)
+      file.writeText("synthetic")
+      java.io.File(directory, "${file.name}.pending").writeText("")
+    }
+
+    assertEquals(emptyList<String>(), replayLegacyOpenedFiles(directory, handedOff).deliver)
+    assertEquals(true, reservation.ownsPath(copying.absolutePath))
+    // A file this WebView already received is not delivered again by a later intent.
+    assertEquals(false, reservation.ownsPath(received.absolutePath))
+
+    reservation.release()
+    val replay = replayLegacyOpenedFiles(directory, handedOff)
+    assertEquals(listOf(copying.absolutePath), replay.deliver)
+    assertEquals(emptyList<String>(), replay.interrupted)
   }
 
   @Test

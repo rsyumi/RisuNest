@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
     alertError: vi.fn(),
     alertNormal: vi.fn(),
     alertRisuServiceTOS: vi.fn(),
+    /** The loading or progress notice on screen, which only a dialog or a clear closes. */
+    status: null as unknown,
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
     saveAsset: vi.fn(),
     charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
@@ -35,6 +37,7 @@ const mocks = vi.hoisted(() => ({
     exportNativeCharacterCardFromPicker: vi.fn(),
     nextId: 0,
     destinationChosen: true,
+    submitDelivery: vi.fn(async (_delivery: unknown) => {}),
 }))
 
 vi.mock('uuid', () => ({ v4: () => `card-id-${++mocks.nextId}` }))
@@ -55,9 +58,10 @@ vi.mock('./alert', () => ({
     alertInput: vi.fn(),
     alertMd: vi.fn(),
     alertNormal: mocks.alertNormal,
-    alertStore: { set: vi.fn() },
+    alertClear: () => { mocks.status = null },
+    alertStore: { set: (value: { type: string }) => { mocks.status = ['wait', 'progress'].includes(value.type) ? value : null } },
     alertTOS: vi.fn(), alertRisuServiceTOS: mocks.alertRisuServiceTOS,
-    alertWait: vi.fn(),
+    alertWait: (msg: string) => { mocks.status = { type: 'wait', msg } },
 }))
 vi.mock('./util', () => ({
     checkNullish: (value: unknown) => value === null || value === undefined,
@@ -155,6 +159,7 @@ vi.mock('./mobileBackgroundTask', async () => (await import('./mobileBackgroundT
 vi.mock('./media', () => ({
     getImageType: vi.fn(() => 'Unknown'),
 }))
+vi.mock('./importIntake/intake', () => ({ submitImportDelivery: mocks.submitDelivery }))
 
 import {
     characterURLImport,
@@ -193,6 +198,7 @@ describe('character card additions', () => {
         mocks.downloads = []
         mocks.nativeDesktopResult = { kind: 'cancelled' }
         mocks.desktopPickerPaths = []
+        mocks.status = null
         vi.clearAllMocks()
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertCardExport.mockResolvedValue({ type: 'cancelled' })
@@ -277,6 +283,38 @@ describe('character card additions', () => {
         expect(second).toEqual(first)
     })
 
+    it.each(['legacy', 'chara_card_v2'])('leaves the success notice of a %s JSON card to a caller that shows its own result', async format => {
+        const card = format === 'legacy'
+            ? { name: 'Synthetic', description: 'Description', first_mes: 'Hello' }
+            : { spec: format, spec_version: '2.0', data: {
+                name: 'Synthetic', description: 'Description', first_mes: 'Hello', personality: '', scenario: '',
+                mes_example: '', creator_notes: '', system_prompt: '', post_history_instructions: '',
+                alternate_greetings: [], tags: [], creator: '', character_version: '', extensions: {},
+            } }
+        const data = new TextEncoder().encode(JSON.stringify(card))
+        await importCharacterProcess({ name: 'synthetic.json', data, quiet: true })
+        expect(mocks.commitDetachedCharacter).toHaveBeenCalledOnce()
+        expect(mocks.alertNormal).not.toHaveBeenCalled()
+        await importCharacterProcess({ name: 'synthetic.json', data })
+        expect(mocks.alertNormal.mock.calls).toEqual([[language.importedCharacter]])
+    })
+
+    it.each([
+        ['imports', 'AQID'],
+        ['fails', '__asset:missing'],
+    ])('closes the progress notice when a quiet card import %s', async (outcome, emotion) => {
+        const card = { spec: 'chara_card_v2', spec_version: '2.0', data: {
+            name: 'Synthetic', description: 'Description', first_mes: 'Hello', personality: '', scenario: '',
+            mes_example: '', creator_notes: '', system_prompt: '', post_history_instructions: '',
+            alternate_greetings: [], tags: [], creator: '', character_version: '',
+            extensions: { risuai: { emotions: [['happy', emotion]] } },
+        } }
+        const imported = importCharacterProcess({ name: 'synthetic.json', data: new TextEncoder().encode(JSON.stringify(card)), quiet: true })
+        if (outcome === 'imports') await expect(imported).resolves.toBe(0)
+        else await expect(imported).rejects.toThrow('missing')
+        expect(mocks.status).toBeNull()
+    })
+
     it('preserves browser malformed-byte replacement in JSON cards', async () => {
         const prefix = new TextEncoder().encode('{"name":"')
         const suffix = new TextEncoder().encode('","description":"Synthetic","first_mes":"Hello"}')
@@ -299,6 +337,9 @@ describe('character card additions', () => {
 
         expect(imported).toBe('native-character-id')
         expect(mocks.importDesktopNativeCharacterPath).toHaveBeenCalledOnce()
+        expect(get(nativeFileOperationOutcome)).toMatchObject({
+            state: 'succeeded', location: { kind: 'character', chaId: 'native-character-id' },
+        })
     })
 
     it('processes every selected desktop path through the native character route', async () => {
@@ -323,11 +364,13 @@ describe('character card additions', () => {
             1,
             'C:\\chosen\\card.png',
             expect.any(Object),
+            'card.png',
         )
         expect(mocks.importDesktopNativeCharacterPath).toHaveBeenNthCalledWith(
             2,
             'C:\\chosen\\card.charx',
             expect.any(Object),
+            'card.charx',
         )
     })
 
@@ -359,6 +402,7 @@ describe('character card additions', () => {
             3,
             'C:\\chosen\\last.charx',
             expect.any(Object),
+            'last.charx',
         )
         const failure = { code: 'import-error', message: error.message, recoveryRequired: false }
         expect(outcomes).toEqual([expect.objectContaining({
@@ -366,39 +410,33 @@ describe('character card additions', () => {
             format: 'content',
             state: 'failed',
             error: failure,
-            batch: { total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [] },
+            batch: expect.objectContaining({
+                total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [],
+                entries: [
+                    { name: 'first.charx', state: 'imported', location: { kind: 'character', chaId: 'first-card' } },
+                    { name: 'broken.charx', state: 'failed', error: failure },
+                    { name: 'last.charx', state: 'imported', location: { kind: 'character', chaId: 'last-card' } },
+                ],
+            }),
         })])
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 
-    it('imports several files a desktop file association opened in one batched outcome', async () => {
+    it('hands the files of one desktop file association opening to the import intake together', async () => {
         const { consumeOpenedFiles } = await import('./openedFiles')
         await characterURLImport()
-        mocks.importDesktopNativeCharacterPath
-            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'opened-card' })
-            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'single-card' })
-        mocks.importModuleContent.mockResolvedValue({ kind: 'imported', value: 'opened-module' })
-        dismissNativeFileOperationOutcome()
-        const outcomes: NativeFileOperationOutcome[] = []
-        const unsubscribe = nativeFileOperationOutcome.subscribe(outcome => {
-            if (outcome) outcomes.push(outcome)
-        })
-        try {
-            await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\book.risum'])
-            await consumeOpenedFiles(['C:\\opened\\single.charx'])
-        } finally {
-            unsubscribe()
-        }
 
-        expect(mocks.importModuleContent).toHaveBeenCalledExactlyOnceWith(
-            { source: { type: 'desktopPath', path: 'C:\\opened\\book.risum' }, displayName: 'book.risum' },
-            { signal: expect.any(AbortSignal), onStatus: expect.any(Function) },
-        )
-        expect(outcomes).toEqual([
-            expect.objectContaining({ state: 'succeeded', batch: { total: 2, imported: 2, failures: [], declined: [] } }),
-            expect.objectContaining({ state: 'succeeded', source: { name: 'single.charx' } }),
+        await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\preset.risup'])
+        await consumeOpenedFiles(['C:\\opened\\backup.risunest'])
+
+        expect(mocks.submitDelivery.mock.calls.map(([delivery]) => delivery)).toEqual([
+            { origin: 'opened', sources: [
+                { type: 'path', path: 'C:\\opened\\card.charx' },
+                { type: 'path', path: 'C:\\opened\\preset.risup' },
+            ] },
+            { origin: 'opened', sources: [{ type: 'path', path: 'C:\\opened\\backup.risunest' }] },
         ])
-        expect(outcomes[1]).not.toHaveProperty('batch')
+        expect(mocks.importDesktopNativeCharacterPath).not.toHaveBeenCalled()
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 

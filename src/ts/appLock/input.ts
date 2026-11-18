@@ -51,10 +51,17 @@ function restoreBodyFrames(): void {
 }
 
 export const isAppLockInputBlocked = (): boolean => blocked
+const unblockedWaiters: (() => void)[] = []
+/** Resolves once the app lock no longer covers the app. */
+export function waitForAppLockInputUnblocked(): Promise<void> {
+    if (!blocked) return Promise.resolve()
+    return new Promise(resolve => unblockedWaiters.push(resolve))
+}
 export function setAppLockInputBlocked(value: boolean, concealFrames = value): void {
     const changed = blocked !== value
     if (changed && value) previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
     blocked = value
+    if (!value) for (const resolve of unblockedWaiters.splice(0)) resolve()
     if (changed) focusGeneration++
     if (framesHidden !== concealFrames) {
         framesHidden = concealFrames

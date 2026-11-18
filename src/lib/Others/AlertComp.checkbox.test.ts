@@ -52,7 +52,10 @@ import AlertComp from './AlertComp.svelte'
 
 let mounted: ReturnType<typeof mount> | undefined
 let target: HTMLDivElement
-const options = { title: 'Replace data?', description: 'Current data is cleared.', checkboxLabel: 'Clear current data', actionLabel: 'Replace', cancelLabel: 'Cancel', requireChecked: true }
+const options = {
+    title: 'Replace data?', description: 'Current data is cleared.', checkboxLabel: 'Clear current data', actionLabel: 'Replace', cancelLabel: 'Cancel', requireChecked: true,
+    details: [{ label: 'File', value: 'synthetic.risunest · 1.0 KiB' }, { label: 'Type', value: 'RisuNest backup' }],
+}
 afterEach(async () => {
     alertStore.set({ type: 'none', msg: '' })
     if (mounted) await unmount(mounted)
@@ -74,6 +77,8 @@ describe('checkbox confirmations', () => {
     it('gates acknowledgement until checked and reports the selection', async () => {
         const { result } = await show()
         expect(target.textContent).toContain(options.description)
+        expect([...target.querySelectorAll('dl > *')].map(row => `${row.tagName}:${row.textContent}`))
+            .toEqual(['DT:File', 'DD:synthetic.risunest · 1.0 KiB', 'DT:Type', 'DD:RisuNest backup'])
         expect(action('Replace').disabled).toBe(true)
         const checkbox = target.querySelector<HTMLInputElement>('input')!
         expect(checkbox.checked).toBe(false)
@@ -161,6 +166,7 @@ describe('action confirmations', () => {
         expect(target.querySelector('#checkbox-confirm-title')?.textContent).toBe(choice.title)
         expect(target.querySelector('#checkbox-confirm-description')?.textContent).toBe(choice.description)
         expect(target.querySelector('input[type="checkbox"]')).toBeNull()
+        expect(target.querySelector('dl')).toBeNull()
         expect(action('Keep off').disabled).toBe(false)
         action('Keep off').click()
         await expect(result).resolves.toBe(true)

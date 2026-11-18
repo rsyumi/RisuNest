@@ -1,5 +1,6 @@
 pub(crate) mod classifier;
 mod error;
+pub(crate) mod intake_classifier;
 mod json_card;
 #[allow(dead_code)]
 pub(crate) mod png_card;

@@ -202,6 +202,14 @@
         <div role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="checkbox-confirm-title" aria-describedby="checkbox-confirm-description" class="relative bg-darkbg text-textcolor p-4 rounded-md flex flex-col gap-4 w-full max-w-lg max-h-full overflow-y-auto">
             <h2 id="checkbox-confirm-title" class="text-xl font-bold whitespace-pre-wrap">{dialog.title}</h2>
             <p id="checkbox-confirm-description" class="whitespace-pre-wrap break-words">{dialog.description}</p>
+            {#if dialog.details?.length}
+                <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 rounded-md border border-darkborderc bg-bgcolor px-3 py-2 text-sm">
+                    {#each dialog.details as detail, index (index)}
+                        <dt class="text-subtext">{detail.label}</dt>
+                        <dd class="min-w-0 break-words">{detail.value}</dd>
+                    {/each}
+                </dl>
+            {/if}
             {#if dialog.checkboxLabel}
                 <label class="flex items-start gap-2">
                     <input type="checkbox" bind:checked={checkboxChecked} class="mt-1 accent-selected" />

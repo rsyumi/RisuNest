@@ -74,6 +74,7 @@ vi.mock('./nativeFileJobs', async (original) => ({
     runNativeBlockRisuSaveRestore: m.block,
     runNativeLegacyLocalBackupRestore: m.legacy,
 }))
+import { language } from 'src/lang'
 import {
     exportPortableBackupFromSystemPicker,
     restoreBackupFromNativeSource,
@@ -299,6 +300,13 @@ describe('common backup file production route', () => {
             expect(selected).toHaveBeenCalledOnce()
             expect(m.manager).toHaveBeenCalledOnce()
             const options = selected.mock.calls[0][2]
+            const kind = format === 'portable' ? language.risuNest.importIntake.kindBackupPortable
+                : format === 'block-risu-save' ? language.risuNest.importIntake.kindBackupRisuSave
+                : language.risuNest.importIntake.kindBackupLocal
+            expect(options.confirmationDetails).toEqual([
+                { label: language.risuNest.importIntake.detailFile, value: 'misleading.bin · 30 B' },
+                { label: language.risuNest.importIntake.detailKind, value: kind },
+            ])
             if (format === 'portable') {
                 m.chooseRestore.mockResolvedValue({
                     library: true,
@@ -320,6 +328,21 @@ describe('common backup file production route', () => {
             expect(m.resume).not.toHaveBeenCalled()
         },
     )
+    it('names the dropped file instead of its copy and leaves a saved conflict backup unnamed', async () => {
+        m.invoke.mockResolvedValue('portable')
+        await restoreBackupFromNativeSource({ type: 'desktopPath', path: 'C:/synthetic/inbox/copy' }, { sourceInfo: { name: 'dropped.risunest', bytes: 2048 } })
+        expect(m.portable.mock.calls[0][2].confirmationDetails[0]).toEqual({ label: language.risuNest.importIntake.detailFile, value: 'dropped.risunest · 2.0 KiB' })
+        await restoreBackupFromNativeSource(async ({ onSource }) => {
+            onSource({ name: 'shared.risunest', bytes: 4096 })
+            return { type: 'androidSpool', token: 'synthetic-spool' }
+        })
+        expect(m.portable.mock.calls[1][2].confirmationDetails[0]).toEqual({ label: language.risuNest.importIntake.detailFile, value: 'shared.risunest · 4.0 KiB' })
+        await restoreBackupFromNativeSource(async ({ onSource }) => {
+            onSource({ name: '2026-11-01 12:00', bytes: 2048 })
+            return { type: 'savedConflict', token: 'synthetic-conflict' }
+        })
+        expect(m.portable.mock.calls[2][2]).not.toHaveProperty('confirmationDetails')
+    })
     it.each(['compatibility-import-required', 'unsupported-format', 'corrupt-input'])('retains %s and releases an unclaimed source without a browser retry', async code => {
         const { NativeFileJobError } = await import('./nativeFileJobs')
         m.invoke.mockResolvedValue('local-backup')
