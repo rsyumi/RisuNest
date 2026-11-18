@@ -1,4 +1,4 @@
-import { onDestroy, untrack } from 'svelte'
+import { untrack } from 'svelte'
 import { fromStore } from 'svelte/store'
 import { DBState } from '../stores.svelte'
 import type { Database } from './database.svelte'
@@ -115,12 +115,15 @@ export function holdPresetEditor(): () => void {
     }
 }
 
-/** For a component's init: the component edits the selected preset, as the settings window does, while it is mounted. */
-export function usePresetEditorSurface(): void {
+/** For a component's init: while `shown()` holds, the component edits the selected preset, as the settings window does. */
+export function usePresetEditorSurface(shown: () => boolean): void {
     markPresetEditorSurface()
-    const release = holdPresetEditor()
-    // A teardown reads state from before the pending update, so the view is written once it has run.
-    onDestroy(() => queueMicrotask(release))
+    $effect.pre(() => {
+        if (!shown()) return
+        const release = holdPresetEditor()
+        // A teardown reads state from before the pending update, so the view is written once it has run.
+        return () => queueMicrotask(release)
+    })
 }
 
 /** Writes pending settings edits of a preset that is not applied to its record. */

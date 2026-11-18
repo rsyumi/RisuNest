@@ -1,7 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import type { Database, botPreset } from 'src/ts/storage/database.svelte'
-import { DBState } from 'src/ts/stores.svelte'
+import { DBState, sideBarStore } from 'src/ts/stores.svelte'
 import { observeEffectivePresetDerive, presetMirrorMap, setEffectivePresetBinding } from 'src/ts/storage/effectiveIdentityState'
 import { flushPresetEditorEdits, presetEditorDBState, syncPresetEditorTarget } from 'src/ts/storage/presetEditor.svelte'
 import { textEditorPopup } from 'src/ts/gui/textEditorPopup.svelte'
@@ -13,7 +13,7 @@ vi.mock('src/ts/stores.svelte', async () => {
     const QuickSettings = $state({ open: true, index: 0 })
     return {
         DBState, QuickSettings, settingsOpen: writable(false), MobileGUI: writable(false), MobileGUIStack: writable(0),
-        MobileSideBar: writable(0), selectedCharID: writable(0), disableHighlight: writable(false),
+        MobileSideBar: writable(0), selectedCharID: writable(0), disableHighlight: writable(false), sideBarStore: writable(true),
     } satisfies Partial<typeof import('src/ts/stores.svelte')>
 })
 // The bot page stands in as one of its text fields, which can open the popup editor.
@@ -44,6 +44,7 @@ afterEach(async () => {
     if (instance) await unmount(instance)
     instance = undefined
     observeEffectivePresetDerive(undefined)
+    sideBarStore.set(true)
     textEditorPopup.request = null
     document.body.replaceChildren()
 })
@@ -73,8 +74,18 @@ it('shows and edits the selected preset while quick settings show in a bound cha
     expect(textEditorPopup.request).toMatchObject({ preview: true, presetEditor: true })
 
     presetEditorDBState.db.mainPrompt = 'Edited selected'
+    // A closed sidebar hides quick settings without unmounting them.
+    sideBarStore.set(false)
+    await tick()
+    expect(DBState.db.botPresets.map(preset => preset.mainPrompt)).toEqual(['Edited selected', 'Prompt bound'])
+    expect(presetEditorDBState.db.mainPrompt).toBe('Prompt bound')
+    sideBarStore.set(true)
+    await tick()
+    expect(presetEditorDBState.db.mainPrompt).toBe('Edited selected')
+
+    presetEditorDBState.db.mainPrompt = 'Edited again'
     await unmount(instance)
     instance = undefined
-    expect(DBState.db.botPresets.map(preset => preset.mainPrompt)).toEqual(['Edited selected', 'Prompt bound'])
+    expect(DBState.db.botPresets.map(preset => preset.mainPrompt)).toEqual(['Edited again', 'Prompt bound'])
     expect(presetEditorDBState.db.mainPrompt).toBe('Prompt bound')
 })

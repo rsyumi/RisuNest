@@ -127,12 +127,15 @@ it('shows nothing for a group without toggles instead of an unnamed switch', asy
 })
 
 it('shows the toggles and jailbreak switch of the preset it is given', async () => {
-    await unmount(instance)
-    const presetDatabase = { ...DBState.db, customPromptTemplateToggle: 'example=Edited toggle', jailbreak: 'Synthetic prompt' }
-    instance = mount(Toggles, { target: document.body, props: { noContainer: true, presetDatabase } })
-    await tick()
-    expect(document.body.textContent).toContain('Edited toggle')
-    expect(document.body.textContent).toContain(language.jailbreakToggle)
+    const jailbreakItem = { type: 'jailbreak', type2: 'normal', text: '', role: 'system' }
+    for (const preset of [{ jailbreak: 'Synthetic prompt' }, { promptTemplate: [jailbreakItem] }]) {
+        await unmount(instance)
+        const presetDatabase = { ...DBState.db, customPromptTemplateToggle: 'example=Edited toggle', ...preset } as typeof DBState.db
+        instance = mount(Toggles, { target: document.body, props: { noContainer: true, presetDatabase } })
+        await tick()
+        expect(document.body.textContent).toContain('Edited toggle')
+        expect(document.body.textContent).toContain(language.jailbreakToggle)
+    }
 })
 
 it('supports initially unset built-in switches and writes their bound values', async () => {
