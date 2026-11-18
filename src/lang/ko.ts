@@ -1808,6 +1808,7 @@ export const languageKorean = {
             compareHint: '비교할 프리셋 두 개를 선택하세요.',
             inherit: '현재 프리셋 사용',
             chatPreset: '현재 채팅',
+            change: '변경',
         },
         promptList: {
             count: '프롬프트 {0}개',

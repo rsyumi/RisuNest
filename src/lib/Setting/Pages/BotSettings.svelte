@@ -37,6 +37,7 @@
     import OpenrouterSettings from "./OpenrouterSettings.svelte";
     import ChatFormatSettings from "./ChatFormatSettings.svelte";
     import PromptSettings from "./PromptSettings.svelte";
+    import PresetHeader from "./PresetHeader.svelte";
     import { openPresetList } from "src/ts/stores.svelte";
     import { updateActivePresetImage } from "src/ts/storage/database.svelte";
     import { selectSingleFile } from "src/ts/util";
@@ -134,6 +135,7 @@
     let usesOllamaCloud = $derived(DBState.db.aiModel === 'ollama-cloud' || DBState.db.subModel === 'ollama-cloud')
 </script>
 <h2 class="mb-2 text-2xl font-bold mt-2">{language.chatBot}</h2>
+<PresetHeader />
 
 {#if submenu !== -1}
     <div class="flex w-full rounded-md border border-darkborderc mb-4">

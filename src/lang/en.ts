@@ -1986,6 +1986,7 @@ export const languageEnglish = {
             compareHint: 'Select two presets to compare.',
             inherit: 'Use current preset',
             chatPreset: 'Current chat',
+            change: 'Change',
         },
         promptList: {
             count: '{0} prompts',
