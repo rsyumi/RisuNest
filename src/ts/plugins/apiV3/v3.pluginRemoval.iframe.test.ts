@@ -149,12 +149,19 @@ afterEach(async () => {
 describe('plugin removal with a running sandbox', () => {
     it('leaves no data behind that the plugin saved while unloading', async () => {
         await runInstalledPlugin()
+        fixture.database.botPresets = [
+            { id: 'applied', currentPluginProvider: owner },
+            { id: 'stored', currentPluginProvider: owner },
+            { id: 'other', currentPluginProvider: 'other-plugin' },
+        ]
         expect(await ownedKeys()).toEqual(['saved-while-running'])
 
         await removeInstalledPlugin(owner, true)
 
         expect(fixture.database.plugins).toEqual([])
         expect(fixture.database.currentPluginProvider).toBe('')
+        expect(fixture.database.botPresets.map((preset: { currentPluginProvider: string }) => preset.currentPluginProvider))
+            .toEqual(['', '', 'other-plugin'])
         expect(document.querySelector('iframe[data-risu-plugin-frame]')).toBeNull()
         expect(await ownedKeys()).toEqual([])
     })
