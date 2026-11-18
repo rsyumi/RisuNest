@@ -110,6 +110,17 @@ it('updates the switch when the active toggle value changes externally', async (
     expect(customSwitch().checked).toBe(false)
 })
 
+it('shows nothing for a group without toggles instead of an unnamed switch', async () => {
+    await unmount(instance)
+    syntax.type = 'group'
+    instance = mount(Toggles, {
+        target: document.body,
+        props: { chara: DBState.db.characters[0], noContainer: true },
+    })
+    await tick()
+    expect(document.body.textContent).not.toContain('Example toggle')
+})
+
 it('supports initially unset built-in switches and writes their bound values', async () => {
     DBState.db.jailbreak = 'Synthetic prompt'
     DBState.db.hypaV3 = true

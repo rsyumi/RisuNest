@@ -59,7 +59,9 @@
     {toggle.value}{@render localToggle(toggle)}
 {/snippet}
 
-{#snippet toggles(items: sidebarToggle[], reverse: boolean = false)}
+{#snippet toggles(definitions: sidebarToggle[], reverse: boolean = false)}
+    <!-- A group without toggles has nothing to show; drawn as a switch it would write `toggle_undefined`. -->
+    {@const items = definitions.filter((toggle) => toggle.type !== 'group' || toggle.children.length > 0)}
     {#each items as toggle, index}
         {#if index > 0 && toggle.type !== 'divider' && items[index - 1]?.type !== 'divider' && toggle.type !== 'caption' && items[index - 1]?.type !== 'caption' && !(toggle.type === 'group' && items[index - 1]?.type === 'group')}
             <div class="w-full my-2 border-t border-darkborderc/20"></div>
