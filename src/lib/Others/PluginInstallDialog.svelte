@@ -2,9 +2,9 @@
     import { untrack } from 'svelte'
     import { language } from 'src/lang'
     import SettingButton from 'src/lib/Setting/RisuNest/SettingButton.svelte'
-    import { doingAlert } from 'src/ts/alert'
     import { fillTemplate, formatBytes } from 'src/ts/gui/nativeFileJobDialogModel'
     import { pluginInstallDialog, type ActivePluginInstall } from 'src/ts/importIntake/pluginInstall'
+    import { modalNavigation } from 'src/ts/ui/modalNavigation'
 
     let panel = $state<HTMLDivElement | undefined>()
     let installingRequest = $state.raw<ActivePluginInstall | null>(null)
@@ -44,20 +44,11 @@
         if (event.target === event.currentTarget) active?.cancel()
     }
 
-    // Captured so a sheet below that also closes on Escape stays open.
-    function handleKeydown(event: KeyboardEvent): void {
-        if (!active || event.key !== 'Escape' || doingAlert()) return
-        event.preventDefault()
-        event.stopPropagation()
-        active.cancel()
-    }
 </script>
-
-<svelte:window onkeydowncapture={handleKeydown} />
 
 {#if active}
     {@const prompt = active.prompt}
-    <div role="presentation" class="fixed inset-0 z-[1100] flex items-center justify-center bg-black/60 p-4" onclick={dismissBackdrop}>
+    <div role="presentation" class="fixed inset-0 z-work-dialog-plugin flex items-center justify-center bg-black/60 p-4" onclick={dismissBackdrop}>
         <div
             bind:this={panel}
             tabindex="-1"
@@ -65,6 +56,7 @@
             aria-modal="true"
             aria-labelledby="plugin-install-dialog-title"
             data-testid="plugin-install-dialog"
+            use:modalNavigation={{ close: () => active?.cancel() }}
             class="flex max-h-[90dvh] w-full max-w-lg flex-col gap-4 overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-5 text-textcolor outline-hidden">
             <h2 id="plugin-install-dialog-title" class="text-lg font-bold">{prompt.replaces ? copy.pluginReplaceTitle : copy.pluginInstallTitle}</h2>
             <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-md border border-darkborderc bg-bgcolor px-3 py-2.5 text-sm">

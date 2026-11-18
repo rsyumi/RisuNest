@@ -151,6 +151,10 @@ describe('plugin install dialog', () => {
         ['the cancel button', () => button(language.cancel).click()],
         ['Escape', () => dialog()!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))],
         ['a backdrop click', () => (dialog()!.parentElement as HTMLElement).click()],
+        ['Android Back', () => {
+            history.replaceState(null, '')
+            window.dispatchEvent(new PopStateEvent('popstate'))
+        }],
     ])('installs nothing after %s and leaves a sheet below open', async (_, dismiss) => {
         const sheetKeydown = vi.fn()
         window.addEventListener('keydown', sheetKeydown)
@@ -167,6 +171,15 @@ describe('plugin install dialog', () => {
         expect(h.importPlugin).not.toHaveBeenCalled()
         await tick()
         expect(dialog()).toBeNull()
+    })
+
+    it('shows an error the install throws and reports the install as failed', async () => {
+        h.importPlugin.mockRejectedValue(new Error('synthetic install failure'))
+        const result = requestPluginInstall(pluginItem('synthetic.js', declared))
+        await tick()
+        button(copy.install).click()
+        expect(await result).toBe('failed')
+        expect(get(alertStore)).toEqual(expect.objectContaining({ type: 'error', msg: expect.stringContaining('synthetic install failure') }))
     })
 
     it('leaves Escape to an alert shown above it', async () => {

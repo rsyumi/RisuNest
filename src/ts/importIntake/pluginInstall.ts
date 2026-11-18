@@ -1,4 +1,5 @@
 import { get, writable } from 'svelte/store'
+import { alertError } from '../alert'
 import { parsePluginHeader, stripPluginBom } from '../plugins/pluginHeader'
 import { importPlugin, type RisuPlugin } from '../plugins/plugins.svelte'
 import { DBState } from '../stores.svelte'
@@ -101,6 +102,9 @@ export function requestPluginInstall(item: ImportIntakeItem): Promise<PluginInst
                             isTypescript: plugin.isTypescript,
                             confirmed: true,
                         })
+                    } catch (error) {
+                        // importPlugin alerts its own refusals; anything it throws is shown here.
+                        alertError(error instanceof Error ? error : String(error))
                     } finally {
                         finish(installed ? 'installed' : 'failed')
                     }
