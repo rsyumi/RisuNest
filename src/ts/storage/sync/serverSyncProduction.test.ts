@@ -6,7 +6,7 @@ import { serverSyncLane } from './serverSyncProgress.testSupport'
 import { assetResidencyStatus } from './serverAssetResidency.testSupport'
 
 const f = vi.hoisted(() => ({
-    native: true,
+    native: true, os: 'windows' as 'windows' | 'android',
     selectedIndex: 0,
     database: { characters: [{ chaId: 'selected-stable-id' }], risunestSyncStatusUi: true },
     alert: vi.fn(),
@@ -45,7 +45,7 @@ const f = vi.hoisted(() => ({
 vi.mock('@tauri-apps/api/core', () => ({ invoke: f.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
 vi.mock('../../alert', () => ({ alertError: f.alert }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async (name, listener) => { f.events.set(name, listener); return () => { f.events.delete(name) } }) }))
-vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({ runtime: f.native ? 'tauri' : 'web', os: 'windows' })))
+vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule(() => ({ runtime: f.native ? 'tauri' : 'web', os: f.os })))
 vi.mock('src/ts/stores.svelte', () => ({ selectedCharID: { subscribe: (run: (value: number) => void) => { run(f.selectedIndex); return () => {} } } }))
 vi.mock('../database.svelte', () => ({ getDatabase: () => f.database }))
 vi.mock('./bindingProduction', async importOriginal => ({
@@ -74,7 +74,7 @@ vi.mock('../generatingConversationRegistry', () => ({ generatingConversations: {
 let production: typeof import('./serverSyncProduction')
 beforeEach(async () => {
     vi.resetModules(); vi.clearAllMocks(); vi.useFakeTimers(); f.events.clear()
-    f.native = true; f.transport = undefined; f.dependencies = undefined; f.generating = []; f.selectedIndex = 0; f.viewport = undefined; f.revision = undefined; f.conversation = null
+    f.native = true; f.os = 'windows'; f.transport = undefined; f.dependencies = undefined; f.generating = []; f.selectedIndex = 0; f.viewport = undefined; f.revision = undefined; f.conversation = null
     f.mobile.mockImplementation(async (_kind: string, operation: (task: object) => Promise<unknown>) => operation({ progress() {}, async dispose() {} }))
     f.deferredMobile.mockImplementation(async (_kind: string, operation: (task: object) => Promise<unknown>) => operation({ progress() {}, async dispose() {} }))
     f.flush.mockResolvedValue(undefined)
@@ -1294,6 +1294,29 @@ describe('production server LWW composition', () => {
         f.invoke.mockClear()
         f.invoke.mockImplementation(async command => command === 'server_sync_lww_pull' ? emptyReceive() : null)
         visible(true); await settle()
+        expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
+    })
+    it('starts no routine sync after its time runs out on a page Android keeps running off screen, until the app returns', async () => {
+        f.os = 'android'
+        const mobile = await import('../../mobileBackgroundTask')
+        const { BackgroundExecutionExpiredError } = await import('../../iosNative')
+        const expiry = new AbortController()
+        vi.mocked(mobile.beginDeferredMobileBackgroundTask).mockImplementation(() => ({ signal: expiry.signal, progress() {}, async dispose() {} }))
+        production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
+        visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
+        let finishPull!: () => void
+        f.invoke.mockImplementation(async command => command === 'server_sync_lww_pull'
+            ? new Promise(resolve => { finishPull = () => resolve(emptyReceive()) }) : null)
+        f.events.get('risu-server-sync-remote-hint')!({ payload: null })
+        await settle()
+        // The app left and the page stays visible, so only the expiry and Android's own start tell where the app is.
+        expiry.abort(new BackgroundExecutionExpiredError()); await settle()
+        finishPull(); await settle()
+        f.invoke.mockClear()
+        f.invoke.mockImplementation(async command => command === 'server_sync_lww_pull' ? emptyReceive() : null)
+        production.resumeServerSyncAfterBackup(); await vi.advanceTimersByTimeAsync(60_000)
+        expect(f.invoke).not.toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } })); await settle()
         expect(f.invoke).toHaveBeenCalledWith('server_sync_lww_pull', expect.anything())
     })
     it('keeps a failed binding visible as a paused connection that 지금 동기화 resumes', async () => {

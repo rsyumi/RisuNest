@@ -804,8 +804,8 @@ describe('bounded production calls and lifecycle ownership', () => {
             return () => { expired = true; for (const controller of held) controller.abort(new BackgroundExecutionExpiredError()) }
         }
         const show = (value: 'hidden' | 'visible') => { Object.defineProperty(document, 'visibilityState', { configurable: true, value }); document.dispatchEvent(new Event('visibilitychange')) }
-        // Android's own stop and start, which a page it keeps running off screen hears without becoming hidden.
-        const app = (reason: 'start' | 'stop') => window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason } }))
+        // Android's own start, which a page it keeps running off screen hears without becoming visible again.
+        const returnToApp = () => window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
         // Lets routine sync run, then tells whether it sent, received and downloaded since the last check.
         const synced = async () => {
             for (let i = 0; i < 6; i++) await settle()
@@ -828,7 +828,7 @@ describe('bounded production calls and lifecycle ownership', () => {
             fixture.os = android ? 'android' : 'ios'
             const expire = expiringHolds()
             if (entry !== 'the start') { dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle() }
-            if (entry === 'the return to the screen') { app('stop'); show('hidden'); for (let i = 0; i < 6; i++) await settle() }
+            if (entry === 'the return to the screen') { show('hidden'); for (let i = 0; i < 6; i++) await settle() }
             const drain = entry === 'a cancelled exit' ? externalLwwExitDrain('sync', 'selection')! : undefined
             await drain?.cancel('cancel-exit')
             fixture.invoke.mockClear(); fixture.download.mockClear()
@@ -841,16 +841,16 @@ describe('bounded production calls and lifecycle ownership', () => {
                 fixture.resumeCurrent.mockImplementation(async target => { await checking; await resume(target) })
             } else checked()
             const resumed = entry === 'the start' ? installExternalLwwAdapters(state()).then(value => { dispose = value })
-                : drain ? drain.resumeAfterExitCancel!() : (app('start'), show('visible'))
+                : drain ? drain.resumeAfterExitCancel!() : (returnToApp(), show('visible'))
             await settle()
-            if (order === 'back and kept away again') { app('stop'); show('hidden'); app('start'); show('visible') }
+            // The app leaves with the page kept running and visible, unless it went hidden first.
+            if (order === 'back and kept away again') { show('hidden'); returnToApp(); show('visible') }
             if (order === 'back before the expiry arrives') { show('hidden'); show('visible') }
             else if (order === 'hidden away') show('hidden')
-            else app('stop')
             expire(); checked(); release(); await resumed
             if (order !== 'back before the expiry arrives') {
                 expect(await synced()).toBe(false)
-                if (android) app('start'); else show('visible')
+                if (android) returnToApp(); else show('visible')
             }
             expect(await synced()).toBe(true)
         })
@@ -858,13 +858,12 @@ describe('bounded production calls and lifecycle ownership', () => {
             fixture.os = 'android'
             const expire = expiringHolds()
             dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle()
-            app('stop')
             const release = gate('external_lww_receive')
             fixture.revision!(13, 'local'); await vi.advanceTimersByTimeAsync(600_000)
             expire(); release(); await synced()
             window.dispatchEvent(new Event('online'))
             expect(await synced()).toBe(false)
-            app('start')
+            returnToApp()
             expect(await synced()).toBe(true)
         })
         it('while a cancelled exit waits to resume sync', async () => {

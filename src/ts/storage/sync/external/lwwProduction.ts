@@ -59,13 +59,10 @@ const foregroundAvailable = () => document.visibilityState !== 'hidden' && netwo
 // but leaves the bound target stopped until the user starts it.
 let resumeBoundTarget = true
 let refreshGeneration = 0
-// Android keeps a page that holds work running off screen, where it stays visible, so the app's own stop and start
-// tell that it left and returned; elsewhere the page is hidden while the app is away.
-let nativeAway = false
-// Sync's background time ran out while the app was away, so routine sync waits for the return.
+// Sync's background time ran out while the app was away, so routine sync waits for the return. Android expires a hold
+// only while the app is away, also when it keeps the page running and visible; elsewhere the page is hidden then.
 let outOfTime = false
-const ranOutOfTime = () => { if (document.visibilityState === 'hidden' || isTauriAndroid && nativeAway) outOfTime = true }
-const returned = () => { nativeAway = false; outOfTime = false }
+const ranOutOfTime = () => { if (isTauriAndroid || document.visibilityState === 'hidden') outOfTime = true }
 /** Whether routine sync may start: off screen, only while sync's background time lasts. */
 const routineMayStart = () => foregroundAvailable() && !outOfTime
 
@@ -422,12 +419,10 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
     if (!isTauri) return () => {}
     resumeBoundTarget = resumeBound
     let foreground = () => {}
-    // A page Android keeps running off screen stays visible, so it hears the app leave and return only from native code.
+    // A page Android keeps running off screen stays visible, so it hears the return only from the app's own start.
     const lifecycle = (event: Event) => {
-        const reason = (event as CustomEvent<{ reason?: unknown } | null>).detail?.reason
-        if (!isTauriAndroid || reason !== 'start' && reason !== 'stop') return
-        if (reason === 'stop') nativeAway = true
-        else { returned(); foreground() }
+        if (!isTauriAndroid || (event as CustomEvent<{ reason?: unknown } | null>).detail?.reason !== 'start') return
+        outOfTime = false; foreground()
     }
     window.addEventListener('risu-native-lifecycle', lifecycle)
     try { await refreshExternalLwwAdapters(state) } catch (error) { window.removeEventListener('risu-native-lifecycle', lifecycle); throw error }
@@ -479,7 +474,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
             }
         }
     }
-    const visibility = () => { if (document.visibilityState !== 'hidden') returned(); foreground() }
+    const visibility = () => { if (document.visibilityState !== 'hidden') outOfTime = false; foreground() }
     document.addEventListener('visibilitychange', visibility)
     window.addEventListener('online', foreground)
     window.addEventListener('offline', foreground)
@@ -494,7 +489,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
         disposeRevision(); disposeDevice(); disposeConversation()
         document.removeEventListener('visibilitychange', visibility); window.removeEventListener('risu-native-lifecycle', lifecycle)
         window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground)
-        returned()
+        outOfTime = false
         refreshGeneration++
         for (const adapter of [...adapters.values()]) adapter.dispose()
         resumeBoundTarget = true
