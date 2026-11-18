@@ -1761,6 +1761,52 @@ fn realm_block_loadout_onboarding_and_preset_binding_fields_publish_and_apply_on
     assert_eq!(conversation["promptPresetId"], "preset-b");
 }
 
+// What a library holds after a build that did not share a field received it: the unit
+// without the field in its document.
+#[test]
+fn opening_projects_received_units_of_newly_shared_fields_once_without_publishing_them() {
+    let (dir, mut store) = store();
+    create_conversation(&mut store, "char", "conv");
+    create_conversation(&mut store, "char", "local");
+    let blocked = serde_json::json!([{"id":"synthetic-creator","name":"Synthetic creator"}]);
+    let onboarding = serde_json::json!({"enabled":true,"mode":"form","questions":[]});
+    receive(&mut store, "shared", vec![
+        change(&["conversation", "char", "conv", "promptPresetId"], 10, serde_json::json!("preset-b")),
+        change(&["conversation", "char", "conv", "note"], 10, serde_json::json!("remote note")),
+        change(&["conversation", "char", "local", "promptPresetId"], 10, serde_json::json!("preset-remote")),
+        change(&["conversation", "char", "local", "onboardingDone"], 10, serde_json::json!(true)),
+        change(&["root", "blockedRealmCreators"], 10, blocked.clone()),
+        change(&["character", "char", "onboarding"], 10, onboarding.clone()),
+    ], vec![]);
+    store.connection.execute_batch(
+        "UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId','$.note') WHERE character_id='char' AND conversation_id='conv';
+         UPDATE conversations SET detail=json_set(json_remove(detail,'$.onboardingDone'),'$.promptPresetId','preset-local') WHERE character_id='char' AND conversation_id='local';
+         UPDATE characters SET detail=json_remove(detail,'$.onboarding') WHERE character_id='char';
+         UPDATE root SET value=json_remove(value,'$.blockedRealmCreators');
+         DELETE FROM meta WHERE key='projectedSharedFields';",
+    ).unwrap();
+    clear_outbox(&mut store);
+    let revision = store.revision().unwrap();
+    drop(store);
+    let store = PersistentStore::open(dir.path()).unwrap();
+    let conversation = store.read_conversation("char", "conv", None).unwrap().unwrap().value;
+    assert_eq!(conversation["promptPresetId"], "preset-b");
+    assert!(conversation.get("note").is_none(), "a field the first release shared");
+    let local = store.read_conversation("char", "local", None).unwrap().unwrap().value;
+    assert_eq!(local["promptPresetId"], "preset-local");
+    assert_eq!(local["onboardingDone"], true);
+    assert_eq!(store.read_character("char", None).unwrap().unwrap().value["onboarding"], onboarding);
+    assert_eq!(store.read_root(None).unwrap().value["blockedRealmCreators"], blocked);
+    assert_eq!(store.revision().unwrap(), revision + 1);
+    assert!(store.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
+    store.connection.execute("UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId') WHERE character_id='char' AND conversation_id='conv'", []).unwrap();
+    let revision = store.revision().unwrap();
+    drop(store);
+    let store = PersistentStore::open(dir.path()).unwrap();
+    assert!(store.read_conversation("char", "conv", None).unwrap().unwrap().value.get("promptPresetId").is_none());
+    assert_eq!(store.revision().unwrap(), revision);
+}
+
 #[test]
 fn plugin_record_deletion_is_reusable_and_generic_record_deletion_is_permanent() {
     let (_, mut store) = store();

@@ -1783,6 +1783,9 @@ impl PersistentStore {
         if store.device_store.is_ok() && store.lww_recover_intents_at_open()? {
             snapshot::sweep_temporary_generations(&mut store.connection, retained_stage.as_deref())?;
         }
+        if let Err(error) = store.lww_project_listed_fields() {
+            crate::nlog!("warn", "shared field projection pending: {}", error);
+        }
         snapshot::checkpoint(&store.connection, CheckpointMode::Truncate)?;
         if store.device_store.is_ok() {
             if let Err(error) = store.server_repair_residency_access() {

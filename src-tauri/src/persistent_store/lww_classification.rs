@@ -408,6 +408,8 @@ pub(super) const CONVERSATION_FIELDS: &[&str] = &[
     "toolCalls",
     "useLocallySetGlobalVariables",
 ];
+// Opening a library projects the stored units of a field added to the lists above
+// (`lww_listed_fields.rs`); one added here would need the same.
 pub(super) const PRESET_FIELDS: &[&str] = &[
     "JinjaTemplate",
     "NAISettings",
