@@ -22,7 +22,7 @@ import type {
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
 import type { Chat, Database, botPreset, character, loreBook } from './database.svelte'
-import { carryPresetBinding, carryPresetOverride, fillRootFieldDefaults, getDatabase, setDatabase } from './database.svelte'
+import { carryPresetBinding, carryPresetOverride, fillRootFieldDefaults, getDatabase, loadSelectedPresetBody, setDatabase } from './database.svelte'
 import { getEffectivePresetBinding, getEffectivePresetOverride, isLoadedPresetRecord } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
@@ -226,6 +226,7 @@ export function createProductionStateAdapter(options: {
                 presetOverride && carryPresetOverride(presetOverride, options.readPreset),
                 presetBinding && carryPresetBinding(presetBinding, options.readPreset),
             ]) if (carried) carried.catch((error) => productionConfiguration.onBackgroundError?.(error))
+            loadSelectedPresetBody(getDatabase(), options.readPreset)
         },
         publishPresetWorkingSet({ revision, root, presets }) {
             const database = getDatabase()

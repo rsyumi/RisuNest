@@ -34,7 +34,7 @@ import * as presetEditor from './presetEditor.svelte';
 import { isConversationSummaryStub } from './conversationResidency';
 import { doingChat } from '../process/generationState';
 import { configurePersistentIdentityHooks } from './persistentIdentityHooks';
-import { markCatalogPresetLoaded } from './workingSetCatalog';
+import { isCatalogPresetWorkingSet, markCatalogPresetLoaded } from './workingSetCatalog';
 export { presetMirrorMap, protectedPresetGroups } from './effectiveIdentityState';
 
 export { appVer, appSubVer } from '../appVersion'
@@ -2165,11 +2165,14 @@ export async function activatePresetOverride(index: number | null): Promise<void
     if (id !== null && !id) throw new Error('Preset was not found')
     const runtime = await import('./persistentDataRuntime.svelte')
     await runtime.flushPendingData('preset-chain')
+    const db = getDatabase()
     if (id === null) {
-        setEffectivePresetOverride(null)
+        // A request applies the selection only once its body is read.
+        const selected = unloadedSelection(db)
+        if (selected && !await loadPresetBody(db, selected)) return activatePresetOverride(null)
+        setEffectivePresetOverride(null, db)
         return
     }
-    const db = getDatabase()
     // A replacement during the read applies the preset as the new library holds it.
     if (!await loadPresetBody(db, id)) return activatePresetOverride(getDatabase().botPresets.findIndex(preset => preset?.id === id))
     setEffectivePresetOverride(id, db)
@@ -2249,6 +2252,32 @@ export async function carryPresetOverride(id: string, read?: PresetReader): Prom
     }
 }
 
+const unloadedSelection = (db: Database): string | undefined => {
+    const id = db.botPresets?.[db.botPresetsId]?.id
+    return id && isCatalogPresetWorkingSet(db.botPresets) && !identity.isLoadedPreset(db, id) ? id : undefined
+}
+
+let loadingSelection: string | null = null
+/**
+ * A catalog working set holds the selected preset's body. A selection that fell back to a summary,
+ * such as after a remote deletion, reads it and derives the mirrors again.
+ */
+export function loadSelectedPresetBody(db: Database = getDatabase(), read?: PresetReader): void {
+    const id = unloadedSelection(db)
+    if (!id || loadingSelection === id) return
+    loadingSelection = id
+    loadPresetBody(db, id, read).then((loaded) => {
+        loadingSelection = null
+        // A library that replaced this one during the read has its own selection to read.
+        if (!loaded) loadSelectedPresetBody(getDatabase(), read)
+        // A stored body that holds no preset fields stays unapplied instead of being read again.
+        else if (identity.isLoadedPreset(db, id)) deriveEffectivePresetMirrors(db)
+    }, (error) => {
+        loadingSelection = null
+        console.error(error)
+    })
+}
+
 export function flushEffectivePersonaEdits(db: Database = getDatabase()): void {
     identity.flushEffectivePersonaEdits(db)
 }
@@ -2276,7 +2305,10 @@ export function prepareImportedIdentityState(db: Database): void {
 identity.observeEffectivePresetDerive({
     // A derive may apply the preset the settings window edits, so its edits reach the record first.
     beforeDerive: (db) => presetEditor.flushPresetEditorEdits(db),
-    afterDerive: (db) => presetEditor.syncPresetEditorTarget(db, applyEffectivePreset, loadPresetBody),
+    afterDerive: (db) => {
+        presetEditor.syncPresetEditorTarget(db, applyEffectivePreset)
+        loadSelectedPresetBody(db)
+    },
 })
 
 configurePersistentIdentityHooks({

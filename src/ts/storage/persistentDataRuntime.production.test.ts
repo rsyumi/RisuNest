@@ -1199,6 +1199,24 @@ describe('preset chain override across a whole working-set replacement', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 
+    it('reads the selected body when the projected selection fell back to a catalog summary', async () => {
+        const initial = presetDatabase()
+        initial.botPresetsId = 1
+        initial.mainPrompt = 'Prompt B'
+        const store = new IndexedDbPersistentDataStore(`selection-fallback-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        // The selected preset was removed on another device.
+        const removed = await store.commit({ expectedRevision: revision, unitMutations: [{ key: '["root","botPresetsId"]', type: 'set', value: 'preset-removed' }] })
+        const replacement = await projectScalableWorkingSetAtRevision(store, removed.revision, { selectedCharacterId: null })
+        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
+        await vi.waitFor(() => expect(getDatabase().mainPrompt).toBe('Prompt A'))
+        expect(getDatabase().botPresetsId).toBe(0)
+        expect(getDatabase().botPresets[0].mainPrompt).toBe('Prompt A')
+    })
+
     it('clears the override when its preset is gone', () => {
         const initial = presetDatabase()
         setDatabase(structuredClone(initial))

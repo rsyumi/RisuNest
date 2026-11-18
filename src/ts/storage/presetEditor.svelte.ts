@@ -32,9 +32,6 @@ let applied: { db: Database; id: string | undefined } | null = null
 let settingsWindow: { readonly current: boolean } | undefined
 let watchingSettingsWindow = false
 let applyEditor: ApplyPreset | undefined
-type LoadPreset = (db: Database, presetId: string) => Promise<boolean>
-let loadEditor: LoadPreset | undefined
-let loading: string | null = null
 const editors = new WeakMap<Database, Database>()
 
 const clone = <T>(value: T): T => value === undefined ? value : safeStructuredClone(value)
@@ -79,19 +76,6 @@ function openView(db: Database, presetId: string, apply: ApplyPreset): void {
     signal.view++
 }
 
-/** Reads the body of a selected catalog stub, which preset settings edit once it is loaded. */
-function loadSelection(db: Database, presetId: string): void {
-    if (!loadEditor || loading === presetId) return
-    loading = presetId
-    loadEditor(db, presetId).then((loaded) => {
-        loading = null
-        if (loaded) refresh()
-    }, (error) => {
-        loading = null
-        console.error(error)
-    })
-}
-
 /**
  * Keeps a view of the selected preset while preset settings show and another preset is applied,
  * and writes and drops it once either stops.
@@ -109,10 +93,9 @@ function refresh(): void {
             })
             subscribed = true
         }
-        const shown = other && applyEditor && isPresetEditorOpen() ? other : null
-        const wanted = shown && isLoadedPreset(db, shown) ? shown : null
+        // A catalog stub's view opens once its body is read and the mirrors derived again.
+        const wanted = other && applyEditor && isPresetEditorOpen() && isLoadedPreset(db, other) ? other : null
         if (view && (view.db !== db || view.presetId !== wanted)) closeView()
-        if (shown && !wanted) loadSelection(db, shown)
         if (!wanted) return
         if (view) derivePresetMirrorView(db, view, applyEditor!)
         else openView(db, wanted, applyEditor!)
@@ -152,9 +135,8 @@ export function flushPresetEditorEdits(db: Database = DBState.db): void {
  * Follows a derive of the preset mirrors: publishes the applied preset and, while preset settings
  * show, gives them a view of the selected preset whenever another preset is applied.
  */
-export function syncPresetEditorTarget(db: Database, apply: ApplyPreset, load?: LoadPreset): void {
+export function syncPresetEditorTarget(db: Database, apply: ApplyPreset): void {
     applyEditor = apply
-    loadEditor = load
     const appliedId = peekEffectivePresetId(db)
     if (applied?.db !== db || applied.id !== appliedId) {
         applied = { db, id: appliedId }

@@ -21,6 +21,7 @@ import {
     activatePresetOverride,
     activateRequestPresetBinding,
     applyConversationPresetBinding,
+    captureCurrentPreset,
     carryPresetBinding,
     getDatabase,
     getEffectivePresetId,
@@ -31,6 +32,7 @@ import {
 } from './database.svelte'
 import { derivePersistentIdentityMirrors } from './persistentIdentityHooks'
 import { getEffectivePresetOverride, isLoadedPreset } from './effectiveIdentityState'
+import { createPresetCatalogWorkingSetFromValues } from './workingSetCatalog'
 
 function presetDatabase(): Database {
     const database = normalizeDatabaseDefaults({} as Database)
@@ -125,6 +127,73 @@ describe('preset chain override activation', () => {
         expect(runtime.readPreset).not.toHaveBeenCalled()
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
+    })
+
+    it('reads the body of a selection that fell back to a catalog summary before saving or applying it', async () => {
+        const database = getDatabase()
+        // A selection removed on another device leaves the first preset selected as a summary.
+        database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, 'preset-removed')
+        database.mainPrompt = 'Removed prompt'
+        const read = deferred()
+        runtime.readPreset.mockImplementation(async (id) => {
+            await read.promise
+            return { revision: 1, value: structuredClone(stored.get(id)!) }
+        })
+        derivePersistentIdentityMirrors()
+        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledExactlyOnceWith('preset-a'))
+        expect(captureCurrentPreset()).toBeNull()
+        let applied = false
+        const request = activatePresetOverride(null).then(() => { applied = true })
+        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledTimes(2))
+        expect(applied).toBe(false)
+
+        read.resolve()
+        await request
+
+        expect(getDatabase().botPresets[0]).toEqual(stored.get('preset-a'))
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
+        expect(captureCurrentPreset()).toEqual(stored.get('preset-a'))
+    })
+
+    it('reads the selected summary of a library that replaced the one being read', async () => {
+        const fallback = () => {
+            const database = presetDatabase()
+            database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, 'preset-removed')
+            return database
+        }
+        setDatabase(fallback())
+        const read = deferred()
+        runtime.readPreset.mockImplementationOnce(async (id) => {
+            await read.promise
+            return { revision: 1, value: structuredClone(stored.get(id)!) }
+        })
+        derivePersistentIdentityMirrors()
+        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
+        const replacement = fallback()
+        replacement.mainPrompt = 'Removed prompt'
+        setDatabase(replacement)
+        const installed = getDatabase()
+        derivePersistentIdentityMirrors()
+        read.resolve()
+
+        await vi.waitFor(() => expect(installed.mainPrompt).toBe('Prompt A'))
+        expect(getDatabase()).toBe(installed)
+        expect(installed.botPresets[0]).toEqual(stored.get('preset-a'))
+    })
+
+    it('reads a selected summary once when its stored body holds no preset fields', async () => {
+        stored.set('preset-a', { id: 'preset-a', name: 'Preset A' } as botPreset)
+        // A store read waits for a task, as a real one does, so repeated reads cannot starve the timer below.
+        runtime.readPreset.mockImplementation(async (id) => {
+            await new Promise((resolve) => setTimeout(resolve))
+            return { revision: 1, value: structuredClone(stored.get(id)!) }
+        })
+        const database = getDatabase()
+        database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, 'preset-removed')
+        derivePersistentIdentityMirrors()
+        await vi.waitFor(() => expect(getDatabase().botPresets[0]).toEqual(stored.get('preset-a')))
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        expect(runtime.readPreset).toHaveBeenCalledOnce()
     })
 
     it('rejects a missing preset without changing the override', async () => {

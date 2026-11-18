@@ -26,7 +26,7 @@ function apply(db: Database, preset: botPreset): void {
     }
 }
 
-function open(names: string[], bound: string, load?: (db: Database, id: string) => Promise<boolean>): Database['botPresets'] {
+function open(names: string[], bound: string): Database['botPresets'] {
     DBState.db = {
         botPresetsId: 0,
         botPresets: names.map(name => ({ id: name, name, mainPrompt: `Prompt ${name}` })),
@@ -34,7 +34,7 @@ function open(names: string[], bound: string, load?: (db: Database, id: string) 
     } as unknown as Database
     observeEffectivePresetDerive({
         beforeDerive: flushPresetEditorEdits,
-        afterDerive: (db) => syncPresetEditorTarget(db, apply, load),
+        afterDerive: (db) => syncPresetEditorTarget(db, apply),
     })
     setEffectivePresetBinding(DBState.db, bound, apply)
     return DBState.db.botPresets
@@ -91,14 +91,8 @@ it('keeps edits across a selection change and a binding change while preset sett
     expect(presets.map(preset => preset.mainPrompt)).toEqual(['Edited selected', 'Edited other', 'Prompt bound'])
 })
 
-it('takes no settings input for a selected catalog stub and edits the selection once its body is read', async () => {
-    let land: (() => void) | undefined
-    const presets = open(['selected', 'bound'], 'bound', (db, id) => new Promise((resolve) => {
-        land = () => {
-            db.botPresets[0] = { id, name: id, mainPrompt: `Prompt ${id}` } as botPreset
-            resolve(true)
-        }
-    }))
+it('takes no settings input for a selected catalog stub and edits the selection once its body is read', () => {
+    const presets = open(['selected', 'bound'], 'bound')
     presets[0] = { id: 'selected', name: 'selected' } as botPreset
     deriveEffectivePresetMirrors(DBState.db, apply)
     settingsOpen.set(true)
@@ -109,8 +103,10 @@ it('takes no settings input for a selected catalog stub and edits the selection 
     presetEditorDBState.db.doNotChangeFallbackModels = true
     expect(DBState.db.doNotChangeFallbackModels).toBeFalsy()
 
-    land!()
-    await vi.waitFor(() => expect(presetEditorDBState.db.mainPrompt).toBe('Prompt selected'))
+    // The body read derives the mirrors again.
+    presets[0] = { id: 'selected', name: 'selected', mainPrompt: 'Prompt selected' } as botPreset
+    deriveEffectivePresetMirrors(DBState.db, apply)
+    expect(presetEditorDBState.db.mainPrompt).toBe('Prompt selected')
     presetEditorDBState.db.mainPrompt = 'Edited selected'
     settingsOpen.set(false)
     expect(presets[0].mainPrompt).toBe('Edited selected')
