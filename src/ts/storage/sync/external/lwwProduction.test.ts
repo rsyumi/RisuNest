@@ -807,10 +807,12 @@ describe('bounded production calls and lifecycle ownership', () => {
         // Android's own start, which a page it keeps running off screen hears without becoming visible again.
         const returnToApp = () => window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
         // Lets routine sync run, then tells whether it sent, received and downloaded since the last check.
+        let resumes = 0
         const synced = async () => {
             for (let i = 0; i < 6; i++) await settle()
             await vi.advanceTimersByTimeAsync(600_000)
             const commands = fixture.invoke.mock.calls.map(([command]) => command)
+            resumes = commands.filter(command => command === 'external_lww_resume').length
             const ran = commands.some(command => command === 'external_lww_publish' || command === 'external_lww_receive') && fixture.download.mock.calls.length > 0
             fixture.invoke.mockClear(); fixture.download.mockClear()
             return ran
@@ -863,7 +865,8 @@ describe('bounded production calls and lifecycle ownership', () => {
             if (order === 'kept away and back as the start ends') { for (let i = 0; i < 6; i++) await settle(); returnToApp(); listened() }
             await resumed
             if (!backBeforeItEnds) {
-                expect(await synced()).toBe(false)
+                // Nothing more starts natively while the app stays away.
+                expect(await synced()).toBe(false); expect(resumes).toBe(1)
                 if (android) returnToApp(); else show('visible')
             }
             expect(await synced()).toBe(true)

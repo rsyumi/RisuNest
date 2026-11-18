@@ -454,7 +454,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                 }).catch(() => {}).finally(() => {
                     adapter.foreground = undefined
                     // The return after a departure during the pass found it still running.
-                    if ((generation !== adapter.generation || departed !== departures) && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
+                    if ((generation !== adapter.generation || departed !== departures) && adapter.state && routineMayStart() && [...adapters.values()].includes(adapter)) foreground()
                 })
             }
         }
