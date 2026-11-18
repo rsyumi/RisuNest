@@ -391,6 +391,52 @@ fn unknown_units_are_opaque_and_never_recaptured() {
         .all(|e| e.key != unknown.key));
 }
 
+// How a released peer treats a conversation field that a later release starts sharing.
+#[test]
+fn a_received_conversation_field_this_build_does_not_list_survives_its_edits_archive_and_replacement() {
+    let (_dir, mut old) = store();
+    create_conversation(&mut old, "char", "conv");
+    let key = unit_key(&["conversation", "char", "conv", "futureBinding"]).unwrap();
+    let bound = change(&["conversation", "char", "conv", "futureBinding"], 10, serde_json::json!("preset-b"));
+    receive(&mut old, "bound", vec![bound.clone()], vec![]);
+    assert!(old.read_conversation("char", "conv", None).unwrap().unwrap().value.get("futureBinding").is_none());
+    clear_outbox(&mut old);
+    save(&mut old, vec![
+        mutation(&["conversation", "char", "conv", "note"], serde_json::json!("edited")),
+        mutation(&["conversation", "char", "conv", "name"], serde_json::json!("renamed")),
+    ]);
+    let outbox = old.lww_read_outbox(0.into(), 100).unwrap().entries;
+    assert!(outbox.iter().any(|e| e.key == unit_key(&["conversation", "char", "conv", "note"]).unwrap()));
+    assert!(outbox.iter().all(|e| e.key != key), "edit");
+    assert_eq!(read_unit(&old.connection, &key).unwrap().unwrap().1, bound.value);
+    clear_outbox(&mut old);
+    let revision = old.revision().unwrap();
+    old.archive_character("char", revision, 10).unwrap();
+    let revision = old.revision().unwrap();
+    old.restore_character("char", revision).unwrap();
+    let outbox = old.lww_read_outbox(0.into(), 100).unwrap().entries;
+    assert!(outbox.iter().all(|e| e.key != key), "archive");
+    assert_eq!(read_unit(&old.connection, &key).unwrap().unwrap().1, bound.value);
+    assert_eq!(old.read_conversation("char", "conv", None).unwrap().unwrap().value["note"], "edited");
+    clear_outbox(&mut old);
+    let target = super::super::ReadTarget { generation: active_generation(&old.connection).unwrap(), revision: old.revision().unwrap() };
+    let mut database = query::materialize_target(&old.connection, &target).unwrap();
+    database["characters"][0]["chats"][0]["futureBinding"] = serde_json::json!("restored-other");
+    database["characters"][0]["chats"][0]["note"] = serde_json::json!("replaced");
+    let characters = database.as_object_mut().unwrap().remove("characters").unwrap();
+    let presets = database.as_object_mut().unwrap().remove("botPresets").unwrap();
+    let stage = old.replace_begin().unwrap().staging_id;
+    old.replace_put_root(&stage, &database).unwrap();
+    old.replace_put_presets(&stage, presets.as_array().unwrap()).unwrap();
+    old.replace_add_characters(&stage, characters.as_array().unwrap()).unwrap();
+    let header = Header { binding_authority: old.lww_binding_authority().unwrap(), request_id: "opaque-field-replace".into() };
+    old.lww_commit_replacement_units(&header, &stage, None).unwrap();
+    let outbox = old.lww_read_outbox(0.into(), 100).unwrap().entries;
+    assert!(outbox.iter().any(|e| e.key == unit_key(&["conversation", "char", "conv", "note"]).unwrap()), "replacement note");
+    assert!(outbox.iter().all(|e| e.key != key), "replacement");
+    assert_eq!(read_unit(&old.connection, &key).unwrap().unwrap().1, bound.value);
+}
+
 #[test]
 fn commit_input_capture_conserves_actual_reserve_completed_and_rejected_retry_hashes() {
     use crate::persistent_store::hash_work::{reset_commit_intent_inputs, take_commit_intent_inputs,
@@ -1676,7 +1722,7 @@ fn local_and_opaque_fields_persist_without_publication() {
 }
 
 #[test]
-fn realm_block_loadout_and_onboarding_fields_publish_and_apply_on_a_peer() {
+fn realm_block_loadout_onboarding_and_preset_binding_fields_publish_and_apply_on_a_peer() {
     let (_source_dir, mut source) = store();
     let (peer_dir, mut peer) = store();
     create_conversation(&mut source, "char", "conv");
@@ -1690,6 +1736,7 @@ fn realm_block_loadout_and_onboarding_fields_publish_and_apply_on_a_peer() {
             mutation(&["root", "loadoutApplyOptions"], options.clone()),
             mutation(&["character", "char", "onboarding"], onboarding.clone()),
             mutation(&["conversation", "char", "conv", "onboardingDone"], serde_json::json!(true)),
+            mutation(&["conversation", "char", "conv", "promptPresetId"], serde_json::json!("preset-b")),
         ],
     );
     let outbox = source.lww_read_outbox(0.into(), 100).unwrap().entries;
@@ -1703,16 +1750,27 @@ fn realm_block_loadout_and_onboarding_fields_publish_and_apply_on_a_peer() {
             .collect(),
         vec![],
     );
+    // A peer that does not list the binding writes only the fields it knows.
+    let later = device_store::now_ms().unwrap() as u64 + 100_000;
+    receive(
+        &mut peer,
+        "older-peer-edit",
+        vec![
+            change(&["conversation", "char", "conv", "note"], later, serde_json::json!("edited")),
+            change(&["conversation", "char", "conv", "name"], later, serde_json::json!("renamed")),
+        ],
+        vec![],
+    );
     drop(peer);
     let peer = PersistentStore::open(peer_dir.path()).unwrap();
     let root = peer.read_root(None).unwrap().value;
     assert_eq!(root["blockedRealmCreators"], blocked);
     assert_eq!(root["loadoutApplyOptions"], options);
     assert_eq!(peer.read_character("char", None).unwrap().unwrap().value["onboarding"], onboarding);
-    assert_eq!(
-        peer.read_conversation("char", "conv", None).unwrap().unwrap().value["onboardingDone"],
-        true
-    );
+    let conversation = peer.read_conversation("char", "conv", None).unwrap().unwrap().value;
+    assert_eq!(conversation["onboardingDone"], true);
+    assert_eq!(conversation["note"], "edited");
+    assert_eq!(conversation["promptPresetId"], "preset-b");
 }
 
 #[test]

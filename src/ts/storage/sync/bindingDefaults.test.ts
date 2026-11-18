@@ -20,8 +20,9 @@ describe('first binding non-default data', () => {
     it('accepts current factory defaults', () => expect(hasNonDefaultBindingData(defaults())).toBe(false))
     it('ignores generated record IDs and selection indexes', () => {
         const data = defaults()
+        ;(data.factoryLibrary.characters as any[])[0].chats[0].promptPresetId = 'preset-id'
         Object.assign((data.library.characters as any[])[0], { chaId: 'other', chatPage: 3 })
-        ;(data.library.characters as any[])[0].chats[0].id = 'other-chat'
+        Object.assign((data.library.characters as any[])[0].chats[0], { id: 'other-chat', promptPresetId: 'other-preset' })
         ;(data.library.botPresets as any[])[0].id = 'other-preset'
         ;(data.library.personas as any[])[0].id = 'other-persona'
         data.library.botPresetsId = 99

@@ -398,6 +398,7 @@ pub(super) const CONVERSATION_FIELDS: &[&str] = &[
     "name",
     "note",
     "onboardingDone",
+    "promptPresetId",
     "rerollRecovery",
     "savedToggleValues",
     "scriptstate",
