@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import fixtures from './fixtures/pocket-features.json'
+import chatFixtures from './fixtures/pocket-chat-features.json'
 import {
+    normalizePocketChat,
     normalizePocketFeatures,
     normalizePocketMessage,
     normalizePocketColdPayload,
@@ -13,6 +15,14 @@ describe('Pocket feature import', () => {
         (_, fixture) => {
             const input = structuredClone(fixture.input)
             normalizePocketMessage(input, 'fallback')
+            expect(input).toEqual(fixture.expected)
+        },
+    )
+    it.each(chatFixtures.map((fixture, index) => [index, fixture] as const))(
+        'matches the shared native chat fixture %i',
+        (_, fixture) => {
+            const input = structuredClone(fixture.input)
+            normalizePocketChat(input, 'fallback', { risuNestSave: 'risuNestSave' in fixture && fixture.risuNestSave })
             expect(input).toEqual(fixture.expected)
         },
     )

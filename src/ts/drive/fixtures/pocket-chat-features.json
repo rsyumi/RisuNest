@@ -1,0 +1,194 @@
+[
+    {
+        "input": {
+            "id": "bound",
+            "bindedBotPreset": "preset-a",
+            "message": []
+        },
+        "expected": {
+            "id": "bound",
+            "promptPresetId": "preset-a",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "both",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": "preset-b",
+            "message": []
+        },
+        "expected": {
+            "id": "both",
+            "promptPresetId": "preset-b",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "unbound-here",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": "",
+            "message": []
+        },
+        "expected": {
+            "id": "unbound-here",
+            "promptPresetId": "",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "empty",
+            "bindedBotPreset": "",
+            "message": []
+        },
+        "expected": {
+            "id": "empty",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "number",
+            "bindedBotPreset": 7,
+            "message": []
+        },
+        "expected": {
+            "id": "number",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "null",
+            "bindedBotPreset": null,
+            "message": []
+        },
+        "expected": {
+            "id": "null",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "unreadable-own",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": null,
+            "message": []
+        },
+        "expected": {
+            "id": "unreadable-own",
+            "promptPresetId": "preset-a",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "number-own",
+            "promptPresetId": 5,
+            "message": []
+        },
+        "expected": {
+            "id": "number-own",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "own",
+            "promptPresetId": "preset-b",
+            "bindedPersona": "persona",
+            "message": []
+        },
+        "expected": {
+            "id": "own",
+            "promptPresetId": "preset-b",
+            "bindedPersona": "persona",
+            "message": []
+        }
+    },
+    {
+        "input": {
+            "id": "toggles",
+            "savedToggleValues": {
+                "toggle_kept": "1",
+                "other": "x",
+                "toggle_number": 2
+            },
+            "bindedPersona": null,
+            "message": []
+        },
+        "expected": {
+            "id": "toggles",
+            "savedToggleValues": {
+                "toggle_kept": "1"
+            },
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-leftover",
+            "bindedBotPreset": "preset-a",
+            "message": []
+        },
+        "expected": {
+            "id": "stored-leftover",
+            "bindedBotPreset": "preset-a",
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-both",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": "preset-b",
+            "message": []
+        },
+        "expected": {
+            "id": "stored-both",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": "preset-b",
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-number",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": 5,
+            "message": []
+        },
+        "expected": {
+            "id": "stored-number",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": 5,
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-toggles",
+            "savedToggleValues": {
+                "toggle_kept": "1",
+                "other": "x"
+            },
+            "bindedPersona": null,
+            "bindedBotPreset": "preset-a",
+            "message": []
+        },
+        "expected": {
+            "id": "stored-toggles",
+            "savedToggleValues": {
+                "toggle_kept": "1"
+            },
+            "bindedBotPreset": "preset-a",
+            "message": []
+        }
+    }
+]

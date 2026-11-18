@@ -313,6 +313,33 @@ describe('conversation context read', () => {
         ])
     })
 
+    it('reads the conversation\'s bound preset and falls back to the selection for a binding that names no preset', async () => {
+        const { store, revision } = await createStore()
+        const target = { characterId: 'char-plain', conversationId: 'conv-plain', include: { lore: true, globals: true } }
+        const bind = async (expectedRevision: number, promptPresetId: string) => {
+            const metadata = (await store.readConversationMetadata('char-plain', 'conv-plain'))!.value
+            await store.commit({
+                expectedRevision,
+                conversations: [{
+                    type: 'replace-range', characterId: 'char-plain', conversationId: 'conv-plain',
+                    start: 3, deleteCount: 0, messages: [],
+                    conversation: { ...metadata.conversation, promptPresetId },
+                }],
+            })
+        }
+
+        await bind(revision, 'preset-other')
+        const bound = await read(store, target)
+        expect(bound.context!.globals!.templateDefaultVariables).toBe('')
+        expect(bound.context!.lore!.modules.map((entry) => entry.id)).toContain('module-unused')
+        expect(bound.context!.lore!.modules.map((entry) => entry.id)).not.toContain('module-int')
+
+        await bind(revision + 1, 'missing')
+        const missing = await read(store, target)
+        expect(missing.context!.globals!.templateDefaultVariables).toBe('tmpl=template\nboth=template\ncharvar=template')
+        expect(missing.context!.lore!.modules.map((entry) => entry.id)).toContain('module-int')
+    })
+
     it.each([
         ['a non-object input', 'input', TypeError],
         ['one ID without the other', { characterId: 'char-plain' }, RangeError],

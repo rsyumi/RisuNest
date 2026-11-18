@@ -1704,6 +1704,7 @@ pub(super) fn replace_commit_lww_rows(
             Ok(())
         })?;
         super::lww::project_replacement_units(&transaction,generation,header,stamp,changes)?;
+        super::lww::project_replacement_listed_fields(&transaction,generation)?;
         changes.visit(false, |key, _, _, _| super::lww::ensure_publishable_parents(&transaction,&key,header.binding_authority))?;
     }
     changes.refresh_orders(&transaction,generation)?;

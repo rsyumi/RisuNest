@@ -24,6 +24,8 @@ mod quarantine;
 mod binding_stage;
 pub(crate) use binding_stage::{BindingUnitStage, StagingObserver, StagingProgress};
 pub(super) use binding_stage::{binding_source_rows, source_digest_rows, catalog_digest, catalog_digest_observed, seed_binding_holds, validate_binding_source, validate_binding_source_rows, BINDING_STAGE_SCHEMA};
+#[path = "lww_listed_fields.rs"]
+mod listed_fields;
 #[path = "lww_intent_rows.rs"]
 pub(super) mod intent_rows;
 pub(super) use intent_rows::FrozenRows;
@@ -36,6 +38,7 @@ mod replacement_source;
 pub(super) use replacement_source::{SourceLayer, REMAPPED as REMAPPED_SOURCE, STAGED as STAGED_SOURCE};
 pub(super) use replacement_source::{clear as clear_replacement_source, insert as insert_replacement_source, units as replacement_source_units};
 pub(super) use projection::validate_received;
+pub(super) use listed_fields::project_replacement_listed_fields;
 pub(super) use projection::{
     apply_mutations, capture_device_changes, capture_targets, is_device, preserve_local_root,
     refresh_orders, archive_object_hashes, archive_value,
