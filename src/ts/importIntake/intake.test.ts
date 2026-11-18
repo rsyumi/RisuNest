@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { get, writable } from 'svelte/store'
+import { get, writable, type Writable } from 'svelte/store'
 import type { NativeImportIntakeClassification } from './classify'
 
 const mocks = vi.hoisted(() => ({
+    runtime: 'tauri' as 'tauri' | 'web',
     os: 'windows' as 'windows' | 'android',
     db: { characters: [] as Array<{ chaId: string; name: string }>, didFirstSetup: true },
     files: new Map<string, Uint8Array>(),
@@ -60,7 +61,7 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
         mocks.files.delete(path)
     }),
 }))
-vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: 'tauri', os: mocks.os })))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: mocks.runtime, os: mocks.os })))
 vi.mock('../mobileBackgroundTask', async () => (await import('../mobileBackgroundTask.testSupport')).mobileBackgroundTaskModule())
 vi.mock('../alert', () => ({ alertError: mocks.alertError, alertNormal: vi.fn() }))
 vi.mock('../stores.svelte', () => ({
@@ -106,10 +107,15 @@ import {
     runSharedNativeFileOperation,
     type NativeFileOperationOutcome,
 } from '../storage/nativeFileJobManager'
-import { selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
+import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'
+import { loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
+import { handleAppDrop } from './drop'
 import { installImportIntake, submitImportDelivery } from './intake'
 import { importDropOverlayVisible, importSheet, resolveImportSheet } from './sheetStore'
 import type { ImportIntakeDelivery, ImportSheetDecision, ImportSheetRequest } from './types'
+
+// The mocked store above is writable.
+const workingSetBlocked = persistentWorkingSetInputBlocked as Writable<boolean>
 
 const encode = (text: string) => new TextEncoder().encode(text)
 const dropped = (name: string, content = `synthetic ${name}`) => new File([encode(content)], name)
@@ -129,6 +135,7 @@ async function answerSheet(decide: (request: ImportSheetRequest) => ImportSheetD
 }
 
 beforeEach(() => {
+    mocks.runtime = 'tauri'
     mocks.os = 'windows'
     mocks.db.characters = []
     mocks.db.didFirstSetup = true
@@ -497,12 +504,13 @@ describe('Android shares', () => {
     })
 })
 
+function dragEvent(type: string, files: File[], types = ['Files']) {
+    const event = new Event(type, { bubbles: true, cancelable: true })
+    Object.defineProperty(event, 'dataTransfer', { value: { types, files, dropEffect: 'none' } })
+    return event as DragEvent
+}
+
 describe('drops on the window', () => {
-    function dragEvent(type: string, files: File[], types = ['Files']) {
-        const event = new Event(type, { bubbles: true, cancelable: true })
-        Object.defineProperty(event, 'dataTransfer', { value: { types, files, dropEffect: 'none' } })
-        return event as DragEvent
-    }
     let dispose: () => void
 
     beforeEach(() => {
@@ -513,6 +521,8 @@ describe('drops on the window', () => {
         dispose()
         onboardingHold.set(false)
         setAppLockInputBlocked(false, false)
+        loadedStore.set(true)
+        workingSetBlocked.set(false)
     })
 
     it('shows the overlay during a file drag and imports the dropped files', async () => {
@@ -530,6 +540,8 @@ describe('drops on the window', () => {
         ['onboarding', () => { mocks.db.didFirstSetup = false }],
         ['the onboarding hold', () => onboardingHold.set(true)],
         ['the app lock', () => setAppLockInputBlocked(true, false)],
+        ['loading', () => loadedStore.set(false)],
+        ['a blocked library', () => workingSetBlocked.set(true)],
     ])('does nothing during %s but still keeps the WebView from opening the file', async (_name, refuse) => {
         refuse()
         const over = dragEvent('dragover', [])
@@ -551,5 +563,23 @@ describe('drops on the window', () => {
         document.body.dispatchEvent(event)
         expect(get(importDropOverlayVisible)).toBe(false)
         expect(event.defaultPrevented).toBe(false)
+    })
+})
+
+describe('the web build', () => {
+    it('installs no window listeners and imports a dropped file through the legacy handler', async () => {
+        mocks.runtime = 'web'
+        const dispose = installImportIntake()
+        document.body.dispatchEvent(dragEvent('dragenter', []))
+        expect(get(importDropOverlayVisible)).toBe(false)
+
+        const file = dropped('card.png')
+        const event = dragEvent('drop', [file])
+        await handleAppDrop(event)
+        dispose()
+        expect(event.defaultPrevented).toBe(true)
+        expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.png', data: file })
+        expect(mocks.classifyRequests).toEqual([])
+        expect(outcomes).toEqual([])
     })
 })
