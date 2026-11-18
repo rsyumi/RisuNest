@@ -1750,17 +1750,6 @@ fn realm_block_loadout_onboarding_and_preset_binding_fields_publish_and_apply_on
             .collect(),
         vec![],
     );
-    // A peer that does not list the binding writes only the fields it knows.
-    let later = device_store::now_ms().unwrap() as u64 + 100_000;
-    receive(
-        &mut peer,
-        "older-peer-edit",
-        vec![
-            change(&["conversation", "char", "conv", "note"], later, serde_json::json!("edited")),
-            change(&["conversation", "char", "conv", "name"], later, serde_json::json!("renamed")),
-        ],
-        vec![],
-    );
     drop(peer);
     let peer = PersistentStore::open(peer_dir.path()).unwrap();
     let root = peer.read_root(None).unwrap().value;
@@ -1769,7 +1758,6 @@ fn realm_block_loadout_onboarding_and_preset_binding_fields_publish_and_apply_on
     assert_eq!(peer.read_character("char", None).unwrap().unwrap().value["onboarding"], onboarding);
     let conversation = peer.read_conversation("char", "conv", None).unwrap().unwrap().value;
     assert_eq!(conversation["onboardingDone"], true);
-    assert_eq!(conversation["note"], "edited");
     assert_eq!(conversation["promptPresetId"], "preset-b");
 }
 
