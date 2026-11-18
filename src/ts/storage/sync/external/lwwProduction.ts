@@ -419,13 +419,17 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
     if (!isTauri) return () => {}
     resumeBoundTarget = resumeBound
     let foreground = () => {}
-    // A page Android keeps running off screen stays visible, so it hears the return only from the app's own start.
+    // A return clears a background time that ran out, also one during the start below. A page Android keeps running
+    // off screen stays visible, so it hears the return only from the app's own start.
+    const visibility = () => { if (document.visibilityState !== 'hidden') outOfTime = false; foreground() }
     const lifecycle = (event: Event) => {
         if (!isTauriAndroid || (event as CustomEvent<{ reason?: unknown } | null>).detail?.reason !== 'start') return
         outOfTime = false; foreground()
     }
+    const unlisten = () => { document.removeEventListener('visibilitychange', visibility); window.removeEventListener('risu-native-lifecycle', lifecycle) }
+    document.addEventListener('visibilitychange', visibility)
     window.addEventListener('risu-native-lifecycle', lifecycle)
-    try { await refreshExternalLwwAdapters(state) } catch (error) { window.removeEventListener('risu-native-lifecycle', lifecycle); throw error }
+    try { await refreshExternalLwwAdapters(state) } catch (error) { unlisten(); throw error }
     const dirty = (generation = false) => { for (const adapter of adapters.values()) if (adapter.state) adapter.scheduler.dirty(generation) }
     const disposeRevision = subscribeLocalPersistentRevision((_revision, cause) => dirty(cause === 'generation-complete'))
     const disposeDevice = await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => dirty())
@@ -474,8 +478,6 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
             }
         }
     }
-    const visibility = () => { if (document.visibilityState !== 'hidden') outOfTime = false; foreground() }
-    document.addEventListener('visibilitychange', visibility)
     window.addEventListener('online', foreground)
     window.addEventListener('offline', foreground)
     const releaseFileOperation = subscribeLibraryFileOperationReleased(() => {
@@ -487,8 +489,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
         disposed = true
         releaseFileOperation()
         disposeRevision(); disposeDevice(); disposeConversation()
-        document.removeEventListener('visibilitychange', visibility); window.removeEventListener('risu-native-lifecycle', lifecycle)
-        window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground)
+        unlisten(); window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground)
         outOfTime = false
         refreshGeneration++
         for (const adapter of [...adapters.values()]) adapter.dispose()

@@ -822,9 +822,11 @@ describe('bounded production calls and lifecycle ownership', () => {
             ['the start', 'kept away before the binding resumes'],
             ['the start', 'back and kept away again'],
             ['the start', 'hidden away'],
+            ['the start', 'hidden away and back while it waits'],
             ['the start', 'back before the expiry arrives'],
         ] as const)('holds routine sync after %s outlives its background time until the app returns (%s)', async (entry, order) => {
-            const android = order !== 'hidden away' && order !== 'back before the expiry arrives'
+            const android = order === 'kept away' || order === 'kept away before the binding resumes' || order === 'back and kept away again'
+            const backBeforeItEnds = order === 'back before the expiry arrives' || order === 'hidden away and back while it waits'
             fixture.os = android ? 'android' : 'ios'
             const expire = expiringHolds()
             if (entry !== 'the start') { dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle() }
@@ -846,9 +848,11 @@ describe('bounded production calls and lifecycle ownership', () => {
             // The app leaves with the page kept running and visible, unless it went hidden first.
             if (order === 'back and kept away again') { show('hidden'); returnToApp(); show('visible') }
             if (order === 'back before the expiry arrives') { show('hidden'); show('visible') }
-            else if (order === 'hidden away') show('hidden')
-            expire(); checked(); release(); await resumed
-            if (order !== 'back before the expiry arrives') {
+            else if (!android) show('hidden')
+            expire()
+            if (order === 'hidden away and back while it waits') show('visible')
+            checked(); release(); await resumed
+            if (!backBeforeItEnds) {
                 expect(await synced()).toBe(false)
                 if (android) returnToApp(); else show('visible')
             }
