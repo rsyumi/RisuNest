@@ -1,6 +1,7 @@
 import { imageAliases, imageFormatFromBytes, stripImageExtension } from './media/imageFormats'
 import { offerHtmlClipboardExport } from './htmlClipboardExport'
 import { defaultChatToggleBinding } from './toggleBindings'
+import { normalizePocketChat } from './drive/pocketRisuFeatures'
 import { materializeAuthorNote } from './authorNotePresets'
 import DOMPurify from 'dompurify'
 import { get, writable } from "svelte/store";
@@ -545,6 +546,8 @@ export async function importChat(){
                             chat.folderId = folderIdMap[chat.folderId]
                         }
                         chat.id = v4()
+                        // PocketRisu and RisuBard chats carry their preset binding and swipes in their own fields.
+                        normalizePocketChat(chat, chat.id)
                     })
                     character.chats.unshift(...chats)
                     return null

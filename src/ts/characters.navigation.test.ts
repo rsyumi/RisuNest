@@ -1056,7 +1056,7 @@ describe('chat list operations', () => {
         expect(new Set(imported.message.map((message: any) => message.chatId)).size).toBe(2)
     })
 
-    it('imports a risuChat file without decoding it through Buffer', async () => {
+    it('imports a risuChat file and the preset binding PocketRisu names without decoding it through Buffer', async () => {
         const character = buildSelectedCharacter()
         mocks.editWindowedChatList.mockReturnValue({ kind: 'unsupported' })
         const message = [
@@ -1068,7 +1068,7 @@ describe('chat list operations', () => {
             data: new TextEncoder().encode(JSON.stringify({
                 type: 'risuChat',
                 ver: 2,
-                data: { id: 'synthetic-source', name: 'Synthetic import', note: '', localLore: [], message },
+                data: { id: 'synthetic-source', name: 'Synthetic import', note: '', localLore: [], message, bindedBotPreset: 'synthetic-preset' },
                 folders: [],
             })),
         })
@@ -1085,6 +1085,9 @@ describe('chat list operations', () => {
         expect(imported.name).toBe('Synthetic import')
         expect(imported.id).not.toBe('synthetic-source')
         expect(imported.message).toEqual(message)
+        // PocketRisu and RisuBard name the chat's bound preset bindedBotPreset.
+        expect(imported.promptPresetId).toBe('synthetic-preset')
+        expect(imported).not.toHaveProperty('bindedBotPreset')
         expect(bufferCalls).toBe(0)
     })
 
