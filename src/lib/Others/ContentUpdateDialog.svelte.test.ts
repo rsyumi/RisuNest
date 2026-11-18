@@ -41,12 +41,13 @@ afterEach(async () => {
 const button = (label: string) => [...document.querySelectorAll('button')].find((element) => element.textContent?.trim() === label) as HTMLButtonElement
 
 it('names fields as the character editor does and updates once every difference has a side', async () => {
-    const installed = { type: 'character', chaId: 'installed', name: 'Luna', creatorNotes: 'old note', chats: [{ id: 'chat' }], extentions: {} }
+    const regex = (comment: string) => ({ comment, type: 'editoutput', in: comment, out: '' })
+    const installed = { type: 'character', chaId: 'installed', name: 'Luna', creatorNotes: 'old note', customscript: [regex('A'), regex('B')], chats: [{ id: 'chat' }], extentions: {} }
     mocks.details.set('installed', structuredClone(installed))
     mocks.db.characters = [installed]
     instance = mount(ContentUpdateDialog, { target: document.body })
     const commit = vi.fn(async (value: any) => { mocks.details.set(value.chaId, structuredClone(value)) })
-    const result = commitImportedCharacter({ type: 'character', chaId: 'incoming', name: 'Luna v2', creatorNotes: 'new note', chats: [], extentions: {} } as any, commit)
+    const result = commitImportedCharacter({ type: 'character', chaId: 'incoming', name: 'Luna v2', creatorNotes: 'new note', customscript: [regex('B'), regex('A')], chats: [], extentions: {} } as any, commit)
     const text = language.risuNest.contentUpdate
 
     await vi.waitFor(() => expect(button(text.next)).toBeTruthy())
@@ -54,6 +55,7 @@ it('names fields as the character editor does and updates once every difference 
     await vi.waitFor(() => expect(contentUpdateDialog.step).toBe('review'))
     await tick()
     expect(document.body.textContent).toContain(language.creatorNotes)
+    expect(document.querySelector('[data-update-item="customscript"]')?.textContent).toContain(`${language.regexScript} ${text.listOrder}`)
     expect(button(text.update).disabled).toBe(true)
 
     button(text.scopeTheirs).click()
@@ -67,5 +69,5 @@ it('names fields as the character editor does and updates once every difference 
     release()
     button(text.update).click()
     expect(await result).toBe('installed')
-    expect(mocks.details.get('installed')).toMatchObject({ name: 'Luna v2', creatorNotes: 'new note', chats: [{ id: 'chat' }] })
+    expect(mocks.details.get('installed')).toMatchObject({ name: 'Luna v2', creatorNotes: 'new note', customscript: [regex('B'), regex('A')], chats: [{ id: 'chat' }] })
 })

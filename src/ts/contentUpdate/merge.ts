@@ -189,6 +189,8 @@ export interface UpdateItem {
     field: string
     /** Item key inside a list or the extensions map; empty for a whole field or a list's order. */
     key: string
+    /** The item is the order of a list: each side holds its entry names in order. */
+    order?: boolean
     status: UpdateItemStatus
     mine: unknown
     theirs: unknown
@@ -246,7 +248,7 @@ function reordered(list: Map<string, unknown>, base: Map<string, unknown>): bool
 }
 
 /** Entry names in list order, shown for the order of a list itself. */
-const entryNames = (list: Map<string, unknown>) => [...list.values()].map((entry: any) => String(entry?.comment || entry?.name || entry?.in || entry?.[0] || ''))
+const entryNames = (list: Map<string, unknown>) => [...list.values()].map((entry: any) => String(entry?.comment || entry?.name || entry?.key || entry?.in || entry?.[0] || ''))
 
 /**
  * Compares the installed entity (mine), the import (theirs) and the import as
@@ -274,9 +276,9 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
             const mineMap = read(m), theirsMap = read(t), baseMap = read(b)
             const mineReordered = !!keyOf && reordered(mineMap, baseMap)
             if (mineReordered && !reordered(theirsMap, baseMap)) keepOrder.push(field)
-            // Both reordered it: the user picks whose order the list follows.
-            else if (mineReordered && reordered(mineMap, theirsMap)) {
-                items.push({ id: field, field, key: '', status: 'conflict', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: true, choice: null })
+            // Both reordered it, or no base tells who did: the user picks whose order the list follows.
+            else if (keyOf && (mineReordered || !hasBase) && reordered(mineMap, theirsMap)) {
+                items.push({ id: field, field, key: '', order: true, status: hasBase ? 'conflict' : 'differs', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: hasBase, choice: null })
             }
             for (const key of new Set([...theirsMap.keys(), ...mineMap.keys(), ...baseMap.keys()])) {
                 if (!mineMap.has(key) && !theirsMap.has(key)) continue

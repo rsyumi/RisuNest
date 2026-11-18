@@ -1851,6 +1851,7 @@ export const languageKorean = {
             summaryEdited: '수정',
             loreSettingsGroup: '로어북 설정',
             loreRootGroup: '폴더 밖 항목',
+            listOrder: '순서',
             groups: { info: '기본 정보', prompt: '프롬프트', lore: '로어북', regex: '정규식', trigger: '트리거', asset: '이미지와 에셋', other: '기타' },
             decideCount: (count: number) => `선택할 항목 ${count}개`,
             noChanges: '설치된 캐릭터가 이 버전과 같습니다.',

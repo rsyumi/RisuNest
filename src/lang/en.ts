@@ -2029,6 +2029,7 @@ export const languageEnglish = {
             summaryEdited: 'Edited',
             loreSettingsGroup: 'Lorebook settings',
             loreRootGroup: 'Outside folders',
+            listOrder: 'order',
             groups: { info: 'Basic Info', prompt: 'Prompts', lore: 'Lorebook', regex: 'Regex', trigger: 'Triggers', asset: 'Images and Assets', other: 'Other' },
             decideCount: (count: number) => `${count} to choose`,
             noChanges: 'The installed character already matches this version.',

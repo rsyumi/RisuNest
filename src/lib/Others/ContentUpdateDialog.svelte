@@ -183,14 +183,14 @@
 
 {#snippet itemView(item: UpdateItem)}
     {@const current = pickOf(item)}
-    {@const name = updateItemName(item)}
+    {@const name = item.order ? `${fieldLabel(item.field)} ${text.listOrder}` : updateItemName(item)}
     {@const editable = isEditable(item)}
     <li class="min-w-0 border-b border-darkborderc/60 py-1 last:border-b-0" data-update-item={item.id}>
         <div class="flex flex-wrap items-center gap-1.5">
             <button type="button" class="flex min-h-9 min-w-0 flex-[1_1_14rem] items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm hover:bg-selected" aria-expanded={!!opened[item.id]} onclick={() => toggle(item.id)}>
                 <ChevronRightIcon size={14} class="shrink-0 text-subtext transition-transform {opened[item.id] ? 'rotate-90' : ''}" />
                 {#if !current}<span class="size-2 shrink-0 rounded-full bg-danger-400" title={text.pendingMark}></span>{/if}
-                {#if item.key}<span class="truncate">{name || text.unnamed}</span>{:else}<span class="font-medium">{fieldLabel(item.field)}</span>{/if}
+                {#if item.key || item.order}<span class="truncate">{name || text.unnamed}</span>{:else}<span class="font-medium">{fieldLabel(item.field)}</span>{/if}
                 <span class="ml-auto shrink-0 text-xs {item.status === 'conflict' || item.status === 'differs' ? 'text-danger-400' : item.status === 'added' || item.status === 'update' ? 'text-success-400' : 'text-subtext'}">{text.status[item.status]}</span>
             </button>
             <span class="inline-flex shrink-0 overflow-hidden rounded-md border border-darkborderc" role="radiogroup" aria-label={name || fieldLabel(item.field)}>
