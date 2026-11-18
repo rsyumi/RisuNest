@@ -80,6 +80,17 @@ fn lacks_field(tx: &Transaction<'_>, generation: &str, key: &UnitKey) -> StoreRe
     Ok(matches!(field_type, Some(None)))
 }
 
+/// Whether a large unit's body is stored. A build that did not share a field kept no body for
+/// its large units, so such a unit waits for a later receive.
+fn body_stored(tx: &Transaction<'_>, value: &UnitValue) -> StoreResult<bool> {
+    let UnitValue::Object { descriptor, .. } = value else { return Ok(true) };
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)",
+        [&descriptor.object_hash],
+        |r| r.get(0),
+    )?)
+}
+
 /// Stored units of the fields `projected` does not list, for documents of `generation` that
 /// lack the field.
 fn lacking_units(tx: &Transaction<'_>, generation: &str, projected: &Projected) -> StoreResult<Vec<(UnitKey, UnitValue)>> {
@@ -109,7 +120,7 @@ fn lacking_units(tx: &Transaction<'_>, generation: &str, projected: &Projected) 
             continue;
         }
         let Some((_, value)) = read_unit(tx, &key)? else { continue };
-        if matches!(value, UnitValue::Deleted) {
+        if matches!(value, UnitValue::Deleted) || !body_stored(tx, &value)? {
             continue;
         }
         // Restoring an archived character projects every unit it holds.
@@ -167,12 +178,19 @@ impl PersistentStore {
 mod tests {
     use super::*;
 
-    // app-v1.0.0 shared 295 root, 78 character and 22 conversation fields. A field listed after
-    // it and missing from `LISTED_SINCE_FIRST_RELEASE` would stay out of the documents after an
-    // upgrade from a build without a record, and after restoring an earlier backup.
+    // app-v1.0.0 shared 295 root, 78 character and 22 conversation fields; the digest covers
+    // their names as `kind:field` lines in order. A field listed after it and missing from
+    // `LISTED_SINCE_FIRST_RELEASE` would stay out of the documents after an upgrade from a
+    // build without a record, and after restoring an earlier backup.
     #[test]
     fn the_first_release_baseline_lists_only_what_app_v1_0_0_shared() {
         let baseline = Projected::first_release();
         assert_eq!((baseline.root.len(), baseline.character.len(), baseline.conversation.len()), (295, 78, 22));
+        let names: String = [("root", &baseline.root), ("character", &baseline.character), ("conversation", &baseline.conversation)]
+            .into_iter()
+            .flat_map(|(kind, fields)| fields.iter().map(move |field| format!("{kind}:{field}
+")))
+            .collect();
+        assert_eq!(risunest_sync_wire::hash(names.as_bytes()), "fc8aa6ccca3d53c942ff8e2c911f949e4f567ec6395a36dc4ad4147740153e4a");
     }
 }

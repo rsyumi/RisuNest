@@ -1777,9 +1777,16 @@ fn opening_projects_received_units_of_newly_shared_fields_once_without_publishin
         change(&["conversation", "char", "local", "onboardingDone"], 10, serde_json::json!(true)),
         change(&["root", "blockedRealmCreators"], 10, blocked.clone()),
         change(&["character", "char", "onboarding"], 10, onboarding.clone()),
+        change(&["conversation", "char", "conv", "authorNotePreset"], 10, serde_json::json!("note-preset")),
     ], vec![]);
+    // That build kept no body for a large unit of a field it did not share.
+    let absent = UnitValue::object(RecordDescriptor::content(risunest_sync_wire::hash(b"\"absent\""))).unwrap();
+    store.connection.execute(
+        "UPDATE lww_units SET value=?1 WHERE json_extract(key,'$[3]')='authorNotePreset'",
+        [serde_json::to_string(&absent).unwrap()],
+    ).unwrap();
     store.connection.execute_batch(
-        "UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId','$.note') WHERE character_id='char' AND conversation_id='conv';
+        "UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId','$.note','$.authorNotePreset') WHERE character_id='char' AND conversation_id='conv';
          UPDATE conversations SET detail=json_set(json_remove(detail,'$.onboardingDone'),'$.promptPresetId','preset-local') WHERE character_id='char' AND conversation_id='local';
          UPDATE characters SET detail=json_remove(detail,'$.onboarding') WHERE character_id='char';
          UPDATE root SET value=json_remove(value,'$.blockedRealmCreators');
@@ -1792,6 +1799,7 @@ fn opening_projects_received_units_of_newly_shared_fields_once_without_publishin
     let conversation = store.read_conversation("char", "conv", None).unwrap().unwrap().value;
     assert_eq!(conversation["promptPresetId"], "preset-b");
     assert!(conversation.get("note").is_none(), "a field the first release shared");
+    assert!(conversation.get("authorNotePreset").is_none(), "a large unit without its body");
     let local = store.read_conversation("char", "local", None).unwrap().unwrap().value;
     assert_eq!(local["promptPresetId"], "preset-local");
     assert_eq!(local["onboardingDone"], true);

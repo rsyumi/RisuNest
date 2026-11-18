@@ -472,14 +472,16 @@ describe('RisuSave persistent store adapter', () => {
     })
 
     it.each([
-        ['before', true],
-        ['after', false],
-        ['absent', false],
-    ] as const)('converts chat preset bindings unless the plugin metadata block is %s the characters', async (marker, kept) => {
+        ['before', 'pluginStorageMeta', true],
+        ['after', 'pluginStorageMeta', false],
+        ['absent', 'pluginStorageMeta', false],
+        // Upstream RisuAI writes other type-12 blocks.
+        ['before', 'kv:synthetic', false],
+    ] as const)('converts chat preset bindings unless the plugin metadata block is %s the characters (%s)', async (marker, name, kept) => {
         const character = { chaId: 'char-1', name: 'Imported', chats: [{ id: 'chat-1', message: [], bindedBotPreset: 'preset-a' }] }
         const block = (type: RisuSaveType, name: string, value: unknown) =>
             encodeRisuSaveBlock({ compression: false, type, name, data: JSON.stringify(value) })
-        const meta = block(RisuSaveType.PLUGIN_STORAGE_META, 'pluginStorageMeta', {})
+        const meta = block(RisuSaveType.PLUGIN_STORAGE_META, name, {})
         const characterBlock = block(RisuSaveType.CHARACTER_WITH_CHAT, 'char-1', character)
         const blocks = await Promise.all(marker === 'before' ? [meta, characterBlock] : marker === 'after' ? [characterBlock, meta] : [characterBlock])
         const bytes = new Uint8Array(magicRisuSaveHeader.length + blocks.reduce((sum, block) => sum + block.length, 0))

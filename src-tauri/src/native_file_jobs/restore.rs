@@ -4782,16 +4782,19 @@ pub(super) mod tests {
             {"id":"bound", "name":"Chat", "message":[], "promptPresetId":"preset-b", "bindedBotPreset":"preset-a"},
         ]});
         // RisuNest writes its plugin metadata block before the characters, so one between them
-        // leaves both converted.
-        for (marker, written_by_risunest) in [(Some(6), true), (Some(7), false), (None, false)] {
+        // leaves both converted, as does another type-12 block before them.
+        let meta = "pluginStorageMeta";
+        for (marker, written_by_risunest) in [
+            (Some((6, meta)), true), (Some((7, meta)), false), (Some((6, "kv:synthetic")), false), (None, false),
+        ] {
             for incremental in [false, true] {
                 let (directory, mut sink) = fixture();
                 sink.incremental = incremental;
                 let mut blocks = valid_blocks();
                 blocks[6] = block(2, true, "char-1", &character("char-1"));
                 blocks.insert(7, block(2, true, "char-2", &character("char-2")));
-                if let Some(index) = marker {
-                    blocks.insert(index, block(12, false, "pluginStorageMeta", &json!({})));
+                if let Some((index, name)) = marker {
+                    blocks.insert(index, block(12, false, name, &json!({})));
                 }
                 let source = directory.path().join("preset-bindings.risudat");
                 fs::write(&source, save_bytes(blocks)).unwrap();
