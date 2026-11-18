@@ -26,7 +26,7 @@ export default defineConfig(({ mode }) => {
                     return adapter('modalNavigationAdapters.ts')
                 }
                 if (/\/src\/lib\/(SideBars\/(LoreBook\/|Scripts\/(Regex|TriggerV1))|Setting\/Pages\/PromptSettings|UI\/(PromptDataItem|GUI\/ListPager|Accordion))/.test(owner)) {
-                    if (/(^|\/)(stores\.svelte|util|alert|lang|database\.svelte|tokenizer|scripts|prompt|templateCheck)$/.test(source)) {
+                    if (/(^|\/)(stores\.svelte|presetEditor\.svelte|util|alert|lang|database\.svelte|tokenizer|scripts|prompt|templateCheck)$/.test(source)) {
                         return adapter('dragDropAdapters.svelte.ts')
                     }
                     if (/(Help|TextAreaInput|ToggleDefinitionEditor|ModelList|AuxModelSelectors)\.svelte$/.test(source)) {

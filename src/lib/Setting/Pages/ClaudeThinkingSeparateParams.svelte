@@ -1,6 +1,6 @@
 <script lang="ts">
     import { language } from 'src/lang';
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { getModelInfo } from 'src/ts/model/modellist';
     import { LLMFlags } from 'src/ts/model/types';
     import SliderInput from 'src/lib/UI/GUI/SliderInput.svelte';
@@ -30,7 +30,7 @@
         }
         return paramKey
     })
-    let modelInfo = $derived(getModelInfo(effectiveModel))
+    let modelInfo = $derived(getModelInfo(effectiveModel, DBState.db))
 
     let hasXHighEffort = $derived(modelInfo.flags.includes(LLMFlags.claudeXHighEffort))
 

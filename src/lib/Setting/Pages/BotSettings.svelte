@@ -8,7 +8,7 @@
     import { language } from "src/lang";
     import Help from "src/lib/Others/Help.svelte";
     
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { customProviderStore } from "src/ts/plugins/plugins.svelte";
     import { downloadFile } from "src/ts/globalApi.svelte";
     import { isTauri } from "src/ts/platform"
@@ -99,9 +99,9 @@
     let { goPromptTemplate = () => {} }: Props = $props();
 
     async function loadTokenize(){
-        tokens.mainPrompt = await tokenizeAccurate(DBState.db.mainPrompt, true)
-        tokens.jailbreak = await tokenizeAccurate(DBState.db.jailbreak, true)
-        tokens.globalNote = await tokenizeAccurate(DBState.db.globalNote, true)
+        tokens.mainPrompt = await tokenizeAccurate(DBState.db.mainPrompt, true, DBState.db)
+        tokens.jailbreak = await tokenizeAccurate(DBState.db.jailbreak, true, DBState.db)
+        tokens.globalNote = await tokenizeAccurate(DBState.db.globalNote, true, DBState.db)
     }
 
     $effect.pre(() => {
@@ -118,8 +118,8 @@
 
 
     let submenu = $state(DBState.db.useLegacyGUI ? -1 : 0)
-    let modelInfo = $derived(getModelInfo(DBState.db.aiModel))
-    let subModelInfo = $derived(getModelInfo(DBState.db.subModel))
+    let modelInfo = $derived(getModelInfo(DBState.db.aiModel, DBState.db))
+    let subModelInfo = $derived(getModelInfo(DBState.db.subModel, DBState.db))
     let nanogptInputMode = $state<'list' | 'manual'>(DBState.db.nanogptRequestModel && !DBState.db.nanogptRequestModelName ? 'manual' : 'list')
     // svelte-ignore state_referenced_locally
     let prevNanogptInputMode = nanogptInputMode;

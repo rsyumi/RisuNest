@@ -257,6 +257,44 @@ it.each(['remove', 'copy'] as const)('rejects queued %s after a same-name reorde
     expect(live.botPresets[3]).toEqual({ ...preset('X Copy', 'B'), id: expect.stringMatching(/^[0-9a-f-]{36}$/) })
 })
 
+it('keeps the selection when another preset is removed and names the selection for the icon while another preset is applied', async () => {
+    let chainPick: string | null = 'b'
+    const live = {
+        botPresetsId: 2,
+        botPresets: ['a', 'b', 'c', 'd', 'e'].map(id => ({ ...preset(id.toUpperCase(), id), id })),
+    } as unknown as Database
+    const controller = createPresetWorkingSetController({
+        getDatabase: () => live,
+        getEffectivePresetId: () => chainPick ?? live.botPresets[live.botPresetsId].id,
+        getEffectivePresetOverride: () => chainPick,
+        clearEffectivePresetOverride: () => { chainPick = null },
+        captureCurrentPreset: () => null,
+        applyPreset: (root, selected) => { (root as Database).mainPrompt = selected.mainPrompt },
+        mutatePersistentPresets: async (_reason, mutate) => {
+            const state = { root: { botPresetsId: live.botPresetsId } as any, presets: structuredClone(live.botPresets) }
+            await mutate(state)
+            Object.assign(live, state.root)
+            live.botPresets = state.presets
+        },
+    })
+
+    await controller.updateActivePresetImage('icon')
+    expect(live.botPresets.map(item => item.image)).toEqual([undefined, undefined, 'icon', undefined, undefined])
+    await controller.removePreset(0)
+    expect(live.botPresets[live.botPresetsId].id).toBe('c')
+    expect(chainPick).toBe('b')
+    await controller.removePreset(2)
+    expect(live.botPresets[live.botPresetsId].id).toBe('c')
+    await controller.removePreset(0)
+    expect(live.botPresets[live.botPresetsId].id).toBe('c')
+    expect(chainPick).toBeNull()
+    // Removing the selected preset falls back to the first one.
+    await controller.removePreset(0)
+    expect(live.botPresets.map(item => item.id)).toEqual(['e'])
+    expect(live.botPresetsId).toBe(0)
+    expect(live.mainPrompt).toBe('e')
+})
+
 it('rejects a confirmed same-name replacement before entering the mutation queue', async () => {
     const live = { botPresetsId: 0, botPresets: [preset('X', 'A'), preset('X', 'B')] } as Database
     const expected = capturePresetNames(live.botPresets)

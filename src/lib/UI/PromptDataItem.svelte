@@ -11,7 +11,7 @@
     import GripVertical from "@lucide/svelte/icons/grip-vertical";
     import Trash from "@lucide/svelte/icons/trash";
     import TextInput from "./GUI/TextInput.svelte";
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { RISU_PROMPT_DRAG_TYPE } from "src/ts/dragTypes";
     import { alertConfirm } from "src/ts/alert";
     import { promptBlockTypeName, promptBlockTypes } from "src/ts/process/promptBlockTypes";

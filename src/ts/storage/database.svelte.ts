@@ -30,6 +30,9 @@ import {
 import { normalizeInlayEncodeOptions } from './blobStore';
 import { v4 } from 'uuid';
 import * as identity from './effectiveIdentityState';
+import * as presetEditor from './presetEditor.svelte';
+import { isConversationSummaryStub } from './conversationResidency';
+import { doingChat } from '../process/generationState';
 import { configurePersistentIdentityHooks } from './persistentIdentityHooks';
 export { presetMirrorMap, protectedPresetGroups } from './effectiveIdentityState';
 
@@ -2125,6 +2128,18 @@ function applyEffectivePreset(db: Database, preset: botPreset): void {
     setPreset(db, preset)
 }
 
+/** Reads a preset's stored body into the library before it is applied. */
+async function loadPresetBody(id: string, runtime: typeof import('./persistentDataRuntime.svelte')): Promise<Database> {
+    const value = await runtime.getPersistentDataRuntime().store.readPreset(id)
+    if (!value) throw new Error('Preset was not found')
+    const db = getDatabase()
+    const currentIndex = db.botPresets.findIndex(preset => preset.id === id)
+    if (currentIndex < 0) throw new Error('Preset was not found')
+    // A loaded record may hold edits made during the read.
+    if (!identity.isLoadedPreset(db.botPresets[currentIndex])) db.botPresets[currentIndex] = value.value
+    return db
+}
+
 export async function activatePresetOverride(index: number | null): Promise<void> {
     // The index names a preset in the library as it is now; it can move while awaiting.
     const id = index === null ? null : getDatabase().botPresets[index]?.id
@@ -2135,14 +2150,83 @@ export async function activatePresetOverride(index: number | null): Promise<void
         setEffectivePresetOverride(null)
         return
     }
-    const value = await runtime.getPersistentDataRuntime().store.readPreset(id)
-    if (!value) throw new Error('Preset was not found')
+    setEffectivePresetOverride(id, await loadPresetBody(id, runtime))
+}
+
+/** The preset ID a conversation binds when it names a preset in the library; summary stubs carry no binding. */
+function resolveConversationPresetBinding(db: Database, chat: Chat | undefined): string | null {
+    const id = chat && !isConversationSummaryStub(chat) ? chat.promptPresetId : undefined
+    return typeof id === 'string' && id && db.botPresets?.some(preset => preset?.id === id) ? id : null
+}
+
+let presetBindingGeneration = 0
+
+/**
+ * Applies the selected conversation's preset binding, or none. A bound catalog stub is read
+ * first, and the result is dropped when another selection or request applied a binding meanwhile.
+ */
+export async function applyConversationPresetBinding(db: Database, chat: Chat | undefined): Promise<void> {
+    const generation = ++presetBindingGeneration
+    const id = resolveConversationPresetBinding(db, chat)
+    const loaded = !id || identity.isLoadedPreset(db.botPresets.find(preset => preset?.id === id))
+    if (loaded && id === identity.getEffectivePresetBinding(db)) return
+    if (id && !loaded) {
+        // Another conversation's binding must not stay applied while this one loads.
+        if (identity.getEffectivePresetBinding(db) !== null) identity.setEffectivePresetBinding(db, null, applyEffectivePreset)
+        const runtime = await import('./persistentDataRuntime.svelte')
+        await runtime.flushPendingData('preset-binding')
+        if (generation !== presetBindingGeneration || getDatabase() !== db) return
+        await loadPresetBody(id, runtime)
+        if (generation !== presetBindingGeneration || getDatabase() !== db) return
+    }
+    identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
+}
+
+/**
+ * Applies the binding of the conversation a request generates for, before the request reads
+ * the mirrors. Returns true when that conversation is bound, which replaces the preset chain.
+ */
+export async function activateRequestPresetBinding(target: { characterId: string, conversationId: string } | undefined): Promise<boolean> {
+    ++presetBindingGeneration
     const db = getDatabase()
-    const currentIndex = db.botPresets.findIndex(preset => preset.id === id)
-    if (currentIndex < 0) throw new Error('Preset was not found')
-    // A loaded record may hold edits made during the read.
-    if (!runtime.isLoadedPreset(db.botPresets[currentIndex])) db.botPresets[currentIndex] = value.value
-    setEffectivePresetOverride(id, db)
+    const chat = target ? db.characters?.find(character => character.chaId === target.characterId)
+        ?.chats?.find(chat => chat.id === target.conversationId) : undefined
+    const id = resolveConversationPresetBinding(db, chat)
+    if (!id) {
+        if (identity.getEffectivePresetBinding(db) !== null) identity.setEffectivePresetBinding(db, null, applyEffectivePreset)
+        return false
+    }
+    let current = db
+    if (!identity.isLoadedPreset(db.botPresets.find(preset => preset?.id === id))) {
+        const runtime = await import('./persistentDataRuntime.svelte')
+        await runtime.flushPendingData('preset-binding')
+        current = await loadPresetBody(id, runtime)
+    }
+    identity.setEffectivePresetBinding(current, id, applyEffectivePreset, { clearOverride: true })
+    return identity.getEffectivePresetBinding(current) === id
+}
+
+/**
+ * Applies a binding carried across a whole database replacement, which starts a new identity
+ * state. A selection or request that applies a binding while a stub body is read wins.
+ */
+export async function carryPresetBinding(id: string, readPreset?: (id: string) => Promise<{ value: botPreset } | null>): Promise<void> {
+    const db = getDatabase()
+    const record = db.botPresets?.find(preset => preset?.id === id)
+    if (!record) return
+    if (identity.isLoadedPreset(record)) {
+        identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
+        return
+    }
+    if (!readPreset) return
+    const generation = presetBindingGeneration
+    const value = await readPreset(id)
+    if (!value || generation !== presetBindingGeneration || getDatabase() !== db ||
+        identity.getEffectivePresetBinding(db) !== null) return
+    const index = db.botPresets.findIndex(preset => preset?.id === id)
+    if (index < 0) return
+    if (!identity.isLoadedPreset(db.botPresets[index])) db.botPresets[index] = value.value
+    identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
 }
 
 export function flushEffectivePersonaEdits(db: Database = getDatabase()): void {
@@ -2169,19 +2253,34 @@ export function prepareImportedIdentityState(db: Database): void {
     identity.prepareImportedIdentityState(db)
 }
 
+identity.observeEffectivePresetDerive({
+    // A derive may apply the preset the settings window edits, so its edits reach the record first.
+    beforeDerive: (db) => presetEditor.flushPresetEditorEdits(db),
+    afterDerive: (db) => presetEditor.syncPresetEditorTarget(db, applyEffectivePreset),
+})
+
 configurePersistentIdentityHooks({
     beforeCapture() {
         const db = DBState.db
+        presetEditor.flushPresetEditorEdits(db)
         flushEffectivePresetEdits(db)
         flushEffectivePersonaEdits(db)
         flushEffectiveToggleEdits(db)
     },
     afterRemoteApply() {
         const db = DBState.db
+        const character = db.characters?.[get(selectedCharID)]
+        const chat = character?.chats?.[character.chatPage]
+        // A running request keeps the binding of the conversation it generates for. A bound
+        // catalog stub stays unapplied here; the chat lifecycle reads its body first.
+        if (!get(doingChat)) {
+            const id = resolveConversationPresetBinding(db, chat)
+            const loaded = id && identity.isLoadedPreset(db.botPresets.find(preset => preset?.id === id))
+            identity.restoreEffectivePresetBinding(db, loaded ? id : null)
+        }
         deriveEffectivePresetMirrors(db)
         deriveEffectivePersonaMirrors(db)
-        const character = db.characters?.[get(selectedCharID)]
-        deriveEffectiveToggleVariables(db, character?.chats?.[character.chatPage])
+        deriveEffectiveToggleVariables(db, chat)
     },
     translateRootUnitIntents(mutations) {
         return identity.translateRootUnitIntents(DBState.db, mutations)

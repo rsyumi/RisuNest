@@ -3,6 +3,8 @@ import type { Database } from '../../src/ts/storage/database.svelte'
 export { languageEnglish as language } from '../../src/lang/en'
 
 export const DBState = $state({ db: {} as Database })
+// The prompt settings read the preset fields they edit through this.
+export const presetEditorDBState = DBState
 export const selectedCharID = writable(0)
 export const alertConfirm = async () => true
 export const tokenizeAccurate = async () => 0
