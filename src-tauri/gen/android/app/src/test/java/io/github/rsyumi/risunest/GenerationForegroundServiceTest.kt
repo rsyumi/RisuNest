@@ -303,6 +303,38 @@ class GenerationForegroundServiceTest {
   }
 
   @Test
+  fun `leaving during launch keeps the page until a moment after the startup work it then holds`() {
+    val delays = Delays()
+    val kept = mutableListOf<Boolean>()
+    lateinit var policy: PageKeptActivePolicy
+    val host = Hosted { policy.onHeldChanged(it) }
+    policy = PageKeptActivePolicy({ kept.add(it) }, host::keepService, delays.post, delays.remove)
+    policy.onResumedChanged(true)
+    policy.onResumedChanged(false)
+    host.registry.promote(host.start)
+    assertEquals(listOf(true), kept)
+    assertEquals(BACKGROUND_ACTIVE, host.begin(taskId(1), "sync", deferred = true))
+    // The first hold ends the launch window, so only the holds keep the page from here.
+    delays.elapse()
+    assertEquals(listOf(true), kept)
+    assertTrue(host.end(taskId(1)))
+    delays.elapse()
+    assertEquals(listOf(true, false), kept)
+
+    // A launch left with no hold lets the page go when its window ends.
+    val idle = mutableListOf<Boolean>()
+    val launch = PageKeptActivePolicy({ idle.add(it) }, { null }, delays.post, delays.remove)
+    launch.onResumedChanged(true)
+    launch.onResumedChanged(false)
+    assertEquals(listOf(true), idle)
+    delays.elapse()
+    delays.elapse()
+    assertEquals(listOf(true, false), idle)
+    launch.onHeldChanged(true)
+    assertEquals(listOf(true, false), idle)
+  }
+
+  @Test
   fun `a page left before its work began keeps the service a moment after each hold so the next hold joins it`() {
     val delays = Delays()
     val kept = mutableListOf<Boolean>()
@@ -310,6 +342,9 @@ class GenerationForegroundServiceTest {
     val host = Hosted { policy.onHeldChanged(it) }
     policy = PageKeptActivePolicy({ kept.add(it) }, host::keepService, delays.post, delays.remove)
     policy.onResumedChanged(true)
+    // The launch window ends with nothing held, so the page goes hidden when the app leaves.
+    delays.elapse()
+    delays.elapse()
     policy.onResumedChanged(false)
     host.registry.promote(host.start)
     // The first hold begins off screen while the platform still allows a start.
@@ -325,7 +360,7 @@ class GenerationForegroundServiceTest {
     assertEquals(0, host.stops)
     delays.elapse()
     assertEquals(1, host.stops)
-    assertEquals(emptyList<Boolean>(), kept)
+    assertEquals(listOf(true, false), kept)
   }
 
   @Test

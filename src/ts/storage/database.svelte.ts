@@ -1711,6 +1711,12 @@ export interface folder{
     id:string
     imgFile?:string
     img?:string
+    // RisuNest folder appearance; older readers ignore these and keep showing `color` and the image.
+    iconText?:string
+    iconType?:'text'|'image'|'glyph'
+    colorStops?:string[]
+    colorAngle?:number
+    textColor?:string
 }
 
 

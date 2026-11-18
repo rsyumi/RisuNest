@@ -35,6 +35,8 @@
     import EasyPanel from './lib/Others/ProTools/EasyPanel.svelte';
     import PopupEditor from './lib/Others/PopupEditor.svelte';
     import TextEditorPopup from './lib/Others/TextEditorPopup.svelte';
+    import FolderManagerPanel from './lib/SideBars/FolderManagerPanel.svelte';
+    import { folderManager } from './ts/gui/folderManager.svelte';
     import { textEditorPopup } from './ts/gui/textEditorPopup.svelte';
     import LoadoutModal from './lib/Others/LoadoutModal.svelte';
     import OnboardingModal from './lib/Others/OnboardingModal.svelte';
@@ -528,6 +530,9 @@
     {/if}
     {#if customSideBarConfigDialogStore.open}
         <CustomSidebarConfig />
+    {/if}
+    {#if folderManager.folderId && folderManager.draft}
+        <FolderManagerPanel />
     {/if}
     <NativeFileJobDialog />
     <UpdatePopup />

@@ -37,17 +37,20 @@ fn a_resume_inside_a_batch_applies_its_stored_pages_without_reading_their_segmen
     tauri::async_runtime::block_on(async {
         use crate::external_storage::{lww_engine::Admission, lww_tests::CycleFixture};
         use crate::persistent_store::{lww::{ApplyReceive, UnitMutation}, WorkingSetCommit};
-        let mut f = CycleFixture::new();
-        for index in 0..6 {
-            f.a.commit(&WorkingSetCommit {
-                expected_revision: f.a.revision().unwrap(),
+        async fn edit(a: &mut crate::persistent_store::PersistentStore, sender: &mut ExternalLwwEngine, index: usize) {
+            a.commit(&WorkingSetCommit {
+                expected_revision: a.revision().unwrap(),
                 unit_mutations: Some(vec![UnitMutation::Set {
                     key: risunest_sync_wire::unit::UnitKey::new(&["root", "language"]).unwrap(),
                     value: serde_json::json!(format!("synthetic-{index}")),
                 }]),
                 ..Default::default()
             }).unwrap();
-            f.publish_a().await;
+            sender.publish(a, 0.into(), &[], &Cancellation::default()).await.unwrap();
+        }
+        let mut f = CycleFixture::new();
+        for index in 0..6 {
+            edit(&mut f.a, &mut f.sender, index).await;
         }
         let segments = f.sender.listing(&Cancellation::default()).await.unwrap()
             .into_iter().map(|receipt| receipt.locator.object).collect::<Vec<_>>();
@@ -70,9 +73,15 @@ fn a_resume_inside_a_batch_applies_its_stored_pages_without_reading_their_segmen
                 session.resume(Cancellation::default());
                 session.engine.as_mut().unwrap().admission = Some(Admission::synthetic(now));
             }
+            if applied == 6 {
+                // Another return comes right after the batch's last page, and another device has published since.
+                edit(&mut f.a, &mut f.sender, 6).await;
+                session.resume(Cancellation::default());
+                session.engine.as_mut().unwrap().admission = Some(Admission::synthetic(now));
+            }
         }
-        assert_eq!(applied, 6);
-        assert_eq!(f.b.read_root(None).unwrap().value["language"], "synthetic-5");
+        assert_eq!(applied, 7, "the receive after a return stops at the stored pages without listing again");
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "synthetic-6");
         assert_eq!(segments.iter().map(|id| provider.read_attempts(id)).collect::<Vec<_>>(), [1; 6],
             "a segment whose pages were stored is read again");
     });
