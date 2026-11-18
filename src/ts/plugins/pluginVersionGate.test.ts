@@ -208,6 +208,32 @@ describe('plugin API version gate', () => {
         expect(confirm).toHaveBeenCalledOnce()
         expect(getDatabase().plugins).toEqual([existing])
     })
+
+    it.each([
+        ['after the caller asked', { confirmed: true }],
+        ['as an update', { isUpdate: true, originalPluginName: 'kept' }],
+    ])('replaces a plugin %s and keeps argument values the new version declares with the same type', async (_, options) => {
+        getDatabase().plugins.push({
+            ...makePlugin('kept', '3.0'),
+            script: 'old',
+            arguments: { limit: 'int', label: 'string', mode: 'string', removed: 'int' },
+            realArg: { limit: 7, label: 'kept text', mode: 'fast', removed: 3 },
+        })
+        const confirm = vi.spyOn(alertModule, 'alertConfirm').mockResolvedValue(false)
+        const code = '//@name kept\n//@api 3.0\n//@arg limit int\n//@arg label string\n//@arg mode int\n//@arg added string\n\nconsole.log("new")'
+        expect(await importPlugin(code, options)).toBe(true)
+        expect(confirm).not.toHaveBeenCalled()
+        expect(getDatabase().plugins.map(plugin => [plugin.name, plugin.script])).toEqual([['kept', code]])
+        expect(getDatabase().plugins[0].realArg).toEqual({ limit: 7, label: 'kept text', mode: 0, added: '' })
+    })
+
+    it('installs nothing when TypeScript fails to transpile', async () => {
+        expect(await importPlugin('//@name typed\n//@api 3.0\n\nlet value: = ;', { isTypescript: true, confirmed: true })).toBe(false)
+        expect(getDatabase().plugins).toEqual([])
+        expect(alertError).toHaveBeenCalledOnce()
+        expect(alertError.mock.calls[0][0]).toContain('Failed to transpile TypeScript code')
+        expect(loadV3Plugins).not.toHaveBeenCalled()
+    })
 })
 
 
