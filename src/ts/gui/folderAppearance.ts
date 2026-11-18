@@ -235,6 +235,11 @@ export function applyFolderDraft<T extends folder>(folder: T, draft: FolderDraft
     }
     set('iconText', draft.iconText.trim() ? draft.iconText : undefined)
     if (draft.imgFile) next.imgFile = draft.imgFile
+    else if (next.imgFile) {
+        // A removed image is cleared the way upstream resets a folder image.
+        next.imgFile = null
+        next.img = ''
+    }
     // 이미지 without an image shows the text, so it is stored as text.
     const chosen = draft.iconType === 'image' && !next.imgFile ? 'text' : draft.iconType
     set('iconType', chosen === folderIconType({ imgFile: next.imgFile }) ? undefined : chosen)

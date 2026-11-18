@@ -79,10 +79,12 @@ describe('stored folder appearance', () => {
         expect(back).toEqual({ ...original, name: '로맨스', color: 'pink', iconType: 'glyph' })
     })
 
-    it('stores 이미지 without an image as text', () => {
+    it('stores 이미지 without an image as text and clears a removed image the way upstream resets it', () => {
         const plain = stored()
         expect(applyFolderDraft(plain, { ...folderDraftFrom(plain, theme), iconType: 'image' })).toEqual(plain)
         expect(applyFolderDraft(plain, { ...folderDraftFrom(plain, theme), iconType: 'image', imgFile: 'assets/new.png' })).toEqual({ ...plain, imgFile: 'assets/new.png' })
+        const withImage = stored({ imgFile: 'assets/f.png', img: 'blob:f' })
+        expect(applyFolderDraft(withImage, { ...folderDraftFrom(withImage, theme), imgFile: null })).toEqual(stored({ imgFile: null as unknown as string, img: '' }))
     })
 })
 

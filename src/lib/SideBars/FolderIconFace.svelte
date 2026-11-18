@@ -55,10 +55,11 @@
         {:else}
             <FolderIcon />
         {/if}
-    {:else if appearance.iconType === 'text'}
+    {:else}
+        <!-- An image tile shows its text only while the image cannot be read. -->
         <div class="lines" style:font-size="{fit.size}px" style:line-height={folderIconLineHeight}>
             {#each fit.lines as line, index (index)}
-                <div class:clip={fit.clipped} style:max-width={fit.clipped ? `${fit.maxWidths[index]}px` : null}>{line}</div>
+                <div class:clip={fit.clipped} style:max-width={fit.clipped ? `${fit.maxWidths[index]}px` : null}>{line || '\u00a0'}</div>
             {/each}
         </div>
     {/if}

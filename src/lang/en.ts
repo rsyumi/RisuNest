@@ -1996,6 +1996,7 @@ export const languageEnglish = {
             iconGlyph: 'Folder',
             iconTextLabel: 'Icon text',
             selectImage: 'Select Image',
+            removeImage: 'Remove Image',
             color: 'Color',
             colorPreset: 'Preset',
             colorSolid: 'Custom',

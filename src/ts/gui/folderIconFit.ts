@@ -62,26 +62,37 @@ function wordLayouts(words: string[], count: number, measure: MeasureLine): stri
     return lines.length === count ? [lines] : []
 }
 
-function syllableLayout(text: string, words: string[], count: number): Layout | null {
-    // Latin words and numbers never break.
-    if (/[\p{Script=Latin}\p{Nd}]/u.test(text)) return null
-    const units = graphemes(words.join(''))
+const unbreakable = /[\p{Script=Latin}\p{Nd}]/u
+
+function syllableLayout(words: string[], count: number): Layout | null {
+    // Other characters may break between any two and drop the spaces between them.
+    // Latin words and numbers never break and keep the spaces beside them.
+    const units: string[] = []
+    let spaced = false
+    for (const unit of graphemes(words.join(' '))) {
+        if (unit === ' ') { spaced = true; continue }
+        const last = units.at(-1) ?? ''
+        if (unbreakable.test(unit) && unbreakable.test(last)) units[units.length - 1] = last + (spaced ? ' ' : '') + unit
+        else units.push(spaced && (unbreakable.test(unit) || unbreakable.test(last)) ? ` ${unit}` : unit)
+        spaced = false
+    }
     if (units.length < 2 * count) return null
     // Even lines, longer ones first, so every line keeps at least two.
     const lines: string[] = []
     let start = 0
     for (let line = 0; line < count; line++) {
         const length = Math.floor(units.length / count) + (line < units.length % count ? 1 : 0)
-        lines.push(units.slice(start, start + length).join(''))
+        lines.push(units.slice(start, start + length).join('').trim())
         start += length
     }
     return { lines, syllable: words.length > 1 }
 }
 
 function layouts(text: string, measure: MeasureLine): Layout[] {
-    const given = text.split('\n').map((line) => line.trim()).filter(Boolean)
+    // Blank lines between lines keep their place.
+    const given = text.trim().split('\n').map((line) => line.trim())
     if (given.length > 1) {
-        const lines = given.length > maxLines ? [...given.slice(0, maxLines - 1), given.slice(maxLines - 1).join(' ')] : given
+        const lines = given.length > maxLines ? [...given.slice(0, maxLines - 1), given.slice(maxLines - 1).filter(Boolean).join(' ')] : given
         return [{ lines, syllable: false }]
     }
     const single = given[0] ?? ''
@@ -89,7 +100,7 @@ function layouts(text: string, measure: MeasureLine): Layout[] {
     const result: Layout[] = [{ lines: [single], syllable: false }]
     for (let count = 2; count <= maxLines; count++) {
         for (const lines of wordLayouts(words, count, measure)) result.push({ lines, syllable: false })
-        const syllable = syllableLayout(single, words, count)
+        const syllable = syllableLayout(words, count)
         if (syllable) result.push(syllable)
     }
     return result

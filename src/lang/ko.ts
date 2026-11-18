@@ -1818,6 +1818,7 @@ export const languageKorean = {
             iconGlyph: '폴더 모양',
             iconTextLabel: '아이콘 글자',
             selectImage: '이미지 선택',
+            removeImage: '이미지 제거',
             color: '색상',
             colorPreset: '기본 색상',
             colorSolid: '직접 선택',

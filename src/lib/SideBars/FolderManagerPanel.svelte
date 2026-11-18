@@ -92,21 +92,27 @@
         draft.iconType = type
     }
 
+    // A folder without its own colours starts them from what it shows, and they follow that until they are changed.
+    let colorSeed: string | null = null
+    let textSeed: string | null = null
+
     function chooseColorMode(mode: FolderColorMode) {
-        // A folder that never had its own colour starts from the preset it shows.
         if (draft.colorMode === 'preset' && mode !== 'preset' && stored && !resolveFolderAppearance(stored).stops) {
             const base = folderPresetBaseHex(draft.preset, theme)
-            draft.solid = base
-            draft.gradient[0] = base
+            if (colorSeed === null || draft.solid === colorSeed) draft.solid = base
+            if (colorSeed === null || draft.gradient[0] === colorSeed) draft.gradient[0] = base
+            colorSeed = base
         }
         draft.colorMode = mode
         openPicker = null
     }
 
     function chooseTextMode(mode: 'auto' | 'manual') {
-        if (mode === 'manual' && draft.textMode === 'auto' && appearance) {
+        if (mode === 'manual' && draft.textMode === 'auto' && appearance && stored && !resolveFolderAppearance(stored).textColor) {
             const automatic = folderTextStyle({ ...appearance, textColor: null }).color
-            draft.textColor = automatic ?? normalizeHexColor(getComputedStyle(document.documentElement).getPropertyValue('--risu-theme-textcolor')) ?? '#ffffff'
+                ?? normalizeHexColor(getComputedStyle(document.documentElement).getPropertyValue('--risu-theme-textcolor')) ?? '#ffffff'
+            if (textSeed === null || draft.textColor === textSeed) draft.textColor = automatic
+            textSeed = automatic
         }
         draft.textMode = mode
         if (mode === 'auto' && openPicker === 'text') openPicker = null
@@ -132,7 +138,13 @@
         else draft.textColor = value
     }
 
-    async function chooseImage() {
+    let choosingImage: Promise<void> | null = null
+
+    function chooseImage() {
+        choosingImage ??= pickImage().finally(() => { choosingImage = null })
+    }
+
+    async function pickImage() {
         const folderId = folderManager.folderId
         const file = await selectSingleFile(imageAliases, { image: true })
         if (!file) return
@@ -146,6 +158,8 @@
         if (saving) return
         saving = true
         try {
+            // A chosen image may still be reading or saving; the folder is saved with it.
+            await choosingImage?.catch(() => {})
             await saveFolderManager()
         } finally {
             saving = false
@@ -259,6 +273,9 @@
                                 {/await}
                             {/if}
                             <button type="button" class="button" onclick={chooseImage}>{text.selectImage}</button>
+                            {#if draft.imgFile}
+                                <button type="button" class="button" onclick={() => { draft.imgFile = null }}>{text.removeImage}</button>
+                            {/if}
                         </div>
                     {/if}
                 </div>

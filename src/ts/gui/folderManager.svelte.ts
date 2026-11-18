@@ -56,11 +56,14 @@ export async function saveFolderManager() {
         closeFolderManager()
         return
     }
-    const next = applyFolderDraft($state.snapshot(found.folder) as folder, draft)
-    if (next.imgFile && next.imgFile !== found.folder.imgFile) next.img = await getFileSrc(next.imgFile)
-    // The order may have changed while the image source resolved.
+    const img = draft.imgFile && draft.imgFile !== found.folder.imgFile ? await getFileSrc(draft.imgFile) : undefined
+    // The folder may have moved or changed its characters while the image source resolved.
     const current = findFolder(folderId)
-    if (current) DBState.db.characterOrder[current.index] = next
+    if (current) {
+        const next = applyFolderDraft($state.snapshot(current.folder) as folder, draft)
+        if (img !== undefined) next.img = img
+        DBState.db.characterOrder[current.index] = next
+    }
     closeFolderManager()
 }
 
