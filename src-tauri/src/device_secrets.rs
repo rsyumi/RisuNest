@@ -669,10 +669,12 @@ mod platform {
     fn record_failure(operation: &str, cause: &str) -> Error {
         let message = format!("Secret Service {operation} failed: {cause}");
         // Bypass libtest capture: the call that precedes a daemon abort may belong to a passing test.
+        // libtest names each test's thread after the test.
         #[cfg(test)]
         {
             use std::io::Write;
-            let _ = writeln!(std::io::stderr(), "{message}");
+            let thread = std::thread::current();
+            let _ = writeln!(std::io::stderr(), "{message} [{}]", thread.name().unwrap_or("unnamed thread"));
         }
         crate::native_log::log_global("warn", "device-secrets", message);
         unavailable()
@@ -717,8 +719,9 @@ mod platform {
 
     #[test]
     fn unavailable_secret_service_calls_log_their_cause() {
-        let timed_out = dbus::Error::new_custom("org.freedesktop.DBus.Error.NoReply", "synthetic timeout");
-        let wrapped = dbus_secret_service_failure(timed_out);
+        // A real NoReply in the test log must come from a real Secret Service call.
+        let synthetic = dbus::Error::new_custom("io.github.rsyumi.risunest.test.SyntheticError", "synthetic failure");
+        let wrapped = dbus_secret_service_failure(synthetic);
         assert_eq!(read_error(keyring::Error::PlatformFailure(wrapped)), Error::Unavailable);
         assert_eq!(
             read_error(keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("synthetic")))),
@@ -730,7 +733,7 @@ mod platform {
             .filter(|entry| entry.target == "device-secrets")
             .map(|entry| entry.message)
             .collect::<Vec<_>>();
-        assert!(messages.contains(&"Secret Service read failed: org.freedesktop.DBus.Error.NoReply".to_owned()), "{messages:?}");
+        assert!(messages.contains(&"Secret Service read failed: io.github.rsyumi.risunest.test.SyntheticError".to_owned()), "{messages:?}");
         assert!(messages.contains(&"Secret Service read failed: no-storage-access".to_owned()), "{messages:?}");
     }
 
