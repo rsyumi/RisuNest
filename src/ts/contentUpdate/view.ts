@@ -6,6 +6,7 @@ import type { UpdateItem } from './merge'
 // Body fields are always shown as blocks so both sides line up in the diff.
 const blockKeys = new Set(['content', 'in', 'out'])
 const longText = (key: string, value: string) => blockKeys.has(key) || value.includes('\n') || value.length > 60
+const isRecord = (value: unknown) => !!value && typeof value === 'object' && !Array.isArray(value)
 
 /** Plain text of one side of an update item, for the line diff. */
 export function updateValueText(value: unknown): string {
@@ -23,6 +24,8 @@ export function updateValueText(value: unknown): string {
             const item = record[key]
             if (item === undefined || key === 'id' || key === 'loreCache') continue
             if (typeof item === 'string' && longText(key, item)) blocks.push(`[${key}]\n${item}`)
+            // Entries such as trigger effects, so the code they hold shows line by line.
+            else if (Array.isArray(item) && item.length && item.every(isRecord)) blocks.push(`[${key}]\n${item.map(updateValueText).join('\n---\n')}`)
             else lines.push(`${key}: ${JSON.stringify(item)}`)
         }
         return [...lines, ...blocks].join('\n')
