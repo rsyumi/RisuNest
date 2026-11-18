@@ -26,8 +26,10 @@ const PNG_KEYWORD_AND_SEPARATOR_BYTES: usize = 80;
 /// Small enough that skipping a large chunk does not read it.
 const PNG_WALK_BUFFER_BYTES: usize = 256;
 const ZIP_LOCAL_ENTRY: &[u8] = b"PK\x03\x04";
+const ZIP_LOCAL_HEADER_BYTES: usize = 30;
+const ZIP64_EXTRA_ID: u16 = 0x0001;
 const PORTABLE_FORMAT_ENTRY: &[u8] = b"format.json";
-const PORTABLE_FORMAT_MAX_BYTES: u32 = 16 * 1024;
+const PORTABLE_FORMAT_MAX_BYTES: u64 = 16 * 1024;
 const JSON_READ_BUFFER_BYTES: usize = 64 * 1024;
 const UNCLASSIFIED_SOURCE_MESSAGE: &str = "this source cannot be classified in place";
 
@@ -199,9 +201,14 @@ fn classify_file(
     file.by_ref().take(PREFIX_BYTES).read_to_end(&mut prefix)?;
 
     // `detect` falls back to any zlib header, so it only sees backup signatures and backup names.
-    // A ZIP reaches it only through its signature: the streaming reader drains an entry it rejects.
-    let backup_name = matches!(extension, "risunest" | "risudat" | "bin");
-    if is_backup_signature(&prefix) || (backup_name && !prefix.starts_with(ZIP_LOCAL_ENTRY)) {
+    // A ZIP reaches it only through a portable `format.json` first entry: the streaming reader
+    // drains an entry it rejects.
+    let backup_candidate = if prefix.starts_with(ZIP_LOCAL_ENTRY) {
+        is_portable_format_entry(file, &prefix)?
+    } else {
+        is_risusave_magic(&prefix) || matches!(extension, "risunest" | "risudat" | "bin")
+    };
+    if backup_candidate {
         file.seek(SeekFrom::Start(0))?;
         if let Ok(format) = detect(file.try_clone()?) {
             return Ok(Found::Content(Kind::Backup, backup_format(format)));
@@ -247,28 +254,72 @@ fn backup_format(format: BackupSourceFormat) -> IntakeFormat {
     }
 }
 
-/// The RisuSave magics `detect` accepts, or a portable backup's leading `format.json`.
-fn is_backup_signature(prefix: &[u8]) -> bool {
+/// The RisuSave magics `detect` accepts.
+fn is_risusave_magic(prefix: &[u8]) -> bool {
     prefix.starts_with(b"RISUSAVE\0")
         || prefix.starts_with(b"\0RISUSAVE\0")
         || prefix.starts_with(b"\0\0RISU")
-        || is_portable_format_entry(prefix)
 }
 
-/// The first local ZIP entry is a `format.json` small enough for `detect` to accept.
-fn is_portable_format_entry(prefix: &[u8]) -> bool {
-    let le_u16 = |offset: usize| {
-        prefix
-            .get(offset..offset + 2)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+/// The first local ZIP entry is a `format.json` small enough for `detect` to accept. The
+/// portable writer marks its sizes for ZIP64, so they may sit in the entry's extra field.
+fn is_portable_format_entry(file: &mut File, prefix: &[u8]) -> io::Result<bool> {
+    let name_end = ZIP_LOCAL_HEADER_BYTES + PORTABLE_FORMAT_ENTRY.len();
+    if le_u16(prefix, 26) != Some(PORTABLE_FORMAT_ENTRY.len() as u16)
+        || prefix.get(ZIP_LOCAL_HEADER_BYTES..name_end) != Some(PORTABLE_FORMAT_ENTRY)
+    {
+        return Ok(false);
+    }
+    let (Some(compressed), Some(uncompressed), Some(extra_length)) =
+        (le_u32(prefix, 18), le_u32(prefix, 22), le_u16(prefix, 28))
+    else {
+        return Ok(false);
     };
-    let compressed_size = prefix
-        .get(18..22)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
-    prefix.starts_with(ZIP_LOCAL_ENTRY)
-        && compressed_size.is_some_and(|size| size <= PORTABLE_FORMAT_MAX_BYTES)
-        && le_u16(26) == Some(PORTABLE_FORMAT_ENTRY.len() as u16)
-        && prefix.get(30..30 + PORTABLE_FORMAT_ENTRY.len()) == Some(PORTABLE_FORMAT_ENTRY)
+    let compressed = if compressed == u32::MAX {
+        let mut extra = vec![0_u8; usize::from(extra_length)];
+        file.seek(SeekFrom::Start(name_end as u64))?;
+        if !read_full(file, &mut extra)? {
+            return Ok(false);
+        }
+        match zip64_compressed_size(&extra, uncompressed == u32::MAX) {
+            Some(size) => size,
+            None => return Ok(false),
+        }
+    } else {
+        u64::from(compressed)
+    };
+    Ok(compressed <= PORTABLE_FORMAT_MAX_BYTES)
+}
+
+/// The compressed size in a local ZIP64 extra field, which lists the uncompressed
+/// size first when that one is marked too.
+fn zip64_compressed_size(mut extra: &[u8], uncompressed_marked: bool) -> Option<u64> {
+    while let (Some(id), Some(length)) = (le_u16(extra, 0), le_u16(extra, 2)) {
+        let end = 4 + usize::from(length);
+        let data = extra.get(4..end)?;
+        if id == ZIP64_EXTRA_ID {
+            let offset = if uncompressed_marked { 8 } else { 0 };
+            return data.get(offset..offset + 8).map(|bytes| {
+                u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ])
+            });
+        }
+        extra = &extra[end..];
+    }
+    None
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset + 2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// The CharX probe of the content import, with its classification limits.
@@ -726,6 +777,25 @@ mod tests {
         )
     }
 
+    /// An empty backup from the product writer, which stores ZIP64 sizes in each local header.
+    fn product_portable() -> Vec<u8> {
+        struct Never;
+        impl crate::local_backup::CancellationProbe for Never {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let jobs = directory.path().join("jobs");
+        fs::create_dir(&jobs).unwrap();
+        let path = directory.path().join("backup.risunest");
+        crate::portable_backup::Catalog::create(&jobs, "synthetic-intake", 0)
+            .unwrap()
+            .write_candidate(&path, false, &Never)
+            .unwrap();
+        fs::read(path).unwrap()
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(bytes).unwrap();
@@ -931,7 +1001,8 @@ mod tests {
                 br#"{"spec":"chara_card_v2"}"#.to_vec(),
                 character(),
             ),
-            ("backup.risunest", portable(), content("backup", "portable")),
+            ("backup.risunest", product_portable(), content("backup", "portable")),
+            ("product.zip", product_portable(), content("backup", "portable")),
             ("portable.zip", portable(), content("backup", "portable")),
             (
                 "backup.risudat",
