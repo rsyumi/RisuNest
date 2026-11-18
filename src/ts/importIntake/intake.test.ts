@@ -497,29 +497,43 @@ describe('Android shares', () => {
     it('refuses and releases a shared backup that came with other files and imports the rest', async () => {
         classify('backup.risunest', { kind: 'backup', format: 'portable' })
         classify('card.json', { kind: 'character', format: 'json' })
+        classify('preset.risup', { kind: 'preset', format: 'risup' })
         mocks.discardResult = false
+        // A share delivers its spooled files and the cache copies of the other files together.
+        const presetPath = `/data/cache/opened_files/${'b'.repeat(64)}-1-preset.risup`
+        mocks.files.set(presetPath, encode('synthetic preset'))
         const delivered = submitImportDelivery({ origin: 'opened', sources: [
             spool('backup-token', 'backup.risunest'),
             spool('card-token', 'card.json', '{"name":"Synthetic"}'),
+            { type: 'path', path: presetPath },
             { type: 'androidSpoolFailure', failure: { displayName: 'broken.png', code: 'source-copy-failed' } },
         ] })
         const request = await answerSheet(({ items }) => items.filter(item => !item.refusal).map(item => ({ id: item.id })))
         await delivered
 
         expect(request.items.map(item => [item.name, item.refusal?.code])).toEqual([
-            ['backup.risunest', 'backup-with-other-files'], ['card.json', undefined], ['broken.png', 'read-failed'],
+            ['backup.risunest', 'backup-with-other-files'], ['card.json', undefined], ['preset.risup', undefined],
+            ['broken.png', 'read-failed'],
         ])
         expect(mocks.classifyRequests).toEqual([[
             { source: { type: 'androidSpool', token: 'backup-token' }, displayName: 'backup.risunest' },
             { source: { type: 'androidSpool', token: 'card-token' }, displayName: 'card.json' },
+            { source: { type: 'desktopPath', path: presetPath }, displayName: 'preset.risup' },
         ]])
         expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.json', data: encode('{"name":"Synthetic"}') })
+        expect(mocks.preset).toHaveBeenCalledExactlyOnceWith({ name: 'preset.risup', data: encode('synthetic preset') })
         expect(outcomes).toEqual([expect.objectContaining({
-            state: 'succeeded', location: { kind: 'character', chaId: 'card.json-id' },
+            state: 'succeeded',
+            batch: expect.objectContaining({ entries: [
+                { name: 'card.json', state: 'imported', location: { kind: 'character', chaId: 'card.json-id' } },
+                { name: 'preset.risup', state: 'imported', location: { kind: 'preset' } },
+            ] }),
         })])
         expect(mocks.restoreAndroid).not.toHaveBeenCalled()
         expect(mocks.discarded.sort()).toEqual(['backup-token', 'card-token'])
         expect(mocks.alertError).toHaveBeenCalledExactlyOnceWith(`backup.risunest: ${failureReason('discard-failed')}`)
+        // The cache copy belongs to the opened-file queue, which acknowledges it after the delivery.
+        expect(mocks.removed).toEqual([])
     })
 
     it('restores a lone shared backup and leaves its spool to the restore', async () => {
