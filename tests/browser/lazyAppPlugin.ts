@@ -5,7 +5,7 @@ import { stubbed } from './autoStubPlugin'
 const root = resolve(import.meta.dirname, '../..').replaceAll('\\', '/')
 const fixture = resolve(import.meta.dirname).replaceAll('\\', '/')
 const lazyScreens = new Map([
-    ['Settings.svelte', 'settings'], ['GridCatalog.svelte', 'grid'], ['botpreset.svelte', 'presets'],
+    ['Settings.svelte', 'settings'], ['GridCatalog.svelte', 'grid'], ['PresetManager.svelte', 'presets'],
     ['listedPersona.svelte', 'personas'], ['CustomGUISettingMenu.svelte', 'custom'],
 ])
 const retained = new Set(['MobileBody.svelte', 'MobileFooter.svelte', 'MobileHeader.svelte', 'Settings.svelte', 'LazyScreenError.svelte', 'LoadingIndicator.svelte', 'AppLockGate.svelte', 'AppLockScreen.svelte', 'AppLockCover.svelte', 'SyncExitDialog.svelte', 'ErrorDetails.svelte', 'SettingButton.svelte', 'BootFailurePanel.svelte', 'AlertComp.svelte', 'Button.svelte'])

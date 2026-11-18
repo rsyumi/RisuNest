@@ -1801,6 +1801,13 @@ export const languageKorean = {
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
         presetList: {
+            noMatch: '검색 결과가 없습니다.',
+            export: '내보내기',
+            import: '가져오기',
+            compare: '비교',
+            compareHint: '비교할 프리셋 두 개를 선택하세요.',
+            inherit: '현재 프리셋 사용',
+            chatPreset: '현재 채팅',
         },
         promptList: {
         },
