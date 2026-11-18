@@ -153,6 +153,8 @@ describe('applyUpdate', () => {
         expect(both.plan.items).toMatchObject([{ id: 'customscript', status: 'conflict', choice: null, mine: ['B', 'A', 'C'], theirs: ['A', 'C', 'B'] }])
         expect(merge(both, { customscript: 'mine' })).toEqual(['B', 'A', 'C'])
         expect(merge(both, { customscript: 'theirs' })).toEqual(['A', 'C', 'B'])
+        // Both added the same entry, in different places.
+        expect(plan(['A', 'B'], ['A', 'X', 'B'], ['X', 'A', 'B']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
         // Without a base, who reordered it is unknown.
         expect(planUpdate(CHARACTER_UPDATE, both.m, both.t, null).items).toMatchObject([{ id: 'customscript', order: true, status: 'differs', choice: null }])
     })

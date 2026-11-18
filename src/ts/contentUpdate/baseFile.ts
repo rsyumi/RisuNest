@@ -8,7 +8,9 @@ import { PngChunk } from '../pngChunk'
 import { convertCharbook } from '../characterCards'
 import type { RisuModule } from '../process/modules'
 import { convertCharacterToModule } from '../interchangeability'
+import { convertJsonToModule } from '../process/moduleImportLocation'
 import { decodeImportUtf8 } from '../importUtf8'
+import { normalizeOnboarding } from '../onboarding'
 import { decodeRPack } from '../rpack/rpack_js'
 
 // Reads an earlier version of a character or module file as the base of an
@@ -109,6 +111,8 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         defaultVariables: risu?.defaultVariables ?? '',
         lowLevelAccess: risu?.lowLevelAccess ?? false,
         hideChatIcon: risu?.hideChatIcon ?? false,
+        onboarding: normalizeOnboarding(risu?.onboarding),
+        source: risu?.source ?? [],
         moduleNamespace: risu?.moduleNamespace,
         customModuleToggle: risu?.toggles ?? {},
         prebuiltAssetCommand: risu?.prebuiltAssetCommand ?? '',
@@ -140,10 +144,11 @@ export async function readUpdateBaseFile(kind: 'character' | 'module', file: { n
     let module: RisuModule | null = null
     if (name.endsWith('.risum')) {
         module = await moduleFromRisum(file.data)
-    } else if (name.endsWith('.json')) {
+    } else if (name.endsWith('.json') || name.endsWith('.lorebook')) {
         const parsed = JSON.parse(text(file.data))
-        if (parsed?.type === 'risuModule') module = parsed
-        else card = parsed
+        // A lorebook or regex file is the module its import converts it to.
+        module = parsed?.type === 'risuModule' ? parsed : kind === 'module' ? (await convertJsonToModule(parsed))?.module ?? null : null
+        if (!module) card = parsed
     } else if (name.endsWith('.png')) {
         card = await cardFromPng(file.data)
     } else if (name.endsWith('.charx') || name.endsWith('.jpg') || name.endsWith('.jpeg')) {

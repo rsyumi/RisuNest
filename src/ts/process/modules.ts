@@ -7,7 +7,6 @@ import { downloadFile, forageStorage, LocalWriter, readImage, saveAsset, Virtual
 import { AppendableBuffer } from "../appendableBuffer"
 import { checkPersonaBinded, selectMultipleFile, sleep } from "../util"
 import { v4 } from "uuid"
-import { convertExternalLorebook } from "./lorebook.svelte"
 import { decodeRPack, encodeRPack } from "../rpack/rpack_js"
 import { DBState, HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../stores.svelte"
 import {get} from "svelte/store"
@@ -19,7 +18,7 @@ import { readFile } from '@tauri-apps/plugin-fs'
 import type { NativeFileJobOptions, NativeFileJobSource } from '../storage/nativeFileJobs'
 import { importContentBatch } from '../storage/contentImportBatch'
 import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from '../storage/nativeFileJobManager'
-import { nativeModuleLocation, type ModuleImportLocation } from './moduleImportLocation'
+import { convertJsonToModule, nativeModuleLocation, type ModuleImportLocation } from './moduleImportLocation'
 import { assertModuleMCPImportAllowed, StdioModuleImportError } from './mcp/moduleImport'
 import { selectConversationModules } from './moduleSelection'
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
@@ -471,48 +470,8 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
             }
             return await commitImportedModuleData(importData, { kind: 'module' })
         }
-        // importData.type === 'risu' in conflict with HypaV3 preset exports
-        // difference: record vs. array
-        if (
-            importData.type === 'risu' &&
-            importData.data &&
-            Array.isArray(importData.data)
-        ) {
-            const lores: loreBook[] = importData.data
-            const importModule = {
-                name: importData.name || 'Imported Lorebook',
-                description:
-                    importData.description || 'Converted from risu lorebook',
-                lorebook: lores,
-                id: v4(),
-            }
-            return await commitImportedModuleData(importModule, { kind: 'module-from-lorebook' })
-        }
-        if (importData.entries) {
-            const lores: loreBook[] = convertExternalLorebook(
-                importData.entries,
-            )
-            const importModule = {
-                name: importData.name || 'Imported Lorebook',
-                description:
-                    importData.description ||
-                    'Converted from external lorebook',
-                lorebook: lores,
-                id: v4(),
-            }
-            return await commitImportedModuleData(importModule, { kind: 'module-from-lorebook' })
-        }
-        if (importData.type === 'regex' && importData.data) {
-            const regexs: customscript[] = importData.data
-            const importModule = {
-                name: importData.name || 'Imported Regex',
-                description:
-                    importData.description || 'Converted from risu regex',
-                regex: regexs,
-                id: v4(),
-            }
-            return await commitImportedModuleData(importModule, { kind: 'module' })
-        }
+        const converted = await convertJsonToModule(importData)
+        if (converted) return await commitImportedModuleData(converted.module, converted.location)
     } catch (error) {
         console.error(error)
         if (error instanceof StdioModuleImportError) {

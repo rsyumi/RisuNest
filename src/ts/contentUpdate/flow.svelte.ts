@@ -226,7 +226,9 @@ async function confirmLowLevelAccess(decision: Decision, triggerField: string): 
     if (decision.kind !== 'update') return true
     const taken = (item: UpdateItem) => (decision.choices[item.id] ?? item.choice) !== 'mine'
     const access = decision.plan.items.find((item) => item.field === 'lowLevelAccess')
-    if (!access?.mine || taken(access) || !decision.plan.items.some((item) => item.field === triggerField && taken(item))) return true
+    // Only a trigger the import brings in runs new code; a removal or a new order does not.
+    const brought = (item: UpdateItem) => item.field === triggerField && item.key && item.theirs !== undefined && taken(item)
+    if (!access?.mine || taken(access) || !decision.plan.items.some(brought)) return true
     return await alertConfirm(language.lowLevelAccessConfirm)
 }
 
@@ -306,7 +308,7 @@ export async function loadContentUpdateBaseFile() {
     const dialog = contentUpdateDialog
     if (!pending || dialog.busy) return
     const { selectSingleFile } = await import('../util')
-    const file = await selectSingleFile(['charx', 'png', 'json', 'risum', 'jpg', 'jpeg'])
+    const file = await selectSingleFile(['charx', 'png', 'json', 'lorebook', 'risum', 'jpg', 'jpeg'])
     if (!file || !pending) return
     const { entity, incoming } = pending
     const target = dialog.target
@@ -319,8 +321,7 @@ export async function loadContentUpdateBaseFile() {
         // The card readers load only when a file is chosen.
         const { readUpdateBaseFile } = await import('./baseFile')
         const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
-        const plan = planUpdate(entity.spec, mine, incoming, base)
-        for (const item of plan.items) if (updateGroupOf(item) === 'asset') Object.assign(item, { status: 'differs', baseKnown: false, choice: null })
+        const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
         const ids = new Set(plan.items.map((item) => item.id))
         dialog.plan = plan
         dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id]) => ids.has(id)))

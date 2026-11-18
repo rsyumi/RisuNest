@@ -239,11 +239,11 @@ function mapEntries(value: unknown): Map<string, unknown> {
 
 const has = (record: object, key: string) => Object.prototype.hasOwnProperty.call(record, key)
 
-/** Whether the entries a list shares with the base come in another order than in the base. */
-function reordered(list: Map<string, unknown>, base: Map<string, unknown>): boolean {
-    const order = [...base.keys()].filter((key) => list.has(key))
+/** Whether the entries a list shares with another come in another order there. */
+function reordered(list: Map<string, unknown>, other: Map<string, unknown>): boolean {
+    const order = [...other.keys()].filter((key) => list.has(key))
     let index = 0
-    for (const key of list.keys()) if (base.has(key) && key !== order[index++]) return true
+    for (const key of list.keys()) if (other.has(key) && key !== order[index++]) return true
     return false
 }
 
@@ -253,44 +253,47 @@ const entryNames = (list: Map<string, unknown>) => [...list.values()].map((entry
 /**
  * Compares the installed entity (mine), the import (theirs) and the import as
  * it was installed (base, null when unknown). Fields the import does not set
- * and the user's own data are left out.
+ * and the user's own data are left out. Fields `unread` names compare as
+ * without a base, for a base that does not carry them.
  */
-export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: T, base: Partial<T> | null): UpdatePlan {
-    const hasBase = !!base
+export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: T, base: Partial<T> | null, unread?: (field: string) => boolean): UpdatePlan {
     const items: UpdateItem[] = []
     const keepOrder: string[] = []
-    const push = (field: string, key: string, values: { b?: unknown, m?: unknown, t?: unknown }, present: { mine: boolean, theirs: boolean, base: boolean }) => {
-        const verdict = decide(hasBase, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
-        if (!verdict || spec.silent.has(field)) return
-        items.push({ id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b, baseKnown: hasBase && present.base, ...verdict })
-    }
     for (const field of Object.keys(theirs)) {
         if (spec.preserved.has(field)) continue
+        const known = !!base && !unread?.(field)
+        const push = (key: string, values: { b?: unknown, m?: unknown, t?: unknown }, present: { mine: boolean, theirs: boolean, base: boolean }) => {
+            const verdict = decide(known, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
+            if (!verdict || spec.silent.has(field)) return
+            items.push({ id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b, baseKnown: known && present.base, ...verdict })
+        }
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
-        const b = base ? (base as any)[field] : undefined
+        const b = known ? (base as any)[field] : undefined
         const keyOf = has(spec.lists, field) ? spec.lists[field] : null
         const silentKeys = has(spec.maps, field) ? spec.maps[field] : null
         if (keyOf || silentKeys) {
             const read = keyOf ? (value: unknown) => keyed(keyOf, value) : mapEntries
             const mineMap = read(m), theirsMap = read(t), baseMap = read(b)
-            const mineReordered = !!keyOf && reordered(mineMap, baseMap)
-            if (mineReordered && !reordered(theirsMap, baseMap)) keepOrder.push(field)
-            // Both reordered it, or no base tells who did: the user picks whose order the list follows.
-            else if (keyOf && (mineReordered || !hasBase) && reordered(mineMap, theirsMap)) {
-                items.push({ id: field, field, key: '', order: true, status: hasBase ? 'conflict' : 'differs', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: hasBase, choice: null })
+            // The entries both have come in another order. The base settles it only when one side alone moved them.
+            if (keyOf && reordered(mineMap, theirsMap)) {
+                const mineMoved = reordered(mineMap, baseMap), theirsMoved = reordered(theirsMap, baseMap)
+                if (known && mineMoved && !theirsMoved) keepOrder.push(field)
+                else if (!known || mineMoved === theirsMoved) {
+                    items.push({ id: field, field, key: '', order: true, status: known ? 'conflict' : 'differs', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: known, choice: null })
+                }
             }
             for (const key of new Set([...theirsMap.keys(), ...mineMap.keys(), ...baseMap.keys()])) {
                 if (!mineMap.has(key) && !theirsMap.has(key)) continue
                 if (silentKeys?.has(key)) continue
-                push(field, key, { b: baseMap.get(key), m: mineMap.get(key), t: theirsMap.get(key) },
+                push(key, { b: baseMap.get(key), m: mineMap.get(key), t: theirsMap.get(key) },
                     { mine: mineMap.has(key), theirs: theirsMap.has(key), base: baseMap.has(key) })
             }
             continue
         }
-        push(field, '', { b, m, t }, { mine: true, theirs: true, base: true })
+        push('', { b, m, t }, { mine: true, theirs: true, base: true })
     }
-    return { hasBase, items, keepOrder }
+    return { hasBase: !!base, items, keepOrder }
 }
 
 export function unresolvedItems(plan: UpdatePlan): UpdateItem[] {

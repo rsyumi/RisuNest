@@ -93,7 +93,7 @@ const groupFields: Record<Exclude<UpdateGroupId, 'other'>, string[]> = {
 const fieldGroup = new Map<string, UpdateGroupId>()
 for (const [group, fields] of Object.entries(groupFields)) for (const field of fields) fieldGroup.set(field, group as UpdateGroupId)
 
-export function updateGroupOf(item: UpdateItem): UpdateGroupId {
+export function updateGroupOf(item: Pick<UpdateItem, 'field'>): UpdateGroupId {
     return fieldGroup.get(item.field) ?? 'other'
 }
 

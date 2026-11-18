@@ -207,30 +207,35 @@ describe('character update', () => {
         expect(await releasedKeys()).toEqual(['assets/third.png'])
     })
 
-    it('asks about the assets an earlier file does not carry, ones the user removed too', async () => {
-        install(card('old', 'Luna', { desc: 'old', image: '', additionalAssets: [] }))
-        const map = ['map', 'assets/map.png', 'png']
-        const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'new', image: 'assets/new.png', additionalAssets: [map] }), commitCharacter)
+    it('asks about the assets an earlier file does not carry, ones the user removed or reordered too', async () => {
+        const asset = (name: string) => [name, `assets/${name}.png`, 'png']
+        install(card('old', 'Luna', { desc: 'old', image: '', additionalAssets: [asset('b'), asset('a')] }))
+        const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'new', image: 'assets/new.png', additionalAssets: [asset('a'), asset('b'), asset('map')] }), commitCharacter)
         await opened()
         await reviewContentUpdate()
+        setContentUpdateChoice('additionalAssets', 'mine')
         const earlier = { spec: 'chara_card_v2', data: { name: 'Luna', description: 'old' } }
         vi.mocked(selectSingleFile).mockResolvedValueOnce({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify(earlier)) })
         await loadContentUpdateBaseFile()
         expect(contentUpdateDialog.baseSource.kind).toBe('file')
-        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.status, item.choice])).toEqual([
-            ['name', 'update', 'theirs'], ['desc', 'update', 'theirs'], ['image', 'differs', null], ['additionalAssets', 'differs', null],
+        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, !!item.order, item.status, item.choice])).toEqual([
+            ['name', false, 'update', 'theirs'], ['desc', false, 'update', 'theirs'], ['image', false, 'differs', null],
+            ['additionalAssets', true, 'differs', null], ['additionalAssets', false, 'differs', null],
         ])
-        chooseContentUpdate('cancel')
-        expect(await pending).toBeNull()
+        for (const item of unresolvedItems(contentUpdateDialog.plan!)) if (!contentUpdateDialog.choices[item.id]) setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        expect(await pending).toBe('old')
+        // The order picked before the file was read still holds.
+        expect(mocks.details.get('old').additionalAssets.map((entry: string[]) => entry[0])).toEqual(['b', 'map', 'a'])
     })
 
     it('asks before low-level access the user turned on covers triggers the update takes', async () => {
         await commitImportedCharacter(card('first', 'Luna v1.0', { lowLevelAccess: false, triggerscript: [] }), commitCharacter)
         mocks.details.get('first').lowLevelAccess = true
         const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
-        const update = async (id: string) => {
+        const update = async (id: string, triggerscript = [trigger]) => {
             // A card without the field, as older cards come.
-            const pending = commitImportedCharacter(card(id, 'Luna v1.1', { triggerscript: [trigger] }), commitCharacter)
+            const pending = commitImportedCharacter(card(id, 'Luna v1.1', { triggerscript }), commitCharacter)
             await opened()
             await reviewContentUpdate()
             chooseContentUpdate('update')
@@ -243,6 +248,10 @@ describe('character update', () => {
         expect(await update('accepted')).toBe('first')
         expect(mocks.alertConfirm).toHaveBeenCalledTimes(2)
         expect(mocks.details.get('first')).toMatchObject({ lowLevelAccess: true, triggerscript: [trigger] })
+        // Taking the author's removal of that trigger brings in no code.
+        expect(await update('removed', [])).toBe('first')
+        expect(mocks.alertConfirm).toHaveBeenCalledTimes(2)
+        expect(mocks.details.get('first').triggerscript).toEqual([])
     })
 
     it('opens the review of the named character for the update action, whatever the import is called', async () => {

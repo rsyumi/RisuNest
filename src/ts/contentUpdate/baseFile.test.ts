@@ -36,7 +36,10 @@ const cardV3 = {
         post_history_instructions: 'post',
         character_version: '1.0',
         nickname: 'Lu',
-        extensions: { color: 'red', risuai: { customScripts: [{ comment: 'r', in: 'a', out: 'b', type: 'editoutput' }] }, depth_prompt: { depth: 1 } },
+        extensions: {
+            color: 'red', depth_prompt: { depth: 1 },
+            risuai: { customScripts: [{ comment: 'r', in: 'a', out: 'b', type: 'editoutput' }], onboarding: { enabled: true, title: 'Welcome' }, source: ['from-risuai'] },
+        },
         character_book: { extensions: {}, entries: [{ keys: ['town'], content: 'town lore', extensions: {}, enabled: true, insertion_order: 1, comment: 'Town' }] },
     },
 }
@@ -86,8 +89,10 @@ describe('readUpdateBaseFile', () => {
         const base = await readUpdateBaseFile('character', { name: 'Luna.json', data: encode(cardV3) }) as any
         expect(base).toMatchObject({
             name: 'Luna', desc: 'desc', firstMessage: 'hello', replaceGlobalNote: 'post', characterVersion: '1.0', nickname: 'Lu',
-            extentions: { color: 'red' }, customscript: [{ comment: 'r' }],
+            extentions: { color: 'red' }, customscript: [{ comment: 'r' }], onboarding: { enabled: true, title: 'Welcome' },
         })
+        const v2 = await readUpdateBaseFile('character', { name: 'Luna.json', data: encode({ ...cardV3, spec: 'chara_card_v2' }) }) as any
+        expect(v2.source).toEqual(['from-risuai'])
         expect(base.globalLore).toEqual([{ comment: 'Town', content: 'town lore' }])
         expect(base.loreSettings).toEqual({ scanDepth: 1 })
         expect(base).not.toHaveProperty('chaId')
@@ -110,6 +115,14 @@ describe('readUpdateBaseFile', () => {
         const module = { name: 'Lore', description: 'd', id: 'other-install', updateLineage: 'file', updateBase: 'assets/x.json', assets: [['a', 'assets/a.png', 'png']], lorebook: [] }
         expect(await readUpdateBaseFile('module', { name: 'Lore.risum', data: await risum(module) })).toEqual({ name: 'Lore', description: 'd', lorebook: [] })
         expect(await readUpdateBaseFile('module', { name: 'Lore.json', data: encode({ ...module, type: 'risuModule' }) })).toEqual({ name: 'Lore', description: 'd', lorebook: [] })
+    })
+
+    it('reads a lorebook or regex file as the module its import converts it to', async () => {
+        const lore = { key: 'k', comment: 'Town', content: 'c' }
+        expect(await readUpdateBaseFile('module', { name: 'Lore.lorebook', data: encode({ type: 'risu', name: 'Lore', data: [lore] }) }))
+            .toEqual({ name: 'Lore', description: 'Converted from risu lorebook', lorebook: [lore] })
+        expect(await readUpdateBaseFile('module', { name: 'Regex.json', data: encode({ type: 'regex', data: [] }) }))
+            .toEqual({ name: 'Imported Regex', description: 'Converted from risu regex', regex: [] })
     })
 
     it('refuses files that hold no card or module', async () => {
