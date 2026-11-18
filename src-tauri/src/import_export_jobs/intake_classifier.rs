@@ -145,7 +145,6 @@ fn classify_source(
         &mut opened.file,
         opened.total_bytes,
         &extension(display_name),
-        PNG_MAX_CHUNKS,
     );
     match found {
         Ok(Found::Content(kind, format)) => ImportIntakeClassification {
@@ -191,7 +190,6 @@ fn classify_file(
     file: &mut File,
     file_length: u64,
     extension: &str,
-    max_png_chunks: usize,
 ) -> io::Result<Found> {
     use IntakeFormat as Format;
     use IntakeKind as Kind;
@@ -217,7 +215,7 @@ fn classify_file(
         });
     }
     if prefix.starts_with(PNG_SIGNATURE) {
-        return Ok(if png_has_card(file, file_length, max_png_chunks)? {
+        return Ok(if png_has_card(file, file_length, PNG_MAX_CHUNKS)? {
             Found::Content(Kind::Character, Format::Png)
         } else {
             Found::Refused(IntakeRefusal::PngWithoutCard)
