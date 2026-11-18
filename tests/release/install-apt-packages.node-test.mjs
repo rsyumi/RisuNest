@@ -12,8 +12,9 @@ const script = fileURLToPath(new URL("../../scripts/install-apt-packages.sh", im
 const runnerMirrors = "# runner mirrors\nhttp://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\nhttps://security.ubuntu.com/ubuntu/\tpriority:3\n";
 
 // `outcome` decides each apt-get call from its action ("update", "download" or "install") and the
-// number of earlier calls with that action. An unprivileged `timeout` cannot signal root's apt-get,
-// so the stub refuses to bound a command outside sudo.
+// number of earlier calls with that action, counted in files because bounded calls run in a child
+// shell. An unprivileged `timeout` cannot signal root's apt-get, so the stub refuses to bound a
+// command outside sudo.
 function run(outcome, mirrors = runnerMirrors) {
   const root = mkdtempSync(join(tmpdir(), "risunest-apt-"));
   try {
@@ -31,8 +32,8 @@ function run(outcome, mirrors = runnerMirrors) {
           *" update") action=update ;;
           *) action=install ;;
         esac
-        eval "calls_$action=\\$((\\\${calls_$action:-0} + 1))"
-        eval "seen=\\$calls_$action"
+        seen=$(( $(cat "$APT_STUB_CALLS/$action" 2>/dev/null || echo 0) + 1 ))
+        echo "$seen" > "$APT_STUB_CALLS/$action"
         printf '%s:%s %s\\n' "$action" "$seen" "$*"
         ${outcome}
       }
@@ -40,7 +41,7 @@ function run(outcome, mirrors = runnerMirrors) {
       exec bash "$@"
     `, "test", script, "libwebkit2gtk-4.1-dev", "gnome-keyring"], {
       encoding: "utf8", timeout: 10000, windowsHide: true,
-      env: { ...process.env, APT_MIRROR_LIST: list, APT_ATTEMPT_SECONDS: "7" },
+      env: { ...process.env, APT_MIRROR_LIST: list, APT_ATTEMPT_SECONDS: "7", APT_STUB_CALLS: root.replaceAll("\\", "/") },
     });
     return { ...result, mirrors: mirrors === null ? null : readFileSync(list, "utf8") };
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -50,11 +51,12 @@ test("a stalled download drops its mirror, retries, and installs from the downlo
   const result = run('[ "$action" != download ] || [ "$seen" -ge 2 ] || return 124');
   assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr);
+  // One bound covers each attempt's index refresh and download.
   assert.deepEqual(result.stdout.trim().split(/\r?\n/), [
     "bounded:7 update:1 -o Acquire::Retries=2 --error-on=any update",
-    "bounded:7 download:1 -o Acquire::Retries=2 install --download-only -y libwebkit2gtk-4.1-dev gnome-keyring",
+    "download:1 -o Acquire::Retries=2 install --download-only -y libwebkit2gtk-4.1-dev gnome-keyring",
     "bounded:7 update:2 -o Acquire::Retries=2 --error-on=any update",
-    "bounded:7 download:2 -o Acquire::Retries=2 install --download-only -y libwebkit2gtk-4.1-dev gnome-keyring",
+    "download:2 -o Acquire::Retries=2 install --download-only -y libwebkit2gtk-4.1-dev gnome-keyring",
     "install:1 -o Acquire::Retries=2 install -y libwebkit2gtk-4.1-dev gnome-keyring",
   ]);
   assert.match(result.stderr, /retrying without http:\/\/azure\.archive\.ubuntu\.com\/ubuntu\//);
