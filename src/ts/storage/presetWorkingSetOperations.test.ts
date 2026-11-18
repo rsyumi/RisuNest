@@ -113,6 +113,21 @@ describe('store-backed preset operations', () => {
         expect(live.mainPrompt).toBe('stored second')
     })
 
+    it('clears a removed plugin provider from every stored body, behind catalog stubs too', async () => {
+        persisted = [
+            { ...preset('First', 'stored first'), currentPluginProvider: 'removed' },
+            { ...preset('Second', 'stored second'), currentPluginProvider: 'removed' },
+            { ...preset('Third', 'stored third'), currentPluginProvider: 'kept' },
+        ]
+        live.botPresets.push(preset('Third', 'catalog stub'))
+        live.currentPluginProvider = 'removed'
+
+        await controller.clearPluginProvider('removed')
+
+        expect(persisted.map((item) => item.currentPluginProvider)).toEqual(['', '', 'kept'])
+        expect(live.currentPluginProvider).toBe('')
+    })
+
     it('copies an inactive full body instead of its catalog stub', async () => {
         await controller.copyPreset(1)
 

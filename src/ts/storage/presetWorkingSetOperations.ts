@@ -61,6 +61,7 @@ export interface PresetWorkingSetController {
     movePreset(fromIndex: number, toIndex: number, expectedNames?: PresetListExpectation): Promise<void>
     renamePreset(id: number, name: string, expectedNames?: PresetListExpectation): Promise<void>
     updateActivePresetImage(image: string): Promise<void>
+    clearPluginProvider(owner: string): Promise<void>
 }
 
 function clonePreset(preset: botPreset): botPreset {
@@ -243,6 +244,15 @@ export function createPresetWorkingSetController(
                 // The settings window names the selection, also while a binding or chain pick applies another preset.
                 assertPresetIndex(state.presets, state.root.botPresetsId)
                 state.presets[state.root.botPresetsId].image = image
+            })
+        },
+        clearPluginProvider(owner) {
+            return dependencies.mutatePersistentPresets('clear-plugin-provider', (state) => {
+                saveActive(state)
+                if (state.root.currentPluginProvider === owner) state.root.currentPluginProvider = ''
+                for (const preset of state.presets) {
+                    if (preset?.currentPluginProvider === owner) preset.currentPluginProvider = ''
+                }
             })
         },
     }

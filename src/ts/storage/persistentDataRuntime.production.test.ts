@@ -1514,6 +1514,8 @@ describe('preset list operations', () => {
         const initial = normalizeDatabaseDefaults({} as Database)
         initial.botPresets[0].id = 'first-preset'
         initial.botPresets[0].name = 'First'
+        initial.botPresets[0].currentPluginProvider = 'removed-plugin'
+        initial.currentPluginProvider = 'removed-plugin'
         initial.personas[0].id = 'persona'
         const store = new IndexedDbPersistentDataStore(`preset-list-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
         await store.open()
@@ -1546,6 +1548,12 @@ describe('preset list operations', () => {
         const ids = (await store.queryPresets()).items.map((item) => item.id)
         expect(new Set(ids).size).toBe(2)
         expect(ids).toContain('first-preset')
+
+        // A removed plugin provider leaves every stored body, also those behind catalog stubs.
+        await controller.clearPluginProvider('removed-plugin')
+        const providers = await Promise.all(ids.map(async (id) => (await store.readPreset(id))!.value.currentPluginProvider))
+        expect(providers).toEqual(['', ''])
+        expect(getDatabase().currentPluginProvider).toBe('')
 
         const commit = vi.spyOn(store, 'commit')
         await runtime.flushPendingDataLocally('after-preset-list-operations')

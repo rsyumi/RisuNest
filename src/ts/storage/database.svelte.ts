@@ -2349,6 +2349,11 @@ export function updateActivePresetImage(image: string): Promise<void> {
     return presetWorkingSetController.updateActivePresetImage(image)
 }
 
+/** Stops every stored preset, loaded or not, from naming a removed plugin provider. */
+export function clearPresetPluginProvider(owner: string): Promise<void> {
+    return presetWorkingSetController.clearPluginProvider(owner)
+}
+
 export function setPreset(db:Database, newPres: botPreset){
     newPres = Object.fromEntries(Object.values(identity.presetMirrorMap)
         .filter(field => Object.hasOwn(newPres, field))
