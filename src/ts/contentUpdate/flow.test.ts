@@ -8,6 +8,10 @@ const mocks = vi.hoisted(() => ({
     alertError: vi.fn(),
     missingTarget: false,
 }))
+const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
+const core = vi.hoisted(() => ({ invoke: vi.fn(async (_command: string, _args?: unknown) => ({ revision: 2 })) }))
+vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
 
 vi.mock('../globalApi.svelte', () => ({
     loadAsset: async (key: string) => mocks.assets.get(key) ?? null,
@@ -22,7 +26,8 @@ vi.mock('../stores.svelte', () => ({ DBState: { db: mocks.db } }))
 vi.mock('../characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
 vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
-vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
+    assetAliasCleanupTarget: (await import('../storage/deletedOwnerAssetCleanup.testSupport')).createAssetAliasCleanupTarget,
     readPersistentCharacterDetail: async (id: string) => {
         const detail = mocks.details.get(id)
         if (!detail) return null
@@ -32,13 +37,17 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     mutatePersistentCharacterDetail: async (id: string, _reason: string, mutate: (state: any) => void) => {
         const detail = mocks.details.get(id)
         if (!detail) return false
-        mutate({ root: mocks.root, character: detail })
+        const character = structuredClone(detail)
+        mutate({ root: mocks.root, character })
+        mocks.details.set(id, editableDetail(detail, character))
         return true
     },
     mutateCharacterDetailFields: async (id: string, _reason: string, mutate: (state: any) => void) => {
         const detail = mocks.details.get(id)
         if (!detail || mocks.missingTarget) return false
-        mutate({ character: detail })
+        const character = structuredClone(detail)
+        mutate({ character })
+        mocks.details.set(id, editableDetail(detail, character))
         return true
     },
 }))
@@ -57,6 +66,14 @@ import {
 import { clearStreamingConversation, setStreamingConversation } from '../storage/streamingConversationRegistry'
 import type { RisuModule } from '../process/modules'
 
+/** Like the native store, which refuses a detail write that touches these fields. */
+function editableDetail(before: any, after: any) {
+    for (const field of ['chaId', 'type', 'chats']) {
+        if (JSON.stringify(before[field]) !== JSON.stringify(after[field])) throw new Error('unit-not-editable')
+    }
+    return after
+}
+
 function install(value: any) {
     mocks.details.set(value.chaId, structuredClone(value))
     mocks.db.characters.push(structuredClone(value))
@@ -70,6 +87,13 @@ const commitModule = vi.fn(async (value: RisuModule) => {
 
 function card(chaId: string, name: string, fields: Record<string, unknown> = {}) {
     return { type: 'character', chaId, name, chats: [{ id: `${chaId}-chat`, message: [] }], extentions: {}, ...fields } as any
+}
+
+/** The asset keys the cleanup after an update was asked to delete when unused. */
+async function releasedKeys() {
+    await vi.waitFor(() => expect(core.invoke).toHaveBeenCalledWith('pds_asset_delete_orphaned_aliases', expect.anything()))
+    const call = core.invoke.mock.calls.find(([command]) => command === 'pds_asset_delete_orphaned_aliases')!
+    return (call[1] as { owner: { keys: string[] } }).owner.keys
 }
 
 async function opened() {
@@ -90,6 +114,8 @@ beforeEach(() => {
     mocks.db.enabledModules = []
     mocks.missingTarget = false
     mocks.alertError.mockClear()
+    platform.runtime = 'web'
+    core.invoke.mockClear()
     commitCharacter.mockClear()
     commitModule.mockClear()
 })
@@ -108,9 +134,13 @@ describe('character update', () => {
     })
 
     it('updates only what the author changed, keeps the user edits and chats, and trashes the old card', async () => {
+        platform.runtime = 'tauri'
         await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm' }), commitCharacter)
         mocks.details.get('first').personality = 'brave'
-        const pending = commitImportedCharacter(card('second', 'Luna v1.1', { desc: 'new', personality: 'calm' }), commitCharacter)
+        const firstBase = mocks.details.get('first').extentions[UPDATE_BASE_EXTENSION_KEY]
+        // A stored import may not carry a type yet, unlike the installed card.
+        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm' })
+        const pending = commitImportedCharacter(second as any, commitCharacter)
         await opened()
         expect(contentUpdateDialog.request?.candidates.map((candidate) => candidate.id)).toEqual(['first'])
         await reviewContentUpdate()
@@ -127,6 +157,7 @@ describe('character update', () => {
         expect(mocks.root.characterOrder).toEqual(['first'])
         const baseKey = updated.extentions[UPDATE_BASE_EXTENSION_KEY]
         expect(JSON.parse(new TextDecoder().decode(mocks.assets.get(baseKey)))).toMatchObject({ name: 'Luna v1.1', desc: 'new' })
+        expect(await releasedKeys()).toContain(firstBase)
     })
 
     it('asks about every difference without a base and applies the picks', async () => {
@@ -152,11 +183,13 @@ describe('character update', () => {
         expect(await asNew).toBe('next')
         expect(mocks.details.get('old').name).toBe('Luna')
 
+        const assetsBefore = mocks.assets.size
         const cancelled = commitImportedCharacter(card('third', 'Luna v3'), commitCharacter)
         await opened()
         chooseContentUpdate('cancel')
         expect(await cancelled).toBeNull()
         expect(mocks.details.has('third')).toBe(false)
+        expect(mocks.assets.size).toBe(assetsBefore)
     })
 
     it('opens the review of the named character for the update action, whatever the import is called', async () => {
@@ -215,8 +248,10 @@ describe('module update', () => {
     }
 
     it('replaces the installed module in place, keeping its id and enabled state', async () => {
+        platform.runtime = 'tauri'
         await commitImportedModule(imported('file-1', { name: 'Lore', description: 'old', lorebook: [] }), commitModule)
         const installedId = mocks.db.modules[0].id
+        const firstBase = mocks.db.modules[0].updateBase
         mocks.db.enabledModules.push(installedId)
         const pending = commitImportedModule(imported('file-1', { name: 'Renamed Lore', description: 'new', lorebook: [] }), commitModule)
         await opened()
@@ -231,6 +266,7 @@ describe('module update', () => {
         expect(mocks.db.enabledModules).toEqual([installedId])
         const base = JSON.parse(new TextDecoder().decode(mocks.assets.get(mocks.db.modules[0].updateBase!)))
         expect(base).toEqual({ description: 'new', name: 'Renamed Lore', lorebook: [], updateLineage: 'file-1' })
+        expect(await releasedKeys()).toContain(firstBase)
     })
 
     it('installs the import as new when the installed module was removed before the update', async () => {
@@ -244,5 +280,6 @@ describe('module update', () => {
         chooseContentUpdate('update')
         expect(await pending).toBe(incoming.id)
         expect(mocks.db.modules.map((module) => module.id)).toEqual([incoming.id])
+        expect(mocks.assets.get(incoming.updateBase!)).toBeDefined()
     })
 })

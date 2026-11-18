@@ -16,10 +16,12 @@ import {
     patchWorkingSetCharacterDetail,
 } from '../storage/workingSetCatalog'
 import {
+    assetAliasCleanupTarget,
     mutateCharacterDetailFields,
     mutatePersistentCharacterDetail,
     readPersistentCharacterDetail,
 } from '../storage/persistentDataRuntime.svelte'
+import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from '../storage/deletedOwnerAssetCleanup'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from '../storage/characterOrderMutation'
 import { editableText, editedValue, isEditable, loreFolderNames } from './view'
 import {
@@ -180,14 +182,32 @@ async function loadUpdateBase<T extends object>(entity: Entity<T>, key: string |
     }
 }
 
-async function saveUpdateBase<T extends object>(spec: UpdateSpec, value: T): Promise<string> {
+/** The import's own fields as the base the next update compares with, taken before normalization. */
+function updateBaseData(spec: UpdateSpec, value: object): Uint8Array | null {
     try {
-        const data = new TextEncoder().encode(JSON.stringify(baseSnapshot(spec, value)))
+        return new TextEncoder().encode(JSON.stringify(baseSnapshot(spec, value)))
+    } catch (error) {
+        console.warn('Update base could not be saved', error)
+        return null
+    }
+}
+
+async function saveUpdateBase(data: Uint8Array | null): Promise<string> {
+    if (!data) return ''
+    try {
         return await saveAsset(data, '', 'base.json')
     } catch (error) {
         console.warn('Update base could not be saved', error)
         return ''
     }
+}
+
+/**
+ * After an update, deletes the assets among `values` that nothing references any more: the
+ * replaced base, and what the merged version did not take from the import or the old module.
+ */
+function releaseUnusedAssets(startedAtMs: number, ...values: unknown[]) {
+    scheduleDeletedOwnerAssetCleanup(collectOwnedAssetKeys(...values), startedAtMs, 'content-update', () => assetAliasCleanupTarget())
 }
 
 export function selectContentUpdateTarget(id: string) {
@@ -394,7 +414,8 @@ function replaceDetailFields(target: Record<string, unknown>, source: Record<str
     }
 }
 
-const characterIdentity = new Set(['chaId', 'chats', 'chatFolders'])
+// The store never edits a character's type in place; a stored import may not carry one yet.
+const characterIdentity = new Set(['chaId', 'type', 'chats', 'chatFolders'])
 
 /**
  * Turns the just-imported character into the trashed copy of the installed
@@ -402,6 +423,7 @@ const characterIdentity = new Set(['chaId', 'chats', 'chatFolders'])
  * goes first so that a failure in between never loses the user's version.
  */
 async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: character, baseKey: string): Promise<string> {
+    const startedAtMs = Date.now()
     const targetId = decision.id
     const stored = await characters.read(targetId)
     if (!stored) throw new Error(language.errors.noData)
@@ -435,6 +457,8 @@ async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' 
     }
     const live = residentCharacter(targetId)
     if (live && isCatalogCharacterStub(live)) patchWorkingSetCharacterDetail(live, merged)
+    // The trashed copy keeps the previous card's assets, all but its base.
+    releaseUnusedAssets(startedAtMs, incoming, previous.extentions?.[UPDATE_BASE_EXTENSION_KEY])
     return targetId
 }
 
@@ -449,7 +473,7 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
     const installed = updatableCharacters(incoming.chaId)
     const target = forcedId && installed.some((entry) => entry.id === forcedId) ? forcedId : null
     const candidates = target ? [] : findCharacterUpdateCandidates(installed, incoming.name ?? '')
-    const baseKey = await saveUpdateBase(CHARACTER_UPDATE, incoming)
+    const baseData = updateBaseData(CHARACTER_UPDATE, incoming)
     let decision: Decision = { kind: 'new' }
     if (target || candidates.length) {
         await characters.normalize(incoming)
@@ -457,6 +481,7 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
         decision = await ask(characters, incoming as CharacterDetail, await withCreators(listed), installed, target)
         if (decision.kind === 'cancel') return null
     }
+    const baseKey = await saveUpdateBase(baseData)
     if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
     await commit(incoming)
     if (decision.kind !== 'update') return incoming.chaId
@@ -471,6 +496,7 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
 
 /** Replaces the installed module with the merged one and removes the just-imported module. */
 async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: RisuModule, baseKey: string, stored: RisuModule): Promise<string> {
+    const startedAtMs = Date.now()
     const list = DBState.db.modules
     const merged = applyUpdate(MODULE_UPDATE, await modules.normalize(stored), incoming, decision.plan, decision.choices)
     if (baseKey) merged.updateBase = baseKey
@@ -480,6 +506,7 @@ async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>,
     list[index] = merged
     const imported = list.findIndex((module) => module?.id === incoming.id)
     if (imported >= 0) list.splice(imported, 1)
+    releaseUnusedAssets(startedAtMs, stored, incoming)
     return decision.id
 }
 
@@ -495,7 +522,7 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
     const forced = forcedId ? installed.find((module) => module.id === forcedId) : undefined
     const candidates = forced ? [] : findModuleUpdateCandidates(installed, incoming)
     delete incoming.updateBase
-    const baseKey = await saveUpdateBase(MODULE_UPDATE, incoming)
+    const baseData = updateBaseData(MODULE_UPDATE, incoming)
     let decision: Decision = { kind: 'new' }
     if (forced || candidates.length) {
         await modules.normalize(incoming)
@@ -505,6 +532,7 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
         decision = await ask(modules, incoming, listed, installed.map((module) => ({ id: module.id, name: module.name ?? '' })), forced?.id ?? null)
         if (decision.kind === 'cancel') return null
     }
+    const baseKey = await saveUpdateBase(baseData)
     if (baseKey) incoming.updateBase = baseKey
     if (decision.kind !== 'update') {
         await commit(incoming)
