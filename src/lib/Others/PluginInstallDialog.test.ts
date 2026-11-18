@@ -29,10 +29,11 @@ let component: ReturnType<typeof mount> | undefined
 let target: HTMLDivElement
 
 function pluginItem(name: string, code: string, bytes?: number): ImportIntakeItem {
-    const inspected = inspectPluginFile(name, code, false)
+    const isTypescript = name.endsWith('.ts')
+    const inspected = inspectPluginFile(name, code, isTypescript)
     if (!('header' in inspected)) throw new Error(`refused: ${inspected.refusal.code}`)
-    return { id: name, name, bytes, source: { type: 'path', path: name }, kind: 'plugin', format: 'js',
-        plugin: { header: inspected.header, code, isTypescript: false } }
+    return { id: name, name, bytes, source: { type: 'path', path: name }, kind: 'plugin', format: isTypescript ? 'ts' : 'js',
+        plugin: { header: inspected.header, code, isTypescript } }
 }
 
 function dialog(): HTMLElement | null {
@@ -123,7 +124,7 @@ describe('plugin install dialog', () => {
     it('asks to replace an installed plugin with both versions and reports a failed install', async () => {
         DBState.db.plugins = [installedPlugin({ displayName: 'Installed Synthetic', versionOfPlugin: '1.1.0' })]
         h.importPlugin.mockResolvedValue(false)
-        const result = requestPluginInstall(pluginItem('synthetic.js', declared, 2048))
+        const result = requestPluginInstall(pluginItem('synthetic.ts', declared, 2048))
         await tick()
 
         expect(dialog()!.querySelector('h2')!.textContent).toBe(copy.pluginReplaceTitle)
@@ -134,6 +135,7 @@ describe('plugin install dialog', () => {
         expect(dialog()!.textContent).toContain(fillTemplate(copy.pluginReplaceData, 'Installed Synthetic'))
         button(copy.replace).click()
         expect(await result).toBe('failed')
+        expect(h.importPlugin).toHaveBeenCalledExactlyOnceWith(declared, { isTypescript: true, confirmed: true })
     })
 
     it.each([false, true])('leaves out the rows a header does not declare, replacing: %s', async replacing => {
