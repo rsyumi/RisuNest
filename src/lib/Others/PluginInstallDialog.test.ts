@@ -136,12 +136,13 @@ describe('plugin install dialog', () => {
         expect(await result).toBe('failed')
     })
 
-    it('leaves out the rows a header does not declare', async () => {
-        DBState.db.plugins = [installedPlugin({ versionOfPlugin: '' })]
+    it.each([false, true])('leaves out the rows a header does not declare, replacing: %s', async replacing => {
+        if (replacing) DBState.db.plugins = [installedPlugin({ versionOfPlugin: '' })]
         void requestPluginInstall(pluginItem('synthetic.js', '//@name synthetic\n//@api 3.0'))
         await tick()
+        expect(dialog()!.querySelector('h2')!.textContent).toBe(replacing ? copy.pluginReplaceTitle : copy.pluginInstallTitle)
         expect(rows()).toEqual([[language.name, 'synthetic'], [copy.detailFile, 'synthetic.js']])
-        expect(dialog()!.textContent).toContain(fillTemplate(copy.pluginReplaceData, 'synthetic'))
+        expect(dialog()!.textContent!.includes(fillTemplate(copy.pluginReplaceData, 'synthetic'))).toBe(replacing)
     })
 
     it.each([
