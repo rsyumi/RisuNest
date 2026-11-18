@@ -16,7 +16,6 @@ use std::path::Path;
 use tauri::State;
 
 const PREFIX_BYTES: u64 = 64;
-const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 /// Far above real cards, which spend one chunk per embedded asset.
 const PNG_MAX_CHUNKS: usize = 1 << 20;
@@ -234,7 +233,7 @@ fn classify_file(
     if has_charx_card(file)? {
         return Ok(Found::Content(Kind::Character, Format::Charx));
     }
-    if let Some(found) = classify_json(file, &prefix)? {
+    if let Some(found) = classify_json(file)? {
         return Ok(found);
     }
     Ok(match extension {
@@ -396,9 +395,9 @@ fn read_full(reader: &mut impl Read, output: &mut [u8]) -> io::Result<bool> {
 }
 
 /// Classifies a JSON object by its top-level keys; `None` when the file does not open an object.
-fn classify_json(file: &mut File, prefix: &[u8]) -> io::Result<Option<Found>> {
-    let start = if prefix.starts_with(UTF8_BOM) { UTF8_BOM.len() as u64 } else { 0 };
-    file.seek(SeekFrom::Start(start))?;
+/// A byte order mark is not skipped because the importers reject it.
+fn classify_json(file: &mut File) -> io::Result<Option<Found>> {
+    file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::with_capacity(JSON_READ_BUFFER_BYTES, file);
     loop {
         let available = reader.fill_buf()?;
@@ -516,10 +515,10 @@ impl JsonFacts {
             Some(IntakeKind::Module)
         } else if self.kind.tag() == Some(Tag::Risu) && self.data == Shape::Array {
             Some(IntakeKind::Lorebook)
-        } else if self.kind.tag() == Some(Tag::Regex) && self.data.truthy() {
-            Some(IntakeKind::Module)
         } else if self.entries.truthy() {
             Some(IntakeKind::Lorebook)
+        } else if self.kind.tag() == Some(Tag::Regex) && self.data.truthy() {
+            Some(IntakeKind::Module)
         } else if (self.char_name.truthy() || self.name.truthy())
             && (self.char_persona.truthy() || self.description.truthy())
             && (self.char_greeting.truthy() || self.first_mes.truthy())
@@ -980,7 +979,17 @@ mod tests {
             (
                 "bom.json",
                 b"\xef\xbb\xbf \r\n{\"spec\":\"chara_card_v2\",\"data\":{}}\n".to_vec(),
+                unsupported(),
+            ),
+            (
+                "whitespace.json",
+                b" \r\n\t{\"spec\":\"chara_card_v2\",\"data\":{}}\n".to_vec(),
                 character(),
+            ),
+            (
+                "regex-entries.json",
+                br#"{"type":"regex","data":[],"entries":{}}"#.to_vec(),
+                lorebook(),
             ),
             (
                 "repeated.json",
