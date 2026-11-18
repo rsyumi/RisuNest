@@ -126,7 +126,7 @@ fn expand_character(
         object.remove("coldstorage");
         object.remove("coldStoragedChats");
     }
-    pocket_features::character(character, fallback);
+    pocket_features::character(character, fallback, pocket_features::Origin::External);
     Ok(())
 }
 

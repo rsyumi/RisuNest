@@ -61,6 +61,7 @@ export interface PresetWorkingSetController {
     movePreset(fromIndex: number, toIndex: number, expectedNames?: PresetListExpectation): Promise<void>
     renamePreset(id: number, name: string, expectedNames?: PresetListExpectation): Promise<void>
     updateActivePresetImage(image: string): Promise<void>
+    clearPluginProvider(owner: string): Promise<void>
 }
 
 function clonePreset(preset: botPreset): botPreset {
@@ -142,11 +143,8 @@ export function createPresetWorkingSetController(
             const database = dependencies.getDatabase()
             assertPresetNames(database.botPresets, expectedNames)
             assertPresetIndex(database.botPresets, id)
-            const effectiveId = dependencies.getEffectivePresetId?.()
-            const sameSelection = effectiveId !== undefined
-                ? database.botPresets[id].id === effectiveId
-                : database.botPresetsId === id
-            if (sameSelection && !dependencies.getEffectivePresetOverride?.()) return
+            // A conversation's binding may apply another preset; the list still changes the selection.
+            if (database.botPresetsId === id && !dependencies.getEffectivePresetOverride?.()) return
             const before = capturePresetNames(database.botPresets)
             await dependencies.mutatePersistentPresets('change-preset', (state) => {
                 assertPresetNames(dependencies.getDatabase().botPresets, before)
@@ -187,6 +185,7 @@ export function createPresetWorkingSetController(
         },
         async removePreset(id, expectedNames = capturePresetNames(dependencies.getDatabase().botPresets)) {
             const before = capturePresetNames(dependencies.getDatabase().botPresets)
+            let removedId: string | undefined
             await dependencies.mutatePersistentPresets('remove-preset', (state) => {
                 assertPresetNames(dependencies.getDatabase().botPresets, before)
                 assertPresetNames(dependencies.getDatabase().botPresets, expectedNames)
@@ -196,10 +195,14 @@ export function createPresetWorkingSetController(
                 }
                 saveActive(state)
                 assertPresetIndex(state.presets, id)
-                state.presets.splice(id, 1)
-                select(state, 0)
+                const selected = state.root.botPresetsId
+                removedId = state.presets.splice(id, 1)[0]?.id
+                if (id === selected) select(state, 0)
+                else if (id < selected) state.root.botPresetsId = selected - 1
             })
-            dependencies.clearEffectivePresetOverride?.()
+            if (removedId && dependencies.getEffectivePresetOverride?.() === removedId) {
+                dependencies.clearEffectivePresetOverride?.()
+            }
         },
         movePreset(fromIndex, toIndex, expectedNames = capturePresetNames(dependencies.getDatabase().botPresets)) {
             const before = capturePresetNames(dependencies.getDatabase().botPresets)
@@ -238,10 +241,18 @@ export function createPresetWorkingSetController(
         updateActivePresetImage(image) {
             return dependencies.mutatePersistentPresets('update-preset-image', (state) => {
                 saveActive(state)
-                const effectiveId = dependencies.getEffectivePresetId?.()
-                const activeIndex = effectiveId ? state.presets.findIndex(preset => preset.id === effectiveId) : state.root.botPresetsId
-                assertPresetIndex(state.presets, activeIndex)
-                state.presets[activeIndex].image = image
+                // The settings window names the selection, also while a binding or chain pick applies another preset.
+                assertPresetIndex(state.presets, state.root.botPresetsId)
+                state.presets[state.root.botPresetsId].image = image
+            })
+        },
+        clearPluginProvider(owner) {
+            return dependencies.mutatePersistentPresets('clear-plugin-provider', (state) => {
+                saveActive(state)
+                if (state.root.currentPluginProvider === owner) state.root.currentPluginProvider = ''
+                for (const preset of state.presets) {
+                    if (preset?.currentPluginProvider === owner) preset.currentPluginProvider = ''
+                }
             })
         },
     }

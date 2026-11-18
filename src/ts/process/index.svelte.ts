@@ -6,7 +6,7 @@ import { noteGenerationMessage, noteGenerationStarted } from './generationEnd'
 import { boundedGenerationFallbackReason } from './boundedGenerationAdmission'
 import { generationDiagnostics, type GenerationDiagnosticAdmission, type GenerationDiagnosticFallback, type GenerationDiagnosticOutcome, type GenerationDiagnosticPhase, type GenerationDiagnosticPhaseDetails, type GenerationDiagnosticTrace, type GenerationFailureReason, type GenerationSavePath } from '../generationDiagnostics'
 import { get, writable } from "svelte/store";
-import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, setCurrentChat, type Message } from "../storage/database.svelte";
+import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, activatePresetOverride, activateRequestPresetBinding, getEffectivePresetId, setCurrentChat, type Message } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, encodeWithTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -1055,6 +1055,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         activatePresetOverride,
         Math.random,
         (name) => alertToast(`Cannot find preset: ${name}`),
+        () => activateRequestPresetBinding(lifecycle.generationTarget),
     )
 
 
@@ -1251,7 +1252,9 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         value: string,
     }[] = []
     if(DBState.db.promptInfoInsideChat){
-        initialPresetNameForPromptInfo = DBState.db.botPresets[DBState.db.botPresetsId]?.name ?? ''
+        const appliedPresetId = getEffectivePresetId(DBState.db)
+        initialPresetNameForPromptInfo = (DBState.db.botPresets.find(preset => preset?.id === appliedPresetId)
+            ?? DBState.db.botPresets[DBState.db.botPresetsId])?.name ?? ''
         initialPromptTogglesForPromptInfo = parseToggleSyntax(DBState.db.customPromptTemplateToggle + getModuleToggles())
             .flatMap(toggle => {
                 const raw = DBState.db.globalChatVariables[`toggle_${toggle.key}`]

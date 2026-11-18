@@ -4,7 +4,7 @@ import type { Chat } from './database.svelte'
 export type ConversationBindingPatch = Partial<Pick<
     Chat,
     'bindedPersona' | 'savedToggleValues' | 'useLocallySetGlobalVariables' | 'GLGlobalVariables' | 'onboardingDone'
-    | 'note' | 'authorNotePreset' | 'modules'
+    | 'note' | 'authorNotePreset' | 'modules' | 'promptPresetId'
 >>
 
 /** Writes the patch onto a conversation record; `undefined` removes the field instead of storing it. */

@@ -1,6 +1,7 @@
 <script lang="ts">
     import { DownloadIcon, PlusIcon, RefreshCwIcon, SaveIcon, UploadIcon } from '@lucide/svelte'
     import { DBState } from 'src/ts/stores.svelte'
+    import { getAppliedPresetIndex } from 'src/ts/storage/presetEditor.svelte'
     import { language } from 'src/lang'
     import { alertConfirm, alertError, alertInput, alertSelect, alertToast } from 'src/ts/alert'
     import { selectSingleFile } from 'src/ts/util'
@@ -26,7 +27,7 @@
     type Preset = NonNullable<typeof DBState.db.togglePresets>[number]
 
     let showAll = $state(false)
-    let promptPresetName = $derived(DBState.db.botPresets?.[DBState.db.botPresetsId]?.name)
+    let promptPresetName = $derived(DBState.db.botPresets?.[getAppliedPresetIndex(DBState.db)]?.name)
 
     // Read back after the assignment: `??=` would hand out the raw array instead of the reactive proxy.
     const list = () => {

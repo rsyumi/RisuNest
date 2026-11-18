@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { Database, botPreset, Chat } from './database.svelte'
 import {
-    deriveEffectivePersonaMirrors, deriveEffectivePresetMirrors, deriveEffectiveToggleVariables,
-    flushEffectivePersonaEdits, flushEffectivePresetEdits, flushEffectiveToggleEdits,
-    getEffectivePresetId, getExplicitGlobalChatVariables, prepareImportedIdentityState,
-    presetMirrorMap, setEffectivePresetOverride, translateRootUnitIntents,
+    createPresetMirrorView, deriveEffectivePersonaMirrors, deriveEffectivePresetMirrors, deriveEffectiveToggleVariables,
+    derivePresetMirrorView, flushEffectivePersonaEdits, flushEffectivePresetEdits, flushEffectiveToggleEdits,
+    flushPresetMirrorView, getEffectivePresetId, getExplicitGlobalChatVariables, prepareImportedIdentityState,
+    presetMirrorMap, setEffectivePresetBinding, setEffectivePresetOverride, translateRootUnitIntents,
 } from './effectiveIdentityState'
 
 function database(): Database {
@@ -95,6 +95,53 @@ describe('authoritative identity records and mirrors', () => {
         db.mainPrompt = 'remaining edit'
         flushEffectivePresetEdits(db)
         expect(db.botPresets[0].mainPrompt).toBe('remaining edit')
+    })
+    it('applies a conversation binding above the chain pick and falls through when its preset is missing', () => {
+        const db = database()
+        db.botPresets.push({ id: 'preset-c', name: 'C', mainPrompt: 'C' } as botPreset)
+        derive(db)
+        setEffectivePresetOverride(db, 'preset-c', apply)
+        setEffectivePresetBinding(db, 'preset-b', apply)
+        expect(getEffectivePresetId(db)).toBe('preset-b')
+        expect(db.mainPrompt).toBe('B')
+        // The chain's null clears only its own pick.
+        setEffectivePresetOverride(db, null, apply)
+        expect(getEffectivePresetId(db)).toBe('preset-b')
+        db.mainPrompt = 'bound edit'
+        flushEffectivePresetEdits(db)
+        expect(db.botPresets.map(preset => preset.mainPrompt)).toEqual(['A', 'bound edit', 'C'])
+        setEffectivePresetBinding(db, 'missing', apply)
+        expect(getEffectivePresetId(db)).toBe('preset-a')
+        expect(db.mainPrompt).toBe('A')
+        setEffectivePresetOverride(db, 'preset-c', apply)
+        setEffectivePresetBinding(db, 'preset-b', apply)
+        db.botPresets.splice(1, 1)
+        deriveEffectivePresetMirrors(db, apply)
+        expect(getEffectivePresetId(db)).toBe('preset-c')
+        expect(db.mainPrompt).toBe('C')
+    })
+    it('writes edits of a preset shown in place of the applied one to its record, except shared protected fields', () => {
+        const db = database()
+        db.botPresets[1].seperateModels = { memory: 'record-b' } as Database['seperateModels']
+        derive(db)
+        const view = createPresetMirrorView(db, 'preset-b', apply)!
+        const values = view.values
+        expect(values.mainPrompt).toBe('B')
+        values.mainPrompt = 'view edit'
+        values.presetRegex = [{ comment: 'view regex' }]
+        values.seperateModels = { memory: 'shared' }
+        db.doNotChangeSeperateModels = true
+        flushPresetMirrorView(db, view)
+        expect(db.botPresets[1]).toMatchObject({
+            mainPrompt: 'view edit', regex: [{ comment: 'view regex' }], seperateModels: { memory: 'record-b' },
+        })
+        expect(db.botPresets[0].mainPrompt).toBe('A')
+        expect(db.mainPrompt).toBe('A')
+        // A received change reaches the view without discarding its pending edit.
+        values.jailbreak = 'pending'
+        db.botPresets[1].autoSuggestPrefix = 'received'
+        expect(derivePresetMirrorView(db, view, apply)).toBe(true)
+        expect(values).toMatchObject({ autoSuggestPrefix: 'received', jailbreak: 'pending', mainPrompt: 'view edit' })
     })
     it('uses the coherent renamed and suggestion fields without maintaining opaque preset keys', () => {
         const db = database()

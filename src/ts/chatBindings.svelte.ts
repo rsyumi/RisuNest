@@ -1,7 +1,7 @@
 import { get } from 'svelte/store'
 import { v4 } from 'uuid'
 import { DBState, selectedCharID } from './stores.svelte'
-import { alertToast } from './alert'
+import { alertError, alertToast } from './alert'
 import { language } from 'src/lang'
 import { doingChat } from './process/generationState'
 import { activeRerollConversations } from './durableReroll'
@@ -113,6 +113,32 @@ export async function bindPersona(conversation: Chat, index: number): Promise<vo
     if (index >= 0 && !persona) throw new Error('Persona is no longer available')
     if (persona) persona.id ||= v4()
     await updateChatBinding(conversation, { bindedPersona: persona?.id ?? '' })
+}
+
+/** Binds a prompt preset to the conversation by its ID, or unbinds it with null. */
+export async function bindPromptPreset(conversation: Chat, presetId: string | null): Promise<void> {
+    if (presetId !== null && !DBState.db.botPresets?.some((preset) => preset?.id === presetId)) {
+        throw new Error('Preset is no longer available')
+    }
+    await updateChatBinding(conversation, { promptPresetId: presetId ?? '' })
+}
+
+type ChatBindingTarget = NonNullable<ReturnType<typeof captureChatBindingTarget>>
+
+/**
+ * Binds the preset picked in the preset list to the captured conversation. Returns false to keep
+ * the list open when the conversation is no longer selected, a response is generating, or saving failed.
+ */
+export async function bindPresetFromList(target: ChatBindingTarget, presetId: string | null): Promise<boolean> {
+    if (!target.isCurrent() || chatBindingBlockedByGeneration()) return false
+    try {
+        await bindPromptPreset(target.conversation, presetId)
+        await saveChatBinding()
+        return true
+    } catch {
+        alertError(language.risuNest.presetBinding.saveFailed)
+        return false
+    }
 }
 
 export async function saveChatBinding(): Promise<void> {

@@ -11,6 +11,7 @@ export function getChatVarFromConversation(
     characterId: string,
     chat: Chat,
     key: string,
+    templateDefaultVariables = database.templateDefaultVariables,
 ): string {
     noteChatVariableRead(key)
     const char = findCharacterById(database.characters, characterId, get(selectedCharID))
@@ -19,7 +20,7 @@ export function getChatVarFromConversation(
     const state = chat.scriptstate?.['$' + key]
     if (state === undefined || state === null) {
         const defaultVariables = parseKeyValue(char.defaultVariables).concat(
-            parseKeyValue(database.templateDefaultVariables),
+            parseKeyValue(templateDefaultVariables),
         )
         return defaultVariables.find(([name]) => name === key)?.[1] ?? 'null'
     }
@@ -38,14 +39,15 @@ export function setChatVarOnConversation(
     return true
 }
 
-export function getChatVar(key:string): string {
+/** `preset` supplies the template defaults; the settings window's token counts pass the preset they edit. */
+export function getChatVar(key:string, preset: Pick<Database, 'templateDefaultVariables'> = DBState.db): string {
     const selectedChar = get(selectedCharID)
     const char = DBState.db.characters[selectedChar]
     if(!char){
         return 'null'
     }
     const chat = char.chats[char.chatPage]
-    return getChatVarFromConversation(DBState.db, char.chaId, chat, key)
+    return getChatVarFromConversation(DBState.db, char.chaId, chat, key, preset.templateDefaultVariables)
 }
 
 export function setChatVar(key:string, value:string): boolean {

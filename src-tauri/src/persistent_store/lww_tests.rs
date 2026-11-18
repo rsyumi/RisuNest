@@ -391,6 +391,52 @@ fn unknown_units_are_opaque_and_never_recaptured() {
         .all(|e| e.key != unknown.key));
 }
 
+// How a released peer treats a conversation field that a later release starts sharing.
+#[test]
+fn a_received_conversation_field_this_build_does_not_list_survives_its_edits_archive_and_replacement() {
+    let (_dir, mut old) = store();
+    create_conversation(&mut old, "char", "conv");
+    let key = unit_key(&["conversation", "char", "conv", "futureBinding"]).unwrap();
+    let bound = change(&["conversation", "char", "conv", "futureBinding"], 10, serde_json::json!("preset-b"));
+    receive(&mut old, "bound", vec![bound.clone()], vec![]);
+    assert!(old.read_conversation("char", "conv", None).unwrap().unwrap().value.get("futureBinding").is_none());
+    clear_outbox(&mut old);
+    save(&mut old, vec![
+        mutation(&["conversation", "char", "conv", "note"], serde_json::json!("edited")),
+        mutation(&["conversation", "char", "conv", "name"], serde_json::json!("renamed")),
+    ]);
+    let outbox = old.lww_read_outbox(0.into(), 100).unwrap().entries;
+    assert!(outbox.iter().any(|e| e.key == unit_key(&["conversation", "char", "conv", "note"]).unwrap()));
+    assert!(outbox.iter().all(|e| e.key != key), "edit");
+    assert_eq!(read_unit(&old.connection, &key).unwrap().unwrap().1, bound.value);
+    clear_outbox(&mut old);
+    let revision = old.revision().unwrap();
+    old.archive_character("char", revision, 10).unwrap();
+    let revision = old.revision().unwrap();
+    old.restore_character("char", revision).unwrap();
+    let outbox = old.lww_read_outbox(0.into(), 100).unwrap().entries;
+    assert!(outbox.iter().all(|e| e.key != key), "archive");
+    assert_eq!(read_unit(&old.connection, &key).unwrap().unwrap().1, bound.value);
+    assert_eq!(old.read_conversation("char", "conv", None).unwrap().unwrap().value["note"], "edited");
+    clear_outbox(&mut old);
+    let target = super::super::ReadTarget { generation: active_generation(&old.connection).unwrap(), revision: old.revision().unwrap() };
+    let mut database = query::materialize_target(&old.connection, &target).unwrap();
+    database["characters"][0]["chats"][0]["futureBinding"] = serde_json::json!("restored-other");
+    database["characters"][0]["chats"][0]["note"] = serde_json::json!("replaced");
+    let characters = database.as_object_mut().unwrap().remove("characters").unwrap();
+    let presets = database.as_object_mut().unwrap().remove("botPresets").unwrap();
+    let stage = old.replace_begin().unwrap().staging_id;
+    old.replace_put_root(&stage, &database).unwrap();
+    old.replace_put_presets(&stage, presets.as_array().unwrap()).unwrap();
+    old.replace_add_characters(&stage, characters.as_array().unwrap()).unwrap();
+    let header = Header { binding_authority: old.lww_binding_authority().unwrap(), request_id: "opaque-field-replace".into() };
+    old.lww_commit_replacement_units(&header, &stage, None).unwrap();
+    let outbox = old.lww_read_outbox(0.into(), 100).unwrap().entries;
+    assert!(outbox.iter().any(|e| e.key == unit_key(&["conversation", "char", "conv", "note"]).unwrap()), "replacement note");
+    assert!(outbox.iter().all(|e| e.key != key), "replacement");
+    assert_eq!(read_unit(&old.connection, &key).unwrap().unwrap().1, bound.value);
+}
+
 #[test]
 fn commit_input_capture_conserves_actual_reserve_completed_and_rejected_retry_hashes() {
     use crate::persistent_store::hash_work::{reset_commit_intent_inputs, take_commit_intent_inputs,
@@ -1676,7 +1722,7 @@ fn local_and_opaque_fields_persist_without_publication() {
 }
 
 #[test]
-fn realm_block_loadout_and_onboarding_fields_publish_and_apply_on_a_peer() {
+fn realm_block_loadout_onboarding_and_preset_binding_fields_publish_and_apply_on_a_peer() {
     let (_source_dir, mut source) = store();
     let (peer_dir, mut peer) = store();
     create_conversation(&mut source, "char", "conv");
@@ -1690,6 +1736,7 @@ fn realm_block_loadout_and_onboarding_fields_publish_and_apply_on_a_peer() {
             mutation(&["root", "loadoutApplyOptions"], options.clone()),
             mutation(&["character", "char", "onboarding"], onboarding.clone()),
             mutation(&["conversation", "char", "conv", "onboardingDone"], serde_json::json!(true)),
+            mutation(&["conversation", "char", "conv", "promptPresetId"], serde_json::json!("preset-b")),
         ],
     );
     let outbox = source.lww_read_outbox(0.into(), 100).unwrap().entries;
@@ -1709,10 +1756,94 @@ fn realm_block_loadout_and_onboarding_fields_publish_and_apply_on_a_peer() {
     assert_eq!(root["blockedRealmCreators"], blocked);
     assert_eq!(root["loadoutApplyOptions"], options);
     assert_eq!(peer.read_character("char", None).unwrap().unwrap().value["onboarding"], onboarding);
-    assert_eq!(
-        peer.read_conversation("char", "conv", None).unwrap().unwrap().value["onboardingDone"],
-        true
-    );
+    let conversation = peer.read_conversation("char", "conv", None).unwrap().unwrap().value;
+    assert_eq!(conversation["onboardingDone"], true);
+    assert_eq!(conversation["promptPresetId"], "preset-b");
+}
+
+// What a library holds after a build that did not share a field received it: the unit
+// without the field in its document.
+#[test]
+fn opening_projects_received_units_of_newly_shared_fields_once_without_publishing_them() {
+    let (dir, mut store) = store();
+    create_conversation(&mut store, "char", "conv");
+    create_conversation(&mut store, "char", "local");
+    let blocked = serde_json::json!([{"id":"synthetic-creator","name":"Synthetic creator"}]);
+    let onboarding = serde_json::json!({"enabled":true,"mode":"form","questions":[]});
+    receive(&mut store, "shared", vec![
+        change(&["conversation", "char", "conv", "promptPresetId"], 10, serde_json::json!("preset-b")),
+        change(&["conversation", "char", "conv", "note"], 10, serde_json::json!("remote note")),
+        change(&["conversation", "char", "local", "promptPresetId"], 10, serde_json::json!("preset-remote")),
+        change(&["conversation", "char", "local", "onboardingDone"], 10, serde_json::json!(true)),
+        change(&["root", "blockedRealmCreators"], 10, blocked.clone()),
+        change(&["character", "char", "onboarding"], 10, onboarding.clone()),
+        change(&["conversation", "char", "conv", "authorNotePreset"], 10, serde_json::json!("note-preset")),
+    ], vec![]);
+    // That build kept no body for a large unit of a field it did not share.
+    let absent = UnitValue::object(RecordDescriptor::content(risunest_sync_wire::hash(b"\"absent\""))).unwrap();
+    store.connection.execute(
+        "UPDATE lww_units SET value=?1 WHERE json_extract(key,'$[3]')='authorNotePreset'",
+        [serde_json::to_string(&absent).unwrap()],
+    ).unwrap();
+    store.connection.execute_batch(
+        "UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId','$.note','$.authorNotePreset') WHERE character_id='char' AND conversation_id='conv';
+         UPDATE conversations SET detail=json_set(json_remove(detail,'$.onboardingDone'),'$.promptPresetId','preset-local') WHERE character_id='char' AND conversation_id='local';
+         UPDATE characters SET detail=json_remove(detail,'$.onboarding') WHERE character_id='char';
+         UPDATE root SET value=json_remove(value,'$.blockedRealmCreators');
+         DELETE FROM meta WHERE key='projectedSharedFields';",
+    ).unwrap();
+    clear_outbox(&mut store);
+    let revision = store.revision().unwrap();
+    drop(store);
+    let store = PersistentStore::open(dir.path()).unwrap();
+    let conversation = store.read_conversation("char", "conv", None).unwrap().unwrap().value;
+    assert_eq!(conversation["promptPresetId"], "preset-b");
+    assert!(conversation.get("note").is_none(), "a field the first release shared");
+    assert!(conversation.get("authorNotePreset").is_none(), "a large unit without its body");
+    let local = store.read_conversation("char", "local", None).unwrap().unwrap().value;
+    assert_eq!(local["promptPresetId"], "preset-local");
+    assert_eq!(local["onboardingDone"], true);
+    assert_eq!(store.read_character("char", None).unwrap().unwrap().value["onboarding"], onboarding);
+    assert_eq!(store.read_root(None).unwrap().value["blockedRealmCreators"], blocked);
+    assert_eq!(store.revision().unwrap(), revision + 1);
+    assert!(store.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
+    store.connection.execute("UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId') WHERE character_id='char' AND conversation_id='conv'", []).unwrap();
+    let revision = store.revision().unwrap();
+    drop(store);
+    let store = PersistentStore::open(dir.path()).unwrap();
+    assert!(store.read_conversation("char", "conv", None).unwrap().unwrap().value.get("promptPresetId").is_none());
+    assert_eq!(store.revision().unwrap(), revision);
+}
+
+// A backup an earlier build made holds units its documents lack.
+#[test]
+fn a_replacement_projects_source_units_of_newly_shared_fields_its_documents_lack() {
+    let (_dir, mut store) = store();
+    create_conversation(&mut store, "char", "conv");
+    receive(&mut store, "shared", vec![
+        change(&["conversation", "char", "conv", "onboardingDone"], 10, serde_json::json!(true)),
+    ], vec![]);
+    clear_outbox(&mut store);
+    let source: BTreeMap<UnitKey, UnitValue> = store.connection.prepare("SELECT key,value FROM lww_units").unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
+        .map(|row| {
+            let (key, value) = row.unwrap();
+            (key.try_into().unwrap(), serde_json::from_str(&value).unwrap())
+        })
+        .collect();
+    let target = super::super::ReadTarget { generation: active_generation(&store.connection).unwrap(), revision: store.revision().unwrap() };
+    let mut database = query::materialize_target(&store.connection, &target).unwrap();
+    database["characters"][0]["chats"][0].as_object_mut().unwrap().remove("onboardingDone");
+    let characters = database.as_object_mut().unwrap().remove("characters").unwrap();
+    let presets = database.as_object_mut().unwrap().remove("botPresets").unwrap();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage, &database).unwrap();
+    store.replace_put_presets(&stage, presets.as_array().unwrap()).unwrap();
+    store.replace_add_characters(&stage, characters.as_array().unwrap()).unwrap();
+    let header = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "earlier-backup".into() };
+    store.lww_commit_replacement_units(&header, &stage, Some(&source)).unwrap();
+    assert_eq!(store.read_conversation("char", "conv", None).unwrap().unwrap().value["onboardingDone"], true);
+    assert!(store.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
 }
 
 #[test]

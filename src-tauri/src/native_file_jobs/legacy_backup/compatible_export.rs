@@ -1064,12 +1064,12 @@ mod tests {
             store
                 .replace_put_upstream_presets(
                     &staging,
-                    &[json!({"name":"Synthetic Preset","image":"assets/nested/icon.webp"})],
+                    &[json!({"id":"synthetic-preset","name":"Synthetic Preset","image":"assets/nested/icon.webp"})],
                 )
                 .unwrap();
             let message = json!({"role":"char","data":"현재 한국어 {{inlay::synthetic}}","chatId":"message","unknownMessage":true,"responseVariants":{"groupId":"message","selectedId":"selected","candidates":[{"id":"other","messages":[{"role":"char","data":"alternative"}]},{"id":"complex","messages":[{"role":"char","data":"one"},{"role":"char","data":"two"}]},{"id":"selected","messages":[{"role":"char","data":"stale selected"}]}]}});
             let note_link = json!({"id":"note-preset","fingerprint":author_note::fingerprint("stale copy")});
-            store.replace_add_characters(&staging,&[json!({"chaId":"synthetic","type":"character","name":"Synthetic","additionalAssets":[["Synthetic owner image","assets/prior-owner.png","png"]],"chats":[{"id":"chat","name":"Chat","message":[message,{"role":"user","data":"followup"}],"savedToggleValues":{"test":"1"},"note":"stale copy","authorNotePreset":note_link,"unknownChat":true}]}),json!({"chaId":"second","type":"character","name":"Synthetic Second","chats":[]})]).unwrap();
+            store.replace_add_characters(&staging,&[json!({"chaId":"synthetic","type":"character","name":"Synthetic","additionalAssets":[["Synthetic owner image","assets/prior-owner.png","png"]],"chats":[{"id":"chat","name":"Chat","message":[message,{"role":"user","data":"followup"}],"savedToggleValues":{"test":"1"},"note":"stale copy","authorNotePreset":note_link,"unknownChat":true,"promptPresetId":"synthetic-preset","bindedBotPreset":"leftover"}]}),json!({"chaId":"second","type":"character","name":"Synthetic Second","chats":[{"id":"leftover-chat","name":"Leftover","message":[],"bindedBotPreset":"leftover"}]})]).unwrap();
             store.replace_add_characters(&staging, &[
                 json!({"chaId":"archived-one","type":"character","name":"Archived","chats":[]}),
                 json!({"chaId":"archived-two","type":"character","name":"Archived second","chats":[]}),
@@ -1261,11 +1261,18 @@ mod tests {
                 );
                 assert_eq!(message["swipeId"], 1);
                 assert_eq!(chat["savedToggleValues"], json!({"test":"1"}));
+                assert_eq!(db["botPresets"][0]["id"], "synthetic-preset");
+                assert_eq!(chat["bindedBotPreset"], "synthetic-preset");
+                assert!(chat.get("promptPresetId").is_none());
+                assert_eq!(db["characters"][1]["chats"][0]["bindedBotPreset"], "leftover");
                 assert_eq!(report.converted.iter().find(|item| item.code == "converted-inlay-provenance").unwrap().items, "1");
             } else {
                 assert_eq!(db["characters"].as_array().unwrap().len(), 2);
                 assert!(message.get("swipes").is_none());
                 assert!(chat.get("savedToggleValues").is_none());
+                assert!(chat.get("promptPresetId").is_none());
+                assert!(chat.get("bindedBotPreset").is_none());
+                assert!(db["characters"][1]["chats"][0].get("bindedBotPreset").is_none());
                 assert!(db.get("disableToggleBinding").is_none());
             }
             if let Some(dir) = std::env::var_os("RISUNEST_COMPAT_FIXTURE_DIR") {

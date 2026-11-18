@@ -21,9 +21,11 @@ export type ProtectedPresetField = keyof typeof protectedPresetGroups
 
 type Snapshot = Record<string, unknown>
 type Conversation = Database['characters'][number]['chats'][number]
+export type ApplyPreset = (db: Database, preset: botPreset) => void
 interface ToggleBinding { characterId: string; conversationId: string }
 interface IdentityState {
     override: string | null
+    bound: string | null
     presetId: string | undefined
     personaId: string | undefined
     preset: Snapshot
@@ -46,7 +48,7 @@ function state(db: Database): IdentityState {
     let current = states.get(db)
     if (!current) {
         current = {
-            override: null, presetId: db.botPresets?.[db.botPresetsId]?.id,
+            override: null, bound: null, presetId: db.botPresets?.[db.botPresetsId]?.id,
             personaId: db.personas?.[db.selectedPersona]?.id,
             preset: snapshot(db, presetMirrorMap), persona: snapshot(db, personaMirrorMap),
             flags: Object.fromEntries(Object.values(protectedPresetGroups).map(key => [key, root(db)[key]])),
@@ -64,12 +66,41 @@ function boundConversation(db: Database, binding: ToggleBinding | undefined): Co
     return chat && !isConversationSummaryStub(chat) ? chat : undefined
 }
 
+// Catalog entries carry only their summary and the local fields normalization adds.
+const catalogPresetKeys = new Set(['id', 'name', 'image', 'localNetworkMode', 'localNetworkTimeoutSec'])
+export const isLoadedPreset = (value: botPreset | undefined): boolean =>
+    !!value && Object.keys(value).some((key) => !catalogPresetKeys.has(key))
+
+const hasPreset = (db: Database, id: string): boolean => !!db.botPresets?.some(preset => preset?.id === id)
+
+export interface EffectivePresetDeriveObserver {
+    beforeDerive(db: Database): void
+    afterDerive(db: Database): void
+}
+let deriveObserver: EffectivePresetDeriveObserver | undefined
+/** Runs around every derive of the preset mirrors, whichever source changed. */
+export function observeEffectivePresetDerive(observer: EffectivePresetDeriveObserver | undefined): void {
+    deriveObserver = observer
+}
+
 export function getEffectivePresetOverride(db: Database): string | null {
     return states.get(db)?.override ?? null
 }
 
+/** The preset bound to the conversation the mirrors currently serve, or null. */
+export function getEffectivePresetBinding(db: Database): string | null {
+    return states.get(db)?.bound ?? null
+}
+
 export function getEffectivePresetId(db: Database): string | undefined {
-    return state(db).override ?? db.botPresets?.[db.botPresetsId]?.id
+    const current = state(db)
+    return current.bound ?? current.override ?? db.botPresets?.[db.botPresetsId]?.id
+}
+
+/** `getEffectivePresetId` without starting the identity state, for readers outside a derive. */
+export function peekEffectivePresetId(db: Database): string | undefined {
+    const current = states.get(db)
+    return current?.bound ?? current?.override ?? db.botPresets?.[db.botPresetsId]?.id
 }
 
 export function flushEffectivePresetEdits(db: Database): void {
@@ -104,9 +135,16 @@ export function flushEffectivePresetEdits(db: Database): void {
     current.flags = Object.fromEntries(Object.values(protectedPresetGroups).map(key => [key, root(db)[key]]))
 }
 
-export function deriveEffectivePresetMirrors(db: Database, apply: (db: Database, preset: botPreset) => void): void {
+export function deriveEffectivePresetMirrors(db: Database, apply: ApplyPreset): void {
+    deriveObserver?.beforeDerive(db)
+    derivePresetMirrors(db, apply)
+    deriveObserver?.afterDerive(db)
+}
+
+function derivePresetMirrors(db: Database, apply: ApplyPreset): void {
     const current = state(db)
-    if (current.override && !db.botPresets?.some(preset => preset.id === current.override)) current.override = null
+    if (current.override && !hasPreset(db, current.override)) current.override = null
+    if (current.bound && !hasPreset(db, current.bound)) current.bound = null
     const id = getEffectivePresetId(db)
     const preset = id ? db.botPresets?.find(preset => preset.id === id) : undefined
     const flags = Object.fromEntries(Object.values(protectedPresetGroups).map(key => [key, root(db)[key]]))
@@ -130,16 +168,115 @@ export function deriveEffectivePresetMirrors(db: Database, apply: (db: Database,
     current.flags = flags
 }
 
-export function setEffectivePresetOverride(db: Database, id: string | null, apply: (db: Database, preset: botPreset) => void): void {
-    if (id !== null && !db.botPresets?.some(preset => preset.id === id)) throw new Error('Preset was not found')
+export function setEffectivePresetOverride(db: Database, id: string | null, apply: ApplyPreset): void {
+    if (id !== null && !hasPreset(db, id)) throw new Error('Preset was not found')
     flushEffectivePresetEdits(db)
     state(db).override = id
     deriveEffectivePresetMirrors(db, apply)
 }
 
-export function adoptEffectivePresetSelection(db: Database, apply: (db: Database, preset: botPreset) => void): void {
+/**
+ * Applies a conversation's preset binding above the chain pick and the selection.
+ * An ID missing from the library leaves the binding empty, so the next source applies.
+ */
+export function setEffectivePresetBinding(db: Database, id: string | null, apply: ApplyPreset,
+    options: { clearOverride?: boolean } = {}): void {
+    flushEffectivePresetEdits(db)
+    const current = state(db)
+    current.bound = id !== null && hasPreset(db, id) ? id : null
+    if (options.clearOverride) current.override = null
+    deriveEffectivePresetMirrors(db, apply)
+}
+
+/**
+ * Sets the binding without flushing the mirrors, for a derive that follows a received
+ * or committed root: those mirrors hold stored values, not edits to the applied record.
+ */
+export function restoreEffectivePresetBinding(db: Database, id: string | null): void {
+    state(db).bound = id !== null && hasPreset(db, id) ? id : null
+}
+
+export function adoptEffectivePresetSelection(db: Database, apply: ApplyPreset): void {
     state(db).override = null
     deriveEffectivePresetMirrors(db, apply)
+}
+
+/**
+ * Mirror-shaped values of one preset that is not applied, edited in place of the mirrors.
+ * `values` may be a reactive container; `snapshot` holds the values last written or derived.
+ */
+export interface PresetMirrorView {
+    presetId: string
+    values: Snapshot
+    /** Each field as the record last had it: the value itself, or the canonical JSON of an object. */
+    saved: Snapshot
+    /** Copies a field out of `values`; a reactive view supplies its own copy. */
+    copy?: (value: unknown) => unknown
+}
+
+const fingerprint = (value: unknown): unknown =>
+    value !== null && typeof value === 'object' ? { json: canonicalJson(value) } : value
+const sameFingerprint = (left: unknown, right: unknown): boolean =>
+    left !== null && typeof left === 'object'
+        ? right !== null && typeof right === 'object' && (left as { json: string }).json === (right as { json: string }).json
+        : left === right || Object.is(left, right)
+
+function presetMirrorSource(db: Database, presetId: string, apply: ApplyPreset): Snapshot | undefined {
+    const preset = db.botPresets?.find(preset => preset?.id === presetId)
+    if (!isLoadedPreset(preset)) return undefined
+    const target = {} as Snapshot
+    apply(target as unknown as Database, preset!)
+    return target
+}
+
+export function createPresetMirrorView(db: Database, presetId: string, apply: ApplyPreset): PresetMirrorView | undefined {
+    const source = presetMirrorSource(db, presetId, apply)
+    if (!source) return undefined
+    const values: Snapshot = {}
+    const saved: Snapshot = {}
+    for (const key of Object.keys(presetMirrorMap)) {
+        // Applying can share nested values with the record, which edits must not reach directly.
+        values[key] = clone(source[key])
+        saved[key] = fingerprint(values[key])
+    }
+    return { presetId, values, saved }
+}
+
+/**
+ * Writes edited view fields to the preset record; protected fields follow the shared mirror instead.
+ * `edited` names fields known to have changed, which are copied before they are compared.
+ */
+export function flushPresetMirrorView(
+    db: Database, view: PresetMirrorView, keys: Iterable<string> = Object.keys(presetMirrorMap), edited = false,
+): void {
+    const record = db.botPresets?.find(preset => preset?.id === view.presetId) as unknown as Snapshot | undefined
+    if (!record || !isLoadedPreset(record as unknown as botPreset)) return
+    const copy = view.copy ?? clone
+    for (const key of keys) {
+        const field = presetMirrorMap[key]
+        const flag = protectedPresetGroups[key as ProtectedPresetField]
+        if (!field || (flag && root(db)[flag])) continue
+        let value = edited ? copy(view.values[key]) : view.values[key]
+        const print = fingerprint(value)
+        if (sameFingerprint(print, view.saved[key])) continue
+        if (!edited) value = copy(value)
+        if (value === undefined) delete record[field]
+        else record[field] = value
+        view.saved[key] = print
+    }
+}
+
+/** Updates the view fields whose record value changed since the view last saw it. */
+export function derivePresetMirrorView(db: Database, view: PresetMirrorView, apply: ApplyPreset): boolean {
+    const source = presetMirrorSource(db, view.presetId, apply)
+    if (!source) return false
+    for (const key of Object.keys(presetMirrorMap)) {
+        const print = fingerprint(source[key])
+        if (sameFingerprint(print, view.saved[key])) continue
+        view.values[key] = clone(source[key])
+        view.saved[key] = print
+    }
+    return true
 }
 
 export function flushEffectivePersonaEdits(db: Database): void {

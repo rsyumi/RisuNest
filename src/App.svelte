@@ -60,6 +60,7 @@
     import SyncStatusPanel from './lib/Others/SyncStatusPanel.svelte';
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
+    import { getAppliedPresetId } from './ts/storage/presetEditor.svelte';
     import { restoreFocusAfterInputBlock } from './ts/ui/restoreFocusAfterInputBlock';
     import { backNavigationLayer, handleRootBack } from './ts/ui/modalNavigation';
 
@@ -186,7 +187,7 @@
 
     let settingsPromise: Promise<typeof import('./lib/Setting/Settings.svelte')> | undefined
     let gridCharsPromise: Promise<typeof import('./lib/Others/GridCatalog.svelte')> | undefined
-    let botpresetPromise: Promise<typeof import('./lib/Setting/botpreset.svelte')> | undefined
+    let presetManagerPromise: Promise<typeof import('./lib/Setting/PresetManager.svelte')> | undefined
     let listedPersonaPromise: Promise<typeof import('./lib/Setting/listedPersona.svelte')> | undefined
     let customGUISettingMenuPromise: Promise<typeof import('./lib/Setting/Pages/CustomGUISettingMenu.svelte')> | undefined
 
@@ -196,8 +197,8 @@
         (settingsPromise ??= import('./lib/Setting/Settings.svelte'))
     const loadGridChars = (_retry: number) =>
         (gridCharsPromise ??= import('./lib/Others/GridCatalog.svelte'))
-    const loadBotpreset = (_retry: number) =>
-        (botpresetPromise ??= import('./lib/Setting/botpreset.svelte'))
+    const loadPresetManager = (_retry: number) =>
+        (presetManagerPromise ??= import('./lib/Setting/PresetManager.svelte'))
     const loadListedPersona = (_retry: number) =>
         (listedPersonaPromise ??= import('./lib/Setting/listedPersona.svelte'))
     const loadCustomGUISettingMenu = (_retry: number) =>
@@ -409,21 +410,22 @@
         <RealmFrame />
     {/if}
     {#if $openPresetList}
-        {#await loadBotpreset(lazyRetry)}
+        {#await loadPresetManager(lazyRetry)}
             <div
                 class="absolute inset-0 z-40 flex items-center justify-center bg-darkbg text-textcolor"
             >
                 <LoadingIndicator label={language.loading} />
             </div>
         {:then module}
-            {@const Botpreset = module.default}
-            <Botpreset
+            {@const PresetManager = module.default}
+            <PresetManager
+                chatPresetId={getAppliedPresetId()}
                 close={() => {
                     $openPresetList = false
                 }}
             />
         {:catch}
-            <LazyScreenError overlay message={language.risuNest.lazy.screen} onRetry={() => { botpresetPromise = undefined; lazyRetry++ }} backLabel={language.close} onBack={() => { botpresetPromise = undefined; $openPresetList = false }} />
+            <LazyScreenError overlay message={language.risuNest.lazy.screen} onRetry={() => { presetManagerPromise = undefined; lazyRetry++ }} backLabel={language.close} onBack={() => { presetManagerPromise = undefined; $openPresetList = false }} />
         {/await}
     {/if}
     {#if $openPersonaList}

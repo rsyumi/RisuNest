@@ -42,7 +42,7 @@ function libraryProjection(library: JsonRecord): unknown {
             return true
         }).map(([key, item]) => [key, project(item, scope,
             (records.has(value) && ['id', 'chaId'].includes(key)) ||
-            ['bindedPersona', 'characterIds', 'enabledModules', 'charOrder', 'modules', 'characters', 'folderId'].includes(key))]))
+            ['bindedPersona', 'promptPresetId', 'characterIds', 'enabledModules', 'charOrder', 'modules', 'characters', 'folderId'].includes(key))]))
     }
     return canonical(Object.fromEntries(Object.entries(library).filter(([key]) =>
         recordCollections.has(key) || (!localRootKeys.has(key) && !derivedRootKeys.has(key) && !['botPresetsId', 'selectedPersona', 'hypaV3PresetId', 'translatorPresetId', 'explicitGlobalChatVariables', 'protectedPresetValues'].includes(key)))

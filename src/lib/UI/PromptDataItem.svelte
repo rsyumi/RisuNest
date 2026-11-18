@@ -1,15 +1,20 @@
 <script lang="ts">
-    import type { PromptItem, PromptItemChat, PromptRole } from "src/ts/process/prompt";
+    import type { PromptItem, PromptItemChat, PromptRole, PromptType } from "src/ts/process/prompt";
     import OptionInput from "./GUI/OptionInput.svelte";
     import TextAreaInput from "./GUI/TextAreaInput.svelte";
     import SelectInput from "./GUI/SelectInput.svelte";
     import { language } from "src/lang";
     import NumberInput from "./GUI/NumberInput.svelte";
     import CheckInput from "./GUI/CheckInput.svelte";
-    import { ArrowDown, ArrowUp, XIcon } from "@lucide/svelte";
+    import ArrowDown from "@lucide/svelte/icons/arrow-down";
+    import ArrowUp from "@lucide/svelte/icons/arrow-up";
+    import GripVertical from "@lucide/svelte/icons/grip-vertical";
+    import Trash from "@lucide/svelte/icons/trash";
     import TextInput from "./GUI/TextInput.svelte";
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { RISU_PROMPT_DRAG_TYPE } from "src/ts/dragTypes";
+    import { alertConfirm } from "src/ts/alert";
+    import { promptBlockTypeName, promptBlockTypes } from "src/ts/process/promptBlockTypes";
     
     interface Props {
         promptItem: PromptItem;
@@ -62,45 +67,79 @@
     }
 
     function getName(promptItem:PromptItem){
+        return promptItem.name || promptBlockTypeName(promptItem.type)
+    }
 
-        if(promptItem.name){
-            return promptItem.name
-        }
+    const keepsText = (type: PromptType) => type === 'plain' || type === 'jailbreak' || type === 'cot'
 
-        if(promptItem.type === 'plain'){
-            return language.formating.plain
+    function roleName(role: unknown){
+        if(role === 'user') return language.user
+        if(role === 'bot' || role === 'assistant') return language.character
+        if(role === 'system') return language.systemPrompt
+        return ''
+    }
+
+    // Only blocks sent with a chosen role carry the role chip. A cache point's role picks messages instead.
+    function blockRole(promptItem: PromptItem){
+        if(keepsText(promptItem.type)) return roleName((promptItem as { role?: unknown }).role)
+        if(hasPromptBlockRole(promptItem)) return roleName(promptItem.role2 ?? 'system')
+        return ''
+    }
+
+    function blockPreview(promptItem: PromptItem){
+        let text: unknown = ''
+        if(keepsText(promptItem.type) || promptItem.type === 'chatML'){
+            text = (promptItem as { text?: unknown }).text
+        } else if(hasPromptBlockRole(promptItem)){
+            text = (promptItem as { innerFormat?: unknown }).innerFormat
         }
-        if(promptItem.type === 'jailbreak'){
-            return language.formating.jailbreak
+        return typeof text === 'string' ? text.slice(0, 300).replace(/\s+/g, ' ').trim() : ''
+    }
+
+    const typeName = $derived(promptBlockTypeName(promptItem.type))
+    const title = $derived(promptItem.name || typeName)
+    const role = $derived(blockRole(promptItem))
+    const detail = $derived.by(() => {
+        const preview = blockPreview(promptItem)
+        if(!promptItem.name) return preview
+        return preview ? `${typeName} · ${preview}` : typeName
+    })
+
+    function toggleOpened(){
+        const next = new Set(openedItems)
+        if (isOpened) {
+            next.delete(promptItem)
+        } else {
+            next.add(promptItem)
+        }
+        openedItems = next
+    }
+
+    async function confirmRemove(){
+        if(await alertConfirm(language.removeConfirm + getName(promptItem))){
+            onRemove()
+        }
+    }
+
+    function changeType(next: PromptType){
+        const previous = promptItem.type
+        ;(promptItem as { type: PromptType }).type = next
+        // Text and role carry over between the three text block types.
+        if((promptItem.type === 'plain' || promptItem.type === 'jailbreak' || promptItem.type === 'cot') && !keepsText(previous)){
+            promptItem.text = ""
+            promptItem.role = "system"
+        }
+        if(promptItem.type === 'cache'){
+            promptItem.depth = 1
+            promptItem.role = 'all'
         }
         if(promptItem.type === 'chat'){
-            return language.Chat
+            promptItem.rangeStart = -1000
+            promptItem.rangeEnd = 'end'
         }
-        if(promptItem.type === 'persona'){
-            return language.formating.personaPrompt
+        if(hasPromptBlockRole(promptItem) && !isPromptRole(promptItem.role2)){
+            promptItem.role2 = 'system'
         }
-        if(promptItem.type === 'description'){
-            return language.formating.description
-        }
-        if(promptItem.type === 'authornote'){
-            return language.formating.authorNote
-        }
-        if(promptItem.type === 'lorebook'){
-            return language.formating.lorebook
-        }
-        if(promptItem.type === 'memory'){
-            return language.formating.memory
-        }
-        if(promptItem.type === 'postEverything'){
-            return language.formating.postEverything
-        }
-        if(promptItem.type === 'cot'){
-            return language.cot
-        }
-        if(promptItem.type === 'chatML'){
-            return 'ChatML'
-        }
-        return ""
     }
 
     const isPromptDrag = (e:DragEvent) => {
@@ -142,7 +181,7 @@
 </div>
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-    class="flex flex-col border border-selected p-4 rounded-md bg-darkbg transition-all duration-200"
+    class="flex flex-col border border-selected rounded-md bg-darkbg transition-all duration-200"
     class:opacity-50={isDragging}
     class:scale-95={isDragging}
     class:border-b-borderc={draggedIndex !== -1 && dragOverIndex === currentIndex + 1}
@@ -184,11 +223,9 @@
         onDrop()
     }}
 >
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div
-        class="flex items-center w-full"
+        class="flex items-center gap-1 px-1"
         draggable="true"
-        style:cursor="grab"
         ondragstart={(e) => {
             draggedIndex = currentIndex
             markPromptDrag(e)
@@ -207,70 +244,30 @@
             draggedIndex = -1
             dragOverIndex = -1
         }}
-        onclick={() => {
-            const next = new Set(openedItems)
-            if (isOpened) {
-                next.delete(promptItem)
-            } else {
-                next.add(promptItem)
-            }
-            openedItems = next
-        }}
     >
-        <span>{getName(promptItem)}</span>
-        <div class="flex flex-1 justify-end">
-            <button onclick={(e) => {
-                e.stopPropagation()
-                onRemove()
-            }}><XIcon /></button>
-            <button onclick={(e) => {
-                e.stopPropagation()
-                moveDown()
-            }}><ArrowDown /></button>
-            <button onclick={(e) => {
-                e.stopPropagation()
-                moveUp()
-            }}><ArrowUp /></button>
+        <span class="shrink-0 w-6 self-stretch flex items-center justify-center text-textcolor2 cursor-grab" aria-hidden="true"><GripVertical size={16} /></span>
+        <button class="min-w-0 flex-1 py-2 text-left flex flex-col gap-0.5" aria-expanded={isOpened} onclick={toggleOpened}>
+            <span class="flex items-center gap-2 min-w-0"><span class="truncate font-medium">{title}</span>{#if role}<span class="shrink-0 rounded-sm bg-selected px-1.5 text-xs leading-5">{role}</span>{/if}</span>
+            {#if detail}
+                <span class="truncate text-xs text-textcolor2">{detail}</span>
+            {/if}
+        </button>
+        <div class="flex items-center shrink-0">
+            <button class="size-10 flex items-center justify-center rounded-md text-textcolor2 hover:text-textcolor hover:bg-selected transition-colors" title={language.movePresetUp} aria-label={language.movePresetUp} onclick={() => moveUp()}><ArrowUp size={18} /></button>
+            <button class="size-10 flex items-center justify-center rounded-md text-textcolor2 hover:text-textcolor hover:bg-selected transition-colors" title={language.movePresetDown} aria-label={language.movePresetDown} onclick={() => moveDown()}><ArrowDown size={18} /></button>
+            <span class="mx-1 h-5 w-px bg-darkborderc" aria-hidden="true"></span>
+            <button class="size-10 flex items-center justify-center rounded-md text-textcolor2 hover:text-draculared hover:bg-draculared/15 transition-colors" title={language.remove} aria-label={language.remove} onclick={confirmRemove}><Trash size={18} /></button>
         </div>
     </div>
     {#if isOpened}
-
-    
-        <span class="mt-6">{language.name}</span>
+    <div class="flex flex-col px-4 pb-4 border-t border-darkborderc">
+        <span class="mt-4">{language.name}</span>
         <TextInput bind:value={promptItem.name} />
         <span class="mt-2">{language.type} </span>
-        <SelectInput bind:value={promptItem.type} onchange={() => {
-            if(promptItem.type === 'plain' || promptItem.type === 'jailbreak' || promptItem.type === 'cot'){
-                promptItem.text = ""
-                promptItem.role = "system"
-            }
-            if(promptItem.type === 'cache'){
-                promptItem.depth = 1
-                promptItem.role = 'all'
-            }
-            if(promptItem.type === 'chat'){
-                promptItem.rangeStart = -1000
-                promptItem.rangeEnd = 'end'
-            }
-            if(hasPromptBlockRole(promptItem) && !isPromptRole(promptItem.role2)){
-                promptItem.role2 = 'system'
-            }
-        }} >
-            <OptionInput value="plain">{language.formating.plain}</OptionInput>
-            <OptionInput value="jailbreak">{language.formating.jailbreak}</OptionInput>
-            <OptionInput value="chat">{language.Chat}</OptionInput>
-            <OptionInput value="persona">{language.formating.personaPrompt}</OptionInput>
-            <OptionInput value="description">{language.formating.description}</OptionInput>
-            <OptionInput value="authornote">{language.formating.authorNote}</OptionInput>
-            <OptionInput value="lorebook">{language.formating.lorebook}</OptionInput>
-            <OptionInput value="memory">{language.formating.memory}</OptionInput>
-            <OptionInput value="postEverything">{language.formating.postEverything}</OptionInput>
-            <OptionInput value="chatML">{"chatML"}</OptionInput>
-            <OptionInput value="cache">{language.cachePoint}</OptionInput>
-
-            {#if DBState.db.promptSettings.customChainOfThought}
-                <OptionInput value="cot">{language.cot}</OptionInput>
-            {/if}
+        <SelectInput value={promptItem.type} onchange={(event) => changeType(event.currentTarget.value as PromptType)}>
+            {#each promptBlockTypes(!!DBState.db.promptSettings.customChainOfThought) as type (type)}
+                <OptionInput value={type}>{promptBlockTypeName(type)}</OptionInput>
+            {/each}
         </SelectInput>
 
         {#if promptItem.type === 'plain' || promptItem.type === 'jailbreak' || promptItem.type === 'cot'}
@@ -363,5 +360,6 @@
                 <OptionInput value="system">{language.systemPrompt}</OptionInput>
             </SelectInput>
         {/if}
+    </div>
     {/if}
 </div>

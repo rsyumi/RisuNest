@@ -1978,6 +1978,35 @@ export const languageEnglish = {
     skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     risuNest: {
+        presetList: {
+            noMatch: 'No presets match the search.',
+            export: 'Export',
+            import: 'Import',
+            compare: 'Compare',
+            compareHint: 'Select two presets to compare.',
+            inherit: 'Use current preset',
+            chatPreset: 'Current chat',
+            change: 'Change',
+        },
+        promptList: {
+            count: '{0} prompts',
+        },
+        toggleEditor: {
+            view: 'Custom toggle view',
+            raw: 'Raw',
+            switch: 'Switch',
+            select: 'Select',
+            text: 'Text',
+            textarea: 'Multiline text',
+            group: 'Group',
+            divider: 'Divider',
+            caption: 'Caption',
+        },
+        presetBinding: {
+            label: 'Preset binding',
+            missing: 'Preset unavailable, using current preset',
+            saveFailed: 'Could not save the preset binding.',
+        },
         moduleScope: {
             info: 'Global applies a module to every chat, Character to every chat with this character, and Chat to this chat only.',
             global: 'Global',

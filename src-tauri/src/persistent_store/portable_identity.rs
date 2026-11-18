@@ -69,6 +69,7 @@ impl IdentityRemap {
             value["id"] = Value::String(self.conversation(owner, id));
         }
         self.field(value, "bindedPersona", "persona");
+        self.field(value, "promptPresetId", "preset");
         self.list(value, "modules", "modules");
     }
     fn root(&self, value: &mut Value) {
@@ -422,7 +423,7 @@ impl PersistentStore {
         };
         for (owner, id) in chats {
             let raw: String = tx.query_row("SELECT detail FROM conversations WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![staging,owner,id],|r|r.get(0))?;
-            let value = IdentityRemap::detail_text(&raw, &["id", "bindedPersona", "modules"], |value| map.chat(&owner, value))?;
+            let value = IdentityRemap::detail_text(&raw, CHAT_REMAPPED, |value| map.chat(&owner, value))?;
             tx.execute("UPDATE conversations SET character_id=?4,conversation_id=?5,detail=?6 WHERE generation=?1 AND character_id=?2 AND conversation_id=?3",params![staging,owner,id,map.id("character",&owner),map.conversation(&owner,&id),value])?;
         }
         let message_owners = {
@@ -537,6 +538,8 @@ const PRESET_REMAPPED: &[&str] = &[
     "seperateModelsForAxModels",
     "fallbackModels",
 ];
+/// The conversation fields `IdentityRemap::chat` changes.
+const CHAT_REMAPPED: &[&str] = &["id", "bindedPersona", "promptPresetId", "modules"];
 
 fn text_member(object: &Object<'_>, name: &str) -> StoreResult<Option<String>> {
     Ok(object.get(name).map(Raw::as_str).transpose()?.flatten().map(|text| text.into_owned()))
@@ -648,7 +651,7 @@ mod tests {
                 &[json!({"id":"preset","name":"kept upstream name","aiModel":"model"})],
             )
             .unwrap();
-        store.replace_add_characters(&id,&[json!({"chaId":"char","type":"character","name":"synthetic","modules":["module"],"chats":[{"id":"chat","name":"synthetic chat","bindedPersona":"persona","modules":["module"],"message":[{"role":"user","data":"synthetic","chatId":"message"}],"bookmarks":["message"],"bookmarkNames":{"message":"kept"},"hypaV3Data":{"memos":["message"]}}]})]).unwrap();
+        store.replace_add_characters(&id,&[json!({"chaId":"char","type":"character","name":"synthetic","modules":["module"],"chats":[{"id":"chat","name":"synthetic chat","bindedPersona":"persona","promptPresetId":"preset","modules":["module"],"message":[{"role":"user","data":"synthetic","chatId":"message"}],"bookmarks":["message"],"bookmarkNames":{"message":"kept"},"hypaV3Data":{"memos":["message"]}}]})]).unwrap();
         id
     }
     fn retire(store: &mut PersistentStore, p: &[&str]) {
@@ -734,6 +737,8 @@ mod tests {
         let chat = &char["chats"][0];
         assert_ne!(chat["id"], "chat");
         assert_eq!(chat["bindedPersona"], db["personas"][0]["id"]);
+        assert_ne!(chat["promptPresetId"], "preset");
+        assert_eq!(chat["promptPresetId"], db["botPresets"][0]["id"]);
         assert_eq!(chat["message"][0]["chatId"], "message");
         assert_eq!(chat["bookmarks"], json!(["message"]));
         assert_eq!(chat["bookmarkNames"], json!({"message":"kept"}));
@@ -1064,14 +1069,14 @@ mod tests {
             assert_eq!(map.root_text(text).unwrap(), serde_json::to_string(&value).unwrap(), "{text}");
         }
         let details = [
-            format!(r#"{{"chaId":"char","modules":["module"],"binary":{{{binary}}},"id":"chat","bindedPersona":"persona","aiModel":"model","n":-0.0}}"#),
+            format!(r#"{{"chaId":"char","modules":["module"],"binary":{{{binary}}},"id":"chat","bindedPersona":"persona","promptPresetId":"preset","aiModel":"model","n":-0.0}}"#),
             r#"{"chaId":3,"id":["chat"],"modules":"module","chaId":"char"}"#.into(),
             r#"{"$serde_json::private::RawValue":"{\"chaId\":\"char\"}"}"#.into(),
             r#""char""#.into(),
         ];
         let edits: [(&[&str], &dyn Fn(&mut Value)); 3] = [
             (&["chaId", "modules"], &|value| map.character(value)),
-            (&["id", "bindedPersona", "modules"], &|value| map.chat("char", value)),
+            (CHAT_REMAPPED, &|value| map.chat("char", value)),
             (PRESET_REMAPPED, &|value| {
                 map.field(value, "id", "preset");
                 map.models(value);

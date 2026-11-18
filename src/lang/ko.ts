@@ -1800,6 +1800,35 @@ export const languageKorean = {
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
     risuNest: {
+        presetList: {
+            noMatch: '검색 결과가 없습니다.',
+            export: '내보내기',
+            import: '가져오기',
+            compare: '비교',
+            compareHint: '비교할 프리셋 두 개를 선택하세요.',
+            inherit: '현재 프리셋 사용',
+            chatPreset: '현재 채팅',
+            change: '변경',
+        },
+        promptList: {
+            count: '프롬프트 {0}개',
+        },
+        toggleEditor: {
+            view: '커스텀 토글 보기',
+            raw: '원문',
+            switch: '스위치',
+            select: '선택',
+            text: '텍스트',
+            textarea: '여러 줄 텍스트',
+            group: '그룹',
+            divider: '구분선',
+            caption: '설명',
+        },
+        presetBinding: {
+            label: '프리셋 바인딩',
+            missing: '바인딩한 프리셋 없음 · 현재 프리셋 사용',
+            saveFailed: '프리셋 바인딩을 저장하지 못했습니다.',
+        },
         moduleScope: {
             info: '글로벌은 모든 채팅, 캐릭터는 이 캐릭터의 모든 채팅, 채팅은 현재 채팅에 모듈을 적용합니다.',
             global: '글로벌',

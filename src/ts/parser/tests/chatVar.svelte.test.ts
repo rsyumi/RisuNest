@@ -3,6 +3,7 @@ import { writable } from 'svelte/store'
 import { beforeEach, expect, test, vi } from 'vitest'
 import { DBState, selectedCharID } from '../../stores.svelte'
 import { getChatVar, getChatVarFromConversation, getGlobalChatVar, setChatVar } from '../chatVar.svelte'
+import { risuChatParser } from '../parser.svelte'
 import { resetChatVariables } from './cbs/lib'
 import type { Chat, Database } from '../../storage/database.svelte'
 
@@ -175,4 +176,19 @@ test('reads the selected owner without visiting the rest of the library', () => 
   } finally {
     selectedCharID.set(0)
   }
+})
+
+test('reads template defaults and model flags from the preset the parser is given', () => {
+  DBState.db.templateDefaultVariables = 'mode=applied'
+  const preset = {
+    ...DBState.db,
+    templateDefaultVariables: 'mode=edited',
+    aiModel: 'claude-opus-4-5-20251101',
+    enableCustomFlags: true,
+    customFlags: [],
+  } as unknown as Database
+
+  expect(risuChatParser('{{getvar::mode}}')).toBe('applied')
+  expect(risuChatParser('{{getvar::mode}} {{prefillsupported}}', { db: preset })).toBe('edited 0')
+  expect(risuChatParser('{{prefillsupported}}', { db: { ...preset, enableCustomFlags: false } })).toBe('1')
 })

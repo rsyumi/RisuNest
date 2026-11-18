@@ -1,3 +1,6 @@
+// A root, character or conversation field added here also joins `LISTED_SINCE_FIRST_RELEASE`
+// (`lww_listed_fields.rs`), which projects the units an earlier build stored for it. A preset
+// field added here would need the same projection.
 pub(super) const ROOT_FIELDS: &[&str] = &[
     "ImagenAspectRatio",
     "ImagenImageSize",
@@ -398,6 +401,7 @@ pub(super) const CONVERSATION_FIELDS: &[&str] = &[
     "name",
     "note",
     "onboardingDone",
+    "promptPresetId",
     "rerollRecovery",
     "savedToggleValues",
     "scriptstate",

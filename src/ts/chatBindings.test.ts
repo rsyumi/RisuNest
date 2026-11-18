@@ -16,12 +16,13 @@ const state = vi.hoisted(() => ({
     bindings: [] as { characterId: string; conversationId: string; patch: unknown; expected?: unknown }[],
     bindingGate: null as Promise<void> | null,
     toast: vi.fn(),
+    error: vi.fn(),
 }))
 vi.mock('./stores.svelte', () => ({
     DBState: state, selectedCharID: writable(0),
     ReloadChatPointer: writable({}), ScriptDisplayRefreshPointer: writable(0),
 }))
-vi.mock('./alert', () => ({ alertToast: state.toast }))
+vi.mock('./alert', () => ({ alertToast: state.toast, alertError: state.error }))
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => state.session,
     getPersistentNavigationGeneration: () => state.navigation,
@@ -54,7 +55,7 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
         },
     }),
 }))
-import { bindPersona, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, refreshAuthorNoteCopy, updateChatBinding } from './chatBindings.svelte'
+import { bindPersona, bindPresetFromList, bindPromptPreset, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, refreshAuthorNoteCopy, updateChatBinding } from './chatBindings.svelte'
 import { authorNoteFingerprint } from './authorNotePresets'
 import { doingChat } from './process/generationState'
 import { activeRerollConversations } from './durableReroll'
@@ -65,6 +66,7 @@ beforeEach(() => {
     doingChat.set(false)
     activeRerollConversations.set([])
     state.toast.mockClear()
+    state.error.mockClear()
     state.navigation = 0
     state.epoch = 0
     state.session = null
@@ -77,6 +79,7 @@ beforeEach(() => {
     state.db = {
         selectedPersona: 0,
         username: 'Global persona',
+        botPresets: [{ id: 'preset-a', name: 'A' }, { id: 'preset-b', name: 'B' }],
         personas: [
             { id: 'global', name: 'Global persona' },
             { id: 'bound', name: 'Bound persona' },
@@ -217,6 +220,31 @@ it('retains an imported persona ID and assigns a missing local ID only once', as
     expect(state.db.personas[0].id).toBe('global')
 })
 
+it('binds a prompt preset by ID through the coordinator and unbinds it with an empty ID', async () => {
+    const target = captureChatBindingTarget()!
+    await bindPromptPreset(target.conversation, 'preset-b')
+    expect(target.conversation.promptPresetId).toBe('preset-b')
+    await bindPromptPreset(target.conversation, null)
+    expect(target.conversation.promptPresetId).toBe('')
+    expect(state.bindings.map((binding) => binding.patch)).toEqual([{ promptPresetId: 'preset-b' }, { promptPresetId: '' }])
+    await expect(bindPromptPreset(target.conversation, 'removed')).rejects.toThrow()
+    expect(state.bindings).toHaveLength(2)
+})
+it('binds the preset picked in the list to the captured conversation only while it is still selected and idle', async () => {
+    const target = captureChatBindingTarget()!
+    expect(await bindPresetFromList(target, 'preset-a')).toBe(true)
+    expect(state.db.characters[0].chats[0].promptPresetId).toBe('preset-a')
+    expect(state.flushes).toEqual(['chat-binding'])
+
+    doingChat.set(true)
+    expect(await bindPresetFromList(target, null)).toBe(false)
+    doingChat.set(false)
+    expect(await bindPresetFromList(target, 'removed')).toBe(false)
+    expect(state.error).toHaveBeenCalledWith(language.risuNest.presetBinding.saveFailed)
+    state.navigation++
+    expect(await bindPresetFromList(target, null)).toBe(false)
+    expect(state.db.characters[0].chats[0].promptPresetId).toBe('preset-a')
+})
 it('blocks binding edits with a notice only while a response is generating', () => {
     state.toast.mockClear()
     expect(chatBindingBlockedByGeneration()).toBe(false)

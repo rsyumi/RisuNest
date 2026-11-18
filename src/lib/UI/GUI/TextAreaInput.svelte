@@ -146,6 +146,7 @@
     import { language } from 'src/lang'
     import { cancelTextEditorPopup, isInsideTextEditorPopup, openTextEditorPopup, type TextEditorPopupRequest } from 'src/ts/gui/textEditorPopup.svelte'
     import { contextHold } from 'src/ts/gui/contextHold'
+    import { presetEditorOrigin } from 'src/ts/gui/presetEditorSurface'
     interface Props {
         size?: 'xs'|'sm'|'md'|'lg'|'xl'|'default';
         autocomplete?: 'on'|'off';
@@ -195,6 +196,7 @@
     let editorRequest: TextEditorPopupRequest | null = null
     // Opening an editor from a field inside the editor would replace it and drop its draft.
     const insidePopupEditor = isInsideTextEditorPopup()
+    const opensFromPresetEditor = presetEditorOrigin()
 
     const autoComplete = () => {
         if(isMobile){
@@ -291,6 +293,7 @@
             value: value ?? '',
             language: popupLanguage,
             preview: popupLanguage === 'markdown',
+            presetEditor: opensFromPresetEditor(),
             save: async (next) => {
                 editorRequest = null
                 value = next

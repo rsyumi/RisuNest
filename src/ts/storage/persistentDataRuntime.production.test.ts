@@ -11,7 +11,7 @@ vi.mock('../gui/receivedDisplaySettings', () => ({ applyReceivedDisplaySettings:
 const pluginRuntime = vi.hoisted(() => ({ load: vi.fn(async () => undefined) }))
 vi.mock('../plugins/plugins.svelte', async (importOriginal) => ({ ...await importOriginal<typeof import('../plugins/plugins.svelte')>(), requestPluginReloadAfterSync: pluginRuntime.load }))
 import { createBrowserPluginDeviceBackend, getPluginDeviceKeyspace } from '../plugins/pluginDeviceKeyspace'
-import { selectedCharID } from '../stores.svelte'
+import { selectedCharID, settingsOpen } from '../stores.svelte'
 import { doingChat } from '../process/generationState'
 import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
 import {
@@ -19,11 +19,12 @@ import {
     registerPluginStorageLifecycle,
 } from '../plugins/pluginStorageStore'
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
-import type { Database } from './database.svelte'
+import type { Chat, Database } from './database.svelte'
 import type { PersistentDataStore, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
 import { createStoreStub } from './persistentDataStore.testSupport'
-import { captureCurrentPreset, fillRootFieldDefaults, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
+import { applyConversationPresetBinding, captureCurrentPreset, carryPresetBinding, fillRootFieldDefaults, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
 import { createPresetWorkingSetController } from './presetWorkingSetOperations'
+import { presetEditorDBState } from './presetEditor.svelte'
 import {
     configurePersistentDataRuntime,
     createProductionStateAdapter,
@@ -1163,6 +1164,22 @@ describe('preset chain override across a whole working-set replacement', () => {
         expect(getDatabase().botPresets.find((preset) => preset.id === 'preset-a')!.mainPrompt).toBe('Prompt A')
     })
 
+    it.each([true, false])('keeps the applied conversation binding (resident=%s)', async (resident) => {
+        const initial = presetDatabase()
+        const store = new IndexedDbPersistentDataStore(`binding-carry-${resident}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        await applyConversationPresetBinding(getDatabase(), { id: 'chat', promptPresetId: 'preset-b' } as Chat)
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        const replacement = resident ? structuredClone(initial) : projectCompleteScalableWorkingSet(initial, null, revision, new Set())
+        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
+        await vi.waitFor(() => expect(getEffectivePresetId()).toBe('preset-b'))
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        expect(getDatabase().botPresetsId).toBe(0)
+    })
+
     it('clears the override when its preset is gone', () => {
         const initial = presetDatabase()
         setDatabase(structuredClone(initial))
@@ -1497,6 +1514,8 @@ describe('preset list operations', () => {
         const initial = normalizeDatabaseDefaults({} as Database)
         initial.botPresets[0].id = 'first-preset'
         initial.botPresets[0].name = 'First'
+        initial.botPresets[0].currentPluginProvider = 'removed-plugin'
+        initial.currentPluginProvider = 'removed-plugin'
         initial.personas[0].id = 'persona'
         const store = new IndexedDbPersistentDataStore(`preset-list-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
         await store.open()
@@ -1530,9 +1549,72 @@ describe('preset list operations', () => {
         expect(new Set(ids).size).toBe(2)
         expect(ids).toContain('first-preset')
 
+        // A removed plugin provider leaves every stored body, also those behind catalog stubs.
+        await controller.clearPluginProvider('removed-plugin')
+        const providers = await Promise.all(ids.map(async (id) => (await store.readPreset(id))!.value.currentPluginProvider))
+        expect(providers).toEqual(['', ''])
+        expect(getDatabase().currentPluginProvider).toBe('')
+
         const commit = vi.spyOn(store, 'commit')
         await runtime.flushPendingDataLocally('after-preset-list-operations')
         expect(commit).not.toHaveBeenCalled()
+    })
+
+    it.each([true, false])('changes only the selection in a bound conversation (catalog=%s)', async (catalog) => {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        Object.assign(initial.botPresets[0], { id: 'preset-a', name: 'A', mainPrompt: 'Prompt A' })
+        for (const id of ['b', 'c']) {
+            initial.botPresets.push({ ...structuredClone(initial.botPresets[0]), id: `preset-${id}`, name: id.toUpperCase(), mainPrompt: `Prompt ${id.toUpperCase()}` })
+        }
+        initial.mainPrompt = 'Prompt A'
+        initial.personas[0].id = 'persona'
+        initial.characters = [{ type: 'character', chaId: 'character', name: 'Character', chatPage: 0, chatFolders: [],
+            chats: [{ id: 'chat', name: 'Chat', note: '', localLore: [], message: [], promptPresetId: 'preset-b' }] }] as unknown as Database['characters']
+        const store = new IndexedDbPersistentDataStore(`preset-bound-selection-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const {revision} = await store.replaceFromDatabase(initial)
+        setDatabaseLite(catalog ? projectCompleteScalableWorkingSet(initial, 'character', revision, new Set(['character'])) : structuredClone(initial))
+        selectedCharID.set(0)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const controller = createPresetWorkingSetController({
+            getDatabase, captureCurrentPreset, getEffectivePresetId,
+            applyPreset: (root, preset) => setPreset(root as Database, preset),
+            mutatePersistentPresets: (reason, mutate) => runtime.mutatePersistentPresets(reason, mutate),
+        })
+        // The chat lifecycle reads a bound catalog stub through the runtime this test does not install.
+        await carryPresetBinding('preset-b', (id) => store.readPreset(id))
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        const storedPrompts = async () => Promise.all(['a', 'b', 'c'].map(async (id) => (await store.readPreset(`preset-${id}`))!.value.mainPrompt))
+
+        await controller.changeToPreset(1)
+        expect(getDatabase().botPresetsId).toBe(1)
+        await controller.changeToPreset(2)
+        expect(getDatabase().botPresetsId).toBe(2)
+        expect((await store.readRoot()).value.botPresetsId).toBe('preset-c')
+        expect(getEffectivePresetId()).toBe('preset-b')
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        expect(await storedPrompts()).toEqual(['Prompt A', 'Prompt B', 'Prompt C'])
+
+        // The settings window edits the selection, which saves like any other edit.
+        const dispose = observePersistentSaveChanges({
+            readDatabase: getDatabase, readSelectedCharacter: () => null,
+            markDirty: (bytes) => runtime.markPersistentDataDirty(bytes),
+        })
+        settingsOpen.set(true)
+        try {
+            flushSync()
+            // Installing the observer marks the data dirty once.
+            await runtime.flushPendingDataLocally('observer-installed')
+            expect(presetEditorDBState.db.mainPrompt).toBe('Prompt C')
+            presetEditorDBState.db.mainPrompt = 'Edited C'
+            flushSync()
+            await vi.waitFor(async () => expect(await storedPrompts()).toEqual(['Prompt A', 'Prompt B', 'Edited C']), { timeout: 3000 })
+        } finally {
+            settingsOpen.set(false)
+            dispose()
+        }
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 })
 
