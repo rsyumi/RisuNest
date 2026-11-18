@@ -162,3 +162,17 @@ impl PersistentStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // app-v1.0.0 shared 295 root, 78 character and 22 conversation fields. A field listed after
+    // it and missing from `LISTED_SINCE_FIRST_RELEASE` would stay out of the documents after an
+    // upgrade from a build without a record, and after restoring an earlier backup.
+    #[test]
+    fn the_first_release_baseline_lists_only_what_app_v1_0_0_shared() {
+        let baseline = Projected::first_release();
+        assert_eq!((baseline.root.len(), baseline.character.len(), baseline.conversation.len()), (295, 78, 22));
+    }
+}

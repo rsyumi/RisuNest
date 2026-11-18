@@ -1,3 +1,6 @@
+// A root, character or conversation field added here also joins `LISTED_SINCE_FIRST_RELEASE`
+// (`lww_listed_fields.rs`), which projects the units an earlier build stored for it. A preset
+// field added here would need the same projection.
 pub(super) const ROOT_FIELDS: &[&str] = &[
     "ImagenAspectRatio",
     "ImagenImageSize",
@@ -408,8 +411,6 @@ pub(super) const CONVERSATION_FIELDS: &[&str] = &[
     "toolCalls",
     "useLocallySetGlobalVariables",
 ];
-// Opening a library projects the stored units of a field added to the lists above
-// (`lww_listed_fields.rs`); one added here would need the same.
 pub(super) const PRESET_FIELDS: &[&str] = &[
     "JinjaTemplate",
     "NAISettings",
