@@ -372,7 +372,8 @@ function continueHydration(continuation = false): void {
     })
 }
 async function updateForeground(visible: boolean): Promise<void> {
-    const usable = !replacing && !!context && !context.signal.aborted
+    // A committed restore keeps routine sync stopped until the user resumes it.
+    const usable = !replacing && !heldForCommittedRestore && !!context && !context.signal.aborted
     continuing = !visible && usable && (foreground || continuing)
     foreground = visible && usable && !outOfTime
     if (!active() && hydrating) hydrationPending = true
@@ -553,7 +554,7 @@ const transport: SyncBindingTransport = {
     async resumeNewDeviceBinding(preparation,result,c) {
         try {
             await during('applying', () => invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }))
-            context = c; adoptSchedulerAuthority(c); checkContext(c)
+            heldForCommittedRestore = false; context = c; adoptSchedulerAuthority(c); checkContext(c)
             if (remoteAssetsRequested(c)) await keepAssetsRemote(c)
             persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true
             await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint()
@@ -633,6 +634,7 @@ async function syncServerNow(): Promise<void> {
     if (!context || context.signal.aborted || context.state.targetAuthority !== current.targetAuthority || context.state.selectionEpoch !== current.selectionEpoch || context.state.libraryId !== current.libraryId || context.state.target.kind !== 'server' || context.state.target.connectionId !== current.target.connectionId) {
         await resumeCurrentServerBinding(current)
     }
+    heldForCommittedRestore = false
     halt()
     try {
         await scheduler.fence()
