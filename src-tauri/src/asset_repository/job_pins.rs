@@ -303,6 +303,15 @@ impl DurableCasJob {
         })
     }
 
+    /// Whether the journal of `job_id` may still be on disk. A check that fails counts as present.
+    pub(crate) fn journal_exists(repository_root: &Path, job_id: &str) -> bool {
+        match job_pin_directory(repository_root, false) {
+            Ok(Some((_, directory))) => directory.join(format!("job-{job_id}.journal")).try_exists().unwrap_or(true),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
     pub(crate) fn owner(&self) -> &CasJobOwner {
         &self.state.owner
     }

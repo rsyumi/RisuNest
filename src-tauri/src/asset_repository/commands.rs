@@ -296,21 +296,25 @@ impl DurableCasJobState {
         Ok(abandoned)
     }
 
-    /// Closes the sessions and uploads that page documents other than
-    /// `current` began, and releases their journals in the background.
+    /// Closes the sessions and uploads that replaced page documents began, and
+    /// releases their journals in the background.
     pub(crate) fn release_replaced_documents<R: tauri::Runtime>(
         &self,
         app: &AppHandle<R>,
-        current: &str,
+        replaced: &dyn Fn(&str) -> bool,
     ) -> Result<(), String> {
-        let abandoned = self.take_replaced_documents(&repository_root(app)?, current)?;
+        let abandoned = self.take_replaced_documents(&repository_root(app)?, replaced)?;
         if !abandoned.journal_ids.is_empty() {
             self.release_in_background(app, abandoned);
         }
         Ok(())
     }
 
-    fn take_replaced_documents(&self, root: &std::path::Path, current: &str) -> Result<AbandonedCasJobs, String> {
+    fn take_replaced_documents(
+        &self,
+        root: &std::path::Path,
+        replaced: &dyn Fn(&str) -> bool,
+    ) -> Result<AbandonedCasJobs, String> {
         let mut uploads = self
             .uploads
             .lock()
@@ -319,22 +323,24 @@ impl DurableCasJobState {
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-        let replaced = jobs
+        // No request can recover a session whose journal is gone.
+        jobs.replaced.retain(|session| DurableCasJob::journal_exists(root, session));
+        let ended = jobs
             .owners
             .iter()
-            .filter(|(_, owner)| owner.as_str() != current)
+            .filter(|(_, owner)| replaced(owner))
             .map(|(session, _)| session.clone())
             .collect::<Vec<_>>();
-        for session in &replaced {
+        for session in &ended {
             jobs.owners.remove(session);
             jobs.handles.remove(session);
             jobs.replaced.insert(session.clone());
             uploads.cancel_session(session);
         }
-        uploads.cancel_owned_except(current);
+        uploads.cancel_owned_by(replaced);
         Ok(AbandonedCasJobs {
             root: root.to_owned(),
-            journal_ids: replaced,
+            journal_ids: ended,
             listing_failure: None,
             cleanup_uploads: false,
         })
@@ -529,15 +535,15 @@ impl CasUploadPool {
         for (id, _) in removed { self.cancel(&id); }
     }
 
-    /// Cancels the uploads that page documents other than `current` opened.
-    fn cancel_owned_except(&mut self, current: &str) {
-        let replaced = self
+    /// Cancels the uploads that replaced page documents opened.
+    fn cancel_owned_by(&mut self, replaced: &dyn Fn(&str) -> bool) {
+        let ended = self
             .uploads
             .iter()
-            .filter(|(_, upload)| upload.owner.as_deref().is_some_and(|owner| owner != current))
+            .filter(|(_, upload)| upload.owner.as_deref().is_some_and(replaced))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        for id in replaced { self.cancel(&id); }
+        for id in ended { self.cancel(&id); }
     }
 
     fn clear(&mut self) {
@@ -1868,11 +1874,23 @@ mod tests {
         assert!(begin(Some("first")).unwrap_err().contains("replaced"));
         assert_eq!(journal_ids(root), [unnamed.clone()].into());
 
-        // A session released as usual is not remembered for the next page.
+        // A session released as usual is not remembered for the next page, and
+        // one whose journal is gone is forgotten at the next replacement.
         let current = begin(Some("second")).unwrap();
         release_job(&mut state.jobs.lock().unwrap(), root, &current, CasReleaseOutcome::Aborted).unwrap();
         open("third").unwrap();
-        assert!(!state.jobs.lock().unwrap().replaced.contains(&current));
+        let mut jobs = state.jobs.lock().unwrap();
+        assert!(!jobs.replaced.contains(&current) && !jobs.replaced.contains(&outgoing));
+        assert!(recover_job(&mut jobs, root, &outgoing).is_err());
+        drop(jobs);
+
+        // A cleanup that runs after the current page began a session leaves it open.
+        let kept = begin(Some("third")).unwrap();
+        let kept_upload = upload(&kept, Some("third"));
+        let store = app.state::<PersistentStoreState>();
+        state.release_replaced_documents(app.handle(), &|document| store.is_replaced_document(document)).unwrap();
+        assert!(uploading(&kept_upload));
+        assert!(state.jobs.lock().unwrap().owners.contains_key(&kept));
     }
 
     #[test]

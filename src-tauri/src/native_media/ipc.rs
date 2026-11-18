@@ -420,10 +420,10 @@ impl TransferPool {
 
     /// Ends the transfers that page documents other than `current` asked for.
     /// An encoder that is still running stops at its next check.
-    fn release_owned_except(&mut self, current: &str) {
+    fn release_owned_by(&mut self, replaced: &dyn Fn(&str) -> bool) {
         let mut removable = Vec::new();
         for (id, transfer) in self.transfers.iter_mut() {
-            if !transfer.owner_mut().as_deref().is_some_and(|owner| owner != current) {
+            if !transfer.owner_mut().as_deref().is_some_and(replaced) {
                 continue;
             }
             match transfer {
@@ -533,11 +533,11 @@ impl NativeMediaIpcState {
         Ok(())
     }
 
-    pub(crate) fn release_replaced_documents(&self, current: &str) -> Result<(), String> {
+    pub(crate) fn release_replaced_documents(&self, replaced: &dyn Fn(&str) -> bool) -> Result<(), String> {
         self.pool
             .lock()
             .map_err(|error| format!("native media transfer mutex poisoned: {error}"))?
-            .release_owned_except(current);
+            .release_owned_by(replaced);
         Ok(())
     }
 
@@ -1012,6 +1012,7 @@ mod tests {
             pool.assign_owner(&id, owner.map(str::to_owned));
             id
         };
+        let replaced = |document: &str| store.is_replaced_document(document);
         assert!(store.claim_renderer_document("first").unwrap());
         let outgoing = upload(Some("first"));
         let unnamed = upload(None);
@@ -1031,7 +1032,7 @@ mod tests {
                 std::thread::yield_now();
             }
             assert!(store.claim_renderer_document("second").unwrap());
-            state.release_replaced_documents("second").unwrap();
+            state.release_replaced_documents(&replaced).unwrap();
             drop(admission);
             for _ in 0..2 {
                 let (document, result) = receive.recv().unwrap();
@@ -1048,6 +1049,10 @@ mod tests {
         let late = super::encode_direct(&state, "late", b"original", "file.bin", None, requester("first"));
         assert!(late.err().expect("a replaced page started an encoder").contains("replaced"));
         assert!(super::encode_direct(&state, "current", b"original", "file.bin", None, requester("second")).is_ok());
+        // A cleanup that runs after the current page opened a transfer leaves it open.
+        let current = upload(Some("second"));
+        state.release_replaced_documents(&replaced).unwrap();
+        assert_eq!(state.pool.lock().unwrap().append(&current, 0, &[1]).unwrap(), 1);
     }
 
     #[test]

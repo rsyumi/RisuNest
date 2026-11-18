@@ -2545,10 +2545,15 @@ impl PersistentStore {
         self.release_revision_leases_where(|_| true)
     }
 
-    /// Releases the leases of page documents other than `current`, keeping
-    /// those that named no document.
-    pub(crate) fn release_revision_leases_except(&mut self, current: &str) -> StoreResult<()> {
-        self.release_revision_leases_where(|owner| owner.is_some_and(|owner| owner != current))
+    /// Releases the leases of the page documents `replaced` names, keeping
+    /// those that named no document. With none to release it leaves the WAL
+    /// to the usual checkpoints instead of waiting for a busy reader.
+    pub(crate) fn release_revision_leases_of(&mut self, replaced: &dyn Fn(&str) -> bool) -> StoreResult<()> {
+        let release = |owner: Option<&str>| owner.is_some_and(replaced);
+        if !self.revision_leases.values().any(|reader| release(reader.owner.as_deref())) {
+            return Ok(());
+        }
+        self.release_revision_leases_where(release)
     }
 
     fn release_revision_leases_where(&mut self, release: impl Fn(Option<&str>) -> bool) -> StoreResult<()> {
