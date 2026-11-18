@@ -1,10 +1,11 @@
-import { untrack } from 'svelte'
-import { derived, fromStore } from 'svelte/store'
-import { DBState, MobileGUI, MobileGUIStack, MobileSideBar, selectedCharID, settingsOpen } from '../stores.svelte'
+import { onDestroy, untrack } from 'svelte'
+import { fromStore } from 'svelte/store'
+import { DBState } from '../stores.svelte'
 import type { Database } from './database.svelte'
 import { safeStructuredClone } from '../safeStructuredClone'
+import { markPresetEditorSurface, settingsWindowStore } from '../gui/presetEditorSurface'
 import {
-    createPresetMirrorValues,
+    createPresetMirrorView,
     deriveEffectivePresetMirrors,
     derivePresetMirrorView,
     flushEffectivePresetEdits,
@@ -25,22 +26,20 @@ interface EditorView extends PresetMirrorView {
 }
 
 // The identity state lives in a WeakMap, so its changes reach components through these counters.
-const signal = $state({ view: 0, applied: 0 })
+const signal = $state({ view: 0, applied: 0, surfaces: 0 })
 let view: EditorView | null = null
 let applied: { db: Database; id: string | undefined } | null = null
 let settingsWindow: { readonly current: boolean } | undefined
-let applyForFlags: ApplyPreset | undefined
+let watchingSettingsWindow = false
+let applyEditor: ApplyPreset | undefined
 const editors = new WeakMap<Database, Database>()
 
 const clone = <T>(value: T): T => value === undefined ? value : safeStructuredClone(value)
 
-// The settings window, or the mobile screen that shows settings when no character is selected.
-function settingsWindowOpen(): boolean {
-    settingsWindow ??= fromStore(derived(
-        [settingsOpen, MobileGUI, MobileGUIStack, MobileSideBar, selectedCharID],
-        ([open, mobile, screen, sideBar, character]) => open || (mobile && screen === 2 && sideBar === 0 && character === -1),
-    ))
-    return settingsWindow.current
+/** Whether preset settings show: the settings window, or a surface such as quick settings that holds the editor. */
+export function isPresetEditorOpen(): boolean {
+    settingsWindow ??= fromStore(settingsWindowStore())
+    return settingsWindow.current || signal.surfaces > 0
 }
 
 function track(value: unknown): void {
@@ -50,25 +49,25 @@ function track(value: unknown): void {
 
 function closeView(): void {
     if (!view) return
-    if (view.db === DBState.db) flushPresetMirrorView(view.db, view)
+    const current = view
+    if (current.db === DBState.db) untrack(() => flushPresetMirrorView(current.db, current))
     view.dispose()
     view = null
     signal.view++
 }
 
 function openView(db: Database, presetId: string, apply: ApplyPreset): void {
-    const initial = createPresetMirrorValues(db, presetId, apply)
-    if (!initial) return
-    const snapshot = Object.fromEntries(Object.entries(initial).map(([key, value]) => [key, clone(value)]))
-    const values = $state(initial)
-    const next: EditorView = { db, presetId, values, snapshot, dispose: () => {} }
+    const created = createPresetMirrorView(db, presetId, apply)
+    if (!created) return
+    const values = $state(created.values)
+    const next: EditorView = { ...created, values, db, copy: (value) => $state.snapshot(value), dispose: () => {} }
     // Edits reach the record as they happen, which the save observer then picks up.
     next.dispose = $effect.root(() => {
         for (const key of Object.keys(presetMirrorMap)) {
             $effect(() => {
                 track(values[key])
                 untrack(() => {
-                    if (view === next && next.db === DBState.db) flushPresetMirrorView(next.db, next, [key])
+                    if (view === next && next.db === DBState.db) flushPresetMirrorView(next.db, next, [key], true)
                 })
             })
         }
@@ -77,36 +76,75 @@ function openView(db: Database, presetId: string, apply: ApplyPreset): void {
     signal.view++
 }
 
+/**
+ * Keeps a view of the selected preset while preset settings show and another preset is applied,
+ * and writes and drops it once either stops.
+ */
+function refresh(): void {
+    untrack(() => {
+        const db = DBState.db
+        const selection = db?.botPresets?.[db.botPresetsId]
+        const candidate = selection?.id && selection.id !== peekEffectivePresetId(db) && isLoadedPreset(selection)
+            ? selection.id : null
+        if (candidate && !watchingSettingsWindow) {
+            watchingSettingsWindow = true
+            let subscribed = false
+            settingsWindowStore().subscribe(() => {
+                if (subscribed) refresh()
+            })
+            subscribed = true
+        }
+        const wanted = candidate && applyEditor && isPresetEditorOpen() ? candidate : null
+        if (view && (view.db !== db || view.presetId !== wanted)) closeView()
+        if (!wanted) return
+        if (view) derivePresetMirrorView(db, view, applyEditor!)
+        else openView(db, wanted, applyEditor!)
+    })
+}
+
+/** Shows preset settings outside the settings window, such as quick settings, until the returned function runs. */
+export function holdPresetEditor(): () => void {
+    untrack(() => signal.surfaces++)
+    refresh()
+    let held = true
+    return () => {
+        if (!held) return
+        held = false
+        untrack(() => signal.surfaces--)
+        refresh()
+    }
+}
+
+/** For a component's init: the component edits the selected preset, as the settings window does, while it is mounted. */
+export function usePresetEditorSurface(): void {
+    markPresetEditorSurface()
+    const release = holdPresetEditor()
+    // A teardown reads state from before the pending update, so the view is written once it has run.
+    onDestroy(() => queueMicrotask(release))
+}
+
 /** Writes pending settings edits of a preset that is not applied to its record. */
 export function flushPresetEditorEdits(db: Database = DBState.db): void {
-    if (view && view.db === db) flushPresetMirrorView(db, view)
+    if (view && view.db === db) untrack(() => flushPresetMirrorView(db, view!))
 }
 
 /**
- * Follows a derive of the preset mirrors: publishes the applied preset and gives the
- * settings window a view of the selected preset whenever another preset is applied.
+ * Follows a derive of the preset mirrors: publishes the applied preset and, while preset settings
+ * show, gives them a view of the selected preset whenever another preset is applied.
  */
 export function syncPresetEditorTarget(db: Database, apply: ApplyPreset): void {
-    applyForFlags = apply
+    applyEditor = apply
     const appliedId = peekEffectivePresetId(db)
     if (applied?.db !== db || applied.id !== appliedId) {
         applied = { db, id: appliedId }
         signal.applied++
     }
-    if (db !== DBState.db) return
-    const selection = db.botPresets?.[db.botPresetsId]
-    const wanted = selection?.id && selection.id !== appliedId && isLoadedPreset(selection) ? selection.id : null
-    if (view && (view.db !== db || view.presetId !== wanted)) closeView()
-    if (!wanted) return
-    if (view) derivePresetMirrorView(db, view, apply)
-    else openView(db, wanted, apply)
+    if (db === DBState.db) refresh()
 }
 
 function editingView(root: Database): EditorView | null {
     void signal.view
-    const current = view
-    if (!current || current.db !== root) return null
-    return settingsWindowOpen() ? current : null
+    return view && view.db === root ? view : null
 }
 
 function routedView(root: Database, key: string): EditorView | null {
@@ -137,7 +175,7 @@ function setProtectionFlag(root: Database, current: EditorView, flag: string, va
     }
     for (const field of protectedFields(flag)) current.values[field] = clone(fields[field])
     fields[flag] = value
-    if (applyForFlags) deriveEffectivePresetMirrors(root, applyForFlags)
+    if (applyEditor) deriveEffectivePresetMirrors(root, applyEditor)
 }
 
 function editorDatabase(root: Database): Database {
@@ -177,9 +215,9 @@ function editorDatabase(root: Database): Database {
 }
 
 /**
- * `DBState` for preset settings surfaces. While the settings window is open, mirrored preset
- * fields read and write the selected preset (`botPresetsId`); elsewhere, and for every other
- * field, it is the live database.
+ * `DBState` for preset settings surfaces. While preset settings show, mirrored preset fields read
+ * and write the selected preset (`botPresetsId`); elsewhere, and for every other field, it is the
+ * live database.
  */
 export const presetEditorDBState = {
     get db(): Database {
@@ -207,7 +245,7 @@ export function getAppliedPresetIndex(db: Database = DBState.db): number {
     return index < 0 ? db.botPresetsId : index
 }
 
-/** The preset `presetEditorDBState` edits where it is read: the selection in the settings window, the applied preset elsewhere. */
+/** The preset `presetEditorDBState` edits: the selection while preset settings show, the applied preset otherwise. */
 export function getEditedPresetId(db: Database = DBState.db): string | undefined {
-    return settingsWindowOpen() ? getSelectedPresetId(db) : getAppliedPresetId(db)
+    return isPresetEditorOpen() ? getSelectedPresetId(db) : getAppliedPresetId(db)
 }

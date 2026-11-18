@@ -284,7 +284,7 @@ describe('text editor popup preview', () => {
     })
 
     it('previews the draft and returns to the editor', async () => {
-        const { target, editor, editorInput, button } = await openOnDesktop({ preview: true })
+        const { target, editor, editorInput, button } = await openOnDesktop({ preview: true, presetEditor: true })
         type(editorInput, 'Previewed draft')
         button('Preview')!.click()
         const preview = await vi.waitFor(() => {
@@ -293,6 +293,7 @@ describe('text editor popup preview', () => {
             return element!
         })
         expect(preview.textContent).toBe('Previewed draft')
+        expect(preview.dataset.presetEditor).toBe('true')
         expect(editor.closest('.invisible')).not.toBeNull()
 
         button('Edit')!.click()

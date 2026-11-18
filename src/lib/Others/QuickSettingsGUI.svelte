@@ -4,6 +4,10 @@
     import BotSettings from "../Setting/Pages/BotSettings.svelte";
     import OtherBotSettings from "../Setting/Pages/OtherBotSettings.svelte";
     import ModuleSettings from "../Setting/Pages/Module/ModuleSettings.svelte";
+    import { usePresetEditorSurface } from "src/ts/storage/presetEditor.svelte";
+
+    // Like the settings window, quick settings show and edit the selected preset.
+    usePresetEditorSurface()
 </script>
 
 <div class="flex mb-2 gap-2">

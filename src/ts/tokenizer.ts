@@ -400,6 +400,7 @@ export async function tokenizeAccurate(data:string, consistantChar?:boolean, db?
     data = risuChatParser(data.replace('{{slot}}',''), {
         tokenizeAccurate: true,
         consistantChar: consistantChar,
+        db,
     })
     const encoded = await encode(data, db)
     return encoded.length

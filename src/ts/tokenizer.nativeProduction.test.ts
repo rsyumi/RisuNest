@@ -32,7 +32,11 @@ vi.mock('./storage/database.svelte', () => ({
 }))
 
 vi.mock('./process/files/inlays', () => ({ supportsInlayImage: () => false }))
-vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.testSupport')).parserStubModule())
+// Like the parser, {{mainprompt}} reads the database the caller passes.
+vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.testSupport')).parserStubModule({
+    risuChatParser: (value: string, arg?: { db?: { mainPrompt?: string } }) =>
+        value.replace('{{mainprompt}}', arg?.db?.mainPrompt ?? ''),
+}))
 vi.mock('./process/transformers', () => ({
     tokenizeTransformers: harness.transformersTokenizer,
 }))
@@ -62,7 +66,8 @@ vi.mock('./plugins/plugins.svelte', () => ({
     pluginV2: { providerOptions: new Map() },
 }))
 
-import { ChatTokenizer, encode, encodeWithTokenizer, strongBan } from './tokenizer'
+import { ChatTokenizer, encode, encodeWithTokenizer, strongBan, tokenizeAccurate } from './tokenizer'
+import type { Database } from './storage/database.svelte'
 import { pluginV2 } from './plugins/plugins.svelte'
 import type { OpenAIChat } from './process/index.svelte'
 
@@ -406,6 +411,17 @@ describe('encodeWithTokenizer', () => {
             encodeWithTokenizer(text, 'tik'),
         ])
         expect([[...loading], [...loaded]]).toEqual([o200k, cl100k])
+    })
+})
+
+describe('tokenizeAccurate', () => {
+    it('counts preset macros from the database it is given', async () => {
+        const preset = {
+            aiModel: 'gpt-4', currentPluginProvider: '', customTokenizer: 'tik', mainPrompt: 'Synthetic edited preset prompt.',
+        } as Database
+        const expected = (await encodeWithTokenizer(preset.mainPrompt, 'tik')).length
+        expect(expected).toBeGreaterThan(0)
+        expect(await tokenizeAccurate('{{mainprompt}}', true, preset)).toBe(expected)
     })
 })
 

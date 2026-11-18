@@ -208,42 +208,73 @@ export function adoptEffectivePresetSelection(db: Database, apply: ApplyPreset):
 export interface PresetMirrorView {
     presetId: string
     values: Snapshot
-    snapshot: Snapshot
+    /** Each field as the record last had it: the value itself, or the canonical JSON of an object. */
+    saved: Snapshot
+    /** Copies a field out of `values`; a reactive view supplies its own copy. */
+    copy?: (value: unknown) => unknown
 }
 
-export function createPresetMirrorValues(db: Database, presetId: string, apply: ApplyPreset): Snapshot | undefined {
+const fingerprint = (value: unknown): unknown =>
+    value !== null && typeof value === 'object' ? { json: canonicalJson(value) } : value
+const sameFingerprint = (left: unknown, right: unknown): boolean =>
+    left !== null && typeof left === 'object'
+        ? right !== null && typeof right === 'object' && (left as { json: string }).json === (right as { json: string }).json
+        : left === right || Object.is(left, right)
+
+function presetMirrorSource(db: Database, presetId: string, apply: ApplyPreset): Snapshot | undefined {
     const preset = db.botPresets?.find(preset => preset?.id === presetId)
     if (!isLoadedPreset(preset)) return undefined
     const target = {} as Snapshot
     apply(target as unknown as Database, preset!)
-    // Applying can share nested values with the record, which edits must not reach directly.
-    return Object.fromEntries(Object.keys(presetMirrorMap).map(key => [key, clone(target[key])]))
+    return target
 }
 
-/** Writes edited view fields to the preset record; protected fields follow the shared mirror instead. */
-export function flushPresetMirrorView(db: Database, view: PresetMirrorView, keys: Iterable<string> = Object.keys(presetMirrorMap)): void {
+export function createPresetMirrorView(db: Database, presetId: string, apply: ApplyPreset): PresetMirrorView | undefined {
+    const source = presetMirrorSource(db, presetId, apply)
+    if (!source) return undefined
+    const values: Snapshot = {}
+    const saved: Snapshot = {}
+    for (const key of Object.keys(presetMirrorMap)) {
+        // Applying can share nested values with the record, which edits must not reach directly.
+        values[key] = clone(source[key])
+        saved[key] = fingerprint(values[key])
+    }
+    return { presetId, values, saved }
+}
+
+/**
+ * Writes edited view fields to the preset record; protected fields follow the shared mirror instead.
+ * `edited` names fields known to have changed, which are copied before they are compared.
+ */
+export function flushPresetMirrorView(
+    db: Database, view: PresetMirrorView, keys: Iterable<string> = Object.keys(presetMirrorMap), edited = false,
+): void {
     const record = db.botPresets?.find(preset => preset?.id === view.presetId) as unknown as Snapshot | undefined
     if (!record || !isLoadedPreset(record as unknown as botPreset)) return
+    const copy = view.copy ?? clone
     for (const key of keys) {
         const field = presetMirrorMap[key]
         const flag = protectedPresetGroups[key as ProtectedPresetField]
         if (!field || (flag && root(db)[flag])) continue
-        const value = view.values[key]
-        if (equal(value, view.snapshot[key])) continue
+        let value = edited ? copy(view.values[key]) : view.values[key]
+        const print = fingerprint(value)
+        if (sameFingerprint(print, view.saved[key])) continue
+        if (!edited) value = copy(value)
         if (value === undefined) delete record[field]
-        else record[field] = clone(value)
-        view.snapshot[key] = clone(value)
+        else record[field] = value
+        view.saved[key] = print
     }
 }
 
 /** Updates the view fields whose record value changed since the view last saw it. */
 export function derivePresetMirrorView(db: Database, view: PresetMirrorView, apply: ApplyPreset): boolean {
-    const next = createPresetMirrorValues(db, view.presetId, apply)
-    if (!next) return false
-    for (const [key, value] of Object.entries(next)) {
-        if (equal(value, view.snapshot[key])) continue
-        view.values[key] = value
-        view.snapshot[key] = clone(value)
+    const source = presetMirrorSource(db, view.presetId, apply)
+    if (!source) return false
+    for (const key of Object.keys(presetMirrorMap)) {
+        const print = fingerprint(source[key])
+        if (sameFingerprint(print, view.saved[key])) continue
+        view.values[key] = clone(source[key])
+        view.saved[key] = print
     }
     return true
 }

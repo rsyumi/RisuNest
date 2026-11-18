@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Database, botPreset, Chat } from './database.svelte'
 import {
-    createPresetMirrorValues, deriveEffectivePersonaMirrors, deriveEffectivePresetMirrors, deriveEffectiveToggleVariables,
+    createPresetMirrorView, deriveEffectivePersonaMirrors, deriveEffectivePresetMirrors, deriveEffectiveToggleVariables,
     derivePresetMirrorView, flushEffectivePersonaEdits, flushEffectivePresetEdits, flushEffectiveToggleEdits,
     flushPresetMirrorView, getEffectivePresetId, getExplicitGlobalChatVariables, prepareImportedIdentityState,
     presetMirrorMap, setEffectivePresetBinding, setEffectivePresetOverride, translateRootUnitIntents,
@@ -124,8 +124,8 @@ describe('authoritative identity records and mirrors', () => {
         const db = database()
         db.botPresets[1].seperateModels = { memory: 'record-b' } as Database['seperateModels']
         derive(db)
-        const values = createPresetMirrorValues(db, 'preset-b', apply)!
-        const view = { presetId: 'preset-b', values, snapshot: structuredClone(values) }
+        const view = createPresetMirrorView(db, 'preset-b', apply)!
+        const values = view.values
         expect(values.mainPrompt).toBe('B')
         values.mainPrompt = 'view edit'
         values.presetRegex = [{ comment: 'view regex' }]

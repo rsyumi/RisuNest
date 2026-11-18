@@ -7,6 +7,8 @@ export interface TextEditorPopupRequest {
     language?: string
     /** Offers the CBS preview with its token count and toggles. */
     preview?: boolean
+    /** Previews with the preset the settings window edits instead of the applied preset. */
+    presetEditor?: boolean
     /** Applies the edited text. Resolving `false` keeps the editor open with the draft. */
     save: (value: string) => boolean | Promise<boolean>
     /** Receives the draft whenever the reader changes it. */
