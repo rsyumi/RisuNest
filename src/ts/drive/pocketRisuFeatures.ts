@@ -69,6 +69,13 @@ export function normalizePocketChat(value: unknown, fallbackId: string): void {
         else delete value.savedToggleValues
     }
     if (value.bindedPersona !== undefined && typeof value.bindedPersona !== 'string') delete value.bindedPersona
+    if (value.promptPresetId !== undefined && typeof value.promptPresetId !== 'string') delete value.promptPresetId
+    // PocketRisu and RisuBard store a chat's preset binding as bindedBotPreset.
+    if (Object.hasOwn(value, 'bindedBotPreset')) {
+        if (value.promptPresetId === undefined && typeof value.bindedBotPreset === 'string' && value.bindedBotPreset)
+            value.promptPresetId = value.bindedBotPreset
+        delete value.bindedBotPreset
+    }
     if (Array.isArray(value.message))
         value.message.forEach((message, index) =>
             normalizePocketMessage(

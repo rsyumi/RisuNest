@@ -74,6 +74,20 @@ pub(crate) fn chat(value: &mut Value, fallback: &str) {
     {
         chat.shift_remove("bindedPersona");
     }
+    if chat
+        .get("promptPresetId")
+        .is_some_and(|value| !value.is_string())
+    {
+        chat.shift_remove("promptPresetId");
+    }
+    // PocketRisu and RisuBard store a chat's preset binding as bindedBotPreset.
+    if let Some(bound) = chat.shift_remove("bindedBotPreset") {
+        if let Some(id) = bound.as_str().filter(|id| !id.is_empty()) {
+            if !chat.contains_key("promptPresetId") {
+                chat.insert("promptPresetId".into(), Value::String(id.to_owned()));
+            }
+        }
+    }
     let id = chat
         .get("id")
         .and_then(Value::as_str)
@@ -188,6 +202,18 @@ mod tests {
         for fixture in fixtures.as_array().unwrap() {
             let mut actual = fixture["input"].clone();
             message(&mut actual, "fallback");
+            assert_eq!(actual, fixture["expected"]);
+        }
+    }
+    #[test]
+    fn shared_chat_fixtures() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../src/ts/drive/fixtures/pocket-chat-features.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let mut actual = fixture["input"].clone();
+            chat(&mut actual, "fallback");
             assert_eq!(actual, fixture["expected"]);
         }
     }

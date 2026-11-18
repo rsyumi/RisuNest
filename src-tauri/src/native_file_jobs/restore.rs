@@ -4731,7 +4731,7 @@ pub(super) mod tests {
                 "chats":[null, {"id":7, "name":"Chat", "message":[{
                     "role":"char", "data":"second", "chatId":"message-1",
                     "swipes":["first", null, "second"], "swipeId":2
-                }]}, "not a chat", {"id":"chat-2", "bindedPersona":null,
+                }]}, "not a chat", {"id":"chat-2", "bindedPersona":null, "bindedBotPreset":"preset-a",
                     "savedToggleValues":{"toggle_a":"1", "other":"x"}, "message":[]}]
             }),
         );
@@ -4755,6 +4755,8 @@ pub(super) mod tests {
         assert_eq!(message["swipes"], json!(["first", null, "second"]));
         assert_eq!(chats[1]["savedToggleValues"], json!({"toggle_a":"1"}));
         assert!(chats[1].get("bindedPersona").is_none());
+        assert_eq!(chats[1]["promptPresetId"], "preset-a");
+        assert!(chats[1].get("bindedBotPreset").is_none());
         assert_eq!(restored["characters"][0]["name"], "");
         assert_eq!(chats[1]["name"], "");
     }
