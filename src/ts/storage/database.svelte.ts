@@ -1844,6 +1844,8 @@ export interface Chat{
     /** Selects an author's note preset while `note` still matches the fingerprint written with it. */
     authorNotePreset?: { id: string; fingerprint: string }
     bindedPersona?:string
+    /** Prompt preset `id` bound to this chat; empty or absent leaves the global selection in effect. */
+    promptPresetId?: string
     fmIndex?:number
     hypaV3Data?:SerializableHypaV3Data
     folderId?:string
