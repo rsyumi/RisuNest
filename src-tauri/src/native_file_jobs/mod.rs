@@ -692,6 +692,15 @@ fn claim_spool_source(
     claim_spool_source_with_display_name(job_root, token, owned_directory, None)
 }
 
+/// Claims a ready spool into a new job directory and reports its byte length.
+#[cfg(test)]
+pub(crate) fn claim_spool_source_for_test(job_root: &Path, token: &str) -> Result<u64, NativeJobError> {
+    let jobs = job_root.join("jobs");
+    fs::create_dir_all(&jobs).map_err(|error| invalid_source_error(error.to_string()))?;
+    let owned = create_owned_directory(&jobs, &Uuid::new_v4().to_string()).map_err(invalid_source_error)?;
+    claim_spool_source(job_root, token, &owned).map(|claimed| claimed.opened.total_bytes)
+}
+
 fn claim_spool_content_source(
     job_root: &Path,
     token: &str,
@@ -1458,6 +1467,10 @@ impl NativeFileJobState {
 
     pub(crate) fn initialize(root: PathBuf) -> Self {
         Self::initialize_with_max_workers(root, MAX_CONCURRENT_JOBS)
+    }
+
+    pub(crate) fn job_root(&self) -> &Path {
+        &self.root
     }
 
     fn initialize_with_max_workers(root: PathBuf, max_concurrent_jobs: usize) -> Self {
