@@ -148,6 +148,8 @@ describe('live module selection', () => {
         expect(toggles).toContain('new=New')
         db.modules[0].namespace = 'other'
         expect(toggles).toBe('')
+        // The module integration of a given database counts, such as the preset that preset settings edit.
+        expect(getModuleToggles({ ...db, moduleIntergration: 'module' })).toContain('new=New')
         db.enabledModules = ['module']
         expect(toggles).toContain('new=New')
         db.modules.splice(0, 1)
