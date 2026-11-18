@@ -11,6 +11,7 @@ const boundary = vi.hoisted(() => ({
     visible: false,
     rejectedFrames: 1,
     listener: null as ((event: { payload: AppLockLifecycle }) => void) | null,
+    logged: [] as string[],
 }))
 vi.mock('@tauri-apps/api/core', async (original) => ({
     ...await original<typeof import('@tauri-apps/api/core')>(),
@@ -27,6 +28,10 @@ vi.mock('@tauri-apps/api/core', async (original) => ({
             boundary.visible = true
             return true
         }
+        if (command === 'native_log_error') {
+            boundary.logged.push(args!.message as string)
+            return
+        }
         throw new Error(`Unexpected native command: ${command}`)
     },
 }))
@@ -40,26 +45,34 @@ vi.mock('@tauri-apps/api/event', async (original) => ({
 
 describe('app lock startup facade', () => {
     it('releases a boot failure before marker initialization and restores lock policy before normal content', async () => {
+        const released = (epoch: number) => `app-lock cover released after 3 s without a confirmed frame: epoch ${epoch}`
+        // The iOS shell took the launch cover off without a confirmed frame before the page listened.
+        boundary.snapshot = { ...boundary.snapshot, unconfirmedRelease: { epoch: 0, afterSeconds: 3 } }
         appLock.setBackgroundColor('rgb(255 255 255)')
         await appLock.renderLoading()
         expect(appLock.state.initialized).toBe(false)
         expect(boundary.visible).toBe(true)
         expect(boundary.policy).toMatchObject({ gateRequired: false, enabled: false })
+        expect(boundary.logged).toEqual([released(0)])
         boundary.visible = false
         await appLock.renderBootFailure()
         expect(appLock.state.initialized).toBe(false)
         expect(boundary.visible).toBe(true)
         expect(boundary.policy).toMatchObject({ gateRequired: false, enabled: false, backgroundColor: '#ffffff' })
         boundary.visible = false
-        boundary.snapshot = { active: true, epoch: 2, atMs: 100, departedAtMs: 50 }
+        boundary.snapshot = { active: true, epoch: 2, atMs: 100, departedAtMs: 50, unconfirmedRelease: { epoch: 2, afterSeconds: 3 } }
         boundary.listener!({ payload: boundary.snapshot })
         await vi.waitFor(() => expect(boundary.visible).toBe(true))
         expect(boundary.policy!.gateRequired).toBe(false)
+        // A policy answer that still carries the first release arrives after the later one.
+        boundary.snapshot = { active: true, epoch: 2, atMs: 100, departedAtMs: 50, unconfirmedRelease: { epoch: 0, afterSeconds: 3 } }
         const pin = await createPinRecord('123456')
         const record = JSON.stringify({ ...defaultAppLockRecord(), enabled: true, pin })
         await appLock.initialize({ read: () => record, commit: async () => {} })
         expect(appLock.state.locked).toBe(true)
         expect(boundary.policy).toMatchObject({ gateRequired: true, enabled: true })
+        expect(boundary.logged).toEqual([released(0), released(2)])
+        boundary.snapshot = { active: true, epoch: 2, atMs: 100, departedAtMs: 50 }
     })
 
     it('refreshes persisted lock data on read retry and retains effective state when the refresh fails', async () => {

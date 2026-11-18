@@ -70,7 +70,6 @@ export class AppLockController {
     private presentingEpoch = -1
     private confirmations = 0
     private reportedStall = ''
-    private reportedReleaseEpoch = -1
     private backgroundColor = '#21252b'
     private unlisten: (() => void) | null = null
     private listening = false
@@ -206,14 +205,7 @@ export class AppLockController {
     }
 
     lifecycle(snapshot: AppLockLifecycle, refreshPresentation = false): void {
-        if (this.disposed) return
-        // The same release can arrive both as an event and in a later policy answer.
-        const release = snapshot.unconfirmedRelease
-        if (release && release.epoch !== this.reportedReleaseEpoch) {
-            this.reportedReleaseEpoch = release.epoch
-            this.native.report(`app-lock cover released after ${release.afterSeconds} s without a confirmed frame: epoch ${release.epoch}`)
-        }
-        if (snapshot.epoch < this.state.epoch) return
+        if (this.disposed || snapshot.epoch < this.state.epoch) return
         const changed = snapshot.epoch !== this.state.epoch || snapshot.active !== this.state.active
         if (!changed) {
             if (refreshPresentation && snapshot.active) {

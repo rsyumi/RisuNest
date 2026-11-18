@@ -34,6 +34,17 @@ export interface AppLockNativeAdapter {
     report(message: string): void
 }
 
+/** Cover releases this page already wrote to the device log, shared by the startup surface and the controller. */
+const reportedReleases = new Set<number>()
+
+/** The same release can arrive in several events and policy answers, in any order. */
+function reportUnconfirmedRelease(snapshot: AppLockLifecycle) {
+    const release = snapshot.unconfirmedRelease
+    if (!release || reportedReleases.has(release.epoch)) return
+    reportedReleases.add(release.epoch)
+    void recordNativeLogError(`app-lock cover released after ${release.afterSeconds} s without a confirmed frame: epoch ${release.epoch}`).catch(() => {})
+}
+
 export function createAppLockNativeAdapter(): AppLockNativeAdapter {
     return {
         async check() {
@@ -43,14 +54,20 @@ export function createAppLockNativeAdapter(): AppLockNativeAdapter {
             return invoke<OsAuthOutcome>('app_lock_authenticate', { reason })
         },
         async setPolicy(policy) {
-            return invoke<AppLockLifecycle>('app_lock_set_policy', { policy })
+            const snapshot = await invoke<AppLockLifecycle>('app_lock_set_policy', { policy })
+            reportUnconfirmedRelease(snapshot)
+            return snapshot
         },
         async ready(epoch, locked) {
             return invoke<boolean>('app_lock_ready', { epoch, locked })
         },
         async listen(listener) {
-            const nativeUnlisten = await listen<AppLockLifecycle>('risunest-app-lock', (event) => listener(event.payload))
-            const onMobileLifecycle = (event: Event) => listener((event as CustomEvent<AppLockLifecycle>).detail)
+            const deliver = (snapshot: AppLockLifecycle) => {
+                reportUnconfirmedRelease(snapshot)
+                listener(snapshot)
+            }
+            const nativeUnlisten = await listen<AppLockLifecycle>('risunest-app-lock', (event) => deliver(event.payload))
+            const onMobileLifecycle = (event: Event) => deliver((event as CustomEvent<AppLockLifecycle>).detail)
             window.addEventListener('risunest-app-lock', onMobileLifecycle)
             return () => {
                 nativeUnlisten()
