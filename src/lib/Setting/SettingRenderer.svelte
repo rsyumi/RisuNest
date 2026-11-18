@@ -17,8 +17,8 @@
     let { items, modelInfo, subModelInfo }: Props = $props();
 
     // Derive modelInfo if not provided
-    let effectiveModelInfo = $derived(modelInfo ?? getModelInfo(DBState.db.aiModel));
-    let effectiveSubModelInfo = $derived(subModelInfo ?? getModelInfo(DBState.db.subModel));
+    let effectiveModelInfo = $derived(modelInfo ?? getModelInfo(DBState.db.aiModel, DBState.db));
+    let effectiveSubModelInfo = $derived(subModelInfo ?? getModelInfo(DBState.db.subModel, DBState.db));
 
     // Build context for condition checks
     let ctx: SettingContext = $derived({

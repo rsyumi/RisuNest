@@ -117,8 +117,8 @@
 
 
     let submenu = $state(DBState.db.useLegacyGUI ? -1 : 0)
-    let modelInfo = $derived(getModelInfo(DBState.db.aiModel))
-    let subModelInfo = $derived(getModelInfo(DBState.db.subModel))
+    let modelInfo = $derived(getModelInfo(DBState.db.aiModel, DBState.db))
+    let subModelInfo = $derived(getModelInfo(DBState.db.subModel, DBState.db))
     let nanogptInputMode = $state<'list' | 'manual'>(DBState.db.nanogptRequestModel && !DBState.db.nanogptRequestModelName ? 'manual' : 'list')
     // svelte-ignore state_referenced_locally
     let prevNanogptInputMode = nanogptInputMode;

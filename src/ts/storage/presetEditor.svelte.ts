@@ -1,6 +1,6 @@
 import { untrack } from 'svelte'
-import { fromStore } from 'svelte/store'
-import { DBState, settingsOpen } from '../stores.svelte'
+import { derived, fromStore } from 'svelte/store'
+import { DBState, MobileGUI, MobileGUIStack, MobileSideBar, selectedCharID, settingsOpen } from '../stores.svelte'
 import type { Database } from './database.svelte'
 import { safeStructuredClone } from '../safeStructuredClone'
 import {
@@ -34,8 +34,12 @@ const editors = new WeakMap<Database, Database>()
 
 const clone = <T>(value: T): T => value === undefined ? value : safeStructuredClone(value)
 
+// The settings window, or the mobile screen that shows settings when no character is selected.
 function settingsWindowOpen(): boolean {
-    settingsWindow ??= fromStore(settingsOpen)
+    settingsWindow ??= fromStore(derived(
+        [settingsOpen, MobileGUI, MobileGUIStack, MobileSideBar, selectedCharID],
+        ([open, mobile, screen, sideBar, character]) => open || (mobile && screen === 2 && sideBar === 0 && character === -1),
+    ))
     return settingsWindow.current
 }
 

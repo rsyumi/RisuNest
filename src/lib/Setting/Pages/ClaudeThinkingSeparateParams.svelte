@@ -30,7 +30,7 @@
         }
         return paramKey
     })
-    let modelInfo = $derived(getModelInfo(effectiveModel))
+    let modelInfo = $derived(getModelInfo(effectiveModel, DBState.db))
 
     let hasXHighEffort = $derived(modelInfo.flags.includes(LLMFlags.claudeXHighEffort))
 

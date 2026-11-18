@@ -16,8 +16,8 @@
 
     let ctx: SettingContext = $derived({
         db: DBState.db,
-        modelInfo: getModelInfo(DBState.db.aiModel),
-        subModelInfo: getModelInfo(DBState.db.subModel),
+        modelInfo: getModelInfo(DBState.db.aiModel, DBState.db),
+        subModelInfo: getModelInfo(DBState.db.subModel, DBState.db),
     })
 
     interface Group {

@@ -1588,16 +1588,24 @@ describe('preset list operations', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         expect(await storedPrompts()).toEqual(['Prompt A', 'Prompt B', 'Prompt C'])
 
-        // The settings window edits the selection, which is saved like any other edit.
+        // The settings window edits the selection, which saves like any other edit.
+        const dispose = observePersistentSaveChanges({
+            readDatabase: getDatabase, readSelectedCharacter: () => null,
+            markDirty: (bytes) => runtime.markPersistentDataDirty(bytes),
+        })
         settingsOpen.set(true)
         try {
+            flushSync()
+            // Installing the observer marks the data dirty once.
+            await runtime.flushPendingDataLocally('observer-installed')
             expect(presetEditorDBState.db.mainPrompt).toBe('Prompt C')
             presetEditorDBState.db.mainPrompt = 'Edited C'
-            await runtime.flushPendingDataLocally('settings-window-edit')
+            flushSync()
+            await vi.waitFor(async () => expect(await storedPrompts()).toEqual(['Prompt A', 'Prompt B', 'Edited C']), { timeout: 3000 })
         } finally {
             settingsOpen.set(false)
+            dispose()
         }
-        expect(await storedPrompts()).toEqual(['Prompt A', 'Prompt B', 'Edited C'])
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 })
