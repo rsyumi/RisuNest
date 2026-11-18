@@ -1807,6 +1807,37 @@ fn opening_projects_received_units_of_newly_shared_fields_once_without_publishin
     assert_eq!(store.revision().unwrap(), revision);
 }
 
+// A backup an earlier build made holds units its documents lack.
+#[test]
+fn a_replacement_projects_source_units_of_newly_shared_fields_its_documents_lack() {
+    let (_dir, mut store) = store();
+    create_conversation(&mut store, "char", "conv");
+    receive(&mut store, "shared", vec![
+        change(&["conversation", "char", "conv", "onboardingDone"], 10, serde_json::json!(true)),
+    ], vec![]);
+    clear_outbox(&mut store);
+    let source: BTreeMap<UnitKey, UnitValue> = store.connection.prepare("SELECT key,value FROM lww_units").unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
+        .map(|row| {
+            let (key, value) = row.unwrap();
+            (key.try_into().unwrap(), serde_json::from_str(&value).unwrap())
+        })
+        .collect();
+    let target = super::super::ReadTarget { generation: active_generation(&store.connection).unwrap(), revision: store.revision().unwrap() };
+    let mut database = query::materialize_target(&store.connection, &target).unwrap();
+    database["characters"][0]["chats"][0].as_object_mut().unwrap().remove("onboardingDone");
+    let characters = database.as_object_mut().unwrap().remove("characters").unwrap();
+    let presets = database.as_object_mut().unwrap().remove("botPresets").unwrap();
+    let stage = store.replace_begin().unwrap().staging_id;
+    store.replace_put_root(&stage, &database).unwrap();
+    store.replace_put_presets(&stage, presets.as_array().unwrap()).unwrap();
+    store.replace_add_characters(&stage, characters.as_array().unwrap()).unwrap();
+    let header = Header { binding_authority: store.lww_binding_authority().unwrap(), request_id: "earlier-backup".into() };
+    store.lww_commit_replacement_units(&header, &stage, Some(&source)).unwrap();
+    assert_eq!(store.read_conversation("char", "conv", None).unwrap().unwrap().value["onboardingDone"], true);
+    assert!(store.lww_read_outbox(0.into(), 100).unwrap().entries.is_empty());
+}
+
 #[test]
 fn plugin_record_deletion_is_reusable_and_generic_record_deletion_is_permanent() {
     let (_, mut store) = store();

@@ -43,6 +43,16 @@ impl Projected {
         projected
     }
 
+    fn recorded(db: &Connection) -> StoreResult<Self> {
+        let recorded: Option<String> = db
+            .query_row("SELECT value FROM meta WHERE key=?1", [META_KEY], |r| r.get(0))
+            .optional()?;
+        // Projecting again finds nothing to fill, so a record this build cannot read starts over.
+        Ok(recorded
+            .and_then(|recorded| serde_json::from_str(&recorded).ok())
+            .unwrap_or_else(Self::first_release))
+    }
+
     fn fields_mut(&mut self, kind: &str) -> &mut BTreeSet<String> {
         match kind {
             "root" => &mut self.root,
@@ -70,56 +80,71 @@ fn lacks_field(tx: &Transaction<'_>, generation: &str, key: &UnitKey) -> StoreRe
     Ok(matches!(field_type, Some(None)))
 }
 
+/// Stored units of the fields `projected` does not list, for documents of `generation` that
+/// lack the field.
+fn lacking_units(tx: &Transaction<'_>, generation: &str, projected: &Projected) -> StoreResult<Vec<(UnitKey, UnitValue)>> {
+    let current = Projected::current();
+    let mut candidates = BTreeSet::new();
+    for (kind, column, now, then) in [
+        ("root", 1, &current.root, &projected.root),
+        ("character", 2, &current.character, &projected.character),
+        ("conversation", 3, &current.conversation, &projected.conversation),
+    ] {
+        let added: Vec<&String> = now.difference(then).collect();
+        if added.is_empty() {
+            continue;
+        }
+        let mut statement = tx.prepare(&format!(
+            "SELECT key FROM lww_units WHERE json_extract(key,'$[0]')=?1 AND json_extract(key,'$[{column}]') IN (SELECT value FROM json_each(?2))"
+        ))?;
+        let keys = statement.query_map(params![kind, serde_json::to_string(&added)?], |r| r.get::<_, String>(0))?;
+        for key in keys {
+            candidates.insert(key?);
+        }
+    }
+    let mut lacking = Vec::new();
+    for key in candidates {
+        let key: UnitKey = wire(key.try_into())?;
+        if !projection::known(&key) {
+            continue;
+        }
+        let Some((_, value)) = read_unit(tx, &key)? else { continue };
+        if matches!(value, UnitValue::Deleted) {
+            continue;
+        }
+        // Restoring an archived character projects every unit it holds.
+        if parent_status_in_generation(tx, &key, Some(generation))? == "ready" && lacks_field(tx, generation, &key)? {
+            lacking.push((key, value));
+        }
+    }
+    Ok(lacking)
+}
+
+/// A backup an earlier build made holds units of fields that build did not share, while its
+/// documents lack them.
+pub(in crate::persistent_store) fn project_replacement_listed_fields(tx: &Transaction<'_>, generation: &str) -> StoreResult<()> {
+    for (key, value) in lacking_units(tx, generation, &Projected::first_release())? {
+        projection::apply(tx, generation, &key, &value)?;
+    }
+    Ok(())
+}
+
 impl PersistentStore {
     /// A build that did not share a field kept its received units opaque, so the documents
     /// lack them. Projects those units once a build shares the field, without publishing them.
     pub(in crate::persistent_store) fn lww_project_listed_fields(&mut self) -> StoreResult<()> {
-        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let recorded: Option<String> = tx
-            .query_row("SELECT value FROM meta WHERE key=?1", [META_KEY], |r| r.get(0))
-            .optional()?;
-        // Projecting again finds nothing to fill, so a record this build cannot read starts over.
-        let recorded = recorded
-            .and_then(|recorded| serde_json::from_str(&recorded).ok())
-            .unwrap_or_else(Projected::first_release);
         let current = Projected::current();
+        // Most opens find the record current, so they take no write lock.
+        if Projected::recorded(&self.connection)? == current {
+            return Ok(());
+        }
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded = Projected::recorded(&tx)?;
         if recorded == current {
             return Ok(());
         }
-        let mut candidates = BTreeSet::new();
-        for (kind, column, now, then) in [
-            ("root", 1, &current.root, &recorded.root),
-            ("character", 2, &current.character, &recorded.character),
-            ("conversation", 3, &current.conversation, &recorded.conversation),
-        ] {
-            let added: Vec<&String> = now.difference(then).collect();
-            if added.is_empty() {
-                continue;
-            }
-            let mut statement = tx.prepare(&format!(
-                "SELECT key FROM lww_units WHERE json_extract(key,'$[0]')=?1 AND json_extract(key,'$[{column}]') IN (SELECT value FROM json_each(?2))"
-            ))?;
-            let keys = statement.query_map(params![kind, serde_json::to_string(&added)?], |r| r.get::<_, String>(0))?;
-            for key in keys {
-                candidates.insert(key?);
-            }
-        }
         let generation = active_generation(&tx)?;
-        let mut pending = Vec::new();
-        for key in candidates {
-            let key: UnitKey = wire(key.try_into())?;
-            if !projection::known(&key) {
-                continue;
-            }
-            let Some((_, value)) = read_unit(&tx, &key)? else { continue };
-            if matches!(value, UnitValue::Deleted) {
-                continue;
-            }
-            // Restoring an archived character projects every unit it holds.
-            if parent_status(&tx, &key)? == "ready" && lacks_field(&tx, &generation, &key)? {
-                pending.push((key, value));
-            }
-        }
+        let pending = lacking_units(&tx, &generation, &recorded)?;
         if !pending.is_empty() {
             let revision = current_revision(&tx)? + 1;
             super::super::content_change_index::begin_mutation(&tx, &generation, revision, "server")?;
