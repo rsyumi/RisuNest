@@ -13,6 +13,7 @@ export async function importStoresModule() {
         CharConfigSubMenu: writable(0),
         MobileGUI: writable(false),
         MobileSideBar: writable(0),
+        openPersonaList: writable(false),
         openPresetList: writable(false),
         QuickSettings: { open: false, index: 0 },
         settingsOpen: writable(false),

@@ -18,6 +18,7 @@
 
   } from "../../ts/stores.svelte";
     import { setDatabase, type folder } from "../../ts/storage/database.svelte";
+    import { openedImportResult } from "src/ts/importIntake/sheetStore";
     import { DBState } from 'src/ts/stores.svelte';
     import BarIcon from "./BarIcon.svelte";
     import SidebarIndicator from "./SidebarIndicator.svelte";
@@ -69,6 +70,7 @@
   let editMode = $state(false);
   let menuMode = $state(0);
   let devTool = $state(false)
+  $effect(() => { if ($openedImportResult?.kind === 'character-lorebook') devTool = false })
 
   function reseter() {
     menuMode = 0;

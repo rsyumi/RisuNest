@@ -11,21 +11,20 @@
 
     const active = $derived($pluginInstallDialog)
     const busy = $derived(active !== null && installingRequest === active)
-    const copy = $derived(language.risuNest.importIntake)
 
     const rows = $derived.by(() => {
         if (!active) return []
         const { header, replaces, fileName, bytes } = active.prompt
         const list: { label: string; value: string }[] = []
         if (replaces) {
-            if (replaces.version) list.push({ label: copy.pluginInstalledVersion, value: replaces.version })
-            if (header.version) list.push({ label: copy.pluginNewVersion, value: header.version })
+            if (replaces.version) list.push({ label: language.risuNest.importIntake.pluginInstalledVersion, value: replaces.version })
+            if (header.version) list.push({ label: language.risuNest.importIntake.pluginNewVersion, value: header.version })
         } else if (header.version) {
-            list.push({ label: copy.pluginVersion, value: header.version })
+            list.push({ label: language.risuNest.importIntake.pluginVersion, value: header.version })
         }
-        if (header.updateHost) list.push({ label: copy.pluginUpdateURL, value: header.updateHost })
+        if (header.updateHost) list.push({ label: language.risuNest.importIntake.pluginUpdateURL, value: header.updateHost })
         const size = bytes === undefined ? '' : formatBytes(bytes)
-        list.push({ label: copy.detailFile, value: size ? `${fileName} · ${size}` : fileName })
+        list.push({ label: language.risuNest.importIntake.detailFile, value: size ? `${fileName} · ${size}` : fileName })
         return list
     })
 
@@ -58,7 +57,7 @@
             data-testid="plugin-install-dialog"
             use:modalNavigation={{ close: () => active?.cancel() }}
             class="flex max-h-[90dvh] w-full max-w-lg flex-col gap-4 overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-5 text-textcolor outline-hidden">
-            <h2 id="plugin-install-dialog-title" class="text-lg font-bold">{prompt.replaces ? copy.pluginReplaceTitle : copy.pluginInstallTitle}</h2>
+            <h2 id="plugin-install-dialog-title" class="text-lg font-bold">{prompt.replaces ? language.risuNest.importIntake.pluginReplaceTitle : language.risuNest.importIntake.pluginInstallTitle}</h2>
             <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 rounded-md border border-darkborderc bg-bgcolor px-3 py-2.5 text-sm">
                 <dt class="text-subtext">{language.name}</dt>
                 <dd class="min-w-0 break-words">
@@ -73,12 +72,12 @@
                 {/each}
             </dl>
             {#if prompt.replaces}
-                <p class="text-sm">{fillTemplate(copy.pluginReplaceData, prompt.replaces.displayName ?? prompt.replaces.name)}</p>
+                <p class="text-sm">{fillTemplate(language.risuNest.importIntake.pluginReplaceData, prompt.replaces.displayName ?? prompt.replaces.name)}</p>
             {/if}
-            <div class="rounded-md border border-danger-400/50 bg-danger-400/5 px-3 py-2 text-[13px] leading-normal">{`${copy.pluginTrustedSources} ${language.pluginWarn}`}</div>
+            <div class="rounded-md border border-danger-400/50 bg-danger-400/5 px-3 py-2 text-[13px] leading-normal">{`${language.risuNest.importIntake.pluginTrustedSources} ${language.pluginWarn}`}</div>
             <footer class="flex flex-wrap items-center justify-end gap-2">
                 <SettingButton variant="secondary" disabled={busy} onclick={() => active?.cancel()}>{language.cancel}</SettingButton>
-                <SettingButton {busy} onclick={install}>{prompt.replaces ? copy.replace : copy.install}</SettingButton>
+                <SettingButton {busy} onclick={install}>{prompt.replaces ? language.risuNest.importIntake.replace : language.risuNest.importIntake.install}</SettingButton>
             </footer>
         </div>
     </div>

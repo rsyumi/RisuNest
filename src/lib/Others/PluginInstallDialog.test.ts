@@ -6,7 +6,7 @@ const h = vi.hoisted(() => ({ importPlugin: vi.fn<typeof import('src/ts/plugins/
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ importPlugin: h.importPlugin }) satisfies Partial<typeof import('src/ts/plugins/plugins.svelte')>)
 vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 
-import { language } from 'src/lang'
+import { changeLanguage, language } from 'src/lang'
 import { alertStore, DBState } from 'src/ts/stores.svelte'
 import { fillTemplate, formatBytes } from 'src/ts/gui/nativeFileJobDialogModel'
 import { inspectPluginFile, pluginInstallDialog, requestPluginInstall } from 'src/ts/importIntake/pluginInstall'
@@ -83,7 +83,7 @@ describe('plugin file inspection', () => {
     })
 
     it('reads a header behind a UTF-8 BOM and keeps only the update host', () => {
-        expect(inspectPluginFile('synthetic.js', `﻿${declared}`, false)).toEqual({ header: {
+        expect(inspectPluginFile('synthetic.js', `\uFEFF${declared}`, false)).toEqual({ header: {
             name: 'synthetic', displayName: 'Synthetic Plugin', version: '1.2.0', apiVersion: '3.0', updateHost: 'plugins.example.test',
         } })
     })
@@ -93,7 +93,7 @@ describe('plugin install dialog', () => {
     it('offers a new plugin with its declared fields and installs it once without asking again', async () => {
         let finishInstall!: (installed: boolean) => void
         h.importPlugin.mockImplementation(() => new Promise(resolve => { finishInstall = resolve }))
-        const result = requestPluginInstall(pluginItem('synthetic.js', `﻿${declared}`, 2048))
+        const result = requestPluginInstall(pluginItem('synthetic.js', `\uFEFF${declared}`, 2048))
         await tick()
 
         expect(dialog()!.querySelector('h2')!.textContent).toBe(copy.pluginInstallTitle)
@@ -180,6 +180,25 @@ describe('plugin install dialog', () => {
         button(copy.install).click()
         expect(await result).toBe('failed')
         expect(get(alertStore)).toEqual(expect.objectContaining({ type: 'error', msg: expect.stringContaining('synthetic install failure') }))
+    })
+
+    it('uses the language chosen after it was first shown', async () => {
+        void requestPluginInstall(pluginItem('first.js', declared))
+        await tick()
+        button(language.cancel).click()
+        await tick()
+        changeLanguage('ko')
+        try {
+            expect(language.risuNest.importIntake.pluginInstallTitle).not.toBe(copy.pluginInstallTitle)
+            void requestPluginInstall(pluginItem('second.js', declared))
+            await tick()
+            expect(dialog()!.querySelector('h2')!.textContent).toBe(language.risuNest.importIntake.pluginInstallTitle)
+            expect(rows().at(-1)).toEqual([language.risuNest.importIntake.detailFile, 'second.js'])
+            expect([...dialog()!.querySelectorAll('button')].map(element => element.textContent?.trim()))
+                .toEqual([language.cancel, language.risuNest.importIntake.install])
+        } finally {
+            changeLanguage('en')
+        }
     })
 
     it('leaves Escape to an alert shown above it', async () => {

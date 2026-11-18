@@ -39,6 +39,7 @@
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
     import { handleAppDragOver, handleAppDragStart, handleAppDrop } from './ts/importIntake/drop';
+    import { openedImportResult } from './ts/importIntake/sheetStore';
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
@@ -205,6 +206,7 @@
 
     let didFirstSetup: boolean  = $derived(DBState.db?.didFirstSetup)
     let gridOpen = $state(false)
+    $effect(() => { if ($openedImportResult) gridOpen = false })
     let aprilFools = $state(new Date().getMonth() === 3 && new Date().getDate() === 1)
     let aprilFoolsPage = $state(0)
 

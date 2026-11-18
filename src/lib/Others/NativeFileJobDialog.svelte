@@ -36,7 +36,6 @@
     const embedded = $derived($nativeFileJobHost === 'onboarding' && !model.compact)
     const open = $derived(model.open && !embedded)
     const ticking = $derived(open && model.terminal === null)
-    const copy = $derived(language.risuNest.importDialog)
     const retryAvailable = $derived($nativeFileOperationOutcome?.status?.kind === 'restore-portable-backup'
         && $nativeFileOperationOutcome.status.restoreAdoptionConfirmed === true
         && $nativeFileOperationOutcome.status.portableBodyRetry?.pending === true
@@ -161,7 +160,7 @@
             {/if}
 
             <SettingProgress
-                label={model.overallPercent === null && !model.terminal ? copy.preparing : model.title}
+                label={model.overallPercent === null && !model.terminal ? language.risuNest.importDialog.preparing : model.title}
                 detail={model.overallText}
                 fraction={model.indeterminate ? null : (model.overallPercent ?? 0) / 100}
                 done={model.terminal?.state === 'succeeded'}
@@ -216,15 +215,15 @@
             {#if model.terminal && (model.terminal.details || model.terminal.state === 'failed')}
                 <div class="flex flex-col items-start gap-2">
                     <SettingButton variant="secondary" onclick={() => { showDetails = !showDetails }}>
-                        {showDetails ? copy.errorDetailsHide : copy.errorDetails}
+                        {showDetails ? language.risuNest.importDialog.errorDetailsHide : language.risuNest.importDialog.errorDetails}
                     </SettingButton>
                     {#if showDetails}
                         <div class="relative w-full">
                             <button
                                 type="button"
                                 class="absolute top-1 right-1 rounded-sm p-1 text-subtext hover:text-textcolor"
-                                title={copied ? copy.copied : copy.copyDetails}
-                                aria-label={copy.copyDetails}
+                                title={copied ? language.risuNest.importDialog.copied : language.risuNest.importDialog.copyDetails}
+                                aria-label={language.risuNest.importDialog.copyDetails}
                                 onclick={copyDetails}>
                                 {#if copied}
                                     <CheckIcon size={14} />
@@ -270,10 +269,11 @@
                         {#if retryAvailable}
                             <SettingButton variant="secondary" onclick={() => {void retryPortableRestoreBodiesFromOutcome().catch(() => {})}}>{language.retry}</SettingButton>
                         {/if}
-                        {#if model.terminal?.openLocation}
+                        <!-- Onboarding stays over the app, so there is nothing to open yet. -->
+                        {#if model.terminal?.openLocation && $nativeFileJobHost !== 'onboarding'}
                             <SettingButton variant="secondary" onclick={() => openResult(model.terminal!.openLocation!)}>{language.risuNest.importIntake.open}</SettingButton>
                         {/if}
-                        <SettingButton onclick={dismiss}>{copy.close}</SettingButton>
+                        <SettingButton onclick={dismiss}>{language.risuNest.importDialog.close}</SettingButton>
                     {/if}
                 </footer>
             {/if}

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
-import { language } from 'src/lang'
-import { nativeFileOperationOutcome, waitForActiveNativeFileOperation } from 'src/ts/storage/nativeFileJobManager'
+import { changeLanguage, language } from 'src/lang'
+import { nativeFileJobHost, nativeFileOperationOutcome, waitForActiveNativeFileOperation } from 'src/ts/storage/nativeFileJobManager'
 import NativeFileJobDialog from './NativeFileJobDialog.svelte'
 import { syntheticNativeFileJobStatus } from 'src/ts/storage/nativeFileJobs'
 import { failureReason } from 'src/ts/gui/nativeFileJobDialogModel'
@@ -205,6 +205,50 @@ describe('file operation error details', () => {
         button(language.risuNest.importIntake.open).click()
         await vi.waitFor(() => expect(h.openImportResult).toHaveBeenCalledExactlyOnceWith(location))
         expect(get(nativeFileOperationOutcome)).toBeNull()
+    })
+
+    it('offers nothing to open while onboarding is on screen', async () => {
+        nativeFileJobHost.set('onboarding')
+        try {
+            nativeFileOperationOutcome.set({
+                kind: 'import', format: 'content', state: 'succeeded', startedAt: 0, finishedAt: 1, observedStages: [], warningCodes: [],
+                partialWritesPossible: false, source: { name: 'Mira.png', bytes: 10 }, location: { kind: 'character', chaId: 'synthetic' },
+            })
+            target = document.createElement('div')
+            document.body.append(target)
+            component = mount(NativeFileJobDialog, { target })
+            await tick()
+            expect(target.querySelector('[role="status"]')?.textContent).toContain(language.risuNest.importIntake.locationCharacter)
+            expect(buttonLabels()).toEqual([language.risuNest.importDialog.close])
+        } finally {
+            nativeFileJobHost.set('dialog')
+        }
+    })
+})
+
+describe('result text', () => {
+    it('uses the language chosen after the result was first shown', async () => {
+        const outcome = {
+            kind: 'import', format: 'content', state: 'succeeded', startedAt: 0, finishedAt: 1,
+            observedStages: [], warningCodes: [], partialWritesPossible: false, source: { name: 'Harbor.json', bytes: 10 },
+        } satisfies Parameters<typeof nativeFileOperationOutcome.set>[0]
+        nativeFileOperationOutcome.set(outcome)
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(NativeFileJobDialog, { target })
+        await tick()
+        expect(buttonLabels()).toEqual([language.risuNest.importDialog.close])
+        nativeFileOperationOutcome.set(null)
+        await tick()
+        changeLanguage('ko')
+        try {
+            expect(language.risuNest.importDialog.close).not.toBe('Close')
+            nativeFileOperationOutcome.set({ ...outcome })
+            await tick()
+            expect(buttonLabels()).toEqual([language.risuNest.importDialog.close])
+        } finally {
+            changeLanguage('en')
+        }
     })
 })
 
