@@ -1302,9 +1302,6 @@ fn write_conversations(
             "Conversation detail must be an object",
         )?;
         conversation.remove("message");
-        // Restoring a RisuSave turns bindedBotPreset into a preset binding, so a value an
-        // earlier PocketRisu import left behind stays out of the file.
-        conversation.shift_remove("bindedBotPreset");
         write_object_with_array(writer, conversation, "message", |writer| {
             write_messages(
                 connection,
@@ -1944,8 +1941,6 @@ mod tests {
                         "chats": [{
                             "id": "live-chat",
                             "name": "Live Chat",
-                            "promptPresetId": "preset-b",
-                            "bindedBotPreset": "preset-a",
                             "message": [
                                 { "role": "user", "data": "hello", "chatId": "l1" },
                                 { "role": "char", "data": "world", "chatId": "l2" }
@@ -2590,8 +2585,6 @@ mod tests {
         assert_eq!(blocks[5].value, json!({ "plugin": { "enabled": true } }));
         assert_eq!(blocks[7].value["chats"][0]["message"][0]["data"], "trash");
         assert_eq!(blocks[8].value["chats"][0]["message"][1]["data"], "world");
-        assert_eq!(blocks[8].value["chats"][0]["promptPresetId"], "preset-b");
-        assert!(blocks[8].value["chats"][0].get("bindedBotPreset").is_none());
         assert_eq!(exported.bytes, fs::metadata(&exported.path).unwrap().len());
     }
 

@@ -645,9 +645,27 @@ export class RisuSaveDecoder {
 // msgpackr appends up to 100 characters of the decoded data to this message.
 const MSGPACK_TRAILING_DATA_ERROR = 'Data read, but end of buffer not reached'
 
+/** Every RisuSave RisuNest writes carries its plugin metadata block ahead of the characters. */
+function writtenByRisuNest(data: Uint8Array): boolean {
+    if (checkHeader(data) !== 'risusave') return false
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    let offset = magicRisuSaveHeader.length
+    while (offset + 3 <= data.length) {
+        const type = data[offset]
+        const nameEnd = offset + 3 + data[offset + 2]
+        if (nameEnd + 4 > data.length) return false
+        if (type === RisuSaveType.CHARACTER_WITH_CHAT || type === RisuSaveType.CHARACTER_WITHOUT_CHAT) return false
+        if (type === RisuSaveType.PLUGIN_STORAGE_META
+            && new TextDecoder().decode(data.subarray(offset + 3, nameEnd)) === 'pluginStorageMeta') return true
+        offset = nameEnd + 4 + view.getUint32(nameEnd, true)
+    }
+    return false
+}
+
 export async function decodeRisuSave(data: Uint8Array) {
     try {
-        return normalizePocketFeatures(await decodeRisuSaveRaw(data))
+        const risuNestSave = writtenByRisuNest(data)
+        return normalizePocketFeatures(await decodeRisuSaveRaw(data), { risuNestSave })
     } catch (error) {
         // Callers show and log this message, so it never carries decoded save content.
         if (error instanceof Error && error.message.startsWith(MSGPACK_TRAILING_DATA_ERROR)) throw new Error(MSGPACK_TRAILING_DATA_ERROR)

@@ -450,7 +450,7 @@ describe('RisuSave persistent store adapter', () => {
         await expect(decodeRisuSave(exported)).resolves.toEqual(database)
     })
 
-    it('exports chat preset bindings without a bindedBotPreset that a restore would bind', async () => {
+    it('keeps chat preset binding fields as stored through its own RisuSave', async () => {
         const database = structuredClone(risuSaveFixtureDatabase)
         const presetId = database.botPresets[0]['id'] as string
         const bound = Object.assign(structuredClone(database.characters[0].chats[0]),
@@ -466,7 +466,36 @@ describe('RisuSave persistent store adapter', () => {
         const [leftover, kept] = decoded.characters[0].chats
         expect(leftover.id).toBe('chat-fixture')
         expect(leftover).not.toHaveProperty('promptPresetId')
+        expect(leftover.bindedBotPreset).toBe('leftover')
         expect(kept.promptPresetId).toBe(presetId)
+        expect(kept.bindedBotPreset).toBe('leftover-bound')
+    })
+
+    it.each([
+        ['before', true],
+        ['after', false],
+        ['absent', false],
+    ] as const)('converts chat preset bindings unless the plugin metadata block is %s the characters', async (marker, kept) => {
+        const character = { chaId: 'char-1', name: 'Imported', chats: [{ id: 'chat-1', message: [], bindedBotPreset: 'preset-a' }] }
+        const block = (type: RisuSaveType, name: string, value: unknown) =>
+            encodeRisuSaveBlock({ compression: false, type, name, data: JSON.stringify(value) })
+        const meta = block(RisuSaveType.PLUGIN_STORAGE_META, 'pluginStorageMeta', {})
+        const characterBlock = block(RisuSaveType.CHARACTER_WITH_CHAT, 'char-1', character)
+        const blocks = await Promise.all(marker === 'before' ? [meta, characterBlock] : marker === 'after' ? [characterBlock, meta] : [characterBlock])
+        const bytes = new Uint8Array(magicRisuSaveHeader.length + blocks.reduce((sum, block) => sum + block.length, 0))
+        bytes.set(magicRisuSaveHeader)
+        let offset = magicRisuSaveHeader.length
+        for (const block of blocks) { bytes.set(block, offset); offset += block.length }
+
+        const [chat] = (await decodeRisuSave(bytes)).characters[0].chats
+
+        if (kept) {
+            expect(chat.bindedBotPreset).toBe('preset-a')
+            expect(chat).not.toHaveProperty('promptPresetId')
+        } else {
+            expect(chat.promptPresetId).toBe('preset-a')
+            expect(chat).not.toHaveProperty('bindedBotPreset')
+        }
     })
 
     it('streams deterministic bytes for the same revision', async () => {

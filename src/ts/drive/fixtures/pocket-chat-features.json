@@ -126,5 +126,69 @@
             },
             "message": []
         }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-leftover",
+            "bindedBotPreset": "preset-a",
+            "message": []
+        },
+        "expected": {
+            "id": "stored-leftover",
+            "bindedBotPreset": "preset-a",
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-both",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": "preset-b",
+            "message": []
+        },
+        "expected": {
+            "id": "stored-both",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": "preset-b",
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-number",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": 5,
+            "message": []
+        },
+        "expected": {
+            "id": "stored-number",
+            "bindedBotPreset": "preset-a",
+            "promptPresetId": 5,
+            "message": []
+        }
+    },
+    {
+        "risuNestSave": true,
+        "input": {
+            "id": "stored-toggles",
+            "savedToggleValues": {
+                "toggle_kept": "1",
+                "other": "x"
+            },
+            "bindedPersona": null,
+            "bindedBotPreset": "preset-a",
+            "message": []
+        },
+        "expected": {
+            "id": "stored-toggles",
+            "savedToggleValues": {
+                "toggle_kept": "1"
+            },
+            "bindedBotPreset": "preset-a",
+            "message": []
+        }
     }
 ]

@@ -1216,7 +1216,7 @@ fn reference_stage_legacy_database<R: Read>(
             if !prepare_legacy_character(&mut character, &mut character_ids) {
                 return None;
             }
-            pocket_features::character(&mut character, &format!("character:{index}"));
+            pocket_features::character(&mut character, &format!("character:{index}"), pocket_features::Origin::External);
             Some(character)
         })
         .collect();

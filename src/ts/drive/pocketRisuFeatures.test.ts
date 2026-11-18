@@ -22,7 +22,7 @@ describe('Pocket feature import', () => {
         'matches the shared native chat fixture %i',
         (_, fixture) => {
             const input = structuredClone(fixture.input)
-            normalizePocketChat(input, 'fallback')
+            normalizePocketChat(input, 'fallback', { risuNestSave: 'risuNestSave' in fixture && fixture.risuNestSave })
             expect(input).toEqual(fixture.expected)
         },
     )

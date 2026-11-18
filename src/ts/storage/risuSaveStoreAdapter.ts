@@ -38,15 +38,7 @@ async function* characterValues(reader: PersistentRevisionReader): AsyncGenerato
     for await (const record of iteratePinnedCharacters(reader)) {
         const chats: Database['characters'][number]['chats'] = []
         for await (const conversation of iteratePinnedConversations(reader, record.summary.id)) {
-            // Restoring a RisuSave turns bindedBotPreset into a preset binding, so a value an
-            // earlier PocketRisu import left behind stays out of the file.
-            if (Object.hasOwn(conversation.value, 'bindedBotPreset')) {
-                const chat: Record<string, unknown> = { ...conversation.value }
-                delete chat.bindedBotPreset
-                chats.push(chat as unknown as Database['characters'][number]['chats'][number])
-            } else {
-                chats.push(conversation.value)
-            }
+            chats.push(conversation.value)
         }
         yield { ...record.detail, chats } as Database['characters'][number]
     }
