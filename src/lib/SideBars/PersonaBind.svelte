@@ -23,6 +23,8 @@
                 ? language.missingBoundPersona
                 : `${language.inheritPersona} (${currentPersona})`),
     )
+    // Like `username`, `userNote` holds the current persona's live note.
+    let note = $derived(bound ? bound.note : chat?.bindedPersona ? '' : DBState.db.userNote)
     async function select(index: number) {
         if (!target?.isCurrent() || chatBindingBlockedByGeneration()) return
         try {
@@ -48,8 +50,8 @@
     >
         <ContactIcon size={16} class="shrink-0" />
         <span class="min-w-0 truncate text-sm">{label}</span>
-        {#if bound?.note}
-            <span class="min-w-0 truncate text-xs opacity-75">({bound.note})</span>
+        {#if note}
+            <span class="min-w-0 flex-1 truncate text-xs opacity-75">({note})</span>
         {/if}
     </button>
 </div>
