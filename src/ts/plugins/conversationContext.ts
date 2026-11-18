@@ -215,10 +215,23 @@ export async function findChatIndex(
     return null
 }
 
+async function readPinnedPreset(reader: PersistentRevisionReader, id: string): Promise<botPreset | null> {
+    const preset = await reader.readPreset(id)
+    if (!preset) return null
+    assertPinnedRevision(reader.revision, preset.revision, `Preset ${id}`)
+    return preset.value
+}
+
+/** The conversation's bound preset when it names one in the library, otherwise the global selection. */
 async function readActivePreset(
     reader: PersistentRevisionReader,
     root: PersistentRoot,
+    conversation: Omit<Chat, 'message'>,
 ): Promise<botPreset | null> {
+    if (typeof conversation.promptPresetId === 'string' && conversation.promptPresetId) {
+        const bound = await readPinnedPreset(reader, conversation.promptPresetId)
+        if (bound) return bound
+    }
     const selection = root.botPresetsId
     let id: string | undefined
     if (typeof selection === 'string') {
@@ -229,10 +242,7 @@ async function readActivePreset(
         id = catalog.items.find((item) => item.configuredIndex === selection)?.id
     }
     if (!id) return null
-    const preset = await reader.readPreset(id)
-    if (!preset) return null
-    assertPinnedRevision(reader.revision, preset.revision, `Preset ${id}`)
-    return preset.value
+    return readPinnedPreset(reader, id)
 }
 
 /** The active preset's value for a preset-mirrored root field, or the stored root value without a preset. */
@@ -352,7 +362,7 @@ export async function readPinnedConversationContext(
         assertPinnedRevision(reader.revision, found.revision, 'Root')
         root = found.value
         if (include.lore || globals) {
-            preset = await readActivePreset(reader, root)
+            preset = await readActivePreset(reader, root, conversation)
             throwIfAborted(options.signal)
         }
     }
