@@ -4,6 +4,7 @@ import { DBState } from 'src/ts/stores.svelte'
 import { RISU_PROMPT_DRAG_TYPE } from 'src/ts/dragTypes'
 import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
 import { language } from 'src/lang'
+import { modalNavigation } from 'src/ts/ui/modalNavigation'
 import PromptSettings from './PromptSettings.svelte'
 
 const mocks = vi.hoisted(() => ({
@@ -11,9 +12,10 @@ const mocks = vi.hoisted(() => ({
     toggleEditor: { props: {} as { value?: unknown, onChange?: (value: string) => void } },
 }))
 
-vi.mock('src/ts/stores.svelte', () => {
+vi.mock('src/ts/stores.svelte', async () => {
+    const { writable } = await import('svelte/store')
     const DBState = $state({ db: {} })
-    return { DBState }
+    return { DBState, alertStore: writable({ type: 'none', msg: '' }) }
 })
 vi.mock('src/ts/process/prompt', () => ({ tokenizePreset: vi.fn(async () => 0) }))
 vi.mock('src/ts/process/templates/templateCheck', () => ({ templateCheck: () => [] }))
@@ -207,6 +209,19 @@ describe('prompt list', () => {
         await tick()
         expect(DBState.db.promptTemplate.at(-1)).toEqual({ type: 'chat', rangeStart: -1000, rangeEnd: 'end' })
         expect(menuItems()).toEqual([])
+
+        // Escape closes only the menu, not the settings window layer it opened in.
+        const settingsLayer = document.createElement('div')
+        document.body.append(settingsLayer)
+        const closeSettings = vi.fn()
+        const layer = modalNavigation(settingsLayer, { close: closeSettings })
+        add().click()
+        await tick()
+        document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        await tick()
+        layer.destroy()
+        expect(menuItems()).toEqual([])
+        expect(closeSettings).not.toHaveBeenCalled()
     })
 
     it('shows the role only for blocks that choose one, and the type before the text of a named block', async () => {

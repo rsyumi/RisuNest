@@ -55,7 +55,7 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
         },
     }),
 }))
-import { bindPersona, bindPresetFromList, bindPromptPreset, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, presetListBinding, refreshAuthorNoteCopy, updateChatBinding } from './chatBindings.svelte'
+import { bindPersona, bindPresetFromList, bindPromptPreset, captureChatBindingTarget, captureOnboardingTarget, chatBindingBlockedByGeneration, conversationMutationBlockedByGeneration, finishOnboarding, refreshAuthorNoteCopy, updateChatBinding } from './chatBindings.svelte'
 import { authorNoteFingerprint } from './authorNotePresets'
 import { doingChat } from './process/generationState'
 import { activeRerollConversations } from './durableReroll'
@@ -67,7 +67,6 @@ beforeEach(() => {
     activeRerollConversations.set([])
     state.toast.mockClear()
     state.error.mockClear()
-    presetListBinding.target = null
     state.navigation = 0
     state.epoch = 0
     state.session = null
@@ -232,19 +231,18 @@ it('binds a prompt preset by ID through the coordinator and unbinds it with an e
     expect(state.bindings).toHaveLength(2)
 })
 it('binds the preset picked in the list to the captured conversation only while it is still selected and idle', async () => {
-    expect(await bindPresetFromList('preset-a')).toBe(false)
-    presetListBinding.target = captureChatBindingTarget()
-    expect(await bindPresetFromList('preset-a')).toBe(true)
+    const target = captureChatBindingTarget()!
+    expect(await bindPresetFromList(target, 'preset-a')).toBe(true)
     expect(state.db.characters[0].chats[0].promptPresetId).toBe('preset-a')
     expect(state.flushes).toEqual(['chat-binding'])
 
     doingChat.set(true)
-    expect(await bindPresetFromList(null)).toBe(false)
+    expect(await bindPresetFromList(target, null)).toBe(false)
     doingChat.set(false)
-    expect(await bindPresetFromList('removed')).toBe(false)
+    expect(await bindPresetFromList(target, 'removed')).toBe(false)
     expect(state.error).toHaveBeenCalledWith(language.risuNest.presetBinding.saveFailed)
     state.navigation++
-    expect(await bindPresetFromList(null)).toBe(false)
+    expect(await bindPresetFromList(target, null)).toBe(false)
     expect(state.db.characters[0].chats[0].promptPresetId).toBe('preset-a')
 })
 it('blocks binding edits with a notice only while a response is generating', () => {

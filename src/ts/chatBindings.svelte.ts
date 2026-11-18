@@ -125,16 +125,12 @@ export async function bindPromptPreset(conversation: Chat, presetId: string | nu
 
 type ChatBindingTarget = NonNullable<ReturnType<typeof captureChatBindingTarget>>
 
-/** The conversation the preset list binds while it is open from the preset binding row. */
-export const presetListBinding = $state<{ target: ChatBindingTarget | null }>({ target: null })
-
 /**
  * Binds the preset picked in the preset list to the captured conversation. Returns false to keep
  * the list open when the conversation is no longer selected, a response is generating, or saving failed.
  */
-export async function bindPresetFromList(presetId: string | null): Promise<boolean> {
-    const target = presetListBinding.target
-    if (!target?.isCurrent() || chatBindingBlockedByGeneration()) return false
+export async function bindPresetFromList(target: ChatBindingTarget, presetId: string | null): Promise<boolean> {
+    if (!target.isCurrent() || chatBindingBlockedByGeneration()) return false
     try {
         await bindPromptPreset(target.conversation, presetId)
         await saveChatBinding()

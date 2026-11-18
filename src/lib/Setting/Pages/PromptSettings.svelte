@@ -22,6 +22,7 @@
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
     import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
+    import { backNavigationLayer } from "src/ts/ui/modalNavigation";
 
     let warns: string[] = $state([])
     let tokens = $state(0)
@@ -112,16 +113,9 @@
     const dismiss = (event: PointerEvent) => {
       if (!(event.target instanceof Node) || !addMenuRoot?.contains(event.target)) addMenuOpen = false
     }
-    const escape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      event.stopPropagation()
-      addMenuOpen = false
-    }
     document.addEventListener('pointerdown', dismiss)
-    document.addEventListener('keydown', escape)
     return () => {
       document.removeEventListener('pointerdown', dismiss)
-      document.removeEventListener('keydown', escape)
     }
   })
 
@@ -236,7 +230,7 @@
 
     <div class="relative mt-2 mx-3 self-start" bind:this={addMenuRoot}>
         {#if addMenuOpen}
-            <div class="absolute left-0 z-20 w-60 rounded-md border border-darkborderc bg-darkbg shadow-lg p-1 flex flex-col max-h-72 overflow-y-auto {addMenuUp ? 'bottom-full mb-1' : 'top-full mt-1'}" role="menu" aria-label={language.add}>
+            <div class="absolute left-0 z-20 w-60 rounded-md border border-darkborderc bg-darkbg shadow-lg p-1 flex flex-col max-h-72 overflow-y-auto {addMenuUp ? 'bottom-full mb-1' : 'top-full mt-1'}" role="menu" aria-label={language.add} use:backNavigationLayer={{ close: () => { addMenuOpen = false } }}>
                 {#each promptBlockTypes(!!DBState.db.promptSettings?.customChainOfThought) as type (type)}
                     <button role="menuitem" class="px-3 py-2 text-left text-sm rounded-sm hover:bg-selected" onclick={() => addPrompt(type)}>{promptBlockTypeName(type)}</button>
                 {/each}

@@ -181,6 +181,8 @@ it('marks the preset the chat uses when the selection differs', async () => {
 it('binds in bind mode without changing the selection, and unbinds through the inherit row', async () => {
     const onBind = vi.fn(async (_id: string | null) => {})
     await open({ mode: 'bind', boundId: 'id-Gamma', onBind })
+    // The Ctrl+number hint changes the selection, which a click here does not.
+    expect(document.body.textContent).not.toContain(languageEnglish.quickPreset)
     const inherit = () => byText(`${text.inherit} (Alpha)`)
     expect(choose('Gamma').getAttribute('aria-current')).toBe('true')
     expect(choose('Alpha').getAttribute('aria-current')).toBeNull()

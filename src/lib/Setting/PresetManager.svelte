@@ -268,7 +268,7 @@
                 >
             {/if}
         </div>
-        <p class="text-xs text-subtext m-0" aria-live="polite">{comparing ? text.compareHint : language.quickPreset}</p>
+        {#if comparing || mode === 'select'}<p class="text-xs text-subtext m-0" aria-live="polite">{comparing ? text.compareHint : language.quickPreset}</p>{/if}
     {/snippet}
 </PresetListPopup>
 
