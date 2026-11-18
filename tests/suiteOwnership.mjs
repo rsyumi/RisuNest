@@ -219,7 +219,6 @@ export const nodeAppTests = [
   'src/ts/storage/nativeCharacterCardExportRoute.test.ts',
   'src/ts/storage/nativeCharacterCharxExportRoute.test.ts',
   'src/ts/storage/nativeCharacterFileRoute.test.ts',
-  'src/ts/storage/nativeCharacterImportOperation.test.ts',
   'src/ts/storage/nativeCharxModuleActivation.test.ts',
   'src/ts/storage/nativeContentFile.test.ts',
   'src/ts/storage/nativeDeviceSettings.test.ts',

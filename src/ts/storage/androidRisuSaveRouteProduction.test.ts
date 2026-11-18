@@ -61,8 +61,10 @@ import {
     importAndroidOpenedPreparedContent,
     restoreAndroidOpenedBackupSource,
     registerAndroidRisuSaveRoute,
+    createAndroidSpoolBatchRouter,
     type AndroidOpenedSpoolDispatchDependencies,
 } from './androidRisuSaveRouteProduction.svelte'
+import type { ImportIntakeDelivery } from '../importIntake/types'
 import type { PreparedNativeContent, PreparedNativeContentReceipt } from './nativeFileJobs'
 import type { AndroidSafJavascriptBridge } from './androidSafBridge'
 import { createPortableExportIntentStore, rememberPortableExport, resumePendingPortableExport, portableAndroidPublicationDependencies } from './deviceBackup/job'
@@ -254,6 +256,52 @@ describe('Android opened spool production route', () => {
         })
         expect(dependencies.reportCharacterError).not.toHaveBeenCalled()
         expect(dependencies.reportDestinationRequired).not.toHaveBeenCalled()
+    })
+
+    it('hands each spool batch after first setup to the import intake as one delivery, in arrival order', async () => {
+        const dispatch = vi.fn(async () => {})
+        const deliveries: ImportIntakeDelivery[] = []
+        let releaseFirst!: () => void
+        let checks = 0
+        let firstSetupDone = false
+        const route = createAndroidSpoolBatchRouter({
+            firstSetupDone: () => ++checks === 2
+                ? new Promise<boolean>(resolve => { releaseFirst = () => resolve(firstSetupDone) })
+                : Promise.resolve(firstSetupDone),
+            loadIntake: async () => async (delivery) => { deliveries.push(delivery) },
+            dispatch,
+        })
+        const save = { token: 'save-token', displayName: 'backup.risunest', bytes: 30 }
+        const card = { token: 'card-token', displayName: 'card.json', bytes: 10 }
+        const book = { token: 'book-token', displayName: 'book.lorebook', bytes: 10 }
+        const picked = { token: 'picked-token', displayName: 'picked.charx', bytes: 20, importDestination: 'module' as const }
+        const broken = { displayName: 'broken.png', code: 'source-copy-failed' }
+
+        // Spools that arrive before first setup keep their own handling.
+        const early = { requestId: 'early', ready: [save], failures: [] }
+        await route(early)
+        expect(dispatch).toHaveBeenCalledExactlyOnceWith(early)
+        expect(deliveries).toEqual([])
+
+        firstSetupDone = true
+        dispatch.mockClear()
+        const first = route({ requestId: 'first', ready: [save, card, picked], failures: [broken] })
+        const second = route({ requestId: 'second', ready: [card, book], failures: [] })
+        await vi.waitFor(() => expect(releaseFirst).toBeDefined())
+        releaseFirst()
+        await Promise.all([first, second])
+        await route({ requestId: 'empty', ready: [book], failures: [] })
+
+        expect(deliveries).toEqual([
+            { origin: 'opened', sources: [
+                { type: 'androidSpool', spool: save },
+                { type: 'androidSpool', spool: card },
+                { type: 'androidSpoolFailure', failure: broken },
+            ] },
+            { origin: 'opened', sources: [{ type: 'androidSpool', spool: book }] },
+        ])
+        // A content picker result that outlived its page keeps the destination chosen in the picker.
+        expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'first', ready: [picked], failures: [] })
     })
 
     it('restores shared backups first and imports the other files together in one batch', async () => {

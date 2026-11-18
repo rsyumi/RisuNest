@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
     exportNativeCharacterCardFromPicker: vi.fn(),
     nextId: 0,
     destinationChosen: true,
+    submitDelivery: vi.fn(async (_delivery: unknown) => {}),
 }))
 
 vi.mock('uuid', () => ({ v4: () => `card-id-${++mocks.nextId}` }))
@@ -155,6 +156,7 @@ vi.mock('./mobileBackgroundTask', async () => (await import('./mobileBackgroundT
 vi.mock('./media', () => ({
     getImageType: vi.fn(() => 'Unknown'),
 }))
+vi.mock('./importIntake/intake', () => ({ submitImportDelivery: mocks.submitDelivery }))
 
 import {
     characterURLImport,
@@ -299,6 +301,9 @@ describe('character card additions', () => {
 
         expect(imported).toBe('native-character-id')
         expect(mocks.importDesktopNativeCharacterPath).toHaveBeenCalledOnce()
+        expect(get(nativeFileOperationOutcome)).toMatchObject({
+            state: 'succeeded', location: { kind: 'character', chaId: 'native-character-id' },
+        })
     })
 
     it('processes every selected desktop path through the native character route', async () => {
@@ -366,39 +371,33 @@ describe('character card additions', () => {
             format: 'content',
             state: 'failed',
             error: failure,
-            batch: expect.objectContaining({ total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [] }),
+            batch: expect.objectContaining({
+                total: 3, imported: 2, failures: [{ name: 'broken.charx', error: failure }], declined: [],
+                entries: [
+                    { name: 'first.charx', state: 'imported', location: { kind: 'character', chaId: 'first-card' } },
+                    { name: 'broken.charx', state: 'failed', error: failure },
+                    { name: 'last.charx', state: 'imported', location: { kind: 'character', chaId: 'last-card' } },
+                ],
+            }),
         })])
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 
-    it('imports several files a desktop file association opened in one batched outcome', async () => {
+    it('hands the files of one desktop file association opening to the import intake together', async () => {
         const { consumeOpenedFiles } = await import('./openedFiles')
         await characterURLImport()
-        mocks.importDesktopNativeCharacterPath
-            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'opened-card' })
-            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'single-card' })
-        mocks.importModuleContent.mockResolvedValue({ kind: 'imported', value: 'opened-module' })
-        dismissNativeFileOperationOutcome()
-        const outcomes: NativeFileOperationOutcome[] = []
-        const unsubscribe = nativeFileOperationOutcome.subscribe(outcome => {
-            if (outcome) outcomes.push(outcome)
-        })
-        try {
-            await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\book.risum'])
-            await consumeOpenedFiles(['C:\\opened\\single.charx'])
-        } finally {
-            unsubscribe()
-        }
 
-        expect(mocks.importModuleContent).toHaveBeenCalledExactlyOnceWith(
-            { source: { type: 'desktopPath', path: 'C:\\opened\\book.risum' }, displayName: 'book.risum' },
-            { signal: expect.any(AbortSignal), onStatus: expect.any(Function) },
-        )
-        expect(outcomes).toEqual([
-            expect.objectContaining({ state: 'succeeded', batch: expect.objectContaining({ total: 2, imported: 2, failures: [], declined: [] }) }),
-            expect.objectContaining({ state: 'succeeded', source: { name: 'single.charx' } }),
+        await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\preset.risup'])
+        await consumeOpenedFiles(['C:\\opened\\backup.risunest'])
+
+        expect(mocks.submitDelivery.mock.calls.map(([delivery]) => delivery)).toEqual([
+            { origin: 'opened', sources: [
+                { type: 'path', path: 'C:\\opened\\card.charx' },
+                { type: 'path', path: 'C:\\opened\\preset.risup' },
+            ] },
+            { origin: 'opened', sources: [{ type: 'path', path: 'C:\\opened\\backup.risunest' }] },
         ])
-        expect(outcomes[1]).not.toHaveProperty('batch')
+        expect(mocks.importDesktopNativeCharacterPath).not.toHaveBeenCalled()
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 

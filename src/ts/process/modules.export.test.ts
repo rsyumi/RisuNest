@@ -192,18 +192,31 @@ describe('legacy module export', () => {
 
     const moduleJson = (name: string) => new TextEncoder().encode(JSON.stringify({ type: 'risuModule', id: name, name }))
 
-    it('imports every module picked on desktop in one dialog', async () => {
+    it('imports every module picked on desktop in one dialog and says where each went', async () => {
         mocks.platform = 'desktop'
         mocks.open.mockResolvedValue(['C:/synthetic/first.json', 'C:/synthetic/second.lorebook'])
-        mocks.readFile.mockImplementation(async (path: string) => moduleJson(path.includes('first') ? 'First' : 'Second'))
+        mocks.readFile.mockImplementation(async (path: string) => path.includes('first')
+            ? moduleJson('First')
+            : new TextEncoder().encode(JSON.stringify({ type: 'risu', name: 'Second', data: [] })))
 
         await expect(importModule()).resolves.toBe('module')
 
         expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ multiple: true }))
         expect(DBState.db.modules.map(module => module.name)).toEqual(['First', 'Second'])
         expect(get(nativeFileOperationOutcome)).toMatchObject({
-            kind: 'import', state: 'succeeded', batch: { total: 2, imported: 2, failures: [], declined: [] },
+            kind: 'import', state: 'succeeded', batch: {
+                total: 2, imported: 2, failures: [], declined: [],
+                entries: [
+                    { name: 'first.json', state: 'imported', location: { kind: 'module' } },
+                    { name: 'second.lorebook', state: 'imported', location: { kind: 'module-from-lorebook' } },
+                ],
+            },
         })
+
+        dismissNativeFileOperationOutcome()
+        mocks.open.mockResolvedValue(['C:/synthetic/first.json'])
+        await expect(importModule()).resolves.toBe('module')
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ state: 'succeeded', location: { kind: 'module' } })
     })
 
     it('imports every module picked on the web', async () => {
