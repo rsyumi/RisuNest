@@ -61,7 +61,7 @@ export interface PresetWorkingSetController {
     movePreset(fromIndex: number, toIndex: number, expectedNames?: PresetListExpectation): Promise<void>
     renamePreset(id: number, name: string, expectedNames?: PresetListExpectation): Promise<void>
     updateActivePresetImage(image: string): Promise<void>
-    clearPluginProvider(owner: string): Promise<void>
+    clearPluginProvider(names: readonly string[]): Promise<void>
 }
 
 function clonePreset(preset: botPreset): botPreset {
@@ -246,12 +246,12 @@ export function createPresetWorkingSetController(
                 state.presets[state.root.botPresetsId].image = image
             })
         },
-        clearPluginProvider(owner) {
+        clearPluginProvider(names) {
             return dependencies.mutatePersistentPresets('clear-plugin-provider', (state) => {
                 saveActive(state)
-                if (state.root.currentPluginProvider === owner) state.root.currentPluginProvider = ''
+                if (names.includes(state.root.currentPluginProvider)) state.root.currentPluginProvider = ''
                 for (const preset of state.presets) {
-                    if (preset?.currentPluginProvider === owner) preset.currentPluginProvider = ''
+                    if (preset?.currentPluginProvider && names.includes(preset.currentPluginProvider)) preset.currentPluginProvider = ''
                 }
             })
         },

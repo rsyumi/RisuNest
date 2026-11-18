@@ -82,6 +82,7 @@ import { generationEndEvents } from '../generationEndHost';
 import { conversationPatchAccess } from '../conversationPatchHost';
 import { hostToolBridge, registerOwnedPluginMCP } from '../hostToolHost';
 import { additionalMessageButtons, normalizeMessageButtonRoles, type MessageButtonDef, type MessageButtonTarget } from '../messageButtons.svelte';
+import { recordPluginProvider } from '../pluginProviderOwners';
 
 /*
     V3 API for RisuAI Plugins
@@ -860,6 +861,7 @@ const makeRisuaiAPIV3 = (
             }
             pluginV2.providers.set(name, provider)
             pluginV2.providerOptions.set(name, options ?? {})
+            recordPluginProvider(name, plugin.name)
             customProviderStore.update((names) => names.includes(name) ? names : [...names, name])
 
             const modelData:LLMModel = {

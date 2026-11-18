@@ -1,10 +1,15 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
-const mocks = vi.hoisted(() => ({ confirm: vi.fn(), deleteData: vi.fn(), error: vi.fn(), reload: vi.fn() }))
+const mocks = vi.hoisted(() => ({ confirm: vi.fn(), deleteData: vi.fn(), error: vi.fn(), reload: vi.fn(), mutatePresets: vi.fn() }))
 vi.mock('src/ts/alert', () => ({ alertCheckboxConfirm: mocks.confirm, alertError: mocks.error, alertConfirm: vi.fn(), alertMd: vi.fn(), alertSelect: vi.fn(), alertToast: vi.fn() }))
 vi.mock('src/ts/plugins/pluginDataInventory', () => ({ deletePluginDataForOwner: mocks.deleteData }))
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ checkPluginUpdate: vi.fn(), createBlankPlugin: vi.fn(), importPlugin: vi.fn(), loadPlugins: mocks.reload, updatePlugin: vi.fn() }))
+// Removal clears the plugin's provider from the stored presets first.
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', async (importOriginal) => ({
+    ...await importOriginal<typeof import('src/ts/storage/persistentDataRuntime.svelte')>(),
+    mutatePersistentPresets: mocks.mutatePresets,
+}))
 vi.mock('src/ts/plugins/apiV3/developMode', () => ({ hotReloadPluginFiles: vi.fn() }))
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ resetAllPluginPermissions: vi.fn() }))
 vi.mock('src/ts/stores.svelte', async () => ({

@@ -1587,7 +1587,7 @@ describe('preset list operations', () => {
         expect(ids).toContain('first-preset')
 
         // A removed plugin provider leaves every stored body, also those behind catalog stubs.
-        await controller.clearPluginProvider('removed-plugin')
+        await controller.clearPluginProvider(['removed-plugin'])
         const providers = await Promise.all(ids.map(async (id) => (await store.readPreset(id))!.value.currentPluginProvider))
         expect(providers).toEqual(['', ''])
         expect(getDatabase().currentPluginProvider).toBe('')

@@ -2401,8 +2401,8 @@ export function updateActivePresetImage(image: string): Promise<void> {
 }
 
 /** Stops every stored preset, loaded or not, from naming a removed plugin provider. */
-export function clearPresetPluginProvider(owner: string): Promise<void> {
-    return presetWorkingSetController.clearPluginProvider(owner)
+export function clearPresetPluginProvider(names: readonly string[]): Promise<void> {
+    return presetWorkingSetController.clearPluginProvider(names)
 }
 
 export function setPreset(db:Database, newPres: botPreset){
