@@ -1803,6 +1803,7 @@ export const languageKorean = {
         presetList: {
         },
         promptList: {
+            count: '프롬프트 {0}개',
         },
         toggleEditor: {
         },

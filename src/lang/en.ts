@@ -1981,6 +1981,7 @@ export const languageEnglish = {
         presetList: {
         },
         promptList: {
+            count: '{0} prompts',
         },
         toggleEditor: {
         },
