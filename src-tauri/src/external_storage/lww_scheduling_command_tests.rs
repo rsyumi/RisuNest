@@ -33,6 +33,52 @@ fn removed_connection_invalidates_inflight_cache_and_cancellation() {
 }
 
 #[test]
+fn a_resume_inside_a_batch_applies_its_stored_pages_without_reading_their_segments_again() {
+    tauri::async_runtime::block_on(async {
+        use crate::external_storage::{lww_engine::Admission, lww_tests::CycleFixture};
+        use crate::persistent_store::{lww::{ApplyReceive, UnitMutation}, WorkingSetCommit};
+        let mut f = CycleFixture::new();
+        for index in 0..6 {
+            f.a.commit(&WorkingSetCommit {
+                expected_revision: f.a.revision().unwrap(),
+                unit_mutations: Some(vec![UnitMutation::Set {
+                    key: risunest_sync_wire::unit::UnitKey::new(&["root", "language"]).unwrap(),
+                    value: serde_json::json!(format!("synthetic-{index}")),
+                }]),
+                ..Default::default()
+            }).unwrap();
+            f.publish_a().await;
+        }
+        let segments = f.sender.listing(&Cancellation::default()).await.unwrap()
+            .into_iter().map(|receipt| receipt.locator.object).collect::<Vec<_>>();
+        assert_eq!(segments.len(), 6);
+        let now = f.now_ms();
+        let provider = f.provider.clone();
+        let mut session = Session::new();
+        session.engine = Some(f.receiver);
+        let checkpoints = Default::default();
+        let mut applied = 0;
+        loop {
+            let (page, _) = receive_page(&mut f.b, &mut session, &checkpoints, 0.into(), false).await.unwrap();
+            let Some(page) = page else { break };
+            f.b.lww_stage_receive(&page).unwrap();
+            f.b.lww_apply_receive(&ApplyReceive { header: page.header.clone(), generating: vec![] }).unwrap();
+            f.b.lww_finish_receive(&page.header).unwrap();
+            applied += 1;
+            if applied == 1 {
+                // The return to the screen comes while the first batch has pages left; the clock is read again.
+                session.resume(Cancellation::default());
+                session.engine.as_mut().unwrap().admission = Some(Admission::synthetic(now));
+            }
+        }
+        assert_eq!(applied, 6);
+        assert_eq!(f.b.read_root(None).unwrap().value["language"], "synthetic-5");
+        assert_eq!(segments.iter().map(|id| provider.read_attempts(id)).collect::<Vec<_>>(), [1; 6],
+            "a segment whose pages were stored is read again");
+    });
+}
+
+#[test]
 fn invalid_routine_admission_refreshes_once_and_preserves_clock_failure_details() {
     for (phase, corrected, reason) in [("entry", false, None), ("entry", true, None),
         ("entry", false, Some("server-offset")), ("entry", false, Some("date-missing")),

@@ -66,6 +66,16 @@ impl Session {
         self.cancel = cancel.clone();
     }
 
+    /// Starts again after the app returns or the binding resumes: new work takes `cancel` and the clock is read
+    /// again. The pages the last listing stored stay queued, so their segments are not read again.
+    fn resume(&mut self, cancel: Cancellation) {
+        self.cancel = cancel;
+        self.fresh_after = Instant::now();
+        if let Some(engine) = self.engine.as_mut() {
+            engine.invalidate_clock()
+        }
+    }
+
     fn finish_maintenance<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.is_err() { self.reset(); }
         result
@@ -803,13 +813,7 @@ pub(crate) async fn external_lww_resume(connection_id: String) -> Result<()> {
         let mut session = context.session.lock().await;
         let cancel = Cancellation::default();
         *context.cancel.lock().map_err(runtime::local_error)? = cancel.clone();
-        session.cancel = cancel;
-        session.fresh_after = Instant::now();
-        session.receive_pages.clear();
-        session.receive_more = false;
-        if let Some(engine) = session.engine.as_mut() {
-            engine.invalidate_clock()
-        }
+        session.resume(cancel);
         Ok(())
     }.await)
 }

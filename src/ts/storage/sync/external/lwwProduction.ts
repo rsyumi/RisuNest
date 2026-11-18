@@ -3,6 +3,7 @@ import { notifySyncReceiveCompleted } from '../bindingChanges'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isTauri } from '../../../platform'
+import { generationDiagnostics, type SyncRunDiagnostic } from '../../../generationDiagnostics'
 import { beginDeferredMobileBackgroundTask, runWithMobileBackgroundTask, type MobileBackgroundTask } from '../../../mobileBackgroundTask'
 import { generatingConversations } from '../../generatingConversationRegistry'
 import { flushPendingDataLocally, getPersistentDataRuntime } from '../../persistentDataRuntime.svelte'
@@ -58,6 +59,17 @@ const foregroundAvailable = () => document.visibilityState !== 'hidden' && netwo
 // but leaves the bound target stopped until the user starts it.
 let resumeBoundTarget = true
 let refreshGeneration = 0
+
+/**
+ * Holds sync work outside the scheduler, such as waiting to start or resume it. If the app leaves the screen during
+ * the work, the page keeps running, so the scheduler starts on it and takes over the hold. Work that begins off
+ * screen, as when the app is left during launch, asks for the service at once; the page stays hidden, so only that
+ * work continues.
+ */
+function holdThroughDeparture<T>(work: () => Promise<T>): Promise<T> {
+    const hold = beginDeferredMobileBackgroundTask('sync')
+    return work().finally(() => { void Promise.resolve(hold).then(task => task.dispose()) })
+}
 
 const receivedBodyReferences = (request: LwwStageReceive) => request.changes.some(change => {
     const [kind] = JSON.parse(change.key) as string[]
@@ -165,21 +177,28 @@ function createAdapter(connectionId: string): Adapter {
     const receivePages = async (binding: BindingContext, turnLimit?: number, completeAvailable = false): Promise<LwwTurn> => {
         const progress = beginExternalProgress(connectionId, 'sync')
         let received = 0
+        const ran = (more: boolean, outcome: SyncRunDiagnostic['outcome']) =>
+            generationDiagnostics.syncRun({ operation: 'receive', count: received, more, outcome })
         try {
             for (;;) {
                 binding.signal.throwIfAborted()
                 const request = await progress.invoke<LwwStageReceive | null>('external_lww_receive', { request: { ...header(connectionId, binding), ...(completeAvailable ? { completeAvailable } : {}) } }, binding.state.targetAuthority)
                 binding.signal.throwIfAborted()
-                if (!request) { progress.finish('complete', received > 0); notifySyncReceiveCompleted(); return { count: received, more: false } }
+                if (!request) { progress.finish('complete', received > 0); ran(false, 'complete'); notifySyncReceiveCompleted(); return { count: received, more: false } }
                 binding.signal.throwIfAborted()
                 progress.stage('applying')
                 await getPersistentDataRuntime().applyLwwReceive(request)
                 received++
                 binding.signal.throwIfAborted()
                 if (receivedBodyReferences(request)) hydrationPending = true
-                if (turnLimit !== undefined && received >= turnLimit) { progress.finish('complete', true); return { count: received, more: true } }
+                if (turnLimit !== undefined && received >= turnLimit) { progress.finish('complete', true); ran(true, 'complete'); return { count: received, more: true } }
             }
-        } catch (error) { progress.finish(externalProgressFailure(error)); throw error }
+        } catch (error) {
+            const outcome = externalProgressFailure(error)
+            progress.finish(outcome)
+            ran(false, outcome)
+            throw error
+        }
     }
     // The plugin startup receive runs beside the scheduler, and native code hands every receive the first unfinished page.
     let receiving: Promise<unknown> = Promise.resolve()
@@ -212,7 +231,13 @@ function createAdapter(connectionId: string): Adapter {
                 })
             }
             if (owned) progress.finish('complete', meaningful)
-        } catch (error) { if (owned) progress.finish(externalProgressFailure(error)); throw error }
+        } catch (error) {
+            const outcome = externalProgressFailure(error)
+            if (owned) progress.finish(outcome)
+            generationDiagnostics.syncRun({ operation: 'publish', count: Number(result.segments), more: result.more, outcome })
+            throw error
+        }
+        generationDiagnostics.syncRun({ operation: 'publish', count: Number(result.segments), more: result.more, outcome: 'complete' })
         return { count: Number(result.segments), more: result.more }
     }
     const publish = (binding?: BindingContext, flush = true, call?: LwwCall): Promise<LwwTurn> => binding
@@ -260,7 +285,7 @@ function createAdapter(connectionId: string): Adapter {
             if ((cause as { name?: unknown } | null)?.name !== 'AbortError') reportFailure(connectionId, cause)
         },
         publishInitialSharedState: async binding => { await publish(binding, false) },
-        async resumeBinding(binding) {
+        resumeBinding: binding => holdThroughDeparture(async () => {
             const generation = ++adapter.generation
             scheduler.stop()
             await Promise.all([scheduler.settled(), stopHydration()])
@@ -279,7 +304,7 @@ function createAdapter(connectionId: string): Adapter {
             adapter.state = binding.state
             scheduler.recovered()
             if (foregroundAvailable()) { scheduler.start(); resumeHydration() }
-        },
+        }),
         async fenceOldJobs(binding) {
             adapter.generation++
             scheduler.stop()
@@ -306,7 +331,8 @@ function createAdapter(connectionId: string): Adapter {
         async receiveAvailableChanges(binding) {
             if (!active || active.signal.aborted || active.state.targetAuthority !== binding.state.targetAuthority || active.state.selectionEpoch !== binding.state.selectionEpoch) throw new Error('Sync is stopped')
             const joined = joinAbortSignals([binding.signal, active.signal])
-            try { await receive({ ...binding, signal: joined.signal }, undefined, true) } finally { joined.dispose() }
+            // This receive runs beside the scheduler, which may not have started, so it holds its own time.
+            try { await holdThroughDeparture(() => receive({ ...binding, signal: joined.signal }, undefined, true)) } finally { joined.dispose() }
         },
     }
     const unregister = registerSyncBindingTransport({ kind: 'external', connectionId }, transport)
@@ -352,17 +378,21 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
         const renewed = new Set([...previous].filter(([id, recovery]) => recoveries.get(id) !== recovery).map(([id]) => id))
         if (renewed.size && adapter.recover(renewed)) recovered.add(adapter)
     }
-    const binding = await native.state()
-    if (generation !== refreshGeneration) return
-    for (const [id, adapter] of adapters) if (binding.target.kind !== 'external' || binding.target.connectionId !== id) {
-        adapter.generation++; adapter.scheduler.stop(); void adapter.stopHydration(); adapter.state = undefined
-    } else if (adapter.state?.targetAuthority === binding.targetAuthority && recovered.has(adapter)) {
-        adapter.resumeHydration(true)
+    const resume = async () => {
+        const binding = await native.state()
+        if (generation !== refreshGeneration) return
+        for (const [id, adapter] of adapters) if (binding.target.kind !== 'external' || binding.target.connectionId !== id) {
+            adapter.generation++; adapter.scheduler.stop(); void adapter.stopHydration(); adapter.state = undefined
+        } else if (adapter.state?.targetAuthority === binding.targetAuthority && recovered.has(adapter)) {
+            adapter.resumeHydration(true)
+        }
+        if (binding.target.kind === 'external' && resumeBoundTarget) {
+            const adapter = adapters.get(binding.target.connectionId)
+            if (adapter && adapter.state?.targetAuthority !== binding.targetAuthority) await resumeCurrentSyncBinding(binding.target)
+        }
     }
-    if (binding.target.kind === 'external' && resumeBoundTarget) {
-        const adapter = adapters.get(binding.target.connectionId)
-        if (adapter && adapter.state?.targetAuthority !== binding.targetAuthority) await resumeCurrentSyncBinding(binding.target)
-    }
+    // A start resumes the bound target from here, so the hold begins before the binding is read.
+    await (sync.size && resumeBoundTarget ? holdThroughDeparture(resume) : resume())
 }
 
 export async function installExternalLwwAdapters(state: ExternalStorageState, resumeBound = true): Promise<() => void> {
@@ -402,7 +432,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                 adapter.scheduler.pauseAutomatic()
                 const generation = adapter.generation
                 const authority = adapter.state.targetAuthority
-                adapter.foreground = (async () => {
+                adapter.foreground = holdThroughDeparture(async () => {
                     await adapter.scheduler.settled()
                     if (adapters.get(adapter.state?.target.kind === 'external' ? adapter.state.target.connectionId : '') !== adapter
                         || generation !== adapter.generation || document.visibilityState === 'hidden' || !navigator.onLine) return
@@ -410,7 +440,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                     if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
                     await invoke('external_lww_resume', { connectionId: current.target.connectionId })
                     if (generation === adapter.generation && foregroundAvailable()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
-                })().catch(() => {}).finally(() => {
+                }).catch(() => {}).finally(() => {
                     adapter.foreground = undefined
                     if (generation !== adapter.generation && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
                 })
@@ -497,7 +527,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
             } catch (error) { return { kind: 'blocked', reason: (error as { kind?: string })?.kind ?? 'sync-unavailable' } }
         },
         async cancel() { adapter.generation++; adapter.scheduler.stop(); const hydration = adapter.stopHydration(); await invoke('external_lww_fence', { connectionId, newDevice: false }); await Promise.all([adapter.scheduler.settled(), hydration]) },
-        async resumeAfterExitCancel() {
+        resumeAfterExitCancel: () => holdThroughDeparture(async () => {
             const generation = ++adapter.generation
             await adapter.scheduler.settled()
             if (adapters.get(connectionId) !== adapter || !adapter.state) return
@@ -507,6 +537,6 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
                 || binding.targetAuthority !== authority || binding.selectionEpoch !== selectionEpoch) return
             await invoke('external_lww_resume', { connectionId })
             if (generation === adapter.generation && adapters.get(connectionId) === adapter && foregroundAvailable()) { adapter.scheduler.start(); adapter.resumeHydration() }
-        },
+        }),
     }
 }

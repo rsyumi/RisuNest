@@ -30,7 +30,28 @@ codes!(SkipReason { Ineligible, Compatibility, MissingCapture, CompleteGate, Sto
 codes!(ResultKind { Buffered, Streaming, Multiline, Failed });
 codes!(SavePath { Windowed, Complete, Fallback, Unknown });
 codes!(Boundary { Checkpoint, Final });
-codes!(Lifecycle { Active, Background, Start, Stop, Freeze, Resume, Exit, Expiry, MemoryWarning, TrimMemory });
+codes!(Lifecycle { Active, Background, Start, Stop, Freeze, Resume, Exit, Expiry, MemoryWarning, TrimMemory, Online, Offline });
+codes!(SyncRunTarget { External });
+codes!(SyncOperation { Receive, Publish });
+codes!(SyncRunOutcome { Complete, Failed, Cancelled });
+#[cfg(any(target_os = "android", test))]
+codes!(BackgroundStage { Promote, Demote, Held, Idle, Expire });
+#[cfg(any(target_os = "android", test))]
+codes!(BackgroundTask { Backup, Restore, Sync, Import, Export, Maintenance, Generation });
+#[cfg(any(target_os = "android", test))]
+codes!(BackgroundOutcome { Active, Background, Failed, None, Timeout, Destroyed });
+
+/// What the Android background work registry did with the page's holds.
+#[cfg(any(target_os = "android", test))]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackgroundWork {
+    stage: BackgroundStage,
+    holds: u32,
+    kinds: Vec<BackgroundTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<BackgroundOutcome>,
+}
 codes!(FailureReason { ConversationChanged, TriggerStop, MemoryFailed, TokenLimit, Fenced, Error, StreamError });
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -54,6 +75,10 @@ pub(crate) enum Event {
         expected_revision: Option<i64>, acknowledged_revision: Option<i64>,
     },
     Lifecycle { document_sequence: u64, event_sequence: u64, event: Lifecycle, trim_level: Option<i32> },
+    SyncRun {
+        document_sequence: u64, event_sequence: u64, target: SyncRunTarget, operation: SyncOperation,
+        count: u32, more: bool, outcome: SyncRunOutcome,
+    },
     ListenerPayload {
         document_sequence: u64, event_sequence: u64, generation_sequence: u64,
         listeners: u32, full_history_listeners: u32,
@@ -105,6 +130,8 @@ struct Diagnostics {
     document: AtomicU64,
     recovery: AtomicBool,
     reload_pending: AtomicBool,
+    /// The app is off screen, as the page or the Android background work registry last reported.
+    off_screen: AtomicBool,
     slots: Mutex<Slots>,
 }
 #[cfg(not(test))]
@@ -194,13 +221,14 @@ impl Diagnostics {
                 *document_sequence
             }
             Event::Phase { document_sequence, .. } | Event::Persistence { document_sequence, .. }
-            | Event::Lifecycle { document_sequence, .. } | Event::ListenerPayload { document_sequence, .. } => *document_sequence,
+            | Event::Lifecycle { document_sequence, .. } | Event::ListenerPayload { document_sequence, .. }
+            | Event::SyncRun { document_sequence, .. } => *document_sequence,
         };
         if current == 0 || document != current { return Err("stale-diagnostic-document"); }
         let event_sequence = match &event {
             Event::Admission { event_sequence, .. } | Event::Phase { event_sequence, .. }
             | Event::Persistence { event_sequence, .. } | Event::Lifecycle { event_sequence, .. }
-            | Event::ListenerPayload { event_sequence, .. } => *event_sequence,
+            | Event::ListenerPayload { event_sequence, .. } | Event::SyncRun { event_sequence, .. } => *event_sequence,
             Event::DocumentStart {} => unreachable!(),
         };
         if event_sequence == 0 { return Err("invalid-diagnostic-number"); }
@@ -286,7 +314,16 @@ impl Diagnostics {
                 };
                 emit(sink, "error", context);
             }
-            Event::Lifecycle { .. } => emit(sink, "info", event),
+            Event::Lifecycle { event: lifecycle, .. } => {
+                match lifecycle {
+                    Lifecycle::Stop | Lifecycle::Background => self.off_screen.store(true, Ordering::SeqCst),
+                    Lifecycle::Start | Lifecycle::Active => self.off_screen.store(false, Ordering::SeqCst),
+                    _ => {}
+                }
+                emit(sink, "info", event)
+            }
+            // On screen the page syncs often and the user sees it, so only runs off screen are kept.
+            Event::SyncRun { .. } if self.off_screen.load(Ordering::SeqCst) => emit(sink, "info", event),
             _ => {}
         }
         Ok(current)
@@ -326,6 +363,25 @@ impl Diagnostics {
             "documentSequence":self.document.load(Ordering::SeqCst),
             "stage":if foreground { "foreground" } else { "start" },
             "outcome":if background { "background-refused" } else { "failed" }}));
+    }
+    #[cfg(any(target_os = "android", test))]
+    fn background_work(&self, record: &str, sink: &impl DiagnosticSink) {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Entry {
+            kind: &'static str,
+            document_sequence: u64,
+            #[serde(flatten)]
+            work: BackgroundWork,
+        }
+        let Ok(work) = serde_json::from_str::<BackgroundWork>(record) else { return };
+        // The registry hears the app leave and return before the page does, which may not listen yet at startup.
+        match work.stage {
+            BackgroundStage::Promote => self.off_screen.store(true, Ordering::SeqCst),
+            BackgroundStage::Demote => self.off_screen.store(false, Ordering::SeqCst),
+            _ => {}
+        }
+        emit(sink, "info", Entry { kind: "background-work", document_sequence: self.document.load(Ordering::SeqCst), work });
     }
     fn renderer_exit(&self, reason: RendererExit, sink: &impl DiagnosticSink) {
         self.recovery.store(true, Ordering::SeqCst);
@@ -382,6 +438,8 @@ pub(crate) fn renderer_exit(reason: RendererExit) { with_context(|state, sink| s
 pub(crate) fn reload_result(outcome: &'static str) { with_context(|state, sink| state.reload_result(outcome, sink)); }
 #[cfg(target_os = "android")]
 fn service_refused(foreground: bool, background: bool) { with_context(|state, sink| state.service_refused(foreground, background, sink)); }
+#[cfg(target_os = "android")]
+fn background_work(record: &str) { with_context(|state, sink| state.background_work(record, sink)); }
 
 #[tauri::command]
 pub(crate) fn native_generation_diagnostic(window: tauri::WebviewWindow, event: Event) -> Result<u64, &'static str> {
@@ -411,6 +469,17 @@ pub extern "system" fn Java_io_github_rsyumi_risunest_BackgroundServiceLog_recor
     _env: jni::JNIEnv, _class: jni::objects::JClass, foreground: jni::sys::jboolean, background: jni::sys::jboolean,
 ) {
     let _ = std::panic::catch_unwind(|| service_refused(foreground != 0, background != 0));
+}
+
+/// The background work registry promoted or demoted the page's holds, or they began, ended or expired off screen.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_rsyumi_risunest_BackgroundServiceLog_recordWork(
+    mut env: jni::JNIEnv, _class: jni::objects::JClass, record: jni::objects::JString,
+) {
+    let Ok(text) = env.get_string(&record) else { return };
+    let text: String = text.into();
+    let _ = std::panic::catch_unwind(|| background_work(&text));
 }
 
 #[cfg(test)]
@@ -635,7 +704,7 @@ mod tests {
         let state = Diagnostics::default();
         let sink = crate::native_log::NativeLogState::for_tests();
         state.document_started(&sink);
-        for event in ["stop", "exit", "active", "start", "freeze", "resume"] {
+        for event in ["stop", "exit", "active", "start", "freeze", "resume", "offline", "online"] {
             state.record(serde_json::from_value(serde_json::json!({"kind":"lifecycle", "documentSequence":1,
                 "eventSequence":1, "event":event})).unwrap(), &sink).unwrap();
             assert_eq!(tail(&sink)["event"], event);
@@ -649,6 +718,19 @@ mod tests {
         state.service_refused(true, false, &sink);
         assert_eq!(tail(&sink)["stage"], "foreground");
         assert_eq!(tail(&sink)["outcome"], "failed");
+        state.background_work(r#"{"stage":"promote","holds":2,"kinds":["sync","backup"],"outcome":"active"}"#, &sink);
+        assert_eq!(tail(&sink), serde_json::json!({"kind":"background-work", "documentSequence":1,
+            "stage":"promote", "holds":2, "kinds":["sync", "backup"], "outcome":"active"}));
+        state.background_work(r#"{"stage":"idle","holds":0,"kinds":[]}"#, &sink);
+        assert_eq!(tail(&sink), serde_json::json!({"kind":"background-work", "documentSequence":1,
+            "stage":"idle", "holds":0, "kinds":[]}));
+        let written = sink.tail(None).len();
+        for record in [r#"{"stage":"expire","holds":1,"kinds":["private"],"outcome":"timeout"}"#,
+            r#"{"stage":"expire","holds":1,"kinds":["sync"],"outcome":"timeout","text":"private"}"#,
+            r#"{"stage":"private","holds":1,"kinds":["sync"]}"#, "private"] {
+            state.background_work(record, &sink);
+        }
+        assert_eq!(sink.tail(None).len(), written);
         state.record(serde_json::from_value(serde_json::json!({"kind":"phase", "documentSequence":1,
             "eventSequence":2, "generationSequence":1, "phase":"completion-processing", "edge":"enter"})).unwrap(), &sink).unwrap();
         state.renderer_exit(RendererExit::Linux { reason:"crashed" }, &sink);
@@ -660,9 +742,39 @@ mod tests {
             serde_json::json!({"kind":"document-start", "text":"private"}),
             serde_json::json!({"kind":"phase", "documentSequence":1, "eventSequence":1,"generationSequence":1,"phase":"private", "edge":"enter"}),
             serde_json::json!({"kind":"lifecycle", "documentSequence":1, "eventSequence":1,"event":"background", "message":"private"}),
+            serde_json::json!({"kind":"sync-run", "documentSequence":1, "eventSequence":1, "target":"private",
+                "operation":"receive", "count":1, "more":false, "outcome":"complete"}),
+            serde_json::json!({"kind":"sync-run", "documentSequence":1, "eventSequence":1, "target":"external",
+                "operation":"receive", "count":1, "more":false, "outcome":"failed", "message":"private"}),
             serde_json::json!({"kind":"phase", "documentSequence":1, "eventSequence":1,"generationSequence":1,"phase":"prompt-preparation",
                 "edge":"exit", "outcome":"failed", "reason":"private"}),
         ] { assert!(serde_json::from_value::<Event>(value).is_err()); }
+    }
+    #[test]
+    fn sync_runs_are_kept_only_while_the_app_is_off_screen() {
+        let state = Diagnostics::default();
+        let sink = crate::native_log::NativeLogState::for_tests();
+        state.document_started(&sink);
+        let run = serde_json::json!({"kind":"sync-run", "documentSequence":1, "eventSequence":1,
+            "target":"external", "operation":"receive", "count":3, "more":true, "outcome":"complete"});
+        let mut kept = vec![];
+        // The Android registry reports a departure the page may not have heard; iOS reports through the page.
+        for step in ["run", "promote", "run", "demote", "run", "stop", "run", "start", "run", "background", "run", "active", "run"] {
+            match step {
+                "run" => {
+                    let before = sink.tail(None).len();
+                    state.record(serde_json::from_value(run.clone()).unwrap(), &sink).unwrap();
+                    kept.push(sink.tail(None).len() > before);
+                    if kept[kept.len() - 1] { assert_eq!(tail(&sink), run); }
+                }
+                "promote" | "demote" => state.background_work(&format!(r#"{{"stage":"{step}","holds":0,"kinds":[]}}"#), &sink),
+                event => {
+                    state.record(serde_json::from_value(serde_json::json!({"kind":"lifecycle", "documentSequence":1,
+                        "eventSequence":1, "event":event})).unwrap(), &sink).unwrap();
+                }
+            }
+        }
+        assert_eq!(kept, [false, true, false, true, false, true, false]);
     }
     #[test]
     fn listener_payload_reaches_a_renderer_exit_inside_the_listener_phase_only() {

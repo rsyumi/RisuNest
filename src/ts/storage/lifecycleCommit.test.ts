@@ -479,6 +479,8 @@ describe('registerLifecycleCommitListeners', () => {
             window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
             window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'trim-memory', trimLevel: 20 } }))
             window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'stop', trimLevel: 20 } }))
+            window.dispatchEvent(new Event('offline'))
+            window.dispatchEvent(new Event('online'))
 
             await vi.waitFor(() => expect(flush.mock.calls).toEqual([['trim-memory'], ['stop']]))
             expect(diagnosticEvents.slice(1)).toEqual([
@@ -487,6 +489,8 @@ describe('registerLifecycleCommitListeners', () => {
                 { kind: 'lifecycle', documentSequence: 7, eventSequence: 3, event: 'start' },
                 { kind: 'lifecycle', documentSequence: 7, eventSequence: 4, event: 'trim-memory', trimLevel: 20 },
                 { kind: 'lifecycle', documentSequence: 7, eventSequence: 5, event: 'stop' },
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 6, event: 'offline' },
+                { kind: 'lifecycle', documentSequence: 7, eventSequence: 7, event: 'online' },
             ])
         } finally {
             dispose()
