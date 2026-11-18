@@ -28,7 +28,6 @@ export function mobileBackgroundTaskModule() {
         retainMobileBackgroundActivity: vi.fn(() => () => {}),
         measuredTaskPercent: vi.fn(measuredTaskPercent),
         mobileDeferredHoldsSettled: vi.fn(async () => {}),
-        expireMobileDeferredHolds: vi.fn(),
         beginMobileBackgroundTask: vi.fn(begin),
         beginDeferredMobileBackgroundTask: vi.fn(begin),
         // A spy loses the type parameter, so it is typed as the generic function it stands for.

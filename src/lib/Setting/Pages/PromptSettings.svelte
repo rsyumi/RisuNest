@@ -1,16 +1,19 @@
 <script lang="ts">
-    import { ArrowLeft, PlusIcon, TrashIcon } from "@lucide/svelte";
+    import { ArrowLeft, ChevronsDownUpIcon, ChevronsUpDownIcon, PlusIcon, TrashIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import PromptDataItem from "src/lib/UI/PromptDataItem.svelte";
-    import { tokenizePreset, type PromptItem } from "src/ts/process/prompt";
+    import { tokenizePreset, type PromptItem, type PromptType } from "src/ts/process/prompt";
+    import { newPromptBlock, promptBlockTypeName, promptBlockTypes } from "src/ts/process/promptBlockTypes";
     import { templateCheck } from "src/ts/process/templates/templateCheck";
     
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
+    import Button from "src/lib/UI/GUI/Button.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
+    import ToggleDefinitionEditor from "src/lib/UI/ToggleDefinitionEditor.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
     import Accordion from "src/lib/UI/Accordion.svelte";
@@ -19,6 +22,7 @@
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
     import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
+    import { backNavigationLayer } from "src/ts/ui/modalNavigation";
 
     let warns: string[] = $state([])
     let tokens = $state(0)
@@ -36,8 +40,8 @@
   let { onGoBack = () => {}, mode = 'independent', subMenu = $bindable(0) }: Props = $props();
 
     async function executeTokenize(prest: PromptItem[]){
-        tokens = await tokenizePreset(prest, true)
-        extokens = await tokenizePreset(prest, false)
+        tokens = await tokenizePreset(prest, true, DBState.db)
+        extokens = await tokenizePreset(prest, false, DBState.db)
     }
 
     $effect.pre(() => {
@@ -76,13 +80,48 @@
     if (retained.length !== openedItems.size) openedItems = new Set(retained)
   })
 
+  let allOpened = $derived(
+    DBState.db.promptTemplate.length > 0 && DBState.db.promptTemplate.every(item => openedItems.has(item))
+  )
+
+  function toggleAllOpened() {
+    openedItems = allOpened ? new Set<PromptItem>() : new Set(DBState.db.promptTemplate)
+  }
+
+  let addMenuOpen = $state(false)
+  let addMenuUp = $state(true)
+  let addMenuRoot: HTMLDivElement | undefined = $state()
+
+  function toggleAddMenu(event: MouseEvent & { currentTarget: HTMLButtonElement }) {
+    if (!addMenuOpen) {
+      // Open toward the side with more room so the whole menu can be scrolled into view.
+      const rect = event.currentTarget.getBoundingClientRect()
+      addMenuUp = rect.top > window.innerHeight - rect.bottom
+    }
+    addMenuOpen = !addMenuOpen
+  }
+
+  function addPrompt(type: PromptType) {
+    addMenuOpen = false
+    let value = DBState.db.promptTemplate ?? []
+    value.push(newPromptBlock(type))
+    DBState.db.promptTemplate = value
+  }
+
+  $effect(() => {
+    if (!addMenuOpen) return
+    const dismiss = (event: PointerEvent) => {
+      if (!(event.target instanceof Node) || !addMenuRoot?.contains(event.target)) addMenuOpen = false
+    }
+    document.addEventListener('pointerdown', dismiss)
+    return () => {
+      document.removeEventListener('pointerdown', dismiss)
+    }
+  })
+
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.ctrlKey && e.altKey && e.key === 'o') {
-      if (openedItems.size === DBState.db.promptTemplate.length) {
-        openedItems = new Set<PromptItem>()
-      } else {
-        openedItems = new Set(DBState.db.promptTemplate)
-      }
+      toggleAllOpened()
     }
   }
 
@@ -126,7 +165,19 @@
 {/if}
 
 {#if subMenu === 0}
-    <div class="contain w-full max-w-full mt-4 flex flex-col p-3 rounded-md" use:htmlTouchDrag>
+    {#if DBState.db.promptTemplate.length > 0}
+        <div class="flex items-center gap-2 px-3 mt-4">
+            <span class="grow text-sm text-textcolor2">{language.risuNest.promptList.count.replace('{0}', String(DBState.db.promptTemplate.length))}</span>
+            <Button styled="outlined" size="sm" className="inline-flex items-center gap-1.5" onclick={toggleAllOpened}>
+                {#if allOpened}
+                    <ChevronsDownUpIcon size={14} />{language.collapseAll}
+                {:else}
+                    <ChevronsUpDownIcon size={14} />{language.expandAll}
+                {/if}
+            </Button>
+        </div>
+    {/if}
+    <div class="contain w-full max-w-full mt-2 flex flex-col px-3 rounded-md" use:htmlTouchDrag>
         {#if DBState.db.promptTemplate.length === 0}
                 <div class="text-textcolor2">No Format</div>
         {/if}
@@ -142,8 +193,13 @@
                     displayIndex={displayIndex}
                     onDrop={handlePromptDrop}
                     onRemove={() => {
+                        // The confirmation is asynchronous, so find the block again instead of trusting its old index.
                         let templates = DBState.db.promptTemplate
-                        templates.splice(originalIndex, 1)
+                        const index = templates.indexOf(prompt)
+                        if(index === -1){
+                            return
+                        }
+                        templates.splice(index, 1)
                         DBState.db.promptTemplate = templates
 
                         draggedIndex = -1
@@ -172,16 +228,16 @@
             {/each}
     </div>
 
-    <button class="font-medium cursor-pointer hover:text-green-500" onclick={() => {
-        let value = DBState.db.promptTemplate ?? []
-        value.push({
-            type: "plain",
-            text: "",
-            role: "system",
-            type2: 'normal'
-        })
-        DBState.db.promptTemplate = value
-    }}><PlusIcon /></button>
+    <div class="relative mt-2 mx-3 self-start" bind:this={addMenuRoot}>
+        {#if addMenuOpen}
+            <div class="absolute left-0 z-20 w-60 rounded-md border border-darkborderc bg-darkbg shadow-lg p-1 flex flex-col max-h-72 overflow-y-auto {addMenuUp ? 'bottom-full mb-1' : 'top-full mt-1'}" role="menu" aria-label={language.add} use:backNavigationLayer={{ close: () => { addMenuOpen = false } }}>
+                {#each promptBlockTypes(!!DBState.db.promptSettings?.customChainOfThought) as type (type)}
+                    <button role="menuitem" class="px-3 py-2 text-left text-sm rounded-sm hover:bg-selected" onclick={() => addPrompt(type)}>{promptBlockTypeName(type)}</button>
+                {/each}
+            </div>
+        {/if}
+        <button class="bg-darkbutton hover:bg-selected focus:ring-selected border-darkborderc border text-textcolor rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 px-4 py-2 text-sm inline-flex items-center gap-1.5" aria-haspopup="menu" aria-expanded={addMenuOpen} onclick={toggleAddMenu}><PlusIcon size={16} />{language.add}</button>
+    </div>
 
     <span class="text-textcolor2 text-sm mt-2">{tokens} {language.fixedTokens}</span>
     <span class="text-textcolor2 mb-6 text-sm mt-2">{extokens} {language.exactTokens}</span>
@@ -211,8 +267,9 @@
         <OptionInput value="system">System</OptionInput>
         <OptionInput value="assistant">assistant</OptionInput>
     </SelectInput>
-    <span class="text-textcolor mt-4">{language.customPromptTemplateToggle} <Help key='customPromptTemplateToggle' /></span>
-    <TextAreaInput bind:value={DBState.db.customPromptTemplateToggle}/>
+    <ToggleDefinitionEditor className="mt-4" value={DBState.db.customPromptTemplateToggle} onChange={(text) => {
+        DBState.db.customPromptTemplateToggle = text
+    }} />
     <span class="text-textcolor mt-4">{language.defaultVariables} <Help key='defaultVariables' /></span>
     <TextAreaInput bind:value={DBState.db.templateDefaultVariables}/>
     <span class="text-textcolor mt-4">{language.predictedOutput}</span>

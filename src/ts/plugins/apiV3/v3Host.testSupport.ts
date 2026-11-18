@@ -71,10 +71,11 @@ export function pluginsModule(overrides: Overrides<PluginsModule> = {}) {
     return { ...module, ...overrides }
 }
 
-export function databaseModule(host: V3HostDatabase) {
-    return {
+export function databaseModule(host: V3HostDatabase, overrides: Overrides<typeof import('src/ts/storage/database.svelte')> = {}) {
+    const module = {
         getDatabase: () => host.read(),
     } satisfies Partial<typeof import('src/ts/storage/database.svelte')>
+    return { ...module, ...overrides }
 }
 
 export function storesModule(host: V3HostDatabase) {

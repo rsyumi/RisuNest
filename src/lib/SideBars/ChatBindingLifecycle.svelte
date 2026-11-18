@@ -1,7 +1,9 @@
 <script lang="ts">
     import { untrack } from 'svelte'
     import { DBState, selectedCharID } from 'src/ts/stores.svelte'
-    import { flushEffectiveToggleEdits, deriveEffectiveToggleVariables } from 'src/ts/storage/database.svelte'
+    import { applyConversationPresetBinding, flushEffectiveToggleEdits, deriveEffectiveToggleVariables } from 'src/ts/storage/database.svelte'
+    import { isLoadedPreset } from 'src/ts/storage/effectiveIdentityState'
+    import { doingChat } from 'src/ts/process/generationState'
     import { isConversationSummaryStub } from 'src/ts/storage/conversationResidency'
     import { activeRerollConversations, recoverInterruptedReroll } from 'src/ts/durableReroll'
     import { getHistoryWindowMemoryMode, openSelectedHistoryWindow, type SelectedHistoryWindow } from 'src/ts/process/index.svelte'
@@ -63,6 +65,18 @@
             flushEffectiveToggleEdits(db)
             deriveEffectiveToggleVariables(db, chat && !isConversationSummaryStub(chat) ? chat : undefined)
         })
+    })
+    // A running request keeps the preset of the conversation it generates for, so the selected
+    // conversation's binding applies once it ends.
+    $effect(() => {
+        const db = DBState.db
+        const character = db?.characters?.[$selectedCharID]
+        const chat = character?.chats?.[character.chatPage]
+        const id = chat?.promptPresetId
+        // Follows the bound preset being added, removed or replaced by its stored body.
+        if (id) void isLoadedPreset(db.botPresets?.find((preset) => preset?.id === id))
+        if (!db || $doingChat) return
+        untrack(() => applyConversationPresetBinding(db, chat)).catch((error) => console.error(error))
     })
     // Runs when another conversation is selected or finishes loading, not on every preset edit.
     $effect(() => {

@@ -4,7 +4,8 @@
     import SegmentedControl from "src/lib/UI/GUI/SegmentedControl.svelte";
     import SliderInput from "src/lib/UI/GUI/SliderInput.svelte";
     import ModelList from "src/lib/UI/ModelList.svelte";
-    import { DBState, easyPanelStore } from "src/ts/stores.svelte";
+    import { easyPanelStore } from "src/ts/stores.svelte";
+    import { isPresetEditorOpen, presetEditorDBState as DBState } from "src/ts/storage/presetEditor.svelte";
     import Help from "../Help.svelte";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
@@ -29,6 +30,12 @@
     const onClose = () => {
         easyPanelStore.open = false
     }
+
+    // The panel edits the preset it opened with, so it closes when preset settings open or close under it.
+    const opensFromPresetEditor = isPresetEditorOpen()
+    $effect.pre(() => {
+        if (isPresetEditorOpen() !== opensFromPresetEditor) onClose()
+    })
 
 </script>
 

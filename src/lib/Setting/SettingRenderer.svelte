@@ -1,7 +1,7 @@
 <script lang="ts">
     import type { SettingItem, SettingContext } from 'src/ts/setting/types';
     import type { LLMModel } from 'src/ts/model/types';
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { getModelInfo } from 'src/ts/model/modellist';
     import { settingRegistry } from 'src/ts/setting/settingRegistry';
     import { checkCondition } from 'src/ts/setting/utils';
@@ -17,8 +17,8 @@
     let { items, modelInfo, subModelInfo }: Props = $props();
 
     // Derive modelInfo if not provided
-    let effectiveModelInfo = $derived(modelInfo ?? getModelInfo(DBState.db.aiModel));
-    let effectiveSubModelInfo = $derived(subModelInfo ?? getModelInfo(DBState.db.subModel));
+    let effectiveModelInfo = $derived(modelInfo ?? getModelInfo(DBState.db.aiModel, DBState.db));
+    let effectiveSubModelInfo = $derived(subModelInfo ?? getModelInfo(DBState.db.subModel, DBState.db));
 
     // Build context for condition checks
     let ctx: SettingContext = $derived({

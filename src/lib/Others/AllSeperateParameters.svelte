@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { DBState } from "src/ts/stores.svelte";
+    import { presetEditorDBState as DBState } from "src/ts/storage/presetEditor.svelte";
     import Help from "./Help.svelte";
     import { language } from "src/lang";
     import SliderInput from "../UI/GUI/SliderInput.svelte";

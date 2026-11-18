@@ -1,3 +1,5 @@
+import { get } from 'svelte/store'
+import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
 import { failureReason } from '../gui/nativeFileJobDialogModel'
 import { fileOperationErrorWasPresented } from './fileOperationErrorPresentation'
 import { Mutex } from '../mutex'
@@ -36,8 +38,70 @@ import {
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 import { createPortableExportIntentStore } from './deviceBackup/job'
+import { handOverOpenedFiles, settleOpenedFilesAfter } from '../openedFiles'
+import type { ImportIntakeDelivery, ImportIntakeSource } from '../importIntake/types'
 
 let disposeSpoolListener: (() => void) | undefined
+
+/** Whether first setup is finished and the onboarding is gone. A restore during onboarding sets `didFirstSetup` while the onboarding stays. */
+export async function androidFirstSetupFinished(): Promise<boolean> {
+    return (await import('./database.svelte')).getDatabase().didFirstSetup && !get(onboardingHold)
+}
+
+export interface AndroidSpoolBatchRouting {
+    /** Spools that arrive before first setup keep their own handling. */
+    firstSetupDone(): Promise<boolean>
+    loadIntake(): Promise<(delivery: ImportIntakeDelivery) => Promise<void>>
+    /** The handling before first setup. */
+    dispatch(batch: AndroidSpoolBatch): Promise<void>
+}
+
+/**
+ * Hands each opened or shared spool batch to the import intake as one delivery, in arrival order,
+ * together with the opened files of the same intent that Android copied instead of spooling.
+ * A content picker result that outlived its page keeps the destination chosen in the picker.
+ */
+export function createAndroidSpoolBatchRouter(
+    routing: AndroidSpoolBatchRouting,
+): (batch: AndroidSpoolBatch) => Promise<void> {
+    const submittedTokens = new Set<string>()
+    let order = Promise.resolve()
+    return ({ openedPaths = [], ...batch }) => {
+        const routed = order.then(async () => {
+            if (!await routing.firstSetupDone()) {
+                // These files keep the handling they had as their own opened-files event.
+                if (openedPaths.length) handOverOpenedFiles(openedPaths)
+                void routing.dispatch(batch)
+                return
+            }
+            let delivery: Promise<void> | undefined
+            try {
+                const submit = await routing.loadIntake()
+                const fresh = batch.ready.filter((source) => !submittedTokens.has(source.token))
+                for (const source of fresh) submittedTokens.add(source.token)
+                const picked = fresh.filter((source) => source.importDestination)
+                // A content picker result arrives as a batch of its own, so its failures stay with it.
+                const pickerFailures = batch.ready.some((source) => source.importDestination) ? batch.failures : []
+                if (picked.length) void routing.dispatch({ ...batch, ready: picked, failures: pickerFailures })
+                const sources: ImportIntakeSource[] = [
+                    ...fresh
+                        .filter((source) => !source.importDestination)
+                        .map((spool) => ({ type: 'androidSpool' as const, spool })),
+                    ...openedPaths.map((path) => ({ type: 'path' as const, path })),
+                    ...batch.failures
+                        .filter((failure) => !pickerFailures.includes(failure))
+                        .map((failure) => ({ type: 'androidSpoolFailure' as const, failure })),
+                ]
+                if (sources.length) delivery = submit({ origin: 'opened', sources })
+            } finally {
+                // Settled as the opened-files handling settles them, once this delivery has ended.
+                if (openedPaths.length) void settleOpenedFilesAfter(openedPaths, async () => await delivery)
+            }
+        })
+        order = routed.catch(() => {})
+        return routed
+    }
+}
 
 export interface AndroidOpenedSpoolDispatchDependencies {
     enqueueRestore(batch: AndroidSpoolBatch): Promise<void>
@@ -268,11 +332,12 @@ export function showDestinationRequired(source: AndroidSpoolReady, startedAt: nu
 export async function restoreAndroidOpenedBackupSource({
     source,
     displayName,
+    bytes,
 }: AndroidRisuSaveRestoreInput): Promise<void> {
     const { restoreBackupFromNativeSource } =
         await import('./portableBackupFileRouteProduction.svelte')
     const result = await restoreBackupFromNativeSource(async ({ onSource }) => {
-        onSource({ name: displayName })
+        onSource({ name: displayName, bytes })
         return source
     })
     if (!result) return
@@ -335,7 +400,12 @@ export function registerAndroidRisuSaveRoute(): void {
         reportCharacterError: showAndroidFileError,
         reportDestinationRequired: showDestinationRequired,
     })
+    const routeSpoolBatch = createAndroidSpoolBatchRouter({
+        firstSetupDone: androidFirstSetupFinished,
+        loadIntake: async () => (await import('../importIntake/intake')).submitImportDelivery,
+        dispatch: dispatcher.enqueue,
+    })
     disposeSpoolListener = listenAndroidSpoolBatches((batch) => {
-        void dispatcher.enqueue(batch)
+        void routeSpoolBatch(batch).catch((error) => showAndroidFileError(error))
     })
 }

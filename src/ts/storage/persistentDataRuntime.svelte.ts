@@ -22,8 +22,8 @@ import type {
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
 import type { Chat, Database, botPreset, character, loreBook } from './database.svelte'
-import { fillRootFieldDefaults, getDatabase, setDatabase, setEffectivePresetOverride } from './database.svelte'
-import { getEffectivePresetOverride } from './effectiveIdentityState'
+import { carryPresetBinding, fillRootFieldDefaults, getDatabase, setDatabase, setEffectivePresetOverride } from './database.svelte'
+import { getEffectivePresetBinding, getEffectivePresetOverride, isLoadedPreset } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
 import { collectCharacterConversationAssetKeys, scheduleDeletedOwnerAssetCleanup, type AssetAliasCleanupTarget } from './deletedOwnerAssetCleanup'
@@ -98,10 +98,7 @@ export { createPersistentDataRuntime } from './persistentDataRuntime'
 
 type CompleteCharacter = character
 
-// Catalog entries carry only their summary and the local fields normalization adds.
-const catalogPresetKeys = new Set(['id', 'name', 'image', 'localNetworkMode', 'localNetworkTimeoutSec'])
-export const isLoadedPreset = (value: botPreset | undefined): boolean =>
-    !!value && Object.keys(value).some((key) => !catalogPresetKeys.has(key))
+export { isLoadedPreset }
 
 /// A whole replacement starts a new identity state, so a preset chain override
 /// is applied again when its preset is still in the library.
@@ -226,6 +223,7 @@ export function createProductionStateAdapter(options: {
         replaceDatabase(database, activeCharacterIds, forceScalableProjection) {
             const liveDatabase = getDatabase()
             const presetOverride = getEffectivePresetOverride(liveDatabase)
+            const presetBinding = getEffectivePresetBinding(liveDatabase)
             const selectedCharacter = liveDatabase.characters[get(selectedCharID)]
             const selectedCharacterId = selectedCharacter?.chaId ?? null
             const selectedConversationId = selectedCharacter
@@ -250,6 +248,9 @@ export function createProductionStateAdapter(options: {
                 (index) => selectedCharID.set(index),
             )
             if (presetOverride) carryPresetOverride(presetOverride, options.readPreset)
+            // A request reads the mirrors per streamed chunk, so its binding cannot wait for the chat lifecycle.
+            if (presetBinding) void carryPresetBinding(presetBinding, options.readPreset)
+                .catch((error) => productionConfiguration.onBackgroundError?.(error))
         },
         publishPresetWorkingSet({ revision, root, presets }) {
             const database = getDatabase()

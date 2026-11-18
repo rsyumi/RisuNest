@@ -2,32 +2,33 @@
     import { untrack } from 'svelte'
     import { getModuleToggles } from "src/ts/process/modules";
     import { DBState, selectedCharID } from "src/ts/stores.svelte";
-    import { parseToggleSyntax, type sidebarToggle, type sidebarToggleGroup } from "src/ts/util";
+    import { parseToggleSyntax } from "src/ts/util";
     import { language } from "src/lang";
     import type { PromptItem } from "src/ts/process/prompt";
-    import { getCurrentCharacter, getCurrentChat, type character } from "src/ts/storage/database.svelte";
-    import Accordion from '../UI/Accordion.svelte'
+    import { getCurrentCharacter, getCurrentChat, type character, type Database } from "src/ts/storage/database.svelte";
     import SwitchInput from "../UI/GUI/SwitchInput.svelte";
-    import SelectInput from "../UI/GUI/SelectInput.svelte";
-    import OptionInput from "../UI/GUI/OptionInput.svelte";
-    import TextAreaInput from '../UI/GUI/TextAreaInput.svelte'
-    import TextInput from "../UI/GUI/TextInput.svelte";
+    import ToggleItems from './ToggleItems.svelte'
     import ModelBind from './ModelBind.svelte'
     import PersonaBind from './PersonaBind.svelte'
+    import PresetBind from './PresetBind.svelte'
     import ToggleBind from './ToggleBind.svelte'
     import CustomSideBar from "./CustomSidebar.svelte";
     import { getGlobalChatVar, isLocallyHandledGlobalChatVar } from "src/ts/parser/chatVar.svelte";
     import { applyGlobalToggleValues, applyLocalToggleValues, removeLocalToggleValue, setCharacterMemory, setLocalToggleMode, setToggleValue } from 'src/ts/sidebarToggles'
     import { applyToggleValues, snapshotToggleValues, toggleValueChanged, type ToggleValues } from 'src/ts/toggleBindings'
+    import { groupSidebarToggles } from 'src/ts/toggleDefinitions'
     import { PinIcon } from "@lucide/svelte";
     import { doingChat } from 'src/ts/process/generationState'
 
     interface Props {
         chara?: character
         noContainer?: boolean
+        /** The preset whose toggles show; the applied preset unless the settings window's preview passes the one it edits. */
+        presetDatabase?: Database
     }
 
-    let { chara = $bindable(), noContainer }: Props = $props();
+    let { chara = $bindable(), noContainer, presetDatabase }: Props = $props();
+    let presetFields = $derived(presetDatabase ?? DBState.db)
 
     const jailbreakToggleToken = '{{jbtoggled}}'
     const usesJailbreakToggle = (value?: string) =>
@@ -53,9 +54,9 @@
         })
 
     let hasJailbreakPrompt = $derived.by(() => {
-        const template = DBState.db.promptTemplate
+        const template = presetFields.promptTemplate
         if (!template) {
-            return (DBState.db.jailbreak ?? '').trim().length > 0
+            return (presetFields.jailbreak ?? '').trim().length > 0
         }
         return templateUsesJailbreakToggle(template)
     })
@@ -74,29 +75,11 @@
         }
     })
 
-    let groupedToggles = $derived.by(() => {
-        const ungrouped = parseToggleSyntax(
-            DBState.db.customPromptTemplateToggle + '\n' +
-            getModuleToggles() + '\n' +
-            charToggle
-        )
-
-        let groupOpen = false
-        // group toggles together between group ... groupEnd
-        return ungrouped.reduce<sidebarToggle[]>((acc, toggle) => {
-            if (toggle.type === 'group') {
-                groupOpen = true
-                acc.push(toggle)
-            } else if (toggle.type === 'groupEnd') {
-                groupOpen = false
-            } else if (groupOpen) {
-                (acc.at(-1) as sidebarToggleGroup).children.push(toggle)
-            } else {
-                acc.push(toggle)
-            }
-            return acc
-        }, [])
-    })
+    let groupedToggles = $derived(groupSidebarToggles(parseToggleSyntax(
+        presetFields.customPromptTemplateToggle + '\n' +
+        getModuleToggles() + '\n' +
+        charToggle
+    )))
 
     // Values that differ from the chat's toggle binding are tinted so the user can see what the
     // save button would write. Nothing is tinted while binding is temporarily disabled.
@@ -176,7 +159,6 @@
         savedToggles !== undefined &&
         (toggleEditor.unpinKeys.includes(`toggle_${key}`)
             || toggleValueChanged(toggleEditor.values[`toggle_${key}`], savedToggles[`toggle_${key}`]))
-    const dirtyClass = (key: string | undefined) => (isToggleDirty(key) ? 'bg-draculared/15' : '')
 
     // Switch rows sit in the same list as the select/text rows below, which set their own spacing.
     const switchRow = 'mt-2 px-1'
@@ -197,112 +179,26 @@
     ))
 </script>
 
-{#snippet localToggle(toggle: sidebarToggle)}
-    {#if isLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)}
-        <button
-            disabled={$doingChat || savingToggles}
-            onclick={() => {
-                void removeLocalToggleValue(`toggle_${toggle.key}`)
-            }}
-        >
-            📌
-        </button>
-    {/if}
-{/snippet}
-
-{#snippet getToggleDisplayName(toggle: sidebarToggle)}
-    {toggle.value}{@render localToggle(toggle)}
-{/snippet}
-
-{#snippet toggles(items: sidebarToggle[], reverse: boolean = false)}
-    {#each items as toggle, index}
-        {#if index > 0 && toggle.type !== 'divider' && items[index - 1]?.type !== 'divider' && toggle.type !== 'caption' && items[index - 1]?.type !== 'caption' && !(toggle.type === 'group' && items[index - 1]?.type === 'group')}
-            <div class="w-full my-2 border-t border-darkborderc/20"></div>
-        {/if}
-        {#if toggle.type === 'group' && toggle.children.length > 0}
-            <div class="w-full mt-1">
-                <Accordion styled name={toggle.value}>
-                    {@render toggles((toggle as sidebarToggleGroup).children, reverse)}
-                </Accordion>
-            </div>
-        {:else if toggle.type === 'select'}
-            <div inert={localEditBlocked(`toggle_${toggle.key}`)} class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1 transition-colors {dirtyClass(toggle.key)}">
-                <span class="min-w-0 break-words">{@render getToggleDisplayName(toggle)}</span>
-                <SelectInput
-                    className="w-32 shrink-0"
-                    value={getGlobalChatVarNH(`toggle_${toggle.key}`)}
-                    onchange={(e) => {
-                        editToggle(`toggle_${toggle.key}`, e.currentTarget.value)
-                    }}
-                >
-                    {#each toggle.options as option, i}
-                        <OptionInput value={i.toString()}>{option}</OptionInput>
-                    {/each}
-                </SelectInput>
-            </div>
-        {:else if toggle.type === 'text'}
-            <div class="w-full flex gap-2 mt-2 items-center justify-between min-h-10 rounded-md px-1 transition-colors {dirtyClass(toggle.key)}">
-                <span class="min-w-0 break-words">{@render getToggleDisplayName(toggle)}</span>
-                <TextInput
-                    className="w-32 shrink-0"
-                    disabled={localEditBlocked(`toggle_${toggle.key}`)}
-                    value={getGlobalChatVarNH(`toggle_${toggle.key}`)}
-                    onchange={(e) => {
-                        editToggle(`toggle_${toggle.key}`, e.currentTarget.value)
-                    }}
-                />
-            </div>
-        {:else if toggle.type === 'textarea'}
-            <div inert={localEditBlocked(`toggle_${toggle.key}`)} class="w-full flex gap-2 mt-2 items-start justify-between min-h-10 rounded-md px-1 transition-colors {dirtyClass(toggle.key)}">
-                <span class="min-w-0 break-words mt-1.5">{@render getToggleDisplayName(toggle)}</span>
-                <TextAreaInput
-                    className="w-32 shrink-0"
-                    height="20"
-                    value={getGlobalChatVarNH(`toggle_${toggle.key}`)}
-                    onchange={(e) => {
-                        //check is div
-                        if (e.currentTarget instanceof HTMLDivElement) {
-                            editToggle(`toggle_${toggle.key}`, e.currentTarget.innerText)
-                        } else {
-                            editToggle(`toggle_${toggle.key}`, e.currentTarget.value)
-                        }
-                    }}
-                />
-            </div>
-        {:else if toggle.type === 'caption'}
-            <div class="w-full mt-1 text-xs text-textcolor2">
-                {toggle.value}
-            </div>
-        {:else if toggle.type === 'divider'}
-            <!-- Prevent multiple dividers appearing in a row -->
-            {#if index === 0 || items[index - 1]?.type !== 'divider' || items[index - 1]?.value !== toggle.value}
-                <div class="w-full min-h-5 flex gap-2 mt-2 items-center" class:justify-end={!reverse}>
-                    {#if toggle.value}
-                        <span class="shrink-0">{@render getToggleDisplayName(toggle)}</span>
-                    {/if}
-                    <hr class="border-t border-darkborderc m-0 grow" />
-                </div>
-            {/if}
-        {:else}
-            <SwitchInput
-                className={switchRow}
-                disabled={localEditBlocked(`toggle_${toggle.key}`)}
-                check={getGlobalChatVarNH(`toggle_${toggle.key}`) === '1'}
-                name={toggle.value}
-                highlight={isToggleDirty(toggle.key)}
-                onChange={(checked) => {
-                    editToggle(`toggle_${toggle.key}`, checked ? '1' : '0')
-                }}
-            >
-                {@render localToggle(toggle)}
-            </SwitchInput>
-        {/if}
-    {/each}
+{#snippet sidebarToggles(reverse: boolean)}
+    <ToggleItems
+        items={groupedToggles}
+        {reverse}
+        value={getGlobalChatVarNH}
+        onEdit={editToggle}
+        blocked={localEditBlocked}
+        dirty={isToggleDirty}
+        pinned={isLocallyHandledGlobalChatVar}
+        pinDisabled={$doingChat || savingToggles}
+        onUnpin={(name) => {
+            void removeLocalToggleValue(name)
+        }}
+    />
 {/snippet}
 
 <div class="flex flex-col gap-4 w-full mt-3">
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
     {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
+    <PresetBind />
     {#if DBState.db.customSidebarItems?.length}<CustomSideBar />{/if}
     <ToggleBind values={toggleEditor.values} unpinKeys={toggleEditor.unpinKeys} onApplyPreset={applyTogglePreset} bind:saving={savingToggles} />
 </div>
@@ -312,7 +208,7 @@
             <SwitchInput className={switchRow} bind:check={DBState.db.jailbreakToggle} name={language.jailbreakToggle} />
         {/if}
 
-        {@render toggles(groupedToggles, true)}
+        {@render sidebarToggles(true)}
         {#if chara && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3)}
             <SwitchInput
                 className={switchRow}
@@ -332,7 +228,7 @@
     {#if hasJailbreakPrompt}
         <SwitchInput className={switchRow} bind:check={DBState.db.jailbreakToggle} name={language.jailbreakToggle} />
     {/if}
-    {@render toggles(groupedToggles)}
+    {@render sidebarToggles(false)}
     {#if chara && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3)}
         <SwitchInput
             className={switchRow}

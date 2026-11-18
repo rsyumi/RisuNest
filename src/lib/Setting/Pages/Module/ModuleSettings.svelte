@@ -1,7 +1,7 @@
 <script lang="ts">
     import { language } from "src/lang";
     
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import Button from "src/lib/UI/GUI/Button.svelte";
     import ModuleMenu from "src/lib/Setting/Pages/Module/ModuleMenu.svelte";
     import { exportModule, exportModuleLegacy, importModule, type RisuModule } from "src/ts/process/modules";

@@ -1,4 +1,4 @@
-import { NativeFileJobError } from './nativeFileJobs'
+import { NativeFileJobError, type NativeFileJobOptions } from './nativeFileJobs'
 import { language } from 'src/lang'
 import { join } from "@tauri-apps/api/path";
 import { nativeDataPath } from "./nativePaths";
@@ -6,56 +6,82 @@ import { mkdir, open, readDir, remove, stat } from "@tauri-apps/plugin-fs";
 import { runContentImport } from "./contentImportOperation";
 import { syntheticNativeFileJobStatus } from "./nativeFileJobs";
 
+/** The private inbox for dropped files. Stale copies an interrupted process left behind are removed first. */
+export async function openContentInbox(): Promise<string> {
+  const directory = await nativeDataPath("content-import-inbox");
+  await mkdir(directory, { recursive: true });
+  await cleanupContentInbox(directory);
+  return directory;
+}
+
+/** Spools a dropped file into the inbox in bounded chunks and returns the copy's path; a failed copy is removed. */
+export async function copyFileToContentInbox(
+  directory: string,
+  file: File,
+  options: Pick<NativeFileJobOptions, "signal" | "onStatus"> = {},
+): Promise<string> {
+  const suffix = file.name.split(".").at(-1)?.toLowerCase() ?? "bin";
+  const path = await join(
+    directory,
+    `${crypto.randomUUID()}.${/^[a-z0-9]+$/.test(suffix) ? suffix : "bin"}`,
+  );
+  const handle = await open(path, { write: true, createNew: true });
+  const reader = file.stream().getReader();
+  let copied = 0;
+  let lastUpdate = 0;
+  try {
+    try {
+      while (true) {
+        options.signal?.throwIfAborted();
+        const { done, value } = await reader.read();
+        if (done) break;
+        for (let offset = 0; offset < value.length; ) {
+          const written = await handle.write(value.subarray(offset));
+          if (written === 0) throw new Error("Unable to spool import source");
+          offset += written;
+        }
+        copied += value.length;
+        if (performance.now() - lastUpdate >= 100) {
+          lastUpdate = performance.now();
+          options.onStatus?.(
+            syntheticNativeFileJobStatus(
+              { kind: "prepare-content-import" },
+              "copying-source",
+              {
+                stageUnit: "bytes",
+                stageCompleted: copied,
+                stageTotal: file.size,
+              },
+            ),
+          );
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+      await handle.close();
+    }
+  } catch (error) {
+    await remove(path).catch((cleanup) =>
+      console.warn("Import source cleanup failed", cleanup),
+    );
+    throw error;
+  }
+  return path;
+}
+
 /** HTML drops expose a File, not an OS path. Spool bounded chunks once, then let Rust extract. */
 export async function importNativeContentFile(
   file: File,
   destination: "character" | "module",
 ): Promise<string | null> {
   return runContentImport(file.name, {}, async (options) => {
-    const directory = await nativeDataPath("content-import-inbox");
-    await mkdir(directory, { recursive: true });
-    await cleanupContentInbox(directory);
-    const suffix = file.name.split(".").at(-1)?.toLowerCase() ?? "bin";
-    const path = await join(
-      directory,
-      `${crypto.randomUUID()}.${/^[a-z0-9]+$/.test(suffix) ? suffix : "bin"}`,
+    const path = await copyFileToContentInbox(
+      await openContentInbox(),
+      file,
+      options,
     );
-    const handle = await open(path, { write: true, createNew: true });
-    const reader = file.stream().getReader();
-    let copied = 0;
-    let lastUpdate = 0;
     try {
-      try {
-        while (true) {
-          options.signal?.throwIfAborted();
-          const { done, value } = await reader.read();
-          if (done) break;
-          for (let offset = 0; offset < value.length; ) {
-            const written = await handle.write(value.subarray(offset));
-            if (written === 0) throw new Error("Unable to spool import source");
-            offset += written;
-          }
-          copied += value.length;
-          if (performance.now() - lastUpdate >= 100) {
-            lastUpdate = performance.now();
-            options.onStatus?.(
-              syntheticNativeFileJobStatus(
-                { kind: "prepare-content-import" },
-                "copying-source",
-                {
-                  stageUnit: "bytes",
-                  stageCompleted: copied,
-                  stageTotal: file.size,
-                },
-              ),
-            );
-          }
-        }
-      } finally {
-        await reader.cancel().catch(() => {});
-        reader.releaseLock();
-        await handle.close();
-      }
       const input = {
         source: { type: "desktopPath" as const, path },
         displayName: file.name,
@@ -83,7 +109,7 @@ export async function importNativeContentFile(
         nativeImport: () =>
           importPreparedNativeCharacterContent(input, options),
         legacyImport: async ({ data }) => {
-          const index = await importCharacterProcess({ name: file.name, data });
+          const index = await importCharacterProcess({ name: file.name, data, quiet: true });
           return typeof index === "number"
             ? (getDatabase().characters[index]?.chaId ?? null)
             : null;

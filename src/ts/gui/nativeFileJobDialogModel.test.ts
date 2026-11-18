@@ -24,6 +24,7 @@ import {
 } from './nativeFileJobDialogModel'
 
 const copy = languageEnglish.risuNest.importDialog
+const intake = languageEnglish.risuNest.importIntake
 
 it('orders account asset download after refresh and plugins and exposes separate outcomes while cancellable', () => {
     const current = status({ kind: 'restore-official-account-snapshot', activationRevision: 8,
@@ -1008,6 +1009,49 @@ describe('nativeFileJobDialogModel', () => {
 
         const single = buildNativeFileJobDialogModel(null, outcome({ format: 'content', state: 'failed', error: io }), 0)
         expect(single.terminal).toMatchObject({ summary: copy.resultFailed, reason: copy.reasonIo, failedFiles: [] })
+
+        // A batch that records every finished file lists them all in order, with where each went or why it failed.
+        const recorded = buildNativeFileJobDialogModel(null, outcome({
+            format: 'content', state: 'failed', error: io,
+            batch: {
+                total: 4, imported: 2, failures: [{ name: 'first.png', error: io }], declined: ['locked.png'],
+                entries: [
+                    { name: 'first.png', state: 'failed', error: io },
+                    { name: 'Harbor.json', state: 'imported', location: { kind: 'character-lorebook', chaId: 'synthetic', characterName: 'Mira' } },
+                    { name: 'locked.png', state: 'declined' },
+                    { name: 'Night.charx', state: 'imported', location: { kind: 'module-from-charx' } },
+                ],
+            },
+        }), 0)
+        expect(recorded.terminal).toMatchObject({
+            summary: fillTemplate(copy.resultBatchFailed, 2, 4),
+            location: '',
+            openLocation: null,
+            entries: [
+                { name: 'first.png', state: 'failed', detail: copy.reasonIo },
+                { name: 'Harbor.json', state: 'imported', detail: fillTemplate(intake.locationCharacterLorebook, 'Mira') },
+                { name: 'locked.png', state: 'declined', detail: '' },
+                { name: 'Night.charx', state: 'imported', detail: intake.locationModuleFromCharx },
+            ],
+        })
+        expect(failed.terminal?.entries).toBeNull()
+    })
+
+    it('names where a single imported file went and opens it, and keeps the old result without a location', () => {
+        const locations = [
+            [{ kind: 'character', chaId: 'synthetic' }, intake.locationCharacter],
+            [{ kind: 'module' }, intake.locationModule],
+            [{ kind: 'module-from-charx' }, intake.locationModuleFromCharx],
+            [{ kind: 'module-from-lorebook' }, intake.locationModuleFromLorebook],
+            [{ kind: 'preset' }, intake.locationPreset],
+            [{ kind: 'character-lorebook', chaId: 'synthetic', characterName: 'Mira' }, fillTemplate(intake.locationCharacterLorebook, 'Mira')],
+        ] as const
+        for (const [location, text] of locations) {
+            const model = buildNativeFileJobDialogModel(null, outcome({ format: 'content', source: { name: 'one.png', bytes: 10 }, location }), 0)
+            expect(model.terminal).toMatchObject({ summary: copy.resultSucceeded, location: text, openLocation: location })
+        }
+        const unrecorded = buildNativeFileJobDialogModel(null, outcome({ format: 'content' }), 0)
+        expect(unrecorded.terminal).toMatchObject({ summary: copy.resultSucceeded, location: '', openLocation: null })
     })
 
     it('maps failure codes to user copy and never shows the code itself', () => {

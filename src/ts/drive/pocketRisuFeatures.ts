@@ -61,7 +61,12 @@ export function normalizePocketMessage(value: unknown, fallbackId: string): void
     // Keep upstream fields as import provenance. Our envelope is authoritative.
 }
 
-export function normalizePocketChat(value: unknown, fallbackId: string): void {
+export interface PocketNormalizeOptions {
+    /** A RisuSave RisuNest wrote keeps a chat's preset binding fields as stored. */
+    readonly risuNestSave?: boolean
+}
+
+export function normalizePocketChat(value: unknown, fallbackId: string, options: PocketNormalizeOptions = {}): void {
     if (!object(value)) return
     if (value.savedToggleValues !== undefined) {
         const values = sanitizeToggleValues(value.savedToggleValues)
@@ -69,6 +74,15 @@ export function normalizePocketChat(value: unknown, fallbackId: string): void {
         else delete value.savedToggleValues
     }
     if (value.bindedPersona !== undefined && typeof value.bindedPersona !== 'string') delete value.bindedPersona
+    if (!options.risuNestSave) {
+        if (value.promptPresetId !== undefined && typeof value.promptPresetId !== 'string') delete value.promptPresetId
+        // PocketRisu and RisuBard store a chat's preset binding as bindedBotPreset.
+        if (Object.hasOwn(value, 'bindedBotPreset')) {
+            if (value.promptPresetId === undefined && typeof value.bindedBotPreset === 'string' && value.bindedBotPreset)
+                value.promptPresetId = value.bindedBotPreset
+            delete value.bindedBotPreset
+        }
+    }
     if (Array.isArray(value.message))
         value.message.forEach((message, index) =>
             normalizePocketMessage(
@@ -78,13 +92,13 @@ export function normalizePocketChat(value: unknown, fallbackId: string): void {
         )
 }
 
-export function normalizePocketCharacter(value: unknown, fallbackId = 'character'): void {
+export function normalizePocketCharacter(value: unknown, fallbackId = 'character', options: PocketNormalizeOptions = {}): void {
     if (object(value) && Array.isArray(value.chats))
-        value.chats.forEach((chat, index) => normalizePocketChat(chat, `${fallbackId}:chat:${index}`))
+        value.chats.forEach((chat, index) => normalizePocketChat(chat, `${fallbackId}:chat:${index}`, options))
 }
 
 /** Drops root values RisuNest cannot read, such as the null PocketRisu stores for a cleared toggle default. */
-export function normalizePocketFeatures<T>(value: T): T {
+export function normalizePocketFeatures<T>(value: T, options: PocketNormalizeOptions = {}): T {
     if (!object(value)) return value
     const root: RecordValue = value
     if (root.disableToggleBinding !== undefined && typeof root.disableToggleBinding !== 'boolean')
@@ -107,7 +121,7 @@ export function normalizePocketFeatures<T>(value: T): T {
     }
     if (Array.isArray(root.characters))
         root.characters.forEach((character, index) =>
-            normalizePocketCharacter(character, `character:${index}`),
+            normalizePocketCharacter(character, `character:${index}`, options),
         )
     return value
 }

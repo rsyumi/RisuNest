@@ -88,6 +88,10 @@ export async function beginIOSBackgroundTask(
   };
 }
 
+// Tasks this page began; each one's expiry ends only its own work.
+const begunTasks = new Set<string>();
+export const isIOSTaskBegun = (id: string): boolean => begunTasks.has(id);
+
 /** Retain the caller's cancellation and pair every native assertion with release. */
 export async function beginIOSGeneration(
   signal?: AbortSignal,
@@ -133,6 +137,7 @@ export async function beginIOSGeneration(
   deps.events.addEventListener("risunest-ios-lifecycle", listener);
   try {
     id = (await deps.begin()).id;
+    if (id) begunTasks.add(id);
   } catch {
     /* Foreground generation remains available when iOS rejects extra runtime. */
   }
@@ -160,7 +165,12 @@ export async function beginIOSGeneration(
       deps.events.removeEventListener("risunest-ios-lifecycle", listener);
       signal?.removeEventListener("abort", abort);
       await pendingProgress;
-      if (id) await deps.end(id, success);
+      if (!id) return;
+      try {
+        await deps.end(id, success);
+      } finally {
+        begunTasks.delete(id);
+      }
     },
   };
 }
@@ -168,7 +178,6 @@ export async function beginIOSGeneration(
 /** Work that keeps the background-entry assertion until it settles. */
 export interface IOSBackgroundHolds {
   settled(): Promise<void>;
-  expire(): void;
 }
 
 export function installIOSPersistenceLifecycle(
@@ -233,10 +242,7 @@ export function installIOSPersistenceLifecycle(
     }
     if (detail?.event === "background") save(detail.id);
     else if (detail?.event === "expired" || detail?.event === "memory-warning") {
-      if (detail.event === "expired" && detail.id && detail.id === backgroundId) {
-        holds?.expire();
-        stopWaiting();
-      }
+      if (detail.event === "expired" && detail.id && detail.id === backgroundId) stopWaiting();
       save();
     }
   };

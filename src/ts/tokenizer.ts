@@ -1,6 +1,6 @@
 import type { Tiktoken } from "@dqbd/tiktoken";
 import type { Tokenizer } from "@mlc-ai/web-tokenizers";
-import {  type character, type Chat, getCurrentCharacter, getDatabase } from "./storage/database.svelte";
+import {  type character, type Chat, type Database, getCurrentCharacter, getDatabase } from "./storage/database.svelte";
 import type { MultiModal, OpenAIChat } from "./process/index.svelte";
 import { supportsInlayImage } from "./process/files/inlays";
 import { risuChatParser } from "./parser/parser.svelte";
@@ -85,8 +85,8 @@ export async function encodeWithTokenizer(data: string, tokenizerType: string): 
     }
 }
 
-export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Array)>{
-    const db = getDatabase();
+/** `db` picks the tokenizer; the settings window passes the preset it edits. */
+export async function encode(data:string, db:Database = getDatabase()):Promise<(number[]|Uint32Array|Int32Array)>{
     const modelInfo = getModelInfo(db.aiModel);
     const pluginTokenizer = pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer ?? "none";
 
@@ -197,7 +197,7 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
         } else if(modelInfo.tokenizer === LLMTokenizer.tiktokenO200Base){
             result = await tikJS(data, 'o200k_base');
         } else if(modelInfo.tokenizer === LLMTokenizer.GoogleCloud && db.googleClaudeTokenizing){
-            result = await tokenizeGoogleCloud(data);
+            result = await tokenizeGoogleCloud(data, db);
         } else if(modelInfo.tokenizer === LLMTokenizer.Gemma || modelInfo.tokenizer === LLMTokenizer.GoogleCloud){
             result = await gemmaTokenize(data);
         } else if(modelInfo.tokenizer === LLMTokenizer.DeepSeek){
@@ -230,8 +230,7 @@ let lastTikModel = 'cl100k_base'
 
 let googleCloudTokenizedCache = new Map<string, number>()
 
-async function tokenizeGoogleCloud(text:string) {
-    const db = getDatabase()
+async function tokenizeGoogleCloud(text:string, db:Database) {
     const model = getModelInfo(db.aiModel)
     const cacheKey = text + model.internalID
 
@@ -392,17 +391,18 @@ export async function tokenizerChar(char:character) {
     return encoded.length
 }
 
-export async function tokenize(data:string) {
-    const encoded = await encode(data)
+export async function tokenize(data:string, db?:Database) {
+    const encoded = await encode(data, db)
     return encoded.length
 }
 
-export async function tokenizeAccurate(data:string, consistantChar?:boolean) {
+export async function tokenizeAccurate(data:string, consistantChar?:boolean, db?:Database) {
     data = risuChatParser(data.replace('{{slot}}',''), {
         tokenizeAccurate: true,
         consistantChar: consistantChar,
+        db,
     })
-    const encoded = await encode(data)
+    const encoded = await encode(data, db)
     return encoded.length
 }
 
@@ -710,7 +710,7 @@ export async function strongBan(data:string, bias:{[key:number]:number}) {
     return bias
 }
 
-export async function getCharToken(char?:character|null){
+export async function getCharToken(char?:character|null, db?:Database){
     let persistant = 0
     let dynamic = 0
 
@@ -722,7 +722,7 @@ export async function getCharToken(char?:character|null){
 
     const basicTokenize = async (data:string) => {
         data = data.replace(/{{char}}/g, char.name).replace(/<char>/g, char.name)
-        return await tokenize(data)
+        return await tokenize(data, db)
     }
 
     persistant += await basicTokenize(char.desc)

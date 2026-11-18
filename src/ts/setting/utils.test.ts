@@ -5,7 +5,10 @@ vi.mock('../stores.svelte', () => ({
     selIdState: { selId: -1 },
 }))
 import { language } from 'src/lang'
-import { getLabel, resolveLanguagePath } from './utils'
+import { DBState } from '../stores.svelte'
+import type { Database } from '../storage/database.svelte'
+import type { SettingContext } from './types'
+import { getLabel, getSettingValue, resolveLanguagePath, setSettingValue } from './utils'
 
 describe('setting language resolution', () => {
     let hadRisuNest = false
@@ -41,5 +44,20 @@ describe('setting language resolution', () => {
             labelKey: 'risuNest.inlay.format',
             fallbackLabel: 'Fallback format',
         })).toBe('Inlay format')
+    })
+})
+
+describe('setting values', () => {
+    it('reads and writes the database its context names, which the settings window points at the selected preset', () => {
+        const edited = { aiModel: 'edited', ooba: { top_p: 1 } } as unknown as Database
+        const ctx = { db: edited } as SettingContext
+        expect(getSettingValue({ id: 'model', type: 'text', bindKey: 'aiModel' }, ctx)).toBe('edited')
+        expect(getSettingValue({ id: 'top', type: 'number', bindPath: 'ooba.top_p' }, ctx)).toBe(1)
+        expect(getSettingValue({ id: 'read', type: 'text', getValue: (db) => db.aiModel }, ctx)).toBe('edited')
+        setSettingValue({ id: 'model', type: 'text', bindKey: 'aiModel' }, 'changed', ctx)
+        setSettingValue({ id: 'top', type: 'number', bindPath: 'ooba.top_p' }, 0.5, ctx)
+        setSettingValue({ id: 'main', type: 'text', setValue: (db, value) => { db.mainPrompt = value } }, 'main', ctx)
+        expect(edited).toMatchObject({ aiModel: 'changed', ooba: { top_p: 0.5 }, mainPrompt: 'main' })
+        expect(DBState.db).toEqual({ characters: [] })
     })
 })

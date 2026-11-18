@@ -113,6 +113,21 @@ describe('store-backed preset operations', () => {
         expect(live.mainPrompt).toBe('stored second')
     })
 
+    it('clears a removed plugin provider from every stored body, behind catalog stubs too', async () => {
+        persisted = [
+            { ...preset('First', 'stored first'), currentPluginProvider: 'removed' },
+            { ...preset('Second', 'stored second'), currentPluginProvider: 'removed' },
+            { ...preset('Third', 'stored third'), currentPluginProvider: 'kept' },
+        ]
+        live.botPresets.push(preset('Third', 'catalog stub'))
+        live.currentPluginProvider = 'removed'
+
+        await controller.clearPluginProvider('removed')
+
+        expect(persisted.map((item) => item.currentPluginProvider)).toEqual(['', '', 'kept'])
+        expect(live.currentPluginProvider).toBe('')
+    })
+
     it('copies an inactive full body instead of its catalog stub', async () => {
         await controller.copyPreset(1)
 
@@ -255,6 +270,44 @@ it.each(['remove', 'copy'] as const)('rejects queued %s after a same-name reorde
     expect(live.botPresets.map(item => item.mainPrompt)).toEqual(['B', 'C', 'A'])
     await controller.copyPreset(0, ['X', 'X', 'X'])
     expect(live.botPresets[3]).toEqual({ ...preset('X Copy', 'B'), id: expect.stringMatching(/^[0-9a-f-]{36}$/) })
+})
+
+it('keeps the selection when another preset is removed and names the selection for the icon while another preset is applied', async () => {
+    let chainPick: string | null = 'b'
+    const live = {
+        botPresetsId: 2,
+        botPresets: ['a', 'b', 'c', 'd', 'e'].map(id => ({ ...preset(id.toUpperCase(), id), id })),
+    } as unknown as Database
+    const controller = createPresetWorkingSetController({
+        getDatabase: () => live,
+        getEffectivePresetId: () => chainPick ?? live.botPresets[live.botPresetsId].id,
+        getEffectivePresetOverride: () => chainPick,
+        clearEffectivePresetOverride: () => { chainPick = null },
+        captureCurrentPreset: () => null,
+        applyPreset: (root, selected) => { (root as Database).mainPrompt = selected.mainPrompt },
+        mutatePersistentPresets: async (_reason, mutate) => {
+            const state = { root: { botPresetsId: live.botPresetsId } as any, presets: structuredClone(live.botPresets) }
+            await mutate(state)
+            Object.assign(live, state.root)
+            live.botPresets = state.presets
+        },
+    })
+
+    await controller.updateActivePresetImage('icon')
+    expect(live.botPresets.map(item => item.image)).toEqual([undefined, undefined, 'icon', undefined, undefined])
+    await controller.removePreset(0)
+    expect(live.botPresets[live.botPresetsId].id).toBe('c')
+    expect(chainPick).toBe('b')
+    await controller.removePreset(2)
+    expect(live.botPresets[live.botPresetsId].id).toBe('c')
+    await controller.removePreset(0)
+    expect(live.botPresets[live.botPresetsId].id).toBe('c')
+    expect(chainPick).toBeNull()
+    // Removing the selected preset falls back to the first one.
+    await controller.removePreset(0)
+    expect(live.botPresets.map(item => item.id)).toEqual(['e'])
+    expect(live.botPresetsId).toBe(0)
+    expect(live.mainPrompt).toBe('e')
 })
 
 it('rejects a confirmed same-name replacement before entering the mutation queue', async () => {

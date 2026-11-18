@@ -185,6 +185,7 @@ internal class SafSpoolStore(
     require(bufferBytes > 0) { "SAF copy buffer must be positive" }
   }
 
+  /** [beforePublish] runs for each token before [listReady] can offer its spool as a new import. */
   fun spool(
     sources: List<SafInputSource>,
     importDestination: SafContentImportDestination? = null,
@@ -192,6 +193,7 @@ internal class SafSpoolStore(
     onProgress: (SafSpoolProgress) -> Unit = {},
     delivered: Boolean = false,
     restoreCopy: Boolean = false,
+    beforePublish: (String) -> Unit = {},
   ): SafSpoolBatch {
     val ready = mutableListOf<SafSpoolReady>()
     val existing = listReady().filter { it.operationId != null }.associateBy { it.operationId }
@@ -199,6 +201,7 @@ internal class SafSpoolStore(
     for (source in sources) {
       val prior = source.operationId?.let { existing[it] }
       if (prior != null) {
+        beforePublish(prior.token)
         // Opening the same source again is a new request, not the interrupted earlier delivery.
         root.resolve(prior.token).resolve(SPOOL_DELIVERY_MARKER).delete()
         ready.add(prior)
@@ -246,6 +249,7 @@ internal class SafSpoolStore(
         // A spool handed straight to a request is never offered again as a new import.
         if (delivered || restoreCopy) writeDurableJson(stagingDirectory, SPOOL_DELIVERY_MARKER, "{}", "SAF spool delivery marker")
         if (restoreCopy) writeDurableJson(stagingDirectory, SPOOL_RESTORE_COPY_MARKER, "{}", "SAF restore copy marker")
+        beforePublish(token)
         atomicPublisher.publish(stagingDirectory, ownedDirectory)
         ready.add(SafSpoolReady(
           token,
@@ -525,8 +529,9 @@ internal suspend fun spoolOpenedFilesOnIo(
   importDestination: SafContentImportDestination? = null,
   isCancelled: () -> Boolean = { false },
   onProgress: (SafSpoolProgress) -> Unit = {},
+  beforePublish: (String) -> Unit = {},
 ): SafSpoolBatch = withContext(Dispatchers.IO) {
-  store.spool(sources, importDestination, isCancelled, onProgress)
+  store.spool(sources, importDestination, isCancelled, onProgress, beforePublish = beforePublish)
 }
 
 /**
@@ -550,16 +555,19 @@ internal fun markSpoolBatchDelivered(store: SafSpoolStore, batch: SafSpoolBatch)
 /**
  * Ready spools for a new WebView. A spool an earlier WebView received but never consumed is
  * discarded and reported instead of being imported again. [handedOff] holds the tokens the current
- * WebView already received; it is read after the marker so a concurrent hand-off is never discarded.
+ * WebView already received, and those an opened intent still copying reserved for its own delivery;
+ * it is read after the marker so a concurrent hand-off is never discarded.
  */
 internal fun replayReadySpoolBatch(store: SafSpoolStore, handedOff: Set<String>): SafSpoolBatch {
   val ready = mutableListOf<SafSpoolReady>()
   val failures = mutableListOf<SafSpoolFailure>()
   for (spool in store.listReady()) {
     if (!shouldUseNativeFileJobSpool(spool.displayName)) continue
-    if (!store.isDelivered(spool.token)) {
+    val delivered = store.isDelivered(spool.token)
+    if (spool.token in handedOff) continue
+    if (!delivered) {
       ready += spool
-    } else if (spool.token !in handedOff) {
+    } else {
       val restoreCopy = store.isRestoreCopy(spool.token)
       val code = if (store.discardReady(spool.token)) SPOOL_INTERRUPTED_CODE else "cleanup-failed"
       if (!restoreCopy || code == "cleanup-failed") failures += SafSpoolFailure(spool.displayName, code)
@@ -963,14 +971,25 @@ private fun spoolFailuresJson(failures: List<SafSpoolFailure>): String =
     "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
   }
 
-internal fun androidSpoolBatchScript(requestId: String, batch: SafSpoolBatch): String {
+/**
+ * [openedPaths] are the copied files of the same opened intent that are outside the spool allowlist,
+ * so the page receives every file of the intent as one delivery.
+ */
+internal fun androidSpoolBatchScript(
+  requestId: String,
+  batch: SafSpoolBatch,
+  openedPaths: List<String> = emptyList(),
+): String {
   val ready = spoolReadyJson(batch.ready)
   val failures = spoolFailuresJson(batch.failures)
-  val value = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
+  val paths = openedPaths.joinToString(",", transform = ::jsonString)
+  val value = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]," +
+    "\"openedPaths\":[$paths]}"
   val pending = "{" +
     "\"requestId\":${jsonString(requestId)}," +
     "\"ready\":[...(window.tauriOpenedFileSpools?.ready??[]),...[$ready]]," +
-    "\"failures\":[...(window.tauriOpenedFileSpools?.failures??[]),...[$failures]]}"
+    "\"failures\":[...(window.tauriOpenedFileSpools?.failures??[]),...[$failures]]," +
+    "\"openedPaths\":[...(window.tauriOpenedFileSpools?.openedPaths??[]),...[$paths]]}"
   return "window.tauriOpenedFileSpools=$pending;" +
     "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$value}));"
 }

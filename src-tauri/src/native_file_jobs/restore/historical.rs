@@ -78,7 +78,7 @@ impl<'de> Visitor<'de> for CharactersSeed<'_, '_> {
             if !self.database.sink.expands_cold_payloads() { omit_unavailable_cold(&mut value, self.database.job).map_err(de::Error::custom)?; }
             if upstream_import::exclude_record(&value, self.excluded) { self.database.job.record_restore_omission("excludedCharacters", 1).map_err(de::Error::custom)?; continue; }
             if !prepare_legacy_character(&mut value, &mut ids) { continue; }
-            pocket_features::character(&mut value, &format!("character:{count}"));
+            pocket_features::character(&mut value, &format!("character:{count}"), pocket_features::Origin::External);
             assign_legacy_chat_ids(std::slice::from_mut(&mut value));
             self.database.sink.add_characters(self.database.staging_id, &[value]).map_err(de::Error::custom)?;
             count += 1;

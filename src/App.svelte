@@ -15,10 +15,8 @@
     import { onboardingHold } from './lib/Others/Onboarding/onboardingGate';
     import BookmarkList from './lib/Others/BookmarkList.svelte';
     import ModuleScopeMenu from './lib/Setting/Pages/Module/ModuleScopeMenu.svelte';
-    import { showRealmInfoStore, importCharacterProcess } from './ts/characterCards';
-    import { importPreset, getDatabase, setDatabase } from './ts/storage/database.svelte';
-    import { readModule } from './ts/process/modules';
-    import { alertNormal } from './ts/alert';
+    import { showRealmInfoStore } from './ts/characterCards';
+    import { getDatabase, setDatabase } from './ts/storage/database.svelte';
     import { showsDialog } from './ts/alertQueue';
     import { language } from './lang';
     import RealmFrame from './lib/UI/Realm/RealmFrame.svelte';
@@ -26,7 +24,6 @@
     import MobileHeader from './lib/Mobile/MobileHeader.svelte';
     import MobileBody from './lib/Mobile/MobileBody.svelte';
     import MobileFooter from './lib/Mobile/MobileFooter.svelte';
-    import { checkCharOrder } from './ts/globalApi.svelte';
     import { ArrowUpIcon, GlobeIcon, PlusIcon } from '@lucide/svelte';
     import { hypaV3ModalOpen, hypaV3ProgressStore } from "./ts/stores.svelte";
     import HypaV3Modal from './lib/Others/HypaV3Modal.svelte';
@@ -35,17 +32,21 @@
     import EasyPanel from './lib/Others/ProTools/EasyPanel.svelte';
     import PopupEditor from './lib/Others/PopupEditor.svelte';
     import TextEditorPopup from './lib/Others/TextEditorPopup.svelte';
+    import FolderManagerPanel from './lib/SideBars/FolderManagerPanel.svelte';
+    import { folderManager } from './ts/gui/folderManager.svelte';
     import { textEditorPopup } from './ts/gui/textEditorPopup.svelte';
     import LoadoutModal from './lib/Others/LoadoutModal.svelte';
     import OnboardingModal from './lib/Others/OnboardingModal.svelte';
     import IrisModal from './lib/Others/IrisModal.svelte';
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
-    import { RISU_APP_INTERNAL_DRAG_TYPE, RISU_SIDEBAR_DRAG_TYPE } from './ts/dragTypes';
+    import { handleAppDragOver, handleAppDragStart, handleAppDrop } from './ts/importIntake/drop';
+    import { openedImportResult } from './ts/importIntake/sheetStore';
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
     import ContentUpdateDialog from './lib/Others/ContentUpdateDialog.svelte';
+    import ImportIntakeHost from './lib/Others/ImportIntakeHost.svelte';
     import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import RecoveryShell from './lib/Others/RecoveryShell.svelte';
     import BootFailurePanel from './lib/Others/BootFailurePanel.svelte';
@@ -60,6 +61,7 @@
     import SyncStatusPanel from './lib/Others/SyncStatusPanel.svelte';
     import PersistentWorkingSetRecovery from './lib/Others/PersistentWorkingSetRecovery.svelte';
     import { persistentWorkingSetInputBlocked } from './ts/storage/persistentDataRuntime.svelte';
+    import { getAppliedPresetId } from './ts/storage/presetEditor.svelte';
     import { restoreFocusAfterInputBlock } from './ts/ui/restoreFocusAfterInputBlock';
     import { backNavigationLayer, handleRootBack } from './ts/ui/modalNavigation';
 
@@ -186,7 +188,7 @@
 
     let settingsPromise: Promise<typeof import('./lib/Setting/Settings.svelte')> | undefined
     let gridCharsPromise: Promise<typeof import('./lib/Others/GridCatalog.svelte')> | undefined
-    let botpresetPromise: Promise<typeof import('./lib/Setting/botpreset.svelte')> | undefined
+    let presetManagerPromise: Promise<typeof import('./lib/Setting/PresetManager.svelte')> | undefined
     let listedPersonaPromise: Promise<typeof import('./lib/Setting/listedPersona.svelte')> | undefined
     let customGUISettingMenuPromise: Promise<typeof import('./lib/Setting/Pages/CustomGUISettingMenu.svelte')> | undefined
 
@@ -196,8 +198,8 @@
         (settingsPromise ??= import('./lib/Setting/Settings.svelte'))
     const loadGridChars = (_retry: number) =>
         (gridCharsPromise ??= import('./lib/Others/GridCatalog.svelte'))
-    const loadBotpreset = (_retry: number) =>
-        (botpresetPromise ??= import('./lib/Setting/botpreset.svelte'))
+    const loadPresetManager = (_retry: number) =>
+        (presetManagerPromise ??= import('./lib/Setting/PresetManager.svelte'))
     const loadListedPersona = (_retry: number) =>
         (listedPersonaPromise ??= import('./lib/Setting/listedPersona.svelte'))
     const loadCustomGUISettingMenu = (_retry: number) =>
@@ -208,69 +210,16 @@
 
     let didFirstSetup: boolean  = $derived(DBState.db?.didFirstSetup)
     let gridOpen = $state(false)
+    $effect(() => { if ($openedImportResult) gridOpen = false })
     let aprilFools = $state(new Date().getMonth() === 3 && new Date().getDate() === 1)
     let aprilFoolsPage = $state(0)
-
-    const getMainDropEffect = (e:DragEvent): DataTransfer['dropEffect'] => {
-        const types = Array.from(e.dataTransfer?.types ?? [])
-        if(types.includes(RISU_SIDEBAR_DRAG_TYPE)){
-            return 'none'
-        }
-        if(types.includes(RISU_APP_INTERNAL_DRAG_TYPE)){
-            return 'none'
-        }
-        return types.includes('Files') ? 'copy' : 'none'
-    }
-
-    const markAppInternalDrag = (e:DragEvent) => {
-        e.dataTransfer?.setData(RISU_APP_INTERNAL_DRAG_TYPE, 'true')
-    }
 
 </script>
 
 <ChatBindingLifecycle />
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<main inert={$persistentWorkingSetInputBlocked || appLockVisible} class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={(e) => {
-    const dropEffect = getMainDropEffect(e)
-    e.preventDefault()
-    e.dataTransfer.dropEffect = dropEffect
-}} ondragstart={markAppInternalDrag} ondrop={async (e) => {
-    const types = Array.from(e.dataTransfer.types ?? [])
-    if (types.includes(RISU_APP_INTERNAL_DRAG_TYPE) || types.includes(RISU_SIDEBAR_DRAG_TYPE)) {
-        e.preventDefault()
-        return
-    }
-    const file = e.dataTransfer.files[0]
-    if (!file) {
-        e.preventDefault()
-        return
-    }
-    e.preventDefault()
-    const name = file.name.toLowerCase()
-
-    if (name.endsWith('.risup')) {
-        const data = new Uint8Array(await file.arrayBuffer())
-        await importPreset({ name: file.name, data })
-        alertNormal(language.successImport)
-    } else if (name.endsWith('.risum')) {
-        if (isTauri) {
-            const { importNativeContentFile } = await import('./ts/storage/nativeContentFile')
-            await importNativeContentFile(file, 'module')
-            return
-        }
-        const data = new Uint8Array(await file.arrayBuffer())
-        const module = await readModule(Buffer.from(data))
-        DBState.db.modules.push(module)
-        alertNormal(language.successImport)
-    } else {
-        await importCharacterProcess({
-            name: file.name,
-            data: file
-        })
-        checkCharOrder()
-    }
-}}>
+<main inert={$persistentWorkingSetInputBlocked || appLockVisible} class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={handleAppDragOver} ondragstart={handleAppDragStart} ondrop={handleAppDrop}>
     {#if !import.meta.env.VITE_RISU_LEGAL_CONFIGURED}
         <Legal />
     {:else if aprilFools}
@@ -462,21 +411,22 @@
         <RealmFrame />
     {/if}
     {#if $openPresetList}
-        {#await loadBotpreset(lazyRetry)}
+        {#await loadPresetManager(lazyRetry)}
             <div
                 class="absolute inset-0 z-40 flex items-center justify-center bg-darkbg text-textcolor"
             >
                 <LoadingIndicator label={language.loading} />
             </div>
         {:then module}
-            {@const Botpreset = module.default}
-            <Botpreset
+            {@const PresetManager = module.default}
+            <PresetManager
+                chatPresetId={getAppliedPresetId()}
                 close={() => {
                     $openPresetList = false
                 }}
             />
         {:catch}
-            <LazyScreenError overlay message={language.risuNest.lazy.screen} onRetry={() => { botpresetPromise = undefined; lazyRetry++ }} backLabel={language.close} onBack={() => { botpresetPromise = undefined; $openPresetList = false }} />
+            <LazyScreenError overlay message={language.risuNest.lazy.screen} onRetry={() => { presetManagerPromise = undefined; lazyRetry++ }} backLabel={language.close} onBack={() => { presetManagerPromise = undefined; $openPresetList = false }} />
         {/await}
     {/if}
     {#if $openPersonaList}
@@ -528,8 +478,12 @@
     {#if customSideBarConfigDialogStore.open}
         <CustomSidebarConfig />
     {/if}
+    {#if folderManager.folderId && folderManager.draft}
+        <FolderManagerPanel />
+    {/if}
     <NativeFileJobDialog />
     <ContentUpdateDialog />
+    <ImportIntakeHost />
     <UpdatePopup />
 </main>
 <SyncExitDialog aboveAppLock={appLockVisible} />

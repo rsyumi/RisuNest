@@ -785,16 +785,10 @@ export async function importLoreBook(mode:'global'|'local'|'sglobal'){
     if (!file?.data) return
 
     try {
-        const imported = JSON.parse(Buffer.from(file.data).toString('utf-8'))
-        const entries: loreBook[] = imported.type === 'risu' && Array.isArray(imported.data)
-            ? imported.data
-            : imported.entries ? convertExternalLorebook(imported.entries) : []
+        const entries = lorebookFileEntries(JSON.parse(Buffer.from(file.data).toString('utf-8')))
         if (!entries.length) return
         if (mode === 'global') {
-            const { mutatePersistentCharacterDetail } = await import('../storage/persistentDataRuntime.svelte')
-            await mutatePersistentCharacterDetail(characterId, 'import-character-lore', ({ character }) => {
-                character.globalLore.push(...entries)
-            })
+            await appendCharacterLorebook(characterId, entries)
         } else {
             const { editSelectedChatList } = await import('../characters')
             await editSelectedChatList(characterId, 'import-chat-lore', (character) => {
@@ -807,6 +801,21 @@ export async function importLoreBook(mode:'global'|'local'|'sglobal'){
     } catch (error) {
         alertError(error)
     }
+}
+
+/** The entries a lorebook file holds: RisuAI lorebook data, or converted external entries. */
+export function lorebookFileEntries(imported: any): loreBook[] {
+    return imported.type === 'risu' && Array.isArray(imported.data)
+        ? imported.data
+        : imported.entries ? convertExternalLorebook(imported.entries) : []
+}
+
+/** Appends entries to a character's own lorebook; false when the character no longer exists. */
+export async function appendCharacterLorebook(characterId: string, entries: loreBook[]): Promise<boolean> {
+    const { mutatePersistentCharacterDetail } = await import('../storage/persistentDataRuntime.svelte')
+    return await mutatePersistentCharacterDetail(characterId, 'import-character-lore', ({ character }) => {
+        character.globalLore.push(...entries)
+    })
 }
 
 export interface CCLorebook{

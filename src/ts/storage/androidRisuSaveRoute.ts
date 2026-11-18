@@ -9,6 +9,7 @@ import type { NativeFileJobSource } from './nativeFileJobs'
 export interface AndroidRisuSaveRestoreInput {
     source: NativeFileJobSource
     displayName: string
+    bytes?: number
 }
 
 export interface AndroidRisuSaveSpoolRouteDependencies {

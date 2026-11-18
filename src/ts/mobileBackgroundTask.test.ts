@@ -4,8 +4,8 @@ vi.mock('./platform', async () => (await import('./platform.testSupport')).platf
 vi.mock('./androidNativeControl', () => ({}))
 vi.mock('./alert', () => ({ alertToast: mocks.toast }))
 import { language } from '../lang'
-import { BackgroundExecutionExpiredError } from './iosNative'
-import { beginDeferredMobileBackgroundTask, beginMobileBackgroundTask, expireMobileDeferredHolds, hasMobileBackgroundTasks, measuredTaskPercent, mobileDeferredHoldsSettled, runWithMobileBackgroundTask } from './mobileBackgroundTask'
+import { BackgroundExecutionExpiredError, beginIOSGeneration } from './iosNative'
+import { beginDeferredMobileBackgroundTask, beginMobileBackgroundTask, hasMobileBackgroundTasks, measuredTaskPercent, mobileDeferredHoldsSettled, runWithMobileBackgroundTask } from './mobileBackgroundTask'
 import { runSharedNativeFileOperation, cancelActiveNativeFileOperation } from './storage/nativeFileJobManager'
 import { syntheticNativeFileJobStatus, type NativeFileJobStatus } from './storage/nativeFileJobs'
 import { createExternalStorageController } from './storage/sync/external/controller'
@@ -250,6 +250,8 @@ describe('mobile background task lifetime', () => {
 describe('iOS deferred holds', () => {
     it('keeps the background-entry wait until each hold settles and aborts them when it expires', async () => {
         mocks.os = 'ios'
+        const lifecycle = (detail: { event: string; id: string }) => window.dispatchEvent(new CustomEvent('risunest-ios-lifecycle', { detail }))
+        const show = (value: 'hidden' | 'visible') => Object.defineProperty(document, 'visibilityState', { configurable: true, value })
         const first = await beginDeferredMobileBackgroundTask('sync')
         const second = await beginDeferredMobileBackgroundTask('generation')
         expect(first.protection).toEqual({ state: 'deferred' })
@@ -258,9 +260,30 @@ describe('iOS deferred holds', () => {
         await first.dispose()
         await Promise.resolve(); await Promise.resolve()
         expect(settled).not.toHaveBeenCalled()
-        expireMobileDeferredHolds()
-        expect(second.signal?.reason).toBeInstanceOf(BackgroundExecutionExpiredError)
-        await second.dispose()
+        const own = await beginIOSGeneration(undefined, {
+            enabled: () => true, begin: async () => ({ id: 'own-task' }), end: async () => {}, events: window,
+            state: async () => ({ activeTasks: ['own-task'], expiredTasks: [], foreground: false, notifications: false, notificationStatus: 0, backgroundMode: 'limited', continuedRegistered: false, continuedErrorCode: null, backgroundRefreshStatus: 2 }),
+        })
+        try {
+            // A task the page began ends only its own work, and an expiry heard back on screen arrived late.
+            show('hidden'); lifecycle({ event: 'expired', id: 'own-task' })
+            show('visible'); lifecycle({ event: 'expired', id: 'background-entry' })
+            expect(own.signal?.aborted).toBe(true)
+            expect(second.signal?.aborted).toBe(false)
+            // The app left before the page heard the departure, so only the expiry of its assertion arrives.
+            show('hidden'); lifecycle({ event: 'expired', id: 'background-entry' })
+            expect(second.signal?.reason).toBeInstanceOf(BackgroundExecutionExpiredError)
+            await second.dispose()
+            // Back on screen and away again: work that runs now ends with the new departure's assertion, not the old one's.
+            show('visible')
+            const third = await beginDeferredMobileBackgroundTask('sync')
+            show('hidden'); lifecycle({ event: 'background', id: 'next-entry' })
+            lifecycle({ event: 'expired', id: 'earlier-entry' })
+            expect(third.signal?.aborted).toBe(false)
+            lifecycle({ event: 'expired', id: 'next-entry' })
+            expect(third.signal?.reason).toBeInstanceOf(BackgroundExecutionExpiredError)
+            await third.dispose()
+        } finally { show('visible'); await own.dispose() }
         await vi.waitFor(() => expect(settled).toHaveBeenCalledOnce())
         expect(bridge.begin).not.toHaveBeenCalled()
     })

@@ -1212,7 +1212,7 @@ function readMatcherChatVar(context: matcherArg | null, key: string): string {
     noteChatVariableRead(key)
     if (context?.chatVariables) return context.chatVariables[key] ?? 'null'
     if (context?.getChatVar) return context.getChatVar(key)
-    return getChatVar(key)
+    return getChatVar(key, context?.db)
 }
 
 function readMatcherGlobalChatVar(context: matcherArg | null, key: string): string {
@@ -1272,7 +1272,7 @@ function initMatcher(){
         getSelectedCharID: () => {
             return activeMatcherContext?.selectedCharID ?? get(selectedCharID)
         },
-        getModelInfo: getModelInfo,
+        getModelInfo: (model) => getModelInfo(model, activeMatcherContext?.db ?? getDatabase()),
         callInternalFunction: function (args: string[]): string {
             return ''
         },

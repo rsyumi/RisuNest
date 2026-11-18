@@ -24,11 +24,17 @@ export async function activatePresetChain(
     await setOverride(index)
 }
 
+/**
+ * Applies the preset a request uses before it is built. `activateBinding` applies the target
+ * conversation's binding and returns true when there is one, which replaces the chain.
+ */
 export async function activatePresetChainForRequest(
     database: PresetChainState,
     setOverride: (index: number | null) => Promise<void>,
     random: () => number,
     onMissing: (name: string) => void,
+    activateBinding?: () => Promise<boolean>,
 ): Promise<void> {
+    if (await activateBinding?.()) return
     await activatePresetChain(database, setOverride, random, onMissing)
 }

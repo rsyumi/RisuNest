@@ -1,6 +1,6 @@
 import './androidNativeControl'
 import { isTauriAndroid, isTauriIOS } from './platform'
-import { beginIOSBackgroundTask, BackgroundExecutionExpiredError, isBackgroundExpiryReason } from './iosNative'
+import { beginIOSBackgroundTask, BackgroundExecutionExpiredError, isBackgroundExpiryReason, isIOSTaskBegun } from './iosNative'
 import { measuredTaskPercent } from './taskPercent'
 
 export { measuredTaskPercent }
@@ -53,9 +53,23 @@ export async function mobileDeferredHoldsSettled(): Promise<void> {
     while (iosDeferredHolds.size > 0) await Promise.all([...iosDeferredHolds].map(hold => hold.settled))
 }
 
-/** The background allowance that kept deferred holds running has expired. */
-export function expireMobileDeferredHolds(): void {
-    for (const hold of iosDeferredHolds) hold.controller.abort(new BackgroundExecutionExpiredError())
+let iosEntryExpiryHeard = false
+/**
+ * Deferred holds run on the assertion iOS takes when the app leaves the screen, so its expiry ends them, also when the
+ * page missed that departure during startup. Once the page heard a departure, only that departure's assertion counts.
+ * A task the page began ends only its own work, and an expiry heard back on screen arrived late.
+ */
+function hearIOSEntryExpiry(): void {
+    if (iosEntryExpiryHeard) return
+    iosEntryExpiryHeard = true
+    let entry: string | undefined
+    window.addEventListener('risunest-ios-lifecycle', event => {
+        const detail = (event as CustomEvent<{ event?: string; id?: string }>).detail
+        if (detail?.event === 'background') entry = detail.id ?? ''
+        if (detail?.event !== 'expired' || !detail.id || entry !== undefined && detail.id !== entry
+            || isIOSTaskBegun(detail.id) || document.visibilityState !== 'hidden') return
+        for (const hold of iosDeferredHolds) hold.controller.abort(new BackgroundExecutionExpiredError())
+    })
 }
 
 function noticeRefusedProtection(): void {
@@ -99,6 +113,7 @@ function beginTask(
     }
     if (isTauriIOS && deferred) {
         // iOS holds the background-entry assertion until deferred holds settle.
+        hearIOSEntryExpiry()
         const controller = new AbortController()
         const abort = () => controller.abort(signal?.reason)
         signal?.addEventListener('abort', abort, { once: true })

@@ -6,6 +6,8 @@ const fixture = vi.hoisted(() => ({
     database: { characters: [], plugins: [], currentPluginProvider: '' } as any,
     // The library plugin storage both the sandbox and the data deletion use.
     storage: new Map<string, Map<string, unknown>>(),
+    // Owners whose provider the preset store was asked to clear.
+    clearedProviders: [] as string[],
 }))
 
 function ownedStorage(owner: string) {
@@ -52,7 +54,9 @@ vi.mock('../../storage/persistentDataStoreFactory', () => ({
         }))),
     }),
 }))
-vi.mock('src/ts/storage/database.svelte', async () => (await import('./v3Host.testSupport')).databaseModule({ read: () => fixture.database }))
+vi.mock('src/ts/storage/database.svelte', async () => (await import('./v3Host.testSupport')).databaseModule({ read: () => fixture.database }, {
+    clearPresetPluginProvider: async (owner: string) => { fixture.clearedProviders.push(owner) },
+}))
 vi.mock('../pluginSafeClass', async () => (await import('./v3Host.testSupport')).pluginSafeClassModule())
 vi.mock('src/ts/stores.svelte', async () => (await import('./v3Host.testSupport')).storesModule({ read: () => fixture.database }))
 vi.mock('src/ts/alert', async () => (await import('./v3Host.testSupport')).alertModule())
@@ -149,12 +153,15 @@ afterEach(async () => {
 describe('plugin removal with a running sandbox', () => {
     it('leaves no data behind that the plugin saved while unloading', async () => {
         await runInstalledPlugin()
+        fixture.clearedProviders = []
         expect(await ownedKeys()).toEqual(['saved-while-running'])
 
         await removeInstalledPlugin(owner, true)
 
         expect(fixture.database.plugins).toEqual([])
         expect(fixture.database.currentPluginProvider).toBe('')
+        // Presets that are not loaded are cleared in the store.
+        expect(fixture.clearedProviders).toEqual([owner])
         expect(document.querySelector('iframe[data-risu-plugin-frame]')).toBeNull()
         expect(await ownedKeys()).toEqual([])
     })

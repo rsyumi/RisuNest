@@ -17,7 +17,7 @@ function dependencies(): AndroidRisuSaveSpoolRouteDependencies {
 }
 
 describe('Android RisuSave spool route', () => {
-    it('serializes multiple native restores and never forwards source bytes', async () => {
+    it('serializes multiple native restores and forwards only the source, its name and its size', async () => {
         const deps = dependencies()
         let releaseFirst!: () => void
         const firstPending = new Promise<void>((resolve) => {
@@ -56,6 +56,7 @@ describe('Android RisuSave spool route', () => {
                 token: '11111111-1111-4111-8111-111111111111',
             },
             displayName: 'first.RISUDAT',
+            bytes: 10_000,
         })
         releaseFirst()
         await pending
@@ -66,6 +67,7 @@ describe('Android RisuSave spool route', () => {
                 token: '22222222-2222-4222-8222-222222222222',
             },
             displayName: 'second.risudat',
+            bytes: 20_000,
         })
     })
 
@@ -113,6 +115,7 @@ describe('Android RisuSave spool route', () => {
                     token: '44444444-4444-4444-8444-444444444444',
                 },
                 displayName,
+                bytes: 4096,
             })
         },
     )
@@ -166,6 +169,7 @@ describe('Android RisuSave spool route', () => {
                 token: '33333333-3333-4333-8333-333333333333',
             },
             displayName: 'valid.risudat',
+            bytes: 20,
         })
     })
 })

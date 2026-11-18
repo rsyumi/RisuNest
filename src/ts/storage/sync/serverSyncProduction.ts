@@ -2,7 +2,7 @@ import { notifySyncReceiveCompleted } from './bindingChanges'
 import { invoke } from '@tauri-apps/api/core'
 import type { SyncExitDrainAdapter } from '../syncExitCoordinator'
 import type { RetainableReplacementFence } from '../retainableReplacementFence'
-import { isTauri } from 'src/ts/platform'
+import { isTauri, isTauriAndroid } from 'src/ts/platform'
 import { createSyncBindingRecoveryRegistration, installSyncBindingFlow } from './bindingProduction'
 import { withPausedPersistentWrites, beginActivatedLibraryGuard, refreshActivatedLibraryUnderPause, applyPersistentLwwReceive, flushPendingDataLocally, getPersistentDataRuntime } from '../persistentDataRuntime.svelte'
 import type { PersistentMutationToken } from '../saveCoordinator'
@@ -90,6 +90,9 @@ let foreground = false
 let continuing = false
 const active = () => foreground || continuing
 const halt = () => { foreground = false; continuing = false }
+// Routine sync's background time ran out while the app was away, so it waits for the return. Android expires a hold
+// only while the app is away, also when it keeps the page running and visible; elsewhere the page is hidden then.
+let outOfTime = false
 type Hold = MobileBackgroundTask | Promise<MobileBackgroundTask>
 const releaseHold = (hold: Hold | undefined) => { if (hold) void Promise.resolve(hold).then(task => task.dispose()) }
 // Routine sync takes service time only if the app leaves the screen while it runs.
@@ -98,6 +101,7 @@ const holdRoutineSync = (): Hold => {
     // When the platform's time runs out, routine sync stops where it stands; returning to the screen resumes it.
     void Promise.resolve(hold).then(task => task.signal?.addEventListener('abort', () => {
         if (!isBackgroundExpiryReason(task.signal?.reason)) return
+        if (isTauriAndroid || document.visibilityState === 'hidden') outOfTime = true
         halt(); if (hydrating) hydrationPending = true
         void scheduler.fence()
     }, { once: true }))
@@ -370,7 +374,7 @@ function continueHydration(continuation = false): void {
 async function updateForeground(visible: boolean): Promise<void> {
     const usable = !replacing && !!context && !context.signal.aborted
     continuing = !visible && usable && (foreground || continuing)
-    foreground = visible && usable
+    foreground = visible && usable && !outOfTime
     if (!active() && hydrating) hydrationPending = true
     // Work in flight hands its protection to the hide-time publication without a moment unheld.
     const bridge = !visible && (attemptHold || pendingHold) ? holdRoutineSync() : undefined
@@ -681,9 +685,16 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     }))
     disposers.push(() => { clearTimeout(priorityTimer); priorityTimer = undefined })
     disposers.push(await listen<{ connected: boolean }>('risu-server-sync-notification', event => scheduler.socket(event.payload.connected)))
-    const visibility = () => { void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; recordFailure(value); changed() }) }
+    const visibility = () => {
+        if (document.visibilityState !== 'hidden') outOfTime = false
+        void updateForeground(document.visibilityState !== 'hidden').catch(value => { if (serverSyncErrorCode(value) === 'cancelled') return; recordFailure(value); changed() })
+    }
     document.addEventListener('visibilitychange', visibility)
     disposers.push(() => document.removeEventListener('visibilitychange', visibility))
+    // A page Android keeps running off screen stays visible, so it hears the return only from the app's own start.
+    const lifecycle = (event: Event) => { if (isTauriAndroid && (event as CustomEvent<{ reason?: unknown } | null>).detail?.reason === 'start') visibility() }
+    window.addEventListener('risu-native-lifecycle', lifecycle)
+    disposers.push(() => { window.removeEventListener('risu-native-lifecycle', lifecycle); outOfTime = false })
     disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; halt(); hydrationPending = false; representativesPending = false; clearTimeout(representativesTimer); representativesTimer = undefined; hydrationAgain = false; attempt = undefined; releaseHold(attemptHold); attemptHold = undefined; releaseHold(pendingHold); pendingHold = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
     if (!resumeBound || heldForCommittedRestore) return

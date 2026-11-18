@@ -825,7 +825,7 @@ fn stream_legacy_characters<S: TrackedSource>(
             continue;
         }
         retained += 1;
-        pocket_features::character(&mut character, &format!("character:{index}"));
+        pocket_features::character(&mut character, &format!("character:{index}"), pocket_features::Origin::External);
         assign_legacy_chat_ids(std::slice::from_mut(&mut character));
         if !batch.is_empty() && batch_bytes.saturating_add(bytes) > CHARACTER_BATCH_BYTES as u64 {
             sink.add_characters_with_binaries(staging_id, &batch, &binaries)
@@ -1623,6 +1623,9 @@ fn parse_and_stage<R: Read>(
     let mut character_batch = Vec::new();
     let mut character_batch_bytes = 0usize;
     let mut character_count = 0u64;
+    // Every RisuSave RisuNest writes carries this block ahead of its characters.
+    let mut origin = pocket_features::Origin::External;
+    let mut saw_character = false;
 
     while reader.completed < reader.total {
         if job.is_cancel_requested() {
@@ -1641,6 +1644,11 @@ fn parse_and_stage<R: Read>(
             String::from_utf8(name_bytes).map_err(|_| invalid("invalid UTF-8 block name"))?;
         if name.is_empty() || !loaded.insert(name.clone()) {
             return Err(invalid(format!("duplicate block {name}")));
+        }
+        if matches!(block_type, 2 | 7) {
+            saw_character = true;
+        } else if block_type == 12 && name == "pluginStorageMeta" && !saw_character {
+            origin = pocket_features::Origin::RisuNest;
         }
         let mut length_bytes = [0u8; 4];
         reader.read_exact_checked(&mut length_bytes)?;
@@ -1676,6 +1684,7 @@ fn parse_and_stage<R: Read>(
                 job,
                 sink,
                 spool_directory,
+                origin,
             )?;
             if retained { character_count += 1; } else { excluded.insert(name.clone()); }
             reader.counts.characters = character_count;
@@ -1748,7 +1757,7 @@ fn parse_and_stage<R: Read>(
                 if !sink.expands_cold_payloads() { omit_unavailable_cold(&mut value, job)?; }
                 assign_legacy_chat_ids(std::slice::from_mut(&mut value));
                 character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
-                pocket_features::character(&mut value, &format!("character:{character_count}"));
+                pocket_features::character(&mut value, &format!("character:{character_count}"), origin);
                 character_batch.push(value);
                 character_count += 1;
                 reader.counts.characters = character_count;
@@ -1989,6 +1998,7 @@ fn read_character_block<R: Read>(
     job: &dyn RestoreControl,
     sink: &dyn ReplacementSink,
     spool_directory: &Path,
+    origin: pocket_features::Origin,
 ) -> Result<bool, NativeJobError> {
     let block = EncodedBlockReader {
         reader,
@@ -2010,6 +2020,7 @@ fn read_character_block<R: Read>(
         job,
         sink,
         staging_error: &staging_error,
+        origin,
     };
     if compression == 0 {
         if encoded_length > limits.max_decoded_block_bytes {
@@ -2405,6 +2416,7 @@ struct CharacterSeed<'a> {
     job: &'a dyn RestoreControl,
     sink: &'a dyn ReplacementSink,
     staging_error: &'a RefCell<Option<StoreError>>,
+    origin: pocket_features::Origin,
 }
 
 impl<'de> DeserializeSeed<'de> for CharacterSeed<'_> {
@@ -2460,6 +2472,7 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
                     job: self.0.job,
                     sink: self.0.sink,
                     staging_error: self.0.staging_error,
+                    origin: self.0.origin,
                 })?;
             } else {
                 let value = map.next_value_seed(BoundedValueSeed(self.0.record_bytes))?;
@@ -2501,6 +2514,7 @@ struct ChatsSeed<'a> {
     job: &'a dyn RestoreControl,
     sink: &'a dyn ReplacementSink,
     staging_error: &'a RefCell<Option<StoreError>>,
+    origin: pocket_features::Origin,
 }
 
 impl<'de> DeserializeSeed<'de> for ChatsSeed<'_> {
@@ -2546,6 +2560,7 @@ impl<'de> Visitor<'de> for ChatsVisitor<'_> {
                 job: self.0.job,
                 sink: self.0.sink,
                 staging_error: self.0.staging_error,
+                origin: self.0.origin,
             })?
         {
             count += i64::from(staged);
@@ -2569,6 +2584,7 @@ struct ConversationSeed<'a> {
     job: &'a dyn RestoreControl,
     sink: &'a dyn ReplacementSink,
     staging_error: &'a RefCell<Option<StoreError>>,
+    origin: pocket_features::Origin,
 }
 
 // Stages one conversation; a chat entry that is not an object is skipped, as in PocketRisu.
@@ -2670,7 +2686,7 @@ impl<'de> Visitor<'de> for ConversationVisitor<'_> {
         detail.insert("id".into(), Value::String(conversation_id.clone()));
         default_name(&mut detail);
         let mut normalized_detail = Value::Object(detail);
-        pocket_features::chat(&mut normalized_detail, &self.0.fallback);
+        pocket_features::chat(&mut normalized_detail, &self.0.fallback, self.0.origin);
         let recent_at = normalized_detail
             .get("lastDate")
             .and_then(Value::as_i64)
@@ -4757,6 +4773,52 @@ pub(super) mod tests {
         assert!(chats[1].get("bindedPersona").is_none());
         assert_eq!(restored["characters"][0]["name"], "");
         assert_eq!(chats[1]["name"], "");
+    }
+
+    #[test]
+    fn a_risusave_risunest_wrote_keeps_chat_preset_binding_fields_as_stored() {
+        let character = |id: &str| json!({"type":"character", "chaId":id, "name":"Imported", "chats":[
+            {"id":"leftover", "name":"Chat", "message":[], "bindedBotPreset":"preset-a"},
+            {"id":"bound", "name":"Chat", "message":[], "promptPresetId":"preset-b", "bindedBotPreset":"preset-a"},
+        ]});
+        // RisuNest writes its plugin metadata block before the characters, so one between them
+        // leaves both converted, as does another type-12 block before them.
+        let meta = "pluginStorageMeta";
+        for (marker, written_by_risunest) in [
+            (Some((6, meta)), true), (Some((7, meta)), false), (Some((6, "kv:synthetic")), false), (None, false),
+        ] {
+            for incremental in [false, true] {
+                let (directory, mut sink) = fixture();
+                sink.incremental = incremental;
+                let mut blocks = valid_blocks();
+                blocks[6] = block(2, true, "char-1", &character("char-1"));
+                blocks.insert(7, block(2, true, "char-2", &character("char-2")));
+                if let Some((index, name)) = marker {
+                    blocks.insert(index, block(12, false, name, &json!({})));
+                }
+                let source = directory.path().join("preset-bindings.risudat");
+                fs::write(&source, save_bytes(blocks)).unwrap();
+                let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+                restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
+                let restored = sink.store.lock().unwrap().materialize(None).unwrap();
+                let characters = restored["characters"].as_array().unwrap();
+                assert_eq!(characters.len(), 2);
+                for character in characters {
+                    let chats = &character["chats"];
+                    let case = format!("marker {marker:?}, incremental {incremental}, {}", character["chaId"]);
+                    if written_by_risunest {
+                        assert_eq!(chats[0]["bindedBotPreset"], "preset-a", "{case}");
+                        assert!(chats[0].get("promptPresetId").is_none(), "{case}");
+                        assert_eq!(chats[1]["bindedBotPreset"], "preset-a", "{case}");
+                    } else {
+                        assert_eq!(chats[0]["promptPresetId"], "preset-a", "{case}");
+                        assert!(chats[0].get("bindedBotPreset").is_none(), "{case}");
+                        assert!(chats[1].get("bindedBotPreset").is_none(), "{case}");
+                    }
+                    assert_eq!(chats[1]["promptPresetId"], "preset-b", "{case}");
+                }
+            }
+        }
     }
 
     #[test]

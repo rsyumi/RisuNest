@@ -372,6 +372,7 @@ describe('Android SAF bridge', () => {
                 token: '11111111-1111-4111-8111-111111111111',
             },
             displayName: 'database.risudat',
+            bytes: 10_000,
         })
         expect(unsupported).toHaveBeenCalledExactlyOnceWith({
             token: '22222222-2222-4222-8222-222222222222',

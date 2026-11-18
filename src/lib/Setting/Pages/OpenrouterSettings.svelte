@@ -3,7 +3,7 @@
     import Accordion from "src/lib/UI/Accordion.svelte";
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     
-    import { DBState } from 'src/ts/stores.svelte';
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import ChatFormatSettings from "./ChatFormatSettings.svelte";
     import OpenrouterProviderList from "src/lib/UI/OpenrouterProviderList.svelte";
     import { PlusIcon, TrashIcon } from "@lucide/svelte";

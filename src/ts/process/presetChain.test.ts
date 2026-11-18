@@ -67,4 +67,15 @@ describe('preset chain activation', () => {
 
         expect(events).not.toContain('request')
     })
+
+    it('leaves the chain alone when the conversation binding applies a preset', async () => {
+        const changePreset = vi.fn(async () => undefined)
+        const database = { presetChain: 'Target', botPresets: [{ name: 'Other' }, { name: 'Target' }] }
+
+        await activatePresetChainForRequest(database, changePreset, () => 0, vi.fn(), async () => true)
+        expect(changePreset).not.toHaveBeenCalled()
+
+        await activatePresetChainForRequest(database, changePreset, () => 0, vi.fn(), async () => false)
+        expect(changePreset).toHaveBeenCalledExactlyOnceWith(1)
+    })
 })

@@ -3,6 +3,8 @@ import { mount, tick, unmount } from 'svelte'
 import { languageEnglish } from '../../lang/en'
 import { DBState } from 'src/ts/stores.svelte'
 import TogglePresetPopup from './TogglePresetPopup.svelte'
+import { observeEffectivePresetDerive, setEffectivePresetBinding } from 'src/ts/storage/effectiveIdentityState'
+import { syncPresetEditorTarget } from 'src/ts/storage/presetEditor.svelte'
 
 const mocks = vi.hoisted(() => ({
     confirm: vi.fn(async () => true),
@@ -44,7 +46,7 @@ const encode = (value: unknown) => ({ name: 'file.json', data: new TextEncoder()
 
 beforeEach(async () => {
     DBState.db = {
-        botPresets: [{ name: 'Alpha' }, { name: 'Beta' }],
+        botPresets: [{ id: 'alpha', name: 'Alpha' }, { id: 'beta', name: 'Beta' }],
         botPresetsId: 0,
         globalChatVariables: { toggle_a: '1', toggle_b: '0', toggle_orphan: 'x' },
         togglePresets: [
@@ -57,6 +59,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    observeEffectivePresetDerive(undefined)
     await unmount(instance)
     document.body.replaceChildren()
     vi.clearAllMocks()
@@ -93,6 +96,16 @@ it('lists presets of the active prompt preset, shows all on request and applies 
     expect(mocks.confirm).toHaveBeenLastCalledWith(languageEnglish.applyTogglePresetConfirm)
     expect(DBState.db.globalChatVariables).toEqual({ toggle_a: '0', toggle_b: '1', toggle_orphan: 'x' })
     expect(mocks.toast).toHaveBeenCalledWith(languageEnglish.togglePresetApplied('One'))
+})
+
+it('lists presets of the prompt preset a conversation binding applies instead of the selection', async () => {
+    observeEffectivePresetDerive({ beforeDerive: () => {}, afterDerive: (db) => syncPresetEditorTarget(db, () => {}) })
+    setEffectivePresetBinding(DBState.db, 'beta', () => {})
+    await tick()
+    expect(names().map((button) => button.textContent)).toEqual([expect.stringContaining('Two')])
+    mocks.input.mockResolvedValueOnce('Bound')
+    byText(languageEnglish.saveNewPreset).click()
+    await vi.waitFor(() => expect(presets().at(-1)).toMatchObject({ name: 'Bound', promptPresetName: 'Beta' }))
 })
 
 it('keeps a refused preset open without showing an applied toast', async () => {

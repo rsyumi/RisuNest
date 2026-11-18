@@ -3,6 +3,7 @@ import { importContentBatch } from './contentImportBatch'
 import { discardIOSFile, pickIOSFiles, type IOSPickedFile } from './iosFiles'
 import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from './nativeFileJobManager'
 import { NativeFileJobError } from './nativeFileJobs'
+import { nativeModuleLocation } from '../process/moduleImportLocation'
 
 // Matches the existing Android metadata-only compatibility reader.
 const MAX_METADATA_BYTES = 128 * 1024 * 1024
@@ -60,22 +61,34 @@ async function importPickedContent(
         }
         if (destination === 'module') {
             const { importModuleData } = await import('../process/modules')
-            return await importModuleData({ name: picked.name, data }) ? 'module' : null
+            const location = await importModuleData({ name: picked.name, data })
+            if (!location) return null
+            context.setLocation(location)
+            return 'module'
         }
         const { importCharacterProcess } = await import('../characterCards')
-        const index = await importCharacterProcess({ name: picked.name, data })
+        const index = await importCharacterProcess({ name: picked.name, data, quiet: true })
         const { getDatabase } = await import('./database.svelte')
-        return typeof index === 'number'
+        const chaId = typeof index === 'number'
             ? getDatabase().characters[index]?.chaId ?? null
             : null
+        if (chaId) context.setLocation({ kind: 'character', chaId })
+        return chaId
     }
     const input = {
         source: { type: 'desktopPath' as const, path: picked.path },
         displayName: picked.name,
     }
     const options = { signal: context.signal, onStatus: context.onStatus }
-    const result = destination === 'module' || /\.risum$/i.test(picked.name)
-        ? await (await import('../process/modules')).importPreparedNativeModuleContent(input, options)
-        : await (await import('../characterCards')).importPreparedNativeCharacterContent(input, options)
-    return result.kind === 'imported' ? result.value : null
+    if (destination === 'module' || /\.risum$/i.test(picked.name)) {
+        const { importPreparedNativeModuleContent } = await import('../process/modules')
+        const result = await importPreparedNativeModuleContent(input, options)
+        if (result.kind !== 'imported') return null
+        context.setLocation(nativeModuleLocation(picked.name))
+        return result.value
+    }
+    const result = await (await import('../characterCards')).importPreparedNativeCharacterContent(input, options)
+    if (result.kind !== 'imported') return null
+    context.setLocation({ kind: 'character', chaId: result.value })
+    return result.value
 }

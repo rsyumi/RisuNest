@@ -22,9 +22,11 @@ export const MobileGUIStack = writable(1), MobileSideBar = writable(0), selected
 export const onboardingHold = writable(false), showRealmInfoStore = writable(null), SettingsMenuIndex = writable(0)
 export const MobileSearch = writable(''), additionalSettingsMenu = []
 export const persistentWorkingSetInputBlocked = writable(false), navigationActivity = writable(null), isLite = writable(false)
+export const openedImportResult = writable(null)
 export const keepFocusedInputVisible = () => {}, restoreFocusAfterInputBlock = () => {}
 export { modalNavigation, backNavigationLayer, handleRootBack } from '../../src/ts/ui/modalNavigation'
 export const textEditorPopup = { request: null }
+export const folderManager = { folderId: null, draft: null }
 
 let failingRoute = ''
 let attempts = 0

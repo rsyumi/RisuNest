@@ -1,6 +1,6 @@
 <script lang="ts">
     import type { SettingContext, SettingItem } from 'src/ts/setting/types'
-    import { DBState } from 'src/ts/stores.svelte'
+    import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte'
     import { getModelInfo } from 'src/ts/model/modellist'
     import { checkCondition, getLabel, resolveLanguagePath } from 'src/ts/setting/utils'
     import SettingGroup from './SettingGroup.svelte'
@@ -16,8 +16,8 @@
 
     let ctx: SettingContext = $derived({
         db: DBState.db,
-        modelInfo: getModelInfo(DBState.db.aiModel),
-        subModelInfo: getModelInfo(DBState.db.subModel),
+        modelInfo: getModelInfo(DBState.db.aiModel, DBState.db),
+        subModelInfo: getModelInfo(DBState.db.subModel, DBState.db),
     })
 
     interface Group {

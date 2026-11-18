@@ -32,36 +32,39 @@ export function getLabel(item: SettingItem): string {
     return item.fallbackLabel ?? '';
 }
 
+// The context names the database its page edits; the settings window edits the selected preset.
 export function getSettingValue(item: SettingItem, ctx: SettingContext): any {
+    const db = ctx.db ?? DBState.db;
     if (item.getValue) {
-        return item.getValue(DBState.db, ctx);
+        return item.getValue(db, ctx);
     }
     if (item.bindPath) {
         const parts = item.bindPath.split('.');
-        let value: any = DBState.db;
+        let value: any = db;
         for (const part of parts) {
             value = value?.[part];
         }
         return value;
     }
     if (item.bindKey) {
-        return (DBState.db as any)[item.bindKey];
+        return (db as any)[item.bindKey];
     }
     return undefined;
 }
 
 export function setSettingValue(item: SettingItem, newValue: any, ctx: SettingContext): void {
+    const db = ctx.db ?? DBState.db;
     if (item.setValue) {
-        item.setValue(DBState.db, newValue, ctx);
+        item.setValue(db, newValue, ctx);
     } else if (item.bindPath) {
         const parts = item.bindPath.split('.');
-        let obj: any = DBState.db;
+        let obj: any = db;
         for (let i = 0; i < parts.length - 1; i++) {
             obj = obj[parts[i]] ??= {};
         }
         obj[parts[parts.length - 1]] = newValue;
     } else if (item.bindKey) {
-        (DBState.db as any)[item.bindKey] = newValue;
+        (db as any)[item.bindKey] = newValue;
     }
     
     if (item.onChange) {

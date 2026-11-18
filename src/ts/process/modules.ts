@@ -19,6 +19,7 @@ import { readFile } from '@tauri-apps/plugin-fs'
 import type { NativeFileJobOptions, NativeFileJobSource } from '../storage/nativeFileJobs'
 import { importContentBatch } from '../storage/contentImportBatch'
 import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from '../storage/nativeFileJobManager'
+import { nativeModuleLocation, type ModuleImportLocation } from './moduleImportLocation'
 import { assertModuleMCPImportAllowed, StdioModuleImportError } from './mcp/moduleImport'
 import { selectConversationModules } from './moduleSelection'
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
@@ -328,13 +329,16 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
     return module
 }
 
-/** Adds an imported module, or updates the installed one it is a new version of when the user chooses that. */
-async function commitImportedModuleData(module: RisuModule): Promise<boolean> {
+/**
+ * Adds an imported module, or updates the installed one it is a new version of when the user
+ * chooses that. Returns where the import went, or null when the user cancelled it.
+ */
+async function commitImportedModuleData(module: RisuModule, location: ModuleImportLocation): Promise<ModuleImportLocation | null> {
     const { commitImportedModule } = await import('../contentUpdate/flow.svelte')
     const id = await commitImportedModule(module, async (value) => {
         DBState.db.modules.push(value)
     })
-    return id !== null
+    return id !== null ? location : null
 }
 
 export async function importModule() {
@@ -389,7 +393,7 @@ export async function importModule() {
     }
     const files = await selectMultipleFile(['json', 'lorebook', 'risum', 'charx'])
     let imported = false
-    for (const file of files ?? []) imported = await importModuleData(file) || imported
+    for (const file of files ?? []) imported = await importModuleData(file) !== null || imported
     return imported ? 'module' : null
 }
 
@@ -400,14 +404,19 @@ async function importDesktopModulePath(path: string, context: SharedNativeFileOp
             { source: { type: 'desktopPath', path }, displayName },
             { signal: context.signal, onStatus: context.onStatus },
         )
-        return result.kind === 'imported' ? result.value : null
+        if (result.kind !== 'imported') return null
+        context.setLocation(nativeModuleLocation(displayName))
+        return result.value
     }
     context.signal.throwIfAborted()
-    return await importModuleData({ name: displayName, data: await readFile(path) }) ? 'module' : null
+    const location = await importModuleData({ name: displayName, data: await readFile(path) })
+    if (!location) return null
+    context.setLocation(location)
+    return 'module'
 }
 
-/** Adds the module the file holds and reports whether it did; a refusal is alerted here. */
-export async function importModuleData(f: { name: string; data: Uint8Array; parsedJson?: ParsedImportJson }): Promise<boolean> {
+/** Adds the module the file holds and says how it was added; a refusal is alerted here and returns null. */
+export async function importModuleData(f: { name: string; data: Uint8Array; parsedJson?: ParsedImportJson }): Promise<ModuleImportLocation | null> {
     let fileData = f.data
     if (f.name.endsWith('.charx')) {
         try {
@@ -419,28 +428,28 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
             })
             if (!char || typeof char === 'number') {
                 alertError(language.errors.noData)
-                return false
+                return null
             }
             const module = convertCharacterToModule(char)
-            if (!await commitImportedModuleData(module)) return false
+            if (!await commitImportedModuleData(module, { kind: 'module-from-charx' })) return null
         } catch (error) {
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
-            return false
+            return null
         }
         alertNormal(language.successImport)
-        return true
+        return { kind: 'module-from-charx' }
     }
     if (f.name.endsWith('.risum')) {
         try {
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
-            return await commitImportedModuleData(module)
+            return await commitImportedModuleData(module, { kind: 'module' })
         } catch (error) {
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
         }
-        return false
+        return null
     }
     try {
         const importData = (f.parsedJson ?? parseImportJson(fileData)).value
@@ -448,7 +457,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
             assertModuleMCPImportAllowed(importData)
             if (!importData.name || !importData.id) {
                 alertError(language.errors.noData)
-                return false
+                return null
             }
             markModuleImport(importData)
             importData.id = v4()
@@ -457,10 +466,10 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
             if (importData.lowLevelAccess) {
                 const conf = await alertConfirm(language.lowLevelAccessConfirm)
                 if (!conf) {
-                    return false
+                    return null
                 }
             }
-            return await commitImportedModuleData(importData)
+            return await commitImportedModuleData(importData, { kind: 'module' })
         }
         // importData.type === 'risu' in conflict with HypaV3 preset exports
         // difference: record vs. array
@@ -477,7 +486,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 lorebook: lores,
                 id: v4(),
             }
-            return await commitImportedModuleData(importModule)
+            return await commitImportedModuleData(importModule, { kind: 'module-from-lorebook' })
         }
         if (importData.entries) {
             const lores: loreBook[] = convertExternalLorebook(
@@ -491,7 +500,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 lorebook: lores,
                 id: v4(),
             }
-            return await commitImportedModuleData(importModule)
+            return await commitImportedModuleData(importModule, { kind: 'module-from-lorebook' })
         }
         if (importData.type === 'regex' && importData.data) {
             const regexs: customscript[] = importData.data
@@ -502,18 +511,18 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 regex: regexs,
                 id: v4(),
             }
-            return await commitImportedModuleData(importModule)
+            return await commitImportedModuleData(importModule, { kind: 'module' })
         }
     } catch (error) {
         console.error(error)
         if (error instanceof StdioModuleImportError) {
             alertError(error)
-            return false
+            return null
         }
     }
 
     alertNormal(language.errors.noData)
-    return false
+    return null
 }
 
 function getModuleById(id:string){

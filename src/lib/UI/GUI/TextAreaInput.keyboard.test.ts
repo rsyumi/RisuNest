@@ -19,6 +19,8 @@ vi.mock('src/ts/stores.svelte', async () => {
     return {
         DBState: { db: { hotkeys: [{ action: 'popupEditor', key: '.', ctrl: true }] } },
         disableHighlight: writable(false),
+        settingsOpen: writable(false), MobileGUI: writable(false), MobileGUIStack: writable(0),
+        MobileSideBar: writable(0), selectedCharID: writable(0),
     }
 })
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'web', os: 'windows' }))
