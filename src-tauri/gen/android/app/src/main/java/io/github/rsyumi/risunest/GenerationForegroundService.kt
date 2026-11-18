@@ -281,11 +281,15 @@ internal class BackgroundTaskRegistry(
 private const val PAGE_KEPT_ACTIVE_RELEASE_DELAY_MILLIS = 2_000L
 // A few seconds past the release, so holds that hidden handlers begin join the running service.
 private const val PAGE_KEPT_SERVICE_LINGER_MILLIS = 5_000L
+// Several times the few seconds a launch takes to reach its startup sync hold.
+private const val PAGE_KEPT_LAUNCH_MILLIS = 15_000L
 
 /**
  * Decides when the WebView keeps the page running off screen, so Chromium does not freeze background work.
  * It starts only while the activity is resumed, so a hold the page begins after it went hidden off screen cannot
  * make it visible again, and it ends a moment after the last hold, so work that follows at once stays covered.
+ * A launch counts as held until its first hold or for a short window, so leaving before the startup work holds
+ * anything keeps the page as leaving during that work does.
  * Off screen, the service stays up from the last hold until a moment after the release, since the app cannot start
  * it again from the background; [keepService] returns what lets it stop, or null when no service runs. A page that was
  * never kept, because its holds began off screen, keeps the service for the same moment after each last hold.
@@ -297,10 +301,13 @@ internal class PageKeptActivePolicy(
   private val removeCallbacks: (Runnable) -> Unit,
   private val releaseDelayMillis: Long = PAGE_KEPT_ACTIVE_RELEASE_DELAY_MILLIS,
   private val serviceLingerMillis: Long = PAGE_KEPT_SERVICE_LINGER_MILLIS,
+  private val launchMillis: Long = PAGE_KEPT_LAUNCH_MILLIS,
 ) {
   private var held = false
   private var resumed = false
   private var kept = false
+  private var launching = true
+  private var launchTimed = false
   private var serviceKept: (() -> Unit)? = null
   private val letServiceStop = Runnable {
     serviceKept?.invoke()
@@ -310,9 +317,17 @@ internal class PageKeptActivePolicy(
     if (!held) keep(false)
     postDelayed(letServiceStop, serviceLingerMillis)
   }
+  private val launched = Runnable {
+    launching = false
+    update()
+  }
 
   fun onHeldChanged(held: Boolean) {
     this.held = held
+    if (held && launching) {
+      launching = false
+      removeCallbacks(launched)
+    }
     update()
     if (held || kept || resumed) return
     if (serviceKept == null) serviceKept = keepService()
@@ -323,6 +338,10 @@ internal class PageKeptActivePolicy(
 
   fun onResumedChanged(resumed: Boolean) {
     this.resumed = resumed
+    if (resumed && launching && !launchTimed) {
+      launchTimed = true
+      postDelayed(launched, launchMillis)
+    }
     update()
   }
 
@@ -332,7 +351,7 @@ internal class PageKeptActivePolicy(
       removeCallbacks(letServiceStop)
       letServiceStop.run()
     }
-    if (held) {
+    if (held || launching) {
       if (resumed) keep(true)
     } else if (kept) {
       if (!resumed && serviceKept == null) serviceKept = keepService()

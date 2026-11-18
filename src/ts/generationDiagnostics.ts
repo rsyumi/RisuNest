@@ -66,12 +66,16 @@ export interface GenerationListenerPayloadDiagnostic {
     messageCharacters?: number
 }
 
-/** One external sync receive or publish run: pages received or segments published, and how it ended. */
+/**
+ * One external sync receive or publish run: pages received or segments published, and how it ended.
+ * A failed run that cannot tell how much it finished leaves `count` and `more` out.
+ */
 export interface SyncRunDiagnostic {
     operation: 'receive' | 'publish'
-    count: number
-    more: boolean
+    count?: number
+    more?: boolean
     outcome: 'complete' | 'failed' | 'cancelled'
+    durationMs: number
 }
 
 export interface GenerationDiagnosticTrace {
@@ -183,7 +187,7 @@ export function createGenerationDiagnostics(options: { enabled: boolean; invoke:
         },
         /** Native code keeps only the runs made while the app is off screen. */
         syncRun(value: SyncRunDiagnostic): void {
-            send({ kind: 'sync-run', target: 'external', operation: value.operation, count: value.count, more: value.more, outcome: value.outcome })
+            send({ kind: 'sync-run', target: 'external', operation: value.operation, count: value.count, more: value.more, outcome: value.outcome, durationMs: Math.max(0, Math.round(value.durationMs)) })
         },
     }
 }

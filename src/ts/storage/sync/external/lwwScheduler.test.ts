@@ -9,9 +9,10 @@ function fixture(withMaintenance = false) {
     const failed = vi.fn()
     const maintain = vi.fn(async () => {})
     const checkFormat = vi.fn(async () => {})
+    const busy = vi.fn()
     let available = true
-    const scheduler = createLwwScheduler({ available: () => available, publish, receive, failed, maintain: withMaintenance ? maintain : undefined, checkFormat, now: () => Date.now() })
-    return { scheduler, publish, receive, failed, maintain, checkFormat, unavailable: () => { available = false } }
+    const scheduler = createLwwScheduler({ available: () => available, publish, receive, failed, maintain: withMaintenance ? maintain : undefined, checkFormat, busy, now: () => Date.now() })
+    return { scheduler, publish, receive, failed, maintain, checkFormat, busy, unavailable: () => { available = false } }
 }
 /** Starting publishes whatever a previous session left; the edits below are counted after it. */
 async function started(f: ReturnType<typeof fixture>) {
@@ -334,12 +335,21 @@ describe('bounded LWW ownership under latency', () => {
     it('blocks unchanged remediation failures until recovery, including across ordinary resume', async () => {
         const f = fixture(); await started(f)
         f.publish.mockRejectedValueOnce({ kind: 'reauthRequired' })
-        f.scheduler.dirty(true); await f.scheduler.settled()
+        f.receive.mockRejectedValueOnce({ kind: 'reauthRequired' })
+        f.scheduler.dirty(true); void f.scheduler.conversationOpened(); await f.scheduler.settled()
+        expect(f.receive).toHaveBeenCalledTimes(2)
+        // Blocked work stays pending, but stops holding background time while it waits for recovery.
+        expect(f.busy).toHaveBeenLastCalledWith(false)
         for (let i = 0; i < 20; i++) { f.scheduler.dirty(true); await vi.advanceTimersByTimeAsync(20_000) }
         f.scheduler.stop(); await f.scheduler.resumeForeground()
         expect(f.publish).toHaveBeenCalledTimes(1)
+        expect(f.receive).toHaveBeenCalledTimes(2)
+        expect(f.busy).toHaveBeenLastCalledWith(false)
+        f.busy.mockClear()
         f.scheduler.recovered(); await f.scheduler.settled()
         expect(f.publish).toHaveBeenCalledTimes(2)
+        expect(f.receive).toHaveBeenCalledTimes(3)
+        expect(f.busy.mock.calls).toEqual([[true], [false]])
         f.scheduler.stop()
     })
     it('rechecks a library format block on each sync trigger, follows the kind it reports, and resumes once the level matches', async () => {

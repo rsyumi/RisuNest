@@ -26,6 +26,7 @@ export const openedImportResult = writable(null)
 export const keepFocusedInputVisible = () => {}, restoreFocusAfterInputBlock = () => {}
 export { modalNavigation, backNavigationLayer, handleRootBack } from '../../src/ts/ui/modalNavigation'
 export const textEditorPopup = { request: null }
+export const folderManager = { folderId: null, draft: null }
 
 let failingRoute = ''
 let attempts = 0
