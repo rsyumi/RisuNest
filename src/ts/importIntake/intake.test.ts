@@ -110,6 +110,7 @@ import {
     runSharedNativeFileOperation,
     type NativeFileOperationOutcome,
 } from '../storage/nativeFileJobManager'
+import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
 import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'
 import { loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
 import { handleAppDrop } from './drop'
@@ -241,14 +242,21 @@ describe('one dropped file', () => {
     it('alerts the name and the reason of a file it cannot import', async () => {
         classify('photo.jpg', { kind: 'unsupported', refusal: 'plain-jpeg' })
         classify('huge.json', { kind: 'unsupported', refusal: 'too-large' })
+        const hugePlugin = dropped('huge.js', '//@name synthetic_huge\n//@api 3.0\n')
+        Object.defineProperty(hugePlugin, 'size', { value: MAX_CONTENT_METADATA_BYTES + 1 })
+        const readHugePlugin = vi.spyOn(hugePlugin, 'text')
         await submitImportDelivery(drop(dropped('photo.jpg')))
         await submitImportDelivery(drop(dropped('notes.txt')))
         await submitImportDelivery(drop(dropped('huge.json')))
+        await submitImportDelivery(drop(hugePlugin))
         expect(mocks.alertError.mock.calls).toEqual([
             [`photo.jpg\n${language.risuNest.importDialog.reasonPlainJpeg}`],
             [`notes.txt\n${language.risuNest.importDialog.reasonUnsupportedFormat}`],
             [`huge.json\n${failureReason('payload-too-large', 'import', 'content')}`],
+            [`huge.js\n${failureReason('payload-too-large', 'import', 'content')}`],
         ])
+        expect(readHugePlugin).not.toHaveBeenCalled()
+        expect(get(pluginInstallDialog)).toBeNull()
         // A file of an unknown extension is never copied or read.
         expect(mocks.classifyRequests.flat().map(({ displayName }) => displayName)).toEqual(['photo.jpg', 'huge.json'])
         expect(outcomes).toEqual([])

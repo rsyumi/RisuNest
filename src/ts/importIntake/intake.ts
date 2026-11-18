@@ -6,6 +6,7 @@ import { isAppLockInputBlocked, waitForAppLockInputUnblocked } from '../appLock/
 import { isTauri } from '../platform'
 import { DBState, loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
 import { AndroidSafSourceError } from '../storage/androidSafBridge'
+import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
 import { presentFileOperationError } from '../storage/fileOperationErrorPresentation'
 import { copyFileToContentInbox, openContentInbox } from '../storage/nativeContentFile'
 import {
@@ -260,9 +261,7 @@ function classifierRefusal(result: NativeImportIntakeClassification | undefined)
     if (!result || result.refusal === 'read-failed') {
         return { code: 'read-failed', error: new NativeFileJobError('source-read-failed', result?.message ?? '') }
     }
-    if (result.refusal === 'too-large') {
-        return { code: 'read-failed', error: new NativeFileJobError('payload-too-large', 'JSON file exceeds the import limit', [], 'content') }
-    }
+    if (result.refusal === 'too-large') return tooLargeRefusal()
     return { code: result.kind === 'unsupported' && result.refusal ? result.refusal : 'unsupported-format' }
 }
 
@@ -287,9 +286,15 @@ function classifiedItem(
     return { ...known, kind: result.kind }
 }
 
+/** A file over the import limit, refused before it is read. */
+function tooLargeRefusal(): ImportIntakeRefusal {
+    return { code: 'read-failed', error: new NativeFileJobError('payload-too-large', 'File exceeds the import limit', [], 'content') }
+}
+
 async function readPluginCandidate(item: Omit<ImportIntakeItem, 'kind'>, file: File): Promise<ImportIntakeItem> {
     const isTypescript = lowercaseExtension(file.name) === 'ts'
     const candidate = { ...item, format: isTypescript ? 'ts' as const : 'js' as const }
+    if (file.size > MAX_CONTENT_METADATA_BYTES) return { ...candidate, kind: 'unsupported', refusal: tooLargeRefusal() }
     try {
         const code = await file.text()
         const inspected = inspectPluginFile(file.name, code, isTypescript)
