@@ -715,6 +715,7 @@ final class NativeUITests: XCTestCase {
         let cardPredicate = NSPredicate(format: "identifier CONTAINS %@ OR label == %@", "io.github.rsyumi.risunest.ios.bench", "RisuNest iOS Bench")
         // Preview hiding with the lock off, a return before the one-minute limit, and an immediate lock,
         // first under Notification Center and then from the app switcher.
+        var inactiveOnly: [String] = []
         for step in ["preview", "timed", "immediate", "switcher-immediate", "switcher-timed", "switcher-preview"] {
             let ready = texts["app-lock-inactive-\(step)-ready"]
             XCTAssertTrue(ready.waitForExistence(timeout: 90), "\(step) step did not start")
@@ -736,8 +737,11 @@ final class NativeUITests: XCTestCase {
             screen.name = "app-lock-inactive-\(step)-away"
             screen.lifetime = .keepAlways
             add(screen)
-            // Recorded rather than asserted: whether this departure stays inactive depends on the iOS version.
-            print("RISUNEST_APP_LOCK_INACTIVE step=\(step) away_state=\(app.state.rawValue)")
+            // Whether a departure stays inactive depends on the iOS version, so each one is recorded and
+            // the test fails below only when none of them left the app in the foreground.
+            let awayState = app.state
+            print("RISUNEST_APP_LOCK_INACTIVE step=\(step) away_state=\(awayState.rawValue)")
+            if awayState == .runningForeground { inactiveOnly.append(step) }
             if switcher {
                 // Other apps in the switcher move the app's card off the middle, so the largest element
                 // that names the app is the card. Its left part is on screen wherever the card sits.
@@ -794,6 +798,8 @@ final class NativeUITests: XCTestCase {
             traceAttachment.lifetime = .keepAlways
             add(traceAttachment)
         }
+        print("RISUNEST_APP_LOCK_INACTIVE inactive_only=\(inactiveOnly.joined(separator: ","))")
+        XCTAssertFalse(inactiveOnly.isEmpty, "No departure left the app in the foreground, so none was inactive only")
         XCTAssertEqual(app.webViews.textViews["Retained synthetic draft"].value as? String, "retained synthetic draft 123456")
         attachScreenshot(app, name: "app-lock-inactive-retained-draft")
     }
