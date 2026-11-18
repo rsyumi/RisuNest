@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mount, unmount } from 'svelte'
+import { flushSync, mount, unmount } from 'svelte'
 import type { Chat, Message } from 'src/ts/storage/database.svelte'
 import { attachHistoryWindow } from 'src/ts/process/historyWindowIndex'
 import ChatBindingLifecycle from './ChatBindingLifecycle.svelte'
-import { DBState } from 'src/ts/stores.svelte'
+import { DBState, selectedCharID } from 'src/ts/stores.svelte'
+import { doingChat } from 'src/ts/process/generationState'
 
 const mocks = vi.hoisted(() => ({
     windowed: true,
@@ -11,6 +12,8 @@ const mocks = vi.hoisted(() => ({
     openWindow: vi.fn(),
     flush: vi.fn(async () => {}),
     error: vi.fn(),
+    // The preset binding the effect last applied, resolved as the database module does.
+    bound: undefined as string | null | undefined,
 }))
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
@@ -20,6 +23,9 @@ vi.mock('src/ts/stores.svelte', async () => {
 vi.mock('src/ts/storage/database.svelte', () => ({
     flushEffectiveToggleEdits: () => {},
     deriveEffectiveToggleVariables: () => {},
+    applyConversationPresetBinding: async (_db: unknown, chat: Chat | undefined) => {
+        mocks.bound = chat?.promptPresetId || null
+    },
 }))
 vi.mock('src/ts/storage/conversationResidency', () => ({ isConversationSummaryStub: () => false }))
 vi.mock('src/ts/process/index.svelte', () => ({
@@ -72,11 +78,14 @@ beforeEach(() => {
     mocks.openWindow.mockReset()
     mocks.flush.mockClear()
     mocks.error.mockReset()
+    mocks.bound = undefined
 })
 
 afterEach(() => {
     if (instance) unmount(instance)
     instance = undefined
+    doingChat.set(false)
+    selectedCharID.set(0)
 })
 
 it('recovers an interrupted reroll over the tail without loading the conversation', async () => {
@@ -142,4 +151,36 @@ it('recovers over the complete conversation when the loading limit does not appl
     expect(shell().message.map((entry) => entry.data).slice(-2)).toEqual(['m98', 'original'])
     expect(shell().rerollRecovery).toBeUndefined()
     expect(mocks.flush).toHaveBeenCalledWith('recover-reroll')
+})
+
+it('applies the selected conversation preset binding, holding it while a request runs', () => {
+    const chat = (id: string, promptPresetId: string) => ({ id, name: id, note: '', localLore: [], message: [], promptPresetId })
+    DBState.db = {
+        botPresets: [{ id: 'preset-b', name: 'B', mainPrompt: 'B' }],
+        characters: [{ chaId: 'character', chatPage: 0, chats: [chat('bound', 'preset-b'), chat('plain', '')] }],
+    } as never
+    instance = mount(ChatBindingLifecycle, { target: document.body })
+    flushSync()
+    expect(mocks.bound).toBe('preset-b')
+
+    DBState.db.characters[0].chatPage = 1
+    flushSync()
+    expect(mocks.bound).toBeNull()
+
+    // The request keeps the preset of the conversation it generates for.
+    doingChat.set(true)
+    DBState.db.characters[0].chatPage = 0
+    flushSync()
+    expect(mocks.bound).toBeNull()
+    doingChat.set(false)
+    flushSync()
+    expect(mocks.bound).toBe('preset-b')
+
+    DBState.db.characters[0].chats[0].promptPresetId = ''
+    flushSync()
+    expect(mocks.bound).toBeNull()
+    DBState.db.characters[0].chats[0].promptPresetId = 'preset-b'
+    selectedCharID.set(-1)
+    flushSync()
+    expect(mocks.bound).toBeNull()
 })
