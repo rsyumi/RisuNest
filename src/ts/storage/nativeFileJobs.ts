@@ -1,3 +1,4 @@
+import type { AlertConfirmDetail } from '../alert'
 import type { PortraitRenditionDescriptor } from './characterPortraitRendition'
 import type { ExportExclusions } from './exportExcludedReport'
 import type { OfficialAccountAssetProgress } from './sync/officialAccountAssetOutcome'
@@ -628,6 +629,8 @@ export interface NativeIncompleteRestorePreview {
 
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
     confirmationWarnings?: string[]
+    /** Rows naming the restored file in the replacement confirmation. */
+    confirmationDetails?: AlertConfirmDetail[]
     /** The restore began as an onboarding import; an unbound device needs no overwrite acknowledgement. */
     firstRun?: boolean
     holdServerSyncAfterRestore?: boolean
@@ -1614,7 +1617,7 @@ async function runNativeReplacementRestore(
                                 if (count > 0) warnings.push(language.portableBackup.omittedRestoreData[key](count))
                             }
                         }
-                        if (!(await confirmUpstreamLibraryReplacement(upstreamBinding.bound, warnings, options))) {
+                        if (!(await confirmUpstreamLibraryReplacement(upstreamBinding.bound, warnings, {firstRun: options.firstRun, details: options.confirmationDetails}))) {
                             cancellationRequested = true
                             await invokeNative(dependencies, 'native_file_job_cancel', {jobId:started.jobId})
                             continue

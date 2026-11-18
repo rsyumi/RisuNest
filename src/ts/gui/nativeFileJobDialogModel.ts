@@ -194,6 +194,14 @@ export function formatBytes(bytes: number): string {
     return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`
 }
 
+/** The kind of backup file, as the native backup format probe reports it. */
+export function backupKindLabel(format: 'portable' | 'block-risu-save' | 'local-backup'): string {
+    const copy = language.risuNest.importIntake
+    return format === 'portable' ? copy.kindBackupPortable
+        : format === 'block-risu-save' ? copy.kindBackupRisuSave
+        : copy.kindBackupLocal
+}
+
 export function formatElapsed(milliseconds: number): string {
     const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000))
     const seconds = totalSeconds % 60

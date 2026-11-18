@@ -195,6 +195,12 @@ export async function alertSelectChar(){
     })
 }
 
+/** A labelled value shown under a confirmation's description. */
+export interface AlertConfirmDetail {
+    label: string
+    value: string
+}
+
 export interface AlertCheckboxConfirmOptions {
     title: string
     description: string
@@ -202,6 +208,7 @@ export interface AlertCheckboxConfirmOptions {
     actionLabel: string
     cancelLabel: string
     requireChecked: boolean
+    details?: AlertConfirmDetail[]
 }
 
 export interface AlertCheckboxConfirmResult {
@@ -226,6 +233,7 @@ export interface AlertActionConfirmOptions {
     description: string
     actionLabel: string
     cancelLabel: string
+    details?: AlertConfirmDetail[]
 }
 
 /** The checkbox confirmation without a checkbox, for a choice whose two answers need their own labels. */
