@@ -273,8 +273,17 @@ describe('iOS deferred holds', () => {
             // The app left before the page heard the departure, so only the expiry of its assertion arrives.
             show('hidden'); lifecycle({ event: 'expired', id: 'background-entry' })
             expect(second.signal?.reason).toBeInstanceOf(BackgroundExecutionExpiredError)
+            await second.dispose()
+            // Back on screen and away again: work that runs now ends with the new departure's assertion, not the old one's.
+            show('visible')
+            const third = await beginDeferredMobileBackgroundTask('sync')
+            show('hidden'); lifecycle({ event: 'background', id: 'next-entry' })
+            lifecycle({ event: 'expired', id: 'earlier-entry' })
+            expect(third.signal?.aborted).toBe(false)
+            lifecycle({ event: 'expired', id: 'next-entry' })
+            expect(third.signal?.reason).toBeInstanceOf(BackgroundExecutionExpiredError)
+            await third.dispose()
         } finally { show('visible'); await own.dispose() }
-        await second.dispose()
         await vi.waitFor(() => expect(settled).toHaveBeenCalledOnce())
         expect(bridge.begin).not.toHaveBeenCalled()
     })

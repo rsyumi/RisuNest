@@ -4,7 +4,7 @@ import { trackAbortListeners, withoutAbortSignalAny } from '../../../../../tests
 import type { BindingContext, SyncBindingTransport } from '../bindingFlow'
 import type { ExternalStorageState } from './types'
 const fixture = vi.hoisted(() => ({
-    native: true,
+    native: true, os: 'windows' as 'windows' | 'android' | 'ios',
     invoke: vi.fn(), listen: vi.fn(), state: vi.fn(), apply: vi.fn(), flush: vi.fn(), outbox: vi.fn(), storageMutation: vi.fn(), resumeCurrent: vi.fn(), download: vi.fn(),
     registrations: new Map<string, SyncBindingTransport>(), viewport: undefined as undefined | ((source: unknown) => void),
     revision: undefined as undefined | ((revision: number, cause: string) => void),
@@ -12,7 +12,7 @@ const fixture = vi.hoisted(() => ({
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: fixture.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: fixture.listen }))
-vi.mock('../../../platform', async () => (await import('../../../platform.testSupport')).platformModule(() => ({ runtime: fixture.native ? 'tauri' : 'web', os: 'windows' })))
+vi.mock('../../../platform', async () => (await import('../../../platform.testSupport')).platformModule(() => ({ runtime: fixture.native ? 'tauri' : 'web', os: fixture.os })))
 vi.mock('../../../mobileBackgroundTask', async () => (await import('../../../mobileBackgroundTask.testSupport')).mobileBackgroundTaskModule())
 vi.mock('../../../generationDiagnostics', async (importOriginal) => (await import('../../../process/tests/sendChatTestHarness'))
     .generationDiagnosticsModule(await importOriginal<typeof import('../../../generationDiagnostics')>(), fixture.diagnostic))
@@ -35,7 +35,7 @@ const state = (providers = ['webdav']): ExternalStorageState => ({ connections: 
 let dispose: (() => void) | undefined
 withoutAbortSignalAny()
 beforeEach(() => {
-    vi.useFakeTimers(); fixture.native = true; fixture.registrations.clear()
+    vi.useFakeTimers(); fixture.native = true; fixture.os = 'windows'; fixture.registrations.clear()
     fixture.invoke.mockReset(); fixture.invoke.mockImplementation(async command => command === 'external_lww_receive' ? null : command === 'external_lww_publish' ? { segments: '0', more: false } : undefined)
     fixture.state.mockResolvedValue(binding); fixture.listen.mockResolvedValue(() => {})
     fixture.resumeCurrent.mockReset(); fixture.resumeCurrent.mockImplementation(async target => { const current = await fixture.state(); await fixture.registrations.get(target.connectionId)!.resumeBinding({ state: current, signal: new AbortController().signal }) })
@@ -791,33 +791,80 @@ describe('bounded production calls and lifecycle ownership', () => {
             await whileWaiting(release, () => expect(held()).toBe(1))
             expect(held()).toBe(0)
         })
+        // Every hold that has not ended expires at once; one that begins afterwards is refused and never expires.
+        const expiringHolds = () => {
+            const held = new Set<AbortController>()
+            let expired = false
+            vi.mocked(beginDeferredMobileBackgroundTask).mockImplementation((): MobileBackgroundTask => {
+                const controller = new AbortController()
+                if (expired) return { signal: controller.signal, protection: { state: 'refused', reason: 'background' }, progress() {}, async dispose() {} }
+                held.add(controller)
+                return { signal: controller.signal, protection: { state: 'deferred' }, progress() {}, async dispose() { held.delete(controller) } }
+            })
+            return () => { expired = true; for (const controller of held) controller.abort(new BackgroundExecutionExpiredError()) }
+        }
+        const show = (value: 'hidden' | 'visible') => { Object.defineProperty(document, 'visibilityState', { configurable: true, value }); document.dispatchEvent(new Event('visibilitychange')) }
+        // Android's own start, which a page it keeps running off screen hears without becoming visible again.
+        const returnToApp = () => window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
+        // Lets routine sync run, then tells whether it sent, received and downloaded since the last check.
+        const synced = async () => {
+            for (let i = 0; i < 6; i++) await settle()
+            await vi.advanceTimersByTimeAsync(600_000)
+            const commands = fixture.invoke.mock.calls.map(([command]) => command)
+            const ran = commands.some(command => command === 'external_lww_publish' || command === 'external_lww_receive') && fixture.download.mock.calls.length > 0
+            fixture.invoke.mockClear(); fixture.download.mockClear()
+            return ran
+        }
         it.each([
-            ['the start', false],
-            ['the start', true],
-            ['the return to the screen', false],
-            ['a cancelled exit', false],
-        ] as const)('starts routine sync after %s outlives its background time only if the app was away and back (away: %s)', async (entry, away) => {
-            const expiration = new AbortController()
-            vi.mocked(beginDeferredMobileBackgroundTask).mockImplementation((): MobileBackgroundTask => ({ signal: expiration.signal, progress() {}, async dispose() {} }))
-            const show = (value: 'hidden' | 'visible') => { Object.defineProperty(document, 'visibilityState', { configurable: true, value }); document.dispatchEvent(new Event('visibilitychange')) }
+            ['the start', 'kept away'],
+            ['the return to the screen', 'kept away'],
+            ['a cancelled exit', 'kept away'],
+            ['the start', 'kept away before the binding resumes'],
+            ['the start', 'back and kept away again'],
+            ['the start', 'hidden away'],
+            ['the start', 'back before the expiry arrives'],
+        ] as const)('holds routine sync after %s outlives its background time until the app returns (%s)', async (entry, order) => {
+            const android = order !== 'hidden away' && order !== 'back before the expiry arrives'
+            fixture.os = android ? 'android' : 'ios'
+            const expire = expiringHolds()
             if (entry !== 'the start') { dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle() }
             if (entry === 'the return to the screen') { show('hidden'); for (let i = 0; i < 6; i++) await settle() }
             const drain = entry === 'a cancelled exit' ? externalLwwExitDrain('sync', 'selection')! : undefined
             await drain?.cancel('cancel-exit')
             fixture.invoke.mockClear(); fixture.download.mockClear()
             const release = gate('external_lww_resume')
+            // The binding check before the transport resumes still waits when the start's hold expires.
+            let checked!: () => void
+            const checking = new Promise<void>(resolve => { checked = resolve })
+            if (order === 'kept away before the binding resumes') {
+                const resume = fixture.resumeCurrent.getMockImplementation()!
+                fixture.resumeCurrent.mockImplementation(async target => { await checking; await resume(target) })
+            } else checked()
             const resumed = entry === 'the start' ? installExternalLwwAdapters(state()).then(value => { dispose = value })
-                : drain ? drain.resumeAfterExitCancel!() : show('visible')
+                : drain ? drain.resumeAfterExitCancel!() : (returnToApp(), show('visible'))
             await settle()
-            // A page Android keeps running off screen stays visible; a page that was hidden and is visible again is back on screen.
-            if (away) { show('hidden'); show('visible') }
-            expiration.abort(new BackgroundExecutionExpiredError()); release(); await resumed
-            for (let i = 0; i < 6; i++) await settle()
-            await vi.advanceTimersByTimeAsync(600_000)
-            const commands = fixture.invoke.mock.calls.map(([command]) => command)
-            expect(commands).toContain('external_lww_resume')
-            expect(commands.filter(command => command === 'external_lww_publish' || command === 'external_lww_receive').length > 0).toBe(away)
-            expect(fixture.download.mock.calls.length > 0).toBe(away)
+            // The app leaves with the page kept running and visible, unless it went hidden first.
+            if (order === 'back and kept away again') { show('hidden'); returnToApp(); show('visible') }
+            if (order === 'back before the expiry arrives') { show('hidden'); show('visible') }
+            else if (order === 'hidden away') show('hidden')
+            expire(); checked(); release(); await resumed
+            if (order !== 'back before the expiry arrives') {
+                expect(await synced()).toBe(false)
+                if (android) returnToApp(); else show('visible')
+            }
+            expect(await synced()).toBe(true)
+        })
+        it('keeps routine sync stopped after its own hold expires away, also when the network returns, until the app returns', async () => {
+            fixture.os = 'android'
+            const expire = expiringHolds()
+            dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle()
+            const release = gate('external_lww_receive')
+            fixture.revision!(13, 'local'); await vi.advanceTimersByTimeAsync(600_000)
+            expire(); release(); await synced()
+            window.dispatchEvent(new Event('online'))
+            expect(await synced()).toBe(false)
+            returnToApp()
+            expect(await synced()).toBe(true)
         })
         it('while a cancelled exit waits to resume sync', async () => {
             const held = track()
