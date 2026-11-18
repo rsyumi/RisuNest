@@ -50,7 +50,7 @@ import {
     setUsingSw
 } from "./globalApi.svelte";
 import { isTauri, isTauriAndroid, isTauriDesktop, isTauriIOS } from "./platform";
-import { expireMobileDeferredHolds, mobileDeferredHoldsSettled } from "./mobileBackgroundTask";
+import { mobileDeferredHoldsSettled } from "./mobileBackgroundTask";
 import { setGenerationBackground } from "./process/generationState";
 import { beginGenerationBackground } from "./process/generationBackground";
 import { registerModelDynamic } from "./model/modellist";
@@ -962,7 +962,6 @@ export async function loadData() {
           schedulePeriodicNativeSnapshot();
           installIOSPersistenceLifecycle((reason) => flushLifecycle(reason, true), {
             settled: mobileDeferredHoldsSettled,
-            expire: expireMobileDeferredHolds,
           });
         }
         if (!excluded('modules')) moduleUpdate()
