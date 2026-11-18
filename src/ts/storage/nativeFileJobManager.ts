@@ -229,7 +229,8 @@ function backgroundTaskPercent({ kind, phase, progress, detail }: NativeFileJobS
         ? measuredTaskPercent(detail.stageCompleted, detail.stageTotal) : percent
 }
 
-function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFileOperationError {
+/** The code and message a failed operation or batch file reports for `error`. */
+export function outcomeError(kind: NativeFileOperationKind, error: unknown): NativeFileOperationError {
     if (error instanceof NativeFileJobActivationCommittedError || error instanceof NativeFileJobActivationUnresolvedError) {
         const cause = error.cause
         return {
