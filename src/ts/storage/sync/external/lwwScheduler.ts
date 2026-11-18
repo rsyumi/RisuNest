@@ -15,7 +15,7 @@ export interface LwwSchedulerDependencies {
     turnLimit?: number
     setTimer?(callback: () => void, delay: number): unknown
     clearTimer?(timer: unknown): void
-    /** Reports whether work is running, waiting, or due without a new check. */
+    /** Reports whether work is running, waiting, or due without a new check; work a stop blocks is not due. */
     busy?(busy: boolean): void
     /** Reports whether the last receive left changes to receive, so the next one follows at once. */
     catchingUp?(catchingUp: boolean): void
@@ -86,7 +86,7 @@ export function createLwwScheduler(dependencies: LwwSchedulerDependencies) {
             dependencies.catchingUp?.(catchingUp)
         }
         const busy = !!inFlight || !!maintenance || !!rechecking || waiting.size > 0
-            || enabled && (receivePending || !hidden && dirtyVersion !== coveredVersion)
+            || enabled && (receivePending && !blocked.has('receive') || !hidden && hasPublish() && !blocked.has('publish'))
         if (busy === reportedBusy) return
         reportedBusy = busy
         dependencies.busy?.(busy)

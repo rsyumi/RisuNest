@@ -791,6 +791,34 @@ describe('bounded production calls and lifecycle ownership', () => {
             await whileWaiting(release, () => expect(held()).toBe(1))
             expect(held()).toBe(0)
         })
+        it.each([
+            ['the start', false],
+            ['the start', true],
+            ['the return to the screen', false],
+            ['a cancelled exit', false],
+        ] as const)('starts routine sync after %s outlives its background time only if the app was away and back (away: %s)', async (entry, away) => {
+            const expiration = new AbortController()
+            vi.mocked(beginDeferredMobileBackgroundTask).mockImplementation((): MobileBackgroundTask => ({ signal: expiration.signal, progress() {}, async dispose() {} }))
+            const show = (value: 'hidden' | 'visible') => { Object.defineProperty(document, 'visibilityState', { configurable: true, value }); document.dispatchEvent(new Event('visibilitychange')) }
+            if (entry !== 'the start') { dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle() }
+            if (entry === 'the return to the screen') { show('hidden'); for (let i = 0; i < 6; i++) await settle() }
+            const drain = entry === 'a cancelled exit' ? externalLwwExitDrain('sync', 'selection')! : undefined
+            await drain?.cancel('cancel-exit')
+            fixture.invoke.mockClear(); fixture.download.mockClear()
+            const release = gate('external_lww_resume')
+            const resumed = entry === 'the start' ? installExternalLwwAdapters(state()).then(value => { dispose = value })
+                : drain ? drain.resumeAfterExitCancel!() : show('visible')
+            await settle()
+            // A page Android keeps running off screen stays visible; a page that was hidden and is visible again is back on screen.
+            if (away) { show('hidden'); show('visible') }
+            expiration.abort(new BackgroundExecutionExpiredError()); release(); await resumed
+            for (let i = 0; i < 6; i++) await settle()
+            await vi.advanceTimersByTimeAsync(600_000)
+            const commands = fixture.invoke.mock.calls.map(([command]) => command)
+            expect(commands).toContain('external_lww_resume')
+            expect(commands.filter(command => command === 'external_lww_publish' || command === 'external_lww_receive').length > 0).toBe(away)
+            expect(fixture.download.mock.calls.length > 0).toBe(away)
+        })
         it('while a cancelled exit waits to resume sync', async () => {
             const held = track()
             dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle()

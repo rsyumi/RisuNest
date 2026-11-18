@@ -64,17 +64,25 @@ let refreshGeneration = 0
  * Holds sync work outside the scheduler, such as waiting to start or resume it. If the app leaves the screen during
  * the work, the page keeps running, so the scheduler starts on it and takes over the hold. Work that begins off
  * screen asks for the service at once; the page stays hidden, so only that work continues. `expired` aborts when the
- * hold's background time runs out.
+ * hold's background time runs out. `onScreen` tells whether the work may start routine sync: once the time runs out,
+ * only after the page was hidden at some point during the hold, since a page kept running off screen stays visible.
  */
-function holdThroughDeparture<T>(work: (expired: AbortSignal) => Promise<T>): Promise<T> {
+function holdThroughDeparture<T>(work: (expired: AbortSignal, onScreen: () => boolean) => Promise<T>): Promise<T> {
     const hold = beginDeferredMobileBackgroundTask('sync')
     const expiry = new AbortController()
+    let wasHidden = document.visibilityState === 'hidden'
+    const seen = () => { wasHidden ||= document.visibilityState === 'hidden' }
+    document.addEventListener('visibilitychange', seen)
     void Promise.resolve(hold).then(task => {
         const signal = task.signal
         if (signal?.aborted) expiry.abort(signal.reason)
         else signal?.addEventListener('abort', () => expiry.abort(signal.reason), { once: true })
     })
-    return work(expiry.signal).finally(() => { void Promise.resolve(hold).then(task => task.dispose()) })
+    const onScreen = () => foregroundAvailable() && (!expiry.signal.aborted || wasHidden)
+    return work(expiry.signal, onScreen).finally(() => {
+        document.removeEventListener('visibilitychange', seen)
+        void Promise.resolve(hold).then(task => task.dispose())
+    })
 }
 
 const receivedBodyReferences = (request: LwwStageReceive) => request.changes.some(change => {
@@ -292,7 +300,7 @@ function createAdapter(connectionId: string): Adapter {
             if ((cause as { name?: unknown } | null)?.name !== 'AbortError') reportFailure(connectionId, cause)
         },
         publishInitialSharedState: async binding => { await publish(binding, false) },
-        resumeBinding: binding => holdThroughDeparture(async () => {
+        resumeBinding: binding => holdThroughDeparture(async (_expired, onScreen) => {
             const generation = ++adapter.generation
             scheduler.stop()
             await Promise.all([scheduler.settled(), stopHydration()])
@@ -310,7 +318,7 @@ function createAdapter(connectionId: string): Adapter {
             active = binding
             adapter.state = binding.state
             scheduler.recovered()
-            if (foregroundAvailable()) { scheduler.start(); resumeHydration() }
+            if (onScreen()) { scheduler.start(); resumeHydration() }
         }),
         async fenceOldJobs(binding) {
             adapter.generation++
@@ -444,14 +452,14 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                 adapter.scheduler.pauseAutomatic()
                 const generation = adapter.generation
                 const authority = adapter.state.targetAuthority
-                adapter.foreground = holdThroughDeparture(async () => {
+                adapter.foreground = holdThroughDeparture(async (_expired, onScreen) => {
                     await adapter.scheduler.settled()
                     if (adapters.get(adapter.state?.target.kind === 'external' ? adapter.state.target.connectionId : '') !== adapter
                         || generation !== adapter.generation || document.visibilityState === 'hidden' || !navigator.onLine) return
                     const current = await native.state()
                     if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
                     await invoke('external_lww_resume', { connectionId: current.target.connectionId })
-                    if (generation === adapter.generation && foregroundAvailable()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
+                    if (generation === adapter.generation && onScreen()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
                 }).catch(() => {}).finally(() => {
                     adapter.foreground = undefined
                     if (generation !== adapter.generation && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
@@ -539,7 +547,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
             } catch (error) { return { kind: 'blocked', reason: (error as { kind?: string })?.kind ?? 'sync-unavailable' } }
         },
         async cancel() { adapter.generation++; adapter.scheduler.stop(); const hydration = adapter.stopHydration(); await invoke('external_lww_fence', { connectionId, newDevice: false }); await Promise.all([adapter.scheduler.settled(), hydration]) },
-        resumeAfterExitCancel: () => holdThroughDeparture(async () => {
+        resumeAfterExitCancel: () => holdThroughDeparture(async (_expired, onScreen) => {
             const generation = ++adapter.generation
             await adapter.scheduler.settled()
             if (adapters.get(connectionId) !== adapter || !adapter.state) return
@@ -548,7 +556,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
             if (generation !== adapter.generation || binding.target.kind !== 'external' || binding.target.connectionId !== connectionId
                 || binding.targetAuthority !== authority || binding.selectionEpoch !== selectionEpoch) return
             await invoke('external_lww_resume', { connectionId })
-            if (generation === adapter.generation && adapters.get(connectionId) === adapter && foregroundAvailable()) { adapter.scheduler.start(); adapter.resumeHydration() }
+            if (generation === adapter.generation && adapters.get(connectionId) === adapter && onScreen()) { adapter.scheduler.start(); adapter.resumeHydration() }
         }),
     }
 }
