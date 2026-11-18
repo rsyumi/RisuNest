@@ -59,7 +59,7 @@ describe('generation diagnostic boundary', () => {
             characterName: 'PRIVATE_CONTENT_CANARY',
         } as GenerationListenerPayloadDiagnostic)
         diagnostics.syncRun({
-            operation: 'receive', count: 2, more: true, outcome: 'complete', connectionId: 'PRIVATE_CONTENT_CANARY',
+            operation: 'receive', count: 2, more: true, outcome: 'complete', durationMs: 1234.6, connectionId: 'PRIVATE_CONTENT_CANARY',
         } as SyncRunDiagnostic)
         expect(JSON.stringify(events)).not.toContain('PRIVATE_CONTENT_CANARY')
         expect(events[1]).toMatchObject({ documentSequence: 3, generationSequence: 1, historyLimitMultiplier: 1.5 })
@@ -71,7 +71,7 @@ describe('generation diagnostic boundary', () => {
         })
         expect(events[4]).toEqual({
             kind: 'sync-run', documentSequence: 3, eventSequence: 4, target: 'external',
-            operation: 'receive', count: 2, more: true, outcome: 'complete',
+            operation: 'receive', count: 2, more: true, outcome: 'complete', durationMs: 1235,
         })
     })
 
