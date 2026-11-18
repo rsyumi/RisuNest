@@ -31,6 +31,8 @@ struct Session {
     receive_pages: VecDeque<String>,
     /// The last listing holds segments its pages stopped before.
     receive_more: bool,
+    /// A resume kept the pages queued, so the receive that finishes them lists again for what arrived meanwhile.
+    receive_relist: bool,
 }
 impl Session {
     fn new() -> Self {
@@ -44,6 +46,7 @@ impl Session {
             cancel: Cancellation::default(),
             receive_pages: VecDeque::new(),
             receive_more: false,
+            receive_relist: false,
         }
     }
 
@@ -53,6 +56,7 @@ impl Session {
         self.dependencies = None;
         self.receive_pages.clear();
         self.receive_more = false;
+        self.receive_relist = false;
         self.fresh_after = Instant::now();
     }
 
@@ -67,10 +71,12 @@ impl Session {
     }
 
     /// Starts again after the app returns or the binding resumes: new work takes `cancel` and the clock is read
-    /// again. The pages the last listing stored stay queued, so their segments are not read again.
+    /// again. The pages the last listing stored stay queued, so their segments are not read again, and the receive
+    /// that finishes them lists again.
     fn resume(&mut self, cancel: Cancellation) {
         self.cancel = cancel;
         self.fresh_after = Instant::now();
+        self.receive_relist = !self.receive_pages.is_empty();
         if let Some(engine) = self.engine.as_mut() {
             engine.invalidate_clock()
         }
@@ -638,9 +644,10 @@ async fn publish_round(
 
 /// One page per call: pages from the last listing come first, and a new
 /// listing runs on the next round after every page is finished. It runs at
-/// once while the last listing holds segments its batch stopped before, or
-/// with `complete_available`; then no page means none is available. Returns
-/// the page and whether this call recorded the sync time.
+/// once while the last listing holds segments its batch stopped before, after
+/// a resume kept pages queued, or with `complete_available`; then no page
+/// means none is available. Returns the page and whether this call recorded
+/// the sync time.
 async fn receive_page(
     store: &mut crate::persistent_store::PersistentStore,
     session: &mut Session,
@@ -650,13 +657,14 @@ async fn receive_page(
 ) -> Result<(Option<StageReceive>, bool)> {
     let mut finished = 0;
     loop {
-        let Session { engine, receive_pages: queue, receive_more: more, cancel, .. } = session;
+        let Session { engine, receive_pages: queue, receive_more: more, receive_relist: relist, cancel, .. } = session;
         let engine = engine.as_ref().ok_or_else(lww_segment::corrupt)?;
         let result = async {
             let mut page = next_receive_page(store, queue, authority, &mut finished)?;
             let recorded = page.is_none() && finished > 0 && !*more;
-            if page.is_none() && (finished == 0 || complete_available || *more) {
+            if page.is_none() && (finished == 0 || complete_available || *more || *relist) {
                 let batch = engine.receive_requests_cached(store, authority, checkpoints, cancel).await?;
+                *relist = false;
                 *more = batch.more;
                 *queue = batch.pages.into();
                 page = next_receive_page(store, queue, authority, &mut finished)?;
