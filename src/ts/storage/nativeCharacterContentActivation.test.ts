@@ -211,10 +211,12 @@ describe('prepared native character content activation', () => {
         expect(await create(null)).toEqual(mappedCharacter())
     })
 
-    it('lets the update offer install the character, update another or cancel the import', async () => {
+    it('lets the update offer install the character, update another or cancel the import before sealing', async () => {
         const cancelled = dependencies({ commitImport: vi.fn(async () => null) })
-        expect(await activatePreparedNativeCharacterContent(content, lifecycle(), cancelled)).toBeNull()
+        const cancelledSession = lifecycle()
+        expect(await activatePreparedNativeCharacterContent(content, cancelledSession, cancelled)).toBeNull()
         expect(cancelled.upsert).not.toHaveBeenCalled()
+        expect(cancelledSession.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
 
         const updated = dependencies({
             commitImport: vi.fn(async (character, commit) => {

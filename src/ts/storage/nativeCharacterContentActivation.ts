@@ -193,29 +193,29 @@ export async function activatePreparedNativeCharacterContent(
     if (!character) return null
 
     const assetAliases = preparedAliases(content)
-    throwIfAborted(signal)
-    const assetOwnerHead = await prepareAdditionalAssetOwnerHead(
-        character,
-        assetAliases,
-        lifecycle.prepareOwnerManifestAndSeal,
-    )
-    const commit = (value: character) => dependencies.upsert(
-        value.chaId,
-        'native-content-import',
-        () => value,
-        {
+    // Sealed only once the import commits, so a cancelled import releases what it prepared.
+    const commit = async (value: character) => {
+        throwIfAborted(signal)
+        const assetOwnerHead = await prepareAdditionalAssetOwnerHead(
+            value,
             assetAliases,
-            assetOwnerHeads: [assetOwnerHead],
-        },
-    )
+            lifecycle.prepareOwnerManifestAndSeal,
+        )
+        await dependencies.upsert(
+            value.chaId,
+            'native-content-import',
+            () => value,
+            {
+                assetAliases,
+                assetOwnerHeads: [assetOwnerHead],
+            },
+        )
+    }
     if (!dependencies.commitImport) {
         await commit(character)
         return { characterId: character.chaId }
     }
-    const characterId = await dependencies.commitImport(character, async (value) => {
-        throwIfAborted(signal)
-        await commit(value)
-    })
+    const characterId = await dependencies.commitImport(character, commit)
     return characterId ? { characterId } : null
 }
 

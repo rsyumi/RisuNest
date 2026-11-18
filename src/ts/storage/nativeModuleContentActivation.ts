@@ -90,15 +90,15 @@ export async function activatePreparedNativeModuleContent(
         const module = convertCharacterToModule(character)
         module.id = dependencies.createId()
         const assetAliases = preparedAliases(prepared)
-        signal?.throwIfAborted()
-        const head = await prepareAdditionalAssetOwnerHead(
-            character,
-            assetAliases,
-            lifecycle.prepareOwnerManifestAndSeal,
-        )
         let moduleId: string | null
         try {
             moduleId = await commitModule(dependencies, module, async (value) => {
+                signal?.throwIfAborted()
+                const head = await prepareAdditionalAssetOwnerHead(
+                    character,
+                    assetAliases,
+                    lifecycle.prepareOwnerManifestAndSeal,
+                )
                 signal?.throwIfAborted()
                 await dependencies.append(
                     {
