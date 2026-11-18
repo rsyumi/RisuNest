@@ -118,6 +118,7 @@ describe('Android bounded JSON compatibility replay', () => {
         expect(mocks.character).toHaveBeenCalledWith({
             name: source.displayName,
             data: new TextEncoder().encode(text),
+            quiet: true,
         })
     })
     it('accepts the bytes as a number array', async () => {

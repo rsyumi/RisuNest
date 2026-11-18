@@ -279,6 +279,22 @@ describe('character card additions', () => {
         expect(second).toEqual(first)
     })
 
+    it.each(['legacy', 'chara_card_v2'])('leaves the success notice of a %s JSON card to a caller that shows its own result', async format => {
+        const card = format === 'legacy'
+            ? { name: 'Synthetic', description: 'Description', first_mes: 'Hello' }
+            : { spec: format, spec_version: '2.0', data: {
+                name: 'Synthetic', description: 'Description', first_mes: 'Hello', personality: '', scenario: '',
+                mes_example: '', creator_notes: '', system_prompt: '', post_history_instructions: '',
+                alternate_greetings: [], tags: [], creator: '', character_version: '', extensions: {},
+            } }
+        const data = new TextEncoder().encode(JSON.stringify(card))
+        await importCharacterProcess({ name: 'synthetic.json', data, quiet: true })
+        expect(mocks.commitDetachedCharacter).toHaveBeenCalledOnce()
+        expect(mocks.alertNormal).not.toHaveBeenCalled()
+        await importCharacterProcess({ name: 'synthetic.json', data })
+        expect(mocks.alertNormal.mock.calls).toEqual([[language.importedCharacter]])
+    })
+
     it('preserves browser malformed-byte replacement in JSON cards', async () => {
         const prefix = new TextEncoder().encode('{"name":"')
         const suffix = new TextEncoder().encode('","description":"Synthetic","first_mes":"Hello"}')

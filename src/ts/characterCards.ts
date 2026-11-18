@@ -181,7 +181,7 @@ export async function importCharacterPathInOperation(
         nativeEnabled: () => nativeCharacterContentImportEnabled,
         nativeImport: (input) => importPreparedNativeCharacterContent({ ...input, displayName }, { signal: context.signal, onStatus: context.onStatus }),
         legacyImport: async ({ data }) => {
-            const importedIndex = await importCharacterProcess({ name: displayName, data })
+            const importedIndex = await importCharacterProcess({ name: displayName, data, quiet: true })
             return typeof importedIndex === 'number'
                 ? (getDatabase().characters[importedIndex]?.chaId ?? null)
                 : null
@@ -196,13 +196,20 @@ export async function importCharacterPathInOperation(
     return outcome.value
 }
 
+type CharacterCardSpecImporter = typeof importCharacterCardSpec
+
 export async function importCharacterProcess<T extends boolean = false>(f: {
     name: string
     data: Uint8Array | File | ReadableStream<Uint8Array>
     parsedJson?: ParsedImportJson
     lightningRealmImport?: boolean
     returnCharacter?: T //note That this option only works with v3 charx
+    /** Leaves the success notice to a caller that shows its own result. */
+    quiet?: boolean
 }): Promise<T extends true ? character | number | null : number | null> {
+    // Shadows the exported importer so every card branch below honours `quiet`.
+    const importCharacterCardSpec = ((...args: Parameters<CharacterCardSpecImporter>) =>
+        importCharacterCardSpecWithPolicy(args[0], args[1], args[2], args[3], args[4], args[5], undefined, !f.quiet)) as CharacterCardSpecImporter
     const fileName = f.name.split(/[\\/]/).at(-1) ?? f.name
     const separator = fileName.lastIndexOf('.')
     const extension =
@@ -250,7 +257,7 @@ export async function importCharacterProcess<T extends boolean = false>(f: {
                 convertOffSpecCards(da),
                 'import-character-card',
             )
-            alertNormal(language.importedCharacter)
+            if (!f.quiet) alertNormal(language.importedCharacter)
             return getDatabase().characters.findIndex(
                 (character) => character.chaId === importedId,
             ) as any
@@ -550,7 +557,7 @@ export async function importCharacterProcess<T extends boolean = false>(f: {
             convertOffSpecCards(charaData, imgp),
             'import-character-card',
         )
-        alertNormal(language.importedCharacter)
+        if (!f.quiet) alertNormal(language.importedCharacter)
         return getDatabase().characters.findIndex(
             (character) => character.chaId === importedId,
         )
@@ -1157,6 +1164,7 @@ async function importCharacterCardSpecWithPolicy<T extends boolean = false>(
     overrideLorebook: loreBook[] = null,
     returnValue: T = false as T,
     assetPolicy?: CardAssetImportPolicy,
+    notify = true,
 ): Promise<T extends true ? character | false : string | false> {
     if (
         !card ||
@@ -1535,7 +1543,7 @@ async function importCharacterCardSpecWithPolicy<T extends boolean = false>(
     }
 
     await commitDetachedCharacter(char, 'import-character-card')
-    alertNormal(language.importedCharacter)
+    if (notify) alertNormal(language.importedCharacter)
     return char.chaId as any
 }
 

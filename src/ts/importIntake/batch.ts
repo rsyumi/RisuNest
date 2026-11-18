@@ -110,7 +110,7 @@ async function importCharacter(
     if (item.format === 'json') {
         // JSON spools keep the JavaScript converter, as the Android content picker does.
         const data = await readImportSourceBytes(item.source, ledger, context.signal)
-        const index = await importCharacterProcess({ name: jsonImportName(item.name), data })
+        const index = await importCharacterProcess({ name: jsonImportName(item.name), data, quiet: true })
         characterId = typeof index === 'number' ? getDatabase().characters[index]?.chaId ?? null : null
     } else {
         ledger.claim(item.source)

@@ -109,7 +109,7 @@ export async function importNativeContentFile(
         nativeImport: () =>
           importPreparedNativeCharacterContent(input, options),
         legacyImport: async ({ data }) => {
-          const index = await importCharacterProcess({ name: file.name, data });
+          const index = await importCharacterProcess({ name: file.name, data, quiet: true });
           return typeof index === "number"
             ? (getDatabase().characters[index]?.chaId ?? null)
             : null;

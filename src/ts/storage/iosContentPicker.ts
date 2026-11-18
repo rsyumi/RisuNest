@@ -67,7 +67,7 @@ async function importPickedContent(
             return 'module'
         }
         const { importCharacterProcess } = await import('../characterCards')
-        const index = await importCharacterProcess({ name: picked.name, data })
+        const index = await importCharacterProcess({ name: picked.name, data, quiet: true })
         const { getDatabase } = await import('./database.svelte')
         const chaId = typeof index === 'number'
             ? getDatabase().characters[index]?.chaId ?? null

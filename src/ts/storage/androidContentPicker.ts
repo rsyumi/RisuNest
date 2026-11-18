@@ -174,6 +174,7 @@ async function consumeAndroidContentSpool(
             const index = await importCharacterProcess({
                 name: displayName,
                 data,
+                quiet: true,
                 ...(parsedJson && { parsedJson }),
             })
             const chaId = typeof index === 'number'
