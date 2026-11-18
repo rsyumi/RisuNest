@@ -206,6 +206,7 @@
     layer="absolute inset-0 z-40"
     width="w-[28rem]"
     listScroll
+    touchTargets
     leading={mode === 'bind' ? inheritRow : undefined}
 >
     {#snippet header()}

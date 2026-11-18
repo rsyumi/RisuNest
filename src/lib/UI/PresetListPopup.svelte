@@ -56,6 +56,8 @@
         width?: string
         /** Scrolls only the rows, keeping the header and footer in view. */
         listScroll?: boolean
+        /** Enlarges rows and their menu button on touch screens. */
+        touchTargets?: boolean
         header?: Snippet<[PresetGuard]>
         leading?: Snippet<[PresetGuard]>
         /** Content before the name. With it, the selected mark follows the name. */
@@ -86,6 +88,7 @@
         layer = 'fixed inset-0 z-modal',
         width = 'w-96',
         listScroll = false,
+        touchTargets = false,
         header,
         leading,
         rowLeading,
@@ -200,7 +203,6 @@
         dragged = preset
         dragFrom = index
         data.effectAllowed = 'move'
-        data.setData('text/plain', preset.name)
         data.setData(dragType, String(index))
         const row = source.closest<HTMLElement>('[data-preset-row]')
         if (row) {
@@ -271,7 +273,7 @@
                 <p class="text-textcolor2 text-sm m-0">{emptyFiltered ?? empty}</p>
             {:else}
                 <div
-                    class="flex flex-col gap-1 {listScroll ? 'overflow-y-auto min-h-0' : ''}"
+                    class="flex flex-col gap-1 {listScroll ? 'overflow-y-auto min-h-0' : ''} {dragType ? 'py-1 -my-1' : ''}"
                     role="list"
                     use:touchDrag={dragType ? { item: '[data-preset-item]', ghost: '[data-preset-row]' } : null}
                     ondragleave={(event) => {
@@ -310,7 +312,7 @@
                                 <button
                                     class="flex-1 min-w-0 {sortable
                                         ? 'pr-3'
-                                        : 'px-3 rounded-l-md'} py-2 pointer-coarse:py-2.5 text-left transition-colors hover:bg-selected flex items-center gap-2"
+                                        : 'px-3 rounded-l-md'} py-2 {touchTargets ? 'pointer-coarse:py-2.5' : ''} text-left transition-colors hover:bg-selected flex items-center gap-2"
                                     title={rowTitle}
                                     aria-current={isSelected ? 'true' : undefined}
                                     draggable={sortable ? 'true' : undefined}
@@ -332,7 +334,7 @@
                                     {@render rowTrailing?.(preset, index)}
                                 </button>
                                 <button
-                                    class="shrink-0 w-9 pointer-coarse:w-11 flex items-center justify-center rounded-r-md transition-colors hover:bg-selected"
+                                    class="shrink-0 w-9 {touchTargets ? 'pointer-coarse:w-11' : ''} flex items-center justify-center rounded-r-md transition-colors hover:bg-selected"
                                     title={language.presetActions}
                                     aria-expanded={openMenu === index}
                                     onclick={() => {
