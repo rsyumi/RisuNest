@@ -110,7 +110,7 @@ const loreKey = (entry: loreBook) => JSON.stringify([entry?.mode ?? '', entry?.c
 // A named regex stays the same item when the author changes its pattern.
 const regexKey = (script: any) => JSON.stringify(script?.comment ? [script.comment, script.type ?? ''] : ['', script?.type ?? '', script?.in ?? ''])
 const triggerKey = (script: any) => JSON.stringify([script?.comment ?? '', script?.type ?? ''])
-const assetKey = (asset: any) => String(asset?.[0] ?? '')
+const assetKey = (asset: any) => JSON.stringify([asset?.[0] ?? ''])
 
 export const CHARACTER_UPDATE: UpdateSpec = {
     preserved: new Set([
@@ -202,6 +202,8 @@ export interface UpdateItem {
 export interface UpdatePlan {
     hasBase: boolean
     items: UpdateItem[]
+    /** List fields the user reordered and the author did not, merged in the user's order. */
+    keepOrder?: string[]
 }
 
 function decide(hasBase: boolean, base: string, mine: string, theirs: string, present: { mine: boolean, theirs: boolean, base: boolean }): Pick<UpdateItem, 'status' | 'choice'> | null {
@@ -235,6 +237,14 @@ function mapEntries(value: unknown): Map<string, unknown> {
 
 const has = (record: object, key: string) => Object.prototype.hasOwnProperty.call(record, key)
 
+/** Whether the entries a list shares with the base come in another order than in the base. */
+function reordered(list: Map<string, unknown>, base: Map<string, unknown>): boolean {
+    const order = [...base.keys()].filter((key) => list.has(key))
+    let index = 0
+    for (const key of list.keys()) if (base.has(key) && key !== order[index++]) return true
+    return false
+}
+
 /**
  * Compares the installed entity (mine), the import (theirs) and the import as
  * it was installed (base, null when unknown). Fields the import does not set
@@ -243,6 +253,7 @@ const has = (record: object, key: string) => Object.prototype.hasOwnProperty.cal
 export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: T, base: Partial<T> | null): UpdatePlan {
     const hasBase = !!base
     const items: UpdateItem[] = []
+    const keepOrder: string[] = []
     const push = (field: string, key: string, values: { b?: unknown, m?: unknown, t?: unknown }, present: { mine: boolean, theirs: boolean, base: boolean }) => {
         const verdict = decide(hasBase, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
         if (!verdict || spec.silent.has(field)) return
@@ -258,6 +269,7 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         if (keyOf || silentKeys) {
             const read = keyOf ? (value: unknown) => keyed(keyOf, value) : mapEntries
             const mineMap = read(m), theirsMap = read(t), baseMap = read(b)
+            if (keyOf && reordered(mineMap, baseMap) && !reordered(theirsMap, baseMap)) keepOrder.push(field)
             for (const key of new Set([...theirsMap.keys(), ...mineMap.keys(), ...baseMap.keys()])) {
                 if (!mineMap.has(key) && !theirsMap.has(key)) continue
                 if (silentKeys?.has(key)) continue
@@ -268,15 +280,18 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         }
         push(field, '', { b, m, t }, { mine: true, theirs: true, base: true })
     }
-    return { hasBase, items }
+    return { hasBase, items, keepOrder }
 }
 
 export function unresolvedItems(plan: UpdatePlan): UpdateItem[] {
     return plan.items.filter(item => item.choice === null)
 }
 
-/** Puts mine-only items back after the item they followed in the user's list. */
-function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknown, theirsList: unknown, choices: Map<string, UpdateChoice>): unknown[] {
+/**
+ * Merges a list in the order of one side, the author's unless `mineOrder`.
+ * Items only the other side has follow the item they came after there.
+ */
+function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknown, theirsList: unknown, choices: Map<string, UpdateChoice>, mineOrder = false): unknown[] {
     const mineMap = keyed(keyOf, mineList)
     const theirsMap = keyed(keyOf, theirsList)
     const keepId = (chosen: unknown, own: unknown) => lore && own && chosen && typeof chosen === 'object'
@@ -289,23 +304,25 @@ function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknow
         if (typeof choice === 'object') return keepId(choice.value, own)
         return choice === 'mine' ? own : keepId(other, own)
     }
-    const result: { key: string, value: unknown }[] = []
-    for (const key of theirsMap.keys()) {
-        const value = pick(key)
-        if (value !== undefined) result.push({ key, value })
-    }
+    const [lead, other] = mineOrder ? [mineMap, theirsMap] : [theirsMap, mineMap]
+    const following = new Map<string | null, string[]>()
     let previous: string | null = null
-    for (const key of mineMap.keys()) {
-        if (!theirsMap.has(key)) {
-            const value = pick(key)
-            if (value !== undefined) {
-                const at = previous === null ? -1 : result.findIndex(entry => entry.key === previous)
-                result.splice(at + 1, 0, { key, value })
-            }
-        }
-        if (result.some(entry => entry.key === key)) previous = key
+    for (const key of other.keys()) {
+        if (lead.has(key)) previous = key
+        else if (following.has(previous)) following.get(previous)!.push(key)
+        else following.set(previous, [key])
     }
-    return result.map(entry => entry.value)
+    const result: unknown[] = []
+    const place = (key: string) => {
+        const value = pick(key)
+        if (value !== undefined) result.push(value)
+    }
+    for (const key of following.get(null) ?? []) place(key)
+    for (const key of lead.keys()) {
+        place(key)
+        for (const next of following.get(key) ?? []) place(next)
+    }
+    return result
 }
 
 /**
@@ -327,7 +344,7 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
         if (has(spec.lists, field)) {
-            result[field] = mergeList(spec.lists[field], spec.lore.has(field), m, t, fieldChoices)
+            result[field] = mergeList(spec.lists[field], spec.lore.has(field), m, t, fieldChoices, plan.keepOrder?.includes(field))
         } else if (has(spec.maps, field)) {
             const silentKeys = spec.maps[field]
             const out: Record<string, unknown> = {}

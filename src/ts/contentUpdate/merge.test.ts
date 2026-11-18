@@ -137,6 +137,26 @@ describe('applyUpdate', () => {
         expect(merged.extentions).toEqual({ color: 'blue', mood: 'mine', [UPDATE_BASE_EXTENSION_KEY]: 'assets/new.json' })
     })
 
+    it('keeps the order of whichever side reordered the list, and the author order when both did', () => {
+        const regex = (comment: string) => ({ comment, type: 'editoutput', in: comment, out: '' })
+        const order = (merged: any) => merged.customscript.map((script: any) => script.comment)
+        const merge = (base: string[], mine: string[], theirs: string[]) => {
+            const [b, m, t] = [base, mine, theirs].map((list) => ({ name: 'Luna', customscript: list.map(regex) }))
+            return order(applyUpdate(CHARACTER_UPDATE, m as any, t as any, planUpdate(CHARACTER_UPDATE, m as any, t as any, b as any)))
+        }
+        expect(merge(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'N', 'C'])).toEqual(['C', 'A', 'B', 'N'])
+        expect(merge(['A', 'B', 'C'], ['A', 'B', 'C', 'Own'], ['B', 'A', 'C'])).toEqual(['B', 'A', 'C', 'Own'])
+        expect(merge(['A', 'B', 'C'], ['C', 'B', 'A'], ['B', 'A', 'C'])).toEqual(['B', 'A', 'C'])
+    })
+
+    it('tells apart assets that share a name from one named like a second copy', () => {
+        const assets = [['face', 'assets/1.png', 'png'], ['face', 'assets/2.png', 'png'], ['face#1', 'assets/3.png', 'png']]
+        const mine = { id: 'm', name: 'M', description: '', assets }
+        const plan = planUpdate(MODULE_UPDATE, mine as RisuModule, { ...mine, id: 't' } as RisuModule, null)
+        expect(plan.items).toEqual([])
+        expect(applyUpdate(MODULE_UPDATE, mine as RisuModule, { ...mine, id: 't' } as RisuModule, plan).assets).toEqual(assets)
+    })
+
     it('keeps the installed module id and takes the new lineage', () => {
         const mine = { id: 'installed', name: 'M', description: 'old', updateBase: 'assets/a.json', updateLineage: 'one' } as RisuModule
         const theirs = { id: 'incoming', name: 'M', description: 'new', updateBase: 'assets/b.json', updateLineage: 'two' } as RisuModule
