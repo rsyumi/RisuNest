@@ -1956,7 +1956,7 @@ describe('received preset selection', () => {
         expect(saveFailures).toEqual([])
     })
 
-    it('keeps a preset a request applied while a refresh released its revision', async () => {
+    it.each([[false, 'preset-c'], [true, 'preset-b']] as const)('keeps a preset a request applied while a refresh released its revision unless it removed it (removed=%s)', async (removed, applied) => {
         const {store, runtime, saveFailures} = await presetRuntime(true)
         // C holds what the selection B holds, so applying it leaves the captured root as it was.
         const copy = {key: JSON.stringify(['preset', 'preset-c', 'mainPrompt']), type: 'set' as const, value: 'Prompt B'}
@@ -1965,7 +1965,9 @@ describe('received preset selection', () => {
         await carryPresetOverride('preset-c', runtime)
         setEffectivePresetOverride(null)
         const temperature = {key: JSON.stringify(['preset', 'preset-a', 'temperature']), type: 'set' as const, value: 3}
-        const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations: [temperature]})
+        const removal: PersistentUnitMutation[] = removed ? [{key: JSON.stringify(['exists', 'preset', 'preset-c']), type: 'delete'},
+            {key: JSON.stringify(['order', 'presets']), type: 'set', value: ['preset-a', 'preset-b']}] : []
+        const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations: [temperature, ...removal]})
         let releasing!: () => void
         const released = new Promise<void>((resolve) => { releasing = resolve })
         let resume!: () => void
@@ -1988,7 +1990,7 @@ describe('received preset selection', () => {
             resume()
             fence.release()
         }
-        expect(getEffectivePresetId()).toBe('preset-c')
+        expect(getEffectivePresetId()).toBe(applied)
         expect(saveFailures).toEqual([])
     })
 
