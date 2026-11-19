@@ -41,6 +41,7 @@
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
     import { handleAppDragOver, handleAppDragStart, handleAppDrop } from './ts/importIntake/drop';
+    import { canOpenImportResult } from './ts/importIntake/openResult';
     import { openedImportResult } from './ts/importIntake/sheetStore';
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
@@ -480,7 +481,7 @@
     {#if folderManager.folderId && folderManager.draft}
         <FolderManagerPanel />
     {/if}
-    <NativeFileJobDialog />
+    <NativeFileJobDialog canOpen={canOpenImportResult} />
     <ImportIntakeHost />
     <UpdatePopup />
 </main>

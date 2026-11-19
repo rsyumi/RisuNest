@@ -17,6 +17,9 @@
 
     import { retrySnapshotRestoreBodiesFromOutcome } from 'src/ts/storage/nativePersistentMaintenance'
 
+    /** Whether what an import added can be opened over what is on screen now. */
+    let { canOpen = () => true }: { canOpen?: (location: NativeFileOperationImportLocation) => boolean } = $props()
+
     const accountRetryAvailable = $derived(!!$nativeFileOperationOutcome?.status?.officialAssets?.operationId
         && ['failed', 'cancelled'].includes($nativeFileOperationOutcome.status.officialAssets.state)
         && !['account-changed', 'library-changed'].includes($nativeFileOperationOutcome.status.officialAssets.reason ?? ''))
@@ -270,7 +273,7 @@
                             <SettingButton variant="secondary" onclick={() => {void retryPortableRestoreBodiesFromOutcome().catch(() => {})}}>{language.retry}</SettingButton>
                         {/if}
                         <!-- Onboarding stays over the app, so there is nothing to open yet. -->
-                        {#if model.terminal?.openLocation && $nativeFileJobHost !== 'onboarding'}
+                        {#if model.terminal?.openLocation && $nativeFileJobHost !== 'onboarding' && canOpen(model.terminal.openLocation)}
                             <SettingButton variant="secondary" onclick={() => openResult(model.terminal!.openLocation!)}>{language.risuNest.importIntake.open}</SettingButton>
                         {/if}
                         <SettingButton onclick={dismiss}>{language.risuNest.importDialog.close}</SettingButton>

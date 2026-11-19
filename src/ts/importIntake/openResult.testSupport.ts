@@ -24,6 +24,7 @@ export async function importStoresModule() {
         openPresetList: writable(false),
         popUpEditorStore: { open: false, value: '', mode: 'default', language: 'markdown' },
         QuickSettings: { open: false, index: 0 },
+        selectedCharID: writable(0),
         settingsOpen: writable(false),
         SettingsMenuIndex: writable(-1),
         ShowRealmFrameStore: writable(''),
