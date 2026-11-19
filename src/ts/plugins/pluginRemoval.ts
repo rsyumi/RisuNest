@@ -12,13 +12,13 @@ import { loadPlugins } from './plugins.svelte'
 export async function removeInstalledPlugin(owner: string, deleteData: boolean): Promise<void> {
     if (DBState.db.plugins.some((installed) => installed.name === owner)) {
         const names = pluginProviderNames(owner)
-        // The applied preset and the preset the settings window edits stop showing it at once.
-        for (const db of [DBState.db, presetEditorDBState.db]) {
-            if (names.includes(db.currentPluginProvider)) db.currentPluginProvider = ''
-        }
         // Presets that are not loaded keep their bodies in the store. The plugin stays installed
         // until they are cleared, so removing it again after a failure clears them again.
         await clearPresetPluginProvider(names)
+        // The applied preset and the preset the settings window edits stop showing it.
+        for (const db of [DBState.db, presetEditorDBState.db]) {
+            if (names.includes(db.currentPluginProvider)) db.currentPluginProvider = ''
+        }
         const index = DBState.db.plugins.findIndex((installed) => installed.name === owner)
         if (index !== -1) DBState.db.plugins.splice(index, 1)
     }

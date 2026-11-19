@@ -87,6 +87,15 @@ describe('plugin removal option', () => {
         expect((DBState.db as any).pluginPermissions).toEqual({ synthetic: true })
         expect(mocks.reload).toHaveBeenCalledOnce()
     })
+    it('keeps the plugin and the provider it shows when the stored presets cannot be cleared', async () => {
+        mocks.confirm.mockResolvedValue({ confirmed: true, checked: true })
+        mocks.mutatePresets.mockRejectedValue(new Error('clear failed'))
+        await remove()
+        await vi.waitFor(() => expect(mocks.error).toHaveBeenCalled())
+        expect(DBState.db.plugins).toHaveLength(1)
+        expect(DBState.db.currentPluginProvider).toBe('synthetic')
+        expect(mocks.deleteData).not.toHaveBeenCalled()
+    })
     it('keeps the data when the reload fails', async () => {
         mocks.confirm.mockResolvedValue({ confirmed: true, checked: true })
         mocks.reload.mockRejectedValue(new Error('unload failed'))
