@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { alertError } from './alert'
 import { isTauriAndroid, isTauriDesktop, isTauriIOS } from 'src/ts/platform'
 import { discardIOSFile } from './storage/iosFiles'
+import type { ImportIntakeSource } from './importIntake/types'
 
 /**
  * Name shared by the DOM event Android dispatches on a warm start and by the Tauri event the
@@ -14,43 +15,51 @@ export const OPENED_FILES_EVENT = 'risu-opened-files'
 /** Desktop command that returns the pending opened files and clears them in the same call. */
 export const OPENED_FILES_TAKE_COMMAND = 'opened_files_take'
 
+/** A file one opening handed over: the path of its prepared copy, or a file that could not be prepared. */
+export type OpenedFile = string | { name: string; code: string }
+
 /** Hands the files of one opening over to the intake, which reports how each of them ended. */
-export type OpenedFilesDelivery = (paths: string[]) => Promise<void>
+export type OpenedFilesDelivery = (files: OpenedFile[]) => Promise<void>
 
 let openedFilesDelivery: OpenedFilesDelivery | null = null
 let domListener: ((event: Event) => void) | null = null
-let queue: Promise<void> = Promise.resolve()
 
-/**
- * Delivers the files of one opening together, after the previous opening was handled. Each file is
- * settled once the delivery has ended, also when it failed.
- */
-export async function consumeOpenedFiles(files: string[]): Promise<void> {
-    const deliver = openedFilesDelivery
-    if (!deliver || !Array.isArray(files)) {
-        return
-    }
-    const run = queue.then(async () => {
-        const opened = files.filter((file) => typeof file === 'string' && file.length > 0)
-        if (!opened.length) return
-        await settleOpenedFilesAfter(opened, () => deliver(opened))
-    })
-    queue = run.catch(() => {})
-    await run
+function isOpenedFile(value: unknown): value is OpenedFile {
+    if (typeof value === 'string') return value.length > 0
+    return value !== null && typeof value === 'object'
+        && typeof (value as { name?: unknown }).name === 'string' && typeof (value as { code?: unknown }).code === 'string'
+}
+
+/** The intake source of an opened file; one that could not be prepared is refused there. */
+export function openedFileSource(file: OpenedFile): ImportIntakeSource {
+    return typeof file === 'string' ? { type: 'path', path: file } : { type: 'failed', ...file }
 }
 
 /**
- * Runs the delivery that holds these opened files, then settles each of them once it has ended,
- * also when it failed. An Android share whose other files were spooled delivers its opened files
- * with that spool batch, and they are settled here as well.
+ * Delivers the files of one opening together as soon as they arrive, so the intake queues them in
+ * arrival order with dropped files. Each file is settled once the delivery has ended, also when it failed.
  */
-export async function settleOpenedFilesAfter(files: string[], delivery: () => Promise<void>): Promise<void> {
+export async function consumeOpenedFiles(files: unknown[]): Promise<void> {
+    const deliver = openedFilesDelivery
+    if (!deliver || !Array.isArray(files)) return
+    const opened = files.filter(isOpenedFile)
+    if (!opened.length) return
+    await settleOpenedFilesAfter(opened, () => deliver(opened))
+}
+
+/**
+ * Runs the delivery that holds these opened files, then settles each prepared copy once it has
+ * ended, also when it failed. An Android share whose other files were spooled delivers its opened
+ * files with that spool batch, and they are settled here as well.
+ */
+export async function settleOpenedFilesAfter(files: OpenedFile[], delivery: () => Promise<void>): Promise<void> {
     try {
         await delivery()
     } catch (error) {
-        alertError(`Failed to open the selected files: ${files.join(', ')}\n${error}`)
+        const names = files.map(file => typeof file === 'string' ? file : file.name)
+        alertError(`Failed to open the selected files: ${names.join(', ')}\n${error}`)
     } finally {
-        for (const file of files) await settleOpenedFile(file)
+        for (const file of files) if (typeof file === 'string') await settleOpenedFile(file)
     }
 }
 
@@ -58,7 +67,7 @@ export async function settleOpenedFilesAfter(files: string[], delivery: () => Pr
  * Hands opened files over as the Android opened-files event does: to the listener when one is
  * registered, otherwise to the startup queue it drains.
  */
-export function handOverOpenedFiles(files: string[]): void {
+export function handOverOpenedFiles(files: OpenedFile[]): void {
     const event = new CustomEvent(OPENED_FILES_EVENT, { detail: { files }, cancelable: true })
     if (!window.dispatchEvent(event)) return
     const holder = window as Window & { tauriOpenedFiles?: unknown }
@@ -101,7 +110,7 @@ export function registerOpenedFileListeners(deliver: OpenedFilesDelivery): void 
             // Android watches the cancelation to tell a delivered payload from one that arrived
             // before this listener existed, which it then parks in the startup queue instead.
             event.preventDefault()
-            void consumeOpenedFiles(files as string[])
+            void consumeOpenedFiles(files)
         }
     }
     window.addEventListener(OPENED_FILES_EVENT, domListener)
@@ -126,20 +135,17 @@ export function registerOpenedFileListeners(deliver: OpenedFilesDelivery): void 
 
 async function drainIOSOpenedFiles(): Promise<void> {
     try {
-        const { files } = await invoke<{ files: Array<{ path?: string; error?: string }> }>(
+        const { files } = await invoke<{ files: Array<{ path?: string; name?: string; code?: string }> }>(
             'plugin:ios-native|take_opened_files',
         )
-        for (const file of files) {
-            if (file.error) alertError(file.error)
-
-        }
-        await consumeOpenedFiles(files.flatMap(file => file.path ? [file.path] : []))
+        // A file that could not be prepared stays in its opening, so a backup opened with it is refused.
+        await consumeOpenedFiles(files.map(file => file.path ?? { name: file.name ?? '', code: file.code ?? 'source-copy-failed' }))
     } catch (error) {
         alertError(`Failed to receive the selected file: ${error}`)
     }
 }
 
-function takeInjectedOpenedFiles(): string[] {
+function takeInjectedOpenedFiles(): unknown[] {
     const holder = window as Window & { tauriOpenedFiles?: unknown }
     const injected = holder.tauriOpenedFiles
     if (!Array.isArray(injected)) {
@@ -147,7 +153,7 @@ function takeInjectedOpenedFiles(): string[] {
     }
     // The Android cold start injection runs once per page load, so drop it after draining.
     delete holder.tauriOpenedFiles
-    return injected as string[]
+    return injected
 }
 
 /**

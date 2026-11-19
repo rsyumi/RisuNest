@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -747,11 +748,11 @@ class SafFileBridgeTest {
   @Test
   fun `an opened intent reserves each spool before a replay can offer it`() {
     val root = temporaryDirectory()
-    val token = "44444444-4444-4444-8444-444444444444"
+    val tokens = ArrayDeque(listOf("44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"))
     val store = SafSpoolStore(
       root = root,
       atomicPublisher = testAtomicPublisher,
-      tokenFactory = { UUID.fromString(token) },
+      tokenFactory = { UUID.fromString(tokens.removeFirst()) },
     )
     val source = object : SafInputSource {
       override val operationId = "c".repeat(64)
@@ -761,21 +762,49 @@ class SafFileBridgeTest {
     }
     val reserved = mutableSetOf<String>()
     val offeredAtReservation = mutableListOf<Boolean>()
-    fun share() = store.spool(listOf(source), beforePublish = { reservedToken ->
+    fun share() = store.spoolEach(listOf(source), reserve = { reservedToken ->
       offeredAtReservation += store.listReady().any { it.token == reservedToken && !store.isDelivered(it.token) }
-      reserved += reservedToken
-    })
+      reserved.add(reservedToken)
+    }).single()
 
     val first = share()
     assertEquals(SafSpoolBatch(emptyList(), emptyList()), replayReadySpoolBatch(store, reserved))
     markSpoolBatchDelivered(store, first)
-    // Opening the same source again reserves it before its earlier delivery is forgotten.
-    assertEquals(first.ready, share().ready)
-    assertEquals(listOf(false, false), offeredAtReservation)
+    // The page still holds the first spool, so opening the same source again copies it for itself.
+    val second = share()
+    assertNotEquals(first.ready.single().token, second.ready.single().token)
+    assertTrue(store.isDelivered(first.ready.single().token))
+    assertFalse(offeredAtReservation.any { it })
     assertEquals(SafSpoolBatch(emptyList(), emptyList()), replayReadySpoolBatch(store, reserved))
 
     reserved.clear()
-    assertEquals(first.ready, replayReadySpoolBatch(store, reserved).ready)
+    assertEquals(second.ready, replayReadySpoolBatch(store, reserved).ready)
+
+    // A spool that fails after its token was taken gives the token back.
+    val failing = SafSpoolStore(temporaryDirectory(), atomicPublisher = SafAtomicPublisher { temporary, target ->
+      // Only the last step, publishing the copied spool, fails.
+      if (temporary.isDirectory) throw IOException("gone") else testAtomicPublisher.publish(temporary, target)
+    })
+    val reservation = OpenedFileReservation(mutableSetOf(), reserved)
+    val failed = failing.spoolEach(listOf(source), reserve = reservation::reserveToken, release = reservation::releaseToken).single()
+    assertEquals(listOf("card.json"), failed.failures.map { it.displayName })
+    assertEquals(emptySet<String>(), reserved)
+  }
+
+  @Test
+  fun `each opened source keeps its place among the spools`() {
+    val store = SafSpoolStore(temporaryDirectory(), atomicPublisher = testAtomicPublisher)
+    fun source(name: String, readable: Boolean) = object : SafInputSource {
+      override val operationId: String? = null
+      override val displayName = name
+      override val totalBytes = 1L
+      override fun open(): InputStream = if (readable) ByteArrayInputStream(byteArrayOf(1)) else throw IOException("gone")
+    }
+
+    val results = store.spoolEach(listOf(source("a.png", true), source("b.png", false), source("c.png", true)))
+
+    assertEquals(listOf("a.png", null, "c.png"), results.map { it.ready.singleOrNull()?.displayName })
+    assertEquals(listOf(null, "b.png", null), results.map { it.failures.singleOrNull()?.displayName })
   }
 
   @Test
@@ -797,6 +826,24 @@ class SafFileBridgeTest {
       ),
       batch.failures,
     )
+
+    // An opened intent marks its spools file by file, so two files of one name keep their own reasons.
+    val handedOff = markOpenedSpoolsDelivered(
+      store,
+      listOf(
+        SafSpoolBatch(listOf(missing.copy(displayName = "card.png")), emptyList()),
+        SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("card.png", "storage-full"))),
+      ),
+    ) { true }
+    val script = openedIntentScripts("request-1", listOf("card.png", "card.png"), handedOff, emptyList()).single()
+    assertEquals(
+      true,
+      script.contains(
+        "\"failures\":[{\"displayName\":\"card.png\",\"code\":\"spool-write-failed\"}," +
+          "{\"displayName\":\"card.png\",\"code\":\"storage-full\"}]",
+      ),
+    )
+    assertEquals(true, script.contains("\"order\":[\"card.png\",\"card.png\"]"))
   }
 
   @Test

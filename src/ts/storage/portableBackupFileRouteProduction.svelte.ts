@@ -208,6 +208,8 @@ export function restoreBackupFromNativeSource(
     return restoreBackupFromSource(source, options, false)
 }
 
+let givenSourceRestores = 0
+
 async function restoreBackupFromSource(
     source: NativeFileJobSource | BackupSourceFactory,
     options: BackupRestoreOptions,
@@ -220,7 +222,8 @@ async function restoreBackupFromSource(
         )
     return runSharedNativeFileOperation(
         'import',
-        'backup-import',
+        // A second picker press joins the restore it opened; a given source is a restore of its own.
+        sourceFromPicker ? 'backup-import' : `backup-import:${++givenSourceRestores}`,
         async (context) => {
             const joined = combineSignals(context.signal, options.signal)
             let input: NativeFileJobSource | null = null

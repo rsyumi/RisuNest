@@ -36,8 +36,8 @@ export function importSourceName(source: ImportIntakeSource): string {
         }
         case 'androidSpool':
             return source.spool.displayName
-        case 'androidSpoolFailure':
-            return source.failure.displayName
+        case 'failed':
+            return source.name
     }
 }
 
@@ -50,14 +50,14 @@ export function nativeImportSource(source: ImportIntakeSource): NativeFileJobSou
             return { type: 'desktopPath', path: source.path }
         case 'androidSpool':
             return { type: 'androidSpool', token: source.spool.token }
-        case 'androidSpoolFailure':
+        case 'failed':
             return null
     }
 }
 
 /**
- * What one delivery still holds: inbox copies, and Android spools no importer or restore has taken.
- * `release` removes them whichever way the delivery ended.
+ * What one delivery holds: inbox copies and Android spools. `release` removes them whichever way the
+ * delivery ended; a spool an importer or a restore already took is no longer there to remove.
  */
 export class ImportSourceLedger {
     private readonly copies: string[] = []
@@ -78,11 +78,6 @@ export class ImportSourceLedger {
         if (entry) entry.refusedBackup = true
     }
 
-    /** Hands a spool to an importer or a restore, which releases or consumes it itself. */
-    claim(source: ImportIntakeSource): void {
-        if (source.type === 'androidSpool') this.spools.delete(source.spool.token)
-    }
-
     async release(): Promise<void> {
         const copies = this.copies.splice(0)
         const spools = [...this.spools.values()]
@@ -99,23 +94,17 @@ export class ImportSourceLedger {
 
 /**
  * Reads a file's bytes for the TypeScript importers. An Android spool goes through the bounded
- * native reader and is released afterwards, as the content picker does.
+ * native reader, as the content picker does; the delivery releases it.
  */
 export async function readImportSourceBytes(
     source: ImportIntakeSource,
-    ledger: ImportSourceLedger,
     signal: AbortSignal,
 ): Promise<Uint8Array> {
     signal.throwIfAborted()
     if (source.type === 'androidSpool') {
-        ledger.claim(source)
-        try {
-            const response = await invoke<ArrayBuffer | number[]>('native_content_source_metadata', { token: source.spool.token })
-            signal.throwIfAborted()
-            return response instanceof ArrayBuffer ? new Uint8Array(response) : Uint8Array.from(response)
-        } finally {
-            await discardAndroidSafSource(source.spool.token).catch(() => false)
-        }
+        const response = await invoke<ArrayBuffer | number[]>('native_content_source_metadata', { token: source.spool.token })
+        signal.throwIfAborted()
+        return response instanceof ArrayBuffer ? new Uint8Array(response) : Uint8Array.from(response)
     }
     const native = nativeImportSource(source)
     if (native?.type !== 'desktopPath') throw new Error(language.errors.noData)

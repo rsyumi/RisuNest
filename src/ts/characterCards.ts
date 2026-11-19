@@ -22,7 +22,7 @@ import { exportModuleLegacy, readModule, type RisuModule } from "./process/modul
 import { readFile } from "@tauri-apps/plugin-fs"
 import { open } from "./storage/fileSelection"
 import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_SITE_URL } from "./realmEndpoints"
-import { registerOpenedFileListeners } from "./openedFiles"
+import { openedFileSource, registerOpenedFileListeners } from "./openedFiles"
 import { type DeviceMarkerStorage } from './storage/deviceMarkers'
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import { importContentBatch } from './storage/contentImportBatch'
@@ -770,9 +770,9 @@ export async function characterURLImport() {
     }
 
     // Files a file association or share hands over arrive together as one intake delivery.
-    registerOpenedFileListeners(async (paths) => {
+    registerOpenedFileListeners(async (files) => {
         const { submitImportDelivery } = await import('./importIntake/intake')
-        await submitImportDelivery({ origin: 'opened', sources: paths.map(path => ({ type: 'path', path })) })
+        await submitImportDelivery({ origin: 'opened', sources: files.map(openedFileSource) })
     })
 
     async function importFile(name: string, data: Uint8Array): Promise<void | 'failed'> {

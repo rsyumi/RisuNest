@@ -1,16 +1,27 @@
 import { get } from 'svelte/store'
+import { showRealmInfoStore } from '../characterCards'
 import type { NativeFileOperationImportLocation } from '../storage/nativeFileJobManager'
 import {
+    bookmarkListOpen,
     botMakerMode,
     CharConfigSubMenu,
+    customSideBarConfigDialogStore,
     DBState,
+    easyPanelStore,
+    hypaV3ModalOpen,
+    irisStore,
+    loadoutModalStore,
     MobileGUI,
     MobileSideBar,
+    moduleScopeMenuOpen,
     openPersonaList,
     openPresetList,
+    popUpEditorStore,
     QuickSettings,
+    selectedCharID,
     settingsOpen,
     SettingsMenuIndex,
+    ShowRealmFrameStore,
     sideBarStore,
 } from '../stores.svelte'
 import { openedImportResult } from './sheetStore'
@@ -20,16 +31,17 @@ const LOREBOOK_TAB = 3
 
 /** Goes to what an import added: the character, the module settings, the preset list or a character's lorebook. */
 export function openImportResult(location: NativeFileOperationImportLocation): void {
+    if (!canOpenImportResult(location)) return
     switch (location.kind) {
         case 'module':
         case 'module-from-charx':
         case 'module-from-lorebook':
-            closeLists()
+            closeOverlays()
             SettingsMenuIndex.set(MODULE_SETTINGS_PAGE)
             settingsOpen.set(true)
             return
         case 'preset':
-            openPersonaList.set(false)
+            closeOverlays()
             openPresetList.set(true)
             return
         case 'character':
@@ -39,10 +51,23 @@ export function openImportResult(location: NativeFileOperationImportLocation): v
     }
 }
 
-/** Closes the preset and persona lists, which show over every screen. */
-function closeLists(): void {
-    openPresetList.set(false)
-    openPersonaList.set(false)
+/**
+ * Whether what an import added can be opened now. The HypaV3 summaries, the Realm upload, EasyPanel,
+ * loadouts and Iris work on the selected character until they close, so no other character opens over them.
+ */
+export function canOpenImportResult(location: NativeFileOperationImportLocation): boolean {
+    if (!('chaId' in location) || location.chaId === DBState.db.characters?.[get(selectedCharID)]?.chaId) return true
+    return ![get(hypaV3ModalOpen), get(ShowRealmFrameStore), easyPanelStore.open, loadoutModalStore.open, irisStore.open].some(Boolean)
+}
+
+/**
+ * Closes the lists and menus that show over every screen. Screens that keep unsaved work only while
+ * open, such as the HypaV3 summaries or the Realm upload, stay open.
+ */
+function closeOverlays(): void {
+    for (const open of [openPresetList, openPersonaList, bookmarkListOpen, moduleScopeMenuOpen]) open.set(false)
+    for (const panel of [popUpEditorStore, customSideBarConfigDialogStore]) panel.open = false
+    showRealmInfoStore.set(null)
 }
 
 async function openCharacter(location: Extract<NativeFileOperationImportLocation, { chaId: string }>): Promise<void> {
@@ -51,7 +76,7 @@ async function openCharacter(location: Extract<NativeFileOperationImportLocation
     const { changeChar } = await import('../characters')
     // A refused selection (a running generation, an archived character) leaves the screen as it was.
     if (!await changeChar(index)) return
-    closeLists()
+    closeOverlays()
     settingsOpen.set(false)
     openedImportResult.set({ kind: location.kind })
     if (location.kind === 'character') {

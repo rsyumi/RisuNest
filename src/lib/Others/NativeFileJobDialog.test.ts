@@ -15,7 +15,7 @@ const h = vi.hoisted(() => ({
     busy: true,
 }))
 vi.mock('src/ts/alert', () => ({ alertError: h.alertError }))
-vi.mock('src/ts/importIntake/openResult', () => ({ openImportResult: h.openImportResult }) satisfies typeof import('src/ts/importIntake/openResult'))
+vi.mock('src/ts/importIntake/openResult', () => ({ openImportResult: h.openImportResult, canOpenImportResult: () => true }) satisfies typeof import('src/ts/importIntake/openResult'))
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     getServerSyncController: () => ({ assertFileOperationAvailable() { if (h.busy) throw Object.assign(new Error('server-sync-busy'), { code: 'server-sync-busy' }) } }),
 }))
@@ -207,8 +207,11 @@ describe('file operation error details', () => {
         expect(get(nativeFileOperationOutcome)).toBeNull()
     })
 
-    it('offers nothing to open while onboarding is on screen', async () => {
-        nativeFileJobHost.set('onboarding')
+    it.each([
+        ['onboarding is on screen', 'onboarding', true],
+        ['the result cannot be opened over the screen', 'dialog', false],
+    ] as const)('offers nothing to open while %s', async (_, host, openable) => {
+        nativeFileJobHost.set(host)
         try {
             nativeFileOperationOutcome.set({
                 kind: 'import', format: 'content', state: 'succeeded', startedAt: 0, finishedAt: 1, observedStages: [], warningCodes: [],
@@ -216,7 +219,7 @@ describe('file operation error details', () => {
             })
             target = document.createElement('div')
             document.body.append(target)
-            component = mount(NativeFileJobDialog, { target })
+            component = mount(NativeFileJobDialog, { target, props: { canOpen: () => openable } })
             await tick()
             expect(target.querySelector('[role="status"]')?.textContent).toContain(language.risuNest.importIntake.locationCharacter)
             expect(buttonLabels()).toEqual([language.risuNest.importDialog.close])

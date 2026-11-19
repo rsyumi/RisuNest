@@ -1,4 +1,4 @@
-import type { AndroidSpoolFailure, AndroidSpoolReady } from '../storage/androidSafBridge'
+import type { AndroidSpoolReady } from '../storage/androidSafBridge'
 
 /** Where one file of a delivery comes from. */
 export type ImportIntakeSource =
@@ -7,8 +7,8 @@ export type ImportIntakeSource =
     /** A desktop or iOS opened file, or an Android opened file outside the spool allowlist. */
     | { type: 'path'; path: string }
     | { type: 'androidSpool'; spool: AndroidSpoolReady }
-    /** A file Android could not copy; it is always refused. */
-    | { type: 'androidSpoolFailure'; failure: AndroidSpoolFailure }
+    /** A file that could not be prepared for import; it is always refused. */
+    | { type: 'failed'; name: string; code: string }
 
 export type ImportIntakeOrigin = 'drop' | 'opened'
 

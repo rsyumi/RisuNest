@@ -141,11 +141,18 @@ class MainActivityBehaviorTest {
 
   @Test
   fun `ready document delivery dispatches opened files and falls back to its startup queue`() {
-    val script = openedFilesEventScript(listOf("/data/cache/opened_files/1-0-preset.risup"))
+    val script = openedFilesEventScript(listOf(
+      OpenedFileEntry.Copied("/data/cache/opened_files/1-0-preset.risup"),
+      OpenedFileEntry.Failed("broken.risup", "source-copy-failed"),
+    ))
 
     assertEquals(true, script.contains("new CustomEvent('risu-opened-files'"))
     assertEquals(true, script.contains("cancelable:true"))
-    assertEquals(true, script.contains("\"/data/cache/opened_files/1-0-preset.risup\""))
+    // A file that could not be copied stays in its opening, so the page refuses it there.
+    assertEquals(
+      true,
+      script.contains("var files=[\"/data/cache/opened_files/1-0-preset.risup\",{\"name\":\"broken.risup\",\"code\":\"source-copy-failed\"}];"),
+    )
     assertEquals(true, script.contains("if(window.dispatchEvent(event)){"))
     assertEquals(true, script.contains("window.tauriOpenedFiles="))
     // Delivery never replaces an earlier undrained startup batch.
@@ -156,8 +163,8 @@ class MainActivityBehaviorTest {
   fun `ready document delivery escapes opened file paths`() {
     assertEquals(
       true,
-      openedFilesEventScript(listOf("C:\\opened\nfile.risup"))
-        .contains("\"C:\\\\opened\\u000afile.risup\""),
+      openedFilesEventScript(listOf(OpenedFileEntry.Copied("C:\\opened\nfile.risup")))
+        .contains("\"C:\\\\opened\\nfile.risup\""),
     )
   }
 
@@ -500,9 +507,7 @@ class MainActivityBehaviorTest {
       ),
     )
 
-    assertEquals(true, script.contains("window.tauriOpenedFileSpools="))
-    assertEquals(true, script.contains("window.tauriOpenedFileSpools?.ready"))
-    assertEquals(true, script.contains("window.tauriOpenedFileSpools?.failures"))
+    assertEquals(true, script.startsWith("window.tauriOpenedFileSpools=[...(window.tauriOpenedFileSpools??[]),{"))
     assertEquals(true, script.contains("\"requestId\":\"request-1\""))
     assertEquals(true, script.contains("11111111-1111-4111-8111-111111111111"))
     assertEquals(true, script.contains("a\\\"b\\\\c\\nd.risudat"))
@@ -510,7 +515,7 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `an opened intent that spooled files delivers its copied paths inside its spool batch`() {
+  fun `an opened intent that spooled files delivers its other files inside its spool batch in opening order`() {
     val spool = SafSpoolReady(
       token = "11111111-1111-4111-8111-111111111111",
       displayName = "backup.risunest",
@@ -519,30 +524,40 @@ class MainActivityBehaviorTest {
     )
     val failure = SafSpoolFailure("broken.png", "source-copy-failed")
     val preset = "/data/cache/opened_files/${"a".repeat(64)}-1-preset.risup"
+    val opened = listOf(OpenedFileEntry.Copied(preset), OpenedFileEntry.Failed("lost.risup", "source-copy-failed"))
     val readyJson = "[{\"token\":\"${spool.token}\",\"displayName\":\"backup.risunest\",\"bytes\":9," +
       "\"totalBytes\":9,\"importDestination\":null}]"
     val failuresJson = "[{\"displayName\":\"broken.png\",\"code\":\"source-copy-failed\"}]"
+    val openedJson = "[\"$preset\",{\"name\":\"lost.risup\",\"code\":\"source-copy-failed\"}]"
+    val orderJson = "[\"$preset\",\"${spool.token}\",\"lost.risup\",\"broken.png\"]"
 
-    val joined = openedIntentScripts("request-1", SafSpoolBatch(listOf(spool), listOf(failure)), listOf(preset), spooled = true)
+    val joined = openedIntentScripts(
+      "request-1",
+      listOf("preset.risup", "backup.risunest", "lost.risup", "broken.png"),
+      listOf(SafSpoolBatch(listOf(spool), emptyList()), SafSpoolBatch(emptyList(), listOf(failure))),
+      opened,
+    )
 
     assertEquals(1, joined.size)
     assertEquals(false, joined.single().contains("risu-opened-files"))
+    val detail = "{\"requestId\":\"request-1\"," +
+      "\"ready\":$readyJson,\"failures\":$failuresJson,\"openedFiles\":$openedJson,\"order\":$orderJson}"
+    // A late listener reads the same batch after any earlier undrained ones, each still a delivery of its own.
     assertEquals(
-      true,
-      joined.single().contains(
-        "new CustomEvent('risu-android-spool-ready',{detail:{\"requestId\":\"request-1\"," +
-          "\"ready\":$readyJson,\"failures\":$failuresJson,\"openedPaths\":[\"$preset\"]}})",
-      ),
+      "window.tauriOpenedFileSpools=[...(window.tauriOpenedFileSpools??[]),$detail];" +
+        "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$detail}));",
+      joined.single(),
     )
-    // A late listener reads the same paths from the startup value, after any earlier undrained ones.
+    // A batch without an opening order lists its files as the page groups them.
     assertEquals(
       true,
-      joined.single().contains("\"openedPaths\":[...(window.tauriOpenedFileSpools?.openedPaths??[]),...[\"$preset\"]]"),
+      androidSpoolBatchScript("replay", SafSpoolBatch(listOf(spool), listOf(failure)), opened)
+        .contains("\"order\":[\"${spool.token}\",\"$preset\",\"lost.risup\",\"broken.png\"]}"),
     )
 
     // An intent without spooled files keeps its own opened-files event.
-    val copiedOnly = openedIntentScripts("request-2", SafSpoolBatch(emptyList(), emptyList()), listOf(preset), spooled = false)
-    assertEquals(listOf(openedFilesEventScript(listOf(preset)), androidSpoolBatchScript("request-2", SafSpoolBatch(emptyList(), emptyList()))), copiedOnly)
+    val copiedOnly = openedIntentScripts("request-2", listOf("preset.risup", "lost.risup"), emptyList(), opened)
+    assertEquals(listOf(openedFilesEventScript(opened), androidSpoolBatchScript("request-2", SafSpoolBatch(emptyList(), emptyList()))), copiedOnly)
     assertEquals(false, copiedOnly.last().contains(preset))
   }
 
@@ -814,6 +829,52 @@ class MainActivityBehaviorTest {
     val again = replayLegacyOpenedFiles(directory, emptySet())
     assertEquals(listOf(waiting.absolutePath), again.deliver)
     assertEquals(listOf("current.risup"), again.interrupted)
+  }
+
+  @Test
+  fun `an opening copies a file another opening holds or is still copying to a path of its own`() {
+    val directory = temporaryFolder.newFolder("claimed-legacy")
+    val handedOff = mutableSetOf<String>()
+    val publisher = SafAtomicPublisher { temporary, target ->
+      java.nio.file.Files.move(temporary.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    }
+    fun source(whileCopying: () -> Unit) = object : SafInputSource {
+      override val operationId = "a".repeat(64)
+      override val displayName = "preset.risup"
+      override val totalBytes: Long? = null
+      override fun open(): java.io.InputStream {
+        whileCopying()
+        return ByteArrayInputStream("synthetic".toByteArray())
+      }
+    }
+    fun open(reservation: OpenedFileReservation, whileCopying: () -> Unit = {}): String {
+      val copied = copyLegacyOpenedSources(directory, listOf(source(whileCopying)), reservation, publisher).single()
+      return (copied as OpenedFileEntry.Copied).path.also { assertEquals(true, reservation.ownsPath(it)) }
+    }
+    // An opening that cannot read the file keeps no path for it, whether it took the earlier path or one of its own.
+    fun failToOpen() {
+      val before = handedOff.toSet()
+      val unreadable = source { throw java.io.IOException("gone") }
+      assertEquals(listOf(OpenedFileEntry.Failed("preset.risup", "source-copy-failed")),
+        copyLegacyOpenedSources(directory, listOf(unreadable), OpenedFileReservation(handedOff, mutableSetOf()), publisher))
+      assertEquals(before, handedOff)
+    }
+    val openings = List(4) { OpenedFileReservation(handedOff, mutableSetOf()) }
+
+    failToOpen()
+
+    lateinit var second: String
+    // The second opening runs to the end while the first is still copying.
+    val first = open(openings[0]) { second = open(openings[1]) }
+    // The third arrives while the page still holds the first copy.
+    val third = open(openings[2])
+
+    assertEquals(3, setOf(first, second, third).size)
+    assertEquals(listOf("synthetic", "synthetic", "synthetic"), listOf(first, second, third).map { java.io.File(it).readText() })
+    // A copy its opening gave back undelivered is taken over by the next opening of the same file.
+    openings[0].release()
+    assertEquals(first, open(openings[3]))
+    failToOpen()
   }
 
   @Test

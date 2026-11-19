@@ -1,7 +1,8 @@
 import { parseImportJson } from '../importUtf8'
 import { importContentBatch } from '../storage/contentImportBatch'
 import type { NativeFileOperationSource, SharedNativeFileOperationContext } from '../storage/nativeFileJobManager'
-import { importSourceName, nativeImportSource, readImportSourceBytes, type ImportSourceLedger } from './sources'
+import { NativeFileJobError } from '../storage/nativeFileJobs'
+import { importSourceName, nativeImportSource, readImportSourceBytes } from './sources'
 import type { ImportIntakeItem, ImportSheetRowDecision } from './types'
 
 /** The destination chosen for one file: the sheet's choice, or the default of a direct import. */
@@ -20,13 +21,12 @@ export function describeIntakeItem(item: ImportIntakeItem): NativeFileOperationS
 export function importIntakeRows(
     context: SharedNativeFileOperationContext,
     rows: readonly ImportIntakeRow[],
-    ledger: ImportSourceLedger,
 ): Promise<string | null> {
     return importContentBatch(
         context,
         rows,
         row => describeIntakeItem(row.item),
-        row => importIntakeItem(row.item, row.decision, context, ledger),
+        row => importIntakeItem(row.item, row.decision, context),
     )
 }
 
@@ -68,31 +68,32 @@ export async function importIntakeItem(
     item: ImportIntakeItem,
     decision: ImportIntakeDecision,
     context: SharedNativeFileOperationContext,
-    ledger: ImportSourceLedger,
 ): Promise<string | null> {
     context.signal.throwIfAborted()
     switch (item.kind) {
         case 'character':
             return item.format === 'charx' && decision.charxAs === 'module'
-                ? importNativeModule(item, context, ledger)
-                : importCharacter(item, context, ledger)
+                ? importNativeModule(item, context)
+                : importCharacter(item, context)
         case 'module':
             return item.format === 'json'
-                ? importModuleBytes(item, context, ledger)
-                : importNativeModule(item, context, ledger)
+                ? importModuleBytes(item, context)
+                : importNativeModule(item, context)
         case 'lorebook': {
             const target = decision.lorebookTarget ?? { type: 'new-module' }
-            if (target.type === 'new-module') return importModuleBytes(item, context, ledger)
+            if (target.type === 'new-module') return importModuleBytes(item, context)
             const { appendCharacterLorebook, lorebookFileEntries } = await import('../process/lorebook.svelte')
-            const data = await readImportSourceBytes(item.source, ledger, context.signal)
-            const entries = lorebookFileEntries(parseImportJson(data).value)
-            if (!entries.length || !await appendCharacterLorebook(target.chaId, entries)) return null
+            const data = await readImportSourceBytes(item.source, context.signal)
+            // An empty lorebook imports as one, as it does into a new module.
+            if (!await appendCharacterLorebook(target.chaId, lorebookFileEntries(parseImportJson(data).value))) {
+                throw new NativeFileJobError('revision-conflict', `${target.name} was removed during the import`)
+            }
             context.setLocation({ kind: 'character-lorebook', chaId: target.chaId, characterName: target.name })
             return target.chaId
         }
         case 'preset': {
             const { importPreset } = await import('../storage/database.svelte')
-            const data = await readImportSourceBytes(item.source, ledger, context.signal)
+            const data = await readImportSourceBytes(item.source, context.signal)
             const index = await importPreset({ name: presetImportName(item), data })
             if (typeof index !== 'number') return null
             context.setLocation({ kind: 'preset' })
@@ -106,7 +107,6 @@ export async function importIntakeItem(
 async function importCharacter(
     item: ImportIntakeItem,
     context: SharedNativeFileOperationContext,
-    ledger: ImportSourceLedger,
 ): Promise<string | null> {
     const source = nativeImportSource(item.source)
     if (source?.type === 'desktopPath') {
@@ -122,11 +122,10 @@ async function importCharacter(
     let characterId: string | null
     if (item.format === 'json') {
         // JSON spools keep the JavaScript converter, as the Android content picker does.
-        const data = await readImportSourceBytes(item.source, ledger, context.signal)
+        const data = await readImportSourceBytes(item.source, context.signal)
         const index = await importCharacterProcess({ name: characterImportName(item), data, quiet: true })
         characterId = typeof index === 'number' ? getDatabase().characters[index]?.chaId ?? null : null
     } else {
-        ledger.claim(item.source)
         const result = await importPreparedNativeCharacterContent({ source, displayName: characterImportName(item) }, nativeOptions(context))
         characterId = result.kind === 'imported' ? result.value : null
     }
@@ -139,11 +138,9 @@ async function importCharacter(
 async function importNativeModule(
     item: ImportIntakeItem,
     context: SharedNativeFileOperationContext,
-    ledger: ImportSourceLedger,
 ): Promise<string | null> {
     const source = nativeImportSource(item.source)
     if (!source) throw new Error(`${item.name} cannot be imported`)
-    ledger.claim(item.source)
     const { importPreparedNativeModuleContent } = await import('../process/modules')
     const result = await importPreparedNativeModuleContent({ source, displayName: item.name }, nativeOptions(context))
     if (result.kind !== 'imported') return null
@@ -154,10 +151,9 @@ async function importNativeModule(
 async function importModuleBytes(
     item: ImportIntakeItem,
     context: SharedNativeFileOperationContext,
-    ledger: ImportSourceLedger,
 ): Promise<string | null> {
     const { importModuleData } = await import('../process/modules')
-    const data = await readImportSourceBytes(item.source, ledger, context.signal)
+    const data = await readImportSourceBytes(item.source, context.signal)
     const location = await importModuleData({ name: jsonImportName(item.name), data })
     if (!location) return null
     context.setLocation(location)

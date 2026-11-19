@@ -185,7 +185,6 @@ internal class SafSpoolStore(
     require(bufferBytes > 0) { "SAF copy buffer must be positive" }
   }
 
-  /** [beforePublish] runs for each token before [listReady] can offer its spool as a new import. */
   fun spool(
     sources: List<SafInputSource>,
     importDestination: SafContentImportDestination? = null,
@@ -193,26 +192,37 @@ internal class SafSpoolStore(
     onProgress: (SafSpoolProgress) -> Unit = {},
     delivered: Boolean = false,
     restoreCopy: Boolean = false,
-    beforePublish: (String) -> Unit = {},
-  ): SafSpoolBatch {
-    val ready = mutableListOf<SafSpoolReady>()
+  ): SafSpoolBatch = spoolEach(sources, importDestination, isCancelled, onProgress, delivered, restoreCopy)
+    .let { results -> SafSpoolBatch(results.flatMap { it.ready }, results.flatMap { it.failures }) }
+
+  /**
+   * One result per source, in source order. [reserve] takes each token before [listReady] can offer
+   * its spool as a new import, and reports whether it took it. [release] gives back the token of a
+   * spool that failed after it was taken.
+   */
+  fun spoolEach(
+    sources: List<SafInputSource>,
+    importDestination: SafContentImportDestination? = null,
+    isCancelled: () -> Boolean = { false },
+    onProgress: (SafSpoolProgress) -> Unit = {},
+    delivered: Boolean = false,
+    restoreCopy: Boolean = false,
+    reserve: (String) -> Boolean = { true },
+    release: (String) -> Unit = {},
+  ): List<SafSpoolBatch> {
     val existing = listReady().filter { it.operationId != null }.associateBy { it.operationId }
-    val failures = mutableListOf<SafSpoolFailure>()
-    for (source in sources) {
+    fun failed(displayName: String, code: String) = SafSpoolBatch(emptyList(), listOf(SafSpoolFailure(displayName, code)))
+    return sources.map { source ->
       val prior = source.operationId?.let { existing[it] }
-      if (prior != null) {
-        beforePublish(prior.token)
-        // Opening the same source again is a new request, not the interrupted earlier delivery.
+      // Opening the same source again is a new request, not the interrupted earlier delivery. A spool
+      // the caller already holds stays with its earlier request, and this one gets a copy of its own.
+      if (prior != null && reserve(prior.token)) {
         root.resolve(prior.token).resolve(SPOOL_DELIVERY_MARKER).delete()
-        ready.add(prior)
-        continue
+        return@map SafSpoolBatch(listOf(prior), emptyList())
       }
       val displayName = safeSafDisplayName(source.displayName)
       val token = tokenFactory().toString()
-      if (!CANONICAL_TOKEN.matches(token)) {
-        failures.add(SafSpoolFailure(displayName, "invalid-token"))
-        continue
-      }
+      if (!CANONICAL_TOKEN.matches(token)) return@map failed(displayName, "invalid-token")
       val ownedDirectory = root.resolve(token)
       val stagingDirectory = root.resolve("$SPOOL_STAGING_PREFIX$token")
       try {
@@ -249,27 +259,23 @@ internal class SafSpoolStore(
         // A spool handed straight to a request is never offered again as a new import.
         if (delivered || restoreCopy) writeDurableJson(stagingDirectory, SPOOL_DELIVERY_MARKER, "{}", "SAF spool delivery marker")
         if (restoreCopy) writeDurableJson(stagingDirectory, SPOOL_RESTORE_COPY_MARKER, "{}", "SAF restore copy marker")
-        beforePublish(token)
+        reserve(token)
         atomicPublisher.publish(stagingDirectory, ownedDirectory)
-        ready.add(SafSpoolReady(
+        SafSpoolBatch(listOf(SafSpoolReady(
           token,
           displayName,
           copiedBytes,
           source.totalBytes,
           importDestination,
           source.operationId,
-        ))
-      } catch (error: SafSpoolException) {
-        deleteGeneratedDirectory(stagingDirectory, token)
-        deleteGeneratedDirectory(ownedDirectory, token)
-        failures.add(SafSpoolFailure(displayName, error.code))
+        )), emptyList())
       } catch (error: Exception) {
         deleteGeneratedDirectory(stagingDirectory, token)
         deleteGeneratedDirectory(ownedDirectory, token)
-        failures.add(SafSpoolFailure(displayName, spoolWriteFailureCode(error)))
+        release(token)
+        failed(displayName, if (error is SafSpoolException) error.code else spoolWriteFailureCode(error))
       }
     }
-    return SafSpoolBatch(ready, failures)
   }
 
   fun cleanupStale(
@@ -529,9 +535,8 @@ internal suspend fun spoolOpenedFilesOnIo(
   importDestination: SafContentImportDestination? = null,
   isCancelled: () -> Boolean = { false },
   onProgress: (SafSpoolProgress) -> Unit = {},
-  beforePublish: (String) -> Unit = {},
 ): SafSpoolBatch = withContext(Dispatchers.IO) {
-  store.spool(sources, importDestination, isCancelled, onProgress, beforePublish = beforePublish)
+  store.spool(sources, importDestination, isCancelled, onProgress)
 }
 
 /**
@@ -550,6 +555,19 @@ internal fun markSpoolBatchDelivered(store: SafSpoolStore, batch: SafSpoolBatch)
     }
   }
   return SafSpoolBatch(ready, failures)
+}
+
+/**
+ * Marks the spools of one opened intent delivered file by file, one result per file in the order
+ * [spooled] lists them, so a spool that cannot be marked fails in the place of its own file. [owned]
+ * keeps the spools the intent reserved for itself.
+ */
+internal fun markOpenedSpoolsDelivered(
+  store: SafSpoolStore,
+  spooled: List<SafSpoolBatch>,
+  owned: (String) -> Boolean,
+): List<SafSpoolBatch> = spooled.map { result ->
+  markSpoolBatchDelivered(store, result.copy(ready = result.ready.filter { owned(it.token) }))
 }
 
 /**
@@ -971,26 +989,42 @@ private fun spoolFailuresJson(failures: List<SafSpoolFailure>): String =
     "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
   }
 
+/** One opened file outside the spool allowlist: its copy, or a file that could not be copied. */
+internal sealed interface OpenedFileEntry {
+  data class Copied(val path: String) : OpenedFileEntry
+  data class Failed(val displayName: String, val code: String) : OpenedFileEntry
+}
+
+internal fun openedFileEntryJson(entry: OpenedFileEntry): String = when (entry) {
+  is OpenedFileEntry.Copied -> jsonString(entry.path)
+  is OpenedFileEntry.Failed -> "{\"name\":${jsonString(entry.displayName)},\"code\":${jsonString(entry.code)}}"
+}
+
+/** What the page sorts an opened file by: a spool token, a copied path, or the name of a failed file. */
+internal fun openedFileOrderKey(entry: OpenedFileEntry): String = when (entry) {
+  is OpenedFileEntry.Copied -> entry.path
+  is OpenedFileEntry.Failed -> entry.displayName
+}
+
 /**
- * [openedPaths] are the copied files of the same opened intent that are outside the spool allowlist,
- * so the page receives every file of the intent as one delivery.
+ * [openedFiles] are the files of the same opened intent outside the spool allowlist, so the page
+ * receives every file of the intent as one delivery, in [order]. Batches the page has not listened to
+ * yet wait one by one, so each stays a delivery of its own.
  */
 internal fun androidSpoolBatchScript(
   requestId: String,
   batch: SafSpoolBatch,
-  openedPaths: List<String> = emptyList(),
+  openedFiles: List<OpenedFileEntry> = emptyList(),
+  order: List<String> = batch.ready.map { it.token } + openedFiles.map(::openedFileOrderKey) +
+    batch.failures.map { it.displayName },
 ): String {
   val ready = spoolReadyJson(batch.ready)
   val failures = spoolFailuresJson(batch.failures)
-  val paths = openedPaths.joinToString(",", transform = ::jsonString)
+  val opened = openedFiles.joinToString(",", transform = ::openedFileEntryJson)
+  val keys = order.joinToString(",", transform = ::jsonString)
   val value = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]," +
-    "\"openedPaths\":[$paths]}"
-  val pending = "{" +
-    "\"requestId\":${jsonString(requestId)}," +
-    "\"ready\":[...(window.tauriOpenedFileSpools?.ready??[]),...[$ready]]," +
-    "\"failures\":[...(window.tauriOpenedFileSpools?.failures??[]),...[$failures]]," +
-    "\"openedPaths\":[...(window.tauriOpenedFileSpools?.openedPaths??[]),...[$paths]]}"
-  return "window.tauriOpenedFileSpools=$pending;" +
+    "\"openedFiles\":[$opened],\"order\":[$keys]}"
+  return "window.tauriOpenedFileSpools=[...(window.tauriOpenedFileSpools??[]),$value];" +
     "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$value}));"
 }
 
