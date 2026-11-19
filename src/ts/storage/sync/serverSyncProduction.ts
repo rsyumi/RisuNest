@@ -30,6 +30,7 @@ import { bytePhase, laneDeltas, readServerSyncLanes, routineMoved, routinePeak, 
 import { createRemainingTimeEstimator } from './remainingTime'
 import { setAssetResidencyPolicy, type AssetResidencyPolicy } from './serverAssetResidency'
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../libraryFileOperation'
+import { getDeviceMarkers } from '../deviceMarkers'
 
 import { readRepresentativeImagePriority, subscribeRepresentativeImagePriority } from '../../ui/representativeImagePriority'
 
@@ -115,6 +116,13 @@ const noteLocalChange = () => {
     if (foreground && !pendingHold) pendingHold = holdRoutineSync()
 }
 let heldForCommittedRestore = false
+// The hold stays with the binding it stopped, through its resumes and restarts, until Sync now or a new device binding.
+const RESTORE_HOLD = 'risuNestServerSyncRestoreHold'
+async function saveRestoreHold(state?: BindingContext['state']): Promise<void> {
+    const epoch = heldForCommittedRestore && state ? state.selectionEpoch : null
+    const markers = getDeviceMarkers()
+    if (markers.getItem(RESTORE_HOLD) !== epoch) await markers.commitItem!(RESTORE_HOLD, epoch)
+}
 let replacing = false
 let hydrating: Promise<void> | undefined
 let hydrationPending = false
@@ -531,8 +539,10 @@ const transport: SyncBindingTransport = {
     },
     async resumeBinding(c) {
         try {
-            heldForCommittedRestore = c.holdAutomaticSync === true; context = c; adoptSchedulerAuthority(c)
+            heldForCommittedRestore = c.holdAutomaticSync === true || getDeviceMarkers().getItem(RESTORE_HOLD) === c.state.selectionEpoch
+            context = c; adoptSchedulerAuthority(c)
             activationPending = c
+            await saveRestoreHold(c.state)
             try { await ensureActivated(c) }
             catch (value) {
                 // A busy or unavailable local store is tried again by automatic sync too, without the offline notice.
@@ -555,6 +565,7 @@ const transport: SyncBindingTransport = {
         try {
             await during('applying', () => invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }))
             heldForCommittedRestore = false; context = c; adoptSchedulerAuthority(c); checkContext(c)
+            await saveRestoreHold()
             if (remoteAssetsRequested(c)) await keepAssetsRemote(c)
             persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true
             await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint()
@@ -637,6 +648,7 @@ async function syncServerNow(): Promise<void> {
     heldForCommittedRestore = false
     halt()
     try {
+        await saveRestoreHold()
         await scheduler.fence()
         await hydrating
         if (context) await ensureActivated(context)
@@ -699,15 +711,17 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     disposers.push(() => { window.removeEventListener('risu-native-lifecycle', lifecycle); outOfTime = false })
     disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; halt(); hydrationPending = false; representativesPending = false; clearTimeout(representativesTimer); representativesTimer = undefined; hydrationAgain = false; attempt = undefined; releaseHold(attemptHold); attemptHold = undefined; releaseHold(pendingHold); pendingHold = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
-    if (!resumeBound || heldForCommittedRestore) return
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
+    heldForCommittedRestore ||= current.target.kind === 'server' && getDeviceMarkers().getItem(RESTORE_HOLD) === current.selectionEpoch
+    await saveRestoreHold(current)
+    if (!resumeBound) return
     if (current.target.kind === 'server' && status.configured) {
         try { await resumeCurrentServerBinding(current) }
         catch (value) {
             // A fenced binding that cannot reach its server keeps the local library usable until retry.
             if (!failures(value).every(failure => transientTransportFailure(failure) || settingsResolvedFailure(failure))) throw value
         }
-    } else if (current.target.kind === 'server') await completeInterruptedBinding()
+    } else if (current.target.kind === 'server' && !heldForCommittedRestore) await completeInterruptedBinding()
 }
 // The user already chose to connect, so a server still as empty as when it was inspected
 // is bound without asking again. Anything else waits for Connect in settings.
@@ -721,7 +735,7 @@ async function completeInterruptedBinding(): Promise<void> {
     bindingIncomplete = true; changed()
 }
 
-const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || scheduler.isBlocked(), blockedCode: scheduler.blockedCode(), replacing, draining: false, error, bindingIncomplete, progress: attempt && { ...attempt, stages: [...attempt.stages], active: [...attempt.active] }, finished: finished && { ...finished, stages: [...finished.stages], active: [...finished.active] }, lastSuccessAt })
+const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || heldForCommittedRestore || scheduler.isBlocked(), blockedCode: scheduler.blockedCode(), replacing, draining: false, error, bindingIncomplete, progress: attempt && { ...attempt, stages: [...attempt.stages], active: [...attempt.active] }, finished: finished && { ...finished, stages: [...finished.stages], active: [...finished.active] }, lastSuccessAt })
 const controller = {
     snapshot,
     subscribe: (listener: (value: ReturnType<typeof snapshot>) => void) => { listeners.add(listener); listener(controller.snapshot()); return () => { listeners.delete(listener) } },

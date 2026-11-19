@@ -486,8 +486,18 @@ describe('native external LWW adapter', () => {
         await vi.advanceTimersByTimeAsync(15_000); await settle()
         expect(fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_publish')).toHaveLength(1)
     })
-    it('flushes once on background entry and suspends all timed work', async () => {
-        dispose = await installExternalLwwAdapters(state()); await settle(); fixture.invoke.mockClear()
+    it.each(['on screen', 'hidden and shown as it begins'] as const)('flushes once on background entry after a start %s and suspends all timed work', async start => {
+        if (start === 'on screen') dispose = await installExternalLwwAdapters(state())
+        else {
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+            let listened!: () => void
+            fixture.listen.mockImplementationOnce(() => new Promise(resolve => { listened = () => resolve(() => {}) }))
+            const installing = installExternalLwwAdapters(state()).then(value => { dispose = value })
+            await settle()
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange'))
+            listened(); await installing
+        }
+        await settle(); fixture.invoke.mockClear()
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' }); document.dispatchEvent(new Event('visibilitychange'))
         await settle(); expect(fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_publish')).toHaveLength(1)
         document.dispatchEvent(new Event('visibilitychange')); await vi.advanceTimersByTimeAsync(600_000); await settle()
@@ -826,11 +836,9 @@ describe('bounded production calls and lifecycle ownership', () => {
             ['the start', 'hidden away'],
             ['the start', 'hidden away and back while it waits'],
             ['the start', 'back before the expiry arrives'],
-            ['the start', 'kept away and back as the start ends'],
         ] as const)('holds routine sync after %s outlives its background time until the app returns (%s)', async (entry, order) => {
             const android = order === 'kept away' || order === 'kept away before the binding resumes' || order === 'back and kept away again'
-                || order === 'kept away and back as the start ends'
-            const backBeforeItEnds = order === 'back before the expiry arrives' || order === 'hidden away and back while it waits' || order === 'kept away and back as the start ends'
+            const backBeforeItEnds = order === 'back before the expiry arrives' || order === 'hidden away and back while it waits'
             fixture.os = android ? 'android' : 'ios'
             const expire = expiringHolds()
             if (entry !== 'the start') { dispose = await installExternalLwwAdapters(state()); for (let i = 0; i < 6; i++) await settle() }
@@ -846,12 +854,6 @@ describe('bounded production calls and lifecycle ownership', () => {
                 const resume = fixture.resumeCurrent.getMockImplementation()!
                 fixture.resumeCurrent.mockImplementation(async target => { await checking; await resume(target) })
             } else checked()
-            // The start still waits to hear device changes after the binding resumed.
-            let listened = () => {}
-            if (order === 'kept away and back as the start ends') {
-                const listening = new Promise<void>(resolve => { listened = resolve })
-                fixture.listen.mockImplementationOnce(async () => { await listening; return () => {} })
-            }
             const resumed = entry === 'the start' ? installExternalLwwAdapters(state()).then(value => { dispose = value })
                 : drain ? drain.resumeAfterExitCancel!() : (returnToApp(), show('visible'))
             await settle()
@@ -861,9 +863,7 @@ describe('bounded production calls and lifecycle ownership', () => {
             else if (!android) show('hidden')
             expire()
             if (order === 'hidden away and back while it waits') show('visible')
-            checked(); release()
-            if (order === 'kept away and back as the start ends') { for (let i = 0; i < 6; i++) await settle(); returnToApp(); listened() }
-            await resumed
+            checked(); release(); await resumed
             if (!backBeforeItEnds) {
                 // Nothing more starts natively while the app stays away.
                 expect(await synced()).toBe(false); expect(resumes).toBe(1)
@@ -878,8 +878,11 @@ describe('bounded production calls and lifecycle ownership', () => {
             const release = gate('external_lww_receive')
             fixture.revision!(13, 'local'); await vi.advanceTimersByTimeAsync(600_000)
             expire(); release(); await synced()
-            window.dispatchEvent(new Event('online'))
-            expect(await synced()).toBe(false)
+            vi.mocked(beginDeferredMobileBackgroundTask).mockClear()
+            Object.defineProperty(navigator, 'onLine', { configurable: true, value: false }); window.dispatchEvent(new Event('offline'))
+            Object.defineProperty(navigator, 'onLine', { configurable: true, value: true }); window.dispatchEvent(new Event('online'))
+            expect(await synced()).toBe(false); expect(resumes).toBe(0)
+            expect(beginDeferredMobileBackgroundTask).not.toHaveBeenCalled()
             // Android stops keeping the page shortly after, while the app stays away.
             show('hidden'); for (let i = 0; i < 6; i++) await settle()
             expect(fixture.invoke.mock.calls.some(([command]) => command === 'external_lww_publish')).toBe(false)
@@ -903,6 +906,29 @@ describe('bounded production calls and lifecycle ownership', () => {
             if (away === 'leaves the screen') { show('hidden'); show('visible'); returnToApp() }
             release(); for (let i = 0; i < 6; i++) await settle()
             expect(fixture.invoke.mock.calls.filter(([command]) => command === 'external_lww_resume')).toHaveLength(passes)
+            fixture.invoke.mockClear()
+            fixture.revision!(14, 'local'); await vi.advanceTimersByTimeAsync(600_000)
+            expect(fixture.invoke.mock.calls.some(([command]) => command === 'external_lww_publish')).toBe(true)
+        })
+        it.each(['the app returns after its time ran out', 'the network returns', 'a file operation ends'] as const)('starts routine sync when %s while the start finishes', async event => {
+            fixture.os = 'android'
+            const expire = expiringHolds()
+            const admission = await import('../../libraryFileOperation')
+            const reserved = event === 'a file operation ends' ? admission.reserveLibraryFileOperation() : undefined
+            if (event === 'the network returns') Object.defineProperty(navigator, 'onLine', { configurable: true, value: false })
+            // The start still runs after the binding resumed.
+            let finish!: () => void
+            const finishing = new Promise<void>(resolve => { finish = resolve })
+            const resume = fixture.resumeCurrent.getMockImplementation()!
+            fixture.resumeCurrent.mockImplementation(async target => { await resume(target); await finishing })
+            // The time runs out while the binding resumes, so the start leaves sync stopped.
+            const release = event === 'the app returns after its time ran out' ? gate('external_lww_resume') : undefined
+            const installing = installExternalLwwAdapters(state()).then(value => { dispose = value })
+            for (let i = 0; i < 6; i++) await settle()
+            if (release) { expire(); release(); for (let i = 0; i < 6; i++) await settle(); returnToApp() }
+            if (event === 'the network returns') { Object.defineProperty(navigator, 'onLine', { configurable: true, value: true }); window.dispatchEvent(new Event('online')) }
+            reserved?.()
+            finish(); await installing
             fixture.invoke.mockClear()
             fixture.revision!(14, 'local'); await vi.advanceTimersByTimeAsync(600_000)
             expect(fixture.invoke.mock.calls.some(([command]) => command === 'external_lww_publish')).toBe(true)

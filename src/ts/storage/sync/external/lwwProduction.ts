@@ -54,7 +54,8 @@ export function supportsExternalLwwNewDevice(id: string): boolean {
 const header = (connectionId: string, context: BindingContext, requestId: string = crypto.randomUUID()) => ({ connectionId, bindingAuthority: context.state.targetAuthority, requestId, generating: generatingConversations.snapshot() })
 const native = createNativeSyncBindingBridge()
 const networkAvailable = () => navigator.onLine && !isLibraryFileOperationReserved()
-const foregroundAvailable = () => document.visibilityState !== 'hidden' && networkAvailable()
+/** Whether routine sync may run: on screen and online, and not away after sync's background time ran out. */
+const foregroundAvailable = () => document.visibilityState !== 'hidden' && networkAvailable() && !outOfTime
 // A start that left sync off registers the transports, so settings can still change the sync target,
 // but leaves the bound target stopped until the user starts it.
 let resumeBoundTarget = true
@@ -65,8 +66,6 @@ let outOfTime = false
 // Departures the page noticed, so a return pass that began before one runs again after the return that follows it.
 let departures = 0
 const ranOutOfTime = () => { if (isTauriAndroid || document.visibilityState === 'hidden') { outOfTime = true; departures++ } }
-/** Whether routine sync may start: off screen, only while sync's background time lasts. */
-const routineMayStart = () => foregroundAvailable() && !outOfTime
 
 /**
  * Holds sync work outside the scheduler, such as waiting to start or resume it. If the app leaves the screen during
@@ -320,7 +319,7 @@ function createAdapter(connectionId: string): Adapter {
             active = binding
             adapter.state = binding.state
             scheduler.recovered()
-            if (routineMayStart()) { scheduler.start(); resumeHydration() }
+            if (foregroundAvailable()) { scheduler.start(); resumeHydration() }
         }),
         async fenceOldJobs(binding) {
             adapter.generation++
@@ -420,6 +419,9 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
 export async function installExternalLwwAdapters(state: ExternalStorageState, resumeBound = true): Promise<() => void> {
     if (!isTauri) return () => {}
     resumeBoundTarget = resumeBound
+    const dirty = (generation = false) => { for (const adapter of adapters.values()) if (adapter.state) adapter.scheduler.dirty(generation) }
+    // Everything is heard before the start below, so an event the start overlaps is not lost.
+    const disposeDevice = await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => dirty())
     let hiddenFlushed = document.visibilityState === 'hidden'
     let wasOnline = navigator.onLine
     let disposed = false
@@ -437,7 +439,7 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                 // which waits for the return once that time ran out.
                 else if (flushHidden) void adapter.hide(navigator.onLine && !outOfTime).catch(() => {})
             }
-            else if (!adapter.foreground) {
+            else if (!adapter.foreground && !outOfTime) {
                 adapter.generation++
                 adapter.scheduler.pauseAutomatic()
                 const generation = adapter.generation
@@ -450,51 +452,48 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
                     const current = await native.state()
                     if (generation !== adapter.generation || current.targetAuthority !== authority || current.target.kind !== 'external' || !foregroundAvailable()) return
                     await invoke('external_lww_resume', { connectionId: current.target.connectionId })
-                    if (generation === adapter.generation && routineMayStart()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
+                    if (generation === adapter.generation && foregroundAvailable()) { adapter.resumeHydration(); await adapter.scheduler.resumeForeground() }
                 }).catch(() => {}).finally(() => {
                     adapter.foreground = undefined
                     // The return after a departure during the pass found it still running.
-                    if ((generation !== adapter.generation || departed !== departures) && adapter.state && routineMayStart() && [...adapters.values()].includes(adapter)) foreground()
+                    if ((generation !== adapter.generation || departed !== departures) && adapter.state && foregroundAvailable() && [...adapters.values()].includes(adapter)) foreground()
                 })
             }
         }
     }
-    // A return clears a background time that ran out, also one during the start below. A page Android keeps running
-    // off screen stays visible, so it hears the return only from the app's own start.
+    // A return clears a background time that ran out. A page Android keeps running off screen stays visible, so it
+    // hears the return only from the app's own start.
     const visibility = () => { if (document.visibilityState !== 'hidden') outOfTime = false; foreground() }
     const lifecycle = (event: Event) => {
         if (!isTauriAndroid || (event as CustomEvent<{ reason?: unknown } | null>).detail?.reason !== 'start') return
         outOfTime = false; foreground()
     }
-    const unlisten = () => { document.removeEventListener('visibilitychange', visibility); window.removeEventListener('risu-native-lifecycle', lifecycle) }
+    let lastConversation = ''
+    const disposers = [disposeDevice, subscribeLocalPersistentRevision((_revision, cause) => dirty(cause === 'generation-complete')),
+        getPersistentDataRuntime().subscribeActiveConversationViewportSource(source => {
+            if (!source) return
+            const value = getPersistentDataRuntime().captureSelectedConversationTarget()
+            if (!value) return
+            const identity = JSON.stringify([value.characterId, value.conversationId])
+            if (identity === lastConversation) return
+            lastConversation = identity
+            for (const adapter of adapters.values()) if (adapter.state) void adapter.scheduler.conversationOpened()
+        }),
+        subscribeLibraryFileOperationReleased(() => {
+            const resuming = [...adapters.values()].flatMap(adapter => adapter.foreground ? [adapter.foreground] : [])
+            if (resuming.length) void Promise.allSettled(resuming).then(foreground)
+            else foreground()
+        }),
+        () => { document.removeEventListener('visibilitychange', visibility); window.removeEventListener('risu-native-lifecycle', lifecycle) },
+        () => { window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground) }]
     document.addEventListener('visibilitychange', visibility)
     window.addEventListener('risu-native-lifecycle', lifecycle)
-    try { await refreshExternalLwwAdapters(state) } catch (error) { unlisten(); throw error }
-    const dirty = (generation = false) => { for (const adapter of adapters.values()) if (adapter.state) adapter.scheduler.dirty(generation) }
-    const disposeRevision = subscribeLocalPersistentRevision((_revision, cause) => dirty(cause === 'generation-complete'))
-    const disposeDevice = await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => dirty())
-    let lastConversation = ''
-    const disposeConversation = getPersistentDataRuntime().subscribeActiveConversationViewportSource(source => {
-        if (!source) return
-        const value = getPersistentDataRuntime().captureSelectedConversationTarget()
-        if (!value) return
-        const identity = JSON.stringify([value.characterId, value.conversationId])
-        if (identity === lastConversation) return
-        lastConversation = identity
-        for (const adapter of adapters.values()) if (adapter.state) void adapter.scheduler.conversationOpened()
-    })
     window.addEventListener('online', foreground)
     window.addEventListener('offline', foreground)
-    const releaseFileOperation = subscribeLibraryFileOperationReleased(() => {
-        const resuming = [...adapters.values()].flatMap(adapter => adapter.foreground ? [adapter.foreground] : [])
-        if (resuming.length) void Promise.allSettled(resuming).then(foreground)
-        else foreground()
-    })
+    const stop = () => { disposed = true; for (const dispose of disposers) dispose() }
+    try { await refreshExternalLwwAdapters(state) } catch (error) { stop(); throw error }
     return () => {
-        disposed = true
-        releaseFileOperation()
-        disposeRevision(); disposeDevice(); disposeConversation()
-        unlisten(); window.removeEventListener('online', foreground); window.removeEventListener('offline', foreground)
+        stop()
         outOfTime = false
         refreshGeneration++
         for (const adapter of [...adapters.values()]) adapter.dispose()
@@ -571,7 +570,7 @@ export function externalLwwExitDrain(connectionId: string, selectionEpoch: strin
             if (generation !== adapter.generation || binding.target.kind !== 'external' || binding.target.connectionId !== connectionId
                 || binding.targetAuthority !== authority || binding.selectionEpoch !== selectionEpoch) return
             await invoke('external_lww_resume', { connectionId })
-            if (generation === adapter.generation && adapters.get(connectionId) === adapter && routineMayStart()) { adapter.scheduler.start(); adapter.resumeHydration() }
+            if (generation === adapter.generation && adapters.get(connectionId) === adapter && foregroundAvailable()) { adapter.scheduler.start(); adapter.resumeHydration() }
         }),
     }
 }
