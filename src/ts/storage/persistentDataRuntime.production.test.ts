@@ -1863,7 +1863,7 @@ describe('received preset selection', () => {
     async function presetRuntime(catalog: boolean) {
         const initial = normalizeDatabaseDefaults({} as Database)
         const preset = initial.botPresets[0]
-        initial.botPresets = [{...structuredClone(preset), id: 'preset-a', name: 'A', mainPrompt: 'Prompt A'}, {...structuredClone(preset), id: 'preset-b', name: 'B', mainPrompt: 'Prompt B'}]
+        initial.botPresets = ['A', 'B', 'C'].map((name) => ({...structuredClone(preset), id: `preset-${name.toLowerCase()}`, name, mainPrompt: `Prompt ${name}`}))
         initial.botPresetsId = 1
         initial.personas[0].id = 'persona'
         const store = new IndexedDbPersistentDataStore(`received-preset-selection-${catalog}-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange) as PersistentDataStore
@@ -1888,23 +1888,30 @@ describe('received preset selection', () => {
         return mutations
     }
 
-    it.each([[false, false], [true, false], [true, true]])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s, refresh=%s)', async (catalog, refresh) => {
+    it.each([
+        [false, false, 'preset-elsewhere', false], [true, false, 'preset-elsewhere', false], [true, true, 'preset-elsewhere', false],
+        [true, false, 'preset-elsewhere', true], [true, true, 'preset-elsewhere', true], [true, false, undefined, false], [true, true, undefined, false],
+    ])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s, refresh=%s, selection=%s, reorder=%s)', async (catalog, refresh, received, reorder) => {
         const {store, runtime, saveFailures} = await presetRuntime(catalog)
-        const selection = {key: JSON.stringify(['root', 'botPresetsId']), type: 'set' as const, value: 'preset-elsewhere'}
+        const selectionKey = JSON.stringify(['root', 'botPresetsId'])
+        const unitMutations: PersistentUnitMutation[] = [received ? {key: selectionKey, type: 'set', value: received} : {key: selectionKey, type: 'delete'}]
+        // The first preset after the receive is a summary on this device.
+        if (reorder) unitMutations.push({key: JSON.stringify(['order', 'presets']), type: 'set', value: ['preset-c', 'preset-a', 'preset-b']})
+        const fallback = reorder ? 'C' : 'A'
         if (refresh) {
-            const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations: [selection]})
+            const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations})
             const fence = await runtime.acquireCommittedWorkingSetRefreshFence()
             try {
                 await expect(fence.refreshCommittedWorkingSet(revision)).resolves.toMatchObject({projection: 'applied'})
             } finally {
                 fence.release()
             }
-        } else await receiveCommit(store, runtime, {unitMutations: [selection]}, [selection.key])
-        expect(getDatabase().botPresets[getDatabase().botPresetsId]).toMatchObject({id: 'preset-a', mainPrompt: 'Prompt A'})
-        expect(getDatabase().mainPrompt).toBe('Prompt A')
+        } else await receiveCommit(store, runtime, {unitMutations}, unitMutations.map((value) => value.key))
+        expect(getDatabase().botPresets[getDatabase().botPresetsId]).toMatchObject({name: fallback, mainPrompt: `Prompt ${fallback}`})
+        expect(getDatabase().mainPrompt).toBe(`Prompt ${fallback}`)
         const mutations = await savedMutations(store, runtime)
         expect(mutations.map((value) => value.key)).toEqual(['classicMaxWidth'])
-        expect((await store.readRoot()).value.botPresetsId).toBe('preset-elsewhere')
+        expect((await store.readRoot()).value.botPresetsId).toBe(received)
         expect(saveFailures).toEqual([])
     })
 

@@ -87,11 +87,16 @@ export async function applyLwwWorkingSetUnits(
     for (const [kind, id, field, metadataField] of keys) {
         if (kind === 'preset' && database.botPresets.some((value) => value?.['id'] === id)) await readPreset(id)
         if (!isCatalogPresetWorkingSet(database.botPresets) && (kind === 'preset' || kind === 'exists' && id === 'preset')) await readPreset(kind === 'preset' ? id : field)
-        if (kind === 'root' && id === 'botPresetsId' && typeof root?.botPresetsId === 'string') {
-            await readPreset(root.botPresetsId)
-            if (presets.get(root.botPresetsId) && !presetCatalog) presetCatalog = await store.queryPresets()
-            // A selection naming a preset this device does not hold falls back to the first.
-            else if (catalogPresets && typeof database.botPresets[0]?.['id'] === 'string') await readPreset(database.botPresets[0]['id'])
+        if (kind === 'root' && id === 'botPresetsId') {
+            const received = typeof root?.botPresetsId === 'string' ? root.botPresetsId : undefined
+            if (received) await readPreset(received)
+            if (received && presets.get(received)) presetCatalog ??= await store.queryPresets()
+            else if (catalogPresets) {
+                // A selection naming a preset this device does not hold, or none, falls back to the first.
+                // The selection key runs last, so a received order or removal has already read that catalog.
+                const first = presetCatalog ? presetCatalog.items[0]?.id : database.botPresets[0]?.['id']
+                if (typeof first === 'string') await readPreset(first)
+            }
         }
         if ((kind === 'order' && id === 'presets') || (kind === 'exists' && id === 'preset')) {
             presetCatalog ??= await store.queryPresets()
@@ -137,6 +142,8 @@ export async function applyLwwWorkingSetUnits(
                 }
             }
             const remote = { ...root } as unknown as Record<string, unknown>
+            // A removed selection selects the first record.
+            if ((id === 'botPresetsId' || id === 'selectedPersona') && !Object.hasOwn(remote, id)) remote[id] = 0
             if (id === 'botPresetsId' && typeof remote[id] === 'string') remote[id] = Math.max(0, database.botPresets.findIndex((value) => value?.['id'] === remote[id]))
             if (id === 'selectedPersona' && typeof remote[id] === 'string') remote[id] = Math.max(0, database.personas?.findIndex((value) => value.id === remote[id]) ?? 0)
             const before = { ...baseline.root } as unknown as Record<string, unknown>
@@ -150,7 +157,7 @@ export async function applyLwwWorkingSetUnits(
             if (id === 'botPresetsId' || id === 'selectedPersona') {
                 const records: readonly ({ id?: unknown } | undefined)[] = (id === 'botPresetsId' ? database.botPresets : database.personas) ?? []
                 const received = root[id], index = database[id]
-                if (typeof received === 'string' && index === remote[id] && !records.some((value) => value?.id === received)) {
+                if ((received === undefined || typeof received === 'string' && !records.some((value) => value?.id === received)) && index === remote[id]) {
                     const fallbackId = records[index]?.id
                     const baselineRoot = baseline.root as unknown as Record<string, unknown>
                     baselineRoot[id] = typeof fallbackId === 'string' ? fallbackId : index
