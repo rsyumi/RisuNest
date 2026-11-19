@@ -1927,6 +1927,8 @@ describe('received preset selection', () => {
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
         expect(getDatabase().temperature).toBe(3)
+        // Reading the body is no edit of the preset.
+        expect((await savedMutations(store, runtime)).filter((value) => value.key.startsWith('["preset",'))).toEqual([])
         const controller = createPresetWorkingSetController({
             getDatabase, captureCurrentPreset, getEffectivePresetId,
             applyPreset: (root, preset) => setPreset(root as Database, preset),
