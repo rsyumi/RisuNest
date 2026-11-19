@@ -2141,23 +2141,28 @@ function applyEffectivePreset(db: Database, preset: botPreset): void {
 export type PresetSource = Pick<PersistentDataRuntime, 'withPausedPersistentWrites'> & { store: Pick<PersistentDataStore, 'readPreset'> }
 
 /**
- * Reads a catalog stub's stored body into `db`, with no save or receive in between. The body is
- * placed only while `db` is installed and `wanted()` holds; returns whether the preset is loaded.
+ * Runs `apply` once `db` holds the preset's body, reading a catalog stub's stored body first with no
+ * save or receive in between. It runs only while `db` is installed and `wanted()` holds, in the same
+ * task as that check; returns whether it ran.
  */
-async function loadPresetBody(db: Database, id: string, source?: PresetSource, wanted = () => true): Promise<boolean> {
+async function applyPresetBody(db: Database, id: string, apply: () => void, source?: PresetSource, wanted = () => true): Promise<boolean> {
     const index = () => getDatabase() === db && wanted() ? db.botPresets.findIndex(preset => preset?.id === id) : -1
+    const place = (value?: botPreset) => {
+        const current = index()
+        if (current < 0) return false
+        if (value) placeCatalogPresetBody(db.botPresets, current, value)
+        apply()
+        return true
+    }
     if (index() < 0) return false
-    if (identity.isLoadedPreset(db, id)) return true
+    if (identity.isLoadedPreset(db, id)) return place()
     const presets = source ?? (await import('./persistentDataRuntime.svelte')).getPersistentDataRuntime()
     return presets.withPausedPersistentWrites('preset-body', async () => {
         if (index() < 0) return false
-        if (identity.isLoadedPreset(db, id)) return true
+        if (identity.isLoadedPreset(db, id)) return place()
         const value = await presets.store.readPreset(id)
         if (!value) throw new Error('Preset was not found')
-        const current = index()
-        if (current < 0) return false
-        placeCatalogPresetBody(db.botPresets, current, value.value)
-        return true
+        return place(value.value)
     })
 }
 
@@ -2173,8 +2178,7 @@ export async function activatePresetOverride(index: number | null): Promise<void
         return
     }
     // A replacement during the read applies the preset as the new library holds it.
-    if (!await loadPresetBody(db, id)) return activatePresetOverride(getDatabase().botPresets.findIndex(preset => preset?.id === id))
-    setEffectivePresetOverride(id, db)
+    if (!await applyPresetBody(db, id, () => setEffectivePresetOverride(id, db))) return activatePresetOverride(getDatabase().botPresets.findIndex(preset => preset?.id === id))
 }
 
 /** The preset ID a conversation binds when it names a preset in the library; summary stubs carry no binding. */
@@ -2192,14 +2196,14 @@ let presetBindingGeneration = 0
 export async function applyConversationPresetBinding(db: Database, chat: Chat | undefined): Promise<void> {
     const generation = ++presetBindingGeneration
     const id = resolveConversationPresetBinding(db, chat)
-    const loaded = !id || identity.isLoadedPreset(db, id)
-    if (loaded && id === identity.getEffectivePresetBinding(db)) return
-    if (id && !loaded) {
-        // Another conversation's binding must not stay applied while this one loads.
-        if (identity.getEffectivePresetBinding(db) !== null) identity.setEffectivePresetBinding(db, null, applyEffectivePreset)
-        if (!await loadPresetBody(db, id, undefined, () => generation === presetBindingGeneration)) return
+    const apply = () => identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
+    if (!id || identity.isLoadedPreset(db, id)) {
+        if (id !== identity.getEffectivePresetBinding(db)) apply()
+        return
     }
-    identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
+    // Another conversation's binding must not stay applied while this one loads.
+    if (identity.getEffectivePresetBinding(db) !== null) identity.setEffectivePresetBinding(db, null, applyEffectivePreset)
+    await applyPresetBody(db, id, apply, undefined, () => generation === presetBindingGeneration)
 }
 
 /**
@@ -2216,9 +2220,9 @@ export async function activateRequestPresetBinding(target: { characterId: string
         if (identity.getEffectivePresetBinding(db) !== null) identity.setEffectivePresetBinding(db, null, applyEffectivePreset)
         return false
     }
-    // A replacement during the read applies the binding as the new library holds it.
-    if (!await loadPresetBody(db, id)) return activateRequestPresetBinding(target)
-    identity.setEffectivePresetBinding(db, id, applyEffectivePreset, { clearOverride: true })
+    // A replacement during or after the read applies the binding as the new library holds it.
+    const apply = () => identity.setEffectivePresetBinding(db, id, applyEffectivePreset, { clearOverride: true })
+    if (!await applyPresetBody(db, id, apply) || getDatabase() !== db) return activateRequestPresetBinding(target)
     return identity.getEffectivePresetBinding(db) === id
 }
 
@@ -2230,19 +2234,19 @@ export async function activateRequestPresetBinding(target: { characterId: string
 export async function carryPresetBinding(id: string, source?: PresetSource): Promise<void> {
     const db = getDatabase()
     const generation = presetBindingGeneration
-    if (identity.isLoadedPreset(db, id) || source && await loadPresetBody(db, id, source,
-        () => generation === presetBindingGeneration && identity.getEffectivePresetBinding(db) === null)) {
-        identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
-    }
+    const apply = () => identity.setEffectivePresetBinding(db, id, applyEffectivePreset)
+    if (identity.isLoadedPreset(db, id)) apply()
+    else if (source) await applyPresetBody(db, id, apply, source,
+        () => generation === presetBindingGeneration && identity.getEffectivePresetBinding(db) === null)
 }
 
 export async function carryPresetOverride(id: string, source?: PresetSource): Promise<void> {
     const db = getDatabase()
     const selectedId = db.botPresets[db.botPresetsId]?.id
-    if (identity.isLoadedPreset(db, id) || source && await loadPresetBody(db, id, source,
-        () => identity.getEffectivePresetOverride(db) === null && db.botPresets[db.botPresetsId]?.id === selectedId)) {
-        setEffectivePresetOverride(id, db)
-    }
+    const apply = () => setEffectivePresetOverride(id, db)
+    if (identity.isLoadedPreset(db, id)) apply()
+    else if (source) await applyPresetBody(db, id, apply, source,
+        () => identity.getEffectivePresetOverride(db) === null && db.botPresets[db.botPresetsId]?.id === selectedId)
 }
 
 export function flushEffectivePersonaEdits(db: Database = getDatabase()): void {

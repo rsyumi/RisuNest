@@ -195,17 +195,20 @@ describe('conversation preset binding', () => {
         expect(getDatabase().botPresetsId).toBe(0)
     })
 
-    it('drops a stale binding whose preset a later selection read meanwhile', async () => {
+    it.each(['before', 'after'] as const)('drops a stale binding whose preset a later selection read meanwhile (selection %s the body is placed)', async (when) => {
         summarizePresetB()
         const flush = deferred()
         runtime.pausedWrites.mockImplementationOnce(async (operation) => {
-            await flush.promise
-            return operation()
+            if (when === 'before') await flush.promise
+            const placed = await operation()
+            if (when === 'after') await flush.promise
+            return placed
         })
         const database = getDatabase()
 
         const stale = applyConversationPresetBinding(database, conversation('bound', 'preset-b'))
-        await vi.waitFor(() => expect(runtime.pausedWrites).toHaveBeenCalledOnce())
+        if (when === 'before') await vi.waitFor(() => expect(runtime.pausedWrites).toHaveBeenCalledOnce())
+        else await vi.waitFor(() => expect(isLoadedPreset(database, 'preset-b')).toBe(true))
         await applyConversationPresetBinding(database, conversation('bound', 'preset-b'))
         expect(getEffectivePresetId()).toBe('preset-b')
         await applyConversationPresetBinding(database, conversation('unbound', ''))
@@ -271,10 +274,10 @@ describe('conversation preset binding', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt A')
     })
 
-    it.each(['chain', 'request'] as const)('reads the body into a library that replaced the one being read (%s)', async (path) => {
+    it.each([['chain', true], ['request', true], ['request', false]] as const)('reads the body into a library that replaced the one being read (%s, summary=%s)', async (path, summary) => {
         const owner = () => [{ type: 'character', chaId: 'character', name: 'Character', chatPage: 0,
             chats: [conversation('target', 'preset-b')] } as unknown as character]
-        summarizePresetB()
+        if (summary) summarizePresetB()
         getDatabase().characters = owner()
         const read = deferred()
         const previous = { revision: 1, value: structuredClone(stored.get('preset-b')!) }
@@ -284,10 +287,12 @@ describe('conversation preset binding', () => {
         })
         const activation = path === 'chain' ? activatePresetOverride(1)
             : activateRequestPresetBinding({ characterId: 'character', conversationId: 'target' })
-        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
+        // A held body needs no read, so the library is replaced before the activation resumes.
+        if (summary) await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
         stored.get('preset-b')!.mainPrompt = 'Replacement B'
         const replacement = presetDatabase()
-        summarizePresetB(replacement)
+        if (summary) summarizePresetB(replacement)
+        else replacement.botPresets[1].mainPrompt = 'Replacement B'
         replacement.characters = owner()
         setDatabase(replacement)
         read.resolve()
