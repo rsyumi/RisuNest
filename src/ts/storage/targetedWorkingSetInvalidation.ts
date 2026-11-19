@@ -164,7 +164,8 @@ export async function applyTargetedWorkingSetInvalidation(
     previous.characters.forEach((value, position) => positions.set(value.chaId, position))
 
     let rootValue: PersistentRoot | null = null
-    if (plan.root) {
+    // The root names the selected preset by ID, so a preset change that moves it reads the root too.
+    if (plan.root || plan.presets) {
         const root = await reader.readRoot()
         assertPinnedRevision(reader.revision, root.revision, 'Root')
         rootValue = options.prepareRoot ? await options.prepareRoot(root.value) : root.value
