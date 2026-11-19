@@ -502,9 +502,11 @@ describe('production server LWW composition', () => {
         if (!held) return
         expect(production.getServerSyncController().snapshot().paused).toBe(true)
         expect(pullCalls()).toBe(0)
-        // Another restore receives first.
+        // Another restore receives first, and nothing else goes out.
         await f.transport!.receiveAvailableChanges!(bindingContext())
+        visible(false); visible(true); await vi.advanceTimersByTimeAsync(60_000)
         expect(pullCalls()).toBe(1)
+        expect(f.invoke.mock.calls.some(([command]) => ['server_sync_lww_push', 'server_sync_lww_hydrate'].includes(command))).toBe(false)
         expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
     })
 
