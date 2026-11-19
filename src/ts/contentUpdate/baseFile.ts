@@ -65,12 +65,8 @@ async function moduleFromRisum(data: Uint8Array): Promise<RisuModule> {
 
 /** The card fields a character import sets from text, as importCharacterCardSpec maps them. */
 function cardToCharacter(card: Card, module: RisuModule | null): Partial<character> {
-    if (card?.spec !== 'chara_card_v2' && card?.spec !== 'chara_card_v3') {
-        // An older card, which the importer takes when it has these fields.
-        const old = card as any
-        if (!(old?.char_name || old?.name) || !(old.char_persona || old.description) || !(old.char_greeting || old.first_mes)) throw new UnsupportedUpdateBaseFileError()
-        return convertOffSpecCards(old)
-    }
+    // An older card, through the importer's old-format reader.
+    if (card?.spec !== 'chara_card_v2' && card?.spec !== 'chara_card_v3') return convertOffSpecCards(card as any)
     const data = card.data
     if (!data) throw new UnsupportedUpdateBaseFileError()
     const risu = data.extensions?.risuai
@@ -154,7 +150,9 @@ export async function readUpdateBaseFile(kind: 'character' | 'module', file: { n
         const parsed = JSON.parse(text(file.data))
         // A lorebook or regex file is the module its import converts it to.
         module = parsed?.type === 'risuModule' ? parsed : kind === 'module' ? (await convertJsonToModule(parsed))?.module ?? null : null
-        if (!module) card = parsed
+        // Other JSON is a card; the JSON importer takes an older one only with these fields.
+        const spec = parsed?.spec === 'chara_card_v2' || parsed?.spec === 'chara_card_v3'
+        if (!module && (spec || ((parsed?.char_name || parsed?.name) && (parsed.char_persona || parsed.description) && (parsed.char_greeting || parsed.first_mes)))) card = parsed
     } else if (name.endsWith('.png')) {
         card = await cardFromPng(file.data)
     } else if (name.endsWith('.charx') || name.endsWith('.jpg') || name.endsWith('.jpeg')) {

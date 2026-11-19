@@ -130,7 +130,8 @@ describe('readUpdateBaseFile', () => {
         const old = { name: 'Luna', description: 'd', first_mes: 'hi' }
         const read = { name: 'Luna', desc: 'd', firstMessage: 'hi' }
         expect(await readUpdateBaseFile('character', { name: 'Luna.json', data: encode(old) })).toEqual(read)
-        expect(await readUpdateBaseFile('character', { name: 'Luna.png', data: png({ chara: base64(old) }) })).toEqual(read)
+        // The PNG importer takes one without a description too.
+        expect(await readUpdateBaseFile('character', { name: 'Luna.png', data: png({ chara: base64({ ...old, description: '' }) }) })).toEqual({ ...read, desc: '' })
     })
 
     it('refuses files that hold no card or module', async () => {
