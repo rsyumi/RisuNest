@@ -3569,6 +3569,8 @@ export class SaveCoordinator {
             }
             this.dependencies.onLocalRevision?.(replaced.revision)
             this.dependencies.replaceDatabase(candidate)
+            // The identity mirrors the installed working set derives belong to its baseline.
+            this.rootBaseline = this.capture().rootCanonical
             // Projection may select a different character when the old selection is absent.
             // Baseline the committed candidate for that selection, never the mutable live view.
             this.setCharacterBaseline(this.captureDatabase(candidate))

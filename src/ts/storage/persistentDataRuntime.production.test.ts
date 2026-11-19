@@ -41,6 +41,7 @@ import { workingSetResidency } from './workingSetResidency'
 import { canonicalJson, PersistentMutationFencedError, SaveCoordinator, type PersistentCharacterAssetOwnerHead } from './saveCoordinator'
 import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
+import { prepareUpstreamImport } from './importedIdentity'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { clearStreamingConversation, setStreamingConversation } from './streamingConversationRegistry'
@@ -1960,6 +1961,19 @@ describe('received preset selection', () => {
         })
         await controller.saveCurrentPreset()
         expect((await store.readPreset('preset-a'))!.value).toMatchObject({mainPrompt: 'Prompt A', temperature: 3})
+        expect(saveFailures).toEqual([])
+    })
+
+    it('does not save the mirrors a restore derives for root fields its backup did not hold', async () => {
+        const {store, runtime, saveFailures} = await presetRuntime(true)
+        const backup = normalizeDatabaseDefaults({} as Database)
+        backup.botPresets = [{...structuredClone(backup.botPresets[0]), id: 'preset-c', name: 'C', extractJson: 'json-c'}]
+        backup.botPresetsId = 0
+        delete (backup as Partial<Database>).extractJson
+        backup.personas[0].id = 'persona'
+        await runtime.replacePersistentDatabase(prepareUpstreamImport(backup), 'restore')
+        expect(getDatabase().extractJson).toBe('json-c')
+        expect((await savedMutations(store, runtime)).map((value) => value.key)).toEqual(['classicMaxWidth'])
         expect(saveFailures).toEqual([])
     })
 
