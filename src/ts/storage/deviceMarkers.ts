@@ -19,6 +19,7 @@ export const DEVICE_MARKER_KEYS = [
     'risuNestPluginSyncSettings',
     'risuNestDefaultPluginsAttempted',
     'risuNestUpdateSettings',
+    'risuNestServerSyncRestoreHold',
     'mcpStdioApprovals',
     'risuNestDisplayRecovery',
     'risuNestAppLock',

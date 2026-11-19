@@ -30,6 +30,7 @@ import { bytePhase, laneDeltas, readServerSyncLanes, routineMoved, routinePeak, 
 import { createRemainingTimeEstimator } from './remainingTime'
 import { setAssetResidencyPolicy, type AssetResidencyPolicy } from './serverAssetResidency'
 import { isLibraryFileOperationReserved, registerLibraryFileOperationGate, subscribeLibraryFileOperationReleased } from '../libraryFileOperation'
+import { getDeviceMarkers } from '../deviceMarkers'
 
 import { readRepresentativeImagePriority, subscribeRepresentativeImagePriority } from '../../ui/representativeImagePriority'
 
@@ -115,6 +116,13 @@ const noteLocalChange = () => {
     if (foreground && !pendingHold) pendingHold = holdRoutineSync()
 }
 let heldForCommittedRestore = false
+// The hold outlives a restart for the binding it stopped, until the user resumes that binding.
+const RESTORE_HOLD = 'risuNestServerSyncRestoreHold'
+async function saveRestoreHold(state?: BindingContext['state']): Promise<void> {
+    const epoch = heldForCommittedRestore && state ? state.selectionEpoch : null
+    const markers = getDeviceMarkers()
+    if (markers.getItem(RESTORE_HOLD) !== epoch) await markers.commitItem!(RESTORE_HOLD, epoch)
+}
 let replacing = false
 let hydrating: Promise<void> | undefined
 let hydrationPending = false
@@ -533,6 +541,7 @@ const transport: SyncBindingTransport = {
         try {
             heldForCommittedRestore = c.holdAutomaticSync === true; context = c; adoptSchedulerAuthority(c)
             activationPending = c
+            await saveRestoreHold(c.state)
             try { await ensureActivated(c) }
             catch (value) {
                 // A busy or unavailable local store is tried again by automatic sync too, without the offline notice.
@@ -555,6 +564,7 @@ const transport: SyncBindingTransport = {
         try {
             await during('applying', () => invoke('server_sync_lww_activate_new_device', { authorizationId: preparation.authorizationId, writerId: result.writerId, request: { bindingAuthority: result.bindingAuthority, requestId: crypto.randomUUID() } }))
             heldForCommittedRestore = false; context = c; adoptSchedulerAuthority(c); checkContext(c)
+            await saveRestoreHold()
             if (remoteAssetsRequested(c)) await keepAssetsRemote(c)
             persistedBinding = c.state; error = ''; hydrationError = ''; hydrationPending = true
             await scheduler.retry(); await updateForeground(document.visibilityState !== 'hidden'); scheduler.remoteHint()
@@ -637,6 +647,7 @@ async function syncServerNow(): Promise<void> {
     heldForCommittedRestore = false
     halt()
     try {
+        await saveRestoreHold()
         await scheduler.fence()
         await hydrating
         if (context) await ensureActivated(context)
@@ -699,8 +710,10 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     disposers.push(() => { window.removeEventListener('risu-native-lifecycle', lifecycle); outOfTime = false })
     disposeServer = () => { scheduler.dispose(); for (const dispose of disposers) dispose(); context = undefined; persistedBinding = undefined; halt(); hydrationPending = false; representativesPending = false; clearTimeout(representativesTimer); representativesTimer = undefined; hydrationAgain = false; attempt = undefined; releaseHold(attemptHold); attemptHold = undefined; releaseHold(pendingHold); pendingHold = undefined; clearFinished(); watchSamples() }
     await controller.ensureStatus()
-    if (!resumeBound || heldForCommittedRestore) return
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
+    heldForCommittedRestore ||= current.target.kind === 'server' && getDeviceMarkers().getItem(RESTORE_HOLD) === current.selectionEpoch
+    await saveRestoreHold(current)
+    if (!resumeBound || heldForCommittedRestore) return
     if (current.target.kind === 'server' && status.configured) {
         try { await resumeCurrentServerBinding(current) }
         catch (value) {
