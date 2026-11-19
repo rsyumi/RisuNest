@@ -531,6 +531,12 @@ select optgroup {
   z-index: 1100;
 }
 
+/* The character and module update dialog asks during an import, so it covers the import
+   dialog. Alerts stay above it, and the working-set recovery covers it. */
+@utility z-work-dialog-content-update {
+  z-index: 1050;
+}
+
 /* The plugin install dialog opens over the import sheet, and the drop overlay shows over every
    work dialog while files are dragged in. Both stay below z-modal. */
 @utility z-work-dialog-plugin {

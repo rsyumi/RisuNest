@@ -72,6 +72,8 @@ vi.mock('../characterCards', () => ({
     exportCharacterCard: vi.fn(),
     importCharacterProcess: vi.fn(),
 }))
+// The lorebook upgrade the update flow applies, without the app state its module loads.
+vi.mock('../characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
 
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
@@ -86,6 +88,7 @@ import {
 import { alertConfirm, alertError, alertNormal } from '../alert'
 import { StdioModuleImportError } from './mcp/moduleImport'
 import { convertExternalLorebook } from './lorebook.svelte'
+import { decodeRPack } from '../rpack/rpack_js'
 
 describe('legacy module export', () => {
     beforeEach(() => {
@@ -115,6 +118,20 @@ describe('legacy module export', () => {
         await importModuleData({ name: 'synthetic.json', data: Uint8Array.of(0xff), parsedJson: { value } })
         expect(first).toBeDefined()
         expect(DBState.db.modules[0]).toEqual(first)
+    })
+
+    it('offers a lorebook file picked for a module update as that update', async () => {
+        DBState.db.modules = [{ id: 'installed', name: 'Lore', description: '', lorebook: [] }]
+        const { chooseContentUpdate, contentUpdateDialog, importAsContentUpdate } = await import('../contentUpdate/flow.svelte')
+        const data = new TextEncoder().encode(JSON.stringify({ type: 'risu', data: [{ key: 'synthetic', content: 'lore' }] }))
+        const imported = importAsContentUpdate('module', 'installed', () => importModuleData({ name: 'synthetic.json', data }))
+        await vi.waitFor(() => expect(contentUpdateDialog.request && !contentUpdateDialog.busy).toBe(true))
+        expect(contentUpdateDialog.request?.kind).toBe('module')
+        expect(contentUpdateDialog.target).toBe('installed')
+        chooseContentUpdate('cancel')
+        // No location: the import intake opens nothing for a cancelled import.
+        expect(await imported).toBeNull()
+        expect(DBState.db.modules.map((module) => module.id)).toEqual(['installed'])
     })
 
     it('preserves browser malformed-byte replacement in JSON modules', async () => {
@@ -293,6 +310,8 @@ describe('legacy module export', () => {
             id: 'source-module-id',
             name: 'Byte exact module',
             description: 'Legacy asset roundtrip',
+            updateBase: 'asset://base',
+            updateLineage: 'author-module',
             assets: [
                 ['ordinary-asset-a', 'asset://source-a', 'bin', 'first-tail', { rank: 1 }],
                 ['ordinary-asset-b', 'asset://source-b', 'dat', 'second-tail', { rank: 2 }],
@@ -300,7 +319,12 @@ describe('legacy module export', () => {
         }
 
         const exported = await exportModuleLegacy(module, { alertEnd: false, saveData: false })
-        const imported = await readModule(Buffer.from(exported))
+        const file = Buffer.from(exported)
+        const main = JSON.parse(new TextDecoder().decode(await decodeRPack(file.subarray(6, 6 + file.readUInt32LE(2)))))
+        expect(main.module).not.toHaveProperty('updateBase')
+        expect(module.updateBase).toBe('asset://base')
+        const imported = await readModule(file)
+        expect(imported.updateLineage).toBe('author-module')
 
         expect(mocks.readImage.mock.calls.map(([source]) => source)).toEqual([
             'asset://source-a',

@@ -97,6 +97,27 @@ describe('native RISUM module activation', () => {
         expect(append.mock.calls[0][0].module).not.toHaveProperty('mcp')
     })
 
+    it('lets the update offer install the module, update another or cancel before sealing', async () => {
+        const lifecycle = { prepareOwnerManifestAndSeal: vi.fn(), sealPreparedContent: vi.fn() }
+        const append = vi.fn()
+        const base = { confirmLowLevelAccess: async () => true, createId: () => 'new-id', append }
+        expect(await activatePreparedNativeModuleContent(risumContent(), lifecycle, {
+            ...base, commitImport: async () => null,
+        })).toBeNull()
+        expect(lifecycle.sealPreparedContent).not.toHaveBeenCalled()
+        expect(append).not.toHaveBeenCalled()
+
+        expect(await activatePreparedNativeModuleContent(risumContent(), lifecycle, {
+            ...base,
+            commitImport: async (module, commit) => {
+                await commit(module)
+                return 'installed-id'
+            },
+        })).toEqual({ moduleId: 'installed-id' })
+        expect(lifecycle.sealPreparedContent).toHaveBeenCalledOnce()
+        expect(append.mock.calls[0][0].module).toMatchObject({ id: 'new-id', updateLineage: 'source-id' })
+    })
+
     it('confirms low-level access, seals native roots, then atomically appends full metadata', async () => {
         const events: string[] = []
         const append = vi.fn(async () => { events.push('append') })
@@ -125,6 +146,7 @@ describe('native RISUM module activation', () => {
                 name: 'Imported module',
                 lowLevelAccess: true,
                 unknownFutureField: { retained: true },
+                updateLineage: 'source-id',
                 assets: [
                     ['same', `assets/${hash('a')}.PNG`, 'PNG'],
                     ['same', `assets/${hash('b')}.bin`, 'bin'],

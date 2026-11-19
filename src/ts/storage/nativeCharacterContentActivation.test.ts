@@ -211,6 +211,23 @@ describe('prepared native character content activation', () => {
         expect(await create(null)).toEqual(mappedCharacter())
     })
 
+    it('lets the update offer install the character, update another or cancel the import before sealing', async () => {
+        const cancelled = dependencies({ commitImport: vi.fn(async () => null) })
+        const cancelledSession = lifecycle()
+        expect(await activatePreparedNativeCharacterContent(content, cancelledSession, cancelled)).toBeNull()
+        expect(cancelled.upsert).not.toHaveBeenCalled()
+        expect(cancelledSession.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
+
+        const updated = dependencies({
+            commitImport: vi.fn(async (character, commit) => {
+                await commit(character)
+                return 'installed-character'
+            }),
+        })
+        expect(await activatePreparedNativeCharacterContent(content, lifecycle(), updated)).toEqual({ characterId: 'installed-character' })
+        expect(updated.upsert).toHaveBeenCalledWith('character-1', 'native-content-import', expect.any(Function), expect.objectContaining({ assetAliases: expect.any(Array) }))
+    })
+
     it('passes a CharX portrait and module overlay to the mapper while committing only ordinary asset aliases', async () => {
         const charxContent = {
             ...content,

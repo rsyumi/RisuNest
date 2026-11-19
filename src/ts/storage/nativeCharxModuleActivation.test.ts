@@ -19,7 +19,7 @@ import {
 import type { character } from './database.svelte'
 import type { PreparedNativeContent } from './nativeFileJobs'
 
-it('converts CharX to a module with its owner manifest, without committing an intermediate character', async () => {
+it('converts CharX to a module with its owner manifest, without committing an intermediate character or sealing a cancelled import', async () => {
     const hash = 'ab'.repeat(32)
     const key = `assets/${hash}.png`
     const character = {
@@ -83,4 +83,11 @@ it('converts CharX to a module with its owner manifest, without committing an in
         manifestHash: await ownerManifestIdentity(manifest),
     })
     expect(decodeOwnerManifest(manifest)).toHaveLength(2)
+
+    const seal = vi.fn()
+    expect(await activatePreparedNativeModuleContent(content, { prepareOwnerManifestAndSeal: seal }, {
+        createId: () => 'cancelled-id', confirmLowLevelAccess: vi.fn(), append, commitImport: async () => null,
+    })).toBeNull()
+    expect(seal).not.toHaveBeenCalled()
+    expect(append).toHaveBeenCalledOnce()
 })

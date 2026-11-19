@@ -15,6 +15,7 @@ const nativeFileJobDialog = readFileSync('src/lib/Others/NativeFileJobDialog.sve
 const persistentWorkingSetRecovery = readFileSync('src/lib/Others/PersistentWorkingSetRecovery.svelte', 'utf8')
 const pluginInstallDialog = readFileSync('src/lib/Others/PluginInstallDialog.svelte', 'utf8')
 const updatePopup = readFileSync('src/lib/Others/UpdatePopup.svelte', 'utf8')
+const contentUpdateDialog = readFileSync('src/lib/Others/ContentUpdateDialog.svelte', 'utf8')
 const popupEditor = readFileSync('src/lib/Others/PopupEditor.svelte', 'utf8')
 const textEditorPopup = readFileSync('src/lib/Others/TextEditorPopup.svelte', 'utf8')
 const promptDiffModal = readFileSync('src/lib/Others/PromptDiffModal.svelte', 'utf8')
@@ -83,6 +84,7 @@ const workDialogSources: Record<string, string> = {
 const coveringDialogSources: Record<string, string> = {
     'UpdatePopup.svelte': updatePopup,
     'PersistentWorkingSetRecovery.svelte': persistentWorkingSetRecovery,
+    'ContentUpdateDialog.svelte': contentUpdateDialog,
     'PluginInstallDialog.svelte': pluginInstallDialog,
     'ImportDropOverlay.svelte': importDropOverlay,
 }
@@ -157,6 +159,10 @@ describe('modal layering', () => {
         expect(styles).toMatch(/@utility z-work-dialog-recovery \{\s*z-index: 1100;\s*\}/)
         expect(count(updatePopup, 'z-work-dialog-update')).toBe(1)
         expect(count(persistentWorkingSetRecovery, 'z-work-dialog-recovery')).toBe(1)
+        expect(count(contentUpdateDialog, 'z-work-dialog-content-update')).toBe(1)
+        const contentUpdateLayer = utilityZIndex('z-work-dialog-content-update')
+        expect(contentUpdateLayer).toBeGreaterThan(1000)
+        expect(contentUpdateLayer).toBeLessThan(utilityZIndex('z-work-dialog-recovery'))
         expect(count(pluginInstallDialog, 'z-work-dialog-plugin')).toBe(1)
         expect(count(importDropOverlay, 'z-drop-overlay')).toBe(1)
         expect(utilityZIndex('z-work-dialog-plugin')).toBeGreaterThan(1000)

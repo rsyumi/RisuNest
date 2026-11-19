@@ -7,7 +7,6 @@ import { downloadFile, forageStorage, LocalWriter, readImage, saveAsset, Virtual
 import { AppendableBuffer } from "../appendableBuffer"
 import { checkPersonaBinded, selectMultipleFile, sleep } from "../util"
 import { v4 } from "uuid"
-import { convertExternalLorebook } from "./lorebook.svelte"
 import { decodeRPack, encodeRPack } from "../rpack/rpack_js"
 import { DBState, HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../stores.svelte"
 import {get} from "svelte/store"
@@ -19,10 +18,11 @@ import { readFile } from '@tauri-apps/plugin-fs'
 import type { NativeFileJobOptions, NativeFileJobSource } from '../storage/nativeFileJobs'
 import { importContentBatch } from '../storage/contentImportBatch'
 import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from '../storage/nativeFileJobManager'
-import { nativeModuleLocation, type ModuleImportLocation } from './moduleImportLocation'
+import { convertJsonToModule, nativeModuleLocation, type ModuleImportLocation } from './moduleImportLocation'
 import { assertModuleMCPImportAllowed, StdioModuleImportError } from './mcp/moduleImport'
 import { selectConversationModules } from './moduleSelection'
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
+import { markModuleImport } from '../contentUpdate/merge'
 
 export interface MCPModule{
     url: string
@@ -44,6 +44,10 @@ export interface RisuModule{
     customModuleToggle?:string
     mcp?:MCPModule
     icon?:string
+    /** Asset key of the module as last installed from a file, compared on the next update. */
+    updateBase?:string
+    /** Id the module had in the file it was installed from, so a later version finds it. */
+    updateLineage?:string
 }
 
 export async function importPreparedNativeModuleContent(
@@ -143,6 +147,8 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
 
     const assets = module.assets ?? []
     module = safeStructuredClone(module)
+    // The update base is an asset key of this device; it means nothing in the file.
+    delete module.updateBase
     module.assets ??= []
     module.assets = module.assets.map((asset) => {
         const retained = safeStructuredClone(asset)
@@ -316,9 +322,22 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
         alertClear()
     }
 
+    markModuleImport(module)
     module.id = v4()
     delete module.mcp
     return module
+}
+
+/**
+ * Adds an imported module, or updates the installed one it is a new version of when the user
+ * chooses that. Returns where the import went, or null when the user cancelled it.
+ */
+async function commitImportedModuleData(module: RisuModule, location: ModuleImportLocation): Promise<ModuleImportLocation | null> {
+    const { commitImportedModule } = await import('../contentUpdate/flow.svelte')
+    const id = await commitImportedModule(module, async (value) => {
+        DBState.db.modules.push(value)
+    })
+    return id !== null ? location : null
 }
 
 export async function importModule() {
@@ -411,7 +430,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 return null
             }
             const module = convertCharacterToModule(char)
-            DBState.db.modules.push(module)
+            if (!await commitImportedModuleData(module, { kind: 'module-from-charx' })) return null
         } catch (error) {
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
@@ -424,8 +443,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
         try {
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
-            DBState.db.modules.push(module)
-            return { kind: 'module' }
+            return await commitImportedModuleData(module, { kind: 'module' })
         } catch (error) {
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
@@ -440,6 +458,7 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 alertError(language.errors.noData)
                 return null
             }
+            markModuleImport(importData)
             importData.id = v4()
             delete importData.mcp
 
@@ -449,54 +468,10 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                     return null
                 }
             }
-            DBState.db.modules.push(importData)
-            return { kind: 'module' }
+            return await commitImportedModuleData(importData, { kind: 'module' })
         }
-        // importData.type === 'risu' in conflict with HypaV3 preset exports
-        // difference: record vs. array
-        if (
-            importData.type === 'risu' &&
-            importData.data &&
-            Array.isArray(importData.data)
-        ) {
-            const lores: loreBook[] = importData.data
-            const importModule = {
-                name: importData.name || 'Imported Lorebook',
-                description:
-                    importData.description || 'Converted from risu lorebook',
-                lorebook: lores,
-                id: v4(),
-            }
-            DBState.db.modules.push(importModule)
-            return { kind: 'module-from-lorebook' }
-        }
-        if (importData.entries) {
-            const lores: loreBook[] = convertExternalLorebook(
-                importData.entries,
-            )
-            const importModule = {
-                name: importData.name || 'Imported Lorebook',
-                description:
-                    importData.description ||
-                    'Converted from external lorebook',
-                lorebook: lores,
-                id: v4(),
-            }
-            DBState.db.modules.push(importModule)
-            return { kind: 'module-from-lorebook' }
-        }
-        if (importData.type === 'regex' && importData.data) {
-            const regexs: customscript[] = importData.data
-            const importModule = {
-                name: importData.name || 'Imported Regex',
-                description:
-                    importData.description || 'Converted from risu regex',
-                regex: regexs,
-                id: v4(),
-            }
-            DBState.db.modules.push(importModule)
-            return { kind: 'module' }
-        }
+        const converted = await convertJsonToModule(importData)
+        if (converted) return await commitImportedModuleData(converted.module, converted.location)
     } catch (error) {
         console.error(error)
         if (error instanceof StdioModuleImportError) {

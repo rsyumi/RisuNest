@@ -45,6 +45,7 @@
     import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
     import { isTauri, isTauriMobile } from './ts/platform';
     import NativeFileJobDialog from './lib/Others/NativeFileJobDialog.svelte';
+    import ContentUpdateDialog from './lib/Others/ContentUpdateDialog.svelte';
     import ImportIntakeHost from './lib/Others/ImportIntakeHost.svelte';
     import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import RecoveryShell from './lib/Others/RecoveryShell.svelte';
@@ -481,6 +482,7 @@
         <FolderManagerPanel />
     {/if}
     <NativeFileJobDialog />
+    <ContentUpdateDialog />
     <ImportIntakeHost />
     <UpdatePopup />
 </main>
