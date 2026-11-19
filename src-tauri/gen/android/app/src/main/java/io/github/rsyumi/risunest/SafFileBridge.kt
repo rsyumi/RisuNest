@@ -555,6 +555,19 @@ internal fun markSpoolBatchDelivered(store: SafSpoolStore, batch: SafSpoolBatch)
 }
 
 /**
+ * Marks the spools of one opened intent delivered file by file, one result per file in the order
+ * [spooled] lists them, so a spool that cannot be marked fails in the place of its own file. [owned]
+ * keeps the spools the intent reserved for itself.
+ */
+internal fun markOpenedSpoolsDelivered(
+  store: SafSpoolStore,
+  spooled: List<SafSpoolBatch>,
+  owned: (String) -> Boolean,
+): List<SafSpoolBatch> = spooled.map { result ->
+  markSpoolBatchDelivered(store, result.copy(ready = result.ready.filter { owned(it.token) }))
+}
+
+/**
  * Ready spools for a new WebView. A spool an earlier WebView received but never consumed is
  * discarded and reported instead of being imported again. [handedOff] holds the tokens the current
  * WebView already received, and those an opened intent still copying reserved for its own delivery;

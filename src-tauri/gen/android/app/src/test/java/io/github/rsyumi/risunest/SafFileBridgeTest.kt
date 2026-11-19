@@ -816,6 +816,24 @@ class SafFileBridgeTest {
       ),
       batch.failures,
     )
+
+    // An opened intent marks its spools file by file, so two files of one name keep their own reasons.
+    val handedOff = markOpenedSpoolsDelivered(
+      store,
+      listOf(
+        SafSpoolBatch(listOf(missing.copy(displayName = "card.png")), emptyList()),
+        SafSpoolBatch(emptyList(), listOf(SafSpoolFailure("card.png", "storage-full"))),
+      ),
+    ) { true }
+    val script = openedIntentScripts("request-1", listOf("card.png", "card.png"), handedOff, emptyList()).single()
+    assertEquals(
+      true,
+      script.contains(
+        "\"failures\":[{\"displayName\":\"card.png\",\"code\":\"spool-write-failed\"}," +
+          "{\"displayName\":\"card.png\",\"code\":\"storage-full\"}]",
+      ),
+    )
+    assertEquals(true, script.contains("\"order\":[\"card.png\",\"card.png\"]"))
   }
 
   @Test

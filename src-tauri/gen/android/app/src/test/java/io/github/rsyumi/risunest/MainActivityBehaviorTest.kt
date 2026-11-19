@@ -529,10 +529,14 @@ class MainActivityBehaviorTest {
       "\"totalBytes\":9,\"importDestination\":null}]"
     val failuresJson = "[{\"displayName\":\"broken.png\",\"code\":\"source-copy-failed\"}]"
     val openedJson = "[\"$preset\",{\"name\":\"lost.risup\",\"code\":\"source-copy-failed\"}]"
-    val order = listOf(preset, spool.token, "lost.risup", "broken.png")
     val orderJson = "[\"$preset\",\"${spool.token}\",\"lost.risup\",\"broken.png\"]"
 
-    val joined = openedIntentScripts("request-1", SafSpoolBatch(listOf(spool), listOf(failure)), opened, order, spooled = true)
+    val joined = openedIntentScripts(
+      "request-1",
+      listOf("preset.risup", "backup.risunest", "lost.risup", "broken.png"),
+      listOf(SafSpoolBatch(listOf(spool), emptyList()), SafSpoolBatch(emptyList(), listOf(failure))),
+      opened,
+    )
 
     assertEquals(1, joined.size)
     assertEquals(false, joined.single().contains("risu-opened-files"))
@@ -552,28 +556,9 @@ class MainActivityBehaviorTest {
     )
 
     // An intent without spooled files keeps its own opened-files event.
-    val copiedOnly = openedIntentScripts("request-2", SafSpoolBatch(emptyList(), emptyList()), opened, listOf(preset, "lost.risup"), spooled = false)
+    val copiedOnly = openedIntentScripts("request-2", listOf("preset.risup", "lost.risup"), emptyList(), opened)
     assertEquals(listOf(openedFilesEventScript(opened), androidSpoolBatchScript("request-2", SafSpoolBatch(emptyList(), emptyList()))), copiedOnly)
     assertEquals(false, copiedOnly.last().contains(preset))
-  }
-
-  @Test
-  fun `a spool withdrawn at hand-off keeps its place in the opening order`() {
-    val withdrawn = SafSpoolReady("22222222-2222-4222-8222-222222222222", "second.png", 1, 1)
-    val kept = SafSpoolReady("11111111-1111-4111-8111-111111111111", "first.png", 1, 1)
-    val broken = SafSpoolFailure("broken.png", "source-copy-failed")
-    val preset = OpenedFileEntry.Copied("/data/cache/opened_files/${"a".repeat(64)}-0-preset.risup")
-    val spooled = listOf(
-      SafSpoolBatch(listOf(withdrawn), emptyList()),
-      SafSpoolBatch(listOf(kept), emptyList()),
-      SafSpoolBatch(emptyList(), listOf(broken)),
-    )
-    val handedOff = SafSpoolBatch(listOf(kept), listOf(broken, SafSpoolFailure("second.png", "spool-write-failed")))
-
-    assertEquals(
-      listOf("second.png", preset.path, kept.token, "broken.png"),
-      openedIntentOrder(listOf("second.png", "preset.risup", "first.png", "broken.png"), spooled, listOf(preset), handedOff),
-    )
   }
 
   @Test
@@ -844,6 +829,41 @@ class MainActivityBehaviorTest {
     val again = replayLegacyOpenedFiles(directory, emptySet())
     assertEquals(listOf(waiting.absolutePath), again.deliver)
     assertEquals(listOf("current.risup"), again.interrupted)
+  }
+
+  @Test
+  fun `an opening copies a file another opening holds or is still copying to a path of its own`() {
+    val directory = temporaryFolder.newFolder("claimed-legacy")
+    val handedOff = mutableSetOf<String>()
+    val publisher = SafAtomicPublisher { temporary, target ->
+      java.nio.file.Files.move(temporary.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    }
+    fun open(reservation: OpenedFileReservation, whileCopying: () -> Unit = {}): String {
+      val source = object : SafInputSource {
+        override val operationId = "a".repeat(64)
+        override val displayName = "preset.risup"
+        override val totalBytes: Long? = null
+        override fun open(): java.io.InputStream {
+          whileCopying()
+          return ByteArrayInputStream("synthetic".toByteArray())
+        }
+      }
+      val copied = copyLegacyOpenedSources(directory, listOf(source), reservation::reservePath, publisher).single()
+      return (copied as OpenedFileEntry.Copied).path.also { assertEquals(true, reservation.ownsPath(it)) }
+    }
+    val openings = List(4) { OpenedFileReservation(handedOff, mutableSetOf()) }
+
+    lateinit var second: String
+    // The second opening runs to the end while the first is still copying.
+    val first = open(openings[0]) { second = open(openings[1]) }
+    // The third arrives while the page still holds the first copy.
+    val third = open(openings[2])
+
+    assertEquals(3, setOf(first, second, third).size)
+    assertEquals(listOf("synthetic", "synthetic", "synthetic"), listOf(first, second, third).map { java.io.File(it).readText() })
+    // A copy its opening gave back undelivered is taken over by the next opening of the same file.
+    openings[0].release()
+    assertEquals(first, open(openings[3]))
   }
 
   @Test
