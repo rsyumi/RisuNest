@@ -139,5 +139,9 @@ describe('readUpdateBaseFile', () => {
         await expect(readUpdateBaseFile('character', { name: 'notes.txt', data: encode('x') })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
         await expect(readUpdateBaseFile('character', { name: 'old.json', data: encode({ spec: 'other' }) })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
         await expect(readUpdateBaseFile('character', { name: 'empty.charx', data: zipSync({ 'card.json': encode({}) }) })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
+        // A card without the metadata the importers need.
+        for (const data of [null, {}, { extensions: { risuai: [] } }]) {
+            await expect(readUpdateBaseFile('character', { name: 'bad.charx', data: zipSync({ 'card.json': encode({ spec: 'chara_card_v3', data }) }) })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
+        }
     })
 })

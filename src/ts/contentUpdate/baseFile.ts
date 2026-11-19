@@ -26,6 +26,7 @@ export class UnsupportedUpdateBaseFileError extends Error {
 type Card = { spec?: string, data?: Record<string, any> }
 
 const text = (data: Uint8Array) => decodeImportUtf8(data)
+const isRecord = (value: unknown) => !!value && typeof value === 'object' && !Array.isArray(value)
 
 async function cardFromPng(data: Uint8Array): Promise<Card> {
     let chara = ''
@@ -68,7 +69,8 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
     // An older card, through the importer's old-format reader.
     if (card?.spec !== 'chara_card_v2' && card?.spec !== 'chara_card_v3') return convertOffSpecCards(card as any)
     const data = card.data
-    if (!data) throw new UnsupportedUpdateBaseFileError()
+    // The card metadata the importers need, as the native CHARX reader checks it.
+    if (!data || !isRecord(data.extensions) || (data.extensions.risuai !== undefined && !isRecord(data.extensions.risuai))) throw new UnsupportedUpdateBaseFileError()
     const risu = data.extensions?.risuai
     let lore: loreBook[] = module?.lorebook ?? []
     let loreSettings: character['loreSettings']

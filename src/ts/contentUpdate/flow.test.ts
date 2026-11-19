@@ -214,10 +214,16 @@ describe('character update', () => {
         await opened()
         await reviewContentUpdate()
         setContentUpdateChoice('additionalAssets', 'mine')
-        const earlier = { spec: 'chara_card_v2', data: { name: 'Luna', description: 'old' } }
+        const earlier = { spec: 'chara_card_v2', data: { name: 'Luna', description: 'old', extensions: {} } }
         vi.mocked(selectSingleFile).mockResolvedValueOnce({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify(earlier)) })
         await loadContentUpdateBaseFile()
         expect(contentUpdateDialog.baseSource.kind).toBe('file')
+        // A file the importers would refuse leaves that comparison as it is.
+        const plan = contentUpdateDialog.plan
+        vi.mocked(selectSingleFile).mockResolvedValueOnce({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v3', data: {} })) })
+        await loadContentUpdateBaseFile()
+        expect(contentUpdateDialog.plan).toBe(plan)
+        expect(contentUpdateDialog.error).toBe(language.risuNest.contentUpdate.baseFileUnsupported)
         expect(contentUpdateDialog.plan!.items.map((item) => [item.field, !!item.order, item.status, item.choice])).toEqual([
             ['name', false, 'update', 'theirs'], ['desc', false, 'update', 'theirs'], ['image', false, 'differs', null],
             ['additionalAssets', true, 'differs', null], ['additionalAssets', false, 'differs', null],
