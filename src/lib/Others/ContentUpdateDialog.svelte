@@ -13,6 +13,7 @@
         loadContentUpdateBaseFile, reviewContentUpdate, selectContentUpdateTarget, setContentUpdateChoice,
         setContentUpdateEdit, type UpdatePick,
     } from 'src/ts/contentUpdate/flow.svelte'
+    import { modalNavigation } from 'src/ts/ui/modalNavigation'
 
     const text = $derived(language.risuNest.contentUpdate)
     const request = $derived(dialog.request)
@@ -243,6 +244,7 @@
             aria-modal="true"
             aria-labelledby="content-update-title"
             aria-describedby="content-update-description"
+            use:modalNavigation={{ close: () => chooseContentUpdate('cancel') }}
             class="flex max-h-[90dvh] w-full flex-col rounded-lg border border-darkborderc bg-darkbg text-textcolor {dialog.step === 'review' ? 'max-w-3xl' : 'max-w-lg'}"
         >
             <header class="flex flex-col gap-1 px-5 pt-5 pb-3">

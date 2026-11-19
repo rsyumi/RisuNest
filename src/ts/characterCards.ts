@@ -843,7 +843,7 @@ export async function characterURLImport() {
 }
 
 
-function convertOffSpecCards(charaData:OldTavernChar|CharacterCardV2Risu, imgp:string|undefined = undefined):character{
+export function convertOffSpecCards(charaData:OldTavernChar|CharacterCardV2Risu, imgp:string|undefined = undefined):character{
     const data = charaData.spec_version === '2.0' ? charaData.data : charaData
     const charbook = charaData.spec_version === '2.0' ? charaData.data.character_book : null
     let lorebook:loreBook[] = []

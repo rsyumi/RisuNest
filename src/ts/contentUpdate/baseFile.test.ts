@@ -2,13 +2,14 @@ import { readFileSync } from 'node:fs'
 import { zipSync } from 'fflate'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-// The importer's lorebook converter, without the app state its module loads.
+// The importer's converters, without the app state their module loads.
 vi.mock('../characterCards', () => ({
     convertCharbook: ({ charbook }: any) => ({
         lorebook: charbook.entries.map((entry: any) => ({ comment: entry.comment, content: entry.content })),
         loresettings: { scanDepth: 1 },
         loreExt: charbook.extensions,
     }),
+    convertOffSpecCards: (card: any) => ({ name: card.name, desc: card.description, firstMessage: card.first_mes, image: undefined }),
 }))
 vi.mock('../characters', () => ({ createBlankChar: vi.fn() }))
 vi.mock('../globalApi.svelte', async () => ({ ...await import('../appendableBuffer'), VirtualWriter: class {} }))
@@ -123,6 +124,13 @@ describe('readUpdateBaseFile', () => {
             .toEqual({ name: 'Lore', description: 'Converted from risu lorebook', lorebook: [lore] })
         expect(await readUpdateBaseFile('module', { name: 'Regex.json', data: encode({ type: 'regex', data: [] }) }))
             .toEqual({ name: 'Imported Regex', description: 'Converted from risu regex', regex: [] })
+    })
+
+    it('reads an older card the importer takes through its old-format reader', async () => {
+        const old = { name: 'Luna', description: 'd', first_mes: 'hi' }
+        const read = { name: 'Luna', desc: 'd', firstMessage: 'hi' }
+        expect(await readUpdateBaseFile('character', { name: 'Luna.json', data: encode(old) })).toEqual(read)
+        expect(await readUpdateBaseFile('character', { name: 'Luna.png', data: png({ chara: base64(old) }) })).toEqual(read)
     })
 
     it('refuses files that hold no card or module', async () => {

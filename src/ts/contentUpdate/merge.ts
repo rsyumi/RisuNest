@@ -275,11 +275,12 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         if (keyOf || silentKeys) {
             const read = keyOf ? (value: unknown) => keyed(keyOf, value) : mapEntries
             const mineMap = read(m), theirsMap = read(t), baseMap = read(b)
-            // The entries both have come in another order. The base settles it only when one side alone moved them.
+            // The entries both have come in another order. The base settles it only when one side alone moved
+            // them, and only if it has them all: an entry both added has no place there.
             if (keyOf && reordered(mineMap, theirsMap)) {
-                const mineMoved = reordered(mineMap, baseMap), theirsMoved = reordered(theirsMap, baseMap)
-                if (known && mineMoved && !theirsMoved) keepOrder.push(field)
-                else if (!known || mineMoved === theirsMoved) {
+                const settled = known && [...mineMap.keys()].every((key) => baseMap.has(key) || !theirsMap.has(key))
+                if (settled && !reordered(theirsMap, baseMap)) keepOrder.push(field)
+                else if (!settled || reordered(mineMap, baseMap)) {
                     items.push({ id: field, field, key: '', order: true, status: known ? 'conflict' : 'differs', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: known, choice: null })
                 }
             }

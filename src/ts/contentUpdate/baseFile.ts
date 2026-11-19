@@ -5,7 +5,7 @@ import { unzipSync } from 'fflate'
 import type { character, customscript, loreBook, triggerscript } from '../storage/database.svelte'
 import { AppendableBuffer } from '../appendableBuffer'
 import { PngChunk } from '../pngChunk'
-import { convertCharbook } from '../characterCards'
+import { convertCharbook, convertOffSpecCards } from '../characterCards'
 import type { RisuModule } from '../process/modules'
 import { convertCharacterToModule } from '../interchangeability'
 import { convertJsonToModule } from '../process/moduleImportLocation'
@@ -65,8 +65,14 @@ async function moduleFromRisum(data: Uint8Array): Promise<RisuModule> {
 
 /** The card fields a character import sets from text, as importCharacterCardSpec maps them. */
 function cardToCharacter(card: Card, module: RisuModule | null): Partial<character> {
-    const data = card?.data
-    if (!data || (card.spec !== 'chara_card_v2' && card.spec !== 'chara_card_v3')) throw new UnsupportedUpdateBaseFileError()
+    if (card?.spec !== 'chara_card_v2' && card?.spec !== 'chara_card_v3') {
+        // An older card, which the importer takes when it has these fields.
+        const old = card as any
+        if (!(old?.char_name || old?.name) || !(old.char_persona || old.description) || !(old.char_greeting || old.first_mes)) throw new UnsupportedUpdateBaseFileError()
+        return convertOffSpecCards(old)
+    }
+    const data = card.data
+    if (!data) throw new UnsupportedUpdateBaseFileError()
     const risu = data.extensions?.risuai
     let lore: loreBook[] = module?.lorebook ?? []
     let loreSettings: character['loreSettings']

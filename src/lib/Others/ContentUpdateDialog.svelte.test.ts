@@ -11,7 +11,7 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     saveAsset: async () => 'assets/base.json',
 }))
 vi.mock('src/ts/alert', () => ({ alertClear: vi.fn(), alertError: vi.fn(), alertConfirm: vi.fn() }))
-vi.mock('src/ts/stores.svelte', () => ({ DBState: { db: mocks.db } }))
+vi.mock('src/ts/stores.svelte', async () => ({ DBState: { db: mocks.db }, alertStore: (await import('svelte/store')).writable({ type: 'none', msg: '' }) }))
 vi.mock('src/ts/characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
 vi.mock('src/ts/process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
@@ -30,6 +30,7 @@ import { language } from 'src/lang'
 import ContentUpdateDialog from './ContentUpdateDialog.svelte'
 import { commitImportedCharacter, contentUpdateDialog } from 'src/ts/contentUpdate/flow.svelte'
 import { registerGeneratingConversation } from 'src/ts/storage/generatingConversationRegistry'
+import { modalNavigation } from 'src/ts/ui/modalNavigation'
 
 let instance: ReturnType<typeof mount> | undefined
 afterEach(async () => {
@@ -70,4 +71,22 @@ it('names fields as the character editor does and updates once every difference 
     button(text.update).click()
     expect(await result).toBe('installed')
     expect(mocks.details.get('installed')).toMatchObject({ name: 'Luna v2', creatorNotes: 'new note', customscript: [regex('B'), regex('A')], chats: [{ id: 'chat' }] })
+})
+
+it('takes Escape from the screen it opened over and cancels the import', async () => {
+    // A screen with its own navigation layer, such as the module settings the update action opens from.
+    const behind = document.body.appendChild(document.createElement('div'))
+    const closeBehind = vi.fn()
+    const layer = modalNavigation(behind, { close: closeBehind })
+    mocks.db.characters = [{ type: 'character', chaId: 'installed', name: 'Luna', chats: [] }]
+    instance = mount(ContentUpdateDialog, { target: document.body })
+    const commit = vi.fn()
+    const result = commitImportedCharacter({ type: 'character', chaId: 'incoming', name: 'Luna v2', chats: [], extentions: {} } as any, commit)
+    await vi.waitFor(() => expect(button(language.risuNest.contentUpdate.next)).toBeTruthy())
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    expect(closeBehind).not.toHaveBeenCalled()
+    expect(await result).toBeNull()
+    expect(commit).not.toHaveBeenCalled()
+    layer.destroy()
 })
