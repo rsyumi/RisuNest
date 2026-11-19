@@ -300,12 +300,12 @@ describe('bootstrap recovery exclusions', () => {
     })
 })
 
-describe('exit sync after a start that left sync off', () => {
+describe('exit sync target', () => {
     type ExitDependencies = Parameters<typeof createSyncExitCoordinator>[0]
     const selection = (kind: 'server' | 'external', connectionId: string) => ({ kind, connectionId, selectionEpoch: '2', paused: false })
-    async function exitTarget(current: ReturnType<typeof selection>, clearedDuringSession = false) {
+    async function exitTarget(current: ReturnType<typeof selection>, clearedDuringSession = false, syncOffAtStart = true) {
         startup.native = true
-        startup.exclusions = ['sync']
+        startup.exclusions = syncOffAtStart ? ['sync'] : []
         startup.exitDrain.mockImplementation(() => ({ id: `external:${current.connectionId}:2` }))
         startup.serverDrain.mockImplementation((id: string) => ({ id }))
         vi.mocked(getExternalStorageBridge).mockReturnValue({
@@ -348,6 +348,12 @@ describe('exit sync after a start that left sync off', () => {
 
     it('leaves a server target alone when it was never started', async () => {
         const { target, drain } = await exitTarget(selection('server', 'server-1'))
+        expect(target.selectionId).toBe('none:2')
+        expect(drain).toBeNull()
+    })
+
+    it('leaves a paused server target alone after a start with sync on', async () => {
+        const { target, drain } = await exitTarget(selection('server', 'server-1'), false, false)
         expect(target.selectionId).toBe('none:2')
         expect(drain).toBeNull()
     })

@@ -721,7 +721,7 @@ async function completeInterruptedBinding(): Promise<void> {
     bindingIncomplete = true; changed()
 }
 
-const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || scheduler.isBlocked(), blockedCode: scheduler.blockedCode(), replacing, draining: false, error, bindingIncomplete, progress: attempt && { ...attempt, stages: [...attempt.stages], active: [...attempt.active] }, finished: finished && { ...finished, stages: [...finished.stages], active: [...finished.active] }, lastSuccessAt })
+const snapshot = () => ({ status: { ...status, bound: persistedBinding?.target.kind === 'server' || !!context && !context.signal.aborted }, running: scheduler.isRunning() || !!hydrating, paused: !context || context.signal.aborted || heldForCommittedRestore || scheduler.isBlocked(), blockedCode: scheduler.blockedCode(), replacing, draining: false, error, bindingIncomplete, progress: attempt && { ...attempt, stages: [...attempt.stages], active: [...attempt.active] }, finished: finished && { ...finished, stages: [...finished.stages], active: [...finished.active] }, lastSuccessAt })
 const controller = {
     snapshot,
     subscribe: (listener: (value: ReturnType<typeof snapshot>) => void) => { listeners.add(listener); listener(controller.snapshot()); return () => { listeners.delete(listener) } },

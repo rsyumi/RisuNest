@@ -496,6 +496,8 @@ describe('production server LWW composition', () => {
         f.invoke.mockClear()
         await f.transport!.resumeBinding({...bindingContext(), holdAutomaticSync: true})
         expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
+        // A normal exit reads it as paused and sends nothing.
+        expect(production.getServerSyncController().snapshot().paused).toBe(true)
         // Returns to the app and a finished backup leave it stopped.
         visible(false); visible(true)
         window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
@@ -510,6 +512,7 @@ describe('production server LWW composition', () => {
         else if (resume === 'a new device binding') await f.transport!.resumeNewDeviceBinding!({ authorizationId: 'authorization', writerId: 'writer' }, { revision: 1, writerId: 'writer', bindingAuthority: '0' }, bindingContext())
         else await f.transport!.resumeBinding(bindingContext())
         expect(f.transport?.heldForCommittedRestore?.()).toBe(false)
+        expect(production.getServerSyncController().snapshot().paused).toBe(false)
         // Routine sync runs again from then on.
         visible(false); await settle(); f.invoke.mockClear()
         visible(true); await settle()
