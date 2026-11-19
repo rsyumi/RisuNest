@@ -1956,6 +1956,42 @@ describe('received preset selection', () => {
         expect(saveFailures).toEqual([])
     })
 
+    it('keeps a preset a request applied while a refresh released its revision', async () => {
+        const {store, runtime, saveFailures} = await presetRuntime(true)
+        // C holds what the selection B holds, so applying it leaves the captured root as it was.
+        const copy = {key: JSON.stringify(['preset', 'preset-c', 'mainPrompt']), type: 'set' as const, value: 'Prompt B'}
+        await receiveCommit(store, runtime, {unitMutations: [copy]}, [copy.key])
+        // C is loaded on this device but applied nowhere when the refresh reads the presets.
+        await carryPresetOverride('preset-c', runtime)
+        setEffectivePresetOverride(null)
+        const temperature = {key: JSON.stringify(['preset', 'preset-a', 'temperature']), type: 'set' as const, value: 3}
+        const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations: [temperature]})
+        let releasing!: () => void
+        const released = new Promise<void>((resolve) => { releasing = resolve })
+        let resume!: () => void
+        const resumed = new Promise<void>((resolve) => { resume = resolve })
+        const acquire = store.acquireRevision.bind(store)
+        vi.spyOn(store, 'acquireRevision').mockImplementation(async (value) => new Proxy(await acquire(value), { get: (target, key, receiver) => {
+            const member = Reflect.get(target, key, receiver)
+            return key === 'release' ? async () => { releasing(); await resumed; return member.call(target) } : member
+        } }))
+        const fence = await runtime.acquireCommittedWorkingSetRefreshFence()
+        try {
+            const refresh = fence.refreshCommittedWorkingSet(revision)
+            await released
+            doingChat.set(true)
+            await carryPresetBinding('preset-c', runtime)
+            expect(getEffectivePresetId()).toBe('preset-c')
+            resume()
+            await expect(refresh).resolves.toMatchObject({projection: 'applied'})
+        } finally {
+            resume()
+            fence.release()
+        }
+        expect(getEffectivePresetId()).toBe('preset-c')
+        expect(saveFailures).toEqual([])
+    })
+
     it('keeps a field received while the body of a catalog stub was read', async () => {
         const {store, runtime, saveFailures} = await presetRuntime(true)
         const temperature = {key: JSON.stringify(['preset', 'preset-a', 'temperature']), type: 'set' as const, value: 3}

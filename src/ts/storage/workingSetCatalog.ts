@@ -315,6 +315,11 @@ export function isCatalogPresetLoaded(presets: Database['botPresets'], id: strin
     return getCatalogPresetMetadata(presets)?.loaded.has(id) ?? true
 }
 
+/** Whether a preset applied in place of the selection is a summary in `presets`. */
+export function lacksResidentPresetBody(presets: Database['botPresets']): boolean {
+    return getResidentPresetIds().some((id) => presets.some((preset) => preset?.['id'] === id) && !isCatalogPresetLoaded(presets, id))
+}
+
 /** Places a preset's stored body, a new object, in a working set. */
 export function placeCatalogPresetBody(presets: Database['botPresets'], index: number, value: Database['botPresets'][number]): void {
     getCatalogPresetMetadata(presets)?.loaded.add(value.id!)
