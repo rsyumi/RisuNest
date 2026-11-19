@@ -34,8 +34,10 @@ import { showRealmInfoStore, type hubType } from '../characterCards'
 import { openImportResult } from './openResult'
 import { openedImportResult } from './sheetStore'
 
-const overlayStores = [bookmarkListOpen, moduleScopeMenuOpen, hypaV3ModalOpen]
-const overlayPanels = [easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore]
+const overlayStores = [bookmarkListOpen, moduleScopeMenuOpen]
+const overlayPanels = [popUpEditorStore, customSideBarConfigDialogStore]
+// With the HypaV3 modal and the Realm upload, these hold unsaved work only while open.
+const workPanels = [easyPanelStore, loadoutModalStore, irisStore]
 
 /** Lets the selection that `openImportResult` started finish. */
 const settled = () => new Promise(resolve => setTimeout(resolve))
@@ -46,9 +48,8 @@ function screen() {
         settingsPage: get(SettingsMenuIndex),
         presetList: get(openPresetList),
         personaList: get(openPersonaList),
-        overlays: [
-            ...overlayStores.map(open => get(open)), ...overlayPanels.map(panel => panel.open), get(ShowRealmFrameStore), get(showRealmInfoStore),
-        ].some(Boolean),
+        overlays: [...overlayStores.map(open => get(open)), ...overlayPanels.map(panel => panel.open), get(showRealmInfoStore)].some(Boolean),
+        workScreens: [get(hypaV3ModalOpen), ...workPanels.map(panel => panel.open), get(ShowRealmFrameStore)].every(Boolean),
         opened: get(openedImportResult),
         tab: get(CharConfigSubMenu),
         characterPanel: get(botMakerMode),
@@ -66,8 +67,8 @@ beforeEach(() => {
     // The lists and panels show over every screen until the Open button closes them.
     openPresetList.set(true)
     openPersonaList.set(true)
-    for (const open of overlayStores) open.set(true)
-    for (const panel of overlayPanels) panel.open = true
+    for (const open of [...overlayStores, hypaV3ModalOpen]) open.set(true)
+    for (const panel of [...overlayPanels, ...workPanels]) panel.open = true
     ShowRealmFrameStore.set('character')
     showRealmInfoStore.set({ name: 'Synthetic' } as hubType)
     openedImportResult.set(null)
@@ -82,13 +83,13 @@ beforeEach(() => {
 describe('opening an import result', () => {
     it.each(['module', 'module-from-charx', 'module-from-lorebook'] as const)('opens the module settings page for %s', kind => {
         openImportResult({ kind })
-        expect(screen()).toMatchObject({ settingsOpen: true, settingsPage: 14, presetList: false, personaList: false, overlays: false, opened: null })
+        expect(screen()).toMatchObject({ settingsOpen: true, settingsPage: 14, presetList: false, personaList: false, overlays: false, workScreens: true, opened: null })
         expect(navigation.changeChar).not.toHaveBeenCalled()
     })
 
     it('opens the preset list', () => {
         openImportResult({ kind: 'preset' })
-        expect(screen()).toMatchObject({ presetList: true, personaList: false, overlays: false, settingsOpen: true, settingsPage: 2, opened: null })
+        expect(screen()).toMatchObject({ presetList: true, personaList: false, overlays: false, workScreens: true, settingsOpen: true, settingsPage: 2, opened: null })
     })
 
     it.each([false, true])('selects an imported character and leaves settings for its chat, mobile %s', async mobile => {
@@ -97,7 +98,7 @@ describe('opening an import result', () => {
         await vi.waitFor(() => expect(navigation.changeChar).toHaveBeenCalledExactlyOnceWith(1))
         await settled()
         expect(screen()).toEqual({
-            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, opened: { kind: 'character' }, tab: 0,
+            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, workScreens: true, opened: { kind: 'character' }, tab: 0,
             characterPanel: false, sidebar: false, quickSettings: true, mobilePanel: 0,
         })
     })
@@ -107,7 +108,7 @@ describe('opening an import result', () => {
         await vi.waitFor(() => expect(navigation.changeChar).toHaveBeenCalledExactlyOnceWith(1))
         await settled()
         expect(screen()).toEqual({
-            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, opened: { kind: 'character-lorebook' }, tab: 3,
+            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, workScreens: true, opened: { kind: 'character-lorebook' }, tab: 3,
             characterPanel: true, sidebar: true, quickSettings: false, mobilePanel: 1,
         })
     })
@@ -118,7 +119,7 @@ describe('opening an import result', () => {
         await vi.waitFor(() => expect(navigation.changeChar).toHaveBeenCalledExactlyOnceWith(1))
         await settled()
         expect(screen()).toEqual({
-            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, opened: { kind: 'character-lorebook' }, tab: 3,
+            settingsOpen: false, settingsPage: 2, presetList: false, personaList: false, overlays: false, workScreens: true, opened: { kind: 'character-lorebook' }, tab: 3,
             characterPanel: false, sidebar: false, quickSettings: true, mobilePanel: 2,
         })
     })

@@ -248,14 +248,18 @@ describe('one dropped file', () => {
         classify('huge.png', { kind: 'unsupported', refusal: 'png-without-card' })
         classify('shared.json', { kind: 'unsupported', refusal: 'too-large' })
         const hugeJson = dropped('huge.json', '\n  {"name":"synthetic"}')
+        // Whitespace past the bytes the check reads still counts as JSON.
+        const paddedJson = dropped('padded.json', `${' '.repeat(64 * 1024)}{"name":"synthetic"}`)
         const hugePng = dropped('huge.png', 'synthetic image')
         const hugePlugin = dropped('huge.js', '//@name synthetic_huge\n//@api 3.0\n')
-        for (const file of [hugeJson, hugePng, hugePlugin]) Object.defineProperty(file, 'size', { value: MAX_CONTENT_METADATA_BYTES + 1 })
+        for (const file of [hugeJson, paddedJson, hugePng, hugePlugin]) Object.defineProperty(file, 'size', { value: MAX_CONTENT_METADATA_BYTES + 1 })
         const copyHugeJson = vi.spyOn(hugeJson, 'stream')
+        const copyPaddedJson = vi.spyOn(paddedJson, 'stream')
         const readHugePlugin = vi.spyOn(hugePlugin, 'text')
         await submitImportDelivery(drop(dropped('photo.jpg')))
         await submitImportDelivery(drop(dropped('notes.txt')))
         await submitImportDelivery(drop(hugeJson))
+        await submitImportDelivery(drop(paddedJson))
         await submitImportDelivery(drop(hugePng))
         await submitImportDelivery(drop(hugePlugin))
         await submitImportDelivery({ origin: 'opened', sources: [{ type: 'path', path: '/opened/shared.json' }] })
@@ -263,12 +267,14 @@ describe('one dropped file', () => {
             [`photo.jpg\n${language.risuNest.importDialog.reasonPlainJpeg}`],
             [`notes.txt\n${language.risuNest.importDialog.reasonUnsupportedFormat}`],
             [`huge.json\n${failureReason('payload-too-large', 'import', 'content')}`],
+            [`padded.json\n${failureReason('payload-too-large', 'import', 'content')}`],
             [`huge.png\n${language.risuNest.importIntake.reasonPngWithoutCard}`],
             [`huge.js\n${failureReason('payload-too-large', 'import', 'content')}`],
             [`shared.json\n${failureReason('payload-too-large', 'import', 'content')}`],
         ])
         // A dropped JSON file over the limit is refused before it is copied; another large file is copied.
         expect(copyHugeJson).not.toHaveBeenCalled()
+        expect(copyPaddedJson).not.toHaveBeenCalled()
         expect(readHugePlugin).not.toHaveBeenCalled()
         expect(get(pluginInstallDialog)).toBeNull()
         // A file of an unknown extension is never copied or read.

@@ -247,11 +247,15 @@ async function readSource(
     return classify(copied, { source: { type: 'desktopPath', path: inboxPath }, displayName: name }, state.moduleScreen)
 }
 
-/** Whether the first byte after leading whitespace opens a JSON object, which is what makes the native classifier read JSON. */
+/**
+ * Whether the first byte after leading whitespace opens a JSON object, which is what makes the native
+ * classifier read JSON. A prefix of whitespace only counts too, since no other importable file starts so.
+ */
 async function opensJsonObject(file: File): Promise<boolean> {
     try {
         const prefix = new Uint8Array(await file.slice(0, 64 * 1024).arrayBuffer())
-        return prefix.find(byte => ![0x20, 0x09, 0x0a, 0x0d].includes(byte)) === 0x7b
+        const first = prefix.find(byte => ![0x20, 0x09, 0x0a, 0x0d].includes(byte))
+        return first === undefined || first === 0x7b
     } catch {
         // The copy that follows reports a file that cannot be read.
         return false

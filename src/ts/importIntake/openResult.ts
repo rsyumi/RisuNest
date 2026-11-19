@@ -7,10 +7,6 @@ import {
     CharConfigSubMenu,
     customSideBarConfigDialogStore,
     DBState,
-    easyPanelStore,
-    hypaV3ModalOpen,
-    irisStore,
-    loadoutModalStore,
     MobileGUI,
     MobileSideBar,
     moduleScopeMenuOpen,
@@ -20,7 +16,6 @@ import {
     QuickSettings,
     settingsOpen,
     SettingsMenuIndex,
-    ShowRealmFrameStore,
     sideBarStore,
 } from '../stores.svelte'
 import { openedImportResult } from './sheetStore'
@@ -49,11 +44,13 @@ export function openImportResult(location: NativeFileOperationImportLocation): v
     }
 }
 
-/** Closes the lists and panels that show over every screen and lose nothing when closed. */
+/**
+ * Closes the lists and menus that show over every screen. Screens that keep unsaved work only while
+ * open, such as the HypaV3 summaries or the Realm upload, stay open.
+ */
 function closeOverlays(): void {
-    for (const open of [openPresetList, openPersonaList, bookmarkListOpen, moduleScopeMenuOpen, hypaV3ModalOpen]) open.set(false)
-    for (const panel of [easyPanelStore, popUpEditorStore, loadoutModalStore, irisStore, customSideBarConfigDialogStore]) panel.open = false
-    ShowRealmFrameStore.set('')
+    for (const open of [openPresetList, openPersonaList, bookmarkListOpen, moduleScopeMenuOpen]) open.set(false)
+    for (const panel of [popUpEditorStore, customSideBarConfigDialogStore]) panel.open = false
     showRealmInfoStore.set(null)
 }
 

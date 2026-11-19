@@ -292,7 +292,7 @@ describe('Android SAF bridge', () => {
         })).toBeNull()
     })
 
-    it('subscribes before consuming the replayed ready batch and removes the listener', async () => {
+    it('subscribes before consuming each batch that waited and removes the listener', async () => {
         const listeners = new Set<(event: Event) => void>()
         const batches: unknown[] = []
         let pendingClears = 0
@@ -306,12 +306,14 @@ describe('Android SAF bridge', () => {
             }],
             failures: [],
         }
+        // A share that arrived on its own before the page listened stays a batch of its own.
+        const waiting = { requestId: 'waiting-request', ready: [], failures: [{ displayName: 'card.png', code: 'source-read-failed' }] }
 
         const dispose = listenAndroidSpoolBatches(
             (batch) => batches.push(batch),
             {
-                takePendingBatch: () => initial,
-                clearPendingBatch: () => pendingClears += 1,
+                takePendingBatches: () => [initial, waiting],
+                clearPendingBatches: () => pendingClears += 1,
                 addEventListener: (_name, listener) => listeners.add(listener),
                 removeEventListener: (_name, listener) => listeners.delete(listener),
             },
@@ -326,7 +328,7 @@ describe('Android SAF bridge', () => {
         }
         await Promise.resolve()
 
-        expect(batches).toEqual([eventBatch, initial])
+        expect(batches).toEqual([eventBatch, initial, waiting])
         expect(pendingClears).toBe(1)
         dispose()
         expect(listeners.size).toBe(0)

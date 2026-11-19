@@ -37,22 +37,23 @@ export interface AndroidSpoolBatch {
 }
 
 export interface AndroidSpoolListenerDependencies {
-    takePendingBatch(): AndroidSpoolBatch | null | undefined
-    clearPendingBatch(): void
+    /** The batches Android delivered before the page listened, each still a delivery of its own. */
+    takePendingBatches(): AndroidSpoolBatch[]
+    clearPendingBatches(): void
     addEventListener(name: string, listener: (event: Event) => void): void
     removeEventListener(name: string, listener: (event: Event) => void): void
 }
 
+type PendingSpoolWindow = Window & { tauriOpenedFileSpools?: AndroidSpoolBatch[] }
+
 const productionSpoolListenerDependencies: AndroidSpoolListenerDependencies = {
-    takePendingBatch: () => {
-        const target = window as Window & { tauriOpenedFileSpools?: AndroidSpoolBatch }
-        const batch = target.tauriOpenedFileSpools
-        delete target.tauriOpenedFileSpools
-        return batch
+    takePendingBatches: () => {
+        const batches = (window as PendingSpoolWindow).tauriOpenedFileSpools ?? []
+        delete (window as PendingSpoolWindow).tauriOpenedFileSpools
+        return batches
     },
-    clearPendingBatch: () => {
-        delete (window as Window & { tauriOpenedFileSpools?: AndroidSpoolBatch })
-            .tauriOpenedFileSpools
+    clearPendingBatches: () => {
+        delete (window as PendingSpoolWindow).tauriOpenedFileSpools
     },
     addEventListener: (name, listener) => window.addEventListener(name, listener),
     removeEventListener: (name, listener) => window.removeEventListener(name, listener),
@@ -65,13 +66,13 @@ export function listenAndroidSpoolBatches(
     const onReady = (event: Event) => {
         const batch = (event as CustomEvent<AndroidSpoolBatch>).detail
         if (batch) {
-            dependencies.clearPendingBatch()
+            dependencies.clearPendingBatches()
             listener(batch)
         }
     }
     dependencies.addEventListener(SPOOL_EVENT, onReady)
-    const initial = dependencies.takePendingBatch()
-    if (initial) queueMicrotask(() => listener(initial))
+    const initial = dependencies.takePendingBatches()
+    if (initial.length) queueMicrotask(() => initial.forEach(batch => listener(batch)))
     return () => dependencies.removeEventListener(SPOOL_EVENT, onReady)
 }
 

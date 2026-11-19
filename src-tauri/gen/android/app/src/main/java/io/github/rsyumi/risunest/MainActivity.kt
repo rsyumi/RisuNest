@@ -287,6 +287,25 @@ internal fun openedIntentScripts(
 }
 
 /**
+ * The sort key of each file of one opened intent, named by [displayNames] in the order it was opened:
+ * its spool token, or its name when it failed or its spool was withdrawn at [handedOff].
+ */
+internal fun openedIntentOrder(
+  displayNames: List<String>,
+  spooled: List<SafSpoolBatch>,
+  legacyFiles: List<OpenedFileEntry>,
+  handedOff: SafSpoolBatch,
+): List<String> {
+  val tokens = handedOff.ready.mapTo(HashSet()) { it.token }
+  val native = spooled.map { result ->
+    result.ready.firstOrNull()?.let { if (it.token in tokens) it.token else it.displayName }
+      ?: result.failures.first().displayName
+  }.iterator()
+  val legacy = legacyFiles.map(::openedFileOrderKey).iterator()
+  return displayNames.map { if (shouldUseNativeFileJobSpool(it)) native.next() else legacy.next() }
+}
+
+/**
  * The files one opened intent is still copying, entered in the current WebView's hand-off sets
  * before a replay can see them, so they reach the page only together with the rest of the intent.
  */
@@ -297,13 +316,11 @@ internal class OpenedFileReservation(
   private val paths = ConcurrentHashMap.newKeySet<String>()
   private val tokens = ConcurrentHashMap.newKeySet<String>()
 
-  fun reservePath(path: String) {
-    if (handedOffPaths.add(path)) paths.add(path)
-  }
+  /** False when the page already holds [path] for another opening. */
+  fun reservePath(path: String): Boolean = handedOffPaths.add(path).also { if (it) paths.add(path) }
 
-  fun reserveToken(token: String) {
-    if (handedOffTokens.add(token)) tokens.add(token)
-  }
+  /** False when the page already holds [token] for another opening. */
+  fun reserveToken(token: String): Boolean = handedOffTokens.add(token).also { if (it) tokens.add(token) }
 
   fun ownsPath(path: String): Boolean = path in paths
 
@@ -2473,20 +2490,15 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val legacyFiles = withContext(Dispatchers.IO) {
           copyLegacyOpenedFiles(legacySources.map { it.uri }, openedIntent?.action, reservation::reservePath)
         }
-        val store = safSpoolStore()
-        val sources = withContext(Dispatchers.IO) {
-          store.cleanupStale()
-          nativeJobSources.map { source ->
-            contentResolverSource(source.uri, source.displayName, source.totalBytes,
-              openedFileIntentFingerprint(openedIntent?.action, listOf(source.uri.toString())))
-          }
-        }
         val copyContext = currentCoroutineContext()
-        // One source at a time, so each file's spool or failure keeps its place in the intent.
-        val spooled = sources.map { source ->
-          spoolOpenedFilesOnIo(
-            store,
-            listOf(source),
+        val spooled = withContext(Dispatchers.IO) {
+          val store = safSpoolStore()
+          store.cleanupStale()
+          store.spoolEach(
+            nativeJobSources.map { source ->
+              contentResolverSource(source.uri, source.displayName, source.totalBytes,
+                openedFileIntentFingerprint(openedIntent?.action, listOf(source.uri.toString())))
+            },
             isCancelled = { cancellation.get() || !copyContext.isActive },
             onProgress = { progress ->
               dispatchSafProgress(
@@ -2499,16 +2511,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
                 isActive = { safSourceCancellations[requestId] === cancellation },
               )
             },
-            beforePublish = reservation::reserveToken,
+            reserve = reservation::reserveToken,
           )
         }
         val batch = SafSpoolBatch(spooled.flatMap { it.ready }, spooled.flatMap { it.failures })
-        val nativeKeys = spooled.map { it.ready.firstOrNull()?.token ?: it.failures.firstOrNull()?.displayName.orEmpty() }
-          .iterator()
-        val legacyKeys = legacyFiles.map(::openedFileOrderKey).iterator()
-        val order = openedSources.map { source ->
-          if (shouldUseNativeFileJobSpool(source.displayName)) nativeKeys.next() else legacyKeys.next()
-        }
         if (batch.failures.isEmpty() && legacyFiles.all { it is OpenedFileEntry.Copied }) {
           markOpenedIntentStaged(openedIntent, uris)
         } else {
@@ -2519,6 +2525,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val spools = handOffSpools(batch, reservation::ownsToken)
         val openedFiles = markLegacyOpenedFilesDelivered(legacyFiles, reservation::ownsPath)
         if (lifecycleWebView !== webView) return@launch
+        val order = openedIntentOrder(openedSources.map { it.displayName }, spooled, legacyFiles, spools)
         openedIntentScripts(requestId, spools, openedFiles, order, spooled = nativeJobSources.isNotEmpty())
           .forEach { script -> webView.evaluateJavascript(script, null) }
         delivered = true
@@ -2693,13 +2700,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   }
 
   /**
-   * Copies each file in order, or names the ones that could not be copied. [beforeReady] runs for
-   * each copy before a replay can offer it.
+   * Copies each file in order, or names the ones that could not be copied. [beforeReady] takes each
+   * copy before a replay can offer it, and reports whether it took it.
    */
   private fun copyLegacyOpenedFiles(
     uris: List<Uri>,
     action: String?,
-    beforeReady: (String) -> Unit = {},
+    beforeReady: (String) -> Boolean = { true },
   ): List<OpenedFileEntry> {
     if (uris.isEmpty()) return emptyList()
     val directory = File(cacheDir, "opened_files")
@@ -2711,14 +2718,16 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       val displayName = runCatching { resolveLegacyDisplayName(uri) }
         .getOrElse { sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") }
       try {
-        val sourceId = openedFileIntentFingerprint(action, listOf(uri.toString()))
-        val openedTarget = File(directory, "$sourceId-$index-$displayName")
-        if (openedTarget.isFile && File("${openedTarget.absolutePath}.pending").isFile) {
-          beforeReady(openedTarget.absolutePath)
-          File("${openedTarget.absolutePath}.delivered").delete()
-          markLegacyFileReady(openedTarget)
-          return@mapIndexed OpenedFileEntry.Copied(openedTarget.absolutePath)
+        val earlier = File(directory, "${openedFileIntentFingerprint(action, listOf(uri.toString()))}-$index-$displayName")
+        val pending = earlier.isFile && File("${earlier.absolutePath}.pending").isFile
+        if (pending && beforeReady(earlier.absolutePath)) {
+          File("${earlier.absolutePath}.delivered").delete()
+          markLegacyFileReady(earlier)
+          return@mapIndexed OpenedFileEntry.Copied(earlier.absolutePath)
         }
+        // The page still holds the earlier copy for another opening, so this one gets a copy of its own.
+        val openedTarget = if (!pending) earlier else File(directory,
+          "${openedFileIntentFingerprint(action, listOf(uri.toString(), UUID.randomUUID().toString()))}-$index-$displayName")
         val partial = File(directory, "${openedTarget.name}.partial")
         target = partial
         contentResolver.openInputStream(uri)?.use { input ->
