@@ -307,6 +307,12 @@ internal class OpenedFileReservation(
   /** False when the page already holds [token] for another opening. */
   fun reserveToken(token: String): Boolean = handedOffTokens.add(token).also { if (it) tokens.add(token) }
 
+  /** Gives back [path] when its copy failed, so the next opening of the file can take it. */
+  fun releasePath(path: String) { if (paths.remove(path)) handedOffPaths.remove(path) }
+
+  /** Gives back [token] when its spool failed. */
+  fun releaseToken(token: String) { if (tokens.remove(token)) handedOffTokens.remove(token) }
+
   fun ownsPath(path: String): Boolean = path in paths
 
   fun ownsToken(token: String): Boolean = token in tokens
@@ -548,23 +554,23 @@ internal fun replayLegacyOpenedFiles(directory: File, handedOff: Set<String>): L
 
 /**
  * Copies each opened file into [directory] in order, or names the ones that could not be copied.
- * [claim] takes each copy's path before anything is written to it, so no replay or other opening can
- * offer it, and reports whether it took it. A copy an interrupted earlier opening left is reused.
+ * [reservation] takes each copy's path before anything is written to it, so no replay or other opening
+ * can offer it, and gets it back when the copy fails. A copy an interrupted earlier opening left is reused.
  */
 internal fun copyLegacyOpenedSources(
   directory: File,
   sources: List<SafInputSource>,
-  claim: (String) -> Boolean,
+  reservation: OpenedFileReservation,
   publisher: SafAtomicPublisher = AndroidSafAtomicPublisher,
 ): List<OpenedFileEntry> {
   if (sources.isEmpty()) return emptyList()
   directory.mkdirs()
   cleanupLegacyOpenedFiles(directory)
   return sources.mapIndexed { index, source ->
-    var partial: File? = null
+    var reserved: File? = null
     try {
       val earlier = File(directory, "${source.operationId}-$index-${source.displayName}")
-      val claimed = claim(earlier.absolutePath)
+      val claimed = reservation.reservePath(earlier.absolutePath)
       if (claimed && earlier.isFile && File("${earlier.absolutePath}.pending").isFile) {
         File("${earlier.absolutePath}.delivered").delete()
         return@mapIndexed OpenedFileEntry.Copied(earlier.absolutePath)
@@ -572,15 +578,19 @@ internal fun copyLegacyOpenedSources(
       // Another opening holds the earlier copy or is still writing it, so this one gets a copy of its own.
       val target = if (claimed) earlier else File(directory,
         "${openedFileIntentFingerprint(null, listOf(UUID.randomUUID().toString()))}-$index-${source.displayName}")
-        .also { claim(it.absolutePath) }
-      val copy = File(directory, "${target.name}.partial").also { partial = it }
+        .also { reservation.reservePath(it.absolutePath) }
+      reserved = target
+      val copy = File(directory, "${target.name}.partial")
       source.open().use { input -> copy.outputStream().use { output -> input.copyTo(output); output.fd.sync() } }
       publisher.publish(copy, target)
       val marker = File("${target.absolutePath}.pending")
       if (!marker.isFile) publishLegacyMarker(marker, publisher)
       OpenedFileEntry.Copied(target.absolutePath)
     } catch (error: Exception) {
-      partial?.delete()
+      reserved?.let {
+        File(directory, "${it.name}.partial").delete()
+        reservation.releasePath(it.absolutePath)
+      }
       OpenedFileEntry.Failed(source.displayName, "source-copy-failed")
     }
   }
@@ -2519,7 +2529,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           shouldUseNativeFileJobSpool(source.displayName)
         }
         val legacyFiles = withContext(Dispatchers.IO) {
-          copyLegacyOpenedFiles(legacySources.map { it.uri }, openedIntent?.action, reservation::reservePath)
+          copyLegacyOpenedFiles(legacySources.map { it.uri }, openedIntent?.action, reservation)
         }
         val copyContext = currentCoroutineContext()
         val spooled = withContext(Dispatchers.IO) {
@@ -2543,6 +2553,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
               )
             },
             reserve = reservation::reserveToken,
+            release = reservation::releaseToken,
           )
         }
         if (spooled.all { it.failures.isEmpty() } && legacyFiles.all { it is OpenedFileEntry.Copied }) {
@@ -2670,7 +2681,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       var delivered = false
       try {
         val openedFiles = withContext(Dispatchers.IO) {
-          copyLegacyOpenedFiles(uris, openedIntent?.action, reservation::reservePath)
+          copyLegacyOpenedFiles(uris, openedIntent?.action, reservation)
         }
         if (openedFiles.all { it is OpenedFileEntry.Copied }) markOpenedIntentStaged(openedIntent, uris)
         else Toast.makeText(this@MainActivity, R.string.opened_file_prepare_failed, Toast.LENGTH_LONG).show()
@@ -2727,12 +2738,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private fun copyLegacyOpenedFiles(
     uris: List<Uri>,
     action: String?,
-    claim: (String) -> Boolean,
+    reservation: OpenedFileReservation,
   ): List<OpenedFileEntry> = copyLegacyOpenedSources(File(cacheDir, "opened_files"), uris.map { uri ->
     val displayName = runCatching { resolveLegacyDisplayName(uri) }
       .getOrElse { sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") }
     contentResolverSource(uri, displayName, null, openedFileIntentFingerprint(action, listOf(uri.toString())))
-  }, claim)
+  }, reservation)
 
   private fun resolveLegacyDisplayName(uri: Uri): String {
     if (uri.scheme == ContentResolver.SCHEME_CONTENT) {

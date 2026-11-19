@@ -838,20 +838,30 @@ class MainActivityBehaviorTest {
     val publisher = SafAtomicPublisher { temporary, target ->
       java.nio.file.Files.move(temporary.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     }
-    fun open(reservation: OpenedFileReservation, whileCopying: () -> Unit = {}): String {
-      val source = object : SafInputSource {
-        override val operationId = "a".repeat(64)
-        override val displayName = "preset.risup"
-        override val totalBytes: Long? = null
-        override fun open(): java.io.InputStream {
-          whileCopying()
-          return ByteArrayInputStream("synthetic".toByteArray())
-        }
+    fun source(whileCopying: () -> Unit) = object : SafInputSource {
+      override val operationId = "a".repeat(64)
+      override val displayName = "preset.risup"
+      override val totalBytes: Long? = null
+      override fun open(): java.io.InputStream {
+        whileCopying()
+        return ByteArrayInputStream("synthetic".toByteArray())
       }
-      val copied = copyLegacyOpenedSources(directory, listOf(source), reservation::reservePath, publisher).single()
+    }
+    fun open(reservation: OpenedFileReservation, whileCopying: () -> Unit = {}): String {
+      val copied = copyLegacyOpenedSources(directory, listOf(source(whileCopying)), reservation, publisher).single()
       return (copied as OpenedFileEntry.Copied).path.also { assertEquals(true, reservation.ownsPath(it)) }
     }
+    // An opening that cannot read the file keeps no path for it, whether it took the earlier path or one of its own.
+    fun failToOpen() {
+      val before = handedOff.toSet()
+      val unreadable = source { throw java.io.IOException("gone") }
+      assertEquals(listOf(OpenedFileEntry.Failed("preset.risup", "source-copy-failed")),
+        copyLegacyOpenedSources(directory, listOf(unreadable), OpenedFileReservation(handedOff, mutableSetOf()), publisher))
+      assertEquals(before, handedOff)
+    }
     val openings = List(4) { OpenedFileReservation(handedOff, mutableSetOf()) }
+
+    failToOpen()
 
     lateinit var second: String
     // The second opening runs to the end while the first is still copying.
@@ -864,6 +874,7 @@ class MainActivityBehaviorTest {
     // A copy its opening gave back undelivered is taken over by the next opening of the same file.
     openings[0].release()
     assertEquals(first, open(openings[3]))
+    failToOpen()
   }
 
   @Test

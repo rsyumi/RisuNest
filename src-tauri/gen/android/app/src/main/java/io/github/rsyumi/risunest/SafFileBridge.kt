@@ -197,7 +197,8 @@ internal class SafSpoolStore(
 
   /**
    * One result per source, in source order. [reserve] takes each token before [listReady] can offer
-   * its spool as a new import, and reports whether it took it.
+   * its spool as a new import, and reports whether it took it. [release] gives back the token of a
+   * spool that failed after it was taken.
    */
   fun spoolEach(
     sources: List<SafInputSource>,
@@ -207,6 +208,7 @@ internal class SafSpoolStore(
     delivered: Boolean = false,
     restoreCopy: Boolean = false,
     reserve: (String) -> Boolean = { true },
+    release: (String) -> Unit = {},
   ): List<SafSpoolBatch> {
     val existing = listReady().filter { it.operationId != null }.associateBy { it.operationId }
     fun failed(displayName: String, code: String) = SafSpoolBatch(emptyList(), listOf(SafSpoolFailure(displayName, code)))
@@ -270,6 +272,7 @@ internal class SafSpoolStore(
       } catch (error: Exception) {
         deleteGeneratedDirectory(stagingDirectory, token)
         deleteGeneratedDirectory(ownedDirectory, token)
+        release(token)
         failed(displayName, if (error is SafSpoolException) error.code else spoolWriteFailureCode(error))
       }
     }

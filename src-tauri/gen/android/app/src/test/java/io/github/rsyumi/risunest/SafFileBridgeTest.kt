@@ -779,6 +779,16 @@ class SafFileBridgeTest {
 
     reserved.clear()
     assertEquals(second.ready, replayReadySpoolBatch(store, reserved).ready)
+
+    // A spool that fails after its token was taken gives the token back.
+    val failing = SafSpoolStore(temporaryDirectory(), atomicPublisher = SafAtomicPublisher { temporary, target ->
+      // Only the last step, publishing the copied spool, fails.
+      if (temporary.isDirectory) throw IOException("gone") else testAtomicPublisher.publish(temporary, target)
+    })
+    val reservation = OpenedFileReservation(mutableSetOf(), reserved)
+    val failed = failing.spoolEach(listOf(source), reserve = reservation::reserveToken, release = reservation::releaseToken).single()
+    assertEquals(listOf("card.json"), failed.failures.map { it.displayName })
+    assertEquals(emptySet<String>(), reserved)
   }
 
   @Test
