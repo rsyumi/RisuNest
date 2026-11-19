@@ -1899,14 +1899,15 @@ describe('received preset selection', () => {
 
     it.each([
         [false, false, 'preset-elsewhere', false], [true, false, 'preset-elsewhere', false], [true, true, 'preset-elsewhere', false],
-        [true, false, 'preset-elsewhere', true], [true, false, undefined, false],
-    ])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s, refresh=%s, selection=%s, reorder=%s)', async (catalog, refresh, received, reorder) => {
+        [true, false, 'preset-elsewhere', true], [true, false, undefined, false], [true, false, 2, false], [true, false, 0, true],
+    ])('selects the stored body of a received selection without saving it back (catalog=%s, refresh=%s, selection=%s, reorder=%s)', async (catalog, refresh, received, reorder) => {
         const {store, runtime, saveFailures} = await presetRuntime(catalog)
         const selectionKey = JSON.stringify(['root', 'botPresetsId'])
-        const unitMutations: PersistentUnitMutation[] = [received ? {key: selectionKey, type: 'set', value: received} : {key: selectionKey, type: 'delete'}]
+        const unitMutations: PersistentUnitMutation[] = [received === undefined ? {key: selectionKey, type: 'delete'} : {key: selectionKey, type: 'set', value: received}]
         // The first preset after the receive is a summary on this device.
         if (reorder) unitMutations.push({key: JSON.stringify(['order', 'presets']), type: 'set', value: ['preset-c', 'preset-a', 'preset-b']})
-        const fallback = reorder ? 'C' : 'A'
+        // An index names the preset at that position after the receive; any other selection this device cannot resolve falls back to the first.
+        const fallback = (reorder ? ['C', 'A', 'B'] : ['A', 'B', 'C'])[typeof received === 'number' ? received : 0]
         if (refresh) {
             const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations})
             const fence = await runtime.acquireCommittedWorkingSetRefreshFence()

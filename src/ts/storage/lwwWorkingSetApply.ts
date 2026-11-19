@@ -92,10 +92,12 @@ export async function applyLwwWorkingSetUnits(
             if (received) await readPreset(received)
             if (received && presets.get(received)) presetCatalog ??= await store.queryPresets()
             else if (catalogPresets) {
-                // A selection naming a preset this device does not hold, or none, falls back to the first.
-                // The selection key runs last, so a received order or removal has already read that catalog.
-                const first = presetCatalog ? presetCatalog.items[0]?.id : database.botPresets[0]?.['id']
-                if (typeof first === 'string') await readPreset(first)
+                // An index names the preset at that position; a selection naming a preset this device does not
+                // hold, or none, falls back to the first. The selection key runs last, so a received order or
+                // removal has already read that catalog.
+                const index = typeof root?.botPresetsId === 'number' ? root.botPresetsId : 0
+                const selected = presetCatalog ? presetCatalog.items.find((item) => item.configuredIndex === index)?.id : database.botPresets[index]?.['id']
+                if (typeof selected === 'string') await readPreset(selected)
             }
         }
         if ((kind === 'order' && id === 'presets') || (kind === 'exists' && id === 'preset')) {
@@ -153,11 +155,11 @@ export async function applyLwwWorkingSetUnits(
             if (id === 'botPresetsId') placeSelectedBody()
             if (Object.hasOwn(root, id)) (baseline.root as unknown as Record<string, unknown>)[id] = canonicalClone((root as unknown as Record<string, unknown>)[id])
             else delete (baseline.root as unknown as Record<string, unknown>)[id]
-            // The fallback for a received selection this working set cannot resolve is not a local selection to save.
+            // The record a received index or unresolved selection lands on is not a local selection to save.
             if (id === 'botPresetsId' || id === 'selectedPersona') {
                 const records: readonly ({ id?: unknown } | undefined)[] = (id === 'botPresetsId' ? database.botPresets : database.personas) ?? []
                 const received = root[id], index = database[id]
-                if ((received === undefined || typeof received === 'string' && !records.some((value) => value?.id === received)) && index === remote[id]) {
+                if ((typeof received !== 'string' || !records.some((value) => value?.id === received)) && index === remote[id]) {
                     const fallbackId = records[index]?.id
                     const baselineRoot = baseline.root as unknown as Record<string, unknown>
                     baselineRoot[id] = typeof fallbackId === 'string' ? fallbackId : index
