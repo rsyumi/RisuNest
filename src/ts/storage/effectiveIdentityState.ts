@@ -4,6 +4,7 @@ import { v4 } from 'uuid'
 import { canonicalJson } from './saveCoordinatorHelpers'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { isConversationSummaryStub } from './conversationResidency'
+import { isCatalogPresetLoaded } from './workingSetCatalog'
 
 export const presetMirrorMap = Object.fromEntries([
     ...('apiType localNetworkMode localNetworkTimeoutSec mainPrompt jailbreak globalNote temperature maxContext maxResponse frequencyPenalty PresensePenalty formatingOrder aiModel subModel currentPluginProvider textgenWebUIStreamURL textgenWebUIBlockingURL forceReplaceUrl promptPreprocess bias koboldURL proxyKey ooba ainconfig proxyRequestModel openrouterRequestModel promptTemplate NAIadventure NAIappendName localStopStrings autoSuggestPrompt autoSuggestPrefix autoSuggestClean customProxyRequestModel reverseProxyOobaArgs top_p promptSettings repetition_penalty min_p top_a openrouterProvider useInstructPrompt customPromptTemplateToggle templateDefaultVariables moduleIntergration top_k instructChatTemplate JinjaTemplate jsonSchemaEnabled jsonSchema strictJsonSchema extractJson namedMessageRole messageNameTemplate seperateParametersEnabled seperateParameters customAPIFormat systemContentReplacement systemRoleReplacement customFlags enableCustomFlags thinkingTokens thinkingType deepseekThinkingType adaptiveThinkingEffort deepseekReasoningEffort outputImageModal seperateModelsForAxModels seperateModels modelTools fallbackModels fallbackWhenBlankResponse verbosity dynamicOutput').split(' ').map(key => [key, key]),
@@ -66,10 +67,11 @@ function boundConversation(db: Database, binding: ToggleBinding | undefined): Co
     return chat && !isConversationSummaryStub(chat) ? chat : undefined
 }
 
-// Catalog entries carry only their summary and the local fields normalization adds.
-const catalogPresetKeys = new Set(['id', 'name', 'image', 'localNetworkMode', 'localNetworkTimeoutSec'])
-export const isLoadedPreset = (value: botPreset | undefined): boolean =>
-    !!value && Object.keys(value).some((key) => !catalogPresetKeys.has(key))
+/** Whether `preset`, an entry of `presets`, holds its stored body; a received field does not make a catalog summary one. */
+export const isLoadedPresetRecord = (presets: Database['botPresets'], preset: botPreset | undefined): boolean =>
+    !!preset && isCatalogPresetLoaded(presets, preset.id!)
+export const isLoadedPreset = (db: Database, id: string | null | undefined): boolean =>
+    isLoadedPresetRecord(db?.botPresets, id ? db?.botPresets?.find(preset => preset?.id === id) : undefined)
 
 const hasPreset = (db: Database, id: string): boolean => !!db.botPresets?.some(preset => preset?.id === id)
 
@@ -222,10 +224,9 @@ const sameFingerprint = (left: unknown, right: unknown): boolean =>
         : left === right || Object.is(left, right)
 
 function presetMirrorSource(db: Database, presetId: string, apply: ApplyPreset): Snapshot | undefined {
-    const preset = db.botPresets?.find(preset => preset?.id === presetId)
-    if (!isLoadedPreset(preset)) return undefined
+    if (!isLoadedPreset(db, presetId)) return undefined
     const target = {} as Snapshot
-    apply(target as unknown as Database, preset!)
+    apply(target as unknown as Database, db.botPresets.find(preset => preset?.id === presetId)!)
     return target
 }
 
@@ -250,7 +251,7 @@ export function flushPresetMirrorView(
     db: Database, view: PresetMirrorView, keys: Iterable<string> = Object.keys(presetMirrorMap), edited = false,
 ): void {
     const record = db.botPresets?.find(preset => preset?.id === view.presetId) as unknown as Snapshot | undefined
-    if (!record || !isLoadedPreset(record as unknown as botPreset)) return
+    if (!record || !isLoadedPreset(db, view.presetId)) return
     const copy = view.copy ?? clone
     for (const key of keys) {
         const field = presetMirrorMap[key]

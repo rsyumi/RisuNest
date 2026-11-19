@@ -19,7 +19,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     const DBState = $state({ db: {} })
-    return { DBState, alertStore: writable({ type: 'none', msg: '' }) }
+    return { DBState, alertStore: writable({ type: 'none', msg: '' }), settingsOpen: writable(false), MobileGUI: writable(false), MobileGUIStack: writable(0), MobileSideBar: writable(0), selectedCharID: writable(0) }
 })
 vi.mock('src/ts/alert', () => ({
     alertConfirm: mocks.confirm,

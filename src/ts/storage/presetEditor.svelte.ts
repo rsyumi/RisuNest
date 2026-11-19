@@ -10,7 +10,6 @@ import {
     derivePresetMirrorView,
     flushEffectivePresetEdits,
     flushPresetMirrorView,
-    isLoadedPreset,
     peekEffectivePresetId,
     presetMirrorMap,
     protectedPresetGroups,
@@ -84,8 +83,7 @@ function refresh(): void {
     untrack(() => {
         const db = DBState.db
         const selection = db?.botPresets?.[db.botPresetsId]
-        const candidate = selection?.id && selection.id !== peekEffectivePresetId(db) && isLoadedPreset(selection)
-            ? selection.id : null
+        const candidate = selection?.id && selection.id !== peekEffectivePresetId(db) ? selection.id : null
         if (candidate && !watchingSettingsWindow) {
             watchingSettingsWindow = true
             let subscribed = false

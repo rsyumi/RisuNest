@@ -6,8 +6,8 @@ const fixture = vi.hoisted(() => ({
     database: { characters: [], plugins: [], currentPluginProvider: '' } as any,
     // The library plugin storage both the sandbox and the data deletion use.
     storage: new Map<string, Map<string, unknown>>(),
-    // Owners whose provider the preset store was asked to clear.
-    clearedProviders: [] as string[],
+    // Provider names the preset store is asked to clear.
+    clearProviders: vi.fn(async (_names: string[]) => undefined),
 }))
 
 function ownedStorage(owner: string) {
@@ -55,7 +55,7 @@ vi.mock('../../storage/persistentDataStoreFactory', () => ({
     }),
 }))
 vi.mock('src/ts/storage/database.svelte', async () => (await import('./v3Host.testSupport')).databaseModule({ read: () => fixture.database }, {
-    clearPresetPluginProvider: async (owner: string) => { fixture.clearedProviders.push(owner) },
+    clearPresetPluginProvider: fixture.clearProviders,
 }))
 vi.mock('../pluginSafeClass', async () => (await import('./v3Host.testSupport')).pluginSafeClassModule())
 vi.mock('src/ts/stores.svelte', async () => (await import('./v3Host.testSupport')).storesModule({ read: () => fixture.database }))
@@ -92,6 +92,7 @@ window.ready = (async () => {
     await risuai.onUnload(async () => {
         await risuai.pluginStorage.setItem('saved-while-unloading', { cache: 'flushed' })
     })
+    await risuai.addProvider('custom-provider', async () => ({ success: true, content: '' }))
     await risuai.pluginStorage.setItem('saved-while-running', 'value')
 })()
 `,
@@ -126,7 +127,7 @@ async function executeIframeSrcdoc(frame: HTMLIFrameElement): Promise<void> {
 
 async function runInstalledPlugin(): Promise<void> {
     fixture.database.plugins = [structuredClone(removable)]
-    fixture.database.currentPluginProvider = owner
+    fixture.database.currentPluginProvider = 'custom-provider'
     await loadPlugins()
     const frame = document.querySelector<HTMLIFrameElement>('iframe[data-risu-plugin-frame]')
     if (!frame) throw new Error('Plugin iframe was not created')
@@ -151,17 +152,20 @@ afterEach(async () => {
 })
 
 describe('plugin removal with a running sandbox', () => {
-    it('leaves no data behind that the plugin saved while unloading', async () => {
+    it('clears the providers it registered and leaves no data behind that the plugin saved while unloading', async () => {
         await runInstalledPlugin()
-        fixture.clearedProviders = []
         expect(await ownedKeys()).toEqual(['saved-while-running'])
+        // A removal that fails to clear the stored presets keeps the plugin for another try.
+        fixture.clearProviders.mockRejectedValueOnce(new Error('Preset store failed'))
+        await expect(removeInstalledPlugin(owner, true)).rejects.toThrow('Preset store failed')
+        expect(fixture.database.plugins.map((plugin: RisuPlugin) => plugin.name)).toEqual([owner])
 
         await removeInstalledPlugin(owner, true)
 
         expect(fixture.database.plugins).toEqual([])
         expect(fixture.database.currentPluginProvider).toBe('')
         // Presets that are not loaded are cleared in the store.
-        expect(fixture.clearedProviders).toEqual([owner])
+        expect(fixture.clearProviders).toHaveBeenLastCalledWith(['custom-provider', owner])
         expect(document.querySelector('iframe[data-risu-plugin-frame]')).toBeNull()
         expect(await ownedKeys()).toEqual([])
     })

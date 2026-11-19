@@ -1056,7 +1056,7 @@ describe('chat list operations', () => {
         expect(new Set(imported.message.map((message: any) => message.chatId)).size).toBe(2)
     })
 
-    it('imports a risuChat file without decoding it through Buffer', async () => {
+    it('imports a risuChat file and the preset binding PocketRisu names without decoding it through Buffer', async () => {
         const character = buildSelectedCharacter()
         mocks.editWindowedChatList.mockReturnValue({ kind: 'unsupported' })
         const message = [
@@ -1068,7 +1068,7 @@ describe('chat list operations', () => {
             data: new TextEncoder().encode(JSON.stringify({
                 type: 'risuChat',
                 ver: 2,
-                data: { id: 'synthetic-source', name: 'Synthetic import', note: '', localLore: [], message },
+                data: { id: 'synthetic-source', name: 'Synthetic import', note: '', localLore: [], message, bindedBotPreset: 'synthetic-preset' },
                 folders: [],
             })),
         })
@@ -1085,6 +1085,9 @@ describe('chat list operations', () => {
         expect(imported.name).toBe('Synthetic import')
         expect(imported.id).not.toBe('synthetic-source')
         expect(imported.message).toEqual(message)
+        // PocketRisu and RisuBard name the chat's bound preset bindedBotPreset.
+        expect(imported.promptPresetId).toBe('synthetic-preset')
+        expect(imported).not.toHaveProperty('bindedBotPreset')
         expect(bufferCalls).toBe(0)
     })
 
@@ -1512,6 +1515,8 @@ describe('chat list operations', () => {
             message: [{ role: 'user', data: 'authoritative body' }],
             note: 'stale copy',
             authorNotePreset: { id: 'preset', fingerprint: authorNoteFingerprint('stale copy') },
+            // An unbound chat imported before chat files read PocketRisu bindings keeps this field.
+            bindedBotPreset: 'stale-preset',
         })
 
         await exportChat(0)
@@ -1527,6 +1532,7 @@ describe('chat list operations', () => {
         ])
         expect(exported.data.note).toBe('Shared note')
         expect(exported.data).not.toHaveProperty('authorNotePreset')
+        expect(exported.data).not.toHaveProperty('bindedBotPreset')
     })
 
     it('filters markup added by translation from an HTML export and shows names as text', async () => {
@@ -1594,7 +1600,7 @@ describe('chat list operations', () => {
         resident.chats[0].message = []
         const complete = structuredClone(resident)
         complete.chats[0].message = [{ role: 'user', data: 'authoritative body' }]
-        Object.assign(complete.chats[0], { note: 'stale copy', authorNotePreset: { id: 'preset', fingerprint: authorNoteFingerprint('stale copy') } })
+        Object.assign(complete.chats[0], { note: 'stale copy', authorNotePreset: { id: 'preset', fingerprint: authorNoteFingerprint('stale copy') }, bindedBotPreset: 'stale-preset' })
         Object.assign(mocks.database, { authorNotePresets: [{ id: 'preset', name: 'Preset', text: 'Shared note' }] })
         onTestFinished(() => { Reflect.deleteProperty(mocks.database, 'authorNotePresets') })
         mocks.database.characters.push(resident)
@@ -1613,5 +1619,6 @@ describe('chat list operations', () => {
         ])
         expect(exported.data[0].note).toBe('Shared note')
         expect(exported.data[0]).not.toHaveProperty('authorNotePreset')
+        expect(exported.data[0]).not.toHaveProperty('bindedBotPreset')
     })
 })

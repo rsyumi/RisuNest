@@ -1,10 +1,15 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
-const mocks = vi.hoisted(() => ({ confirm: vi.fn(), deleteData: vi.fn(), error: vi.fn(), reload: vi.fn() }))
+const mocks = vi.hoisted(() => ({ confirm: vi.fn(), deleteData: vi.fn(), error: vi.fn(), reload: vi.fn(), mutatePresets: vi.fn() }))
 vi.mock('src/ts/alert', () => ({ alertCheckboxConfirm: mocks.confirm, alertError: mocks.error, alertConfirm: vi.fn(), alertMd: vi.fn(), alertSelect: vi.fn(), alertToast: vi.fn() }))
 vi.mock('src/ts/plugins/pluginDataInventory', () => ({ deletePluginDataForOwner: mocks.deleteData }))
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ checkPluginUpdate: vi.fn(), createBlankPlugin: vi.fn(), importPlugin: vi.fn(), loadPlugins: mocks.reload, updatePlugin: vi.fn() }))
+// Removal clears the plugin's provider from the stored presets first.
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', async (importOriginal) => ({
+    ...await importOriginal<typeof import('src/ts/storage/persistentDataRuntime.svelte')>(),
+    mutatePersistentPresets: mocks.mutatePresets,
+}))
 vi.mock('src/ts/plugins/apiV3/developMode', () => ({ hotReloadPluginFiles: vi.fn() }))
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({ resetAllPluginPermissions: vi.fn() }))
 vi.mock('src/ts/stores.svelte', async () => ({
@@ -81,6 +86,15 @@ describe('plugin removal option', () => {
         expect(DBState.db.currentPluginProvider).toBe('')
         expect((DBState.db as any).pluginPermissions).toEqual({ synthetic: true })
         expect(mocks.reload).toHaveBeenCalledOnce()
+    })
+    it('keeps the plugin and the provider it shows when the stored presets cannot be cleared', async () => {
+        mocks.confirm.mockResolvedValue({ confirmed: true, checked: true })
+        mocks.mutatePresets.mockRejectedValue(new Error('clear failed'))
+        await remove()
+        await vi.waitFor(() => expect(mocks.error).toHaveBeenCalled())
+        expect(DBState.db.plugins).toHaveLength(1)
+        expect(DBState.db.currentPluginProvider).toBe('synthetic')
+        expect(mocks.deleteData).not.toHaveBeenCalled()
     })
     it('keeps the data when the reload fails', async () => {
         mocks.confirm.mockResolvedValue({ confirmed: true, checked: true })

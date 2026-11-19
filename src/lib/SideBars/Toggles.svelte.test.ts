@@ -20,7 +20,13 @@ vi.mock('src/ts/stores.svelte', () => {
 vi.mock('src/ts/storage/database.svelte', () => ({
     getCurrentChat: () => DBState.db.characters[0].chats[DBState.db.characters[0].chatPage],
 }))
-vi.mock('src/ts/process/modules', () => ({ getModuleToggles: () => '' }))
+// A preset's integrated module adds a toggle.
+vi.mock('src/ts/process/modules', async () => {
+    const { DBState } = await import('src/ts/stores.svelte')
+    return {
+        getModuleToggles: (database = DBState.db) => database.moduleIntergration ? `example=Toggle of ${database.moduleIntergration}` : '',
+    }
+})
 // The persistent writes are covered by Chat.windowedInteractions.test.ts; here they apply in memory.
 vi.mock('src/ts/chatBindings.svelte', async () => {
     const { get } = await import('svelte/store')
@@ -136,6 +142,13 @@ it('shows the toggles and jailbreak switch of the preset it is given', async () 
         expect(document.body.textContent).toContain('Edited toggle')
         expect(document.body.textContent).toContain(language.jailbreakToggle)
     }
+
+    await unmount(instance)
+    DBState.db.moduleIntergration = 'Applied module'
+    const presetDatabase = { ...DBState.db, moduleIntergration: 'Edited module' } as typeof DBState.db
+    instance = mount(Toggles, { target: document.body, props: { noContainer: true, presetDatabase } })
+    await tick()
+    expect(document.body.textContent).toContain('Toggle of Edited module')
 })
 
 it('supports initially unset built-in switches and writes their bound values', async () => {

@@ -122,7 +122,7 @@ describe('store-backed preset operations', () => {
         live.botPresets.push(preset('Third', 'catalog stub'))
         live.currentPluginProvider = 'removed'
 
-        await controller.clearPluginProvider('removed')
+        await controller.clearPluginProvider(['removed'])
 
         expect(persisted.map((item) => item.currentPluginProvider)).toEqual(['', '', 'kept'])
         expect(live.currentPluginProvider).toBe('')

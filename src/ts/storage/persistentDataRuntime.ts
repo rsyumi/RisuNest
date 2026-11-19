@@ -68,6 +68,7 @@ import {
     isCatalogCharacterStub,
     isWorkingSetCharacterStub,
     isCatalogPresetWorkingSet,
+    lacksResidentPresetBody,
     patchWorkingSetCharacterDetail,
     patchWorkingSetRoot,
     projectPinnedScalableWorkingSet,
@@ -916,11 +917,14 @@ export function createPersistentDataRuntime(
             const selectedConversationId =
                 dependencies.state.getSelectedConversationId?.() ?? null
             const activeCharacterIds = activatedLibraryGuard ? new Set<string>() : workingSet.activeCharacterIds
-            const projected = await projectRefreshedWorkingSet(revision, {
+            const project = () => projectRefreshedWorkingSet(revision, {
                 selectedCharacterId: activatedLibraryGuard ? null : selectedCharacterId,
                 selectedConversationId: activatedLibraryGuard ? null : selectedConversationId,
                 activeCharacterIds,
             }, activatedLibraryGuard ? captureChanges({wholeLibrary: true}) : options?.changeSet)
+            let projected = await project()
+            // A fenced install cannot read a body afterwards, so a preset applied once the presets were read is read again.
+            while (lacksResidentPresetBody(projected.database.botPresets)) projected = await project()
             if (activatedLibraryGuard && projected.deferred) {
                 throw new Error('Activated library projection is incomplete')
             }
@@ -939,14 +943,13 @@ export function createPersistentDataRuntime(
                 activeCharacterIds,
                 options?.forceScalableProjection ?? true,
             )
-            let installed = projected.database
             if (activatedLibraryGuard) {
-                // The activated library has no resident character to keep selected,
-                // and its derived identity mirrors belong to the installed baseline.
+                // The activated library has no resident character to keep selected.
                 dependencies.state.restoreSelection?.(null, null)
                 dependencies.state.afterRemoteApply?.()
-                installed = dependencies.state.captureWorkingSetDatabase?.() ?? installed
             }
+            // The identity mirrors the installed working set derives belong to its baseline.
+            const installed = dependencies.state.captureWorkingSetDatabase?.() ?? projected.database
             workingSet.installCommittedWorkingSet(installed, revision, projected.windowedMetadata)
             applyInstalledRootChanges(rootBefore)
             deferredContentPending = projected.deferred

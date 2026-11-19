@@ -242,7 +242,9 @@ describe('LWW renderer save path', () => {
     it.each([
         ['preset', '["root","botPresetsId"]', 'preset-alpha', '["exists","preset","preset-alpha"]'],
         ['persona', '["root","selectedPersona"]', 'persona-second', '["exists","persona","persona-second"]'],
-    ] as const)('does not save the selection that replaces a remotely deleted selected %s', async (kind, selectionKey, selectedId, existsKey) => {
+        ['preset', '["root","botPresetsId"]', 'preset-alpha', '["root","botPresetsId"]'],
+        ['persona', '["root","selectedPersona"]', 'persona-second', '["root","selectedPersona"]'],
+    ] as const)('does not save the selection that replaces a remotely deleted selected %s (%s, %s, deleted %s)', async (kind, selectionKey, selectedId, existsKey) => {
         const {database,commit,runtime,receive} = await identityRuntimeHarness()
         await receive([{key:selectionKey,type:'set',value:selectedId}])
         await receive([{key:existsKey,type:'delete'}])

@@ -11,6 +11,7 @@
         acquireCompleteConversation,
         captureSelectedConversationTarget,
         flushPendingData,
+        persistentWorkingSetInputBlocked,
     } from 'src/ts/storage/persistentDataRuntime.svelte'
     import { alertError } from 'src/ts/alert'
     import { refreshAuthorNoteCopy } from 'src/ts/chatBindings.svelte'
@@ -67,15 +68,16 @@
         })
     })
     // A running request keeps the preset of the conversation it generates for, so the selected
-    // conversation's binding applies once it ends.
+    // conversation's binding applies once it ends. A replacement refuses the read of a bound
+    // stub until it ends.
     $effect(() => {
         const db = DBState.db
         const character = db?.characters?.[$selectedCharID]
         const chat = character?.chats?.[character.chatPage]
         const id = chat?.promptPresetId
         // Follows the bound preset being added, removed or replaced by its stored body.
-        if (id) void isLoadedPreset(db.botPresets?.find((preset) => preset?.id === id))
-        if (!db || $doingChat) return
+        if (id) void isLoadedPreset(db, id)
+        if (!db || $doingChat || $persistentWorkingSetInputBlocked) return
         untrack(() => applyConversationPresetBinding(db, chat)).catch((error) => console.error(error))
     })
     // Runs when another conversation is selected or finishes loading, not on every preset edit.

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushSync, mount, unmount } from 'svelte'
+import { get, writable, type Writable } from 'svelte/store'
 import type { Chat, Message } from 'src/ts/storage/database.svelte'
 import { attachHistoryWindow } from 'src/ts/process/historyWindowIndex'
 import ChatBindingLifecycle from './ChatBindingLifecycle.svelte'
@@ -24,6 +25,8 @@ vi.mock('src/ts/storage/database.svelte', () => ({
     flushEffectiveToggleEdits: () => {},
     deriveEffectiveToggleVariables: () => {},
     applyConversationPresetBinding: async (_db: unknown, chat: Chat | undefined) => {
+        // A replacement refuses the read of a bound stub.
+        if (get(persistentWorkingSetInputBlocked)) throw new Error('replacement fenced')
         mocks.bound = chat?.promptPresetId || null
     },
 }))
@@ -36,8 +39,12 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     acquireCompleteConversation: mocks.acquireComplete,
     captureSelectedConversationTarget: () => ({ characterId: 'character', conversationId: 'chat', navigationGeneration: 1 }),
     flushPendingData: mocks.flush,
+    persistentWorkingSetInputBlocked: writable(false),
 }))
 vi.mock('src/ts/alert', () => ({ alertError: mocks.error }))
+
+import { persistentWorkingSetInputBlocked } from 'src/ts/storage/persistentDataRuntime.svelte'
+const blocked = persistentWorkingSetInputBlocked as Writable<boolean>
 
 const message = (data: string, role: Message['role'] = 'char'): Message => ({
     data,
@@ -85,6 +92,7 @@ afterEach(() => {
     if (instance) unmount(instance)
     instance = undefined
     doingChat.set(false)
+    blocked.set(false)
     selectedCharID.set(0)
 })
 
@@ -153,7 +161,7 @@ it('recovers over the complete conversation when the loading limit does not appl
     expect(mocks.flush).toHaveBeenCalledWith('recover-reroll')
 })
 
-it('applies the selected conversation preset binding, holding it while a request runs', () => {
+it('applies the selected conversation preset binding, holding it while a request or replacement runs', () => {
     const chat = (id: string, promptPresetId: string) => ({ id, name: id, note: '', localLore: [], message: [], promptPresetId })
     DBState.db = {
         botPresets: [{ id: 'preset-b', name: 'B', mainPrompt: 'B' }],
@@ -179,7 +187,13 @@ it('applies the selected conversation preset binding, holding it while a request
     DBState.db.characters[0].chats[0].promptPresetId = ''
     flushSync()
     expect(mocks.bound).toBeNull()
+    // A replacement holds the binding until it ends.
+    blocked.set(true)
     DBState.db.characters[0].chats[0].promptPresetId = 'preset-b'
+    flushSync()
+    blocked.set(false)
+    flushSync()
+    expect(mocks.bound).toBe('preset-b')
     selectedCharID.set(-1)
     flushSync()
     expect(mocks.bound).toBeNull()

@@ -20,7 +20,7 @@ import { importContentBatch } from '../storage/contentImportBatch'
 import { runSharedNativeFileOperation, type SharedNativeFileOperationContext } from '../storage/nativeFileJobManager'
 import { convertJsonToModule, nativeModuleLocation, type ModuleImportLocation } from './moduleImportLocation'
 import { assertModuleMCPImportAllowed, StdioModuleImportError } from './mcp/moduleImport'
-import { selectConversationModules } from './moduleSelection'
+import { selectConversationModules, type ModuleSelectionSource } from './moduleSelection'
 import { runWithMobileBackgroundTask } from '../mobileBackgroundTask'
 import { markModuleImport } from '../contentUpdate/merge'
 
@@ -501,9 +501,9 @@ function getModuleById(id:string){
     return null
 }
 
-export function getModules(){
+export function getModules(database: ModuleSelectionSource = getDatabase()){
     return selectConversationModules(
-        getDatabase(),
+        database,
         getCurrentChat()?.modules,
         getCurrentCharacter()?.modules,
         checkPersonaBinded(),
@@ -573,8 +573,9 @@ export function getModuleRegexScripts() {
     return customscripts
 }
 
-export function getModuleToggles() {
-    const modules = getModules()
+/** `database` names the preset whose integrated modules count, such as the one preset settings edit. */
+export function getModuleToggles(database?: ModuleSelectionSource) {
+    const modules = getModules(database)
     let costomModuleToggles: string = ''
     for (const module of modules) {
         if(!module){

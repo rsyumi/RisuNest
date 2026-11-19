@@ -14,7 +14,7 @@ import {
     TARGETED_INVALIDATION_KEY_LIMIT,
     type TargetedWorkingSetInvalidationOptions,
 } from './targetedWorkingSetInvalidation'
-import { getCatalogPresetMetadata, projectPinnedScalableWorkingSet } from './workingSetCatalog'
+import { getCatalogPresetMetadata, isCatalogPresetLoaded, placeCatalogPresetBody, projectPinnedScalableWorkingSet } from './workingSetCatalog'
 
 vi.mock('./database.svelte', () => ({
     getDatabase: () => {
@@ -50,7 +50,7 @@ interface ModelCharacter {
 interface Model {
     revision: number
     root: Record<string, unknown>
-    presets: Array<{ name: string; image?: string; body: string }>
+    presets: Array<{ id?: string; name: string; image?: string; body: string }>
     characters: ModelCharacter[]
 }
 
@@ -119,14 +119,14 @@ function createReader(model: Model): PersistentRevisionReader {
         queryPresets: async () => ({
             revision,
             items: model.presets.map((preset, configuredIndex) => ({
-                id: String(configuredIndex),
+                id: preset.id ?? String(configuredIndex),
                 configuredIndex,
                 name: preset.name,
                 ...(preset.image === undefined ? {} : { image: preset.image }),
             })),
         }),
         readPreset: async (id: string) => {
-            const preset = model.presets[Number(id)]
+            const preset = model.presets.find((value, configuredIndex) => (value.id ?? String(configuredIndex)) === id)
             return preset ? { revision, value: clone(preset) as unknown as botPreset } : null
         },
         queryCharacters: async (input) =>
@@ -634,7 +634,7 @@ describe('targeted invalidation equals a full reprojection', () => {
         expect(result?.database.modules[0].description).toBe('Edited by retained editor')
     })
 
-    it('refreshes a nonresident changed ID without reading unchanged character or preset bodies', async () => {
+    it('refreshes a nonresident changed ID without reading unchanged character or preset bodies, keeping one read meanwhile', async () => {
         const model = newModel()
         const options = {
             selectedCharacterId: 'char-a', selectedConversationId: 'conv-a2',
@@ -644,7 +644,13 @@ describe('targeted invalidation equals a full reprojection', () => {
         characterOf(model, 'char-b')!.detail.name = 'Updated summary'
         model.revision++
         const reader = createReader(model)
-        const summary = vi.spyOn(reader, 'readCharacterSummary')
+        const readSummary = reader.readCharacterSummary.bind(reader)
+        // A preset a request applies has its body read while the characters are read.
+        const applied = { id: '1', name: 'Second', mainPrompt: 'second' } as unknown as botPreset
+        const summary = vi.spyOn(reader, 'readCharacterSummary').mockImplementation(async (id) => {
+            placeCatalogPresetBody(previous.botPresets, 1, applied)
+            return readSummary(id)
+        })
         const body = vi.spyOn(reader, 'readCharacter')
         const conversations = vi.spyOn(reader, 'queryConversations')
         const messages = vi.spyOn(reader, 'readConversation')
@@ -669,6 +675,26 @@ describe('targeted invalidation equals a full reprojection', () => {
         expect(result!.database.botPresets[0]).toBe(previous.botPresets[0])
         expect(getCatalogPresetMetadata(result!.database.botPresets)?.catalogRevision).toBe(2)
         expect(getCatalogPresetMetadata(previous.botPresets)?.catalogRevision).toBe(1)
+        // The reader names presets by their configured index.
+        expect(isCatalogPresetLoaded(result!.database.botPresets, String(previous.botPresetsId))).toBe(true)
+        expect(result!.database.botPresets[1]).toBe(applied)
+        expect(isCatalogPresetLoaded(result!.database.botPresets, '1')).toBe(true)
+    })
+
+    it.each([['preset-b', 'B'], ['preset-elsewhere', 'C']])('keeps the selection the root names when a committed order moves the presets (%s)', async (selection, selected) => {
+        const model = newModel()
+        model.presets = ['A', 'B', 'C'].map((name) => ({ id: `preset-${name.toLowerCase()}`, name, body: name }))
+        model.root.botPresetsId = selection
+        const options = { selectedCharacterId: null, selectedConversationId: null, activeCharacterIds: new Set<string>() }
+        const previous = await projectPinnedScalableWorkingSet(createReader(model), options)
+        model.presets = [model.presets[2], model.presets[0], model.presets[1]]
+        model.revision++
+        // The native store records an order change as a change of every preset, not of the root.
+        const keys = model.presets.map((preset) => ({ kind: 'preset' as const, key1: preset.id!, key2: '' }))
+        const result = await applyTargetedWorkingSetInvalidation(previous, keys, createReader(model), options)
+        const full = await projectPinnedScalableWorkingSet(createReader(model), options)
+        expect(full.botPresets[full.botPresetsId]).toMatchObject({ name: selected, body: selected })
+        expect(liftHiddenState(result!.database)).toEqual(liftHiddenState(full))
     })
 
     it('reprojects only the root when a committed change set contains no character or preset changes', async () => {

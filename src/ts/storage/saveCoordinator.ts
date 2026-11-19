@@ -3569,6 +3569,8 @@ export class SaveCoordinator {
             }
             this.dependencies.onLocalRevision?.(replaced.revision)
             this.dependencies.replaceDatabase(candidate)
+            // The identity mirrors the installed working set derives belong to its baseline.
+            this.rootBaseline = this.capture().rootCanonical
             // Projection may select a different character when the old selection is absent.
             // Baseline the committed candidate for that selection, never the mutable live view.
             this.setCharacterBaseline(this.captureDatabase(candidate))
@@ -5297,6 +5299,9 @@ export class SaveCoordinator {
         for (const preset of presetRecords) {
             if (preset['id']) this.presetRecordBaselines.set(preset['id'] as string, canonicalClone(preset))
         }
+        // A summarized preset keeps no baseline, so reading its body later compares with the stored body.
+        const resident = new Set((this.dependencies.capturePresetRecords?.() ?? []).map((value) => value['id']))
+        for (const id of this.presetRecordBaselines.keys()) if (!resident.has(id)) this.presetRecordBaselines.delete(id)
         for (const character of characters) this.materializedBaselines.set(character.chaId, captureMaterializedCharacter(character))
         const selected = this.dependencies.captureSelectedCharacter()
         const persisted = characters.find((value) => value.chaId === selected?.chaId)
