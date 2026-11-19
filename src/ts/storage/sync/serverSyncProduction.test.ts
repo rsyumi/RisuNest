@@ -487,7 +487,8 @@ describe('production server LWW composition', () => {
         expect(f.transport?.heldForCommittedRestore?.()).toBe(false)
     })
 
-    it('reattaches a restored binding without automatic pull, push or hydration until resumed', async () => {
+    it.each(['a binding resume', 'Sync now', 'a new device binding'] as const)('reattaches a restored binding without automatic pull, push or hydration until %s', async resume => {
+        f.os = 'android'
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()
         visible(true); await f.transport!.resumeBinding(bindingContext()); await settle()
         await f.transport!.fenceOldJobs(bindingContext())
@@ -495,11 +496,23 @@ describe('production server LWW composition', () => {
         f.invoke.mockClear()
         await f.transport!.resumeBinding({...bindingContext(), holdAutomaticSync: true})
         expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
+        // Returns to the app and a finished backup leave it stopped.
+        visible(false); visible(true)
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', { detail: { reason: 'start' } }))
+        production.resumeServerSyncAfterBackup()
         await vi.advanceTimersByTimeAsync(60_000)
         expect(f.invoke.mock.calls.some(([command]) => ['server_sync_lww_pull', 'server_sync_lww_push', 'server_sync_lww_hydrate'].includes(command))).toBe(false)
-        await f.transport!.resumeBinding(bindingContext())
+        if (resume === 'Sync now') {
+            const answer = f.invoke.getMockImplementation()!
+            f.invoke.mockImplementation(async (command: string, args?: unknown) => command === 'pds_lww_binding_state' ? bindingContext().state : answer(command, args))
+            await production.retryServerSync()
+        }
+        else if (resume === 'a new device binding') await f.transport!.resumeNewDeviceBinding!({ authorizationId: 'authorization', writerId: 'writer' }, { revision: 1, writerId: 'writer', bindingAuthority: '0' }, bindingContext())
+        else await f.transport!.resumeBinding(bindingContext())
         expect(f.transport?.heldForCommittedRestore?.()).toBe(false)
-        await settle()
+        // Routine sync runs again from then on.
+        visible(false); await settle(); f.invoke.mockClear()
+        visible(true); await settle()
         expect(pullCalls()).toBeGreaterThan(0)
     })
     it.each(['module.bin', 'character.charx'])('waits for external assets with both sync adapters installed before importing %s', async name => {
