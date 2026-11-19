@@ -2166,10 +2166,7 @@ async function applyPresetBody(db: Database, id: string, apply: () => void, sour
     })
 }
 
-export async function activatePresetOverride(index: number | null): Promise<void> {
-    // The index names a preset in the library as it is now; it can move while awaiting.
-    const id = index === null ? null : getDatabase().botPresets[index]?.id
-    if (id !== null && !id) throw new Error('Preset was not found')
+export async function activatePresetOverride(id: string | null): Promise<void> {
     const runtime = await import('./persistentDataRuntime.svelte')
     await runtime.flushPendingData('preset-chain')
     const db = getDatabase()
@@ -2177,8 +2174,9 @@ export async function activatePresetOverride(index: number | null): Promise<void
         setEffectivePresetOverride(null, db)
         return
     }
+    if (!db.botPresets.some(preset => preset?.id === id)) throw new Error('Preset was not found')
     // A replacement during the read applies the preset as the new library holds it.
-    if (!await applyPresetBody(db, id, () => setEffectivePresetOverride(id, db))) return activatePresetOverride(getDatabase().botPresets.findIndex(preset => preset?.id === id))
+    if (!await applyPresetBody(db, id, () => setEffectivePresetOverride(id, db))) return activatePresetOverride(id)
 }
 
 /** The preset ID a conversation binds when it names a preset in the library; summary stubs carry no binding. */

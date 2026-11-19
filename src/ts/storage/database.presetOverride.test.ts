@@ -38,6 +38,7 @@ import { derivePersistentIdentityMirrors } from './persistentIdentityHooks'
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { getEffectivePresetOverride, isLoadedPreset } from './effectiveIdentityState'
 import { createPresetCatalogWorkingSetFromValues } from './workingSetCatalog'
+import { activatePresetChainForRequest } from '../process/presetChain'
 
 function presetDatabase(): Database {
     const database = normalizeDatabaseDefaults({} as Database)
@@ -78,7 +79,7 @@ beforeEach(() => {
 })
 
 describe('preset chain override activation', () => {
-    it('activates the preset the index named when the library changes during the flush', async () => {
+    it('activates the named preset when the library changes during the flush', async () => {
         summarizePresetB()
         const added = { ...structuredClone(stored.get('preset-a')!), id: 'preset-c', name: 'Preset C', mainPrompt: 'Prompt C' }
         stored.set(added.id, added)
@@ -88,9 +89,24 @@ describe('preset chain override activation', () => {
             database.botPresetsId = 1
         })
 
-        await activatePresetOverride(1)
+        await activatePresetOverride('preset-b')
 
         expect(runtime.readPreset).toHaveBeenCalledExactlyOnceWith('preset-b')
+        expect(getEffectivePresetId()).toBe('preset-b')
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+    })
+
+    it('activates the preset the chain named when a library in another order replaces this one first', async () => {
+        getDatabase().presetChain = 'Preset B'
+
+        await activatePresetChainForRequest(getDatabase(), activatePresetOverride, () => 0, vi.fn(), async () => {
+            const reordered = presetDatabase()
+            reordered.botPresets.reverse()
+            reordered.botPresetsId = 1
+            setDatabase(reordered)
+            return false
+        })
+
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
@@ -99,7 +115,7 @@ describe('preset chain override activation', () => {
         summarizePresetB()
         expect(isLoadedPreset(getDatabase(), 'preset-b')).toBe(false)
 
-        await activatePresetOverride(1)
+        await activatePresetOverride('preset-b')
 
         expect(getDatabase().botPresets[1]).toEqual(stored.get('preset-b'))
         expect(getEffectivePresetId()).toBe('preset-b')
@@ -130,19 +146,19 @@ describe('preset chain override activation', () => {
     })
 
     it('rejects a missing preset without changing the override', async () => {
-        await expect(activatePresetOverride(5)).rejects.toThrow('Preset was not found')
+        await expect(activatePresetOverride('preset-missing')).rejects.toThrow('Preset was not found')
         expect(runtime.readPreset).not.toHaveBeenCalled()
 
         const presetB = stored.get('preset-b')!
         stored.delete('preset-b')
         summarizePresetB()
-        await expect(activatePresetOverride(1)).rejects.toThrow('Preset was not found')
+        await expect(activatePresetOverride('preset-b')).rejects.toThrow('Preset was not found')
 
         stored.set('preset-b', presetB)
         runtime.flushPendingData.mockImplementation(async () => {
             getDatabase().botPresets.splice(1, 1)
         })
-        await expect(activatePresetOverride(1)).rejects.toThrow('Preset was not found')
+        await expect(activatePresetOverride('preset-b')).rejects.toThrow('Preset was not found')
 
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
@@ -285,7 +301,7 @@ describe('conversation preset binding', () => {
             await read.promise
             return previous
         })
-        const activation = path === 'chain' ? activatePresetOverride(1)
+        const activation = path === 'chain' ? activatePresetOverride('preset-b')
             : activateRequestPresetBinding({ characterId: 'character', conversationId: 'target' })
         // A held body needs no read, so the library is replaced before the activation resumes.
         if (summary) await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
