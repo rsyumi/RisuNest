@@ -554,7 +554,7 @@ internal fun replayLegacyOpenedFiles(directory: File, handedOff: Set<String>): L
 internal fun copyLegacyOpenedSources(
   directory: File,
   sources: List<SafInputSource>,
-  claim: (String) -> Boolean = { true },
+  claim: (String) -> Boolean,
   publisher: SafAtomicPublisher = AndroidSafAtomicPublisher,
 ): List<OpenedFileEntry> {
   if (sources.isEmpty()) return emptyList()
@@ -2665,24 +2665,33 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     openedIntent: Intent? = intent,
   ) {
     if (uris.isEmpty()) return
+    val reservation = OpenedFileReservation(deliveredLegacyPaths, deliveredSpoolTokens)
     safScope.launch {
+      var delivered = false
       try {
         val openedFiles = withContext(Dispatchers.IO) {
-          copyLegacyOpenedFiles(uris, openedIntent?.action)
+          copyLegacyOpenedFiles(uris, openedIntent?.action, reservation::reservePath)
         }
         if (openedFiles.all { it is OpenedFileEntry.Copied }) markOpenedIntentStaged(openedIntent, uris)
         else Toast.makeText(this@MainActivity, R.string.opened_file_prepare_failed, Toast.LENGTH_LONG).show()
         if (openedFiles.isEmpty()) return@launch
         ready.await()
-        if (lifecycleWebView === webView) deliverLegacyOpenedFiles(webView, openedFiles)
+        if (lifecycleWebView !== webView) return@launch
+        deliverLegacyOpenedFiles(webView, openedFiles, reservation::ownsPath)
+        delivered = true
       } finally {
+        if (!delivered) reservation.release()
         releaseOpenedIntentClaim(openedIntent, uris)
       }
     }
   }
 
-  private suspend fun deliverLegacyOpenedFiles(webView: WebView, files: List<OpenedFileEntry>) {
-    val fresh = markLegacyOpenedFilesDelivered(files)
+  private suspend fun deliverLegacyOpenedFiles(
+    webView: WebView,
+    files: List<OpenedFileEntry>,
+    owned: (String) -> Boolean = deliveredLegacyPaths::add,
+  ) {
+    val fresh = markLegacyOpenedFilesDelivered(files, owned)
     if (fresh.isNotEmpty() && lifecycleWebView === webView) {
       webView.evaluateJavascript(openedFilesEventScript(fresh), null)
     }
@@ -2694,7 +2703,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
    */
   private suspend fun markLegacyOpenedFilesDelivered(
     files: List<OpenedFileEntry>,
-    owned: (String) -> Boolean = deliveredLegacyPaths::add,
+    owned: (String) -> Boolean,
   ): List<OpenedFileEntry> {
     val fresh = files.filter { it !is OpenedFileEntry.Copied || owned(it.path) }
     // An unmarked file is still delivered; at worst it is offered once more after a restart.
@@ -2718,7 +2727,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private fun copyLegacyOpenedFiles(
     uris: List<Uri>,
     action: String?,
-    claim: (String) -> Boolean = { true },
+    claim: (String) -> Boolean,
   ): List<OpenedFileEntry> = copyLegacyOpenedSources(File(cacheDir, "opened_files"), uris.map { uri ->
     val displayName = runCatching { resolveLegacyDisplayName(uri) }
       .getOrElse { sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") }
