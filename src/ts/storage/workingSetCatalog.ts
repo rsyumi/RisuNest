@@ -530,7 +530,6 @@ export async function projectPinnedScalableWorkingSet(
     const root = await reader.readRoot()
     assertPinnedRevision(reader.revision, root.revision, 'Root')
     const rootValue = options.prepareRoot ? await options.prepareRoot(root.value) : root.value
-    const presets = await readPinnedActivePreset(reader, rootValue.botPresetsId)
     const residentIds = new Set(options.activeCharacterIds)
     if (options.selectedCharacterId) residentIds.add(options.selectedCharacterId)
     let selectedDetail: CharacterDetail | null = null
@@ -576,6 +575,8 @@ export async function projectPinnedScalableWorkingSet(
             : createPinnedDetailOnlyCharacter(summary, detail))
     }
 
+    // Read last, so a preset applied while the characters were read stays loaded.
+    const presets = await readPinnedActivePreset(reader, rootValue.botPresetsId)
     return projectSelectionIndexes({
         ...rootValue,
         pluginCustomStorage: {},

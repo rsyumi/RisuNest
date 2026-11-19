@@ -170,20 +170,6 @@ export async function applyTargetedWorkingSetInvalidation(
         rootValue = options.prepareRoot ? await options.prepareRoot(root.value) : root.value
     }
 
-    const botPresetsId = rootValue?.botPresetsId ?? previous.botPresetsId
-    const selectedPresetIndex = typeof botPresetsId === 'string'
-        ? previous.botPresets.findIndex((preset) => preset?.['id'] === botPresetsId)
-        : botPresetsId
-    let botPresets: Database['botPresets']
-    if (plan.presets || selectedPresetIndex !== previous.botPresetsId ||
-        (getCatalogPresetMetadata(previous.botPresets)?.activeConfiguredIndex ?? null) !==
-            (previous.botPresets[selectedPresetIndex] ? selectedPresetIndex : null)) {
-        const presets = await readPinnedActivePreset(reader, botPresetsId)
-        botPresets = createCatalogPresetWorkingSet(presets.catalog, presets.active, presets.resident)
-    } else {
-        botPresets = advanceCatalogPresetWorkingSetRevision(previous.botPresets, reader.revision)
-    }
-
     const selectedCharacterId = options.selectedCharacterId
     const residentIds = new Set(options.activeCharacterIds)
     let selectedSummary: CharacterSummary | null = null
@@ -283,6 +269,21 @@ export async function applyTargetedWorkingSetInvalidation(
         if (!positions.has(id)) characters.push(value)
     }
     characters.sort(compareCatalogPosition)
+
+    const botPresetsId = rootValue?.botPresetsId ?? previous.botPresetsId
+    const selectedPresetIndex = typeof botPresetsId === 'string'
+        ? previous.botPresets.findIndex((preset) => preset?.['id'] === botPresetsId)
+        : botPresetsId
+    let botPresets: Database['botPresets']
+    // Read last, so a preset applied while the characters were read stays loaded.
+    if (plan.presets || selectedPresetIndex !== previous.botPresetsId ||
+        (getCatalogPresetMetadata(previous.botPresets)?.activeConfiguredIndex ?? null) !==
+            (previous.botPresets[selectedPresetIndex] ? selectedPresetIndex : null)) {
+        const presets = await readPinnedActivePreset(reader, botPresetsId)
+        botPresets = createCatalogPresetWorkingSet(presets.catalog, presets.active, presets.resident)
+    } else {
+        botPresets = advanceCatalogPresetWorkingSetRevision(previous.botPresets, reader.revision)
+    }
 
     const {
         characters: _characters,

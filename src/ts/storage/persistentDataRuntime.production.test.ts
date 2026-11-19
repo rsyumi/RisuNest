@@ -34,6 +34,7 @@ import {
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
     projectCompleteScalableWorkingSet,
+    projectPinnedScalableWorkingSet,
     projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
@@ -1194,6 +1195,35 @@ describe('preset chain override across a whole working-set replacement', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         doingChat.set(true)
         const replacement = await projectScalableWorkingSetAtRevision(store, revision, { selectedCharacterId: null })
+        createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
+        expect(getEffectivePresetId()).toBe('preset-b')
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+    })
+
+    it('keeps a conversation binding a request applied while the replacement was read', async () => {
+        const initial = presetDatabase()
+        const store = new IndexedDbPersistentDataStore(`binding-during-projection-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(initial)
+        setDatabase(projectCompleteScalableWorkingSet(initial, null, revision, new Set()))
+        selectedCharID.set(-1)
+        const lease = await store.acquireRevision(revision)
+        let reading!: () => void
+        const characterRead = new Promise<void>((resolve) => { reading = resolve })
+        let resume!: () => void
+        const resumed = new Promise<void>((resolve) => { resume = resolve })
+        // The projection waits on its character read while the request applies its binding.
+        const reader = new Proxy(lease, { get: (target, key) => key === 'queryCharacters'
+            ? async (...args: Parameters<typeof lease.queryCharacters>) => { reading(); await resumed; return target.queryCharacters(...args) }
+            : Reflect.get(target, key) })
+        const projection = projectPinnedScalableWorkingSet(reader, { selectedCharacterId: null })
+        await characterRead
+        doingChat.set(true)
+        await carryPresetBinding('preset-b', {store, withPausedPersistentWrites: (_reason, operation) => operation({revision, mutationGeneration: 0})})
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        resume()
+        const replacement = await projection
+        await lease.release()
         createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')

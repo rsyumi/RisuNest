@@ -14,7 +14,7 @@ import {
     TARGETED_INVALIDATION_KEY_LIMIT,
     type TargetedWorkingSetInvalidationOptions,
 } from './targetedWorkingSetInvalidation'
-import { getCatalogPresetMetadata, isCatalogPresetLoaded, projectPinnedScalableWorkingSet } from './workingSetCatalog'
+import { getCatalogPresetMetadata, isCatalogPresetLoaded, placeCatalogPresetBody, projectPinnedScalableWorkingSet } from './workingSetCatalog'
 
 vi.mock('./database.svelte', () => ({
     getDatabase: () => {
@@ -634,7 +634,7 @@ describe('targeted invalidation equals a full reprojection', () => {
         expect(result?.database.modules[0].description).toBe('Edited by retained editor')
     })
 
-    it('refreshes a nonresident changed ID without reading unchanged character or preset bodies', async () => {
+    it('refreshes a nonresident changed ID without reading unchanged character or preset bodies, keeping one read meanwhile', async () => {
         const model = newModel()
         const options = {
             selectedCharacterId: 'char-a', selectedConversationId: 'conv-a2',
@@ -644,7 +644,13 @@ describe('targeted invalidation equals a full reprojection', () => {
         characterOf(model, 'char-b')!.detail.name = 'Updated summary'
         model.revision++
         const reader = createReader(model)
-        const summary = vi.spyOn(reader, 'readCharacterSummary')
+        const readSummary = reader.readCharacterSummary.bind(reader)
+        // A preset a request applies has its body read while the characters are read.
+        const applied = { id: '1', name: 'Second', mainPrompt: 'second' } as unknown as botPreset
+        const summary = vi.spyOn(reader, 'readCharacterSummary').mockImplementation(async (id) => {
+            placeCatalogPresetBody(previous.botPresets, 1, applied)
+            return readSummary(id)
+        })
         const body = vi.spyOn(reader, 'readCharacter')
         const conversations = vi.spyOn(reader, 'queryConversations')
         const messages = vi.spyOn(reader, 'readConversation')
@@ -671,6 +677,8 @@ describe('targeted invalidation equals a full reprojection', () => {
         expect(getCatalogPresetMetadata(previous.botPresets)?.catalogRevision).toBe(1)
         // The reader names presets by their configured index.
         expect(isCatalogPresetLoaded(result!.database.botPresets, String(previous.botPresetsId))).toBe(true)
+        expect(result!.database.botPresets[1]).toBe(applied)
+        expect(isCatalogPresetLoaded(result!.database.botPresets, '1')).toBe(true)
     })
 
     it('reprojects only the root when a committed change set contains no character or preset changes', async () => {
