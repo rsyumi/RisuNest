@@ -42,6 +42,7 @@ import { canonicalJson, PersistentMutationFencedError, SaveCoordinator, type Per
 import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { prepareUpstreamImport } from './importedIdentity'
+import { preparePersistentRootForWorkingSet } from './databasePreparation'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { clearStreamingConversation, setStreamingConversation } from './streamingConversationRegistry'
@@ -1881,7 +1882,7 @@ describe('received preset selection', () => {
         selectedCharID.set(-1)
         const saveFailures: unknown[] = []
         const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value,
-            onLocalSaveFailure: (error) => { if (error !== null) saveFailures.push(error) }})
+            prepareRoot: (root) => preparePersistentRootForWorkingSet(root), onLocalSaveFailure: (error) => { if (error !== null) saveFailures.push(error) }})
         await runtime.initializeActiveWorkingSet(getDatabase())
         getDatabase().classicMaxWidth = true
         await runtime.flushPendingDataLocally('received-preset-selection-settle')

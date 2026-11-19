@@ -250,12 +250,12 @@ export function createCatalogPresetWorkingSet(
 }
 
 /**
- * The summary of the preset `selection` names. A selection naming no preset, or none, resolves
- * to the first, as the working set's index does.
+ * The summary of the preset `selection` names. An ID naming no preset resolves to the first,
+ * as the working set's index does.
  */
 export function selectedPresetSummary(catalog: PresetCatalog, selection: number | string | undefined): PresetSummary | undefined {
-    const field = typeof selection === 'string' ? 'id' : 'configuredIndex'
-    return catalog.items.find((summary) => summary[field] === selection) ?? catalog.items[0]
+    if (typeof selection !== 'string') return catalog.items.find((summary) => summary.configuredIndex === selection)
+    return catalog.items.find((summary) => summary.id === selection) ?? catalog.items[0]
 }
 
 /** A catalog working set of complete preset values, holding the bodies of the selection and of the presets applied in its place. */
