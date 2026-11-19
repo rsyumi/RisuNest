@@ -1887,10 +1887,18 @@ describe('received preset selection', () => {
         return mutations
     }
 
-    it.each([false, true])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s)', async (catalog) => {
+    it.each([[false, false], [true, false], [true, true]])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s, refresh=%s)', async (catalog, refresh) => {
         const {store, runtime, saveFailures} = await presetRuntime(catalog)
         const selection = {key: JSON.stringify(['root', 'botPresetsId']), type: 'set' as const, value: 'preset-elsewhere'}
-        await receiveCommit(store, runtime, {unitMutations: [selection]}, [selection.key])
+        if (refresh) {
+            const {revision} = await store.commit({expectedRevision: runtime.revision, unitMutations: [selection]})
+            const fence = await runtime.acquireCommittedWorkingSetRefreshFence()
+            try {
+                await expect(fence.refreshCommittedWorkingSet(revision)).resolves.toMatchObject({projection: 'applied'})
+            } finally {
+                fence.release()
+            }
+        } else await receiveCommit(store, runtime, {unitMutations: [selection]}, [selection.key])
         expect(getDatabase().botPresets[getDatabase().botPresetsId]).toMatchObject({id: 'preset-a', mainPrompt: 'Prompt A'})
         expect(getDatabase().mainPrompt).toBe('Prompt A')
         const mutations = await savedMutations(store, runtime)

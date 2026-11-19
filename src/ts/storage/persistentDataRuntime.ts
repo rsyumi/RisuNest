@@ -939,14 +939,13 @@ export function createPersistentDataRuntime(
                 activeCharacterIds,
                 options?.forceScalableProjection ?? true,
             )
-            let installed = projected.database
             if (activatedLibraryGuard) {
-                // The activated library has no resident character to keep selected,
-                // and its derived identity mirrors belong to the installed baseline.
+                // The activated library has no resident character to keep selected.
                 dependencies.state.restoreSelection?.(null, null)
                 dependencies.state.afterRemoteApply?.()
-                installed = dependencies.state.captureWorkingSetDatabase?.() ?? installed
             }
+            // The identity mirrors the installed working set derives belong to its baseline.
+            const installed = dependencies.state.captureWorkingSetDatabase?.() ?? projected.database
             workingSet.installCommittedWorkingSet(installed, revision, projected.windowedMetadata)
             applyInstalledRootChanges(rootBefore)
             deferredContentPending = projected.deferred
