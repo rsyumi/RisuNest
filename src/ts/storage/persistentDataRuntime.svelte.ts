@@ -45,6 +45,7 @@ import type {
     PersistentMutationToken,
     PersistentSelectedConversation,
 } from './saveCoordinator'
+import { PersistentMutationFencedError } from './saveCoordinator'
 import type { CharacterActivationOptions } from './activeWorkingSet.svelte'
 import { notifyLocalPersistentRevision } from './persistentRevisionEvents'
 import { retryCommittedWorkingSetRefreshWithContinuation } from './committedWorkingSetContinuation'
@@ -228,7 +229,10 @@ export function createProductionStateAdapter(options: {
             for (const carried of [
                 presetOverride && carryPresetOverride(presetOverride, options.presets?.()),
                 presetBinding && carryPresetBinding(presetBinding, options.presets?.()),
-            ]) if (carried) carried.catch((error) => productionConfiguration.onBackgroundError?.(error))
+            ]) if (carried) carried.catch((error) => {
+                // A replacement made while writes are fenced cannot read a summarized preset's body.
+                if (!(error instanceof PersistentMutationFencedError)) productionConfiguration.onBackgroundError?.(error)
+            })
         },
         publishPresetWorkingSet({ revision, root, presets }) {
             const database = getDatabase()

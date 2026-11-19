@@ -19,7 +19,7 @@ import {
     registerPluginStorageLifecycle,
 } from '../plugins/pluginStorageStore'
 import { getV2PluginAPIs } from '../plugins/plugins.svelte'
-import type { Chat, Database } from './database.svelte'
+import type { Chat, Database, PresetSource } from './database.svelte'
 import type { PersistentDataStore, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
 import { createStoreStub } from './persistentDataStore.testSupport'
 import { applyConversationPresetBinding, captureCurrentPreset, carryPresetBinding, fillRootFieldDefaults, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
@@ -38,7 +38,7 @@ import {
     projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
 import { workingSetResidency } from './workingSetResidency'
-import { canonicalJson, SaveCoordinator, type PersistentCharacterAssetOwnerHead } from './saveCoordinator'
+import { canonicalJson, PersistentMutationFencedError, SaveCoordinator, type PersistentCharacterAssetOwnerHead } from './saveCoordinator'
 import { capturePersistentRoot, createPersistentDataRuntime } from './persistentDataRuntime'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
@@ -1182,6 +1182,38 @@ describe('preset chain override across a whole working-set replacement', () => {
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         expect(getDatabase().botPresetsId).toBe(0)
+    })
+
+    it.each([false, true])('reads the body of a binding the replacement holds as a summary, reporting no fenced read (fenced=%s)', async (fenced) => {
+        const initial = presetDatabase()
+        const store = new IndexedDbPersistentDataStore(`binding-carry-read-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(initial)
+        setDatabase(structuredClone(initial))
+        selectedCharID.set(-1)
+        // Projected before the request applied its binding.
+        const replacement = projectCompleteScalableWorkingSet(initial, null, revision, new Set())
+        await applyConversationPresetBinding(getDatabase(), { id: 'chat', promptPresetId: 'preset-b' } as Chat)
+        doingChat.set(true)
+        const backgroundErrors: unknown[] = []
+        configurePersistentDataRuntime({ onBackgroundError: (error) => { backgroundErrors.push(error) } })
+        let refused = false
+        const presets: PresetSource = { store, withPausedPersistentWrites: fenced
+            ? () => { refused = true; throw new PersistentMutationFencedError() }
+            : (_reason, operation) => operation({ revision, mutationGeneration: 0 }) }
+        try {
+            createProductionStateAdapter({ presets: () => presets }).replaceDatabase(replacement, new Set(), false)
+            if (fenced) {
+                expect(refused).toBe(true)
+                await new Promise((resolve) => setTimeout(resolve, 0))
+            } else {
+                await vi.waitFor(() => expect(getEffectivePresetId()).toBe('preset-b'))
+                expect(getDatabase().mainPrompt).toBe('Prompt B')
+            }
+            expect(backgroundErrors).toEqual([])
+        } finally {
+            configurePersistentDataRuntime({ onBackgroundError: undefined })
+        }
     })
 
     it('keeps the applied conversation binding across a working set projected from the store', async () => {
