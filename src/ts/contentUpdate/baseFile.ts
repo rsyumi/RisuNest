@@ -159,6 +159,8 @@ export async function readUpdateBaseFile(kind: 'character' | 'module', file: { n
         const files = unzipCharx(file.data)
         if (!files['card.json']) throw new UnsupportedUpdateBaseFileError()
         card = JSON.parse(text(files['card.json']))
+        // The CHARX importer takes a V3 card only.
+        if (card?.spec !== 'chara_card_v3') throw new UnsupportedUpdateBaseFileError()
         if (files['module.risum']) module = await moduleFromRisum(files['module.risum'])
     }
     if (kind === 'character') {

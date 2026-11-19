@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { language } from 'src/lang'
 import type { RisuModule } from '../process/modules'
 import {
     CHARACTER_UPDATE,
@@ -155,9 +156,19 @@ describe('applyUpdate', () => {
         expect(merge(both, { customscript: 'theirs' })).toEqual(['A', 'C', 'B'])
         // Both added the same entry, in different places, whether or not one side also moved others.
         expect(plan(['A', 'B'], ['A', 'X', 'B'], ['X', 'A', 'B']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
+        expect(plan(['A', 'B'], ['X', 'A', 'B'], ['A', 'X', 'B']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
         expect(plan(['A', 'B', 'C', 'D'], ['A', 'X', 'B', 'C', 'D'], ['X', 'A', 'B', 'D', 'C']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
+        expect(plan(['A', 'B'], ['A', 'X', 'B'], ['B', 'X', 'A']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
+        // In the same place, it leaves the base to settle the others.
+        const alike = plan(['A', 'B', 'C', 'D'], ['A', 'X', 'B', 'C', 'D'], ['A', 'X', 'B', 'D', 'C'])
+        expect(alike.plan.items).toEqual([])
+        expect(merge(alike)).toEqual(['A', 'X', 'B', 'D', 'C'])
         // Without a base, who reordered it is unknown.
         expect(planUpdate(CHARACTER_UPDATE, both.m, both.t, null).items).toMatchObject([{ id: 'customscript', order: true, status: 'differs', choice: null }])
+        // A script whose name another one has, on either side, shows its type there.
+        const typed = (type: string) => ({ comment: 'T', type, in: type, out: '' })
+        const typedPlan = planUpdate(CHARACTER_UPDATE, { name: 'Luna', customscript: [typed('editinput'), regex('A'), regex('B')] } as any, { name: 'Luna', customscript: [typed('editoutput'), regex('B'), regex('A')] } as any, null)
+        expect(typedPlan.items.find((item) => item.order)).toMatchObject({ mine: [`T (${language.editInput})`, 'A', 'B'], theirs: [`T (${language.editOutput})`, 'B', 'A'] })
     })
 
     it('tells apart assets that share a name from one named like a second copy', () => {

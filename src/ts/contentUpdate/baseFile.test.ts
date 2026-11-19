@@ -138,5 +138,6 @@ describe('readUpdateBaseFile', () => {
         await expect(readUpdateBaseFile('character', { name: 'Lore.risum', data: await risum({ name: 'Lore' }) })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
         await expect(readUpdateBaseFile('character', { name: 'notes.txt', data: encode('x') })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
         await expect(readUpdateBaseFile('character', { name: 'old.json', data: encode({ spec: 'other' }) })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
+        await expect(readUpdateBaseFile('character', { name: 'empty.charx', data: zipSync({ 'card.json': encode({}) }) })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
     })
 })

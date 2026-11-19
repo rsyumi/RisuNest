@@ -1,12 +1,14 @@
 // Adapted from RisuBard (https://github.com/rpaddict/RisuBard, src/ts/characterUpdate.ts), GPL-3.0.
 
+import { language } from 'src/lang'
 import type { loreBook } from '../storage/database.svelte'
 import type { RisuModule } from '../process/modules'
 
 // Finds an installed character or module that an import is a new version of,
 // and merges the two against the import as it was first installed (the base)
-// so that edits the user made are kept. Pure functions only: the dialog and
-// storage live in flow.svelte.ts.
+// so that edits the user made are kept. Pure functions only, apart from the
+// script type names an order shows: the dialog and storage live in
+// flow.svelte.ts.
 
 /** Character extension holding the asset key of the version as installed. */
 export const UPDATE_BASE_EXTENSION_KEY = 'risunestUpdateBase'
@@ -247,8 +249,37 @@ function reordered(list: Map<string, unknown>, other: Map<string, unknown>): boo
     return false
 }
 
-/** Entry names in list order, shown for the order of a list itself. */
-const entryNames = (list: Map<string, unknown>) => [...list.values()].map((entry: any) => String(entry?.comment || entry?.name || entry?.key || entry?.in || entry?.[0] || ''))
+/** Whether an entry both lists have and the base does not comes before a shared entry in one and after it in the other. */
+function addedApart(mine: Map<string, unknown>, theirs: Map<string, unknown>, base: Map<string, unknown>): boolean {
+    const at = new Map([...theirs.keys()].map((key, index) => [key, index]))
+    let last = -1, lastAdded = -1
+    for (const key of mine.keys()) {
+        const index = at.get(key)
+        if (index === undefined) continue
+        if (index < (base.has(key) ? lastAdded : last)) return true
+        last = Math.max(last, index)
+        if (!base.has(key)) lastAdded = Math.max(lastAdded, index)
+    }
+    return false
+}
+
+// Script types, by the label the script editors show for them.
+const scriptTypes = {
+    editinput: 'editInput', editoutput: 'editOutput', editprocess: 'editProcess', editdisplay: 'editDisplay', edittrans: 'editTranslationDisplay', disabled: 'disabled',
+    start: 'triggerStart', output: 'triggerOutput', input: 'triggerInput', manual: 'triggerManual', display: 'editDisplay', request: 'editProcess',
+} satisfies Record<string, keyof typeof language>
+const entryName = (entry: any) => String(entry?.comment || entry?.name || entry?.key || entry?.in || entry?.[0] || '')
+
+/** Entry names in list order, one list per side, for the order of a list itself. A script whose name another entry has shows its type. */
+function entryNames(...lists: Map<string, unknown>[]): string[][] {
+    const keys = new Map<string, Set<string>>()
+    for (const list of lists) for (const [key, entry] of list) keys.set(entryName(entry), (keys.get(entryName(entry)) ?? new Set()).add(key))
+    return lists.map((list) => [...list.values()].map((entry: any) => {
+        const name = entryName(entry)
+        const type = has(scriptTypes, String(entry?.type)) ? scriptTypes[entry.type as keyof typeof scriptTypes] : null
+        return type && keys.get(name)!.size > 1 ? `${name} (${language[type]})` : name
+    }))
+}
 
 /**
  * Compares the installed entity (mine), the import (theirs) and the import as
@@ -276,12 +307,13 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
             const read = keyOf ? (value: unknown) => keyed(keyOf, value) : mapEntries
             const mineMap = read(m), theirsMap = read(t), baseMap = read(b)
             // The entries both have come in another order. The base settles it only when one side alone moved
-            // them, and only if it has them all: an entry both added has no place there.
+            // them, and not when an entry both added, which it has no place for, sits apart.
             if (keyOf && reordered(mineMap, theirsMap)) {
-                const settled = known && [...mineMap.keys()].every((key) => baseMap.has(key) || !theirsMap.has(key))
+                const settled = known && !addedApart(mineMap, theirsMap, baseMap)
                 if (settled && !reordered(theirsMap, baseMap)) keepOrder.push(field)
                 else if (!settled || reordered(mineMap, baseMap)) {
-                    items.push({ id: field, field, key: '', order: true, status: known ? 'conflict' : 'differs', mine: entryNames(mineMap), theirs: entryNames(theirsMap), base: entryNames(baseMap), baseKnown: known, choice: null })
+                    const [mineOrder, theirsOrder, baseOrder] = entryNames(mineMap, theirsMap, baseMap)
+                    items.push({ id: field, field, key: '', order: true, status: known ? 'conflict' : 'differs', mine: mineOrder, theirs: theirsOrder, base: baseOrder, baseKnown: known, choice: null })
                 }
             }
             for (const key of new Set([...theirsMap.keys(), ...mineMap.keys(), ...baseMap.keys()])) {
