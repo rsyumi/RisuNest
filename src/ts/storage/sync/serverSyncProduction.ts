@@ -116,7 +116,7 @@ const noteLocalChange = () => {
     if (foreground && !pendingHold) pendingHold = holdRoutineSync()
 }
 let heldForCommittedRestore = false
-// The hold outlives a restart for the binding it stopped, until the user resumes that binding.
+// The hold stays with the binding it stopped, through its resumes and restarts, until Sync now or a new device binding.
 const RESTORE_HOLD = 'risuNestServerSyncRestoreHold'
 async function saveRestoreHold(state?: BindingContext['state']): Promise<void> {
     const epoch = heldForCommittedRestore && state ? state.selectionEpoch : null
@@ -539,7 +539,8 @@ const transport: SyncBindingTransport = {
     },
     async resumeBinding(c) {
         try {
-            heldForCommittedRestore = c.holdAutomaticSync === true; context = c; adoptSchedulerAuthority(c)
+            heldForCommittedRestore = c.holdAutomaticSync === true || getDeviceMarkers().getItem(RESTORE_HOLD) === c.state.selectionEpoch
+            context = c; adoptSchedulerAuthority(c)
             activationPending = c
             await saveRestoreHold(c.state)
             try { await ensureActivated(c) }
@@ -713,14 +714,14 @@ export async function installServerSyncProduction({ resumeBound = true }: { resu
     const current = await invoke<BindingContext['state']>('pds_lww_binding_state')
     heldForCommittedRestore ||= current.target.kind === 'server' && getDeviceMarkers().getItem(RESTORE_HOLD) === current.selectionEpoch
     await saveRestoreHold(current)
-    if (!resumeBound || heldForCommittedRestore) return
+    if (!resumeBound) return
     if (current.target.kind === 'server' && status.configured) {
         try { await resumeCurrentServerBinding(current) }
         catch (value) {
             // A fenced binding that cannot reach its server keeps the local library usable until retry.
             if (!failures(value).every(failure => transientTransportFailure(failure) || settingsResolvedFailure(failure))) throw value
         }
-    } else if (current.target.kind === 'server') await completeInterruptedBinding()
+    } else if (current.target.kind === 'server' && !heldForCommittedRestore) await completeInterruptedBinding()
 }
 // The user already chose to connect, so a server still as empty as when it was inspected
 // is bound without asking again. Anything else waits for Connect in settings.
