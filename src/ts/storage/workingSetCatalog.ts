@@ -383,12 +383,16 @@ export async function readPinnedActivePreset(
         return { summary, value: preset.value }
     }
     const summary = selectedPresetSummary(catalog, configuredIndex)
-    const residentIds = new Set(getResidentPresetIds())
+    const active = summary ? await read(summary) : null
     const resident: ActiveCatalogPreset[] = []
-    for (const item of catalog.items) {
-        if (item !== summary && residentIds.has(item.id)) resident.push(await read(item))
+    // Reads until a pass adds none, so a preset applied during a read stays loaded too.
+    for (let added = true; added;) {
+        const ids = new Set(getResidentPresetIds())
+        const next = catalog.items.filter((item) => item !== summary && ids.has(item.id) && !resident.some((body) => body.summary === item))
+        for (const item of next) resident.push(await read(item))
+        added = next.length > 0
     }
-    return { catalog, active: summary ? await read(summary) : null, resident }
+    return { catalog, active, resident }
 }
 
 async function readPinnedPluginStorage(

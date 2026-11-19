@@ -22,7 +22,7 @@ import { getV2PluginAPIs } from '../plugins/plugins.svelte'
 import type { Chat, Database, PresetSource } from './database.svelte'
 import type { PersistentDataStore, PersistentUnitMutation, WorkingSetCommit } from './persistentDataStore'
 import { createStoreStub } from './persistentDataStore.testSupport'
-import { applyConversationPresetBinding, captureCurrentPreset, carryPresetBinding, fillRootFieldDefaults, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
+import { applyConversationPresetBinding, captureCurrentPreset, carryPresetBinding, carryPresetOverride, fillRootFieldDefaults, getDatabase, getEffectivePresetId, normalizeDatabaseDefaults, setDatabase, setDatabaseLite, setEffectivePresetOverride, setPreset } from './database.svelte'
 import { createPresetWorkingSetController } from './presetWorkingSetOperations'
 import { presetEditorDBState } from './presetEditor.svelte'
 import {
@@ -1233,26 +1233,34 @@ describe('preset chain override across a whole working-set replacement', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 
-    it('keeps a conversation binding a request applied while the replacement was read', async () => {
+    it.each([['queryCharacters', 'binding'], ['preset-a', 'binding'], ['preset-a', 'override'], ['preset-c', 'binding']] as const)('keeps the preset a request applied while the replacement was read (paused on %s, %s)', async (paused, applied) => {
         const initial = presetDatabase()
+        initial.botPresets.push({ ...structuredClone(initial.botPresets[0]), id: 'preset-c', name: 'Preset C', mainPrompt: 'Prompt C' })
         const store = new IndexedDbPersistentDataStore(`binding-during-projection-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
         await store.open()
         const { revision } = await store.replaceFromDatabase(initial)
         setDatabase(projectCompleteScalableWorkingSet(initial, null, revision, new Set()))
         selectedCharID.set(-1)
+        const source: PresetSource = {store, withPausedPersistentWrites: (_reason, operation) => operation({revision, mutationGeneration: 0})}
+        // The chain applied C before the replacement, so the projection reads it after the selection.
+        if (paused === 'preset-c') await carryPresetOverride('preset-c', source)
         const lease = await store.acquireRevision(revision)
         let reading!: () => void
         const characterRead = new Promise<void>((resolve) => { reading = resolve })
         let resume!: () => void
         const resumed = new Promise<void>((resolve) => { resume = resolve })
-        // The projection waits on its character read while the request applies its binding.
-        const reader = new Proxy(lease, { get: (target, key) => key === 'queryCharacters'
-            ? async (...args: Parameters<typeof lease.queryCharacters>) => { reading(); await resumed; return target.queryCharacters(...args) }
-            : Reflect.get(target, key) })
+        // The projection waits on a read while the request applies its preset.
+        const reader = new Proxy(lease, { get: (target, key, receiver) => {
+            const value = Reflect.get(target, key, receiver)
+            return key === 'queryCharacters' || key === 'readPreset' ? async (...args: unknown[]) => {
+                if (key === paused || args[0] === paused) { reading(); await resumed }
+                return value.apply(target, args)
+            } : value
+        } })
         const projection = projectPinnedScalableWorkingSet(reader, { selectedCharacterId: null })
         await characterRead
         doingChat.set(true)
-        await carryPresetBinding('preset-b', {store, withPausedPersistentWrites: (_reason, operation) => operation({revision, mutationGeneration: 0})})
+        await (applied === 'binding' ? carryPresetBinding : carryPresetOverride)('preset-b', source)
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         resume()
         const replacement = await projection
