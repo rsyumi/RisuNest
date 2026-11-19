@@ -249,10 +249,20 @@ export function createCatalogPresetWorkingSet(
     return presets
 }
 
+/**
+ * The summary of the preset `selection` names. An ID naming no preset resolves to the first,
+ * as the working set's index does.
+ */
+export function selectedPresetSummary(catalog: PresetCatalog, selection: number | string | undefined): PresetSummary | undefined {
+    if (typeof selection !== 'string') return catalog.items.find((summary) => summary.configuredIndex === selection)
+    return catalog.items.find((summary) => summary.id === selection) ?? catalog.items[0]
+}
+
+/** A catalog working set of complete preset values, holding the bodies of the selection and of the presets applied in its place. */
 export function createPresetCatalogWorkingSetFromValues(
     presets: Database['botPresets'],
     revision: number,
-    activeConfiguredIndex: number | string | undefined,
+    selection: number | string | undefined,
 ): Database['botPresets'] {
     const catalog: PresetCatalog = {
         revision,
@@ -263,9 +273,7 @@ export function createPresetCatalogWorkingSetFromValues(
             image: preset.image,
         })),
     }
-    const activeSummary = catalog.items.find(
-        (summary) => typeof activeConfiguredIndex === 'string' ? summary.id === activeConfiguredIndex : summary.configuredIndex === activeConfiguredIndex,
-    )
+    const activeSummary = selectedPresetSummary(catalog, selection)
     const resident = new Set(getResidentPresetIds())
     const body = (summary: PresetSummary): ActiveCatalogPreset => ({ summary, value: { ...presets[summary.configuredIndex] } })
     return createCatalogPresetWorkingSet(
@@ -307,8 +315,10 @@ export function isCatalogPresetLoaded(presets: Database['botPresets'], id: strin
     return getCatalogPresetMetadata(presets)?.loaded.has(id) ?? true
 }
 
-export function markCatalogPresetLoaded(presets: Database['botPresets'], id: string): void {
-    getCatalogPresetMetadata(presets)?.loaded.add(id)
+/** Places a preset's stored body, a new object, in a working set. */
+export function placeCatalogPresetBody(presets: Database['botPresets'], index: number, value: Database['botPresets'][number]): void {
+    getCatalogPresetMetadata(presets)?.loaded.add(value.id!)
+    presets[index] = value
 }
 
 export function hasIncompletePersistentWorkingSet(
@@ -372,8 +382,7 @@ export async function readPinnedActivePreset(
         assertPinnedRevision(reader.revision, preset.revision, `Preset ${summary.id}`)
         return { summary, value: preset.value }
     }
-    const summary = catalog.items.find((candidate) =>
-        typeof configuredIndex === 'string' ? candidate.id === configuredIndex : candidate.configuredIndex === configuredIndex)
+    const summary = selectedPresetSummary(catalog, configuredIndex)
     const residentIds = new Set(getResidentPresetIds())
     const resident: ActiveCatalogPreset[] = []
     for (const item of catalog.items) {

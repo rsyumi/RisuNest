@@ -67,11 +67,9 @@ function boundConversation(db: Database, binding: ToggleBinding | undefined): Co
     return chat && !isConversationSummaryStub(chat) ? chat : undefined
 }
 
-// Catalog entries carry only their summary and the local fields normalization adds.
-const catalogPresetKeys = new Set(['id', 'name', 'image', 'localNetworkMode', 'localNetworkTimeoutSec'])
 /** Whether `preset`, an entry of `presets`, holds its stored body; a received field does not make a catalog summary one. */
 export const isLoadedPresetRecord = (presets: Database['botPresets'], preset: botPreset | undefined): boolean =>
-    !!preset && Object.keys(preset).some((key) => !catalogPresetKeys.has(key)) && isCatalogPresetLoaded(presets, preset.id!)
+    !!preset && isCatalogPresetLoaded(presets, preset.id!)
 export const isLoadedPreset = (db: Database, id: string | null | undefined): boolean =>
     isLoadedPresetRecord(db?.botPresets, id ? db?.botPresets?.find(preset => preset?.id === id) : undefined)
 

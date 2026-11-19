@@ -21,8 +21,8 @@ import type {
     WindowedConversationMutationController,
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
-import type { Chat, Database, botPreset, character, loreBook } from './database.svelte'
-import { carryPresetBinding, carryPresetOverride, fillRootFieldDefaults, getDatabase, loadSelectedPresetBody, setDatabase } from './database.svelte'
+import type { Chat, Database, character, loreBook } from './database.svelte'
+import { carryPresetBinding, carryPresetOverride, deriveEffectivePresetMirrors, fillRootFieldDefaults, getDatabase, setDatabase, type PresetSource } from './database.svelte'
 import { getEffectivePresetBinding, getEffectivePresetOverride, isLoadedPresetRecord } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
@@ -108,7 +108,8 @@ function prepareResidentCharacter(character: { globalLore?: loreBook[], chats: C
 }
 
 export function createProductionStateAdapter(options: {
-    readPreset?(id: string): Promise<{ value: botPreset } | null>
+    /** Reads a preset applied before a replacement that the replacement holds only as a summary. */
+    presets?(): PresetSource
 } = {}): PersistentDataRuntimeStateAdapter {
     const characterIndex = $derived.by(() => new Map(getDatabase().characters.map((value) => [value.chaId,value])))
     const residentIndex = $derived.by(() => new Map([...characterIndex].filter(([,value]) => !isWorkingSetCharacterStub(value))))
@@ -221,12 +222,13 @@ export function createProductionStateAdapter(options: {
                 selectedConversationId,
                 (index) => selectedCharID.set(index),
             )
+            // The selection may have fallen back to another preset, such as after a remote deletion.
+            deriveEffectivePresetMirrors(getDatabase())
             // A request reads the mirrors per streamed chunk, so its binding cannot wait for the chat lifecycle.
             for (const carried of [
-                presetOverride && carryPresetOverride(presetOverride, options.readPreset),
-                presetBinding && carryPresetBinding(presetBinding, options.readPreset),
+                presetOverride && carryPresetOverride(presetOverride, options.presets?.()),
+                presetBinding && carryPresetBinding(presetBinding, options.presets?.()),
             ]) if (carried) carried.catch((error) => productionConfiguration.onBackgroundError?.(error))
-            loadSelectedPresetBody(getDatabase(), options.readPreset)
         },
         publishPresetWorkingSet({ revision, root, presets }) {
             const database = getDatabase()
@@ -466,7 +468,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
         const store = getPersistentDataStore()
         productionRuntime = createPersistentDataRuntime({
             store,
-            state: createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }),
+            state: createProductionStateAdapter({ presets: () => productionRuntime! }),
             getOfficialPublisher: () => productionConfiguration.officialPublisher,
             onLocalRevision: (revision) => {
                 productionConfiguration.onLocalRevision?.(revision)

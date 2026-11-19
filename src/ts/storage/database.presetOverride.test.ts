@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const runtime = vi.hoisted(() => ({
     flushPendingData: vi.fn(async (_reason: string) => undefined),
     readPreset: vi.fn(async (_id: string): Promise<{ revision: number, value: unknown } | null> => null),
+    // Runs an operation where the runtime queues it behind every save and receive.
+    pausedWrites: vi.fn(async (operation: () => Promise<unknown>) => operation()),
     mutatePresets: vi.fn(),
 }))
 
@@ -11,7 +13,8 @@ vi.mock('./persistentDataRuntime.svelte', async (importOriginal) => ({
     ...await importOriginal<typeof import('./persistentDataRuntime.svelte')>(),
     flushPendingData: runtime.flushPendingData,
     mutatePersistentPresets: runtime.mutatePresets,
-    getPersistentDataRuntime: () => ({ store: { readPreset: runtime.readPreset } }),
+    getPersistentDataRuntime: () => ({ store: { readPreset: runtime.readPreset },
+        withPausedPersistentWrites: (_reason: string, operation: () => Promise<unknown>) => runtime.pausedWrites(operation) }),
 }))
 
 import { selectedCharID } from '../stores.svelte'
@@ -29,8 +32,10 @@ import {
     normalizeDatabaseDefaults,
     setDatabase,
     setEffectivePresetOverride,
+    type PresetSource,
 } from './database.svelte'
 import { derivePersistentIdentityMirrors } from './persistentIdentityHooks'
+import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 import { getEffectivePresetOverride, isLoadedPreset } from './effectiveIdentityState'
 import { createPresetCatalogWorkingSetFromValues } from './workingSetCatalog'
 
@@ -43,6 +48,12 @@ function presetDatabase(): Database {
     database.mainPrompt = 'Prompt A'
     database.personas[0].id = 'persona'
     return database
+}
+
+/** Holds preset B as a catalog summary whose body only the store keeps. */
+function summarizePresetB(database: Database = getDatabase()): void {
+    database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, database.botPresets[database.botPresetsId].id)
+    database.botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
 }
 
 let stored: Map<string, botPreset>
@@ -59,6 +70,7 @@ beforeEach(() => {
     setDatabase(database)
     selectedCharID.set(-1)
     runtime.flushPendingData.mockReset().mockResolvedValue(undefined)
+    runtime.pausedWrites.mockReset().mockImplementation((operation) => operation())
     runtime.readPreset.mockReset().mockImplementation(async (id) => {
         const value = stored.get(id)
         return value ? { revision: 1, value: structuredClone(value) } : null
@@ -67,7 +79,7 @@ beforeEach(() => {
 
 describe('preset chain override activation', () => {
     it('activates the preset the index named when the library changes during the flush', async () => {
-        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+        summarizePresetB()
         const added = { ...structuredClone(stored.get('preset-a')!), id: 'preset-c', name: 'Preset C', mainPrompt: 'Prompt C' }
         stored.set(added.id, added)
         runtime.flushPendingData.mockImplementation(async () => {
@@ -83,31 +95,8 @@ describe('preset chain override activation', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 
-    it('keeps a preset record loaded and edited while its stored value is read', async () => {
-        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
-        const read = deferred()
-        const readStored = runtime.readPreset.getMockImplementation()!
-        runtime.readPreset.mockImplementation(async (id) => {
-            await read.promise
-            return readStored(id)
-        })
-
-        const activation = activatePresetOverride(1)
-        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
-        getDatabase().botPresets[1] = { ...structuredClone(stored.get('preset-b')!), mainPrompt: 'Edited B' }
-        const record = getDatabase().botPresets[1]
-        expect(isLoadedPreset(getDatabase(), 'preset-b')).toBe(true)
-        read.resolve()
-        await activation
-
-        expect(getDatabase().botPresets[1]).toBe(record)
-        expect(record.mainPrompt).toBe('Edited B')
-        expect(getEffectivePresetId()).toBe('preset-b')
-        expect(getDatabase().mainPrompt).toBe('Edited B')
-    })
-
     it('installs the stored value when the record is still a catalog stub', async () => {
-        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+        summarizePresetB()
         expect(isLoadedPreset(getDatabase(), 'preset-b')).toBe(false)
 
         await activatePresetOverride(1)
@@ -129,71 +118,15 @@ describe('preset chain override activation', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt A')
     })
 
-    it('reads the body of a selection that fell back to a catalog summary before saving or applying it', async () => {
+    it('holds the first preset whole when the selection names a removed one, even with no preset fields', () => {
         const database = getDatabase()
-        // A selection removed on another device leaves the first preset selected as a summary.
-        database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, 'preset-removed')
-        database.mainPrompt = 'Removed prompt'
-        const read = deferred()
-        runtime.readPreset.mockImplementation(async (id) => {
-            await read.promise
-            return { revision: 1, value: structuredClone(stored.get(id)!) }
-        })
-        derivePersistentIdentityMirrors()
-        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledExactlyOnceWith('preset-a'))
-        expect(captureCurrentPreset()).toBeNull()
-        let applied = false
-        const request = activatePresetOverride(null).then(() => { applied = true })
-        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledTimes(2))
-        expect(applied).toBe(false)
-
-        read.resolve()
-        await request
-
-        expect(getDatabase().botPresets[0]).toEqual(stored.get('preset-a'))
-        expect(getDatabase().mainPrompt).toBe('Prompt A')
-        expect(captureCurrentPreset()).toEqual(stored.get('preset-a'))
-    })
-
-    it('reads the selected summary of a library that replaced the one being read', async () => {
-        const fallback = () => {
-            const database = presetDatabase()
-            database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, 'preset-removed')
-            return database
-        }
-        setDatabase(fallback())
-        const read = deferred()
-        runtime.readPreset.mockImplementationOnce(async (id) => {
-            await read.promise
-            return { revision: 1, value: structuredClone(stored.get(id)!) }
-        })
-        derivePersistentIdentityMirrors()
-        await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
-        const replacement = fallback()
-        replacement.mainPrompt = 'Removed prompt'
-        setDatabase(replacement)
-        const installed = getDatabase()
-        derivePersistentIdentityMirrors()
-        read.resolve()
-
-        await vi.waitFor(() => expect(installed.mainPrompt).toBe('Prompt A'))
-        expect(getDatabase()).toBe(installed)
-        expect(installed.botPresets[0]).toEqual(stored.get('preset-a'))
-    })
-
-    it('reads a selected summary once when its stored body holds no preset fields', async () => {
-        stored.set('preset-a', { id: 'preset-a', name: 'Preset A' } as botPreset)
-        // A store read waits for a task, as a real one does, so repeated reads cannot starve the timer below.
-        runtime.readPreset.mockImplementation(async (id) => {
-            await new Promise((resolve) => setTimeout(resolve))
-            return { revision: 1, value: structuredClone(stored.get(id)!) }
-        })
-        const database = getDatabase()
+        database.botPresets[0] = { id: 'preset-a', name: 'Preset A' } as botPreset
+        // A selection removed on another device falls back to the first preset.
         database.botPresets = createPresetCatalogWorkingSetFromValues(database.botPresets, 1, 'preset-removed')
         derivePersistentIdentityMirrors()
-        await vi.waitFor(() => expect(getDatabase().botPresets[0]).toEqual(stored.get('preset-a')))
-        await new Promise((resolve) => setTimeout(resolve, 20))
-        expect(runtime.readPreset).toHaveBeenCalledOnce()
+
+        expect(captureCurrentPreset()).toEqual({ id: 'preset-a', name: 'Preset A' })
+        expect(runtime.readPreset).not.toHaveBeenCalled()
     })
 
     it('rejects a missing preset without changing the override', async () => {
@@ -202,7 +135,7 @@ describe('preset chain override activation', () => {
 
         const presetB = stored.get('preset-b')!
         stored.delete('preset-b')
-        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+        summarizePresetB()
         await expect(activatePresetOverride(1)).rejects.toThrow('Preset was not found')
 
         stored.set('preset-b', presetB)
@@ -238,7 +171,7 @@ describe('conversation preset binding', () => {
     afterEach(() => doingChat.set(false))
 
     it('reads a bound catalog stub before applying it and drops the read another selection made stale', async () => {
-        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+        summarizePresetB()
         const read = deferred()
         const readStored = runtime.readPreset.getMockImplementation()!
         runtime.readPreset.mockImplementation(async (id) => {
@@ -257,10 +190,30 @@ describe('conversation preset binding', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt A')
 
         await applyConversationPresetBinding(database, conversation('bound', 'preset-b'))
-        expect(runtime.flushPendingData).toHaveBeenCalled()
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         expect(getDatabase().botPresetsId).toBe(0)
+    })
+
+    it('drops a stale binding whose preset a later selection read meanwhile', async () => {
+        summarizePresetB()
+        const flush = deferred()
+        runtime.pausedWrites.mockImplementationOnce(async (operation) => {
+            await flush.promise
+            return operation()
+        })
+        const database = getDatabase()
+
+        const stale = applyConversationPresetBinding(database, conversation('bound', 'preset-b'))
+        await vi.waitFor(() => expect(runtime.pausedWrites).toHaveBeenCalledOnce())
+        await applyConversationPresetBinding(database, conversation('bound', 'preset-b'))
+        expect(getEffectivePresetId()).toBe('preset-b')
+        await applyConversationPresetBinding(database, conversation('unbound', ''))
+        flush.resolve()
+        await stale
+
+        expect(getEffectivePresetId()).toBe('preset-a')
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
     })
 
     it('applies the binding of the conversation a request generates for, not the selected one', async () => {
@@ -303,12 +256,13 @@ describe('conversation preset binding', () => {
     })
 
     it('drops a binding carried across a replacement when the selection applies one during the read', async () => {
-        getDatabase().botPresets[1] = { id: 'preset-b', name: 'Preset B' } as botPreset
+        summarizePresetB()
         const read = deferred()
-        const carry = carryPresetBinding('preset-b', async (id) => {
+        runtime.readPreset.mockImplementationOnce(async (id) => {
             await read.promise
-            return { value: structuredClone(stored.get(id)!) }
+            return { revision: 1, value: structuredClone(stored.get(id)!) }
         })
+        const carry = carryPresetBinding('preset-b', getPersistentDataRuntime() as unknown as PresetSource)
         await applyConversationPresetBinding(getDatabase(), conversation('unbound', ''))
         read.resolve()
         await carry
@@ -318,10 +272,9 @@ describe('conversation preset binding', () => {
     })
 
     it.each(['chain', 'request'] as const)('reads the body into a library that replaced the one being read (%s)', async (path) => {
-        const stub = () => ({ id: 'preset-b', name: 'Preset B' }) as botPreset
         const owner = () => [{ type: 'character', chaId: 'character', name: 'Character', chatPage: 0,
             chats: [conversation('target', 'preset-b')] } as unknown as character]
-        getDatabase().botPresets[1] = stub()
+        summarizePresetB()
         getDatabase().characters = owner()
         const read = deferred()
         const previous = { revision: 1, value: structuredClone(stored.get('preset-b')!) }
@@ -334,7 +287,7 @@ describe('conversation preset binding', () => {
         await vi.waitFor(() => expect(runtime.readPreset).toHaveBeenCalledOnce())
         stored.get('preset-b')!.mainPrompt = 'Replacement B'
         const replacement = presetDatabase()
-        replacement.botPresets[1] = stub()
+        summarizePresetB(replacement)
         replacement.characters = owner()
         setDatabase(replacement)
         read.resolve()

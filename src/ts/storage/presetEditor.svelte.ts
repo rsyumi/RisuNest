@@ -10,7 +10,6 @@ import {
     derivePresetMirrorView,
     flushEffectivePresetEdits,
     flushPresetMirrorView,
-    isLoadedPreset,
     peekEffectivePresetId,
     presetMirrorMap,
     protectedPresetGroups,
@@ -84,8 +83,8 @@ function refresh(): void {
     untrack(() => {
         const db = DBState.db
         const selection = db?.botPresets?.[db.botPresetsId]
-        const other = selection?.id && selection.id !== peekEffectivePresetId(db) ? selection.id : null
-        if (other && !watchingSettingsWindow) {
+        const candidate = selection?.id && selection.id !== peekEffectivePresetId(db) ? selection.id : null
+        if (candidate && !watchingSettingsWindow) {
             watchingSettingsWindow = true
             let subscribed = false
             settingsWindowStore().subscribe(() => {
@@ -93,8 +92,7 @@ function refresh(): void {
             })
             subscribed = true
         }
-        // A catalog stub's view opens once its body is read and the mirrors derived again.
-        const wanted = other && applyEditor && isPresetEditorOpen() && isLoadedPreset(db, other) ? other : null
+        const wanted = candidate && applyEditor && isPresetEditorOpen() ? candidate : null
         if (view && (view.db !== db || view.presetId !== wanted)) closeView()
         if (!wanted) return
         if (view) derivePresetMirrorView(db, view, applyEditor!)
@@ -158,15 +156,6 @@ function routedView(root: Database, key: string): EditorView | null {
     return flag && (root as unknown as Fields)[flag] ? null : current
 }
 
-/** Preset settings take no input for a selected preset whose view waits for its body. */
-function awaitsView(root: Database, key: string): boolean {
-    const flag = protectedPresetGroups[key as ProtectedPresetField]
-    const routed = Object.hasOwn(presetMirrorMap, key) && !(flag && (root as unknown as Fields)[flag])
-    if (!routed && !Object.values(protectedPresetGroups).includes(key as never)) return false
-    const selection = root.botPresets?.[root.botPresetsId]
-    return !editingView(root) && !!selection?.id && selection.id !== peekEffectivePresetId(root) && isPresetEditorOpen()
-}
-
 function protectedFields(flag: string): string[] {
     return Object.entries(protectedPresetGroups).filter(([, value]) => value === flag).map(([field]) => field)
 }
@@ -205,7 +194,6 @@ function editorDatabase(root: Database): Database {
                     routed.values[key] = value
                     return true
                 }
-                if (awaitsView(target, key)) return true
                 const current = Object.values(protectedPresetGroups).includes(key as never) ? editingView(target) : null
                 if (current && Boolean(value) !== Boolean((target as unknown as Fields)[key])) {
                     setProtectionFlag(target, current, key, value)
@@ -220,7 +208,6 @@ function editorDatabase(root: Database): Database {
                 delete routed.values[key as string]
                 return true
             }
-            if (typeof key === 'string' && awaitsView(target, key)) return true
             return Reflect.deleteProperty(target, key)
         },
     })

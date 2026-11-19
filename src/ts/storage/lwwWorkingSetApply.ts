@@ -1,5 +1,5 @@
 import { sharedRootFields } from './persistentRootFields'
-import { createCatalogCharacterStub, createPresetCatalogWorkingSetFromValues, isCatalogPresetWorkingSet, markCatalogPresetLoaded } from './workingSetCatalog'
+import { createCatalogCharacterStub, createCatalogPresetWorkingSet, isCatalogPresetLoaded, isCatalogPresetWorkingSet, placeCatalogPresetBody } from './workingSetCatalog'
 import { createConversationSummaryStub, createConversationSummaryFromMetadata } from './conversationResidency'
 import type { Chat, Database, botPreset, character } from './database.svelte'
 import type { PersistentRevisionReader, PersistentRoot } from './persistentDataStore'
@@ -64,6 +64,20 @@ export async function applyLwwWorkingSetUnits(
     const summaries = new Map<string, Awaited<ReturnType<PersistentRevisionReader['readCharacterSummary']>>>()
     let presetCatalog: Awaited<ReturnType<PersistentRevisionReader['queryPresets']>> | undefined
     const pair = (characterId: string, conversationId: string) => JSON.stringify([characterId, conversationId])
+    const catalogPresets = isCatalogPresetWorkingSet(database.botPresets)
+    // Places a preset's stored body in place of its catalog summary.
+    const placePresetBody = (index: number, value: botPreset) => {
+        const recorded = baseline.presetRecords.findIndex((record) => record['id'] === value.id)
+        if (recorded >= 0) baseline.presetRecords.splice(recorded, 1)
+        baseline.presetRecords.push(canonicalClone(value))
+        placeCatalogPresetBody(database.botPresets, index, canonicalClone(value))
+    }
+    // A catalog working set holds its selection's body, also when the selection fell back to another preset.
+    const placeSelectedBody = () => {
+        const id = database.botPresets[database.botPresetsId]?.['id']
+        const preset = typeof id === 'string' ? presets.get(id) : undefined
+        if (preset && !isCatalogPresetLoaded(database.botPresets, id as string)) placePresetBody(database.botPresetsId, preset.value)
+    }
     const readPreset = async (id: string) => {
         if (presets.has(id)) return
         const live = database.botPresets.find((value) => value?.['id'] === id)
@@ -76,8 +90,15 @@ export async function applyLwwWorkingSetUnits(
         if (kind === 'root' && id === 'botPresetsId' && typeof root?.botPresetsId === 'string') {
             await readPreset(root.botPresetsId)
             if (presets.get(root.botPresetsId) && !presetCatalog) presetCatalog = await store.queryPresets()
+            // A selection naming a preset this device does not hold falls back to the first.
+            else if (catalogPresets && typeof database.botPresets[0]?.['id'] === 'string') await readPreset(database.botPresets[0]['id'])
         }
-        if ((kind === 'order' && id === 'presets') || (kind === 'exists' && id === 'preset')) presetCatalog ??= await store.queryPresets()
+        if ((kind === 'order' && id === 'presets') || (kind === 'exists' && id === 'preset')) {
+            presetCatalog ??= await store.queryPresets()
+            // A removed selection falls back to the first preset.
+            const selectedId = database.botPresets[database.botPresetsId]?.['id']
+            if (catalogPresets && !presetCatalog.items.some((item) => item.id === selectedId) && presetCatalog.items[0]) await readPreset(presetCatalog.items[0].id)
+        }
         if (kind === 'conversation' || kind === 'messages') {
             const live = charactersById.get(id)?.chats.find((value) => value.id === field)
             const before = baselineById.get(id)?.chats.find((value) => value.id === field)
@@ -109,14 +130,9 @@ export async function applyLwwWorkingSetUnits(
                     if (index !== undefined) {
                         const live = database.botPresets.find((value) => value?.['id'] === root.botPresetsId)
                         const before = baseline.presets?.find((value) => value['id'] === root.botPresetsId) ?? baseline.presetRecords.find((value) => value['id'] === root.botPresetsId)
-                        if (live && before) {
+                        if (live && before && isCatalogPresetLoaded(database.botPresets, root.botPresetsId)) {
                             for (const field of new Set([...Object.keys(before), ...Object.keys(preset.value)])) patchField(live, before, preset.value, field)
-                            database.botPresets[index] = live
-                        } else {
-                            database.botPresets[index] = canonicalClone(preset.value)
-                            baseline.presetRecords.push(canonicalClone(preset.value))
-                        }
-                        markCatalogPresetLoaded(database.botPresets, root.botPresetsId)
+                        } else placePresetBody(index, preset.value)
                     }
                 }
             }
@@ -127,6 +143,7 @@ export async function applyLwwWorkingSetUnits(
             if (id === 'botPresetsId' && typeof before[id] === 'string') before[id] = Math.max(0, database.botPresets.findIndex((value) => value?.['id'] === before[id]))
             if (id === 'selectedPersona' && typeof before[id] === 'string') before[id] = Math.max(0, database.personas?.findIndex((value) => value.id === before[id]) ?? 0)
             patchField(database, before, remote, id)
+            if (id === 'botPresetsId') placeSelectedBody()
             if (Object.hasOwn(root, id)) (baseline.root as unknown as Record<string, unknown>)[id] = canonicalClone((root as unknown as Record<string, unknown>)[id])
             else delete (baseline.root as unknown as Record<string, unknown>)[id]
             // The fallback for a received selection this working set cannot resolve is not a local selection to save.
@@ -252,11 +269,16 @@ export async function applyLwwWorkingSetUnits(
             const catalog = presetCatalog!
             const byId = new Map(database.botPresets.filter(Boolean).map((value) => [value['id'], value]))
             const next = catalog.items.map((summary) => byId.get(summary.id) ?? canonicalClone(presets.get(summary.id)?.value ?? { id: summary.id, name: summary.name, image: summary.image }) as botPreset)
-            database.botPresets = isCatalogPresetWorkingSet(database.botPresets)
-                ? createPresetCatalogWorkingSetFromValues(next, catalog.revision, selectedId) : next
-            if (isCatalogPresetWorkingSet(database.botPresets)) for (let index = 0; index < next.length; index++) database.botPresets[index] = next[index]
+            if (catalogPresets) {
+                const loaded = catalog.items.filter((summary) => byId.has(summary.id) && isCatalogPresetLoaded(database.botPresets, summary.id))
+                    .map((summary) => ({ summary, value: byId.get(summary.id)! }))
+                const active = loaded.find(({ summary }) => summary.id === selectedId) ?? null
+                database.botPresets = createCatalogPresetWorkingSet(catalog, active, loaded.filter((body) => body !== active))
+                for (let index = 0; index < next.length; index++) database.botPresets[index] = next[index]
+            } else database.botPresets = next
             const selectedIndex = database.botPresets.findIndex((value) => value['id'] === selectedId)
             database.botPresetsId = Math.max(0, selectedIndex)
+            placeSelectedBody()
             // The fallback after a remote deletion is not a local selection to save.
             if (selectedIndex < 0) {
                 const fallbackId = database.botPresets[database.botPresetsId]?.['id']

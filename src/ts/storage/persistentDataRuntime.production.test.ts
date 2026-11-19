@@ -1159,7 +1159,7 @@ describe('preset chain override across a whole working-set replacement', () => {
         setEffectivePresetOverride('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         const replacement = resident ? structuredClone(initial) : projectCompleteScalableWorkingSet(initial, null, revision, new Set())
-        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
+        createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         expect(getDatabase().botPresets.find((preset) => preset.id === 'preset-a')!.mainPrompt).toBe('Prompt A')
@@ -1177,7 +1177,7 @@ describe('preset chain override across a whole working-set replacement', () => {
         // A running request reads the mirrors as soon as the replacement is installed.
         doingChat.set(true)
         const replacement = resident ? structuredClone(initial) : projectCompleteScalableWorkingSet(initial, null, revision, new Set())
-        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
+        createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         expect(getDatabase().botPresetsId).toBe(0)
@@ -1190,11 +1190,11 @@ describe('preset chain override across a whole working-set replacement', () => {
         const { revision } = await store.replaceFromDatabase(initial)
         setDatabase(projectCompleteScalableWorkingSet(initial, null, revision, new Set()))
         selectedCharID.set(-1)
-        await carryPresetBinding('preset-b', (id) => store.readPreset(id))
+        await carryPresetBinding('preset-b', {store, withPausedPersistentWrites: (_reason, operation) => operation({revision, mutationGeneration: 0})})
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         doingChat.set(true)
         const replacement = await projectScalableWorkingSetAtRevision(store, revision, { selectedCharacterId: null })
-        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
+        createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
@@ -1211,8 +1211,8 @@ describe('preset chain override across a whole working-set replacement', () => {
         // The selected preset was removed on another device.
         const removed = await store.commit({ expectedRevision: revision, unitMutations: [{ key: '["root","botPresetsId"]', type: 'set', value: 'preset-removed' }] })
         const replacement = await projectScalableWorkingSetAtRevision(store, removed.revision, { selectedCharacterId: null })
-        createProductionStateAdapter({ readPreset: (id) => store.readPreset(id) }).replaceDatabase(replacement, new Set(), false)
-        await vi.waitFor(() => expect(getDatabase().mainPrompt).toBe('Prompt A'))
+        createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
         expect(getDatabase().botPresetsId).toBe(0)
         expect(getDatabase().botPresets[0].mainPrompt).toBe('Prompt A')
     })
@@ -1620,7 +1620,7 @@ describe('preset list operations', () => {
             mutatePersistentPresets: (reason, mutate) => runtime.mutatePersistentPresets(reason, mutate),
         })
         // The chat lifecycle reads a bound catalog stub through the runtime this test does not install.
-        await carryPresetBinding('preset-b', (id) => store.readPreset(id))
+        await carryPresetBinding('preset-b', runtime)
         expect(getDatabase().mainPrompt).toBe('Prompt B')
         const storedPrompts = async () => Promise.all(['a', 'b', 'c'].map(async (id) => (await store.readPreset(`preset-${id}`))!.value.mainPrompt))
 
@@ -1795,6 +1795,8 @@ describe('received persona replacement', () => {
 })
 
 describe('received preset selection', () => {
+    // A preset left bound would stay loaded in the next test's working set.
+    afterEach(() => applyConversationPresetBinding(getDatabase(), undefined))
     async function presetRuntime(catalog: boolean) {
         const initial = normalizeDatabaseDefaults({} as Database)
         const preset = initial.botPresets[0]
@@ -1827,7 +1829,8 @@ describe('received preset selection', () => {
         const {store, runtime, saveFailures} = await presetRuntime(catalog)
         const selection = {key: JSON.stringify(['root', 'botPresetsId']), type: 'set' as const, value: 'preset-elsewhere'}
         await receiveCommit(store, runtime, {unitMutations: [selection]}, [selection.key])
-        expect(getDatabase().botPresets[getDatabase().botPresetsId]).toBeDefined()
+        expect(getDatabase().botPresets[getDatabase().botPresetsId]).toMatchObject({id: 'preset-a', mainPrompt: 'Prompt A'})
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
         const mutations = await savedMutations(store, runtime)
         expect(mutations.map((value) => value.key)).toEqual(['classicMaxWidth'])
         expect((await store.readRoot()).value.botPresetsId).toBe('preset-elsewhere')
@@ -1849,10 +1852,55 @@ describe('received preset selection', () => {
         const {store, runtime, saveFailures} = await presetRuntime(true)
         const temperature = {key: JSON.stringify(['preset', 'preset-a', 'temperature']), type: 'set' as const, value: 3}
         await receiveCommit(store, runtime, {unitMutations: [temperature]}, [temperature.key])
-        await carryPresetBinding('preset-a', (id) => store.readPreset(id))
+        await carryPresetBinding('preset-a', runtime)
         expect(getEffectivePresetId()).toBe('preset-a')
         expect(getDatabase().mainPrompt).toBe('Prompt A')
         expect(getDatabase().temperature).toBe(3)
+        const controller = createPresetWorkingSetController({
+            getDatabase, captureCurrentPreset, getEffectivePresetId,
+            applyPreset: (root, preset) => setPreset(root as Database, preset),
+            mutatePersistentPresets: (reason, mutate) => runtime.mutatePersistentPresets(reason, mutate),
+        })
+        await controller.saveCurrentPreset()
+        expect((await store.readPreset('preset-a'))!.value).toMatchObject({mainPrompt: 'Prompt A', temperature: 3})
+        expect(saveFailures).toEqual([])
+    })
+
+    it('keeps a field received while the body of a catalog stub was read', async () => {
+        const {store, runtime, saveFailures} = await presetRuntime(true)
+        const temperature = {key: JSON.stringify(['preset', 'preset-a', 'temperature']), type: 'set' as const, value: 3}
+        let carried!: Promise<void>
+        await receiveCommit(store, runtime, {unitMutations: [temperature]}, [temperature.key], () => {
+            carried = carryPresetBinding('preset-a', {withPausedPersistentWrites: runtime.withPausedPersistentWrites, store: {readPreset: async (id) => {
+                const value = await store.readPreset(id)
+                // The read finishes once the receive has applied the field.
+                await vi.waitFor(() => expect(getDatabase().botPresets[0].temperature).toBe(3))
+                return value
+            }}})
+        })
+        await carried
+        expect(getDatabase().botPresets[0]).toMatchObject({mainPrompt: 'Prompt A', temperature: 3})
+        // The receive applied no binding for the selected conversation; the preset is bound again.
+        await carryPresetBinding('preset-a')
+        expect(getDatabase().temperature).toBe(3)
+        const controller = createPresetWorkingSetController({
+            getDatabase, captureCurrentPreset, getEffectivePresetId,
+            applyPreset: (root, preset) => setPreset(root as Database, preset),
+            mutatePersistentPresets: (reason, mutate) => runtime.mutatePersistentPresets(reason, mutate),
+        })
+        await controller.saveCurrentPreset()
+        expect((await store.readPreset('preset-a'))!.value).toMatchObject({mainPrompt: 'Prompt A', temperature: 3})
+        expect(saveFailures).toEqual([])
+    })
+
+    it('selects the stored body of a catalog stub that received a field when a received deletion removes the selection', async () => {
+        const {store, runtime, saveFailures} = await presetRuntime(true)
+        const temperature = {key: JSON.stringify(['preset', 'preset-a', 'temperature']), type: 'set' as const, value: 3}
+        await receiveCommit(store, runtime, {unitMutations: [temperature]}, [temperature.key])
+        const keys = [JSON.stringify(['exists', 'preset', 'preset-b']), JSON.stringify(['order', 'presets'])]
+        await receiveCommit(store, runtime, {unitMutations: [{key: keys[0], type: 'delete'}, {key: keys[1], type: 'set', value: ['preset-a']}]}, keys)
+        expect(getDatabase().botPresets[getDatabase().botPresetsId]).toMatchObject({id: 'preset-a', mainPrompt: 'Prompt A', temperature: 3})
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
         const controller = createPresetWorkingSetController({
             getDatabase, captureCurrentPreset, getEffectivePresetId,
             applyPreset: (root, preset) => setPreset(root as Database, preset),

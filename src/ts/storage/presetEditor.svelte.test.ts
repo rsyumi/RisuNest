@@ -5,6 +5,7 @@ import {
     deriveEffectivePresetMirrors, observeEffectivePresetDerive, presetMirrorMap, setEffectivePresetBinding,
 } from './effectiveIdentityState'
 import { flushPresetEditorEdits, holdPresetEditor, presetEditorDBState, syncPresetEditorTarget } from './presetEditor.svelte'
+import { createCatalogPresetWorkingSet } from './workingSetCatalog'
 
 vi.mock('../stores.svelte', async () => {
     const { writable } = await import('svelte/store')
@@ -91,24 +92,18 @@ it('keeps edits across a selection change and a binding change while preset sett
     expect(presets.map(preset => preset.mainPrompt)).toEqual(['Edited selected', 'Edited other', 'Prompt bound'])
 })
 
-it('takes no settings input for a selected catalog stub and edits the selection once its body is read', () => {
-    const presets = open(['selected', 'bound'], 'bound')
-    presets[0] = { id: 'selected', name: 'selected' } as botPreset
+it('edits a selected catalog preset whose stored body holds only its name while another preset is applied', () => {
+    open(['selected', 'bound'], 'bound')
+    const items = ['selected', 'bound'].map((id, configuredIndex) => ({ id, name: id, configuredIndex }))
+    DBState.db.botPresets = createCatalogPresetWorkingSet({ revision: 1, items }, { summary: items[0], value: { id: 'selected', name: 'selected' } as botPreset },
+        [{ summary: items[1], value: { id: 'bound', name: 'bound', mainPrompt: 'Prompt bound', promptSettings: { sendName: false } } as unknown as botPreset }])
     deriveEffectivePresetMirrors(DBState.db, apply)
     settingsOpen.set(true)
-    presetEditorDBState.db.mainPrompt = 'Typed while reading'
-    expect(DBState.db.mainPrompt).toBe('Prompt bound')
-    delete (presetEditorDBState.db as Partial<Database>).mainPrompt
-    expect(DBState.db.mainPrompt).toBe('Prompt bound')
-    presetEditorDBState.db.doNotChangeFallbackModels = true
-    expect(DBState.db.doNotChangeFallbackModels).toBeFalsy()
-
-    // The body read derives the mirrors again.
-    presets[0] = { id: 'selected', name: 'selected', mainPrompt: 'Prompt selected' } as botPreset
-    deriveEffectivePresetMirrors(DBState.db, apply)
-    expect(presetEditorDBState.db.mainPrompt).toBe('Prompt selected')
+    // The selection holds no prompt settings, so the applied preset's are not offered for editing.
+    expect(presetEditorDBState.db.promptSettings).toBeUndefined()
     presetEditorDBState.db.mainPrompt = 'Edited selected'
     settingsOpen.set(false)
-    expect(presets[0].mainPrompt).toBe('Edited selected')
-    expect(presets[1].mainPrompt).toBe('Prompt bound')
+    expect(DBState.db.botPresets[0].mainPrompt).toBe('Edited selected')
+    expect(DBState.db.botPresets[1]).toMatchObject({ mainPrompt: 'Prompt bound', promptSettings: { sendName: false } })
+    expect(DBState.db.mainPrompt).toBe('Prompt bound')
 })
