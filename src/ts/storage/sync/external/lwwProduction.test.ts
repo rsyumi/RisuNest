@@ -486,8 +486,18 @@ describe('native external LWW adapter', () => {
         await vi.advanceTimersByTimeAsync(15_000); await settle()
         expect(fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_publish')).toHaveLength(1)
     })
-    it('flushes once on background entry and suspends all timed work', async () => {
-        dispose = await installExternalLwwAdapters(state()); await settle(); fixture.invoke.mockClear()
+    it.each(['on screen', 'hidden and shown as it begins'] as const)('flushes once on background entry after a start %s and suspends all timed work', async start => {
+        if (start === 'on screen') dispose = await installExternalLwwAdapters(state())
+        else {
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+            let listened!: () => void
+            fixture.listen.mockImplementationOnce(() => new Promise(resolve => { listened = () => resolve(() => {}) }))
+            const installing = installExternalLwwAdapters(state()).then(value => { dispose = value })
+            await settle()
+            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' }); document.dispatchEvent(new Event('visibilitychange'))
+            listened(); await installing
+        }
+        await settle(); fixture.invoke.mockClear()
         Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' }); document.dispatchEvent(new Event('visibilitychange'))
         await settle(); expect(fixture.invoke.mock.calls.filter(call => call[0] === 'external_lww_publish')).toHaveLength(1)
         document.dispatchEvent(new Event('visibilitychange')); await vi.advanceTimersByTimeAsync(600_000); await settle()

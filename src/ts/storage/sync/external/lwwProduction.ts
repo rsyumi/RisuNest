@@ -419,6 +419,9 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
 export async function installExternalLwwAdapters(state: ExternalStorageState, resumeBound = true): Promise<() => void> {
     if (!isTauri) return () => {}
     resumeBoundTarget = resumeBound
+    const dirty = (generation = false) => { for (const adapter of adapters.values()) if (adapter.state) adapter.scheduler.dirty(generation) }
+    // Everything is heard before the start below, so an event the start overlaps is not lost.
+    const disposeDevice = await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => dirty())
     let hiddenFlushed = document.visibilityState === 'hidden'
     let wasOnline = navigator.onLine
     let disposed = false
@@ -458,9 +461,6 @@ export async function installExternalLwwAdapters(state: ExternalStorageState, re
             }
         }
     }
-    const dirty = (generation = false) => { for (const adapter of adapters.values()) if (adapter.state) adapter.scheduler.dirty(generation) }
-    // Everything is heard before the start below, so an event the start overlaps is not lost.
-    const disposeDevice = await listen(SERVER_SYNC_DEVICE_CHANGED_EVENT, () => dirty())
     // A return clears a background time that ran out. A page Android keeps running off screen stays visible, so it
     // hears the return only from the app's own start.
     const visibility = () => { if (document.visibilityState !== 'hidden') outOfTime = false; foreground() }
