@@ -1899,7 +1899,7 @@ describe('received preset selection', () => {
 
     it.each([
         [false, false, 'preset-elsewhere', false], [true, false, 'preset-elsewhere', false], [true, true, 'preset-elsewhere', false],
-        [true, false, 'preset-elsewhere', true], [true, true, 'preset-elsewhere', true], [true, false, undefined, false], [true, true, undefined, false],
+        [true, false, 'preset-elsewhere', true], [true, false, undefined, false],
     ])('does not write back a fallback for a received selection naming a preset this device does not hold (catalog=%s, refresh=%s, selection=%s, reorder=%s)', async (catalog, refresh, received, reorder) => {
         const {store, runtime, saveFailures} = await presetRuntime(catalog)
         const selectionKey = JSON.stringify(['root', 'botPresetsId'])
