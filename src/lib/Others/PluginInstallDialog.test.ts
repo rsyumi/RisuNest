@@ -30,7 +30,7 @@ let target: HTMLDivElement
 
 function pluginItem(name: string, code: string, bytes?: number): ImportIntakeItem {
     const isTypescript = name.endsWith('.ts')
-    const inspected = inspectPluginFile(name, code, isTypescript)
+    const inspected = inspectPluginFile(code)
     if (!('header' in inspected)) throw new Error(`refused: ${inspected.refusal.code}`)
     return { id: name, name, bytes, source: { type: 'path', path: name }, kind: 'plugin', format: isTypescript ? 'ts' : 'js',
         plugin: { header: inspected.header, code, isTypescript } }
@@ -79,11 +79,11 @@ describe('plugin file inspection', () => {
         ['//@name legacy\n//@api 2.1', { code: 'plugin-api-version', version: '2.1' }],
         ['//@name bannerless', { code: 'plugin-api-version', version: '2.0' }],
     ])('refuses %j', (code, refusal) => {
-        expect(inspectPluginFile('synthetic.js', code, false)).toEqual({ refusal })
+        expect(inspectPluginFile(code)).toEqual({ refusal })
     })
 
     it('reads a header behind a UTF-8 BOM and keeps only the update host', () => {
-        expect(inspectPluginFile('synthetic.js', `\uFEFF${declared}`, false)).toEqual({ header: {
+        expect(inspectPluginFile(`\uFEFF${declared}`)).toEqual({ header: {
             name: 'synthetic', displayName: 'Synthetic Plugin', version: '1.2.0', apiVersion: '3.0', updateHost: 'plugins.example.test',
         } })
     })
