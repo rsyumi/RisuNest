@@ -444,13 +444,8 @@ const characterIdentity = new Set(['chaId', 'type', 'chats', 'chatFolders'])
 async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: character, baseKey: string): Promise<string> {
     const startedAtMs = Date.now()
     const targetId = decision.id
-    const stored = await characters.read(targetId)
-    if (!stored) throw new Error(language.errors.noData)
-    const previous = structuredClone(stored)
-    const merged = applyUpdate(CHARACTER_UPDATE, await characters.normalize(stored), incoming as CharacterDetail, decision.plan, decision.choices)
-    merged.extentions = { ...(merged.extentions ?? {}) }
-    if (baseKey) merged.extentions[UPDATE_BASE_EXTENSION_KEY] = baseKey
-    else delete merged.extentions[UPDATE_BASE_EXTENSION_KEY]
+    const previous = await characters.read(targetId)
+    if (!previous) throw new Error(language.errors.noData)
 
     const text = language.risuNest.contentUpdate
     const backedUp = await mutatePersistentCharacterDetail(incoming.chaId, 'content-update-backup', ({ root, character }) => {
@@ -463,7 +458,13 @@ async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' 
         character.trashTime = Date.now()
     })
     if (!backedUp) throw new Error(language.errors.noData)
-    const updated = await mutateCharacterDetailFields(targetId, 'content-update', ({ character }) => {
+    let merged: CharacterDetail | undefined
+    const updated = await mutateCharacterDetailFields(targetId, 'content-update', async ({ character }) => {
+        // Merged with the character as it is stored now, so what changed while the copy was written stays.
+        merged = applyUpdate(CHARACTER_UPDATE, await characters.normalize(character), incoming as CharacterDetail, decision.plan, decision.choices)
+        merged.extentions = { ...(merged.extentions ?? {}) }
+        if (baseKey) merged.extentions[UPDATE_BASE_EXTENSION_KEY] = baseKey
+        else delete merged.extentions[UPDATE_BASE_EXTENSION_KEY]
         replaceDetailFields(character as unknown as Record<string, unknown>, merged as unknown as Record<string, unknown>, characterIdentity)
     }).catch((error: unknown) => error)
     if (updated !== true) {
@@ -475,7 +476,7 @@ async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' 
         throw updated instanceof Error ? updated : new Error(language.errors.noData)
     }
     const live = residentCharacter(targetId)
-    if (live && isCatalogCharacterStub(live)) patchWorkingSetCharacterDetail(live, merged)
+    if (live && merged && isCatalogCharacterStub(live)) patchWorkingSetCharacterDetail(live, merged)
     // The trashed copy keeps the previous card's assets, all but its base.
     releaseUnusedAssets(startedAtMs, incoming, previous.extentions?.[UPDATE_BASE_EXTENSION_KEY])
     return targetId
@@ -517,9 +518,15 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
     }
 }
 
-/** Replaces the installed module with the merged one and removes the just-imported module. */
-async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: RisuModule, baseKey: string, stored: RisuModule): Promise<string> {
+/**
+ * Replaces the installed module with the merged one and removes the just-imported module.
+ * A module the user removed meanwhile leaves the import installed as new.
+ */
+async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>, incoming: RisuModule, baseKey: string): Promise<string> {
     const startedAtMs = Date.now()
+    // Read once the import is stored, so the merge starts from the module as it is now.
+    const stored = await modules.read(decision.id)
+    if (!stored) return incoming.id
     const list = DBState.db.modules
     const merged = applyUpdate(MODULE_UPDATE, await modules.normalize(stored), incoming, decision.plan, decision.choices)
     if (baseKey) merged.updateBase = baseKey
@@ -561,12 +568,9 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
         await commit(incoming)
         return incoming.id
     }
-    // Read before the import commits: a module the user removed meanwhile installs the import as new.
-    const stored = await modules.read(decision.id)
     await commit(incoming)
-    if (!stored) return incoming.id
     try {
-        return await foldModuleUpdate(decision, incoming, baseKey, stored)
+        return await foldModuleUpdate(decision, incoming, baseKey)
     } catch (error) {
         console.error(error)
         alertError(`${language.risuNest.contentUpdate.failed}\n${error instanceof Error ? error.message : String(error)}`)

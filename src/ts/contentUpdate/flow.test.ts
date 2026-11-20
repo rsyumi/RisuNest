@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
     missingTarget: false,
     /** Write reasons that fail. */
     failing: new Set<string>(),
+    /** Runs while the trashed copy of the installed character is written. */
+    duringBackup: null as (() => void) | null,
 }))
 const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
@@ -46,14 +48,15 @@ vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
         const character = structuredClone(detail)
         mutate({ root: mocks.root, character })
         mocks.details.set(id, editableDetail(detail, character))
+        if (reason === 'content-update-backup') mocks.duringBackup?.()
         return true
     },
-    mutateCharacterDetailFields: async (id: string, reason: string, mutate: (state: any) => void) => {
+    mutateCharacterDetailFields: async (id: string, reason: string, mutate: (state: any) => void | Promise<void>) => {
         const detail = mocks.details.get(id)
         if (mocks.failing.has(reason)) throw new Error('write failed')
         if (!detail || mocks.missingTarget) return false
         const character = structuredClone(detail)
-        mutate({ character })
+        await mutate({ character })
         mocks.details.set(id, editableDetail(detail, character))
         return true
     },
@@ -123,6 +126,7 @@ beforeEach(() => {
     mocks.db.enabledModules = []
     mocks.missingTarget = false
     mocks.failing.clear()
+    mocks.duringBackup = null
     mocks.alertError.mockClear()
     mocks.alertConfirm.mockReset().mockResolvedValue(true)
     platform.runtime = 'web'
@@ -156,11 +160,13 @@ describe('character update', () => {
         expect(contentUpdateDialog.request?.candidates.map((candidate) => candidate.id)).toEqual(['first'])
         await reviewContentUpdate()
         expect(unresolvedItems(contentUpdateDialog.plan!)).toEqual([])
+        // A note saved while the old card is copied.
+        mocks.duringBackup = () => { mocks.details.get('first').notes = 'written meanwhile' }
         chooseContentUpdate('update')
         expect(await pending).toBe('first')
 
         const updated = mocks.details.get('first')
-        expect(updated).toMatchObject({ name: 'Luna v1.1', desc: 'new', personality: 'brave', chats: [{ id: 'first-chat' }] })
+        expect(updated).toMatchObject({ name: 'Luna v1.1', desc: 'new', personality: 'brave', notes: 'written meanwhile', chats: [{ id: 'first-chat' }] })
         expect(updated).not.toHaveProperty('backgroundHTML')
         const backup = mocks.details.get('second')
         expect(backup).toMatchObject({ chaId: 'second', name: `Luna v1.0 ${language.risuNest.contentUpdate.backupSuffix}`, desc: 'old', personality: 'brave', chats: [{ id: 'second-chat' }] })
@@ -335,6 +341,11 @@ describe('module update', () => {
         const installedId = mocks.db.modules[0].id
         const firstBase = mocks.db.modules[0].updateBase
         mocks.db.enabledModules.push(installedId)
+        commitModule.mockImplementationOnce(async (value) => {
+            // A setting changed while the import is stored.
+            mocks.db.modules[0].hideIcon = true
+            mocks.db.modules.push(value)
+        })
         const pending = commitImportedModule(imported('file-1', { name: 'Renamed Lore', description: 'new', lorebook: [] }), commitModule)
         await opened()
         expect(contentUpdateDialog.request?.candidates.map((candidate) => [candidate.id, candidate.reason])).toEqual([[installedId, 'lineage']])
@@ -344,7 +355,7 @@ describe('module update', () => {
         expect(await pending).toBe(installedId)
 
         expect(mocks.db.modules).toHaveLength(1)
-        expect(mocks.db.modules[0]).toMatchObject({ id: installedId, name: 'Renamed Lore', description: 'new', updateLineage: 'file-1' })
+        expect(mocks.db.modules[0]).toMatchObject({ id: installedId, name: 'Renamed Lore', description: 'new', updateLineage: 'file-1', hideIcon: true })
         expect(mocks.db.enabledModules).toEqual([installedId])
         const base = JSON.parse(new TextDecoder().decode(mocks.assets.get(mocks.db.modules[0].updateBase!)))
         expect(base).toEqual({ description: 'new', name: 'Renamed Lore', lorebook: [], updateLineage: 'file-1' })
