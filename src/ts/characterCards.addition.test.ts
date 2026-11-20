@@ -47,7 +47,7 @@ vi.mock('./characters', () => ({
     commitDetachedCharacter: mocks.commitDetachedCharacter,
 }))
 vi.mock('./storage/database.svelte', () => ({
-    defaultSdDataFunc: () => ({}),
+    defaultSdDataFunc: () => [['always', 'synthetic']],
     appVer: '0.0.0',
     getDatabase: () => mocks.database,
 }))
@@ -185,7 +185,8 @@ import {
 } from './storage/nativeFileJobManager'
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
-import { UPDATE_BASE_EXTENSION_KEY } from './contentUpdate/merge'
+import { readUpdateBaseFile } from './contentUpdate/baseFile'
+import { CHARACTER_UPDATE, UPDATE_BASE_EXTENSION_KEY, planUpdate } from './contentUpdate/merge'
 
 describe('character card additions', () => {
     beforeEach(() => {
@@ -1161,6 +1162,15 @@ describe('character card additions', () => {
         }
         const imported = await importCharacterCardSpec(structuredClone(card), undefined, 'normal', {}, null, true)
         expect(imported && imported.globalLore[0]).toMatchObject({ key: 'synthetic', content: '' })
+    })
+
+    it('reads a card file as an earlier version with every field an import of it stores', async () => {
+        // No RisuAI extension, so the import fills each of its defaults.
+        const card = { spec: 'chara_card_v3', spec_version: '3.0', data: { name: 'Luna', description: 'd', first_mes: 'hi', extensions: {} } }
+        const imported = await importCharacterCardSpec(structuredClone(card) as any, undefined, 'normal', {}, null, true)
+        const read = await readUpdateBaseFile('character', { name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify(card)) })
+        expect(imported).toBeTruthy()
+        expect(planUpdate(CHARACTER_UPDATE, read as object, imported as object, null).items.map((item) => item.field)).toEqual([])
     })
 
     it('stops a Realm download or preview from a blocked creator before anything is downloaded', async () => {

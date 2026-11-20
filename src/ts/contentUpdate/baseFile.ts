@@ -2,7 +2,7 @@
 
 import { Buffer } from 'buffer'
 import { unzipSync } from 'fflate'
-import type { character, customscript, loreBook, triggerscript } from '../storage/database.svelte'
+import { defaultSdDataFunc, type character, type customscript, type loreBook, type triggerscript } from '../storage/database.svelte'
 import { AppendableBuffer } from '../appendableBuffer'
 import { PngChunk } from '../pngChunk'
 import { convertCharbook, convertOffSpecCards } from '../characterCards'
@@ -123,9 +123,9 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         prebuiltAssetExclude: risu?.prebuiltAssetExclude ?? [],
         prebuiltAssetStyle: risu?.prebuiltAssetStyle ?? '',
         bias: risu?.bias,
-        viewScreen: risu?.viewScreen,
-        utilityBot: risu?.utilityBot,
-        sdData: risu?.sdData,
+        viewScreen: risu?.viewScreen ?? 'none',
+        utilityBot: risu?.utilityBot ?? false,
+        sdData: risu?.sdData ?? defaultSdDataFunc(),
     }
     if (card.spec === 'chara_card_v3') {
         char.nickname = data.nickname ?? ''

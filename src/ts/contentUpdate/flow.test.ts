@@ -33,6 +33,7 @@ vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) =
 vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
 // The earlier-file reader's lorebook converter, without the app state its module loads.
 vi.mock('../characterCards', () => ({ convertCharbook: vi.fn() }))
+vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
 vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
     assetAliasCleanupTarget: (await import('../storage/deletedOwnerAssetCleanup.testSupport')).createAssetAliasCleanupTarget,
     readPersistentCharacterDetail: async (id: string) => {
