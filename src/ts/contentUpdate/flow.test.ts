@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
     failing: new Set<string>(),
     /** Runs while the trashed copy of the installed character is written. */
     duringBackup: null as (() => void) | null,
+    /** Runs while a lorebook is brought to the current format. */
+    duringNormalize: null as (() => void) | null,
 }))
 const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
@@ -28,7 +30,12 @@ vi.mock('../globalApi.svelte', () => ({
 }))
 vi.mock('../alert', () => ({ alertClear: vi.fn(), alertError: mocks.alertError, alertConfirm: mocks.alertConfirm }))
 vi.mock('../stores.svelte', () => ({ DBState: { db: mocks.db } }))
-vi.mock('../characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
+vi.mock('../characters', () => ({
+    updateLorebooks: (books: unknown[]) => {
+        mocks.duringNormalize?.()
+        return books
+    },
+}))
 vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
 // The earlier-file reader's lorebook converter, without the app state its module loads.
@@ -128,6 +135,7 @@ beforeEach(() => {
     mocks.missingTarget = false
     mocks.failing.clear()
     mocks.duringBackup = null
+    mocks.duringNormalize = null
     mocks.alertError.mockClear()
     mocks.alertConfirm.mockReset().mockResolvedValue(true)
     platform.runtime = 'web'
@@ -351,6 +359,11 @@ describe('module update', () => {
             // A setting changed while the import is stored.
             mocks.db.modules[0].hideIcon = true
             mocks.db.modules.push(value)
+            // A module order received while the merge is prepared puts a new list in place of this one.
+            mocks.duringNormalize = () => {
+                mocks.duringNormalize = null
+                mocks.db.modules = [...mocks.db.modules].reverse()
+            }
         })
         const pending = commitImportedModule(imported('file-1', { name: 'Renamed Lore', description: 'new', lorebook: [] }), commitModule)
         await opened()

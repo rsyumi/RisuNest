@@ -527,10 +527,11 @@ async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>,
     // Read once the import is stored, so the merge starts from the module as it is now.
     const stored = await modules.read(decision.id)
     if (!stored) return incoming.id
-    const list = DBState.db.modules
     const merged = applyUpdate(MODULE_UPDATE, await modules.normalize(stored), incoming, decision.plan, decision.choices)
     if (baseKey) merged.updateBase = baseKey
     else delete merged.updateBase
+    // The list as it is after the waits above: a received module order puts a new list in its place.
+    const list = DBState.db.modules
     const index = list.findIndex((module) => module?.id === decision.id)
     if (index < 0) throw new Error(language.errors.noData)
     list[index] = merged
