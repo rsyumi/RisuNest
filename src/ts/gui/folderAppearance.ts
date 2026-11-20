@@ -240,7 +240,7 @@ export function applyFolderDraft<T extends folder>(folder: T, draft: FolderDraft
         next.imgFile = null
         next.img = ''
     }
-    // 이미지 without an image shows the text, so it is stored as text.
+    // The image icon type without an image shows the text, so it is stored as text.
     const chosen = draft.iconType === 'image' && !next.imgFile ? 'text' : draft.iconType
     set('iconType', chosen === folderIconType({ imgFile: next.imgFile }) ? undefined : chosen)
     const stops = draft.colorMode === 'solid' ? [normalizeHexColor(draft.solid)] : draft.colorMode === 'gradient' ? draft.gradient.map(normalizeHexColor) : null

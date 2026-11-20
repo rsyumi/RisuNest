@@ -153,7 +153,7 @@
         const file = await selectSingleFile(imageAliases, { image: true })
         if (!file) return false
         const saved = await saveImage(file.data)
-        // The panel may have closed, opened again, left 이미지 or removed the image meanwhile.
+        // The panel may have closed, opened again, left the image icon type or removed the image meanwhile.
         if (folderManager.draft === opened && opened?.iconType === 'image' && opened.imgFile === before) opened.imgFile = saved
         return true
     }
