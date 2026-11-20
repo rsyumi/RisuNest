@@ -226,14 +226,6 @@ export const presetEditorDBState = {
     },
 }
 
-export function getSelectedPresetIndex(db: Database = DBState.db): number {
-    return db.botPresetsId
-}
-
-export function getSelectedPresetId(db: Database = DBState.db): string | undefined {
-    return db.botPresets?.[db.botPresetsId]?.id
-}
-
 /** The preset the mirrors hold: the chat's binding, then the chain pick, then the selection. */
 export function getAppliedPresetId(db: Database = DBState.db): string | undefined {
     void signal.applied
@@ -244,9 +236,4 @@ export function getAppliedPresetIndex(db: Database = DBState.db): number {
     const id = getAppliedPresetId(db)
     const index = id ? db.botPresets?.findIndex(preset => preset?.id === id) ?? -1 : -1
     return index < 0 ? db.botPresetsId : index
-}
-
-/** The preset `presetEditorDBState` edits: the selection while preset settings show, the applied preset otherwise. */
-export function getEditedPresetId(db: Database = DBState.db): string | undefined {
-    return isPresetEditorOpen() ? getSelectedPresetId(db) : getAppliedPresetId(db)
 }
