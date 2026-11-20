@@ -160,20 +160,21 @@ describe('character update', () => {
     it('updates only what the author changed, keeps the user edits and chats, and trashes the old card', async () => {
         platform.runtime = 'tauri'
         const lore = (comment: string) => ({ comment, key: comment, content: '' })
-        await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm', backgroundHTML: '<b>', globalLore: [lore('shared')] }), commitCharacter)
+        await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm', backgroundHTML: '<b>', globalLore: [lore('shared'), lore('dropped')], extentions: { color: 'red' } }), commitCharacter)
         mocks.details.get('first').personality = 'brave'
         const firstBase = mocks.details.get('first').extentions[UPDATE_BASE_EXTENSION_KEY]
         // A stored import may not carry a type yet, unlike the installed card.
-        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm', backgroundHTML: undefined, globalLore: [lore('shared')] })
+        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm', backgroundHTML: undefined, globalLore: [lore('shared'), lore('dropped')], extentions: { color: 'red' } })
         const pending = commitImportedCharacter(second as any, commitCharacter)
         await opened()
         expect(contentUpdateDialog.request?.candidates.map((candidate) => candidate.id)).toEqual(['first'])
         await reviewContentUpdate()
         expect(unresolvedItems(contentUpdateDialog.plan!)).toEqual([])
-        // A note and a lorebook entry saved while the old card is copied.
+        // While the old card is copied: a note saved, a lorebook entry and an extension value removed, an entry added.
         mocks.duringBackup = () => {
             mocks.details.get('first').notes = 'written meanwhile'
-            mocks.details.get('first').globalLore.push(lore('added meanwhile'))
+            mocks.details.get('first').globalLore.splice(1, 1, lore('added meanwhile'))
+            delete mocks.details.get('first').extentions.color
         }
         chooseContentUpdate('update')
         expect(await pending).toBe('first')
@@ -181,6 +182,7 @@ describe('character update', () => {
         const updated = mocks.details.get('first')
         expect(updated).toMatchObject({ name: 'Luna v1.1', desc: 'new', personality: 'brave', notes: 'written meanwhile', chats: [{ id: 'first-chat' }] })
         expect(updated.globalLore).toEqual([lore('shared'), lore('added meanwhile')])
+        expect(Object.keys(updated.extentions)).toEqual([UPDATE_BASE_EXTENSION_KEY])
         expect(updated).not.toHaveProperty('backgroundHTML')
         const backup = mocks.details.get('second')
         expect(backup).toMatchObject({ chaId: 'second', name: `Luna v1.0 ${language.risuNest.contentUpdate.backupSuffix}`, desc: 'old', personality: 'brave', chats: [{ id: 'second-chat' }] })
