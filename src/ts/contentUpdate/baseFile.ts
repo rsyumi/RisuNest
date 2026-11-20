@@ -71,7 +71,10 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
     const data = card.data
     // The card metadata the importers need, as the native CHARX reader checks it.
     if (!data || !isRecord(data.extensions) || (data.extensions.risuai !== undefined && !isRecord(data.extensions.risuai))) throw new UnsupportedUpdateBaseFileError()
-    const risu = data.extensions?.risuai
+    // The module of a CHARX gives the card its scripts, and a RisuAI block when it has none, as its import does.
+    const risu = module
+        ? { ...data.extensions.risuai, customScripts: module.regex ?? [], triggerscript: module.trigger ?? [] }
+        : data.extensions.risuai
     let lore: loreBook[] = module?.lorebook ?? []
     let loreSettings: character['loreSettings']
     let loreExt: unknown
@@ -101,8 +104,8 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         globalLore: lore,
         loreSettings,
         loreExt,
-        customscript: (module?.regex ?? risu?.customScripts ?? []) as customscript[],
-        triggerscript: (module?.trigger ?? risu?.triggerscript ?? []) as triggerscript[],
+        customscript: (risu?.customScripts ?? []) as customscript[],
+        triggerscript: (risu?.triggerscript ?? []) as triggerscript[],
         backgroundHTML: risu?.backgroundHTML,
         license: risu?.license,
         private: risu?.private ?? false,
