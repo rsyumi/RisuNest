@@ -37,6 +37,8 @@ const mocks = vi.hoisted(() => ({
     exportNativeCharacterCardFromPicker: vi.fn(),
     nextId: 0,
     destinationChosen: true,
+    /** The chunks a PNG card read yields, the image last. */
+    pngChunks: [] as unknown[],
     submitDelivery: vi.fn(async (_delivery: unknown) => {}),
 }))
 
@@ -120,6 +122,7 @@ vi.mock('./parser/parser.svelte', async () => (await import('./parser/parser.tes
 vi.mock('./process/files/inlays', () => ({ reencodeImage: vi.fn() }))
 vi.mock('./pngChunk', () => ({
     PngChunk: {
+        readGenerator: async function* () { yield* mocks.pngChunks },
         streamWriter: class {
             constructor(_image: Uint8Array, _writer: unknown) {}
             async init() {}
@@ -188,6 +191,10 @@ import { zipSync } from 'fflate'
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
 import { encodeRPack } from './rpack/rpack_js'
+import { alertInput } from './alert'
+import { AppendableBuffer } from './globalApi.svelte'
+import { hasher } from './parser/parser.svelte'
+import { decryptBuffer } from './util'
 import { readUpdateBaseFile } from './contentUpdate/baseFile'
 import { CHARACTER_UPDATE, UPDATE_BASE_EXTENSION_KEY, planUpdate } from './contentUpdate/merge'
 
@@ -204,6 +211,7 @@ describe('character card additions', () => {
         mocks.nativeDesktopResult = { kind: 'cancelled' }
         mocks.desktopPickerPaths = []
         mocks.status = null
+        mocks.pngChunks = []
         vi.clearAllMocks()
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertCardExport.mockResolvedValue({ type: 'cancelled' })
@@ -303,6 +311,33 @@ describe('character card additions', () => {
         await importCharacterProcess({ name: 'synthetic.json', data: new TextEncoder().encode(JSON.stringify(card)) })
         expect(mocks.alertConfirm).toHaveBeenCalled()
         expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
+    it('shows no password error when the import of a password card is declined', async () => {
+        const card = {
+            spec: 'chara_card_v2', spec_version: '2.0',
+            data: {
+                name: 'Synthetic', description: 'Description', first_mes: 'Hello',
+                personality: '', scenario: '', mes_example: '', creator_notes: '',
+                system_prompt: '', post_history_instructions: '', alternate_greetings: [],
+                tags: [], creator: '', character_version: '', extensions: { risuai: { lowLevelAccess: true } },
+            },
+        }
+        const base64 = (value: string) => Buffer.from(value).toString('base64')
+        vi.mocked(hasher).mockResolvedValueOnce('synthetic-hash')
+        vi.mocked(alertInput).mockResolvedValueOnce('synthetic-password')
+        vi.mocked(decryptBuffer).mockResolvedValueOnce(new TextEncoder().encode(JSON.stringify(card)))
+        mocks.alertConfirm.mockResolvedValue(false)
+        mocks.pngChunks = [
+            { key: 'chara', value: ['rcc', 'rccv1', base64('sealed'), 'synthetic-hash', base64(JSON.stringify({ usePassword: true }))].join('||') },
+            Object.assign(new AppendableBuffer(), { buffer: new Uint8Array([1]) }),
+        ]
+
+        await expect(importCharacterProcess({ name: 'locked.png', data: new Uint8Array([1]) })).resolves.toBeUndefined()
+        expect(decryptBuffer).toHaveBeenCalledWith(expect.anything(), 'synthetic-password')
+        expect(mocks.alertConfirm).toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+        expect(mocks.alertError).not.toHaveBeenCalled()
     })
 
     it.each(['legacy', 'chara_card_v2'])('leaves the success notice of a %s JSON card to a caller that shows its own result', async format => {

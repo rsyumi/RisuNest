@@ -520,9 +520,9 @@ async function importCharacterWithNotices<T extends boolean = false>(f: {
                             return getDatabase().characters.findIndex(
                                 (character) => character.chaId === importedId,
                             )
-                        } else {
-                            throw new Error('Error while importing')
                         }
+                        // A cancelled import, such as a declined update, installs nothing.
+                        return
                     } catch (error) {
                         alertError(language.errors.wrongPassword)
                         return
