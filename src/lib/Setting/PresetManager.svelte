@@ -55,6 +55,7 @@
     /** The first preset picked for a comparison, kept by identity so a reorder does not change it. */
     let comparePick = $state.raw<botPreset | null>(null)
     let diff = $state.raw<[botPreset, botPreset] | null>(null)
+    let diffModal = $state<{ handleClose(): void } | undefined>()
     let selectionName = $derived(DBState.db.botPresets[DBState.db.botPresetsId]?.name ?? '')
     let inherits = $derived(!boundId)
 
@@ -276,7 +277,8 @@
 </PresetListPopup>
 
 {#if diff}
-    <div class="contents" use:modalNavigation={{ close: () => (diff = null) }}>
-        <PromptDiffModal firstPreset={diff[0]} secondPreset={diff[1]} onClose={() => (diff = null)} />
+    <!-- Back and Escape close the comparison as its close button does, which keeps its view settings. -->
+    <div class="contents" use:modalNavigation={{ close: () => (diffModal ? diffModal.handleClose() : (diff = null)) }}>
+        <PromptDiffModal bind:this={diffModal} firstPreset={diff[0]} secondPreset={diff[1]} onClose={() => (diff = null)} />
     </div>
 {/if}

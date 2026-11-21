@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     cardExport: vi.fn(async () => ({ type: '', type2: '' })),
     download: vi.fn(async () => ({ data: {}, buf: null })),
     diff: vi.fn(),
+    diffClose: vi.fn(),
     close: vi.fn(),
 }))
 vi.mock('src/ts/stores.svelte', async () => {
@@ -28,8 +29,11 @@ vi.mock('src/ts/alert', () => ({
 }))
 vi.mock('src/ts/process/templates/templates', () => ({ prebuiltPresets: { OAI2: {} } }))
 vi.mock('../Others/PromptDiffModal.svelte', () => ({
-    default: (_anchor: unknown, props: { firstPreset: { name: string }; secondPreset: { name: string } }) =>
-        mocks.diff([props.firstPreset.name, props.secondPreset.name]),
+    default: (_anchor: unknown, props: { firstPreset: { name: string }; secondPreset: { name: string }; onClose(): void }) => {
+        mocks.diff([props.firstPreset.name, props.secondPreset.name])
+        // Its close button saves the view settings, then closes.
+        return { handleClose: () => { mocks.diffClose(); props.onClose() } }
+    },
 }))
 vi.mock('src/ts/storage/database.svelte', async () => {
     const { DBState } = await import('src/ts/stores.svelte')
@@ -167,6 +171,9 @@ it('compares two picked presets without changing the selection when prompt compa
     choose('Gamma').click()
     await vi.waitFor(() => expect(mocks.diff).toHaveBeenCalledWith(['Alpha', 'Gamma']))
     expect(DBState.db.botPresetsId).toBe(0)
+    // Escape closes the comparison as its close button does, leaving the preset list open.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    expect(mocks.diffClose).toHaveBeenCalled()
     expect(mocks.close).not.toHaveBeenCalled()
 })
 
