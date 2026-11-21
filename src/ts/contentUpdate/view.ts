@@ -39,7 +39,8 @@ export function updateItemName(item: UpdateItem): string {
     if (item.field === 'extentions') return item.key
     const value = (item.mine ?? item.theirs) as any
     if (Array.isArray(value)) return String(value[0] ?? '')
-    if (value && typeof value === 'object') return String(value.comment || value.name || value.key || '').trim()
+    // A regex without a name goes by its pattern, as the order item lists it.
+    if (value && typeof value === 'object') return String(value.comment || value.name || value.key || value.in || '').trim()
     return ''
 }
 
@@ -66,8 +67,9 @@ export function editableText(item: UpdateItem, side: 'mine' | 'theirs'): string 
     const key = editableKey(item)
     const value = side === 'mine' ? item.mine ?? item.theirs : item.theirs ?? item.mine
     if (key === null || value === undefined) return ''
-    if (key === '') return String(value ?? '')
-    return String((value as Record<string, unknown>)[key] ?? '')
+    // The other side may hold another shape, which has no text to start from.
+    const text = key === '' ? value : (value as Record<string, unknown> | null)?.[key]
+    return typeof text === 'string' ? text : ''
 }
 
 /** The item with the user's text in place: the rest of the entry comes from the user's version. */
@@ -128,10 +130,17 @@ export function updateSubgroupOf(item: UpdateItem, folders: Map<string, string>,
  * both sides. Internal ids and flags are left out so they do not match.
  */
 export function updateSearchText(item: UpdateItem, label: string): string {
-    const sides = isEditable(item)
+    const editable = isEditable(item)
+    const sides = editable
         ? [editableText(item, 'mine'), editableText(item, 'theirs')]
         : [updateValueText(item.mine), updateValueText(item.theirs)]
-    return [label, updateItemName(item), ...sides].join('\n').toLowerCase()
+    // The keys of a lore entry and the pattern of a regex, besides the text an editable item shows.
+    const keys = editable
+        ? [item.mine, item.theirs].flatMap((side) => isRecord(side)
+            ? ['key', 'secondkey', 'in'].map((key) => (side as Record<string, unknown>)[key]).filter((text) => typeof text === 'string')
+            : [])
+        : []
+    return [label, updateItemName(item), ...keys, ...sides].join('\n').toLowerCase()
 }
 
 export interface DiffLine {
