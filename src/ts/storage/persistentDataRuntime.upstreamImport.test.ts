@@ -296,7 +296,7 @@ describe('direct native upstream import publication',()=>{
         ['refresh',false],['uncertain',false],['refresh',true],['uncertain',true],
     ] as const)('retains read-only activation and resumes only after strict recovery: %s, account=%s',async(failure,account)=>{
         const h=await createHarness({pin:async()=>({publish:async()=>{},dispose:async()=>{}})})
-        const incoming={...makeDatabase(),username:'Imported after recovery'}
+        const incoming={...makeDatabase(),username:'Imported after recovery',globalChatVariables:{shared:'1'}}
         if(failure==='refresh') h.replaceDatabase.mockImplementationOnce(()=>{throw new Error('refresh failed')})
         else vi.mocked(h.store.replaceFromDatabase).mockImplementationOnce(async database=>{
             h.nativeCommit(database)
@@ -307,6 +307,8 @@ describe('direct native upstream import publication',()=>{
             : h.runtime.replacePersistentDatabase(incoming,'upstream-import',{upstreamImport:true,publishOfficial:true})
         if(account) await expect(operation).rejects.toMatchObject({code:'activation-outcome-unresolved',recoveryRequired:true})
         else await expect(operation).rejects.toThrow()
+        // The account restore hands over a candidate prepared as an upstream import.
+        if(account) expect(vi.mocked(h.store.replaceFromDatabase).mock.calls[0][0]).toMatchObject({explicitGlobalChatVariables:{shared:'1'}})
         expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
         expect(binding.resume).not.toHaveBeenCalled()
         await expect(retryCommittedWorkingSetRefreshWithContinuation(h.runtime)).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
@@ -322,7 +324,7 @@ describe('direct native upstream import publication',()=>{
         const h=await createHarness({pin})
         const incoming={...makeDatabase(),username:'Upstream import'}
         await expect(h.runtime.replacePersistentDatabase(incoming,'upstream-import',{upstreamImport:true,publishOfficial})).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})
-        expect(h.store.replaceFromDatabase).toHaveBeenCalledWith(expect.objectContaining({username:'Upstream import',explicitGlobalChatVariables:{}}),1,[],undefined,
+        expect(h.store.replaceFromDatabase).toHaveBeenCalledWith(expect.objectContaining({username:'Upstream import'}),1,[],undefined,
             {bindingAuthority:'9007199254740993',requestId:expect.any(String)})
         expect(binding.fence).toHaveBeenCalledOnce()
         expect(binding.resume).toHaveBeenCalledOnce()

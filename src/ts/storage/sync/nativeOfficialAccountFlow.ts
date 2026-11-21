@@ -30,7 +30,8 @@ export async function restoreNativeOfficialAccountCandidate(
     warnings: string[],
 ): Promise<{ revision: DataRevision }> {
     try {
-        const outcome = await runtime.replacePersistentDatabase(candidate, 'native-official-compatibility-restore', {
+        const { prepareUpstreamImport } = await import('../importedIdentity')
+        const outcome = await runtime.replacePersistentDatabase(prepareUpstreamImport(candidate), 'native-official-compatibility-restore', {
             upstreamImport: true,
             upstreamImportWarnings: warnings,
             expectedRevision,
