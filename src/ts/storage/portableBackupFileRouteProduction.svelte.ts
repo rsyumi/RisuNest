@@ -231,7 +231,8 @@ async function restoreBackupFromSource(
             let completedResult: NativeFileJobResult | undefined
             const cleanupSource = () => {
                 const cleanup: Promise<unknown>[] = []
-                if (input?.type === 'androidSpool') cleanup.push(discardAndroidSafSource(input.token))
+                // Every restore job claims its spool, so a completed restore leaves none to remove.
+                if (input?.type === 'androidSpool' && !completedResult) cleanup.push(discardAndroidSafSource(input.token))
                 if (selectedCustody) cleanup.push(invoke('native_portable_source_discard', { source: selectedCustody }))
                 return Promise.allSettled(cleanup)
             }
