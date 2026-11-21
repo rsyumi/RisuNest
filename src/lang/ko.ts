@@ -1940,7 +1940,7 @@ export const languageKorean = {
             textColor: '글자색',
             textAuto: '자동',
             textManual: '직접 선택',
-            clipped: '글자가 작아 일부가 잘립니다.',
+            clipped: '글자가 길어 일부가 잘립니다.',
             lowContrast: '글자가 잘 보이지 않을 수 있습니다.',
             delete: '폴더 삭제',
             deleteTitle: '폴더를 삭제하시겠습니까?',
