@@ -73,6 +73,11 @@ vi.mock('../stores.svelte', () => ({
     settingsOpen: writable(false),
     SettingsMenuIndex: writable(0),
     loadedStore: writable(true),
+    ShowRealmFrameStore: writable(''),
+    popUpEditorStore: { open: false },
+    irisStore: { open: false },
+    onboardingModalStore: { open: false },
+    customSideBarConfigDialogStore: { open: false },
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({ persistentWorkingSetInputBlocked: writable(false) }))
 vi.mock('../storage/database.svelte', () => ({ getDatabase: () => mocks.db, importPreset: mocks.preset }))
@@ -81,6 +86,7 @@ vi.mock('../characterCards', () => ({
     importCharacterPathInOperation: mocks.characterPath,
     importCharacterProcess: mocks.characterProcess,
     importPreparedNativeCharacterContent: mocks.nativeCharacter,
+    showRealmInfoStore: writable(null),
 }))
 vi.mock('../process/modules', () => ({
     importModuleData: mocks.moduleData,
@@ -103,6 +109,7 @@ import { alertStore } from '../alertQueue'
 import { setAppLockInputBlocked } from '../appLock/input'
 import { RISU_APP_INTERNAL_DRAG_TYPE } from '../dragTypes'
 import { failureReason } from '../gui/nativeFileJobDialogModel'
+import { closeTextEditorPopup, openTextEditorPopup, type TextEditorPopupRequest } from '../gui/textEditorPopup.svelte'
 import {
     cancelActiveNativeFileOperation,
     dismissNativeFileOperationOutcome,
@@ -116,6 +123,7 @@ import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
 import { NativeFileJobError } from '../storage/nativeFileJobs'
 import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'
 import { loadedStore, selectedCharID, settingsOpen, SettingsMenuIndex } from '../stores.svelte'
+import { appUpdateState } from '../update/state.svelte'
 import { handleAppDrop } from './drop'
 import { pluginInstallDialog } from './pluginInstall'
 import { installImportIntake, submitImportDelivery } from './intake'
@@ -124,6 +132,8 @@ import type { ImportIntakeDelivery, ImportSheetDecision, ImportSheetRequest } fr
 
 // The mocked store above is writable.
 const workingSetBlocked = persistentWorkingSetInputBlocked as Writable<boolean>
+const showUpdatePopup = (popupVisible: boolean) => appUpdateState.update(state => ({ ...state, popupVisible }))
+const editorRequest: TextEditorPopupRequest = { value: 'synthetic', save: () => true }
 
 const encode = (text: string) => new TextEncoder().encode(text)
 const dropped = (name: string, content = `synthetic ${name}`) => new File([encode(content)], name)
@@ -570,6 +580,18 @@ describe('holding', () => {
             loadedStore.set(false)
             return async () => loadedStore.set(true)
         }],
+        ['the library recovery screen', async () => {
+            workingSetBlocked.set(true)
+            return async () => workingSetBlocked.set(false)
+        }],
+        ['the update popup', async () => {
+            showUpdatePopup(true)
+            return async () => showUpdatePopup(false)
+        }],
+        ['a full-screen editor', async () => {
+            openTextEditorPopup(editorRequest)
+            return async () => closeTextEditorPopup(editorRequest)
+        }],
     ])('waits for %s before it starts', async (_, block) => {
         classify('card.png', { kind: 'character', format: 'png' })
         const unblock = await block()
@@ -720,6 +742,8 @@ describe('drops on the window', () => {
         setAppLockInputBlocked(false, false)
         loadedStore.set(true)
         workingSetBlocked.set(false)
+        showUpdatePopup(false)
+        closeTextEditorPopup(editorRequest)
     })
 
     it('shows the overlay during a file drag and imports the dropped files', async () => {
@@ -754,6 +778,8 @@ describe('drops on the window', () => {
         ['the app lock', () => setAppLockInputBlocked(true, false)],
         ['loading', () => loadedStore.set(false)],
         ['a blocked library', () => workingSetBlocked.set(true)],
+        ['the update popup', () => showUpdatePopup(true)],
+        ['a full-screen editor', () => openTextEditorPopup(editorRequest)],
     ])('does nothing during %s but still keeps the WebView from opening the file', async (_name, refuse) => {
         refuse()
         const over = dragEvent('dragover', [])
