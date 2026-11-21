@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { get } from 'svelte/store'
+import { get, toStore } from 'svelte/store'
 
 const navigation = vi.hoisted(() => ({ changeChar: vi.fn<(index: number) => Promise<boolean>>() }))
 vi.mock('src/ts/stores.svelte', async () => (await import('./openResult.testSupport')).importStoresModule())
@@ -150,6 +150,24 @@ describe('opening an import result', () => {
         await settled()
         expect(navigation.changeChar).toHaveBeenCalledOnce()
         expect(screen()).toEqual(before)
+    })
+
+    it.each([
+        ['the HypaV3 summaries closes', () => hypaV3ModalOpen.set(true), () => hypaV3ModalOpen.set(false)],
+        ['the Realm upload closes', () => ShowRealmFrameStore.set('character'), () => ShowRealmFrameStore.set('')],
+        ['the character is selected', () => hypaV3ModalOpen.set(true), () => selectedCharID.set(1)],
+    ] as const)('offers the other character again once %s', async (_, cover, uncover) => {
+        showWorkScreens(false)
+        cover()
+        // The outcome dialog reads this while it draws, so the offer must follow the screens it depends on.
+        const offered: boolean[] = []
+        const stop = toStore(() => canOpenImportResult({ kind: 'character', chaId: 'imported' })).subscribe(value => offered.push(value))
+        try {
+            uncover()
+            await vi.waitFor(() => expect(offered).toEqual([false, true]))
+        } finally {
+            stop()
+        }
     })
 
     it.each(Object.keys(workScreens) as (keyof typeof workScreens)[])('opens no other character over %s', async name => {
