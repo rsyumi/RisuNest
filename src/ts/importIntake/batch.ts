@@ -126,7 +126,8 @@ async function importCharacter(
         const index = await importCharacterProcess({ name: characterImportName(item), data, quiet: true })
         characterId = typeof index === 'number' ? getDatabase().characters[index]?.chaId ?? null : null
     } else {
-        const result = await importPreparedNativeCharacterContent({ source, displayName: characterImportName(item) }, nativeOptions(context))
+        // The native importer reads the format from the content, and an Android spool is claimed only under the name it recorded.
+        const result = await importPreparedNativeCharacterContent({ source, displayName: item.name }, nativeOptions(context))
         characterId = result.kind === 'imported' ? result.value : null
     }
     if (!characterId) return null

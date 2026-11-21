@@ -655,6 +655,21 @@ describe('Android shares', () => {
         expect(mocks.removed).toEqual([])
     })
 
+    it.each([
+        ['card.jpg', 'png'],
+        ['card.risunest', 'charx'],
+        ['card.png', 'jpeg-charx'],
+    ] as const)('hands a shared %s to the native importer under the name its spool records', async (name, format) => {
+        classify(name, { kind: 'character', format })
+        mocks.nativeCharacter.mockResolvedValueOnce({ kind: 'imported', value: 'shared-card' })
+        await submitImportDelivery({ origin: 'opened', sources: [spool('card-token', name, 'synthetic card')] })
+        expect(mocks.nativeCharacter).toHaveBeenCalledExactlyOnceWith(
+            { source: { type: 'androidSpool', token: 'card-token' }, displayName: name },
+            expect.anything(),
+        )
+        expect(outcomes).toEqual([expect.objectContaining({ state: 'succeeded', location: { kind: 'character', chaId: 'shared-card' } })])
+    })
+
     it('releases a lone shared backup when its restore is refused before it starts', async () => {
         classify('backup.risunest', { kind: 'backup', format: 'portable' })
         mocks.restoreAndroid.mockRejectedValueOnce(new NativeFileJobError('generation-active', 'generation-active'))
