@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
     duringBackup: null as (() => void) | null,
     /** Runs while a lorebook is brought to the current format. */
     duringNormalize: null as (() => void) | null,
+    /** Awaited before the installed character is read for a comparison. */
+    beforeRead: null as (() => Promise<void>) | null,
 }))
 const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
@@ -54,7 +56,8 @@ vi.mock('../characterCards', () => ({ convertCharbook: vi.fn() }))
 vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
 vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
     assetAliasCleanupTarget: (await import('../storage/deletedOwnerAssetCleanup.testSupport')).createAssetAliasCleanupTarget,
-    readPersistentCharacterDetail: async (id: string) => {
+    readPersistentCharacterDetail: async (id: string, reason: string) => {
+        if (reason === 'content-update-read') await mocks.beforeRead?.()
         const detail = mocks.details.get(id)
         if (!detail) return null
         const { chats: _chats, ...rest } = detail
@@ -152,6 +155,7 @@ beforeEach(() => {
     mocks.failing.clear()
     mocks.duringBackup = null
     mocks.duringNormalize = null
+    mocks.beforeRead = null
     mocks.alertError.mockClear()
     mocks.alertConfirm.mockReset().mockResolvedValue(true)
     alertStore.set({ type: 'none', msg: '' })
@@ -298,6 +302,31 @@ describe('character update', () => {
         expect(mocks.assets.size).toBe(assetsBefore)
         // The card reader saved its assets already; they go when nothing uses them.
         expect(await releasedKeys()).toEqual(['assets/third.png'])
+    })
+
+    it.each(['review', 'earlier file'] as const)('leaves the dialog of a later import alone when the %s read for an earlier import ends', async (step) => {
+        install(card('old', 'Luna', { desc: 'mine' }))
+        const first = commitImportedCharacter(card('first', 'Luna', { desc: 'first' }), commitCharacter)
+        await opened()
+        if (step === 'earlier file') await reviewContentUpdate()
+        let release!: () => void
+        const held = new Promise<void>((resolve) => { release = resolve })
+        if (step === 'review') mocks.beforeRead = () => held
+        else vi.mocked(selectSingleFile).mockReturnValueOnce(held.then(() => ({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v2', data: { name: 'Luna', description: 'mine', extensions: {} } })) })))
+        const stale = step === 'review' ? reviewContentUpdate() : loadContentUpdateBaseFile()
+        // Another import asks while the read waits, which ends the first one.
+        const second = commitImportedCharacter(card('second', 'Luna', { desc: 'second' }), commitCharacter)
+        expect(await first).toBeNull()
+        await vi.waitFor(() => expect(contentUpdateDialog.request?.incomingName).toBe('Luna'))
+        expect(contentUpdateDialog.step).toBe('choose')
+        mocks.beforeRead = null
+        release()
+        await stale
+        expect(contentUpdateDialog).toMatchObject({ step: 'choose', plan: null, busy: false, baseSource: { kind: 'none' } })
+        await reviewContentUpdate()
+        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.theirs])).toEqual([['desc', 'second']])
+        chooseContentUpdate('cancel')
+        expect(await second).toBeNull()
     })
 
     it('asks about the assets an earlier file does not carry, ones the user removed or reordered too', async () => {

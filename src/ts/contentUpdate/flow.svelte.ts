@@ -258,8 +258,9 @@ export function selectContentUpdateTarget(id: string) {
 /** Compares the chosen entity with the import and opens the review step. */
 export async function reviewContentUpdate() {
     const dialog = contentUpdateDialog
-    if (!pending || dialog.busy) return
-    const { entity, incoming } = pending
+    const session = pending
+    if (!session || dialog.busy) return
+    const { entity, incoming } = session
     const target = dialog.target
     dialog.busy = true
     dialog.error = ''
@@ -268,7 +269,8 @@ export async function reviewContentUpdate() {
         if (!value) throw new Error(language.errors.noData)
         const base = await loadUpdateBase(entity, entity.baseKey(value))
         const mine = await entity.normalize(value)
-        if (!pending || dialog.target !== target) return
+        // Another import may have opened the dialog meanwhile.
+        if (pending !== session || dialog.target !== target) return
         dialog.plan = planUpdate(entity.spec, mine, incoming, base)
         dialog.baseSource = { kind: base ? 'record' : 'none' }
         dialog.folders = loreFolderNames((mine as any).globalLore ?? (mine as any).lorebook, (incoming as any).globalLore ?? (incoming as any).lorebook)
@@ -279,9 +281,9 @@ export async function reviewContentUpdate() {
         dialog.targetBusy = entity.busy(target)
         dialog.step = 'review'
     } catch (error) {
-        dialog.error = error instanceof Error ? error.message : String(error)
+        if (pending === session) dialog.error = error instanceof Error ? error.message : String(error)
     } finally {
-        dialog.busy = false
+        if (pending === session) dialog.busy = false
     }
 }
 
@@ -324,11 +326,13 @@ export function chooseContentUpdateMany(ids: string[], side: UpdateSide) {
  */
 export async function loadContentUpdateBaseFile() {
     const dialog = contentUpdateDialog
-    if (!pending || dialog.busy) return
+    const session = pending
+    if (!session || dialog.busy) return
     const { selectSingleFile } = await import('../util')
     const file = await selectSingleFile(['charx', 'png', 'json', 'lorebook', 'risum', 'jpg', 'jpeg'])
-    if (!file || !pending) return
-    const { entity, incoming } = pending
+    // Another import may have opened the dialog meanwhile.
+    if (!file || pending !== session || dialog.busy) return
+    const { entity, incoming } = session
     const target = dialog.target
     dialog.busy = true
     dialog.error = ''
@@ -339,6 +343,7 @@ export async function loadContentUpdateBaseFile() {
         // The card readers load only when a file is chosen.
         const { readUpdateBaseFile } = await import('./baseFile')
         const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
+        if (pending !== session || dialog.target !== target) return
         const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
         const ids = new Set(plan.items.map((item) => item.id))
         dialog.plan = plan
@@ -350,11 +355,11 @@ export async function loadContentUpdateBaseFile() {
             () => false,
         )
         const text = language.risuNest.contentUpdate
-        dialog.error = unsupported
+        if (pending === session) dialog.error = unsupported
             ? text.baseFileUnsupported
             : `${text.baseFileFailed} ${error instanceof Error ? error.message : String(error)}`
     } finally {
-        dialog.busy = false
+        if (pending === session) dialog.busy = false
     }
 }
 
