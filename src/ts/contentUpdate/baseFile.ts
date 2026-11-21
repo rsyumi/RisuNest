@@ -12,6 +12,7 @@ import { convertJsonToModule } from '../process/moduleImportLocation'
 import { decodeImportUtf8 } from '../importUtf8'
 import { normalizeOnboarding } from '../onboarding'
 import { decodeRPack } from '../rpack/rpack_js'
+import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
 
 // Reads an earlier version of a character or module file as the base of an
 // update, without installing it or saving its assets. Only the text the card
@@ -41,17 +42,34 @@ async function cardFromPng(data: Uint8Array): Promise<Card> {
     return JSON.parse(text(Buffer.from(encoded, 'base64')))
 }
 
-function unzipCharx(data: Uint8Array) {
-    const filter = (file: { name: string }) => file.name === 'card.json' || file.name === 'module.risum'
-    try {
-        return unzipSync(data, { filter })
-    } catch (error) {
-        // A JPEG with a CHARX appended: read from the first local file header.
-        for (let i = 0; i + 3 < data.length; i++) {
-            if (data[i] === 0x50 && data[i + 1] === 0x4b && data[i + 2] === 3 && data[i + 3] === 4) return unzipSync(data.subarray(i), { filter })
-        }
-        throw error
+function unzipCharx(data: Uint8Array): Record<string, Uint8Array> {
+    const filter = (file: { name: string, originalSize: number }) => {
+        if (file.name !== 'card.json' && file.name !== 'module.risum') return false
+        // The importer refuses a card or module larger than this, so it is not inflated here.
+        if (file.originalSize > MAX_CONTENT_METADATA_BYTES) throw new UnsupportedUpdateBaseFileError()
+        return true
     }
+    let failure: unknown = null
+    const read = (from: number) => {
+        try {
+            const files = unzipSync(from ? data.subarray(from) : data, { filter })
+            if (files['card.json']) return files
+        } catch (error) {
+            if (error instanceof UnsupportedUpdateBaseFileError) throw error
+            failure ??= error
+        }
+        return null
+    }
+    const whole = read(0)
+    if (whole) return whole
+    // A JPEG with a CHARX appended: read from the local file header the CHARX starts at, past image bytes that look like one.
+    for (let i = 1; i + 3 < data.length; i++) {
+        if (data[i] !== 0x50 || data[i + 1] !== 0x4b || data[i + 2] !== 3 || data[i + 3] !== 4) continue
+        const files = read(i)
+        if (files) return files
+    }
+    if (failure) throw failure
+    return {}
 }
 
 /** The module record of a RISUM file, without its assets. */

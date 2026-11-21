@@ -113,6 +113,23 @@ describe('readUpdateBaseFile', () => {
         expect(asModule.lorebook.map((entry: any) => entry.comment)).toContain('From Character Description')
     })
 
+    it('reads the CHARX a JPEG carries after image bytes that look like a ZIP header', async () => {
+        const charx = zipSync({ 'card.json': encode(cardV3) })
+        const image = Uint8Array.from([0xff, 0xd8, 0x50, 0x4b, 3, 4, 0, 0, 0, 0, 0xff, 0xd9])
+        const data = new Uint8Array(image.length + charx.length)
+        data.set(image)
+        data.set(charx, image.length)
+        expect(await readUpdateBaseFile('character', { name: 'Luna.jpg', data })).toMatchObject({ name: 'Luna' })
+    })
+
+    it('refuses a CHARX whose card is larger than the importer takes, without inflating it', async () => {
+        const data = zipSync({ 'card.json': encode(cardV3) })
+        // The central directory entry names the size the card inflates to.
+        const entry = data.findIndex((_, at) => data[at] === 0x50 && data[at + 1] === 0x4b && data[at + 2] === 1 && data[at + 3] === 2)
+        new DataView(data.buffer, data.byteOffset).setUint32(entry + 24, 0xffffffff, true)
+        await expect(readUpdateBaseFile('character', { name: 'Luna.charx', data })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
+    })
+
     it('reads a module file without the install bookkeeping of another install', async () => {
         const module = { name: 'Lore', description: 'd', id: 'other-install', updateLineage: 'file', updateBase: 'assets/x.json', assets: [['a', 'assets/a.png', 'png']], lorebook: [] }
         expect(await readUpdateBaseFile('module', { name: 'Lore.risum', data: await risum(module) })).toEqual({ name: 'Lore', description: 'd', lorebook: [] })
