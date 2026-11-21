@@ -14,6 +14,7 @@
         persistentWorkingSetInputBlocked,
     } from 'src/ts/storage/persistentDataRuntime.svelte'
     import { alertError } from 'src/ts/alert'
+    import { PersistentMutationFencedError } from 'src/ts/storage/saveCoordinator'
     import { refreshAuthorNoteCopy } from 'src/ts/chatBindings.svelte'
     let recovering = new Set<string>()
     $effect(() => {
@@ -78,7 +79,10 @@
         // Follows the bound preset being added, removed or replaced by its stored body.
         if (id) void isLoadedPreset(db, id)
         if (!db || $doingChat || $persistentWorkingSetInputBlocked) return
-        untrack(() => applyConversationPresetBinding(db, chat)).catch((error) => console.error(error))
+        // A replacement that fences writes runs this again once it ends.
+        untrack(() => applyConversationPresetBinding(db, chat)).catch((error) => {
+            if (!(error instanceof PersistentMutationFencedError)) console.error(error)
+        })
     })
     // Runs when another conversation is selected or finishes loading, not on every preset edit.
     $effect(() => {
