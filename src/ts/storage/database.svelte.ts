@@ -2175,8 +2175,8 @@ export async function activatePresetOverride(id: string | null): Promise<void> {
         return
     }
     if (!db.botPresets.some(preset => preset?.id === id)) throw new Error('Preset was not found')
-    // A replacement during the read applies the preset as the new library holds it.
-    if (!await applyPresetBody(db, id, () => setEffectivePresetOverride(id, db))) return activatePresetOverride(id)
+    // A replacement during or after the read applies the preset as the new library holds it.
+    if (!await applyPresetBody(db, id, () => setEffectivePresetOverride(id, db)) || getDatabase() !== db) return activatePresetOverride(id)
 }
 
 /** The preset ID a conversation binds when it names a preset in the library; summary stubs carry no binding. */

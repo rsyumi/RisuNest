@@ -96,13 +96,14 @@ describe('preset chain override activation', () => {
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 
-    it('activates the preset the chain named when a library in another order replaces this one first', async () => {
-        getDatabase().presetChain = 'Preset B'
+    it('activates the preset the chain of a library in another order names when it replaces this one first', async () => {
+        getDatabase().presetChain = 'Preset A'
 
-        await activatePresetChainForRequest(getDatabase(), activatePresetOverride, () => 0, vi.fn(), async () => {
+        await activatePresetChainForRequest(getDatabase, activatePresetOverride, () => 0, vi.fn(), async () => {
             const reordered = presetDatabase()
             reordered.botPresets.reverse()
             reordered.botPresetsId = 1
+            reordered.presetChain = 'Preset B'
             setDatabase(reordered)
             return false
         })
@@ -317,6 +318,27 @@ describe('conversation preset binding', () => {
         expect(getDatabase().botPresets[1].mainPrompt).toBe('Replacement B')
         expect(getEffectivePresetId()).toBe('preset-b')
         expect(getDatabase().mainPrompt).toBe('Replacement B')
+    })
+
+    it.each(['chain', 'request'] as const)('applies the preset again to a library that replaced this one right after the read (%s)', async (path) => {
+        const owner = () => [{ type: 'character', chaId: 'character', name: 'Character', chatPage: 0,
+            chats: [conversation('target', 'preset-b')] } as unknown as character]
+        const replacement = presetDatabase()
+        summarizePresetB(replacement)
+        replacement.characters = owner()
+        summarizePresetB()
+        getDatabase().characters = owner()
+        runtime.pausedWrites.mockImplementationOnce(async (operation) => {
+            const result = await operation()
+            // A replacement queued behind the read is installed before the activation resumes.
+            setDatabase(replacement)
+            return result
+        })
+        await (path === 'chain' ? activatePresetOverride('preset-b')
+            : activateRequestPresetBinding({ characterId: 'character', conversationId: 'target' }))
+
+        expect(getEffectivePresetId()).toBe('preset-b')
+        expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
 })
 

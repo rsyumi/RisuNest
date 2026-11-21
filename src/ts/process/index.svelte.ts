@@ -1051,7 +1051,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     if (hasMismatchedActiveConversationSession()) return false
 
     await activatePresetChainForRequest(
-        DBState.db,
+        () => DBState.db,
         activatePresetOverride,
         Math.random,
         (name) => alertToast(`Cannot find preset: ${name}`),
