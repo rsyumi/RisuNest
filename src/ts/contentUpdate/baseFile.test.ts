@@ -12,6 +12,7 @@ vi.mock('../characterCards', () => ({
     convertOffSpecCards: (card: any) => ({ name: card.name, desc: card.description, firstMessage: card.first_mes, image: undefined }),
 }))
 vi.mock('../characters', () => ({ createBlankChar: vi.fn() }))
+vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
 vi.mock('../globalApi.svelte', async () => ({ ...await import('../appendableBuffer'), VirtualWriter: class {} }))
 vi.mock('../util', () => ({ blobToUint8Array: vi.fn() }))
 

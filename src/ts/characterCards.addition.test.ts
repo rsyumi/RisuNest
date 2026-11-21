@@ -47,7 +47,7 @@ vi.mock('./characters', () => ({
     commitDetachedCharacter: mocks.commitDetachedCharacter,
 }))
 vi.mock('./storage/database.svelte', () => ({
-    defaultSdDataFunc: () => ({}),
+    defaultSdDataFunc: () => [['always', 'synthetic']],
     appVer: '0.0.0',
     getDatabase: () => mocks.database,
 }))
@@ -183,9 +183,13 @@ import {
     runSharedNativeFileOperation,
     type NativeFileOperationOutcome,
 } from './storage/nativeFileJobManager'
+import { readFileSync } from 'node:fs'
+import { zipSync } from 'fflate'
 import { get } from 'svelte/store'
 import { language } from 'src/lang'
-import { UPDATE_BASE_EXTENSION_KEY } from './contentUpdate/merge'
+import { encodeRPack } from './rpack/rpack_js'
+import { readUpdateBaseFile } from './contentUpdate/baseFile'
+import { CHARACTER_UPDATE, UPDATE_BASE_EXTENSION_KEY, planUpdate } from './contentUpdate/merge'
 
 describe('character card additions', () => {
     beforeEach(() => {
@@ -1161,6 +1165,34 @@ describe('character card additions', () => {
         }
         const imported = await importCharacterCardSpec(structuredClone(card), undefined, 'normal', {}, null, true)
         expect(imported && imported.globalLore[0]).toMatchObject({ key: 'synthetic', content: '' })
+    })
+
+    it('reads a card file as an earlier version with every field an import of it stores', async () => {
+        // No RisuAI extension, so the import fills each of its defaults.
+        const card = { spec: 'chara_card_v3', spec_version: '3.0', data: { name: 'Luna', description: 'd', first_mes: 'hi', extensions: {} } }
+        const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value))
+        const imported = await importCharacterCardSpec(structuredClone(card) as any, undefined, 'normal', {}, null, true)
+        const read = await readUpdateBaseFile('character', { name: 'Luna.json', data: encode(card) })
+        expect(imported).toBeTruthy()
+        expect(planUpdate(CHARACTER_UPDATE, read as object, imported as object, null).items.map((item) => item.field)).toEqual([])
+
+        // As a CHARX, its module gives the card a RisuAI block, and takes the place of the scripts of a card that has one.
+        const script = { comment: 'r', in: 'a', out: 'b', type: 'editoutput' }
+        const scripted = { ...card, data: { ...card.data, extensions: { risuai: { customScripts: [script] } } } }
+        const map = readFileSync('src/ts/rpack/rpack_map.bin')
+        await withFetch(() => ({ arrayBuffer: async () => map.buffer.slice(map.byteOffset, map.byteOffset + map.byteLength) }), async () => {
+            for (const [embedding, module] of [[card, { regex: [script] }], [scripted, {}]] as const) {
+                const packed = await encodeRPack(encode({ type: 'risuModule', module: { name: 'Luna', id: 'm', ...module } }))
+                const risum = new Uint8Array(6 + packed.length)
+                risum[0] = 111
+                new DataView(risum.buffer).setUint32(2, packed.length, true)
+                risum.set(packed, 6)
+                const earlier = await readUpdateBaseFile('character', { name: 'Luna.charx', data: zipSync({ 'card.json': encode(embedding), 'module.risum': risum }) })
+                const mapped = await mapPreparedNativeCharacterCard({ card: structuredClone(embedding) as any, assets: [], module: module as any })
+                expect(mapped).toBeTruthy()
+                expect(planUpdate(CHARACTER_UPDATE, earlier as object, mapped as object, null).items.map((item) => item.field)).toEqual([])
+            }
+        })
     })
 
     it('stops a Realm download or preview from a blocked creator before anything is downloaded', async () => {

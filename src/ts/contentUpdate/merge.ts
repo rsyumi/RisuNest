@@ -346,7 +346,8 @@ function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknow
         const own = mineMap.get(key)
         const other = theirsMap.get(key)
         const choice = choices.get(key)
-        if (!choice) return own ?? other
+        // Without a choice both sides had the same entry when they were compared: one removed since stays removed.
+        if (!choice) return own
         if (typeof choice === 'object') return keepId(choice.value, own)
         return choice === 'mine' ? own : keepId(other, own)
     }
@@ -397,7 +398,7 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
             const mineMap = mapEntries(m), theirsMap = mapEntries(t)
             for (const key of new Set([...mineMap.keys(), ...theirsMap.keys()])) {
                 const side = silentKeys.has(key) && theirsMap.has(key) ? 'theirs' : fieldChoices.get(key)
-                const value = typeof side === 'object' ? side.value : side === 'theirs' ? theirsMap.get(key) : side === 'mine' ? mineMap.get(key) : mineMap.get(key) ?? theirsMap.get(key)
+                const value = typeof side === 'object' ? side.value : side === 'theirs' ? theirsMap.get(key) : mineMap.get(key)
                 if (value !== undefined) out[key] = value
             }
             result[field] = out

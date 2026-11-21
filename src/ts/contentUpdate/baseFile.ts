@@ -2,7 +2,7 @@
 
 import { Buffer } from 'buffer'
 import { unzipSync } from 'fflate'
-import type { character, customscript, loreBook, triggerscript } from '../storage/database.svelte'
+import { defaultSdDataFunc, type character, type customscript, type loreBook, type triggerscript } from '../storage/database.svelte'
 import { AppendableBuffer } from '../appendableBuffer'
 import { PngChunk } from '../pngChunk'
 import { convertCharbook, convertOffSpecCards } from '../characterCards'
@@ -71,7 +71,10 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
     const data = card.data
     // The card metadata the importers need, as the native CHARX reader checks it.
     if (!data || !isRecord(data.extensions) || (data.extensions.risuai !== undefined && !isRecord(data.extensions.risuai))) throw new UnsupportedUpdateBaseFileError()
-    const risu = data.extensions?.risuai
+    // The module of a CHARX gives the card its scripts, and a RisuAI block when it has none, as its import does.
+    const risu = module
+        ? { ...data.extensions.risuai, customScripts: module.regex ?? [], triggerscript: module.trigger ?? [] }
+        : data.extensions.risuai
     let lore: loreBook[] = module?.lorebook ?? []
     let loreSettings: character['loreSettings']
     let loreExt: unknown
@@ -101,8 +104,8 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         globalLore: lore,
         loreSettings,
         loreExt,
-        customscript: (module?.regex ?? risu?.customScripts ?? []) as customscript[],
-        triggerscript: (module?.trigger ?? risu?.triggerscript ?? []) as triggerscript[],
+        customscript: (risu?.customScripts ?? []) as customscript[],
+        triggerscript: (risu?.triggerscript ?? []) as triggerscript[],
         backgroundHTML: risu?.backgroundHTML,
         license: risu?.license,
         private: risu?.private ?? false,
@@ -123,9 +126,9 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         prebuiltAssetExclude: risu?.prebuiltAssetExclude ?? [],
         prebuiltAssetStyle: risu?.prebuiltAssetStyle ?? '',
         bias: risu?.bias,
-        viewScreen: risu?.viewScreen,
-        utilityBot: risu?.utilityBot,
-        sdData: risu?.sdData,
+        viewScreen: risu?.viewScreen ?? 'none',
+        utilityBot: risu?.utilityBot ?? false,
+        sdData: risu?.sdData ?? defaultSdDataFunc(),
     }
     if (card.spec === 'chara_card_v3') {
         char.nickname = data.nickname ?? ''

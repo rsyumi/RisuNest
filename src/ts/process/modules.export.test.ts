@@ -58,7 +58,8 @@ vi.mock('../util', () => ({
 }))
 vi.mock('uuid', () => ({ v4: () => 'roundtrip-module-id' }))
 vi.mock('./lorebook.svelte', () => ({ convertExternalLorebook: vi.fn() }))
-vi.mock('../stores.svelte', () => ({
+vi.mock('../stores.svelte', async () => ({
+    alertStore: (await import('../alertQueue')).alertStore,
     DBState: { db: { modules: [] } },
     HideIconStore: { set: vi.fn() },
     moduleBackgroundEmbedding: { set: vi.fn() },

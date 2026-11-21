@@ -44,11 +44,7 @@ function updateHostOf(updateURL: string): string | undefined {
 }
 
 /** Reads a plugin file's header, or says why it cannot be installed. */
-export function inspectPluginFile(
-    _name: string,
-    code: string,
-    _isTypescript: boolean,
-): { header: ImportIntakePluginHeader } | { refusal: ImportIntakeRefusal } {
+export function inspectPluginFile(code: string): { header: ImportIntakePluginHeader } | { refusal: ImportIntakeRefusal } {
     // Other header problems are reported by importPlugin when the user installs.
     const { header } = parsePluginHeader(stripPluginBom(code))
     if (!header.name) return { refusal: { code: 'unsupported-format' } }

@@ -316,7 +316,7 @@ async function readPluginCandidate(item: Omit<ImportIntakeItem, 'kind'>, file: F
     if (file.size > MAX_CONTENT_METADATA_BYTES) return { ...candidate, kind: 'unsupported', refusal: tooLargeRefusal() }
     try {
         const code = await file.text()
-        const inspected = inspectPluginFile(file.name, code, isTypescript)
+        const inspected = inspectPluginFile(code)
         if ('refusal' in inspected) {
             return {
                 ...candidate,

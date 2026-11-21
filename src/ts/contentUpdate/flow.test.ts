@@ -10,6 +10,10 @@ const mocks = vi.hoisted(() => ({
     missingTarget: false,
     /** Write reasons that fail. */
     failing: new Set<string>(),
+    /** Runs while the trashed copy of the installed character is written. */
+    duringBackup: null as (() => void) | null,
+    /** Runs while a lorebook is brought to the current format. */
+    duringNormalize: null as (() => void) | null,
 }))
 const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
@@ -24,13 +28,30 @@ vi.mock('../globalApi.svelte', () => ({
         return key
     },
 }))
-vi.mock('../alert', () => ({ alertClear: vi.fn(), alertError: mocks.alertError, alertConfirm: mocks.alertConfirm }))
-vi.mock('../stores.svelte', () => ({ DBState: { db: mocks.db } }))
-vi.mock('../characters', () => ({ updateLorebooks: (books: unknown[]) => books }))
+// The alerts go through the app's queue, so a test reads what the screen shows.
+vi.mock('../alert', async () => {
+    const { alertStore } = await import('../alertQueue')
+    return {
+        alertClear: () => alertStore.clearStatus(),
+        alertError: (msg: string) => {
+            mocks.alertError(msg)
+            alertStore.set({ type: 'error', msg })
+        },
+        alertConfirm: mocks.alertConfirm,
+    }
+})
+vi.mock('../stores.svelte', async () => ({ DBState: { db: mocks.db }, alertStore: (await import('../alertQueue')).alertStore }))
+vi.mock('../characters', () => ({
+    updateLorebooks: (books: unknown[]) => {
+        mocks.duringNormalize?.()
+        return books
+    },
+}))
 vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
 // The earlier-file reader's lorebook converter, without the app state its module loads.
 vi.mock('../characterCards', () => ({ convertCharbook: vi.fn() }))
+vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
 vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
     assetAliasCleanupTarget: (await import('../storage/deletedOwnerAssetCleanup.testSupport')).createAssetAliasCleanupTarget,
     readPersistentCharacterDetail: async (id: string) => {
@@ -46,20 +67,23 @@ vi.mock('../storage/persistentDataRuntime.svelte', async () => ({
         const character = structuredClone(detail)
         mutate({ root: mocks.root, character })
         mocks.details.set(id, editableDetail(detail, character))
+        if (reason === 'content-update-backup') mocks.duringBackup?.()
         return true
     },
-    mutateCharacterDetailFields: async (id: string, reason: string, mutate: (state: any) => void) => {
+    mutateCharacterDetailFields: async (id: string, reason: string, mutate: (state: any) => void | Promise<void>) => {
         const detail = mocks.details.get(id)
         if (mocks.failing.has(reason)) throw new Error('write failed')
         if (!detail || mocks.missingTarget) return false
         const character = structuredClone(detail)
-        mutate({ character })
+        await mutate({ character })
         mocks.details.set(id, editableDetail(detail, character))
         return true
     },
 }))
 
+import { get } from 'svelte/store'
 import { language } from 'src/lang'
+import { alertStore } from '../alertQueue'
 import { UPDATE_BASE_EXTENSION_KEY, markModuleImport, unresolvedItems } from './merge'
 import {
     chooseContentUpdate,
@@ -105,6 +129,9 @@ async function releasedKeys() {
     return (call[1] as { owner: { keys: string[] } }).owner.keys
 }
 
+/** The loading notice an import shows while it reads its file. */
+const reading = { type: 'wait', msg: 'Loading... (Reading)' } as const
+
 async function opened() {
     await vi.waitFor(() => expect(contentUpdateDialog.request).not.toBeNull())
 }
@@ -123,8 +150,12 @@ beforeEach(() => {
     mocks.db.enabledModules = []
     mocks.missingTarget = false
     mocks.failing.clear()
+    mocks.duringBackup = null
+    mocks.duringNormalize = null
     mocks.alertError.mockClear()
     mocks.alertConfirm.mockReset().mockResolvedValue(true)
+    alertStore.set({ type: 'none', msg: '' })
+    alertStore.clearStatus()
     platform.runtime = 'web'
     core.invoke.mockClear()
     commitCharacter.mockClear()
@@ -146,21 +177,37 @@ describe('character update', () => {
 
     it('updates only what the author changed, keeps the user edits and chats, and trashes the old card', async () => {
         platform.runtime = 'tauri'
-        await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm', backgroundHTML: '<b>' }), commitCharacter)
+        const lore = (comment: string) => ({ comment, key: comment, content: '' })
+        await commitImportedCharacter(card('first', 'Luna v1.0', { desc: 'old', personality: 'calm', backgroundHTML: '<b>', globalLore: [lore('shared'), lore('dropped')], extentions: { color: 'red' } }), commitCharacter)
         mocks.details.get('first').personality = 'brave'
         const firstBase = mocks.details.get('first').extentions[UPDATE_BASE_EXTENSION_KEY]
         // A stored import may not carry a type yet, unlike the installed card.
-        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm', backgroundHTML: undefined })
+        const { type: _type, ...second } = card('second', 'Luna v1.1', { desc: 'new', personality: 'calm', backgroundHTML: undefined, globalLore: [lore('shared'), lore('dropped')], extentions: { color: 'red' } })
+        alertStore.set(reading)
         const pending = commitImportedCharacter(second as any, commitCharacter)
         await opened()
+        expect(get(alertStore).type).toBe('none')
         expect(contentUpdateDialog.request?.candidates.map((candidate) => candidate.id)).toEqual(['first'])
         await reviewContentUpdate()
         expect(unresolvedItems(contentUpdateDialog.plan!)).toEqual([])
+        // While the old card is copied: a note saved, a lorebook entry and an extension value removed, an entry added.
+        let shownWhileWritten: unknown
+        mocks.duringBackup = () => {
+            shownWhileWritten = get(alertStore)
+            mocks.details.get('first').notes = 'written meanwhile'
+            mocks.details.get('first').globalLore.splice(1, 1, lore('added meanwhile'))
+            delete mocks.details.get('first').extentions.color
+        }
         chooseContentUpdate('update')
         expect(await pending).toBe('first')
+        // The import's loading notice covers the screen again until the update is written.
+        expect(shownWhileWritten).toBe(reading)
+        expect(get(alertStore).type).toBe('none')
 
         const updated = mocks.details.get('first')
-        expect(updated).toMatchObject({ name: 'Luna v1.1', desc: 'new', personality: 'brave', chats: [{ id: 'first-chat' }] })
+        expect(updated).toMatchObject({ name: 'Luna v1.1', desc: 'new', personality: 'brave', notes: 'written meanwhile', chats: [{ id: 'first-chat' }] })
+        expect(updated.globalLore).toEqual([lore('shared'), lore('added meanwhile')])
+        expect(Object.keys(updated.extentions)).toEqual([UPDATE_BASE_EXTENSION_KEY])
         expect(updated).not.toHaveProperty('backgroundHTML')
         const backup = mocks.details.get('second')
         expect(backup).toMatchObject({ chaId: 'second', name: `Luna v1.0 ${language.risuNest.contentUpdate.backupSuffix}`, desc: 'old', personality: 'brave', chats: [{ id: 'second-chat' }] })
@@ -174,6 +221,13 @@ describe('character update', () => {
 
     it('asks about every difference without a base and applies the picks', async () => {
         install(card('old', 'Luna', { desc: 'mine', scenario: 'same' }))
+        // A notice that is not a loading one does not come back after the dialog.
+        alertStore.set({ type: 'toast', msg: 'saved' })
+        let shownWhileStored: unknown
+        commitCharacter.mockImplementationOnce(async (value) => {
+            shownWhileStored = get(alertStore).type
+            install(value)
+        })
         const pending = commitImportedCharacter(card('next', 'Luna Beta', { desc: 'theirs', scenario: 'same' }), commitCharacter)
         await opened()
         await reviewContentUpdate()
@@ -184,23 +238,33 @@ describe('character update', () => {
         setContentUpdateChoice('desc', 'theirs')
         chooseContentUpdate('update')
         expect(await pending).toBe('old')
+        expect(shownWhileStored).toBe('none')
         expect(mocks.details.get('old')).toMatchObject({ name: 'Luna', desc: 'theirs' })
     })
 
     it('installs the import as new or not at all when the user says so', async () => {
         install(card('old', 'Luna'))
+        alertStore.set(reading)
+        let shownWhileStored: unknown
+        commitCharacter.mockImplementationOnce(async (value) => {
+            shownWhileStored = get(alertStore)
+            install(value)
+        })
         const asNew = commitImportedCharacter(card('next', 'Luna v2'), commitCharacter)
         await opened()
         chooseContentUpdate('new')
         expect(await asNew).toBe('next')
+        expect(shownWhileStored).toBe(reading)
         expect(mocks.details.get('old').name).toBe('Luna')
 
         platform.runtime = 'tauri'
         const assetsBefore = mocks.assets.size
+        alertStore.set(reading)
         const cancelled = commitImportedCharacter(card('third', 'Luna v3', { image: 'assets/third.png' }), commitCharacter)
         await opened()
         chooseContentUpdate('cancel')
         expect(await cancelled).toBeNull()
+        expect(get(alertStore).type).toBe('none')
         expect(mocks.details.has('third')).toBe(false)
         expect(mocks.assets.size).toBe(assetsBefore)
         // The card reader saved its assets already; they go when nothing uses them.
@@ -304,6 +368,7 @@ describe('character update', () => {
         ['cannot be written and the import not restored', () => { mocks.failing.add('content-update').add('content-update-restore') }, false],
     ])('keeps the import as a new character only once it is back, when the installed one %s', async (_case, fail, restored) => {
         install(card('old', 'Luna', { desc: 'a' }))
+        alertStore.set(reading)
         const pending = commitImportedCharacter(card('next', 'Luna v2', { desc: 'b' }), commitCharacter)
         await opened()
         await reviewContentUpdate()
@@ -312,6 +377,8 @@ describe('character update', () => {
         chooseContentUpdate('update')
         expect(await pending).toBe(restored ? 'next' : null)
         expect(mocks.alertError).toHaveBeenCalledOnce()
+        // The failure stays on screen when the loading notice goes.
+        expect(get(alertStore).type).toBe('error')
         const text = language.risuNest.contentUpdate
         expect(mocks.alertError.mock.calls[0][0].split('\n')[0]).toBe(restored ? text.failed : text.notUpdated)
         const kept = mocks.details.get('next')
@@ -335,6 +402,20 @@ describe('module update', () => {
         const installedId = mocks.db.modules[0].id
         const firstBase = mocks.db.modules[0].updateBase
         mocks.db.enabledModules.push(installedId)
+        const loadingAssets = { type: 'progress', msg: 'Loading... (Loading Assets)', submsg: '50.00' } as const
+        alertStore.set(loadingAssets)
+        let shownWhileStored: unknown
+        commitModule.mockImplementationOnce(async (value) => {
+            shownWhileStored = get(alertStore)
+            // A setting changed while the import is stored.
+            mocks.db.modules[0].hideIcon = true
+            mocks.db.modules.push(value)
+            // A module order received while the merge is prepared puts a new list in place of this one.
+            mocks.duringNormalize = () => {
+                mocks.duringNormalize = null
+                mocks.db.modules = [...mocks.db.modules].reverse()
+            }
+        })
         const pending = commitImportedModule(imported('file-1', { name: 'Renamed Lore', description: 'new', lorebook: [] }), commitModule)
         await opened()
         expect(contentUpdateDialog.request?.candidates.map((candidate) => [candidate.id, candidate.reason])).toEqual([[installedId, 'lineage']])
@@ -342,9 +423,11 @@ describe('module update', () => {
         expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.choice])).toEqual([['description', 'theirs'], ['name', 'theirs']])
         chooseContentUpdate('update')
         expect(await pending).toBe(installedId)
+        expect(shownWhileStored).toBe(loadingAssets)
+        expect(get(alertStore).type).toBe('none')
 
         expect(mocks.db.modules).toHaveLength(1)
-        expect(mocks.db.modules[0]).toMatchObject({ id: installedId, name: 'Renamed Lore', description: 'new', updateLineage: 'file-1' })
+        expect(mocks.db.modules[0]).toMatchObject({ id: installedId, name: 'Renamed Lore', description: 'new', updateLineage: 'file-1', hideIcon: true })
         expect(mocks.db.enabledModules).toEqual([installedId])
         const base = JSON.parse(new TextDecoder().decode(mocks.assets.get(mocks.db.modules[0].updateBase!)))
         expect(base).toEqual({ description: 'new', name: 'Renamed Lore', lorebook: [], updateLineage: 'file-1' })

@@ -20,8 +20,8 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
         mutate({ root: { characterOrder: [] }, character: mocks.details.get(id) })
         return true
     },
-    mutateCharacterDetailFields: async (id: string, _reason: string, mutate: (state: any) => void) => {
-        mutate({ character: mocks.details.get(id) })
+    mutateCharacterDetailFields: async (id: string, _reason: string, mutate: (state: any) => void | Promise<void>) => {
+        await mutate({ character: mocks.details.get(id) })
         return true
     },
 }))

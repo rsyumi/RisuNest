@@ -398,22 +398,19 @@ export async function refreshExternalLwwAdapters(state: ExternalStorageState): P
         const renewed = new Set([...previous].filter(([id, recovery]) => recoveries.get(id) !== recovery).map(([id]) => id))
         if (renewed.size && adapter.recover(renewed)) recovered.add(adapter)
     }
-    const resume = async () => {
-        const binding = await native.state()
-        if (generation !== refreshGeneration) return
-        for (const [id, adapter] of adapters) if (binding.target.kind !== 'external' || binding.target.connectionId !== id) {
-            adapter.generation++; adapter.scheduler.stop(); void adapter.stopHydration(); adapter.state = undefined
-        } else if (adapter.state?.targetAuthority === binding.targetAuthority && recovered.has(adapter)) {
-            adapter.resumeHydration(true)
-        }
-        if (binding.target.kind === 'external' && resumeBoundTarget) {
-            const target = binding.target
-            const adapter = adapters.get(target.connectionId)
-            // A start resumes the bound target from here; the hold also covers the checks before the transport resumes.
-            if (adapter && adapter.state?.targetAuthority !== binding.targetAuthority) await holdThroughDeparture(() => resumeCurrentSyncBinding(target))
-        }
+    const binding = await native.state()
+    if (generation !== refreshGeneration) return
+    for (const [id, adapter] of adapters) if (binding.target.kind !== 'external' || binding.target.connectionId !== id) {
+        adapter.generation++; adapter.scheduler.stop(); void adapter.stopHydration(); adapter.state = undefined
+    } else if (adapter.state?.targetAuthority === binding.targetAuthority && recovered.has(adapter)) {
+        adapter.resumeHydration(true)
     }
-    await resume()
+    if (binding.target.kind === 'external' && resumeBoundTarget) {
+        const target = binding.target
+        const adapter = adapters.get(target.connectionId)
+        // A start resumes the bound target from here; the hold also covers the checks before the transport resumes.
+        if (adapter && adapter.state?.targetAuthority !== binding.targetAuthority) await holdThroughDeparture(() => resumeCurrentSyncBinding(target))
+    }
 }
 
 export async function installExternalLwwAdapters(state: ExternalStorageState, resumeBound = true): Promise<() => void> {
