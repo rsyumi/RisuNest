@@ -242,6 +242,25 @@ describe('character update', () => {
         expect(mocks.details.get('old')).toMatchObject({ name: 'Luna', desc: 'theirs' })
     })
 
+    it('compares and writes the creator and version where the character editor shows them', async () => {
+        // The editor changed them in additionalData; the copies beside it stay as the import set them.
+        install(card('old', 'Luna', { creator: 'Imported', characterVersion: '1.0', additionalData: { tag: [], creator: 'Edited', character_version: '1.0b' } }))
+        const pending = commitImportedCharacter(card('next', 'Luna', { creator: 'Author', characterVersion: '2.0',
+            additionalData: { tag: ['tag'], creator: 'Author', character_version: '2.0' } }), commitCharacter)
+        await opened()
+        expect(contentUpdateDialog.request?.candidates[0].creator).toBe('Edited')
+        await reviewContentUpdate()
+        expect(contentUpdateDialog.plan!.items.map((item) => [item.field, item.mine, item.theirs])).toEqual([
+            ['creator', 'Edited', 'Author'], ['characterVersion', '1.0b', '2.0'],
+        ])
+        setContentUpdateChoice('creator', 'mine')
+        setContentUpdateChoice('characterVersion', 'theirs')
+        chooseContentUpdate('update')
+        expect(await pending).toBe('old')
+        expect(mocks.details.get('old')).toMatchObject({ creator: 'Edited', characterVersion: '2.0',
+            additionalData: { tag: ['tag'], creator: 'Edited', character_version: '2.0' } })
+    })
+
     it('installs the import as new or not at all when the user says so', async () => {
         install(card('old', 'Luna'))
         alertStore.set(reading)

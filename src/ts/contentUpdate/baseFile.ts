@@ -100,6 +100,7 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         tags: data.tags ?? [],
         creator: data.creator ?? '',
         characterVersion: `${data.character_version}` || '',
+        additionalData: { tag: data.tags ?? [], creator: data.creator, character_version: data.character_version },
         replaceGlobalNote: data.post_history_instructions ?? '',
         globalLore: lore,
         loreSettings,

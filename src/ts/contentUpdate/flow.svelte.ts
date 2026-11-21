@@ -112,6 +112,13 @@ const characters: Entity<CharacterDetail> = {
         if (Array.isArray(value.globalLore)) value.globalLore = updateLorebooks(value.globalLore)
         if (!value.newGenData && value.viewScreen) updateInlayScreen(value as unknown as character)
         value.lowLevelAccess = !!value.lowLevelAccess
+        // The editor and the export read the creator and version from additionalData, which an import
+        // fills beside them; they compare as the creator and version items.
+        const data = value.additionalData
+        if (data && typeof data === 'object') {
+            value.creator = String(data.creator ?? '')
+            value.characterVersion = String(data.character_version ?? '')
+        }
         return value
     },
     // From the start of a request, before a first token or without streaming.
@@ -364,7 +371,8 @@ async function withCreators(candidates: UpdateCandidate[]): Promise<ContentUpdat
     return Promise.all(candidates.slice(0, 20).map(async (candidate) => {
         try {
             const detail = await readPersistentCharacterDetail(candidate.id, 'content-update-candidates')
-            return detail?.creator ? { ...candidate, creator: detail.creator } : candidate
+            const creator = detail?.additionalData?.creator || detail?.creator
+            return creator ? { ...candidate, creator } : candidate
         } catch {
             return candidate
         }
@@ -480,6 +488,7 @@ async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' 
     const updated = await mutateCharacterDetailFields(targetId, 'content-update', async ({ character }) => {
         // Merged with the character as it is stored now, so what changed while the copy was written stays.
         merged = applyUpdate(CHARACTER_UPDATE, await characters.normalize(character), incoming as CharacterDetail, decision.plan, decision.choices)
+        merged.additionalData = { ...(merged.additionalData ?? {}), creator: merged.creator, character_version: merged.characterVersion }
         merged.extentions = { ...(merged.extentions ?? {}) }
         if (baseKey) merged.extentions[UPDATE_BASE_EXTENSION_KEY] = baseKey
         else delete merged.extentions[UPDATE_BASE_EXTENSION_KEY]

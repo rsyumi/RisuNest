@@ -91,7 +91,7 @@ describe('readUpdateBaseFile', () => {
         const base = await readUpdateBaseFile('character', { name: 'Luna.json', data: encode(cardV3) }) as any
         expect(base).toMatchObject({
             name: 'Luna', desc: 'desc', firstMessage: 'hello', replaceGlobalNote: 'post', characterVersion: '1.0', nickname: 'Lu',
-            extentions: { color: 'red' }, customscript: [{ comment: 'r' }], onboarding: { enabled: true, title: 'Welcome' },
+            additionalData: { character_version: '1.0' }, extentions: { color: 'red' }, customscript: [{ comment: 'r' }], onboarding: { enabled: true, title: 'Welcome' },
         })
         const v2 = await readUpdateBaseFile('character', { name: 'Luna.json', data: encode({ ...cardV3, spec: 'chara_card_v2' }) }) as any
         expect(v2.source).toEqual(['from-risuai'])
