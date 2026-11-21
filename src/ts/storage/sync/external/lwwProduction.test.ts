@@ -717,6 +717,7 @@ describe('bounded production calls and lifecycle ownership', () => {
         // Running out of background time ends the run as cancelled, not as a sync failure.
         const runs = fixture.diagnostic.mock.calls.map(([, args]) => args.event as Record<string, unknown>).filter(event => event.kind === 'sync-run')
         expect(runs).toEqual([expect.objectContaining({ operation: 'receive', outcome: 'cancelled' })])
+        expect(runs[0].more).toBeUndefined()
     })
     it('expires a hide-time publication waiting behind a receive without sending it', async () => {
         const expiration = new AbortController()

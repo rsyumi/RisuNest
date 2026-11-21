@@ -193,7 +193,7 @@ function createAdapter(connectionId: string): Adapter {
         const progress = beginExternalProgress(connectionId, 'sync')
         let received = 0
         const started = performance.now()
-        const ran = (more: boolean, outcome: SyncRunDiagnostic['outcome']) =>
+        const ran = (more: boolean | undefined, outcome: SyncRunDiagnostic['outcome']) =>
             generationDiagnostics.syncRun({ operation: 'receive', count: received, more, outcome, durationMs: performance.now() - started })
         try {
             for (;;) {
@@ -212,7 +212,8 @@ function createAdapter(connectionId: string): Adapter {
         } catch (error) {
             const outcome = externalProgressFailure(error)
             progress.finish(outcome)
-            ran(false, outcome)
+            // A failed run cannot tell whether more changes wait.
+            ran(undefined, outcome)
             throw error
         }
     }
