@@ -646,9 +646,6 @@ export function failureReason(code: string, direction: 'import' | 'export' = 'im
             return copy.reasonDestination
         case 'destination-busy':
             return copy.reasonDestinationBusy
-        case 'destination-required':
-        case 'unsupported-without-destination':
-            return copy.reasonPlainJpeg
         case 'length-mismatch':
         case 'publication-pending':
         case 'archive-output-failed':
