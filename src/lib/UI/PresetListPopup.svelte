@@ -228,6 +228,13 @@
         const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect()
         dropAt = event.clientY < bounds.top + bounds.height / 2 ? index : index + 1
     }
+    /** Where the row at `index` sits once the row at `from` moves into the gap `to`, so an open menu stays with its row. */
+    function movedIndex(index: number, from: number, to: number) {
+        if (index === from) return to > from ? to - 1 : to
+        if (index > from && index < to) return index - 1
+        if (index < from && index >= to) return index + 1
+        return index
+    }
     async function drop(event: DragEvent) {
         if (!accepts(event)) return
         event.preventDefault()
@@ -240,12 +247,13 @@
         if (from < 0 || to === null || to === from || to === from + 1) return
         if (actions) {
             await guarded(async () => {
-                await actions.move(from, to)
+                if (await actions.move(from, to) && openMenu !== null) openMenu = movedIndex(openMenu, from, to)
             })
             return
         }
         const [moved] = current.splice(from, 1)
         current.splice(to > from ? to - 1 : to, 0, moved)
+        if (openMenu !== null) openMenu = movedIndex(openMenu, from, to)
     }
     /** Whether the gap would move the dragged row, so a gap next to it shows nothing. */
     const movesTo = (gap: number) => dragFrom !== null && gap !== dragFrom && gap !== dragFrom + 1

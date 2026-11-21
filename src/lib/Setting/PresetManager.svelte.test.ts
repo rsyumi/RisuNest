@@ -201,6 +201,7 @@ it('binds in bind mode without changing the selection, and unbinds through the i
 })
 
 it('moves a held preset by touch to the gap it is dropped on without selecting it', async () => {
+    await openActions('Gamma')
     const alpha = [...document.querySelectorAll('button[draggable="true"] span')].find(span => span.textContent === 'Alpha')!
     const end = rows().at(-1)!
     let entered = undefined as Event | undefined
@@ -212,6 +213,11 @@ it('moves a held preset by touch to the gap it is dropped on without selecting i
     touch(alpha, 'touchend', 30, 160)
     alpha.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
     await vi.waitFor(() => expect(order()).toEqual(['Beta', 'Gamma', 'Delta', 'Alpha']))
+    // The menu that was open stays with its preset.
+    await tick()
+    const menu = (name: string) => row(name).querySelector(`button[title="${languageEnglish.movePresetDown}"]`)
+    expect(menu('Gamma')).not.toBeNull()
+    expect(menu('Delta')).toBeNull()
     // Drag implementations that follow the HTML specification drop only where dragenter was cancelled.
     expect(entered?.defaultPrevented).toBe(true)
     expect(mocks.close).not.toHaveBeenCalled()
