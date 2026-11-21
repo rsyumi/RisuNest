@@ -402,7 +402,13 @@ fn read_full(reader: &mut impl Read, output: &mut [u8]) -> io::Result<bool> {
 fn classify_json(file: &mut File, file_length: u64) -> io::Result<Option<Found>> {
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::with_capacity(JSON_READ_BUFFER_BYTES, file);
+    let mut skipped = 0_usize;
     loop {
+        // An oversized file that is still whitespace after the first window is refused as the drop path does,
+        // without reading the rest of it.
+        if skipped >= JSON_READ_BUFFER_BYTES && file_length > JSON_MAX_BYTES {
+            return Ok(Some(Found::Refused(IntakeRefusal::TooLarge)));
+        }
         let available = reader.fill_buf()?;
         if available.is_empty() {
             return Ok(None);
@@ -425,6 +431,7 @@ fn classify_json(file: &mut File, file_length: u64) -> io::Result<Option<Found>>
             None => {
                 let length = available.len();
                 reader.consume(length);
+                skipped += length;
             }
         }
     }
@@ -1084,6 +1091,25 @@ mod tests {
             json!({ "kind": "unsupported", "refusal": "too-large", "bytes": JSON_MAX_BYTES + 1 }),
         );
         assert_eq!(response[1], with_bytes(content("character", "json"), small.len()));
+    }
+
+    #[test]
+    fn an_oversized_file_that_opens_with_whitespace_is_refused_as_too_large() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("padded.json");
+        let mut file = File::create(&path).unwrap();
+        // Whitespace fills the first read window; the rest is never read, whatever it holds.
+        file.write_all(&vec![b' '; JSON_READ_BUFFER_BYTES]).unwrap();
+        file.set_len(JSON_MAX_BYTES + 1).unwrap();
+        drop(file);
+        let sources = vec![json!({ "source": { "type": "desktopPath", "path": path }, "displayName": "padded.json" })];
+
+        let response = respond(directory.path(), sources);
+
+        assert_eq!(
+            response[0],
+            json!({ "kind": "unsupported", "refusal": "too-large", "bytes": JSON_MAX_BYTES + 1 }),
+        );
     }
 
     #[test]
