@@ -741,7 +741,13 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     cha.backgroundHTML ??= ''
     cha.backgroundCSS ??= ''
     cha.creation_date ??= Date.now()
-    cha.globalLore = updateLorebooks(cha.globalLore)
+    // A character restored from another app's backup can lack the fields below.
+    cha.firstMessage ??= ''
+    cha.viewScreen ??= 'none'
+    cha.emotionImages ??= []
+    cha.bias ??= []
+    cha.desc ??= ''
+    cha.globalLore = updateLorebooks(cha.globalLore ?? [])
     if(!cha.newGenData){
         cha = updateInlayScreen(cha)
     }
