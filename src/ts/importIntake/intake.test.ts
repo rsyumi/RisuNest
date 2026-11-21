@@ -243,6 +243,13 @@ describe('one dropped file', () => {
         }
     })
 
+    it('imports a dropped .preset file, which the preset picker also accepts', async () => {
+        classify('legacy.preset', { kind: 'preset', format: 'json' })
+        await submitImportDelivery(drop(dropped('legacy.preset', '{"temperature":1}')))
+        expect(mocks.preset).toHaveBeenCalledExactlyOnceWith({ name: expect.stringMatching(/^legacy\.preset/), data: encode('{"temperature":1}') })
+        expect(outcomes).toEqual([expect.objectContaining({ state: 'succeeded', location: { kind: 'preset' } })])
+    })
+
     it.each([
         ['card.risudat', 'png', 'card.risudat.png'],
         ['card.bin', 'jpeg-charx', 'card.bin.jpeg'],
