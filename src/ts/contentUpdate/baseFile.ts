@@ -78,7 +78,7 @@ async function moduleFromRisum(data: Uint8Array): Promise<RisuModule> {
     if (buffer.length < 6 || buffer.readUInt8(0) !== 111 || buffer.readUInt8(1) !== 0) throw new UnsupportedUpdateBaseFileError()
     const length = buffer.readUInt32LE(2)
     const main = JSON.parse(text(await decodeRPack(buffer.subarray(6, 6 + length))))
-    if (main?.type !== 'risuModule' || !main.module) throw new UnsupportedUpdateBaseFileError()
+    if (main?.type !== 'risuModule' || !isRecord(main.module)) throw new UnsupportedUpdateBaseFileError()
     return main.module
 }
 
@@ -173,7 +173,7 @@ export async function readUpdateBaseFile(kind: 'character' | 'module', file: { n
     } else if (name.endsWith('.json') || name.endsWith('.lorebook')) {
         const parsed = JSON.parse(text(file.data))
         // A lorebook or regex file is the module its import converts it to.
-        module = parsed?.type === 'risuModule' ? parsed : kind === 'module' ? (await convertJsonToModule(parsed))?.module ?? null : null
+        module = parsed?.type === 'risuModule' ? parsed : kind === 'module' && isRecord(parsed) ? (await convertJsonToModule(parsed))?.module ?? null : null
         // Other JSON is a card; the JSON importer takes an older one only with these fields.
         const spec = parsed?.spec === 'chara_card_v2' || parsed?.spec === 'chara_card_v3'
         if (!module && (spec || ((parsed?.char_name || parsed?.name) && (parsed.char_persona || parsed.description) && (parsed.char_greeting || parsed.first_mes)))) card = parsed
