@@ -127,3 +127,19 @@ test('wrapped prose fills each row until the next word no longer fits', async ({
         expect(row.endsWithSpace).toBe(true)
     }
 })
+
+test.describe('with a Windows user agent', () => {
+    // Monaco gives text without a line break the line break of the platform its user agent names.
+    test.use({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' })
+
+    test('a line break typed into text without one is stored as LF', async ({ page }) => {
+        await page.goto('/monaco.html')
+        await page.waitForFunction(() => !!window.monacoDriver)
+        await page.evaluate(() => window.monacoDriver.open('markdown', 'first'))
+        await expect(page.locator('#editor textarea.inputarea')).toBeFocused()
+        await page.keyboard.press('End')
+        await page.keyboard.press('Enter')
+        await page.keyboard.type('second')
+        await expect.poll(() => page.evaluate(() => window.monacoDriver.state().value)).toBe('first\nsecond')
+    })
+})

@@ -9,10 +9,10 @@ let value = ''
 const current = () => monaco.editor.getEditors().find(editor => editor.getDomNode()?.closest('#editor'))!
 
 export const monacoDriver = {
-    async open(language: 'markdown' | 'lua') {
+    async open(language: 'markdown' | 'lua', text?: string) {
         if (component) await unmount(component)
         saved = []
-        value = language === 'lua' ? 'local greeting = "hello"\nprint(greeting)' : '# Synthetic title\nhello world'
+        value = text ?? (language === 'lua' ? 'local greeting = "hello"\nprint(greeting)' : '# Synthetic title\nhello world')
         component = mount(TextEditorMonaco, {
             target: document.querySelector('#editor')!,
             props: { value, language, onchange: next => { value = next }, onsave: () => { saved.push(value) } },
