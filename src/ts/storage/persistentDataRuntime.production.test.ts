@@ -1168,21 +1168,22 @@ describe('preset chain override across a whole working-set replacement', () => {
         expect(getDatabase().botPresets.find((preset) => preset.id === 'preset-a')!.mainPrompt).toBe('Prompt A')
     })
 
-    it.each([true, false])('keeps the applied conversation binding (resident=%s)', async (resident) => {
+    it.each([[true, true], [false, true], [true, false], [false, false]])('keeps the applied conversation binding only while a request runs (resident=%s, generating=%s)', async (resident, generating) => {
         const initial = presetDatabase()
-        const store = new IndexedDbPersistentDataStore(`binding-carry-${resident}`, new IDBFactory(), IDBKeyRange)
+        const store = new IndexedDbPersistentDataStore(`binding-carry-${resident}-${generating}`, new IDBFactory(), IDBKeyRange)
         await store.open()
         const { revision } = await store.replaceFromDatabase(initial)
         setDatabase(structuredClone(initial))
         selectedCharID.set(-1)
         await applyConversationPresetBinding(getDatabase(), { id: 'chat', promptPresetId: 'preset-b' } as Chat)
         expect(getDatabase().mainPrompt).toBe('Prompt B')
-        // A running request reads the mirrors as soon as the replacement is installed.
-        doingChat.set(true)
+        // A running request reads the mirrors as soon as the replacement is installed. Otherwise
+        // the conversation the replacement selects, here none, gives the binding.
+        doingChat.set(generating)
         const replacement = resident ? structuredClone(initial) : projectCompleteScalableWorkingSet(initial, null, revision, new Set())
         createProductionStateAdapter().replaceDatabase(replacement, new Set(), false)
-        expect(getEffectivePresetId()).toBe('preset-b')
-        expect(getDatabase().mainPrompt).toBe('Prompt B')
+        expect(getEffectivePresetId()).toBe(generating ? 'preset-b' : 'preset-a')
+        expect(getDatabase().mainPrompt).toBe(generating ? 'Prompt B' : 'Prompt A')
         expect(getDatabase().botPresetsId).toBe(0)
     })
 

@@ -2185,6 +2185,16 @@ function resolveConversationPresetBinding(db: Database, chat: Chat | undefined):
     return typeof id === 'string' && id && db.botPresets?.some(preset => preset?.id === id) ? id : null
 }
 
+/**
+ * Restores the selected conversation's binding for a derive that follows a received or replaced
+ * library. A bound catalog stub stays unapplied; the chat lifecycle reads its body first.
+ */
+export function restoreSelectedConversationPresetBinding(db: Database): void {
+    const character = db.characters?.[get(selectedCharID)]
+    const id = resolveConversationPresetBinding(db, character?.chats?.[character.chatPage])
+    identity.restoreEffectivePresetBinding(db, identity.isLoadedPreset(db, id) ? id : null)
+}
+
 let presetBindingGeneration = 0
 
 /**
@@ -2289,12 +2299,8 @@ configurePersistentIdentityHooks({
         const db = DBState.db
         const character = db.characters?.[get(selectedCharID)]
         const chat = character?.chats?.[character.chatPage]
-        // A running request keeps the binding of the conversation it generates for. A bound
-        // catalog stub stays unapplied here; the chat lifecycle reads its body first.
-        if (!get(doingChat)) {
-            const id = resolveConversationPresetBinding(db, chat)
-            identity.restoreEffectivePresetBinding(db, identity.isLoadedPreset(db, id) ? id : null)
-        }
+        // A running request keeps the binding of the conversation it generates for.
+        if (!get(doingChat)) restoreSelectedConversationPresetBinding(db)
         deriveEffectivePresetMirrors(db)
         deriveEffectivePersonaMirrors(db)
         deriveEffectiveToggleVariables(db, chat)

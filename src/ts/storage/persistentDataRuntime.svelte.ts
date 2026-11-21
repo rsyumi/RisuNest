@@ -22,7 +22,7 @@ import type {
 } from './activeWorkingSet.svelte'
 import type { ConversationViewportSource } from '../conversationViewportSource'
 import type { Chat, Database, character, loreBook } from './database.svelte'
-import { carryPresetBinding, carryPresetOverride, deriveEffectivePresetMirrors, fillRootFieldDefaults, getDatabase, setDatabase, type PresetSource } from './database.svelte'
+import { carryPresetBinding, carryPresetOverride, deriveEffectivePresetMirrors, fillRootFieldDefaults, getDatabase, restoreSelectedConversationPresetBinding, setDatabase, type PresetSource } from './database.svelte'
 import { getEffectivePresetBinding, getEffectivePresetOverride, isLoadedPresetRecord } from './effectiveIdentityState'
 import { prepareDatabaseForPersistence, preparePersistentRootForWorkingSet } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
@@ -199,7 +199,9 @@ export function createProductionStateAdapter(options: {
         replaceDatabase(database, activeCharacterIds, forceScalableProjection) {
             const liveDatabase = getDatabase()
             const presetOverride = getEffectivePresetOverride(liveDatabase)
-            const presetBinding = getEffectivePresetBinding(liveDatabase)
+            // A running request keeps the binding of the conversation it generates for.
+            const generating = get(doingChat)
+            const presetBinding = generating ? getEffectivePresetBinding(liveDatabase) : null
             const selectedCharacter = liveDatabase.characters[get(selectedCharID)]
             const selectedCharacterId = selectedCharacter?.chaId ?? null
             const selectedConversationId = selectedCharacter
@@ -223,6 +225,7 @@ export function createProductionStateAdapter(options: {
                 selectedConversationId,
                 (index) => selectedCharID.set(index),
             )
+            if (!generating) restoreSelectedConversationPresetBinding(getDatabase())
             // The selection may have fallen back to another preset, such as after a remote deletion.
             deriveEffectivePresetMirrors(getDatabase())
             // A request reads the mirrors per streamed chunk, so its binding cannot wait for the chat lifecycle.
