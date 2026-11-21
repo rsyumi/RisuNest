@@ -326,7 +326,7 @@ describe('character card additions', () => {
         const base64 = (value: string) => Buffer.from(value).toString('base64')
         vi.mocked(hasher).mockResolvedValueOnce('synthetic-hash')
         vi.mocked(alertInput).mockResolvedValueOnce('synthetic-password')
-        vi.mocked(decryptBuffer).mockResolvedValueOnce(new TextEncoder().encode(JSON.stringify(card)))
+        vi.mocked(decryptBuffer).mockResolvedValueOnce(new TextEncoder().encode(JSON.stringify(card)).buffer)
         mocks.alertConfirm.mockResolvedValue(false)
         mocks.pngChunks = [
             { key: 'chara', value: ['rcc', 'rccv1', base64('sealed'), 'synthetic-hash', base64(JSON.stringify({ usePassword: true }))].join('||') },
