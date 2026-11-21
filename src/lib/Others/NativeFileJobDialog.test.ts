@@ -15,6 +15,7 @@ const h = vi.hoisted(() => ({
     busy: true,
 }))
 vi.mock('src/ts/alert', () => ({ alertError: h.alertError }))
+vi.mock('src/ts/stores.svelte', async () => ({ alertStore: (await import('svelte/store')).writable({ type: 'none', msg: '' }) }))
 vi.mock('src/ts/importIntake/openResult', () => ({ openImportResult: h.openImportResult, canOpenImportResult: () => true }) satisfies typeof import('src/ts/importIntake/openResult'))
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     getServerSyncController: () => ({ assertFileOperationAvailable() { if (h.busy) throw Object.assign(new Error('server-sync-busy'), { code: 'server-sync-busy' }) } }),
