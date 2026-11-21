@@ -125,7 +125,7 @@ export function fitFolderIconText(text: string, round: boolean, measure: Measure
     for (const layout of layouts(text, measure)) {
         const size = sizeFor(layout.lines.map(measure), round)
         const score = size * (layout.syllable ? syllablePenalty : 1)
-        if (score > best.score * extraLineGain) best = { score, size, lines: layout.lines }
+        if (score > (layout.lines.length > best.lines.length ? best.score * extraLineGain : best.score)) best = { score, size, lines: layout.lines }
     }
     const fitted = Math.min(maxFontPx, Math.floor(best.size * 2) / 2)
     const clipped = fitted < minFontPx

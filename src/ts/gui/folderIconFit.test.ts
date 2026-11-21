@@ -23,6 +23,11 @@ describe('fitFolderIconText', () => {
         expect(fit('가나다 라마바사').lines).toEqual(['가나다', '라마바사'])
     })
 
+    it('takes another line only when it is clearly larger than the best layout with fewer lines', () => {
+        // Of two two-line layouts the larger wins, and three lines are not clearly larger than it.
+        expect(fit('가a 나b abc').lines).toEqual(['가a 나b', 'abc'])
+    })
+
     it('keeps the user line breaks and blank lines between them, joining any beyond the third line', () => {
         expect(fit('로맨스\n판타지').lines).toEqual(['로맨스', '판타지'])
         expect(fit('일\n이\n삼\n사').lines).toEqual(['일', '이', '삼 사'])
