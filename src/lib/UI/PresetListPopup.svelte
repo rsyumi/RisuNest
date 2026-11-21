@@ -288,9 +288,9 @@
                 </div>
             {/if}
             {#if !presets?.length}
-                {#if empty}<p class="text-textcolor2 text-sm m-0">{empty}</p>{/if}
+                {#if empty}<p class="text-subtext text-sm m-0">{empty}</p>{/if}
             {:else if visible.length === 0}
-                <p class="text-textcolor2 text-sm m-0 {listScroll ? 'flex-1' : ''}">{emptyFiltered ?? empty}</p>
+                <p class="text-subtext text-sm m-0 {listScroll ? 'flex-1' : ''}">{emptyFiltered ?? empty}</p>
             {:else}
                 <div
                     class="flex flex-col gap-1 {listScroll ? 'overflow-y-auto min-h-0 flex-1' : ''} {dragType ? 'py-1 -my-1' : ''}"
@@ -346,7 +346,7 @@
                                     {@render rowLeading?.(preset, index)}
                                     <span class="min-w-0 flex-1">
                                         {#if subtitle}
-                                            <span class="block text-xs text-textcolor2 truncate">{subtitle(preset)}</span>
+                                            <span class="block text-xs text-subtext truncate">{subtitle(preset)}</span>
                                         {/if}
                                         <span class="block truncate {isSelected ? 'font-medium' : ''}">{preset.name}</span>
                                     </span>
