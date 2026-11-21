@@ -345,7 +345,7 @@
             </div>
 
             <div class="footer flex shrink-0 items-center gap-2 border-t border-selected px-4 pt-3">
-                <button type="button" class="button danger" onclick={deleteFolderFromManager}>{text.delete}</button>
+                <button type="button" class="button danger" disabled={saving} onclick={deleteFolderFromManager}>{text.delete}</button>
                 <span class="flex-1"></span>
                 <button type="button" class="button" onclick={closeFolderManager}>{language.cancel}</button>
                 <button type="button" class="button primary" disabled={saving || !draft.name.trim()} onclick={save}>{text.save}</button>
