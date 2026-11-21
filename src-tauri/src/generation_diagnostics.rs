@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::persistent_store::{RevisionResult, StoreError};
 
 const MAX_EVENT_BYTES: usize = 2048;
@@ -137,8 +137,8 @@ struct Diagnostics {
     reload_pending: AtomicBool,
     /// The app is off screen, as the page or the Android background work registry last reported.
     off_screen: AtomicBool,
-    /// When the app last came back on screen, in milliseconds since the epoch.
-    returned_at_ms: AtomicU64,
+    /// When the app last came back on screen, on a clock that a change of the system time leaves alone.
+    returned_at: Mutex<Option<Instant>>,
     slots: Mutex<Slots>,
 }
 #[cfg(not(test))]
@@ -332,15 +332,18 @@ impl Diagnostics {
             // On screen the page syncs often and the user sees it, so only runs that were off screen for a while are
             // kept, including one that ended after the return.
             Event::SyncRun { duration_ms, .. } if self.off_screen.load(Ordering::SeqCst)
-                || self.returned_at_ms.load(Ordering::SeqCst) > now_ms().saturating_sub(*duration_ms) => emit(sink, "info", event),
+                || self.returned_within(Duration::from_millis(*duration_ms)) => emit(sink, "info", event),
             _ => {}
         }
         Ok(current)
     }
     fn set_off_screen(&self, off_screen: bool) {
         if self.off_screen.swap(off_screen, Ordering::SeqCst) && !off_screen {
-            self.returned_at_ms.store(now_ms(), Ordering::SeqCst);
+            *self.returned_at.lock().unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
         }
+    }
+    fn returned_within(&self, duration: Duration) -> bool {
+        self.returned_at.lock().unwrap_or_else(|error| error.into_inner()).is_some_and(|at| at.elapsed() < duration)
     }
     fn commit(&self, document: u64, expected: i64, result: &Result<RevisionResult, StoreError>, committed_revision: Option<i64>, sink: &impl DiagnosticSink) {
         let (revision, outcome, error_code) = match result {
