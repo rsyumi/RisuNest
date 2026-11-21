@@ -148,6 +148,12 @@ describe('applyUpdate', () => {
             applyUpdate(CHARACTER_UPDATE, lists.m, lists.t, lists.plan, choices).customscript.map((script: any) => script.comment)
         expect(merge(plan(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'N', 'C']))).toEqual(['C', 'A', 'B', 'N'])
         expect(merge(plan(['A', 'B', 'C'], ['A', 'B', 'C', 'Own'], ['B', 'A', 'C']))).toEqual(['B', 'A', 'C', 'Own'])
+        // The order one side alone changed is an item of its own, like any other one-sided change.
+        const order = (lists: ReturnType<typeof plan>) => lists.plan.items.find((item) => item.order)
+        expect(order(plan(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'C']))).toMatchObject({ status: 'mine', choice: 'mine', mine: ['C', 'A', 'B'], theirs: ['A', 'B', 'C'] })
+        const authorOnly = plan(['A', 'B', 'C'], ['A', 'B', 'C'], ['B', 'A', 'C'])
+        expect(authorOnly.plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'update', choice: 'theirs' }])
+        expect(merge(authorOnly, { customscript: 'mine' })).toEqual(['A', 'B', 'C'])
         expect(plan(['A', 'B', 'C'], ['B', 'A', 'C'], ['B', 'A', 'C']).plan.items).toEqual([])
 
         const both = plan(['A', 'B', 'C'], ['B', 'A', 'C'], ['A', 'C', 'B'])
@@ -161,7 +167,7 @@ describe('applyUpdate', () => {
         expect(plan(['A', 'B'], ['A', 'X', 'B'], ['B', 'X', 'A']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
         // In the same place, it leaves the base to settle the others.
         const alike = plan(['A', 'B', 'C', 'D'], ['A', 'X', 'B', 'C', 'D'], ['A', 'X', 'B', 'D', 'C'])
-        expect(alike.plan.items).toEqual([])
+        expect(alike.plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'update', choice: 'theirs' }])
         expect(merge(alike)).toEqual(['A', 'X', 'B', 'D', 'C'])
         // Without a base, who reordered it is unknown.
         expect(planUpdate(CHARACTER_UPDATE, both.m, both.t, null).items).toMatchObject([{ id: 'customscript', order: true, status: 'differs', choice: null }])
