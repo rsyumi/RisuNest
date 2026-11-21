@@ -510,8 +510,8 @@ export function getModules(database: ModuleSelectionSource = getDatabase()){
     )
 }
 
-export function getModuleLorebooks() {
-    const modules = getModules()
+export function getModuleLorebooks(database: ModuleSelectionSource = getDatabase()) {
+    const modules = getModules(database)
     let lorebooks: loreBook[] = []
     for (const module of modules) {
         if(!module){

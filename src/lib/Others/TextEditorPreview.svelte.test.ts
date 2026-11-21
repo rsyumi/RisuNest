@@ -49,7 +49,7 @@ afterEach(async () => {
 const text = '합성 테스트 문장입니다. Synthetic sentence.'
 
 async function preview(presetEditor: boolean, tokens: number): Promise<[string, string | undefined]> {
-    instance = mount(TextEditorPreview, { target: document.body, props: { value: '{{mainprompt}}', presetEditor } })
+    instance = mount(TextEditorPreview, { target: document.body, props: { value: '{{mainprompt}}{{moduleenabled::synthetic}}', presetEditor } })
     await tick()
     const parsed = document.querySelector('[data-text-editor-preview]')!.textContent!
     await vi.waitFor(() => expect(document.body.textContent).toContain(`${language.tokens}: ${tokens}`))
@@ -67,9 +67,10 @@ it('previews, counts and lists toggles with the preset the settings window edits
     DBState.db = {
         botPresetsId: 0,
         botPresets: [
-            { id: 'selected', name: 'Selected', mainPrompt: text, aiModel: 'gpt4', customPromptTemplateToggle: 'selected=Selected' },
+            { id: 'selected', name: 'Selected', mainPrompt: text, aiModel: 'gpt4', customPromptTemplateToggle: 'selected=Selected', moduleIntergration: 'synthetic' },
             { id: 'bound', name: 'Bound', mainPrompt: `Bound ${text}`, aiModel: 'gpt4o', customPromptTemplateToggle: 'bound=Bound' },
         ],
+        modules: [{ id: 'synthetic-module', name: 'Synthetic module', namespace: 'synthetic', description: '' }],
         characters: [{ chaId: 'synthetic', name: 'Synthetic', chatPage: 0, chats: [{ message: [], scriptstate: {} }] }],
         globalChatVariables: {},
         customTokenizer: 'tik',
@@ -82,9 +83,10 @@ it('previews, counts and lists toggles with the preset the settings window edits
     setEffectivePresetBinding(DBState.db, 'bound', apply)
 
     // The presets use different tokenizers, so the count shows which model it follows.
-    const selectedTokens = (await encodeWithTokenizer(text, 'tik')).length
-    const boundTokens = (await encodeWithTokenizer(`Bound ${text}`, 'o200k_base')).length
+    const selectedTokens = (await encodeWithTokenizer(`${text}1`, 'tik')).length
+    const boundTokens = (await encodeWithTokenizer(`Bound ${text}0`, 'o200k_base')).length
     expect(selectedTokens).not.toBe(boundTokens)
-    expect(await preview(true, selectedTokens)).toEqual([text, 'selected=Selected'])
-    expect(await preview(false, boundTokens)).toEqual([`Bound ${text}`, 'bound=Bound'])
+    // Only the selected preset enables the module.
+    expect(await preview(true, selectedTokens)).toEqual([`${text}1`, 'selected=Selected'])
+    expect(await preview(false, boundTokens)).toEqual([`Bound ${text}0`, 'bound=Bound'])
 })
