@@ -220,9 +220,13 @@ function releaseUnusedAssets(startedAtMs: number, ...values: unknown[]) {
     scheduleDeletedOwnerAssetCleanup(collectOwnedAssetKeys(...values), startedAtMs, 'content-update', () => assetAliasCleanupTarget())
 }
 
-/** Ends an import the user cancelled: the assets its file saved go once nothing uses them. */
-function cancelImport(incoming: object): null {
+/**
+ * Ends an import the user cancelled: the assets its file saved go once nothing uses them. An import
+ * whose operation ended fails with the operation's reason.
+ */
+function cancelImport(incoming: object, signal: AbortSignal | undefined): null {
     releaseUnusedAssets(Date.now(), incoming)
+    signal?.throwIfAborted()
     return null
 }
 
@@ -400,6 +404,7 @@ function ask<T extends object>(
     candidates: ContentUpdateCandidate[],
     others: { id: string, name: string }[],
     forcedId: string | null,
+    signal: AbortSignal | undefined,
 ): Promise<Decision> {
     if (pending) finish({ kind: 'cancel' })
     alertClear()
@@ -421,6 +426,12 @@ function ask<T extends object>(
         others: others.filter((other) => !listed.has(other.id)).sort((a, b) => a.name.localeCompare(b.name)),
     }
     const decision = new Promise<Decision>((resolve) => { pending = { entity, incoming, resolve } })
+    // An operation that ended, such as one the system stopped in the background, takes its dialog down.
+    const session = pending
+    const abort = () => { if (pending === session) finish({ kind: 'cancel' }) }
+    signal?.addEventListener('abort', abort, { once: true })
+    void decision.then(() => signal?.removeEventListener('abort', abort))
+    if (signal?.aborted) abort()
     // The update action names its target, so the review opens right away.
     if (forcedId) void reviewContentUpdate()
     return decision
@@ -530,7 +541,7 @@ async function foldCharacterUpdate(decision: Extract<Decision, { kind: 'update' 
  * new character. Returns the id the import ended as (the updated character
  * when the user chose to update), or null when the user cancelled the import.
  */
-export async function commitImportedCharacter(incoming: character, commit: (value: character) => Promise<unknown>): Promise<string | null> {
+export async function commitImportedCharacter(incoming: character, commit: (value: character) => Promise<unknown>, signal?: AbortSignal): Promise<string | null> {
     const forcedId = takeForcedTarget('character')
     const installed = updatableCharacters(incoming.chaId)
     const target = forcedId && installed.some((entry) => entry.id === forcedId) ? forcedId : null
@@ -542,11 +553,12 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
         await characters.normalize(incoming)
         const listed = await withCreators(target ? installed.filter((entry) => entry.id === target).map((entry) => ({ ...entry, reason: 'name' as const })) : candidates)
         loading = shownLoading()
-        decision = await ask(characters, incoming as CharacterDetail, listed, installed, target)
-        if (decision.kind === 'cancel' || !await confirmLowLevelAccess(decision, 'triggerscript')) return cancelImport(incoming)
+        decision = await ask(characters, incoming as CharacterDetail, listed, installed, target, signal)
+        if (decision.kind === 'cancel' || !await confirmLowLevelAccess(decision, 'triggerscript')) return cancelImport(incoming, signal)
     }
     const update = decision.kind === 'update' ? decision : null
     return underLoading(loading, async () => {
+        signal?.throwIfAborted()
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
         await commitImport(commit, incoming)
@@ -594,7 +606,7 @@ async function foldModuleUpdate(decision: Extract<Decision, { kind: 'update' }>,
  * enabled list that point to it keep working. `commit` adds the import as a
  * new module. Returns the id the import ended as, or null when cancelled.
  */
-export async function commitImportedModule(incoming: RisuModule, commit: (value: RisuModule) => Promise<unknown>): Promise<string | null> {
+export async function commitImportedModule(incoming: RisuModule, commit: (value: RisuModule) => Promise<unknown>, signal?: AbortSignal): Promise<string | null> {
     const forcedId = takeForcedTarget('module')
     const installed = (DBState.db.modules ?? []).filter((module) => isInstalledModule(module) && module.id !== incoming.id)
     const forced = forcedId ? installed.find((module) => module.id === forcedId) : undefined
@@ -609,11 +621,12 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
             ? [{ id: forced.id, name: forced.name ?? '', reason: 'name', count: forced.lorebook?.length ?? 0 }]
             : candidates
         loading = shownLoading()
-        decision = await ask(modules, incoming, listed, installed.map((module) => ({ id: module.id, name: module.name ?? '' })), forced?.id ?? null)
-        if (decision.kind === 'cancel' || !await confirmLowLevelAccess(decision, 'trigger')) return cancelImport(incoming)
+        decision = await ask(modules, incoming, listed, installed.map((module) => ({ id: module.id, name: module.name ?? '' })), forced?.id ?? null, signal)
+        if (decision.kind === 'cancel' || !await confirmLowLevelAccess(decision, 'trigger')) return cancelImport(incoming, signal)
     }
     const update = decision.kind === 'update' ? decision : null
     return underLoading(loading, async () => {
+        signal?.throwIfAborted()
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.updateBase = baseKey
         await commitImport(commit, incoming)

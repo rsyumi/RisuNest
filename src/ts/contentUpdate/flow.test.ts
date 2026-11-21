@@ -246,6 +246,22 @@ describe('character update', () => {
         expect(mocks.details.get('old')).toMatchObject({ name: 'Luna', desc: 'theirs' })
     })
 
+    it.each(['character', 'module'] as const)('takes the dialog down and fails with the reason when the import operation ends while it asks (%s)', async (kind) => {
+        install(card('old', 'Luna'))
+        mocks.db.modules.push({ id: 'installed-module', name: 'Lore', description: '', lorebook: [] })
+        const operation = new AbortController()
+        const stored = kind === 'character'
+            ? commitImportedCharacter(card('next', 'Luna', { desc: 'new' }), commitCharacter, operation.signal)
+            : commitImportedModule({ id: 'new-module', name: 'Lore', description: 'new', lorebook: [] } as RisuModule, commitModule, operation.signal)
+        await opened()
+        const expired = new Error('background time ended')
+        operation.abort(expired)
+        await expect(stored).rejects.toBe(expired)
+        expect(contentUpdateDialog.request).toBeNull()
+        expect(commitCharacter).not.toHaveBeenCalled()
+        expect(commitModule).not.toHaveBeenCalled()
+    })
+
     it.each(['character', 'module'] as const)('hands the base it saved to the cleanup when the import cannot be stored (%s)', async (kind) => {
         platform.runtime = 'tauri'
         const failed = new Error('import write failed')
