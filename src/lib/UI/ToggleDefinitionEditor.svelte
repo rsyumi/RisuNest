@@ -68,6 +68,8 @@
 
     const outline = $derived(toggleOutline(lines))
     const preview = $derived(groupSidebarToggles(parseToggleSyntax(serializeToggleDefinitions(lines))))
+    // The preview list leaves out empty groups.
+    const previewShown = $derived(preview.some((toggle) => toggle.type !== 'group' || toggle.children.length > 0))
 
     function commit(next: ToggleLine[]) {
         lines = next
@@ -167,7 +169,7 @@
                 {/each}
                 <button class="bg-transparent hover:bg-darkbg focus:ring-selected border-darkborderc text-textcolor2 border rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 px-3 py-1.5 text-sm inline-flex items-center gap-1.5 self-start mt-1" onclick={() => commit(addToggleRow(lines))}><Plus size={16} />{language.add}</button>
             </div>
-            {#if preview.length > 0}
+            {#if previewShown}
                 <div class="rounded-md border border-darkborderc bg-darkbg p-3 self-start min-w-0 w-full">
                     <div class="text-xs text-subtext">{language.preview}</div>
                     <div class="flex flex-col mt-1">

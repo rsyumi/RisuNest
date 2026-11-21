@@ -140,6 +140,10 @@ describe('toggle definition editor', () => {
     })
 
     it('previews the edited rows without saving preview values', async () => {
+        await open('=G=group\n=G=groupEnd')
+        // An empty group shows nothing, so there is no preview.
+        expect(preview()).toBeNull()
+        await unmount(instance!)
         await open('p=Power\nq=Quiet')
         await type(names()[0], 'Boost')
         expect(preview()?.textContent).toContain('Boost')
