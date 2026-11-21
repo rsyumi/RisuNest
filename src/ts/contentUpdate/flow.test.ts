@@ -242,6 +242,16 @@ describe('character update', () => {
         expect(mocks.details.get('old')).toMatchObject({ name: 'Luna', desc: 'theirs' })
     })
 
+    it.each(['character', 'module'] as const)('hands the base it saved to the cleanup when the import cannot be stored (%s)', async (kind) => {
+        platform.runtime = 'tauri'
+        const failed = new Error('import write failed')
+        const stored = kind === 'character'
+            ? commitImportedCharacter(card('new', 'Luna'), async () => { throw failed })
+            : commitImportedModule({ id: 'new-module', name: 'Lore', description: '', lorebook: [] } as RisuModule, async () => { throw failed })
+        await expect(stored).rejects.toBe(failed)
+        expect(await releasedKeys()).toEqual([...mocks.assets.keys()])
+    })
+
     it('compares and writes the creator and version where the character editor shows them', async () => {
         // The editor changed them in additionalData; the copies beside it stay as the import set them.
         install(card('old', 'Luna', { creator: 'Imported', characterVersion: '1.0', additionalData: { tag: [], creator: 'Edited', character_version: '1.0b' } }))

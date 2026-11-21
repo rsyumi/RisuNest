@@ -226,6 +226,16 @@ function cancelImport(incoming: object): null {
     return null
 }
 
+/** Stores the import. When that fails, the base saved for it and the assets its file saved go once nothing uses them. */
+async function commitImport<T extends object>(commit: (value: T) => Promise<unknown>, incoming: T): Promise<void> {
+    try {
+        await commit(incoming)
+    } catch (error) {
+        releaseUnusedAssets(Date.now(), incoming)
+        throw error
+    }
+}
+
 /**
  * Low-level access the user turned on would also cover the triggers the update
  * takes from the import, so it is confirmed as for an import that asks for it.
@@ -534,7 +544,7 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
     return underLoading(loading, async () => {
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
-        await commit(incoming)
+        await commitImport(commit, incoming)
         if (!update) return incoming.chaId
         try {
             return await foldCharacterUpdate(update, incoming, baseKey)
@@ -601,7 +611,7 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
     return underLoading(loading, async () => {
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.updateBase = baseKey
-        await commit(incoming)
+        await commitImport(commit, incoming)
         if (!update) return incoming.id
         try {
             return await foldModuleUpdate(update, incoming, baseKey)
