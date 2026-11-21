@@ -43,12 +43,12 @@ const button = (label: string) => [...document.querySelectorAll('button')].find(
 
 it('names fields as the character editor does and updates once every difference has a side', async () => {
     const regex = (comment: string) => ({ comment, type: 'editoutput', in: comment, out: '' })
-    const installed = { type: 'character', chaId: 'installed', name: 'Luna', creatorNotes: 'old note', customscript: [regex('A'), regex('B')], chats: [{ id: 'chat' }], extentions: {} }
+    const installed = { type: 'character', chaId: 'installed', name: 'Luna', creatorNotes: 'old note', utilityBot: false, customscript: [regex('A'), regex('B')], chats: [{ id: 'chat' }], extentions: {} }
     mocks.details.set('installed', structuredClone(installed))
     mocks.db.characters = [installed]
     instance = mount(ContentUpdateDialog, { target: document.body })
     const commit = vi.fn(async (value: any) => { mocks.details.set(value.chaId, structuredClone(value)) })
-    const result = commitImportedCharacter({ type: 'character', chaId: 'incoming', name: 'Luna v2', creatorNotes: 'new note', customscript: [regex('B'), regex('A')], chats: [], extentions: {} } as any, commit)
+    const result = commitImportedCharacter({ type: 'character', chaId: 'incoming', name: 'Luna v2', creatorNotes: 'new note', utilityBot: true, customscript: [regex('B'), regex('A')], chats: [], extentions: {} } as any, commit)
     const text = language.risuNest.contentUpdate
 
     await vi.waitFor(() => expect(button(text.next)).toBeTruthy())
@@ -57,10 +57,13 @@ it('names fields as the character editor does and updates once every difference 
     await tick()
     expect(document.body.textContent).toContain(language.creatorNotes)
     expect(document.querySelector('[data-update-item="customscript"]')?.textContent).toContain(`${language.regexScript} ${text.listOrder}`)
+    expect(document.querySelector('[data-update-item="utilityBot"]')?.textContent).toContain(language.utilityBot)
     expect(button(text.update).disabled).toBe(true)
 
     button(text.scopeTheirs).click()
     flushSync()
+    // Each side shows as a button that reads as pressed once chosen.
+    expect(document.querySelector('[data-update-item="utilityBot"] button[aria-pressed="true"]')?.textContent?.trim()).toBe(text.takeTheirs)
     expect(button(text.update).disabled).toBe(false)
     // A request for the character holds the update back only until it ends.
     const release = registerGeneratingConversation({ characterId: 'installed', conversationId: 'chat' })
