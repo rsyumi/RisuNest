@@ -243,10 +243,34 @@ internal class BackNavigationPolicy(
   }
 }
 
+// The cache copy is named `<hash>-<index>-<name>` with marker suffixes, which must fit a 255-byte file name.
+private const val MAX_OPENED_FILE_NAME_BYTES = 150
+
+/** The leaf of an opened file's name, kept readable in any script and bounded for its cache copy. */
 internal fun sanitizeOpenedFileName(name: String): String {
   val leaf = name.substringAfterLast('/').substringAfterLast('\\')
-  val safe = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
-  return safe.ifBlank { "opened-file" }
+  val safe = java.text.Normalizer.normalize(leaf, java.text.Normalizer.Form.NFC)
+    .filterNot { it.isISOControl() || it in '‪'..'‮' || it in '⁦'..'⁩' }
+    .replace(Regex("[:*?\"<>|]"), "_")
+    .trim()
+  if (safe.isEmpty() || safe == "." || safe == "..") return "opened-file"
+  if (safe.toByteArray(Charsets.UTF_8).size <= MAX_OPENED_FILE_NAME_BYTES) return safe
+  val extension = safe.substringAfterLast('.', "")
+    .takeIf { it.length in 1..16 && it.all { char -> char in 'a'..'z' || char in 'A'..'Z' || char in '0'..'9' } }
+    ?.let { ".$it" } ?: ""
+  val budget = MAX_OPENED_FILE_NAME_BYTES - extension.length
+  val base = StringBuilder()
+  var bytes = 0
+  var index = 0
+  while (index < safe.length - extension.length) {
+    val codePoint = safe.codePointAt(index)
+    val width = String(Character.toChars(codePoint)).toByteArray(Charsets.UTF_8).size
+    if (bytes + width > budget) break
+    base.appendCodePoint(codePoint)
+    bytes += width
+    index += Character.charCount(codePoint)
+  }
+  return base.toString() + extension
 }
 
 /**
