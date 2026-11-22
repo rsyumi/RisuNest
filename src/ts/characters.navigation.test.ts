@@ -1437,6 +1437,15 @@ describe('chat list operations', () => {
         expect(formatted.chats[0].localLore).toEqual([])
     })
 
+    it('replaces a script list or lorebook that is not a list with an empty one', () => {
+        const character = buildCharacter()
+        character.triggerscript = 'not a list' as any
+        character.customscript = {} as any
+        character.globalLore = 7 as any
+
+        expect(characterFormatUpdate(character)).toMatchObject({ triggerscript: [], customscript: [], globalLore: [] })
+    })
+
     it('reads a chat authoritatively and navigates only to its duplicate', async () => {
         const character = buildCharacter()
         const authoritative = {
