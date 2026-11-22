@@ -2037,6 +2037,7 @@ export const languageEnglish = {
             nothingToDecide: 'Nothing to choose.',
             keepMine: 'Mine',
             takeTheirs: 'New',
+            takeBoth: 'Both',
             mineSide: 'Mine',
             theirsSide: 'New version',
             skippedLines: (count: number) => `${count} unchanged lines`,
@@ -2051,8 +2052,8 @@ export const languageEnglish = {
             update: 'Update',
             back: 'Back',
             backupSuffix: '(before update)',
-            status: { update: 'New version', mine: 'My change', added: 'Added', removed: 'Removed', mineOnly: 'Added by me', conflict: 'Both changed', differs: 'Differs' },
-            summary: { update: 'New version', mine: 'My changes kept', added: 'Added', removed: 'Removed', mineOnly: 'My additions', conflict: 'Both changed', differs: 'Differs' },
+            status: { update: 'New version', mine: 'My change', added: 'Added', removed: 'Removed', mineOnly: 'Added by me', conflict: 'Both changed', merged: 'Both merged', differs: 'Differs' },
+            summary: { update: 'New version', mine: 'My changes kept', added: 'Added', removed: 'Removed', mineOnly: 'My additions', conflict: 'Both changed', merged: 'Both merged', differs: 'Differs' },
             fields: {
                 postHistoryInstructions: 'Post-history instructions', ccAssets: 'Card assets', extentions: 'Extension data',
                 loreSettings: 'Lorebook settings', loreExt: 'Lorebook extension', bias: 'Bias',

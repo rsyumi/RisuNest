@@ -177,6 +177,38 @@ describe('applyUpdate', () => {
         expect(typedPlan.items.find((item) => item.order)).toMatchObject({ mine: [`T (${language.editInput})`, 'A', 'B'], theirs: [`T (${language.editOutput})`, 'B', 'A'] })
     })
 
+    it('merges a lore entry or regex both sides changed field by field, asking only about fields both changed', () => {
+        const bold = (out: string, more = {}) => ({ comment: 'bold', type: 'editdisplay', in: '**', out, ...more })
+        const base = { name: 'Luna', globalLore: [lore('Town', 'town'), lore('Inn', 'inn')], customscript: [bold('<b>')] }
+        const mine = {
+            ...base, globalLore: [lore('Town', '마을', 'id-t'), { ...lore('Inn', '여관', 'id-i'), insertorder: 5 }],
+            customscript: [bold('<strong>')],
+        }
+        const theirs = {
+            ...base, globalLore: [{ ...lore('Town', 'town'), insertorder: 300 }, { ...lore('Inn', 'inn!'), insertorder: 7, alwaysActive: true }],
+            customscript: [bold('<b>', { in: '**(.+?)**', flag: 'g' })],
+        }
+        const plan = planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, base as any)
+        expect(plan.items.map((item) => [(item.mine as any).comment, item.status, item.choice])).toEqual([
+            ['Town', 'merged', 'both'], ['Inn', 'conflict', null], ['bold', 'merged', 'both'],
+        ])
+        expect(summarizePlan(plan)).toMatchObject({ merged: 2, conflict: 1, unresolved: 1 })
+        const apply = (choices: Record<string, any>) => applyUpdate(CHARACTER_UPDATE, mine as any, theirs as any, plan, choices) as any
+        const [, inn] = plan.items
+        // On a conflict a side settles only the fields both changed; the author's alwaysActive stays either way.
+        const keptMine = apply({ [inn.id]: 'mine' })
+        expect(keptMine.globalLore.map((entry: any) => [entry.content, entry.insertorder, entry.alwaysActive, entry.id])).toEqual([
+            ['마을', 300, false, 'id-t'], ['여관', 5, true, 'id-i'],
+        ])
+        expect(keptMine.customscript).toEqual([bold('<strong>', { in: '**(.+?)**', flag: 'g' })])
+        expect(apply({ [inn.id]: 'theirs' }).globalLore[1]).toMatchObject({ content: 'inn!', insertorder: 7, alwaysActive: true, id: 'id-i' })
+        // On a merged item a side is that whole entry.
+        expect(apply({ [inn.id]: 'mine', [plan.items[0].id]: 'mine' }).globalLore[0]).toMatchObject({ content: '마을', insertorder: 100 })
+        expect(apply({ [inn.id]: 'mine', [plan.items[2].id]: 'theirs' }).customscript).toEqual(theirs.customscript)
+        // Without a base nothing is known to be one side's change.
+        expect(planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, null).items.every((item) => item.status === 'differs' && !item.resolved)).toBe(true)
+    })
+
     it('tells apart assets that share a name from one named like a second copy', () => {
         const assets = [['face', 'assets/1.png', 'png'], ['face', 'assets/2.png', 'png'], ['face#1', 'assets/3.png', 'png']]
         const mine = { id: 'm', name: 'M', description: '', assets }

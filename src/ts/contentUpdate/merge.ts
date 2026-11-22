@@ -106,6 +106,8 @@ export interface UpdateSpec {
     maps: Record<string, Set<string>>
     /** Lists of lore entries: ids and caches are ignored and the installed id is kept. */
     lore: Set<string>
+    /** Lists whose entries both sides changed are merged field by field. */
+    fieldMerged: Set<string>
 }
 
 const loreKey = (entry: loreBook) => JSON.stringify([entry?.mode ?? '', entry?.comment ?? '', entry?.key ?? '', entry?.secondkey ?? ''])
@@ -131,6 +133,7 @@ export const CHARACTER_UPDATE: UpdateSpec = {
     },
     maps: { extentions: new Set(['risuRealmImportId', UPDATE_BASE_EXTENSION_KEY]) },
     lore: new Set(['globalLore']),
+    fieldMerged: new Set(['globalLore', 'customscript']),
 }
 
 export const MODULE_UPDATE: UpdateSpec = {
@@ -140,6 +143,7 @@ export const MODULE_UPDATE: UpdateSpec = {
     lists: { lorebook: loreKey, regex: regexKey, trigger: triggerKey, assets: assetKey },
     maps: {},
     lore: new Set(['lorebook']),
+    fieldMerged: new Set(['lorebook', 'regex']),
 }
 
 function isEmpty(value: unknown): boolean {
@@ -180,11 +184,14 @@ export type UpdateItemStatus =
     | 'removed'   // the author removed it, the user had not changed it
     | 'mineOnly'  // the user added it
     | 'conflict'  // both changed it
+    | 'merged'    // both changed it, in different fields
     | 'differs'   // no base: who changed it is unknown
 
 export type UpdateSide = 'mine' | 'theirs'
-/** A side, or a value the user wrote while comparing the two. */
-export type UpdateChoice = UpdateSide | { value: unknown }
+/** A side, or both sides' changes of an entry merged field by field. */
+export type UpdateResolution = UpdateSide | 'both'
+/** A resolution, or a value the user wrote while comparing the two. */
+export type UpdateChoice = UpdateResolution | { value: unknown }
 
 export interface UpdateItem {
     id: string
@@ -200,7 +207,12 @@ export interface UpdateItem {
     base: unknown
     baseKnown: boolean
     /** Preselected side, or null when the user has to decide. */
-    choice: UpdateSide | null
+    choice: UpdateResolution | null
+    /**
+     * An entry merged field by field: what mine and new write. On a conflict they settle only the fields
+     * both sides changed; on a merged item both hold the merged entry.
+     */
+    resolved?: { mine: Record<string, unknown>, theirs: Record<string, unknown> }
 }
 
 export interface UpdatePlan {
@@ -219,6 +231,35 @@ function decide(hasBase: boolean, base: string, mine: string, theirs: string, pr
     if (mine === base && present.mine) return present.theirs ? { status: 'update', choice: 'theirs' } : { status: 'removed', choice: 'theirs' }
     if (theirs === base && present.theirs) return { status: 'mine', choice: 'mine' }
     return { status: 'conflict', choice: null }
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+const fieldCanon = (value: unknown) => value === undefined ? undefined : JSON.stringify(stable(value))
+
+/**
+ * One entry both sides changed, merged field by field against the base: a field one side alone
+ * changed takes that side, and one both changed takes each side in turn. Lore ids and caches are
+ * the installed entry's. Null when the entry is not a record on every side.
+ */
+function mergeFields(lore: boolean, base: unknown, mine: unknown, theirs: unknown): { mine: Record<string, unknown>, theirs: Record<string, unknown>, overlap: boolean } | null {
+    if (!isRecord(base) || !isRecord(mine) || !isRecord(theirs)) return null
+    const out = { mine: {} as Record<string, unknown>, theirs: {} as Record<string, unknown>, overlap: false }
+    for (const key of new Set([...Object.keys(mine), ...Object.keys(theirs), ...Object.keys(base)])) {
+        let values: [unknown, unknown]
+        if (lore && (key === 'id' || key === 'loreCache')) values = [mine[key], mine[key]]
+        else {
+            const [b, m, t] = [fieldCanon(base[key]), fieldCanon(mine[key]), fieldCanon(theirs[key])]
+            if (m === t || t === b) values = [mine[key], mine[key]]
+            else if (m === b) values = [theirs[key], theirs[key]]
+            else {
+                out.overlap = true
+                values = [mine[key], theirs[key]]
+            }
+        }
+        if (values[0] !== undefined) out.mine[key] = values[0]
+        if (values[1] !== undefined) out.theirs[key] = values[1]
+    }
+    return out
 }
 
 function keyed(keyOf: (item: any) => string, list: unknown): Map<string, unknown> {
@@ -291,9 +332,20 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         if (spec.preserved.has(field)) continue
         const known = !!base && !unread?.(field)
         const push = (key: string, values: { b?: unknown, m?: unknown, t?: unknown }, present: { mine: boolean, theirs: boolean, base: boolean }) => {
-            const verdict = decide(known, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
+            let verdict = decide(known, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
             if (!verdict || spec.silent.has(field)) return
-            items.push({ id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b, baseKnown: known && present.base, ...verdict })
+            let resolved: UpdateItem['resolved']
+            if (verdict.status === 'conflict' && key && spec.fieldMerged.has(field) && present.base && present.mine && present.theirs) {
+                const merged = mergeFields(spec.lore.has(field), values.b, values.m, values.t)
+                if (merged) {
+                    resolved = { mine: merged.mine, theirs: merged.theirs }
+                    if (!merged.overlap) verdict = { status: 'merged', choice: 'both' }
+                }
+            }
+            items.push({
+                id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b,
+                baseKnown: known && present.base, ...verdict, ...(resolved ? { resolved } : {}),
+            })
         }
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
@@ -370,6 +422,16 @@ function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknow
     return result
 }
 
+/** What a choice writes for an entry merged field by field; a side of a merged item is that whole entry. */
+function resolvedChoice(item: UpdateItem, side: UpdateChoice): UpdateChoice {
+    if (typeof side === 'object') return side
+    if (side === 'both') {
+        if (!item.resolved) throw new Error(`Update item ${item.id} has no merged entry`)
+        return { value: item.resolved.mine }
+    }
+    return item.resolved && item.status === 'conflict' ? { value: item.resolved[side] } : side
+}
+
 /**
  * The installed entity with the update applied by the plan's choices. Every
  * unresolved item must have a choice. Preserved fields stay as they are.
@@ -380,7 +442,7 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
         const side = choices[item.id] ?? item.choice
         if (!side) throw new Error(`Update choice missing for ${item.id}`)
         if (!chosen.has(item.field)) chosen.set(item.field, new Map())
-        chosen.get(item.field)!.set(item.key, side)
+        chosen.get(item.field)!.set(item.key, resolvedChoice(item, side))
     }
     const result: Record<string, any> = { ...mine }
     for (const field of Object.keys(theirs)) {
@@ -426,7 +488,7 @@ export function baseSnapshot<T extends object>(spec: UpdateSpec, value: T): Part
 }
 
 export function summarizePlan(plan: UpdatePlan, choices: Record<string, UpdateChoice | 'edit'> = {}) {
-    const counts = { update: 0, mine: 0, added: 0, removed: 0, mineOnly: 0, conflict: 0, differs: 0, unresolved: 0 }
+    const counts = { update: 0, mine: 0, added: 0, removed: 0, mineOnly: 0, conflict: 0, merged: 0, differs: 0, unresolved: 0 }
     for (const item of plan.items) {
         counts[item.status]++
         if (!(choices[item.id] ?? item.choice)) counts.unresolved++

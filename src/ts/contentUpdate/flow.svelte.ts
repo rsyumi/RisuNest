@@ -23,7 +23,7 @@ import {
 } from '../storage/persistentDataRuntime.svelte'
 import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from '../storage/deletedOwnerAssetCleanup'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from '../storage/characterOrderMutation'
-import { editableText, editedValue, isEditable, loreFolderNames, updateGroupOf } from './view'
+import { editStartText, editedValue, isEditable, loreFolderNames, updateGroupOf } from './view'
 import {
     CHARACTER_UPDATE,
     MODULE_UPDATE,
@@ -39,6 +39,7 @@ import {
     type UpdateChoice,
     type UpdateItem,
     type UpdatePlan,
+    type UpdateResolution,
     type UpdateSide,
     type UpdateSpec,
 } from './merge'
@@ -59,8 +60,8 @@ export interface ContentUpdateRequest {
 
 type Decision = { kind: 'new' } | { kind: 'cancel' } | { kind: 'update', id: string, plan: UpdatePlan, choices: Record<string, UpdateChoice> }
 
-/** A side, or 'edit' for the text the user wrote (kept in edits). */
-export type UpdatePick = UpdateSide | 'edit'
+/** A resolution, or 'edit' for the text the user wrote (kept in edits). */
+export type UpdatePick = UpdateResolution | 'edit'
 
 /** What differs between updating a character and updating a module. */
 interface Entity<T extends object> {
@@ -304,7 +305,7 @@ export function setContentUpdateChoice(id: string, pick: UpdatePick) {
         // Start from the user's version: usually the one they already rewrote.
         const item = dialog.plan?.items.find((entry) => entry.id === id)
         if (!item || !isEditable(item)) return
-        dialog.edits = { ...dialog.edits, [id]: editableText(item, 'mine') }
+        dialog.edits = { ...dialog.edits, [id]: editStartText(item) }
     }
     dialog.choices = { ...dialog.choices, [id]: pick }
 }
@@ -380,7 +381,7 @@ export function chooseContentUpdate(kind: 'new' | 'cancel' | 'update') {
     const choices: Record<string, UpdateChoice> = {}
     for (const item of plan.items) {
         const pick = picks[item.id]
-        if (pick === 'edit') choices[item.id] = { value: editedValue(item, dialog.edits[item.id] ?? editableText(item, 'mine')) }
+        if (pick === 'edit') choices[item.id] = { value: editedValue(item, dialog.edits[item.id] ?? editStartText(item)) }
         else if (pick) choices[item.id] = pick
     }
     finish({ kind: 'update', id: dialog.target, plan, choices })

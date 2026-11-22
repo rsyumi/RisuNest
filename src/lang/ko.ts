@@ -1859,6 +1859,7 @@ export const languageKorean = {
             nothingToDecide: '선택할 항목이 없습니다.',
             keepMine: '내 버전',
             takeTheirs: '새 버전',
+            takeBoth: '둘 다 반영',
             mineSide: '내 버전',
             theirsSide: '새 버전',
             skippedLines: (count: number) => `변경 없는 ${count}줄`,
@@ -1873,8 +1874,8 @@ export const languageKorean = {
             update: '업데이트',
             back: '뒤로',
             backupSuffix: '(업데이트 전)',
-            status: { update: '새 버전', mine: '내 수정', added: '추가', removed: '삭제', mineOnly: '내가 추가', conflict: '둘 다 수정', differs: '다름' },
-            summary: { update: '새 버전 적용', mine: '내 수정 유지', added: '추가', removed: '삭제', mineOnly: '내가 추가한 항목', conflict: '둘 다 수정', differs: '다름' },
+            status: { update: '새 버전', mine: '내 수정', added: '추가', removed: '삭제', mineOnly: '내가 추가', conflict: '둘 다 수정', merged: '둘 다 반영', differs: '다름' },
+            summary: { update: '새 버전 적용', mine: '내 수정 유지', added: '추가', removed: '삭제', mineOnly: '내가 추가한 항목', conflict: '둘 다 수정', merged: '둘 다 반영', differs: '다름' },
             fields: {
                 postHistoryInstructions: '대화 후 지시문', ccAssets: '카드 에셋', extentions: '확장 데이터', loreSettings: '로어북 설정',
                 loreExt: '로어북 확장', bias: '바이어스', moduleNamespace: '모듈 네임스페이스',
