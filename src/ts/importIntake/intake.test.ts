@@ -784,9 +784,6 @@ describe('drops on the window', () => {
         ['the onboarding hold', () => onboardingHold.set(true)],
         ['the app lock', () => setAppLockInputBlocked(true, false)],
         ['loading', () => loadedStore.set(false)],
-        ['a blocked library', () => workingSetBlocked.set(true)],
-        ['the update popup', () => showUpdatePopup(true)],
-        ['a full-screen editor', () => openTextEditorPopup(editorRequest)],
     ])('does nothing during %s but still keeps the WebView from opening the file', async (_name, refuse) => {
         refuse()
         const over = dragEvent('dragover', [])
@@ -800,6 +797,26 @@ describe('drops on the window', () => {
         await new Promise(resolve => setTimeout(resolve, 0))
         expect(mocks.files.size).toBe(0)
         expect(outcomes).toEqual([])
+    })
+
+    it.each([
+        ['the library recovery screen', () => workingSetBlocked.set(true), () => workingSetBlocked.set(false)],
+        ['the update popup', () => showUpdatePopup(true), () => showUpdatePopup(false)],
+        ['a full-screen editor', () => openTextEditorPopup(editorRequest), () => closeTextEditorPopup(editorRequest)],
+    ])('takes a drop over %s and imports it once that screen closes', async (_name, open, close) => {
+        open()
+        const over = dragEvent('dragover', [])
+        document.body.dispatchEvent(dragEvent('dragenter', []))
+        document.body.dispatchEvent(over)
+        expect(get(importDropOverlayVisible)).toBe(true)
+        expect(over.dataTransfer!.dropEffect).toBe('copy')
+        document.body.dispatchEvent(dragEvent('drop', [dropped('card.png')]))
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(mocks.files.size).toBe(0)
+        expect(mocks.characterPath).not.toHaveBeenCalled()
+        close()
+        await vi.waitFor(() => expect(outcomes).toHaveLength(1))
+        expect(mocks.characterPath).toHaveBeenCalledOnce()
     })
 
     it('leaves in-app drags alone', () => {
