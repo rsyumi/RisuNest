@@ -206,8 +206,6 @@ export interface UpdateItem {
 export interface UpdatePlan {
     hasBase: boolean
     items: UpdateItem[]
-    /** List fields the user reordered and the author did not, merged in the user's order. */
-    keepOrder?: string[]
 }
 
 function decide(hasBase: boolean, base: string, mine: string, theirs: string, present: { mine: boolean, theirs: boolean, base: boolean }): Pick<UpdateItem, 'status' | 'choice'> | null {
@@ -289,7 +287,6 @@ function entryNames(...lists: Map<string, unknown>[]): string[][] {
  */
 export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: T, base: Partial<T> | null, unread?: (field: string) => boolean): UpdatePlan {
     const items: UpdateItem[] = []
-    const keepOrder: string[] = []
     for (const field of Object.keys(theirs)) {
         if (spec.preserved.has(field)) continue
         const known = !!base && !unread?.(field)
@@ -310,11 +307,12 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
             // them, and not when an entry both added, which it has no place for, sits apart.
             if (keyOf && reordered(mineMap, theirsMap)) {
                 const settled = known && !addedApart(mineMap, theirsMap, baseMap)
-                if (settled && !reordered(theirsMap, baseMap)) keepOrder.push(field)
-                else if (!settled || reordered(mineMap, baseMap)) {
-                    const [mineOrder, theirsOrder, baseOrder] = entryNames(mineMap, theirsMap, baseMap)
-                    items.push({ id: field, field, key: '', order: true, status: known ? 'conflict' : 'differs', mine: mineOrder, theirs: theirsOrder, base: baseOrder, baseKnown: known, choice: null })
-                }
+                const [mineOrder, theirsOrder, baseOrder] = entryNames(mineMap, theirsMap, baseMap)
+                const verdict: Pick<UpdateItem, 'status' | 'choice'> = !settled ? { status: known ? 'conflict' : 'differs', choice: null }
+                    : !reordered(theirsMap, baseMap) ? { status: 'mine', choice: 'mine' }
+                    : !reordered(mineMap, baseMap) ? { status: 'update', choice: 'theirs' }
+                    : { status: 'conflict', choice: null }
+                items.push({ id: field, field, key: '', order: true, mine: mineOrder, theirs: theirsOrder, base: baseOrder, baseKnown: known, ...verdict })
             }
             for (const key of new Set([...theirsMap.keys(), ...mineMap.keys(), ...baseMap.keys()])) {
                 if (!mineMap.has(key) && !theirsMap.has(key)) continue
@@ -326,7 +324,7 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         }
         push('', { b, m, t }, { mine: true, theirs: true, base: true })
     }
-    return { hasBase: !!base, items, keepOrder }
+    return { hasBase: !!base, items }
 }
 
 export function unresolvedItems(plan: UpdatePlan): UpdateItem[] {
@@ -391,7 +389,7 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
         if (has(spec.lists, field)) {
-            result[field] = mergeList(spec.lists[field], spec.lore.has(field), m, t, fieldChoices, plan.keepOrder?.includes(field) || fieldChoices.get('') === 'mine')
+            result[field] = mergeList(spec.lists[field], spec.lore.has(field), m, t, fieldChoices, fieldChoices.get('') === 'mine')
         } else if (has(spec.maps, field)) {
             const silentKeys = spec.maps[field]
             const out: Record<string, unknown> = {}

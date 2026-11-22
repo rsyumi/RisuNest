@@ -11,7 +11,7 @@ import type { ImportIntakeSource } from './types'
 /** Dropped files with these lowercased extensions are copied into the inbox and classified there. */
 export const DROP_COPIED_EXTENSIONS: ReadonlySet<string> = new Set([
     'png', 'jpg', 'jpeg', 'charx', 'json', 'lorebook',
-    'risum', 'risup', 'risupreset', 'risunest', 'risudat', 'bin',
+    'risum', 'risup', 'risupreset', 'preset', 'risunest', 'risudat', 'bin',
 ])
 
 /** Dropped plugin candidates, read as text and never copied. */

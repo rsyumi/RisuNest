@@ -5,6 +5,7 @@
     import { bindPresetFromList, captureChatBindingTarget, chatBindingBlockedByGeneration } from 'src/ts/chatBindings.svelte'
     import { getAppliedPresetId } from 'src/ts/storage/presetEditor.svelte'
     import LazyScreenError from '../UI/LazyScreenError.svelte'
+    import LoadingIndicator from '../UI/GUI/LoadingIndicator.svelte'
 
     let target = $state<ReturnType<typeof captureChatBindingTarget>>(null)
     let retry = $state(0)
@@ -46,7 +47,11 @@
     {@const bindTarget = target}
     <!-- The list sits on the modal layer so it also opens above the editor popups that show this row. -->
     <div class="fixed inset-0 z-modal">
-        {#await loadList(retry) then module}
+        {#await loadList(retry)}
+            <div class="w-full h-full flex items-center justify-center bg-black/50 text-textcolor">
+                <LoadingIndicator label={language.loading} />
+            </div>
+        {:then module}
             {@const PresetManager = module.default}
             <PresetManager
                 mode="bind"

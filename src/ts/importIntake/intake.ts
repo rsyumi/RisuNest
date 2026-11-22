@@ -22,6 +22,7 @@ import { classifyNativeImportSources, type NativeImportIntakeClassification, typ
 import { installImportDropListeners } from './drop'
 import { inspectPluginFile, requestPluginInstall } from './pluginInstall'
 import { importIntakeRefusalText } from './refusalText'
+import { importCoveringScreenOpen, waitForImportCoveringScreensClosed } from './screens.svelte'
 import { openImportSheet } from './sheetStore'
 import {
     DROP_COPIED_EXTENSIONS,
@@ -93,16 +94,20 @@ function waitForLoaded(): Promise<void> {
 }
 
 /**
- * Waits until the app has loaded, the app lock is gone, no alert dialog is open or queued, no file operation runs
- * and no outcome is shown.
+ * Waits until the app has loaded, the app lock is gone, no alert dialog is open or queued, no screen covers the
+ * sheet, no file operation runs and no outcome is shown.
  */
 async function waitForImportIdle(): Promise<void> {
-    while (!get(loadedStore) || isAppLockInputBlocked() || alertStore.hasDialogs() || get(nativeFileOperation) || get(nativeFileOperationOutcome)) {
+    while (
+        !get(loadedStore) || isAppLockInputBlocked() || alertStore.hasDialogs() || importCoveringScreenOpen()
+        || get(nativeFileOperation) || get(nativeFileOperationOutcome)
+    ) {
         // The app lock comes up once loading ends, so a file opened at startup waits for both.
         await waitForLoaded()
         await tick()
         await waitForAppLockInputUnblocked()
         await alertStore.idle()
+        await waitForImportCoveringScreensClosed()
         await waitForNativeFileOperationIdle()
     }
 }

@@ -15,6 +15,7 @@ const h = vi.hoisted(() => ({
     busy: true,
 }))
 vi.mock('src/ts/alert', () => ({ alertError: h.alertError }))
+vi.mock('src/ts/stores.svelte', async () => ({ alertStore: (await import('svelte/store')).writable({ type: 'none', msg: '' }) }))
 vi.mock('src/ts/importIntake/openResult', () => ({ openImportResult: h.openImportResult, canOpenImportResult: () => true }) satisfies typeof import('src/ts/importIntake/openResult'))
 vi.mock('src/ts/storage/sync/serverSyncProduction', () => ({
     getServerSyncController: () => ({ assertFileOperationAvailable() { if (h.busy) throw Object.assign(new Error('server-sync-busy'), { code: 'server-sync-busy' }) } }),
@@ -230,6 +231,19 @@ describe('file operation error details', () => {
 })
 
 describe('result text', () => {
+    it('closes a finished result with Escape', async () => {
+        nativeFileOperationOutcome.set({
+            kind: 'import', format: 'content', state: 'succeeded', startedAt: 0, finishedAt: 1,
+            observedStages: [], warningCodes: [], partialWritesPossible: false, source: { name: 'Harbor.json', bytes: 10 },
+        })
+        target = document.createElement('div')
+        document.body.append(target)
+        component = mount(NativeFileJobDialog, { target })
+        await tick()
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+        await vi.waitFor(() => expect(get(nativeFileOperationOutcome)).toBeNull())
+    })
+
     it('uses the language chosen after the result was first shown', async () => {
         const outcome = {
             kind: 'import', format: 'content', state: 'succeeded', startedAt: 0, finishedAt: 1,

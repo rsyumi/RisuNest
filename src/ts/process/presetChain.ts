@@ -30,12 +30,13 @@ export async function activatePresetChain(
  * conversation's binding and returns true when there is one, which replaces the chain.
  */
 export async function activatePresetChainForRequest(
-    database: PresetChainState,
+    database: () => PresetChainState,
     setOverride: (id: string | null) => Promise<void>,
     random: () => number,
     onMissing: (name: string) => void,
     activateBinding?: () => Promise<boolean>,
 ): Promise<void> {
     if (await activateBinding?.()) return
-    await activatePresetChain(database, setOverride, random, onMissing)
+    // A library that replaced this one during the binding names its own chain.
+    await activatePresetChain(database(), setOverride, random, onMissing)
 }

@@ -75,6 +75,8 @@
         namespace: language.namespace, hideIcon: language.hideChatIcon, hideChatIcon: language.hideChatIcon,
         customModuleToggle: language.customPromptTemplateToggle, license: language.license, source: language.source,
         cjs: language.charjs, sdData: language.imageGeneration,
+        utilityBot: language.utilityBot, largePortrait: language.largePortrait, inlayViewScreen: language.inlayViewScreen,
+        depth_prompt: language.depthPrompt, onboarding: language.onboarding,
     })
 
     function fieldLabel(field: string) {
@@ -194,11 +196,11 @@
                 {#if item.key || item.order}<span class="truncate">{name || text.unnamed}</span>{:else}<span class="font-medium">{fieldLabel(item.field)}</span>{/if}
                 <span class="ml-auto shrink-0 text-xs {item.status === 'conflict' || item.status === 'differs' ? 'text-danger-400' : item.status === 'added' || item.status === 'update' ? 'text-success-400' : 'text-subtext'}">{text.status[item.status]}</span>
             </button>
-            <span class="inline-flex shrink-0 overflow-hidden rounded-md border border-darkborderc" role="radiogroup" aria-label={name || fieldLabel(item.field)}>
-                <button type="button" role="radio" aria-checked={current === 'mine'} class="{segment} {current === 'mine' ? segmentOn : ''}" onclick={() => pick(item, 'mine')}>{text.keepMine}</button>
-                <button type="button" role="radio" aria-checked={current === 'theirs'} class="{segment} border-l border-darkborderc {current === 'theirs' ? segmentOn : ''}" onclick={() => pick(item, 'theirs')}>{text.takeTheirs}</button>
+            <span class="inline-flex shrink-0 overflow-hidden rounded-md border border-darkborderc" role="group" aria-label={name || fieldLabel(item.field)}>
+                <button type="button" aria-pressed={current === 'mine'} class="{segment} {current === 'mine' ? segmentOn : ''}" onclick={() => pick(item, 'mine')}>{text.keepMine}</button>
+                <button type="button" aria-pressed={current === 'theirs'} class="{segment} border-l border-darkborderc {current === 'theirs' ? segmentOn : ''}" onclick={() => pick(item, 'theirs')}>{text.takeTheirs}</button>
                 {#if editable}
-                    <button type="button" role="radio" aria-checked={current === 'edit'} class="{segment} border-l border-darkborderc {current === 'edit' ? segmentOn : ''}" onclick={() => pick(item, 'edit')}>{text.editOwn}</button>
+                    <button type="button" aria-pressed={current === 'edit'} class="{segment} border-l border-darkborderc {current === 'edit' ? segmentOn : ''}" onclick={() => pick(item, 'edit')}>{text.editOwn}</button>
                 {/if}
             </span>
         </div>
@@ -261,12 +263,11 @@
                 {#if dialog.step === 'choose'}
                     {#if request.candidates.length}
                         <h3 class="text-xs font-semibold text-subtext">{isModule ? text.moduleCandidates : text.candidates}</h3>
-                        <div class="flex flex-col gap-1.5" role="radiogroup" aria-label={isModule ? text.moduleCandidates : text.candidates}>
+                        <div class="flex flex-col gap-1.5" role="group" aria-label={isModule ? text.moduleCandidates : text.candidates}>
                             {#each request.candidates as candidate (candidate.id)}
                                 <button
                                     type="button"
-                                    role="radio"
-                                    aria-checked={dialog.target === candidate.id}
+                                    aria-pressed={dialog.target === candidate.id}
                                     class="flex w-full items-center gap-3 rounded-md border px-3 py-2.5 text-left transition-colors {dialog.target === candidate.id ? 'border-borderc bg-selected' : 'border-darkborderc hover:bg-selected/60'}"
                                     disabled={dialog.busy}
                                     onclick={() => selectContentUpdateTarget(candidate.id)}
@@ -296,9 +297,9 @@
                             {/if}
                             {#if otherQuery.trim()}
                                 {#if otherMatches.length}
-                                    <div class="flex flex-col" role="radiogroup" aria-label={isModule ? text.moduleOther : text.other}>
+                                    <div class="flex flex-col" role="group" aria-label={isModule ? text.moduleOther : text.other}>
                                         {#each otherMatches as other (other.id)}
-                                            <button type="button" role="radio" aria-checked={dialog.target === other.id} class="rounded-md px-2.5 py-1.5 text-left text-sm hover:bg-selected {dialog.target === other.id ? 'bg-selected' : ''}" disabled={dialog.busy} onclick={() => selectContentUpdateTarget(other.id)}>{other.name || text.unnamed}</button>
+                                            <button type="button" aria-pressed={dialog.target === other.id} class="rounded-md px-2.5 py-1.5 text-left text-sm hover:bg-selected {dialog.target === other.id ? 'bg-selected' : ''}" disabled={dialog.busy} onclick={() => selectContentUpdateTarget(other.id)}>{other.name || text.unnamed}</button>
                                         {/each}
                                     </div>
                                 {:else}
@@ -334,9 +335,9 @@
                                 <input type="search" class="min-w-0 flex-1 bg-transparent text-sm text-textcolor outline-hidden" bind:value={query} placeholder={text.searchPlaceholder} aria-label={text.searchPlaceholder} />
                                 {#if query}<button type="button" class="rounded-sm p-0.5 hover:text-textcolor" aria-label={text.clearSearch} onclick={() => { query = '' }}><XIcon size={14} /></button>{/if}
                             </label>
-                            <span class="inline-flex shrink-0 overflow-hidden rounded-md border border-darkborderc" role="radiogroup" aria-label={text.viewLabel}>
-                                <button type="button" role="radio" aria-checked={!dialog.showAll} class="{segment} {!dialog.showAll ? segmentOn : ''}" onclick={() => { dialog.showAll = false }}>{text.viewDecide(toDecide.length)}</button>
-                                <button type="button" role="radio" aria-checked={dialog.showAll} class="{segment} border-l border-darkborderc {dialog.showAll ? segmentOn : ''}" onclick={() => { dialog.showAll = true }}>{text.viewAll(plan.items.length)}</button>
+                            <span class="inline-flex shrink-0 overflow-hidden rounded-md border border-darkborderc" role="group" aria-label={text.viewLabel}>
+                                <button type="button" aria-pressed={!dialog.showAll} class="{segment} {!dialog.showAll ? segmentOn : ''}" onclick={() => { dialog.showAll = false }}>{text.viewDecide(toDecide.length)}</button>
+                                <button type="button" aria-pressed={dialog.showAll} class="{segment} border-l border-darkborderc {dialog.showAll ? segmentOn : ''}" onclick={() => { dialog.showAll = true }}>{text.viewAll(plan.items.length)}</button>
                             </span>
                         </div>
 

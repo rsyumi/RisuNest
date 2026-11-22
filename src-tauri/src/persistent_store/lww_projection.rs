@@ -2477,6 +2477,12 @@ pub(in crate::persistent_store) fn reproject_archived_children(
             }
             continue;
         }
+        // A large unit an earlier build stored without its body waits for a later receive.
+        if matches!(key.components()[0].as_str(), "character" | "conversation")
+            && !super::listed_fields::body_stored(tx, &value)?
+        {
+            continue;
+        }
         if parent_status(tx, &key)? == "ready" {
             apply(tx, generation, &key, &value)?;
         }

@@ -246,12 +246,27 @@ fn remove_helper(
                 return Ok(());
             }
         } else {
+            let mut failure = None;
             for index in 1..=count {
-                instances
+                let stopped = instances
                     .get_Item(&VARIANT::from(index))
+                    .at("instances")
+                    .and_then(|instance| instance.Stop().at("stop"));
+                if let Err(error) = stopped {
+                    failure.get_or_insert(error);
+                }
+            }
+            // An instance that ended before its stop reached it leaves nothing running.
+            if let Some(error) = failure {
+                if task
+                    .GetInstances(0)
                     .at("instances")?
-                    .Stop()
-                    .at("stop")?;
+                    .Count()
+                    .at("instances")?
+                    != 0
+                {
+                    return Err(error);
+                }
             }
         }
         folder.DeleteTask(&BSTR::from(name), 0).at("delete")

@@ -140,7 +140,8 @@ let offlineNoticeClaimed = false
 const changed = () => {
     for (const listener of listeners) listener(snapshot())
     if (offlineNoticePending || offlineNoticeClaimed || !isTauri || document.visibilityState === 'hidden'
-        || binding || (!context && persistedBinding?.target.kind !== 'server')
+        // A committed restore keeps automatic sync stopped, so nothing retries while it holds.
+        || binding || heldForCommittedRestore || (!context && persistedBinding?.target.kind !== 'server')
         || getDatabase().risunestSyncStatusUi === false
         || !error || !serverUnavailable
         || !outageConfirmed) return

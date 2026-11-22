@@ -486,8 +486,18 @@ class MainActivityBehaviorTest {
   fun `opened file names keep only a safe leaf name`() {
     assertEquals("a.charx", sanitizeOpenedFileName("a.charx"))
     assertEquals("b.risum", sanitizeOpenedFileName("primary:Download/b.risum"))
-    assertEquals("c_d.risup", sanitizeOpenedFileName("c d.risup"))
+    assertEquals("c d.risup", sanitizeOpenedFileName("c d.risup"))
+    assertEquals("한국어 프리셋.risup", sanitizeOpenedFileName("한국어 프리셋.risup"))
+    assertEquals("a_b.risup", sanitizeOpenedFileName("a:b.risup"))
     assertEquals("opened-file", sanitizeOpenedFileName("///"))
+    assertEquals("opened-file", sanitizeOpenedFileName(".."))
+  }
+
+  @Test
+  fun `a long opened file name is cut to fit its cache copy and keeps its extension`() {
+    val name = sanitizeOpenedFileName("가".repeat(80) + ".risup")
+    assertTrue(name.toByteArray(Charsets.UTF_8).size <= 150)
+    assertEquals("가".repeat(48) + ".risup", name)
   }
 
   @Test

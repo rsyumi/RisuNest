@@ -937,7 +937,11 @@ fn release_job(
     if !jobs.contains_key(session_id) {
         match DurableCasJob::open(root, session_id) {
             Ok(job) => { jobs.insert(session_id.to_owned(), job); }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A page reset can leave the owner of a session whose journal is already gone.
+                jobs.owners.remove(session_id);
+                return Ok(());
+            }
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -1479,6 +1483,10 @@ mod tests {
             release_job(&mut jobs, directory.path(), "activation-failure", CasReleaseOutcome::Aborted).unwrap();
             release_job(&mut jobs, directory.path(), "activation-failure", CasReleaseOutcome::Aborted).unwrap();
             assert!(jobs.is_empty());
+            // A page reset keeps only the session's owner, which its release forgets.
+            jobs.owners.insert("activation-failure".to_owned(), "document".to_owned());
+            release_job(&mut jobs, directory.path(), "activation-failure", CasReleaseOutcome::Aborted).unwrap();
+            assert!(jobs.owners.is_empty());
             let roots = collect_durable_cas_job_roots(directory.path());
             assert!(roots.blockers.is_empty());
             assert!(roots.object_hashes.is_empty());

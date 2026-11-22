@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     cardExport: vi.fn(async () => ({ type: '', type2: '' })),
     download: vi.fn(async () => ({ data: {}, buf: null })),
     diff: vi.fn(),
+    diffClose: vi.fn(),
     close: vi.fn(),
 }))
 vi.mock('src/ts/stores.svelte', async () => {
@@ -28,8 +29,11 @@ vi.mock('src/ts/alert', () => ({
 }))
 vi.mock('src/ts/process/templates/templates', () => ({ prebuiltPresets: { OAI2: {} } }))
 vi.mock('../Others/PromptDiffModal.svelte', () => ({
-    default: (_anchor: unknown, props: { firstPreset: { name: string }; secondPreset: { name: string } }) =>
-        mocks.diff([props.firstPreset.name, props.secondPreset.name]),
+    default: (_anchor: unknown, props: { firstPreset: { name: string }; secondPreset: { name: string }; onClose(): void }) => {
+        mocks.diff([props.firstPreset.name, props.secondPreset.name])
+        // Its close button saves the view settings, then closes.
+        return { handleClose: () => { mocks.diffClose(); props.onClose() } }
+    },
 }))
 vi.mock('src/ts/storage/database.svelte', async () => {
     const { DBState } = await import('src/ts/stores.svelte')
@@ -167,6 +171,9 @@ it('compares two picked presets without changing the selection when prompt compa
     choose('Gamma').click()
     await vi.waitFor(() => expect(mocks.diff).toHaveBeenCalledWith(['Alpha', 'Gamma']))
     expect(DBState.db.botPresetsId).toBe(0)
+    // Escape closes the comparison as its close button does, leaving the preset list open.
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    expect(mocks.diffClose).toHaveBeenCalled()
     expect(mocks.close).not.toHaveBeenCalled()
 })
 
@@ -201,6 +208,7 @@ it('binds in bind mode without changing the selection, and unbinds through the i
 })
 
 it('moves a held preset by touch to the gap it is dropped on without selecting it', async () => {
+    await openActions('Gamma')
     const alpha = [...document.querySelectorAll('button[draggable="true"] span')].find(span => span.textContent === 'Alpha')!
     const end = rows().at(-1)!
     let entered = undefined as Event | undefined
@@ -212,6 +220,11 @@ it('moves a held preset by touch to the gap it is dropped on without selecting i
     touch(alpha, 'touchend', 30, 160)
     alpha.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
     await vi.waitFor(() => expect(order()).toEqual(['Beta', 'Gamma', 'Delta', 'Alpha']))
+    // The menu that was open stays with its preset.
+    await tick()
+    const menu = (name: string) => row(name).querySelector(`button[title="${languageEnglish.movePresetDown}"]`)
+    expect(menu('Gamma')).not.toBeNull()
+    expect(menu('Delta')).toBeNull()
     // Drag implementations that follow the HTML specification drop only where dragenter was cancelled.
     expect(entered?.defaultPrevented).toBe(true)
     expect(mocks.close).not.toHaveBeenCalled()

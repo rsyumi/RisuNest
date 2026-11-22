@@ -32,6 +32,7 @@ export interface NativeModuleContentActivationDependencies {
     commitImport?(
         module: RisuModule,
         commit: (value: RisuModule) => Promise<unknown>,
+        signal?: AbortSignal,
     ): Promise<string | null>
 }
 
@@ -39,9 +40,9 @@ const productionDependencies: NativeModuleContentActivationDependencies = {
     confirmLowLevelAccess: () => alertConfirm(language.lowLevelAccessConfirm),
     createId: v4,
     append: appendPersistentRootModule,
-    commitImport: async (module, commit) => {
+    commitImport: async (module, commit, signal) => {
         const { commitImportedModule } = await import('../contentUpdate/flow.svelte')
-        return commitImportedModule(module, commit)
+        return commitImportedModule(module, commit, signal)
     },
 }
 
@@ -49,12 +50,13 @@ async function commitModule(
     dependencies: NativeModuleContentActivationDependencies,
     module: RisuModule,
     commit: (value: RisuModule) => Promise<void>,
+    signal: AbortSignal | undefined,
 ): Promise<string | null> {
     if (!dependencies.commitImport) {
         await commit(module)
         return module.id
     }
-    return dependencies.commitImport(module, commit)
+    return dependencies.commitImport(module, commit, signal)
 }
 
 function requireRisum(content: PreparedNativeContent): PreparedNativeRisumContent {
@@ -112,7 +114,7 @@ export async function activatePreparedNativeModuleContent(
                     },
                     signal,
                 )
-            })
+            }, signal)
         } catch (error) {
             if (
                 error instanceof PersistentRootModuleAppendRejectedError ||
@@ -202,7 +204,7 @@ export async function activatePreparedNativeModuleContent(
                 { module: value, assetAliases, ownerHead: content.ownerHead },
                 signal,
             )
-        })
+        }, signal)
     } catch (error) {
         if (sealed && (
             error instanceof PersistentRootModuleAppendRejectedError ||

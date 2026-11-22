@@ -510,6 +510,26 @@ describe('production server LWW composition', () => {
         expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
     })
 
+    it('shows no automatic retry warning while a committed restore keeps sync stopped', async () => {
+        f.database.risunestSyncStatusUi = true
+        production.holdServerSyncAfterRestore()
+        await startServer({ again: false })
+        await startServer()
+        visible(true); await settle()
+        expect(f.transport?.heldForCommittedRestore?.()).toBe(true)
+        const base = f.invoke.getMockImplementation()!
+        f.invoke.mockImplementation(async (command, args) => {
+            if (command === 'server_sync_lww_pull') throw { code: 'server-unreachable', retryable: true }
+            if (command === 'server_sync_claim_offline_notice') return true
+            return base(command, args)
+        })
+        // Another restore receives while the server is down.
+        await afterLaunchRetries(f.transport!.receiveAvailableChanges!(bindingContext()).catch(() => undefined))
+        await vi.advanceTimersByTimeAsync(60_000); await settle()
+        expect(pullCalls()).toBeGreaterThan(0)
+        expect(f.alert).not.toHaveBeenCalled()
+    })
+
     it.each(['a binding chosen since', 'Sync now', 'a new device binding'] as const)('reattaches a restored binding without automatic pull, push or hydration until %s', async resume => {
         f.os = 'android'
         production.initializeNativeSyncBindings(); await production.installServerSyncProduction()

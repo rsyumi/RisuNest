@@ -55,7 +55,7 @@ describe('preset chain activation', () => {
         })
         const run = async () => {
             await activatePresetChainForRequest(
-                { presetChain: 'Target', botPresets: [{ id: 'target', name: 'Target' }] },
+                () => ({ presetChain: 'Target', botPresets: [{ id: 'target', name: 'Target' }] }),
                 changePreset,
                 () => 0,
                 vi.fn(),
@@ -72,10 +72,10 @@ describe('preset chain activation', () => {
         const changePreset = vi.fn(async () => undefined)
         const database = { presetChain: 'Target', botPresets: [{ id: 'other', name: 'Other' }, { id: 'target', name: 'Target' }] }
 
-        await activatePresetChainForRequest(database, changePreset, () => 0, vi.fn(), async () => true)
+        await activatePresetChainForRequest(() => database, changePreset, () => 0, vi.fn(), async () => true)
         expect(changePreset).not.toHaveBeenCalled()
 
-        await activatePresetChainForRequest(database, changePreset, () => 0, vi.fn(), async () => false)
+        await activatePresetChainForRequest(() => database, changePreset, () => 0, vi.fn(), async () => false)
         expect(changePreset).toHaveBeenCalledExactlyOnceWith('target')
     })
 })

@@ -39,6 +39,7 @@ export interface NativeCharacterContentActivationDependencies {
     commitImport?(
         character: character,
         commit: (value: character) => Promise<unknown>,
+        signal?: AbortSignal,
     ): Promise<string | null>
 }
 
@@ -172,9 +173,9 @@ const productionDependencies: NativeCharacterContentActivationDependencies = {
     decodePng: decodePreparedNativePngCharacterCard,
     map: mapPreparedNativeCharacterCard,
     upsert: upsertPersistentCompleteCharacter,
-    commitImport: async (character, commit) => {
+    commitImport: async (character, commit, signal) => {
         const { commitImportedCharacter } = await import('../contentUpdate/flow.svelte')
-        return commitImportedCharacter(character, commit)
+        return commitImportedCharacter(character, commit, signal)
     },
 }
 
@@ -215,7 +216,7 @@ export async function activatePreparedNativeCharacterContent(
         await commit(character)
         return { characterId: character.chaId }
     }
-    const characterId = await dependencies.commitImport(character, commit)
+    const characterId = await dependencies.commitImport(character, commit, signal)
     return characterId ? { characterId } : null
 }
 

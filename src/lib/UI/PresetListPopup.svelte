@@ -228,6 +228,13 @@
         const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect()
         dropAt = event.clientY < bounds.top + bounds.height / 2 ? index : index + 1
     }
+    /** Where the row at `index` sits once the row at `from` moves into the gap `to`, so an open menu stays with its row. */
+    function movedIndex(index: number, from: number, to: number) {
+        if (index === from) return to > from ? to - 1 : to
+        if (index > from && index < to) return index - 1
+        if (index < from && index >= to) return index + 1
+        return index
+    }
     async function drop(event: DragEvent) {
         if (!accepts(event)) return
         event.preventDefault()
@@ -240,12 +247,13 @@
         if (from < 0 || to === null || to === from || to === from + 1) return
         if (actions) {
             await guarded(async () => {
-                await actions.move(from, to)
+                if (await actions.move(from, to) && openMenu !== null) openMenu = movedIndex(openMenu, from, to)
             })
             return
         }
         const [moved] = current.splice(from, 1)
         current.splice(to > from ? to - 1 : to, 0, moved)
+        if (openMenu !== null) openMenu = movedIndex(openMenu, from, to)
     }
     /** Whether the gap would move the dragged row, so a gap next to it shows nothing. */
     const movesTo = (gap: number) => dragFrom !== null && gap !== dragFrom && gap !== dragFrom + 1
@@ -280,9 +288,9 @@
                 </div>
             {/if}
             {#if !presets?.length}
-                {#if empty}<p class="text-textcolor2 text-sm m-0">{empty}</p>{/if}
+                {#if empty}<p class="text-subtext text-sm m-0">{empty}</p>{/if}
             {:else if visible.length === 0}
-                <p class="text-textcolor2 text-sm m-0 {listScroll ? 'flex-1' : ''}">{emptyFiltered ?? empty}</p>
+                <p class="text-subtext text-sm m-0 {listScroll ? 'flex-1' : ''}">{emptyFiltered ?? empty}</p>
             {:else}
                 <div
                     class="flex flex-col gap-1 {listScroll ? 'overflow-y-auto min-h-0 flex-1' : ''} {dragType ? 'py-1 -my-1' : ''}"
@@ -338,7 +346,7 @@
                                     {@render rowLeading?.(preset, index)}
                                     <span class="min-w-0 flex-1">
                                         {#if subtitle}
-                                            <span class="block text-xs text-textcolor2 truncate">{subtitle(preset)}</span>
+                                            <span class="block text-xs text-subtext truncate">{subtitle(preset)}</span>
                                         {/if}
                                         <span class="block truncate {isSelected ? 'font-medium' : ''}">{preset.name}</span>
                                     </span>

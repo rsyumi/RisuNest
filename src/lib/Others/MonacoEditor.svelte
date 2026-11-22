@@ -71,6 +71,8 @@
             },
             ...options,
         });
+        // Monaco gives text without a line break the line break of the platform, CRLF on Windows, and the app writes LF.
+        if (!value.includes('\r\n')) editor.getModel()?.setEOL(monaco.editor.EndOfLineSequence.LF);
 
         editor.onDidChangeModelContent(() => {
             const newValue = editor.getValue();

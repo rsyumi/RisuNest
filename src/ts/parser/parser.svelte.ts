@@ -1266,8 +1266,8 @@ function initMatcher(){
             format,
             timestamp || activeMatcherContext?.currentTime,
         ),
-        getModules: () => activeMatcherContext?.modules ?? getModules(),
-        getModuleLorebooks: () => activeMatcherContext?.moduleLorebooks ?? getModuleLorebooks(),
+        getModules: () => activeMatcherContext?.modules ?? getModules(activeMatcherContext?.db ?? getDatabase()),
+        getModuleLorebooks: () => activeMatcherContext?.moduleLorebooks ?? getModuleLorebooks(activeMatcherContext?.db ?? getDatabase()),
         pickHashRand: pickHashRand,
         getSelectedCharID: () => {
             return activeMatcherContext?.selectedCharID ?? get(selectedCharID)

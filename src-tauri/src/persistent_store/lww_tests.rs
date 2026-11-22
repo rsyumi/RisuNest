@@ -1810,9 +1810,15 @@ fn opening_projects_received_units_of_newly_shared_fields_once_without_publishin
     store.connection.execute("UPDATE conversations SET detail=json_remove(detail,'$.promptPresetId') WHERE character_id='char' AND conversation_id='conv'", []).unwrap();
     let revision = store.revision().unwrap();
     drop(store);
-    let store = PersistentStore::open(dir.path()).unwrap();
+    let mut store = PersistentStore::open(dir.path()).unwrap();
     assert!(store.read_conversation("char", "conv", None).unwrap().unwrap().value.get("promptPresetId").is_none());
     assert_eq!(store.revision().unwrap(), revision);
+    // Restoring an archived character projects its units and leaves the one without a body waiting.
+    store.archive_character("char", revision, 10).unwrap();
+    store.restore_character("char", store.revision().unwrap()).unwrap();
+    let conversation = store.read_conversation("char", "conv", None).unwrap().unwrap().value;
+    assert_eq!(conversation["promptPresetId"], "preset-b");
+    assert!(conversation.get("authorNotePreset").is_none());
 }
 
 // A backup an earlier build made holds units its documents lack.

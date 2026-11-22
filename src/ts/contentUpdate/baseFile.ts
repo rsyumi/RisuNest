@@ -12,6 +12,7 @@ import { convertJsonToModule } from '../process/moduleImportLocation'
 import { decodeImportUtf8 } from '../importUtf8'
 import { normalizeOnboarding } from '../onboarding'
 import { decodeRPack } from '../rpack/rpack_js'
+import { MAX_CONTENT_METADATA_BYTES } from '../storage/contentImportLimits'
 
 // Reads an earlier version of a character or module file as the base of an
 // update, without installing it or saving its assets. Only the text the card
@@ -41,17 +42,34 @@ async function cardFromPng(data: Uint8Array): Promise<Card> {
     return JSON.parse(text(Buffer.from(encoded, 'base64')))
 }
 
-function unzipCharx(data: Uint8Array) {
-    const filter = (file: { name: string }) => file.name === 'card.json' || file.name === 'module.risum'
-    try {
-        return unzipSync(data, { filter })
-    } catch (error) {
-        // A JPEG with a CHARX appended: read from the first local file header.
-        for (let i = 0; i + 3 < data.length; i++) {
-            if (data[i] === 0x50 && data[i + 1] === 0x4b && data[i + 2] === 3 && data[i + 3] === 4) return unzipSync(data.subarray(i), { filter })
-        }
-        throw error
+function unzipCharx(data: Uint8Array): Record<string, Uint8Array> {
+    const filter = (file: { name: string, originalSize: number }) => {
+        if (file.name !== 'card.json' && file.name !== 'module.risum') return false
+        // The importer refuses a card or module larger than this, so it is not inflated here.
+        if (file.originalSize > MAX_CONTENT_METADATA_BYTES) throw new UnsupportedUpdateBaseFileError()
+        return true
     }
+    let failure: unknown = null
+    const read = (from: number) => {
+        try {
+            const files = unzipSync(from ? data.subarray(from) : data, { filter })
+            if (files['card.json']) return files
+        } catch (error) {
+            if (error instanceof UnsupportedUpdateBaseFileError) throw error
+            failure ??= error
+        }
+        return null
+    }
+    const whole = read(0)
+    if (whole) return whole
+    // A JPEG with a CHARX appended: read from the local file header the CHARX starts at, past image bytes that look like one.
+    for (let i = 1; i + 3 < data.length; i++) {
+        if (data[i] !== 0x50 || data[i + 1] !== 0x4b || data[i + 2] !== 3 || data[i + 3] !== 4) continue
+        const files = read(i)
+        if (files) return files
+    }
+    if (failure) throw failure
+    return {}
 }
 
 /** The module record of a RISUM file, without its assets. */
@@ -60,7 +78,7 @@ async function moduleFromRisum(data: Uint8Array): Promise<RisuModule> {
     if (buffer.length < 6 || buffer.readUInt8(0) !== 111 || buffer.readUInt8(1) !== 0) throw new UnsupportedUpdateBaseFileError()
     const length = buffer.readUInt32LE(2)
     const main = JSON.parse(text(await decodeRPack(buffer.subarray(6, 6 + length))))
-    if (main?.type !== 'risuModule' || !main.module) throw new UnsupportedUpdateBaseFileError()
+    if (main?.type !== 'risuModule' || !isRecord(main.module)) throw new UnsupportedUpdateBaseFileError()
     return main.module
 }
 
@@ -100,6 +118,7 @@ function cardToCharacter(card: Card, module: RisuModule | null): Partial<charact
         tags: data.tags ?? [],
         creator: data.creator ?? '',
         characterVersion: `${data.character_version}` || '',
+        additionalData: { tag: data.tags ?? [], creator: data.creator, character_version: data.character_version },
         replaceGlobalNote: data.post_history_instructions ?? '',
         globalLore: lore,
         loreSettings,
@@ -154,7 +173,7 @@ export async function readUpdateBaseFile(kind: 'character' | 'module', file: { n
     } else if (name.endsWith('.json') || name.endsWith('.lorebook')) {
         const parsed = JSON.parse(text(file.data))
         // A lorebook or regex file is the module its import converts it to.
-        module = parsed?.type === 'risuModule' ? parsed : kind === 'module' ? (await convertJsonToModule(parsed))?.module ?? null : null
+        module = parsed?.type === 'risuModule' ? parsed : kind === 'module' && isRecord(parsed) ? (await convertJsonToModule(parsed))?.module ?? null : null
         // Other JSON is a card; the JSON importer takes an older one only with these fields.
         const spec = parsed?.spec === 'chara_card_v2' || parsed?.spec === 'chara_card_v3'
         if (!module && (spec || ((parsed?.char_name || parsed?.name) && (parsed.char_persona || parsed.description) && (parsed.char_greeting || parsed.first_mes)))) card = parsed

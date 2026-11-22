@@ -128,6 +128,9 @@ describe('common backup file production route', () => {
     })
     it('materializes confirmed upstream Android source after format probe',async()=>{
         m.invoke.mockResolvedValue('local-backup')
+        // The restore job claims the materialized spool, so removing it afterwards finds nothing.
+        m.discard.mockResolvedValue(false)
+        m.legacy.mockResolvedValue({ ...result, warningCodes: [] })
         const bridge = {
             copyExport() {},
             materializeBackupSource(_token: string, report?: (progress: { copiedBytes: number; totalBytes: number | null }) => void) {
@@ -140,14 +143,14 @@ describe('common backup file production route', () => {
             expect(m.invoke).toHaveBeenCalledWith('native_backup_source_format',{source:{type:'androidSeekable',token:'synthetic-custody'}})
             return materializeAndroidBackupSource(token, options, bridge)
         })
-        await restoreBackupFromNativeSource({type:'androidSeekable',token:'synthetic-custody'})
+        await expect(restoreBackupFromNativeSource({type:'androidSeekable',token:'synthetic-custody'}))
+            .resolves.toMatchObject({ warningCodes: [] })
         expect(m.status).toHaveBeenCalledWith(expect.objectContaining({
             detail: expect.objectContaining({
                 stage: 'copying-source', stageUnit: 'bytes', stageCompleted: 4 * 1024 ** 3, stageTotal: 8 * 1024 ** 3,
             }),
         }))
         expect(m.legacy.mock.calls[0][1]).toEqual({type:'androidSpool',token:'synthetic-materialized'})
-        expect(m.discard).toHaveBeenCalledWith('synthetic-materialized')
     })
     it('propagates cancellation into the Android copy and removes its late result before restore', async () => {
         m.invoke.mockResolvedValue('local-backup')
