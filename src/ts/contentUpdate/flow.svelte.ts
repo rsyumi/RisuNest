@@ -25,7 +25,7 @@ import {
 } from '../storage/persistentDataRuntime.svelte'
 import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from '../storage/deletedOwnerAssetCleanup'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from '../storage/characterOrderMutation'
-import { editStartText, editedValue, isEditable, loreFolderNames, updateGroupOf } from './view'
+import { editStartText, editedChoice, isEditable, loreFolderNames, updateGroupOf } from './view'
 import {
     CHARACTER_UPDATE,
     MODULE_UPDATE,
@@ -416,7 +416,7 @@ export function chooseContentUpdate(kind: 'new' | 'cancel' | 'update') {
     const choices: Record<string, UpdateChoice> = {}
     for (const item of plan.items) {
         const pick = picks[item.id]
-        if (pick === 'edit') choices[item.id] = { value: editedValue(item, dialog.edits[item.id] ?? editStartText(item)) }
+        if (pick === 'edit') choices[item.id] = editedChoice(item, dialog.edits[item.id] ?? editStartText(item))
         else if (pick) choices[item.id] = pick
     }
     finish({ kind: 'update', id: dialog.target, plan, choices })

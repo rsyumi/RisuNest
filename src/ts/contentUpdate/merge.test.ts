@@ -210,6 +210,39 @@ describe('applyUpdate', () => {
         expect(planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, null).items.every((item) => item.status === 'differs' && !item.resolved)).toBe(true)
     })
 
+    it('writes a merged entry onto the entry as stored then, so a change made after the comparison stays', () => {
+        const rx = (more = {}) => ({ comment: 'bold', type: 'editdisplay', in: '**', out: '<b>', flag: 'i', ...more })
+        const base = { name: 'Luna', globalLore: [lore('Town', 'town')], customscript: [rx()] }
+        const mine = { ...base, globalLore: [lore('Town', '마을', 'id-t')], customscript: [rx({ out: '<strong>' })] }
+        // The author changed the text and order of the entry and removed the regex flag.
+        const { flag: _flag, ...unflagged } = rx()
+        const theirs = { ...base, globalLore: [{ ...lore('Town', 'town!'), insertorder: 7 }], customscript: [unflagged] }
+        const plan = planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, base as any)
+        const [town, bold] = plan.items
+        expect([town.status, bold.status]).toEqual(['conflict', 'merged'])
+        // Since the comparison the user turned on the regex flag option and made the entry selective.
+        const stored = {
+            ...mine, globalLore: [{ ...lore('Town', '마을', 'id-t'), selective: true }],
+            customscript: [rx({ out: '<strong>', ableFlag: true })],
+        }
+        const apply = (choices: Record<string, any>, from: object = stored) => applyUpdate(CHARACTER_UPDATE, from as any, theirs as any, plan, choices) as any
+
+        const both = apply({ [town.id]: 'mine' })
+        expect(both.customscript).toEqual([{ ...unflagged, out: '<strong>', ableFlag: true }])
+        expect(both.globalLore).toEqual([{ ...lore('Town', '마을', 'id-t'), insertorder: 7, selective: true }])
+        expect(apply({ [town.id]: 'theirs' }).globalLore).toEqual([{ ...lore('Town', 'town!', 'id-t'), insertorder: 7, selective: true }])
+        expect(apply({ [town.id]: { edited: { content: 'written' } } }).globalLore).toEqual([{ ...lore('Town', 'written', 'id-t'), insertorder: 7, selective: true }])
+        // A side of a merged item is that whole entry: the one stored now, or the author's.
+        expect(apply({ [town.id]: 'mine', [bold.id]: 'mine' }).customscript).toEqual(stored.customscript)
+        expect(apply({ [town.id]: 'mine', [bold.id]: 'theirs' }).customscript).toEqual([unflagged])
+
+        // An entry removed since the comparison stays removed unless the author's version or an edit is chosen.
+        const removed = { ...mine, globalLore: [], customscript: [] }
+        expect(apply({ [town.id]: 'mine' }, removed)).toMatchObject({ globalLore: [], customscript: [] })
+        expect(apply({ [town.id]: 'theirs' }, removed).globalLore).toEqual(theirs.globalLore)
+        expect(apply({ [town.id]: { edited: { content: 'written' } } }, removed).globalLore).toEqual([{ ...theirs.globalLore[0], content: 'written' }])
+    })
+
     it('tells apart assets that share a name from one named like a second copy', () => {
         const assets = [['face', 'assets/1.png', 'png'], ['face', 'assets/2.png', 'png'], ['face#1', 'assets/3.png', 'png']]
         const mine = { id: 'm', name: 'M', description: '', assets }

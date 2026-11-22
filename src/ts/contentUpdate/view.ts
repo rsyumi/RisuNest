@@ -1,7 +1,7 @@
 // Adapted from RisuBard (https://github.com/rpaddict/RisuBard, src/ts/characterUpdateView.ts
 // and src/ts/storage/externalChangeDiff.ts), GPL-3.0.
 
-import type { UpdateItem } from './merge'
+import type { UpdateChoice, UpdateItem } from './merge'
 
 // Body fields are always shown as blocks so both sides line up in the diff.
 const blockKeys = new Set(['content', 'in', 'out'])
@@ -91,11 +91,13 @@ export function editStartText(item: UpdateItem): string {
     return textOf(item, editBase(item))
 }
 
-/** The item with the user's text in place: the rest of the entry is the merged entry or the user's version. */
-export function editedValue(item: UpdateItem, text: string): unknown {
+/**
+ * What the user's text writes: a text field itself, or the text in an entry whose other fields are what
+ * 내 버전 writes when the update is written.
+ */
+export function editedChoice(item: UpdateItem, text: string): UpdateChoice {
     const key = editableKey(item)
-    if (key === '') return text
-    return { ...(editBase(item) as object), [key as string]: text }
+    return key === '' ? { value: text } : { edited: { [key as string]: text } }
 }
 
 export type UpdateGroupId = 'info' | 'prompt' | 'lore' | 'regex' | 'trigger' | 'asset' | 'other'
