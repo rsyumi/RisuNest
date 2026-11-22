@@ -1200,8 +1200,38 @@ fn prepare_legacy_character(value: &mut Value, seen_ids: &mut HashSet<String>) -
             character.insert("chaId".to_owned(), Value::String(id));
         }
     }
-    default_name(character);
+    default_character_fields(character);
     true
+}
+
+// A save written by upstream RisuAI can lack these character fields. `checkNewFormat` fills them,
+// when absent or null, on the TypeScript import routes. Its `chats` default is not among them:
+// conversations are staged as rows.
+pub(super) fn default_character_fields(record: &mut Map<String, Value>) {
+    default_name(record);
+    let text = |value: &str| Value::String(value.to_owned());
+    let list = || Value::Array(Vec::new());
+    for (key, value) in [
+        ("type", text("character")),
+        ("chatPage", Value::from(0)),
+        ("customscript", list()),
+        ("firstMessage", text("")),
+        ("globalLore", list()),
+        ("viewScreen", text("none")),
+        ("emotionImages", list()),
+        ("bias", list()),
+        ("characterVersion", text("")),
+        ("creator", text("")),
+        ("desc", text("")),
+        ("utilityBot", Value::Bool(false)),
+        ("tags", list()),
+        ("systemPrompt", text("")),
+        ("scenario", text("")),
+    ] {
+        if record.get(key).is_none_or(Value::is_null) {
+            record.insert(key.to_owned(), value);
+        }
+    }
 }
 
 // The persistent store requires a name, which upstream RisuAI shows as empty when absent.
@@ -2490,7 +2520,7 @@ impl<'de> Visitor<'de> for CharacterVisitor<'_> {
                 "character block name does not match chaId",
             ));
         }
-        default_name(&mut detail);
+        default_character_fields(&mut detail);
         self.0.sink.put_character_detail(
             self.0.staging_id,
             &Value::Object(detail),
@@ -4522,6 +4552,26 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn block_restore_fills_absent_and_null_character_fields_and_keeps_present_ones() {
+        let (directory, sink) = fixture();
+        let mut blocks = valid_blocks();
+        blocks[6] = block(2, false, "char-1", &json!({
+            "chaId":"char-1","name":"Synthetic","globalLore":null,"desc":"kept","utilityBot":true,"chats":[]
+        }));
+        let path = directory.path().join("defaults.risudat");
+        fs::write(&path, save_bytes(blocks)).unwrap();
+        let job = JobRegistry::default().create(JobKind::RestoreBlockRisuSave).unwrap();
+        restore_block_risu_save_path(&path, 1, &job, &sink).unwrap();
+        let mut character = sink.store.lock().unwrap().materialize(None).unwrap()["characters"][0].take();
+        character.as_object_mut().unwrap().remove("chats");
+        assert_eq!(character, json!({
+            "chaId":"char-1","name":"Synthetic","globalLore":[],"desc":"kept","utilityBot":true,
+            "type":"character","chatPage":0,"customscript":[],"firstMessage":"","viewScreen":"none",
+            "emotionImages":[],"bias":[],"characterVersion":"","creator":"","tags":[],"systemPrompt":"","scenario":""
+        }));
+    }
+
+    #[test]
     fn block_restore_rejects_a_renamed_raw_recovery_archive() {
         let (directory, sink) = fixture();
         let source = directory.path().join("renamed.risudat");
@@ -4686,6 +4736,9 @@ pub(super) mod tests {
             if let Some(api_type) = database.get("apiType").cloned() {
                 database.get_mut("botPresets").unwrap()[selected]["apiType"] = api_type;
             }
+        }
+        for character in database.get_mut("characters").and_then(Value::as_array_mut).into_iter().flatten() {
+            default_character_fields(character.as_object_mut().unwrap());
         }
         Value::Object(database)
     }
@@ -5442,7 +5495,11 @@ pub(super) mod tests {
                 }
                 let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
                 assert_eq!(restored["username"], fixture["database"]["username"]);
-                assert_eq!(restored["characters"], fixture["database"]["characters"]);
+                let mut characters = fixture["database"]["characters"].clone();
+                for character in characters.as_array_mut().unwrap() {
+                    default_character_fields(character.as_object_mut().unwrap());
+                }
+                assert_eq!(restored["characters"], characters);
                 assert_eq!(restored["historicalUnknown"], fixture["database"]["historicalUnknown"]);
                 assert_eq!(restored["pluginCustomStorage"], fixture["database"]["pluginCustomStorage"]);
                 assert!(restored.get("account").is_none());
@@ -6433,8 +6490,8 @@ pub(super) mod tests {
             (hex::encode(Sha256::digest(root.as_bytes())), units.len(), hex::encode(digest.finalize())),
             (
                 "c0dd8ab1780897c4d02b17778f1a8e42ee2596e0431113a4905fbf376e190fae".to_owned(),
-                24,
-                "52e5b9888db57ec9f664409a490cefceff0e5d113bb6d4e986b3c7edaf6a0651".to_owned(),
+                37,
+                "9fb09c6a2407f8b92bfd9d34cdaf5133175afe0dc630c070c2039b738f2427b1".to_owned(),
             )
         );
     }
@@ -6532,7 +6589,7 @@ pub(super) mod tests {
         // values. A change to them changes stored rows.
         assert_eq!(
             character_rows_digest(&sink.store.lock().unwrap()),
-            (vec![2, 2, 4, 21], "8b39b35cfb23c4228cf48707378ad39bd5924fb6bfdd2c24a4efcfc8c9ad7b70".to_owned())
+            (vec![2, 2, 4, 47], "c1ac820e986bd8f259648c3184096a775d85d8d091dbc294b7841297878135c6".to_owned())
         );
     }
 
@@ -6635,8 +6692,8 @@ pub(super) mod tests {
 
     #[test]
     fn a_binary_character_or_chat_is_staged_as_the_object_it_converts_to() {
-        // Restore fills in the ID and name of such a record, so it is expanded
-        // before that happens.
+        // Restore fills in the ID, the name and a character's absent fields, so such a
+        // record is expanded before that happens.
         let binary = |length: usize| MessagePackValue::Binary((0..length).map(|index| (index * 7 % 256) as u8).collect());
         let text = |value: &str| MessagePackValue::from(value);
         let map = |entries: Vec<(&str, MessagePackValue)>| {
@@ -6658,7 +6715,11 @@ pub(super) mod tests {
         let rows = store.library_rows();
         let active = "(SELECT json_extract(value,'$') FROM meta WHERE key='activeGeneration')";
         let (character, detail): (String, String) = rows.query_row(&format!("SELECT character_id,detail FROM characters WHERE generation={active} AND character_id<>'holder'"), [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
-        assert_eq!(detail, format!(r#"{{"0":0,"1":7,"2":14,"3":21,"4":28,"chaId":"{character}","name":""}}"#));
+        assert_eq!(detail, format!(concat!(
+            r#"{{"0":0,"1":7,"2":14,"3":21,"4":28,"chaId":"{character}","name":"","type":"character","chatPage":0,"#,
+            r#""customscript":[],"firstMessage":"","globalLore":[],"viewScreen":"none","emotionImages":[],"bias":[],"#,
+            r#""characterVersion":"","creator":"","desc":"","utilityBot":false,"tags":[],"systemPrompt":"","scenario":""}}"#,
+        ), character = character));
         let (chat, detail): (String, String) = rows.query_row(&format!("SELECT conversation_id,detail FROM conversations WHERE generation={active} AND character_id='holder'"), [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
         assert_eq!(detail, format!(r#"{{"0":0,"1":7,"2":14,"id":"{chat}","name":""}}"#));
     }
