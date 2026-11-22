@@ -1904,6 +1904,9 @@ export const languageKorean = {
             group: '그룹',
             divider: '구분선',
             caption: '설명',
+            missingKey: '키가 비어 있어 사이드바에 표시되지 않습니다.',
+            missingName: '이름이 비어 있어 사이드바에 표시되지 않습니다.',
+            missingKeyAndName: '키와 이름이 비어 있어 사이드바에 표시되지 않습니다.',
         },
         presetBinding: {
             label: '프리셋 바인딩',

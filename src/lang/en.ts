@@ -2083,6 +2083,9 @@ export const languageEnglish = {
             group: 'Group',
             divider: 'Divider',
             caption: 'Caption',
+            missingKey: 'Not shown in the sidebar because the key is empty.',
+            missingName: 'Not shown in the sidebar because the name is empty.',
+            missingKeyAndName: 'Not shown in the sidebar because the key and name are empty.',
         },
         presetBinding: {
             label: 'Preset binding',

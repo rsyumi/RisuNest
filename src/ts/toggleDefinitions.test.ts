@@ -4,6 +4,7 @@ import { parseToggleSyntax, type sidebarToggle } from './util'
 import {
     addToggleRow,
     groupSidebarToggles,
+    missingToggleFields,
     moveToggleRow,
     parseToggleDefinitions,
     removeToggleRow,
@@ -58,11 +59,12 @@ function shape(toggle: sidebarToggle): Shape {
 /** What the sidebar shows for a definition text. */
 const sidebar = (text: string) => groupSidebarToggles(parseToggleSyntax(text)).map(shape)
 
-/** What the editor lists for its lines, read back through the sidebar's own parser line by line. */
+/** The editor rows the sidebar shows, read back through the sidebar's own parser line by line. */
 function editorRows(lines: ToggleLine[]): Shape[] {
     const read = (index: number) => shape(parseToggleSyntax(lines[index].raw)[0])
-    return toggleOutline(lines).map((item) => item.type === 'group'
-        ? { ...read(item.line), children: item.children.map(read) }
+    const shown = (index: number) => parseToggleSyntax(lines[index].raw).length > 0
+    return toggleOutline(lines).filter((item) => shown(item.line)).map((item) => item.type === 'group'
+        ? { ...read(item.line), children: item.children.filter(shown).map(read) }
         : read(item.line))
 }
 
@@ -79,10 +81,29 @@ describe('toggle definition text', () => {
         }
     })
 
-    it('lists exactly the rows and groups the sidebar shows, and nothing it skips', () => {
+    it('lists the rows and groups the sidebar shows, and every line it skips that is not blank in its place', () => {
         for (const text of corpus) {
-            expect(editorRows(parseToggleDefinitions(text)), JSON.stringify(text)).toEqual(sidebar(text))
+            const lines = parseToggleDefinitions(text)
+            expect(editorRows(lines), JSON.stringify(text)).toEqual(sidebar(text))
+            const skipped = lines.flatMap((line, index) => !parseToggleSyntax(line.raw).length && line.raw.trim() ? [index] : [])
+            const listed = toggleOutline(lines).flatMap((item) => item.type === 'group' ? [item.line, ...item.children] : [item.line])
+            expect(listed.filter((index) => skipped.includes(index)), JSON.stringify(text)).toEqual(skipped)
         }
+    })
+
+    it('names the empty fields that keep the sidebar from showing a line', () => {
+        const missing = (raw: string) => [parseToggleDefinitions(raw)[0].kind, missingToggleFields(raw)]
+        expect(missing('=Only name')).toEqual(['switch', ['key']])
+        expect(missing('only key=')).toEqual(['switch', ['name']])
+        expect(missing('no equals sign')).toEqual(['switch', ['name']])
+        expect(missing('=')).toEqual(['switch', ['key', 'name']])
+        expect(missing('k==select=a,b')).toEqual(['select', ['name']])
+        expect(missing('==textarea\r')).toEqual(['textarea', ['key', 'name']])
+        expect(missing('==caption')).toEqual(['caption', ['name']])
+        for (const shown of ['k=N', '=G=group', '==divider', 'k=N=select']) {
+            expect(missing(shown)).toEqual([parseToggleDefinitions(shown)[0].kind, []])
+        }
+        for (const blank of ['', '\r', '  \t']) expect(missing(blank)).toEqual([null, []])
     })
 
     it('groups the toggles between a group and its end the way the sidebar does', () => {
@@ -133,6 +154,8 @@ describe('toggle row edits', () => {
     it('adds a row at the end, outside any group, before a final line break', () => {
         expect(edit('', addToggleRow)).toBe('=')
         expect(edit('a=A\n', addToggleRow)).toBe('a=A\n=\n')
+        // The new row stays a row when its text is read again.
+        expect(toggleOutline(parseToggleDefinitions('a=A\n=\n'))).toEqual([{ type: 'row', line: 0 }, { type: 'row', line: 1 }])
         const lines = addToggleRow(parseToggleDefinitions('=G=group\na=A'))
         expect(serializeToggleDefinitions(lines)).toBe('=G=group\na=A\n=G=groupEnd\n=')
         expect(toggleOutline(lines).at(-1)).toEqual({ type: 'row', line: 3 })
