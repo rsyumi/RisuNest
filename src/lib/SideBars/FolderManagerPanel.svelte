@@ -329,16 +329,18 @@
                     {/if}
                 </div>
 
-                {#if draft.iconType === 'text'}
+                {#if draft.iconType === 'text' || draft.iconType === 'glyph'}
+                    {@const glyph = draft.iconType === 'glyph'}
+                    {@const colorLabel = glyph ? text.iconColor : text.textColor}
                     <div class="flex flex-col gap-2">
-                        <span class="text-[13px] text-subtext">{text.textColor}</span>
-                        {@render segmented([['auto', text.textAuto], ['manual', text.textManual]], draft.textMode, (value) => chooseTextMode(value as 'auto' | 'manual'), text.textColor)}
+                        <span class="text-[13px] text-subtext">{colorLabel}</span>
+                        {@render segmented([['auto', text.textAuto], ['manual', text.textManual]], draft.textMode, (value) => chooseTextMode(value as 'auto' | 'manual'), colorLabel)}
                         {#if draft.textMode === 'manual'}
-                            <div class="flex items-center gap-2.5">{@render colorDot('text', text.textColor)}</div>
+                            <div class="flex items-center gap-2.5">{@render colorDot('text', colorLabel)}</div>
                             {@render pickerFor('text')}
                         {/if}
                         {#if lowContrast}
-                            <p class="hint">{text.lowContrast}</p>
+                            <p class="hint">{glyph ? text.iconLowContrast : text.lowContrast}</p>
                         {/if}
                     </div>
                 {/if}
