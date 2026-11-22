@@ -9937,9 +9937,10 @@ pub(crate) async fn native_content_source_metadata(
     }.await)
 }
 
-/// The path the earlier-file reader may open: on desktop a file the file dialog
-/// granted, and on Android and iOS a copy the app's own file picker staged. The
-/// renderer names the path, so every other path is refused.
+/// The path the earlier-file reader may open: on desktop one the runtime fs scope
+/// holds, such as a file the file dialog granted, and on Android and iOS a copy the
+/// app's own file picker staged. The renderer names the path, so every other path
+/// is refused.
 fn permitted_update_base_path(app: &AppHandle, path: &str) -> Result<String, NativeJobError> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let permitted = selection_staging_root(app)
