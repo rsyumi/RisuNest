@@ -68,8 +68,11 @@ export function createAndroidSpoolBatchRouter(
     const submittedTokens = new Set<string>()
     let queue = Promise.resolve()
     return ({ openedFiles = [], order, ...batch }) => {
+        // Read as the batch arrives, so one that waits behind another batch is judged by the time it was opened.
+        const setupDone = routing.firstSetupDone()
+        setupDone.catch(() => {})
         const routed = queue.then(async () => {
-            if (!await routing.firstSetupDone()) {
+            if (!await setupDone) {
                 // Opened or shared while onboarding is on screen: not imported, and their copies are let go.
                 for (const source of batch.ready) if (!source.importDestination) void routing.discard(source)
                 if (openedFiles.length) void settleOpenedFilesAfter(openedFiles, async () => {})

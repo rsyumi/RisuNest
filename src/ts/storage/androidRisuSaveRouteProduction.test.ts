@@ -335,6 +335,32 @@ describe('Android opened spool production route', () => {
         expect(discard).not.toHaveBeenCalled()
     })
 
+    it('lets go of a batch shared during onboarding that waits behind another until onboarding ended', async () => {
+        const deliveries: ImportIntakeDelivery[] = []
+        const discard = vi.fn(async (_source: AndroidSpoolReady) => {})
+        let firstSetupDone = false
+        let releaseAhead: (() => void) | undefined
+        let checks = 0
+        const route = createAndroidSpoolBatchRouter({
+            firstSetupDone: () => ++checks === 1
+                ? new Promise<boolean>(resolve => { releaseAhead = () => resolve(false) })
+                : Promise.resolve(firstSetupDone),
+            loadIntake: async () => async (delivery) => { deliveries.push(delivery) },
+            dispatch: vi.fn(async () => {}),
+            discard,
+        })
+        const ahead = { token: 'ahead-token', displayName: 'ahead.charx', bytes: 10 }
+        const during = { token: 'during-token', displayName: 'during.charx', bytes: 10 }
+        const first = route({ requestId: 'ahead', ready: [ahead], failures: [] })
+        const second = route({ requestId: 'during', ready: [during], failures: [] })
+        await vi.waitFor(() => expect(releaseAhead).toBeDefined())
+        firstSetupDone = true
+        releaseAhead!()
+        await Promise.all([first, second])
+        await vi.waitFor(() => expect(discard.mock.calls.map(([source]) => source)).toEqual([ahead, during]))
+        expect(deliveries).toEqual([])
+    })
+
     it('treats first setup as unfinished while a restored onboarding stays on screen', async () => {
         backupMocks.database.didFirstSetup = true
         onboardingHold.set(true)

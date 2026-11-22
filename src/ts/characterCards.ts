@@ -639,10 +639,9 @@ export const showRealmInfoStore:Writable<null|hubType> = writable(null)
  */
 export function registerOpenedFileImports() {
     registerOpenedFileListeners(async (files) => {
-        if (!onboardingFinished(getDatabase())) return
         const { submitImportDelivery } = await import('./importIntake/intake')
         await submitImportDelivery({ origin: 'opened', sources: files.map(openedFileSource) })
-    })
+    }, () => onboardingFinished(getDatabase()))
 }
 
 export async function characterURLImport() {
