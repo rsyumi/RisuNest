@@ -462,7 +462,9 @@ impl RootSpool {
                 self.put_member_json("personas",&key,Some(stored_json::text(out)?.as_str()))?;
             }
         }
-        if self.kind("explicitGlobalChatVariables")?.is_none() { self.copy_field("globalChatVariables","explicitGlobalChatVariables")?; }
+        // Upstream RisuAI edits only `globalChatVariables`, so a copy an earlier export left
+        // in the file is replaced.
+        self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
         if let Some(key) = self.selected("botPresets","botPresetsId")? {
             let text = self.member_text("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             let document = Document::parse(&text, Depth::Unlimited)?;
@@ -529,7 +531,7 @@ impl RootSpool {
                 self.put_member("personas",&key,Some(&persona))?;
             }
         }
-        if self.kind("explicitGlobalChatVariables")?.is_none() { self.copy_field("globalChatVariables","explicitGlobalChatVariables")?; }
+        self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
         if let Some(key) = self.selected("botPresets","botPresetsId")? {
             let mut preset = self.member("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             for (key,field) in super::export::PRESET_MIRRORS {
@@ -692,7 +694,7 @@ mod tests {
             "username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],
             "personas":[{"id":"persona-one","name":"one"},{"id":"persona-two","name":"stale","embeddedModule":{"id":"embedded","assets":[]}}],
             "modules":[{"id":"module"}],"loadouts":[{"id":"loadout"}],"customModels":[{"id":"model"}],
-            "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},
+            "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},"explicitGlobalChatVariables":{"stale":"0"},
             "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]},
                 {"name":"Binary \"preset\"\n","id":"preset-binary","image":"preset.png","NAISettings":{"blob":binary,"n":-0.0}}],
             "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value","binary":{"blob":binary,"text":"\u{d55c}\n"},"owned-binary":binary,
@@ -710,6 +712,7 @@ mod tests {
         root.put_member_json("pluginCustomStorage","spaced",Some(" { \"b\" : 1 , \"a\" : -0.0 , \"c\" : \"\\u00e9\" } ")).unwrap();
         streamed.replace_put_upstream_stream(&b,&root).unwrap();
         assert_eq!(streamed.materialize_staging(&b).unwrap(),old.materialize_staging(&a).unwrap());
+        assert_eq!(streamed.materialize_staging(&b).unwrap()["explicitGlobalChatVariables"],json!({"toggle_synthetic":"1","ordinary":"2"}));
         for sql in [
             "SELECT preset_id,configured_index,name,image,value FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
             "SELECT owner,storage_key,byte_size,ordinal,value,import_batch_id=?1 FROM plugin_storage WHERE generation=?1 ORDER BY owner,storage_key",
@@ -962,7 +965,7 @@ mod tests {
                 "botPresetsId": "b", "temperature": 0.25, "mainPrompt": binary(5), "aiModel": "model",
                 "fallbackModels": ["protected", binary(2)], "doNotChangeFallbackModels": true,
                 "seperateModels": {"a": "b"}, "doNotChangeSeperateModels": false,
-                "explicitGlobalChatVariables": {"kept": 1}, "globalChatVariables": {"other": 2},
+                "explicitGlobalChatVariables": {"stale": 1}, "globalChatVariables": {"other": 2},
             }),
             json!({"botPresets": [{"id": "x"}], "protectedPresetValues": {"fallbackModels": []}, "fallbackModels": [], "doNotChangeFallbackModels": true}),
             json!({"modules": [{"id": "m"}, "not a record"]}),

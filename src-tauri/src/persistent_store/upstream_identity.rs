@@ -76,10 +76,10 @@ fn normalize_root(mut root: Value) -> StoreResult<Value> {
             root["selectedPersona"] = id;
         }
     }
-    if root.get("explicitGlobalChatVariables").is_none() {
-        if let Some(value) = root.get("globalChatVariables").cloned() {
-            root["explicitGlobalChatVariables"] = value;
-        }
+    // Upstream RisuAI edits only `globalChatVariables`, so a copy an earlier export left
+    // in the file is replaced.
+    if let Some(value) = root.get("globalChatVariables").cloned() {
+        root["explicitGlobalChatVariables"] = value;
     }
     Ok(root)
 }
@@ -157,7 +157,7 @@ mod tests {
         let mut store = PersistentStore::open(dir.path()).unwrap();
         let before = store.read_root(None).unwrap().value;
         let stage = store.replace_begin().unwrap().staging_id;
-        store.replace_put_upstream_root(&stage,&json!({"botPresetsId":1,"selectedPersona":0,"temperature":0.8,"NAIsettings":{"synthetic":true},"username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],"personas":[{"id":"persona-kept","name":"stale","embeddedModule":{"assets":[]}},{"id":"persona-kept","name":"duplicate"},{"name":"missing"}],"modules":[{"id":"kept"},{"id":"kept"},{}],"loadouts":[{}],"globalChatVariables":{"toggle_synthetic":"1"}})).unwrap();
+        store.replace_put_upstream_root(&stage,&json!({"botPresetsId":1,"selectedPersona":0,"temperature":0.8,"NAIsettings":{"synthetic":true},"username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],"personas":[{"id":"persona-kept","name":"stale","embeddedModule":{"assets":[]}},{"id":"persona-kept","name":"duplicate"},{"name":"missing"}],"modules":[{"id":"kept"},{"id":"kept"},{}],"loadouts":[{}],"globalChatVariables":{"toggle_synthetic":"1"},"explicitGlobalChatVariables":{"stale":"0"}})).unwrap();
         assert!(store.replace_put_presets(&stage, &[json!({"name":"missing"})]).is_err());
         store
             .replace_put_upstream_presets(
@@ -203,7 +203,7 @@ mod tests {
             .is_some());
         assert_eq!(root["modules"][0]["id"], "kept");
         assert_ne!(root["modules"][1]["id"], "kept");
-        assert_eq!(root["explicitGlobalChatVariables"]["toggle_synthetic"], "1");
+        assert_eq!(root["explicitGlobalChatVariables"], json!({"toggle_synthetic":"1"}));
         let staged = store.materialize_staging(&stage).unwrap();
         for field in ["botPresets", "personas"] {
             let records = staged[field].as_array().unwrap();
