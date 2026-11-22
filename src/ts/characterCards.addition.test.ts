@@ -48,6 +48,8 @@ vi.mock('./characters', () => ({
     changeChar: vi.fn(),
     characterFormatUpdate: (value: unknown) => value,
     commitDetachedCharacter: mocks.commitDetachedCharacter,
+    // The update comparison brings lorebooks to the current format.
+    updateLorebooks: (books: unknown[]) => books,
 }))
 vi.mock('./storage/database.svelte', () => ({
     defaultSdDataFunc: () => [['always', 'synthetic']],
@@ -112,8 +114,9 @@ vi.mock('./storage/nativeCharacterCardExportRoute', () => ({
 vi.mock('@tauri-apps/plugin-dialog', () => ({
     open: mocks.openDesktopPicker,
 }))
-vi.mock('./stores.svelte', () => ({
+vi.mock('./stores.svelte', async () => ({
     DBState: { db: mocks.database },
+    alertStore: (await import('./alertQueue')).alertStore,
     SettingsMenuIndex: { set: vi.fn() },
     ShowRealmFrameStore: { set: vi.fn() },
     selectedCharID: { set: vi.fn() },
@@ -182,6 +185,7 @@ import {
     type CharacterCardV2Risu,
 } from './characterCards'
 import {
+    cancelActiveNativeFileOperation,
     dismissNativeFileOperationOutcome,
     nativeFileOperationOutcome,
     NativeFileOperationBusyError,
@@ -404,6 +408,46 @@ describe('character card additions', () => {
         expect(get(nativeFileOperationOutcome)).toMatchObject({
             state: 'succeeded', location: { kind: 'character', chaId: 'native-character-id' },
         })
+    })
+
+    it.each([
+        ['a JSON card', 'card.json', false],
+        ['a sealed PNG card', 'card.png', false],
+        ['a password PNG card', 'card.png', true],
+    ])('takes the update dialog down and stores nothing when %s the desktop reads in TypeScript is cancelled while it asks', async (_kind, file, usePassword) => {
+        mocks.database.characters = [{ chaId: 'installed', name: 'Synthetic', type: 'character', chats: [] }]
+        mocks.desktopPickerPaths = [`C:/chosen/${file}`]
+        const legacy = { name: 'Synthetic', description: 'Description', first_mes: 'Hello' }
+        if (file === 'card.png') {
+            // A sealed card, which the PNG reader opens and imports itself.
+            if (usePassword) vi.mocked(alertInput).mockResolvedValueOnce('synthetic-password')
+            const base64 = (value: string) => Buffer.from(value).toString('base64')
+            vi.mocked(hasher).mockResolvedValueOnce('synthetic-hash')
+            vi.mocked(decryptBuffer).mockResolvedValueOnce(new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v2', spec_version: '2.0', data: {
+                ...legacy, first_mes: 'Hello', personality: '', scenario: '', mes_example: '', creator_notes: '', system_prompt: '',
+                post_history_instructions: '', alternate_greetings: [], tags: [], creator: '', character_version: '', extensions: {},
+            } })).buffer)
+            mocks.pngChunks = [
+                { key: 'chara', value: ['rcc', 'rccv1', base64('sealed'), 'synthetic-hash', base64(JSON.stringify({ usePassword }))].join('||') },
+                Object.assign(new AppendableBuffer(), { buffer: new Uint8Array([1]) }),
+            ]
+        }
+        const data = file === 'card.png' ? new Uint8Array([1]) : new TextEncoder().encode(JSON.stringify(legacy))
+        mocks.importDesktopNativeCharacterPath.mockImplementationOnce(async (_path: string, route: any, name: string) => {
+            const value = await route.legacyImport({ name, data })
+            return value ? { kind: 'imported', mode: 'legacy', value } : { kind: 'cancelled' }
+        })
+        // Loaded ahead, as the app has them by the time a card is imported.
+        const [{ contentUpdateDialog }] = await Promise.all([import('./contentUpdate/flow.svelte'), import('./process/inlayScreen'), import('./storage/persistentDataRuntime.svelte')])
+        dismissNativeFileOperationOutcome()
+        const imported = importCharacter()
+        await vi.waitFor(() => expect(contentUpdateDialog.request && !contentUpdateDialog.busy).toBe(true))
+        cancelActiveNativeFileOperation()
+        await expect(imported).resolves.toBeNull()
+        expect(contentUpdateDialog.request).toBeNull()
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ kind: 'import', state: 'cancelled' })
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+        expect(mocks.alertError).not.toHaveBeenCalled()
     })
 
     it('processes every selected desktop path through the native character route', async () => {

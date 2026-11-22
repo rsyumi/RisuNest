@@ -332,11 +332,11 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
  * Adds an imported module, or updates the installed one it is a new version of when the user
  * chooses that. Returns where the import went, or null when the user cancelled it.
  */
-async function commitImportedModuleData(module: RisuModule, location: ModuleImportLocation): Promise<ModuleImportLocation | null> {
+async function commitImportedModuleData(module: RisuModule, location: ModuleImportLocation, signal: AbortSignal | undefined): Promise<ModuleImportLocation | null> {
     const { commitImportedModule } = await import('../contentUpdate/flow.svelte')
     const id = await commitImportedModule(module, async (value) => {
         DBState.db.modules.push(value)
-    })
+    }, signal)
     return id !== null ? location : null
 }
 
@@ -408,14 +408,17 @@ async function importDesktopModulePath(path: string, context: SharedNativeFileOp
         return result.value
     }
     context.signal.throwIfAborted()
-    const location = await importModuleData({ name: displayName, data: await readFile(path) })
+    const location = await importModuleData({ name: displayName, data: await readFile(path), signal: context.signal })
     if (!location) return null
     context.setLocation(location)
     return 'module'
 }
 
-/** Adds the module the file holds and says how it was added; a refusal is alerted here and returns null. */
-export async function importModuleData(f: { name: string; data: Uint8Array; parsedJson?: ParsedImportJson }): Promise<ModuleImportLocation | null> {
+/**
+ * Adds the module the file holds and says how it was added; a refusal is alerted here and returns null.
+ * When `signal` ends, an update dialog the import opened closes and the abort is thrown instead.
+ */
+export async function importModuleData(f: { name: string; data: Uint8Array; parsedJson?: ParsedImportJson; signal?: AbortSignal }): Promise<ModuleImportLocation | null> {
     let fileData = f.data
     if (f.name.endsWith('.charx')) {
         try {
@@ -430,8 +433,9 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                 return null
             }
             const module = convertCharacterToModule(char)
-            if (!await commitImportedModuleData(module, { kind: 'module-from-charx' })) return null
+            if (!await commitImportedModuleData(module, { kind: 'module-from-charx' }, f.signal)) return null
         } catch (error) {
+            if (f.signal?.aborted) throw error
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
             return null
@@ -443,8 +447,9 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
         try {
             const buf = Buffer.from(fileData)
             const module = await readModule(buf)
-            return await commitImportedModuleData(module, { kind: 'module' })
+            return await commitImportedModuleData(module, { kind: 'module' }, f.signal)
         } catch (error) {
+            if (f.signal?.aborted) throw error
             console.error(error)
             alertError(error instanceof StdioModuleImportError ? error : language.errors.noData)
         }
@@ -468,11 +473,12 @@ export async function importModuleData(f: { name: string; data: Uint8Array; pars
                     return null
                 }
             }
-            return await commitImportedModuleData(importData, { kind: 'module' })
+            return await commitImportedModuleData(importData, { kind: 'module' }, f.signal)
         }
         const converted = await convertJsonToModule(importData)
-        if (converted) return await commitImportedModuleData(converted.module, converted.location)
+        if (converted) return await commitImportedModuleData(converted.module, converted.location, f.signal)
     } catch (error) {
+        if (f.signal?.aborted) throw error
         console.error(error)
         if (error instanceof StdioModuleImportError) {
             alertError(error)

@@ -81,6 +81,7 @@ import { language } from 'src/lang'
 import { exportModuleLegacy, importModule, importModuleData, readModule, type RisuModule } from './modules'
 import { DBState } from '../stores.svelte'
 import {
+    cancelActiveNativeFileOperation,
     dismissNativeFileOperationOutcome,
     nativeFileOperationOutcome,
     NativeFileOperationBusyError,
@@ -133,6 +134,23 @@ describe('legacy module export', () => {
         // No location: the import intake opens nothing for a cancelled import.
         expect(await imported).toBeNull()
         expect(DBState.db.modules.map((module) => module.id)).toEqual(['installed'])
+    })
+
+    it('takes the update dialog down and stores nothing when a desktop JSON module import is cancelled while it asks', async () => {
+        mocks.platform = 'desktop'
+        DBState.db.modules = [{ id: 'installed', name: 'Lore', description: '', lorebook: [] }]
+        const { contentUpdateDialog } = await import('../contentUpdate/flow.svelte')
+        mocks.open.mockResolvedValue(['C:/synthetic/lore.json'])
+        mocks.readFile.mockResolvedValue(new TextEncoder().encode(JSON.stringify({ type: 'risuModule', id: 'source', name: 'Lore', lorebook: [] })))
+        const imported = importModule()
+        await vi.waitFor(() => expect(contentUpdateDialog.request && !contentUpdateDialog.busy).toBe(true))
+        cancelActiveNativeFileOperation()
+        await expect(imported).resolves.toBeNull()
+        expect(contentUpdateDialog.request).toBeNull()
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ kind: 'import', state: 'cancelled' })
+        expect(DBState.db.modules.map((module) => module.id)).toEqual(['installed'])
+        expect(alertError).not.toHaveBeenCalled()
+        expect(alertNormal).not.toHaveBeenCalled()
     })
 
     it('preserves browser malformed-byte replacement in JSON modules', async () => {

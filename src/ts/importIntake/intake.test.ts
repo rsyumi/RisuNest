@@ -405,7 +405,7 @@ describe('destination choices', () => {
         await submitImportDelivery(drop(dropped('book.json', '{"type":"risu","data":[{"key":"synthetic"}]}')))
 
         expect(get(importSheet)).toBeNull()
-        expect(mocks.moduleData).toHaveBeenCalledOnce()
+        expect(mocks.moduleData).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
         expect(mocks.appendLorebook).not.toHaveBeenCalled()
     })
 
@@ -667,8 +667,8 @@ describe('Android shares', () => {
             [{ source: { type: 'androidSpool', token: 'card-token' }, displayName: 'card.json' }],
             [{ source: { type: 'desktopPath', path: presetPath }, displayName: 'preset.risup' }],
         ])
-        // The batch outcome reports the import, so the card importer stays quiet.
-        expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.json', data: encode('{"name":"Synthetic"}'), quiet: true })
+        // The batch outcome reports the import, so the card importer stays quiet, and it ends with the batch.
+        expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.json', data: encode('{"name":"Synthetic"}'), quiet: true, signal: expect.any(AbortSignal) })
         expect(mocks.preset).toHaveBeenCalledExactlyOnceWith({ name: 'preset.risup', data: encode('synthetic preset') })
         expect(outcomes).toEqual([expect.objectContaining({
             state: 'succeeded',
