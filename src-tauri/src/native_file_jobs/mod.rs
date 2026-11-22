@@ -9955,10 +9955,10 @@ fn permitted_update_base_path(app: &AppHandle, path: &str) -> Result<String, Nat
     permitted.ok_or_else(|| invalid_source_error("The earlier file was not picked for this update"))
 }
 
-/// Where the Android file picker stages its copies.
+/// Where the Android file picker stages its copies, in the activity's cache directory.
 #[cfg(target_os = "android")]
 fn selection_staging_root(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_cache_dir().ok().map(|cache| cache.join("selected_documents"))
+    crate::app_paths::manifest(app).ok().map(|paths| paths.cache.join("selected_documents"))
 }
 
 /// Where the iOS file picker stages its copies.
