@@ -301,7 +301,7 @@ fn write_projected_risum(
             let tuple = asset
                 .as_array_mut()
                 .ok_or_else(|| invalid_input(format!("RISUM asset {position} must be a tuple")))?;
-            if tuple.len() < 3 {
+            if tuple.len() < 2 {
                 return Err(invalid_input(format!(
                     "RISUM asset {position} tuple is incomplete"
                 )));
@@ -310,7 +310,11 @@ fn write_projected_risum(
                 .as_str()
                 .ok_or_else(|| invalid_input(format!("RISUM asset {position} key is invalid")))?
                 .to_owned();
-            if !tuple[0].is_string() || !tuple[2].is_string() {
+            // The importer reads an absent or null extension as one that was never set.
+            let extension_is_valid = tuple
+                .get(2)
+                .is_none_or(|extension| extension.is_string() || extension.is_null());
+            if !tuple[0].is_string() || !extension_is_valid {
                 return Err(invalid_input(format!(
                     "RISUM asset {position} tuple is invalid"
                 )));
@@ -512,6 +516,13 @@ mod tests {
 
     /// A module with one asset; the last value is that asset's payload hash.
     fn publication_fixture() -> (TempDir, PersistentStore, i64, String) {
+        publication_fixture_with(|key| json!([["asset", key, "bin"]]))
+    }
+
+    /// A module whose asset tuples `tuples` builds from the stored asset's key.
+    fn publication_fixture_with(
+        tuples: impl Fn(&str) -> Value,
+    ) -> (TempDir, PersistentStore, i64, String) {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
@@ -521,9 +532,7 @@ mod tests {
         store
             .replace_put_root(
                 &staging,
-                &json!({"modules": [{"name": "Module", "id": "module-0", "assets": [
-                    ["asset", asset.key, "bin"]
-                ]}]}),
+                &json!({"modules": [{"name": "Module", "id": "module-0", "assets": tuples(&asset.key)}]}),
             )
             .unwrap();
         store.replace_put_presets(&staging, &[]).unwrap();
@@ -760,5 +769,53 @@ mod tests {
             fs::read(parse_root.join(&parsed.assets[2].payload.staged_name)).unwrap(),
             b""
         );
+    }
+
+    #[test]
+    fn native_risum_writer_keeps_an_asset_whose_extension_was_never_set() {
+        let (directory, mut store, revision, _) = publication_fixture_with(|key| {
+            json!([["null extension", key, null], ["no extension", key]])
+        });
+        let prepared = store.prepare_risu_save_export(revision).unwrap();
+        let owned = directory.path().join("owned");
+        let chosen = directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("module.risum");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportRisuModule)
+            .unwrap();
+        export_risu_module(
+            prepared,
+            0,
+            &owned,
+            &directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+
+        // The importer's parser reads both tuples as assets without an extension.
+        let parse_root = directory.path().join("parse");
+        fs::create_dir(&parse_root).unwrap();
+        let staging = JobStaging::open(&parse_root).unwrap();
+        let parsed = parse_risum(
+            &mut fs::File::open(destination).unwrap(),
+            &staging,
+            &crate::native_file_jobs::content::risum_import_limits(),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.metadata["module"]["assets"],
+            json!([["null extension", "", null], ["no extension", ""]])
+        );
+        for asset in &parsed.assets {
+            assert_eq!(asset.declared_extension, "");
+            assert_eq!(
+                fs::read(parse_root.join(&asset.payload.staged_name)).unwrap(),
+                b"module asset"
+            );
+        }
     }
 }
