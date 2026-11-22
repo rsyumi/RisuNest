@@ -231,5 +231,14 @@ mod tests {
         assert_eq!(exported["botPresetsId"], 1);
         assert_eq!(exported["selectedPersona"], 0);
         assert_eq!(exported["fallbackModels"], json!(["protected"]));
+        for no_preset in [json!("missing-preset"), json!(""), json!(-1)] {
+            let mut exported = root.as_object().unwrap().clone();
+            exported.insert("botPresetsId".into(), no_preset);
+            exported.insert("temperature".into(), json!(999));
+            super::super::export::derive_identity_root(&store.connection, &generation, &mut exported)
+                .unwrap();
+            assert_eq!(exported["botPresetsId"], -1);
+            assert_eq!(exported["temperature"], 999);
+        }
     }
 }

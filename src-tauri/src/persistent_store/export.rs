@@ -226,16 +226,16 @@ pub(crate) fn derive_identity_root(
             .map(|record| serde_json::from_str(&record).map_err(Into::into))
             .collect::<StoreResult<_>>()?
     };
+    // A selection that names no preset is RisuAI's no-preset selection: the root keeps its own values.
     let selected = match root.get("botPresetsId") {
         Some(Value::String(id)) => presets
             .iter()
-            .position(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
-            .unwrap_or(0),
-        Some(value) => value.as_u64().unwrap_or(0) as usize,
-        None => 0,
+            .position(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str())),
+        Some(value) => value.as_u64().map(|index| index as usize),
+        None => Some(0),
     };
-    if root.contains_key("botPresetsId"){root.insert("botPresetsId".into(), Value::from(selected));}
-    if let Some(preset) = presets.get(selected) {
+    if root.contains_key("botPresetsId"){root.insert("botPresetsId".into(), selected.map_or(Value::from(-1), Value::from));}
+    if let Some(preset) = selected.and_then(|index| presets.get(index)) {
         for &(key, field) in PRESET_MIRRORS {
             let flag = match key {
                 "seperateModelsForAxModels" | "seperateModels" => Some("doNotChangeSeperateModels"),
