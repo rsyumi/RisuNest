@@ -7,12 +7,22 @@
     import SettingRenderer from '../Setting/SettingRenderer.svelte';
     import ModelBind from './ModelBind.svelte'
     import PersonaBind from './PersonaBind.svelte'
+
+    interface Props {
+        /** Shows the pinned settings only, without the model, persona, preset and loadout controls. */
+        settingsOnly?: boolean
+    }
+
+    let { settingsOnly = false }: Props = $props()
+    let items = $derived(settingsOnly
+        ? DBState.db.customSidebarItems.filter((item) => item.type === 'setting')
+        : DBState.db.customSidebarItems)
 </script>
 
 
 <div class="rounded-sm flex flex-col w-full gap-2">
 
-    {#each DBState.db.customSidebarItems as item}
+    {#each items as item}
         {#if item.type === 'model'}
             <ModelBind />
         {:else if item.type === 'preset'}
