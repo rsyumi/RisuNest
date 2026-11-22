@@ -1,5 +1,4 @@
-import { get } from 'svelte/store'
-import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
+import { onboardingFinished } from 'src/lib/Others/Onboarding/onboardingGate'
 import { failureReason } from '../gui/nativeFileJobDialogModel'
 import { fileOperationErrorWasPresented } from './fileOperationErrorPresentation'
 import { Mutex } from '../mutex'
@@ -38,22 +37,24 @@ import {
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 import { listenRecoveredAndroidRisuSavePublications } from './risuSaveFileRoute'
 import { createPortableExportIntentStore } from './deviceBackup/job'
-import { handOverOpenedFiles, openedFileSource, settleOpenedFilesAfter } from '../openedFiles'
+import { openedFileSource, settleOpenedFilesAfter } from '../openedFiles'
 import type { ImportIntakeDelivery, ImportIntakeSource } from '../importIntake/types'
 
 let disposeSpoolListener: (() => void) | undefined
 
-/** Whether first setup is finished and the onboarding is gone. A restore during onboarding sets `didFirstSetup` while the onboarding stays. */
+/** Whether first setup is finished and the onboarding is gone, read as each batch arrives. */
 export async function androidFirstSetupFinished(): Promise<boolean> {
-    return (await import('./database.svelte')).getDatabase().didFirstSetup && !get(onboardingHold)
+    return onboardingFinished((await import('./database.svelte')).getDatabase())
 }
 
 export interface AndroidSpoolBatchRouting {
-    /** Spools that arrive before first setup keep their own handling. */
+    /** Files opened or shared before first setup and onboarding are over are not imported. */
     firstSetupDone(): Promise<boolean>
     loadIntake(): Promise<(delivery: ImportIntakeDelivery) => Promise<void>>
-    /** The handling before first setup. */
+    /** The handling of a content picker result, which keeps the destination chosen in the picker. */
     dispatch(batch: AndroidSpoolBatch): Promise<void>
+    /** Removes the copy of a file that is not imported. */
+    discard(source: AndroidSpoolReady): Promise<void>
 }
 
 /**
@@ -69,9 +70,11 @@ export function createAndroidSpoolBatchRouter(
     return ({ openedFiles = [], order, ...batch }) => {
         const routed = queue.then(async () => {
             if (!await routing.firstSetupDone()) {
-                // These files keep the handling they had as their own opened-files event.
-                if (openedFiles.length) handOverOpenedFiles(openedFiles)
-                void routing.dispatch(batch)
+                // Opened or shared while onboarding is on screen: not imported, and their copies are let go.
+                for (const source of batch.ready) if (!source.importDestination) void routing.discard(source)
+                if (openedFiles.length) void settleOpenedFilesAfter(openedFiles, async () => {})
+                const picked = batch.ready.filter((source) => source.importDestination)
+                if (picked.length) void routing.dispatch({ ...batch, ready: picked })
                 return
             }
             let delivery: Promise<void> | undefined
@@ -426,6 +429,7 @@ export function registerAndroidRisuSaveRoute(): void {
         firstSetupDone: androidFirstSetupFinished,
         loadIntake: async () => (await import('../importIntake/intake')).submitImportDelivery,
         dispatch: dispatcher.enqueue,
+        discard: async (source) => { await discardAndroidSafSource(source.token).catch(() => false) },
     })
     disposeSpoolListener = listenAndroidSpoolBatches((batch) => {
         void routeSpoolBatch(batch).catch((error) => showAndroidFileError(error))

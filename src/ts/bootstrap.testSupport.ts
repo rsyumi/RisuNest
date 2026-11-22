@@ -326,7 +326,7 @@ export function alertModule() {
 }
 
 export function characterCardsModule() {
-    return { applyHubSelection: vi.fn(), characterURLImport: vi.fn(), downloadRisuHub: vi.fn(), hubURL: 'https://hub.invalid' } satisfies Partial<typeof import('./characterCards')>
+    return { applyHubSelection: vi.fn(), characterURLImport: vi.fn(), downloadRisuHub: vi.fn(), hubURL: 'https://hub.invalid', registerOpenedFileImports: vi.fn() } satisfies Partial<typeof import('./characterCards')>
 }
 
 export function androidSafBridgeModule() {

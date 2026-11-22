@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
         modules: [] as any[],
         statics: { imports: 0 },
         blockedRealmCreators: [] as any[],
+        didFirstSetup: true,
     },
     commitDetachedCharacter: vi.fn(async (character: any, _reason: string) => {
         mocks.database.characters.push(character)
@@ -176,6 +177,7 @@ import {
     importCharacterProcess,
     isNativeCharacterContentImportEnabled,
     mapPreparedNativeCharacterCard,
+    registerOpenedFileImports,
     showRealmInfoStore,
     type CharacterCardV2Risu,
 } from './characterCards'
@@ -197,6 +199,7 @@ import { hasher } from './parser/parser.svelte'
 import { decryptBuffer } from './util'
 import { readUpdateBaseFile } from './contentUpdate/baseFile'
 import { CHARACTER_UPDATE, UPDATE_BASE_EXTENSION_KEY, planUpdate } from './contentUpdate/merge'
+import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
 
 describe('character card additions', () => {
     beforeEach(() => {
@@ -204,6 +207,8 @@ describe('character card additions', () => {
         mocks.database.characters = []
         mocks.database.statics.imports = 0
         mocks.database.blockedRealmCreators = []
+        mocks.database.didFirstSetup = true
+        onboardingHold.set(false)
         mocks.nextId = 0
         mocks.charxWrites = []
         mocks.pngWrites = []
@@ -483,7 +488,7 @@ describe('character card additions', () => {
 
     it('hands the files of one desktop file association opening to the import intake together', async () => {
         const { consumeOpenedFiles } = await import('./openedFiles')
-        await characterURLImport()
+        registerOpenedFileImports()
 
         await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\preset.risup'])
         await consumeOpenedFiles(['C:\\opened\\backup.risunest'])
@@ -496,6 +501,25 @@ describe('character card additions', () => {
             { origin: 'opened', sources: [{ type: 'path', path: 'C:\\opened\\backup.risunest' }] },
         ])
         expect(mocks.importDesktopNativeCharacterPath).not.toHaveBeenCalled()
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ['onboarding', (on: boolean) => { mocks.database.didFirstSetup = !on }],
+        ['the onboarding hold', (on: boolean) => onboardingHold.set(on)],
+    ])('does not import files opened during %s', async (_label, during) => {
+        const { consumeOpenedFiles } = await import('./openedFiles')
+        registerOpenedFileImports()
+        during(true)
+
+        await consumeOpenedFiles(['C:\\opened\\during.charx'])
+        expect(mocks.submitDelivery).not.toHaveBeenCalled()
+
+        during(false)
+        await consumeOpenedFiles(['C:\\opened\\after.charx'])
+        expect(mocks.submitDelivery.mock.calls.map(([delivery]) => delivery)).toEqual([
+            { origin: 'opened', sources: [{ type: 'path', path: 'C:\\opened\\after.charx' }] },
+        ])
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 

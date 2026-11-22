@@ -63,17 +63,6 @@ export async function settleOpenedFilesAfter(files: OpenedFile[], delivery: () =
     }
 }
 
-/**
- * Hands opened files over as the Android opened-files event does: to the listener when one is
- * registered, otherwise to the startup queue it drains.
- */
-export function handOverOpenedFiles(files: OpenedFile[]): void {
-    const event = new CustomEvent(OPENED_FILES_EVENT, { detail: { files }, cancelable: true })
-    if (!window.dispatchEvent(event)) return
-    const holder = window as Window & { tauriOpenedFiles?: unknown }
-    holder.tauriOpenedFiles = (Array.isArray(holder.tauriOpenedFiles) ? holder.tauriOpenedFiles : []).concat(files)
-}
-
 async function settleOpenedFile(file: string): Promise<void> {
     // Every outcome has been reported by now, so Android must not offer the file again.
     if (isTauriAndroid) {

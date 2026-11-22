@@ -1,5 +1,5 @@
 import { get } from 'svelte/store'
-import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
+import { onboardingFinished } from 'src/lib/Others/Onboarding/onboardingGate'
 import { language } from 'src/lang'
 import { alertNormal } from '../alert'
 import { isAppLockInputBlocked } from '../appLock/input'
@@ -29,8 +29,7 @@ function isFileDrag(e: DragEvent): boolean {
 /** Drops are refused while onboarding is on screen, the app lock covers the app or a screen covers the sheet. */
 export function importDropsAccepted(): boolean {
     return get(loadedStore)
-        && !!DBState.db?.didFirstSetup
-        && !get(onboardingHold)
+        && onboardingFinished(DBState.db)
         && !isAppLockInputBlocked()
         && !importCoveringScreenOpen()
 }

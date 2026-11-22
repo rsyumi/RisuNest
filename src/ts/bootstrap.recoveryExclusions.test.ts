@@ -121,6 +121,7 @@ import { initializeNativeSyncBindings, installServerSyncProduction } from './sto
 import { createSyncExitCoordinator } from './storage/syncExitCoordinator'
 import { getExternalStorageBridge } from './storage/sync/external/bridge'
 import { beginDisplayWork, installDisplayRecovery, isDisplayRecoveryMarked } from './displayRecovery.svelte'
+import { characterURLImport, registerOpenedFileImports } from './characterCards'
 
 beforeEach(() => {
     vi.clearAllMocks()
@@ -249,6 +250,14 @@ describe('bootstrap recovery exclusions', () => {
         await loadData()
         expect(keepPluginsOffForThisStart).not.toHaveBeenCalled()
         expect(loadPlugins).toHaveBeenCalledOnce()
+    })
+
+    it('takes files opened during onboarding at every start, without the realm and hub import of a finished setup', async () => {
+        startup.native = true
+        startup.exclusions = []
+        await loadData()
+        expect(registerOpenedFileImports).toHaveBeenCalledOnce()
+        expect(characterURLImport).not.toHaveBeenCalled()
     })
 
     it('reaches UI when registering the sync transports fails while sync is left off', async () => {
