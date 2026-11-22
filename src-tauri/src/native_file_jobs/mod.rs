@@ -9350,6 +9350,37 @@ mod tests {
     }
 
     #[test]
+    fn an_update_base_on_a_phone_is_only_a_copy_the_picker_staged() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("selected_documents");
+        let staged = root.join("0b8c").join("source");
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&staged, b"{}").unwrap();
+        let outside = directory.path().join("secret.json");
+        fs::write(&outside, b"{}").unwrap();
+        let link = root.join("0b8c").join("link");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside, &link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        assert_eq!(
+            staged_selection_path(&root, &staged),
+            Some(staged.canonicalize().unwrap())
+        );
+        for path in [
+            outside.clone(),
+            link,
+            root.join("0b8c").join("..").join("..").join("secret.json"),
+            root.join("0b8c"),
+            root.clone(),
+            root.join("missing"),
+        ] {
+            assert_eq!(staged_selection_path(&root, &path), None, "{path:?}");
+        }
+    }
+
+    #[test]
     fn initialization_records_capability_failure_without_failing_launch() {
         let directory = TempDir::new().unwrap();
         let root = directory.path().join("native-file-jobs");
@@ -9906,10 +9937,49 @@ pub(crate) async fn native_content_source_metadata(
     }.await)
 }
 
+/// The path the earlier-file reader may open: on desktop a file the file dialog
+/// granted, and on Android and iOS a copy the app's own file picker staged. The
+/// renderer names the path, so every other path is refused.
+fn permitted_update_base_path(app: &AppHandle, path: &str) -> Result<String, NativeJobError> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let permitted = selection_staging_root(app)
+        .and_then(|root| staged_selection_path(&root, Path::new(path)))
+        .and_then(|staged| staged.into_os_string().into_string().ok());
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let permitted = {
+        use tauri_plugin_fs::FsExt;
+        app.try_fs_scope()
+            .is_some_and(|scope| scope.is_allowed(path))
+            .then(|| path.to_owned())
+    };
+    permitted.ok_or_else(|| invalid_source_error("The earlier file was not picked for this update"))
+}
+
+/// Where the Android file picker stages its copies.
+#[cfg(target_os = "android")]
+fn selection_staging_root(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_cache_dir().ok().map(|cache| cache.join("selected_documents"))
+}
+
+/// Where the iOS file picker stages its copies.
+#[cfg(target_os = "ios")]
+fn selection_staging_root(app: &AppHandle) -> Option<PathBuf> {
+    crate::app_paths::data_root(app).ok().map(|data| data.join("ios-file-staging"))
+}
+
+/// A regular file a file picker staged below `root`, as its canonical path.
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+fn staged_selection_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let path = path.canonicalize().ok()?;
+    (path.starts_with(&root) && path != root && path.is_file()).then_some(path)
+}
+
 /// The card and module metadata of an earlier file a content update compares
 /// with, without its assets.
 #[tauri::command]
 pub(crate) async fn native_content_update_base_read(
+    app: AppHandle,
     state: tauri::State<'_, NativeFileJobState>,
     path: String,
     format: String,
@@ -9920,6 +9990,7 @@ pub(crate) async fn native_content_update_base_read(
         tauri::async_runtime::spawn_blocking(move || {
             let format = update_base::UpdateBaseFormat::parse(&format)
                 .ok_or_else(|| NativeJobError::new("unsupported-format", "Unknown update base format"))?;
+            let path = permitted_update_base_path(&app, &path)?;
             let mut source = open_job_source(&root, &JobSource::DesktopPath { path })?;
             let bytes = update_base::read_update_base(&mut source.file, format).map_err(|error| match error.kind {
                 FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => {
