@@ -106,6 +106,13 @@ describe('toggle definition text', () => {
         for (const blank of ['', '\r', '  \t']) expect(missing(blank)).toEqual([null, []])
     })
 
+    it('shows a definition saved with CRLF line breaks as the same toggles as with LF', () => {
+        for (const text of forms) {
+            const lf = text.replaceAll('\r\n', '\n')
+            expect(sidebar(lf.replaceAll('\n', '\r\n')), JSON.stringify(text)).toEqual(sidebar(lf))
+        }
+    })
+
     it('groups the toggles between a group and its end the way the sidebar does', () => {
         expect(sidebar('a=A\n=One=group\nb=B\n=Two=group\nc=C\n=Two=groupEnd\nd=D\n=Stray=groupEnd\ne=E')).toEqual([
             { type: 'switch', key: 'a', value: 'A' },

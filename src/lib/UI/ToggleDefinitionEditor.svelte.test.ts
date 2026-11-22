@@ -95,7 +95,7 @@ describe('toggle definition editor', () => {
     it('shows each row type, changes it, and offers groups only outside a group', async () => {
         const text = '=G=group\nc=C=select=x\n=G=groupEnd\nd=D=textarea\n==divider\n=Cap=caption\ne=E=text\r\nf=F'
         await open(text)
-        expect(types().map((select) => select.value)).toEqual(['group', 'select', 'textarea', 'divider', 'caption', 'switch', 'switch'])
+        expect(types().map((select) => select.value)).toEqual(['group', 'select', 'textarea', 'divider', 'caption', 'text', 'switch'])
         const offered = (select: HTMLSelectElement) => [...select.options].map((option) => option.value)
         expect(offered(types()[0])).toContain('group')
         expect(offered(types()[1])).not.toContain('group')
