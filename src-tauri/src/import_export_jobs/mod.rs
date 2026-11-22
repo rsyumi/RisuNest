@@ -6,6 +6,7 @@ mod json_card;
 pub(crate) mod png_card;
 mod risum;
 mod staging;
+pub(crate) mod update_base;
 
 pub use classifier::{classify_content, ContentKind};
 pub use error::{FormatError, FormatErrorKind};

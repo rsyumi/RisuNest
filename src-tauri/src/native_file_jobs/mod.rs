@@ -9905,3 +9905,31 @@ pub(crate) async fn native_content_source_metadata(
         .map_err(|e| NativeJobError::new("store-error", e.to_string()))?
     }.await)
 }
+
+/// The card and module metadata of an earlier file a content update compares
+/// with, without its assets.
+#[tauri::command]
+pub(crate) async fn native_content_update_base_read(
+    state: tauri::State<'_, NativeFileJobState>,
+    path: String,
+    format: String,
+) -> Result<tauri::ipc::Response, NativeJobError> {
+    use crate::import_export_jobs::{update_base, FormatErrorKind};
+    logged("native_content_update_base_read", async move {
+        let root = state.root.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let format = update_base::UpdateBaseFormat::parse(&format)
+                .ok_or_else(|| NativeJobError::new("unsupported-format", "Unknown update base format"))?;
+            let mut source = open_job_source(&root, &JobSource::DesktopPath { path })?;
+            let bytes = update_base::read_update_base(&mut source.file, format).map_err(|error| match error.kind {
+                FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => {
+                    NativeJobError::new("unsupported-format", error.message)
+                }
+                FormatErrorKind::Cancelled | FormatErrorKind::Io => NativeJobError::new("invalid-input", error.message),
+            })?;
+            Ok(tauri::ipc::Response::new(bytes))
+        })
+        .await
+        .map_err(|e| NativeJobError::new("store-error", e.to_string()))?
+    }.await)
+}

@@ -152,6 +152,11 @@ export interface SelectedFileSlices {
     slice(start?: number, end?: number): { arrayBuffer(): Promise<ArrayBuffer> }
 }
 
+/** Keep the picked file's app copy until a native reader given its path settles, then remove it. */
+export function withNativeSelectedPath<T>(options: Omit<FileSelectionOptions, 'multiple'>, consume: (file: NativeSelectedFile) => Promise<T>): Promise<T | null> {
+    return withNativeSelection<T | null>({ ...options, multiple: false }, async ([file]) => file ? consume(file) : null, null)
+}
+
 /** Keep the source until the consumer settles, allowing early release before navigation. */
 export function withNativeSelectedFile<T>(options: Omit<FileSelectionOptions, 'multiple'>, consume: (file: SelectedFileSlices, release: () => Promise<void>) => Promise<T>): Promise<T | null> {
     return withNativeSelection<T | null>({ ...options, multiple: false }, async ([file], discard) => {

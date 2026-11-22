@@ -8,7 +8,9 @@ import { DBState, alertStore } from '../stores.svelte'
 import type { character } from '../storage/database.svelte'
 import type { RisuModule } from '../process/modules'
 import type { CharacterDetail } from '../storage/persistentDataStore'
+import type { UpdateBaseSource } from './baseFile'
 import { generatingConversations } from '../storage/generatingConversationRegistry'
+import { isTauriDesktop, isTauriMobile } from '../platform'
 import {
     getCatalogConversationCount,
     isArchivedCharacter,
@@ -327,6 +329,30 @@ export function chooseContentUpdateMany(ids: string[], side: UpdateSide) {
     contentUpdateDialog.choices = next
 }
 
+const baseFileExtensions = ['charx', 'png', 'json', 'lorebook', 'risum', 'jpg', 'jpeg']
+
+/**
+ * Lets the user pick an earlier file and reads it with `read` while the pick holds it. The native
+ * apps pass its path, so its card and module are read without its assets reaching the WebView.
+ */
+async function pickUpdateBaseFile(read: (file: UpdateBaseSource) => Promise<void>): Promise<void> {
+    if (isTauriMobile) {
+        const [{ fileAccept }, { withNativeSelectedPath }] = await Promise.all([import('../util'), import('../storage/nativeFileSelection')])
+        await withNativeSelectedPath({ accept: fileAccept(baseFileExtensions) }, (file) => read({ name: file.name, path: file.path }))
+        return
+    }
+    if (isTauriDesktop) {
+        const [{ fileAccept }, { open }] = await Promise.all([import('../util'), import('../storage/fileSelection')])
+        const filters = fileAccept(baseFileExtensions) === '*' ? undefined : [{ name: baseFileExtensions.join(', '), extensions: baseFileExtensions }]
+        const path = await open({ multiple: false, directory: false, filters })
+        if (typeof path === 'string') await read({ name: path.split(/[\\/]/).at(-1) || path, path })
+        return
+    }
+    const { selectSingleFile } = await import('../util')
+    const file = await selectSingleFile(baseFileExtensions)
+    if (file) await read(file)
+}
+
 /**
  * Uses an earlier file of this character or module as the base, for an install
  * that has no record of the version it came from. The file's assets are not
@@ -336,31 +362,33 @@ export async function loadContentUpdateBaseFile() {
     const dialog = contentUpdateDialog
     const session = pending
     if (!session || dialog.busy) return
-    const { selectSingleFile } = await import('../util')
-    const file = await selectSingleFile(['charx', 'png', 'json', 'lorebook', 'risum', 'jpg', 'jpeg'])
-    // Another import may have opened the dialog meanwhile.
-    if (!file || pending !== session || dialog.busy) return
     const { entity, incoming } = session
-    const target = dialog.target
-    dialog.busy = true
-    dialog.error = ''
+    let reading = false
     try {
-        const value = await entity.read(target)
-        if (!value) throw new Error(language.errors.noData)
-        const mine = await entity.normalize(value)
-        // The card readers load only when a file is chosen.
-        const { readUpdateBaseFile } = await import('./baseFile')
-        const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
-        if (pending !== session || dialog.target !== target) return
-        const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
-        const items = new Map(plan.items.map((item) => [item.id, item]))
-        dialog.plan = plan
-        // A pick the item compared with this file no longer offers, such as both on what is now a conflict, is asked again.
-        dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id, pick]) => {
-            const item = items.get(id)
-            return !!item && offersPick(item, pick)
-        }))
-        dialog.baseSource = { kind: 'file', name: file.name }
+        await pickUpdateBaseFile(async (file) => {
+            // Another import may have opened the dialog meanwhile.
+            if (pending !== session || dialog.busy) return
+            const target = dialog.target
+            reading = true
+            dialog.busy = true
+            dialog.error = ''
+            const value = await entity.read(target)
+            if (!value) throw new Error(language.errors.noData)
+            const mine = await entity.normalize(value)
+            // The card readers load only when a file is chosen.
+            const { readUpdateBaseFile } = await import('./baseFile')
+            const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
+            if (pending !== session || dialog.target !== target) return
+            const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
+            const items = new Map(plan.items.map((item) => [item.id, item]))
+            dialog.plan = plan
+            // A pick the item compared with this file no longer offers, such as both on what is now a conflict, is asked again.
+            dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id, pick]) => {
+                const item = items.get(id)
+                return !!item && offersPick(item, pick)
+            }))
+            dialog.baseSource = { kind: 'file', name: file.name }
+        })
     } catch (error) {
         const unsupported = await import('./baseFile').then(
             ({ UnsupportedUpdateBaseFileError }) => error instanceof UnsupportedUpdateBaseFileError,
@@ -371,7 +399,7 @@ export async function loadContentUpdateBaseFile() {
             ? text.baseFileUnsupported
             : `${text.baseFileFailed} ${error instanceof Error ? error.message : String(error)}`
     } finally {
-        if (pending === session) dialog.busy = false
+        if (reading && pending === session) dialog.busy = false
     }
 }
 

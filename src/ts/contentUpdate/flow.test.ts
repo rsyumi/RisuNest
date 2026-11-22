@@ -17,9 +17,9 @@ const mocks = vi.hoisted(() => ({
     /** Awaited before the installed character is read for a comparison. */
     beforeRead: null as (() => Promise<void>) | null,
 }))
-const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
-vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
-const core = vi.hoisted(() => ({ invoke: vi.fn(async (_command: string, _args?: unknown) => ({ revision: 2 })) }))
+const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web', os: 'windows' as 'windows' | 'android' }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: platform.os })))
+const core = vi.hoisted(() => ({ invoke: vi.fn(async (_command: string, _args?: unknown): Promise<unknown> => ({ revision: 2 })) }))
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
 
 vi.mock('../globalApi.svelte', () => ({
@@ -50,7 +50,10 @@ vi.mock('../characters', () => ({
     },
 }))
 vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
-vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
+vi.mock('../util', () => ({ selectSingleFile: vi.fn(), fileAccept: () => '*' }))
+// The pickers the apps use for an earlier file, which the native reader then reads by path.
+vi.mock('../storage/fileSelection', () => ({ open: vi.fn() }))
+vi.mock('../storage/nativeFileSelection', () => ({ withNativeSelectedPath: vi.fn() }))
 // The earlier-file reader's lorebook converter, without the app state its module loads.
 vi.mock('../characterCards', () => ({ convertCharbook: vi.fn() }))
 vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
@@ -99,6 +102,8 @@ import {
     setContentUpdateChoice,
 } from './flow.svelte'
 import { selectSingleFile } from '../util'
+import { open } from '../storage/fileSelection'
+import { withNativeSelectedPath } from '../storage/nativeFileSelection'
 import { registerGeneratingConversation } from '../storage/generatingConversationRegistry'
 import type { RisuModule } from '../process/modules'
 
@@ -161,6 +166,7 @@ beforeEach(() => {
     alertStore.set({ type: 'none', msg: '' })
     alertStore.clearStatus()
     platform.runtime = 'web'
+    platform.os = 'windows'
     core.invoke.mockClear()
     commitCharacter.mockClear()
     commitModule.mockClear()
@@ -397,6 +403,40 @@ describe('character update', () => {
         chooseContentUpdate('update')
         expect(await pending).toBe('old')
         expect(mocks.details.get('old').customscript).toEqual([bold({ in: '**(.+?)**', out: '<strong>' })])
+    })
+
+    it.each([
+        ['desktop', 'windows', 'C:\\Cards\\Luna.charx'],
+        // The picked copy goes by the picker's name for it, which keeps the extension the reader is chosen by.
+        ['Android', 'android', '/data/cache/selected_documents/1/source'],
+    ] as const)('reads an earlier file on the %s app natively by its path', async (_label, os, path) => {
+        platform.runtime = 'tauri'
+        platform.os = os
+        install(card('old', 'Luna', { desc: 'mine' }))
+        const pending = commitImportedCharacter(card('next', 'Luna', { desc: 'new' }), commitCharacter)
+        await opened()
+        await reviewContentUpdate()
+        expect(contentUpdateDialog.plan!.items).toMatchObject([{ field: 'desc', status: 'differs' }])
+        const webPicks = vi.mocked(selectSingleFile).mock.calls.length
+        if (os === 'windows') vi.mocked(open).mockResolvedValueOnce(path)
+        else vi.mocked(withNativeSelectedPath).mockImplementationOnce(async (_options, consume) => consume({ path, name: 'Luna.charx', bytes: 1, mimeType: '' }))
+        const earlier = new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v3', data: { name: 'Luna', description: 'mine', extensions: {} } }))
+        const reply = new Uint8Array(5 + earlier.length)
+        reply[0] = 2
+        new DataView(reply.buffer).setUint32(1, earlier.length, true)
+        reply.set(earlier, 5)
+        core.invoke.mockImplementation(async (command) => command === 'native_content_update_base_read' ? reply.buffer : { revision: 2 })
+        try {
+            await loadContentUpdateBaseFile()
+        } finally {
+            core.invoke.mockImplementation(async () => ({ revision: 2 }))
+        }
+        expect(core.invoke).toHaveBeenCalledWith('native_content_update_base_read', { path, format: 'charx' })
+        expect(vi.mocked(selectSingleFile).mock.calls.length).toBe(webPicks)
+        expect([contentUpdateDialog.error, contentUpdateDialog.busy, contentUpdateDialog.baseSource]).toEqual(['', false, { kind: 'file', name: 'Luna.charx' }])
+        expect(contentUpdateDialog.plan!.items).toMatchObject([{ field: 'desc', status: 'update', choice: 'theirs' }])
+        chooseContentUpdate('cancel')
+        expect(await pending).toBeNull()
     })
 
     it('asks before low-level access the user turned on covers triggers the update takes', async () => {

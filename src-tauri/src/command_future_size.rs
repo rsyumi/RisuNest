@@ -168,6 +168,7 @@ async_commands![
     asset_repository::commands::asset_cas_job_seal_prepared_content,
     asset_repository::commands::asset_cas_job_release,
     native_file_jobs::native_content_source_metadata,
+    native_file_jobs::native_content_update_base_read,
     native_file_jobs::native_file_job_prepared_content,
     native_file_jobs::native_file_job_stage_inline_asset,
     native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,
