@@ -373,6 +373,32 @@ describe('character update', () => {
         expect(mocks.details.get('old').additionalAssets.map((entry: string[]) => entry[0])).toEqual(['b', 'map', 'a'])
     })
 
+    it('asks again about an entry another earlier file turns from merged into a conflict', async () => {
+        const bold = (fields: Record<string, unknown>) => ({ comment: 'bold', type: 'editdisplay', in: '**', out: '<b>', ...fields })
+        install(card('old', 'Luna', { customscript: [bold({ out: '<strong>' })] }))
+        const pending = commitImportedCharacter(card('next', 'Luna', { customscript: [bold({ in: '**(.+?)**' })] }), commitCharacter)
+        await opened()
+        await reviewContentUpdate()
+        const earlier = (script: object) => ({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v2', data: { name: 'Luna', extensions: { risuai: { customScripts: [script] } } } })) })
+        vi.mocked(selectSingleFile).mockResolvedValueOnce(earlier(bold({})))
+        await loadContentUpdateBaseFile()
+        const [item] = contentUpdateDialog.plan!.items
+        expect(item).toMatchObject({ status: 'merged', choice: 'both' })
+        setContentUpdateChoice(item.id, 'mine')
+        setContentUpdateChoice(item.id, 'both')
+        // In an earlier version the pattern was another one, which both sides changed.
+        vi.mocked(selectSingleFile).mockResolvedValueOnce(earlier(bold({ in: '__' })))
+        await loadContentUpdateBaseFile()
+        expect(contentUpdateDialog.plan!.items).toMatchObject([{ id: item.id, status: 'conflict', choice: null }])
+        expect(contentUpdateDialog.choices[item.id]).toBeUndefined()
+        setContentUpdateChoice(item.id, 'both')
+        expect(contentUpdateDialog.choices[item.id]).toBeUndefined()
+        setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        expect(await pending).toBe('old')
+        expect(mocks.details.get('old').customscript).toEqual([bold({ in: '**(.+?)**', out: '<strong>' })])
+    })
+
     it('asks before low-level access the user turned on covers triggers the update takes', async () => {
         await commitImportedCharacter(card('first', 'Luna v1.0', { lowLevelAccess: false, triggerscript: [] }), commitCharacter)
         mocks.details.get('first').lowLevelAccess = true

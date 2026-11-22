@@ -426,7 +426,7 @@ function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknow
 function resolvedChoice(item: UpdateItem, side: UpdateChoice): UpdateChoice {
     if (typeof side === 'object') return side
     if (side === 'both') {
-        if (!item.resolved) throw new Error(`Update item ${item.id} has no merged entry`)
+        if (!item.resolved || item.status !== 'merged') throw new Error(`Update item ${item.id} has no merged entry`)
         return { value: item.resolved.mine }
     }
     return item.resolved && item.status === 'conflict' ? { value: item.resolved[side] } : side

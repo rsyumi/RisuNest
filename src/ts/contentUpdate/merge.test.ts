@@ -202,6 +202,7 @@ describe('applyUpdate', () => {
         ])
         expect(keptMine.customscript).toEqual([bold('<strong>', { in: '**(.+?)**', flag: 'g' })])
         expect(apply({ [inn.id]: 'theirs' }).globalLore[1]).toMatchObject({ content: 'inn!', insertorder: 7, alwaysActive: true, id: 'id-i' })
+        expect(() => apply({ [inn.id]: 'both' })).toThrow()
         // On a merged item a side is that whole entry.
         expect(apply({ [inn.id]: 'mine', [plan.items[0].id]: 'mine' }).globalLore[0]).toMatchObject({ content: '마을', insertorder: 100 })
         expect(apply({ [inn.id]: 'mine', [plan.items[2].id]: 'theirs' }).customscript).toEqual(theirs.customscript)

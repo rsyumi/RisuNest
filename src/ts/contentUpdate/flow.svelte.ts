@@ -299,14 +299,17 @@ export function backToContentUpdateTargets() {
     contentUpdateDialog.error = ''
 }
 
+/** Both sides together only for an item merged field by field, and an edit only where there is text to rewrite. */
+function offersPick(item: UpdateItem, pick: UpdatePick) {
+    return pick === 'both' ? item.status === 'merged' : pick === 'edit' ? isEditable(item) : true
+}
+
 export function setContentUpdateChoice(id: string, pick: UpdatePick) {
     const dialog = contentUpdateDialog
-    if (pick === 'edit' && dialog.edits[id] === undefined) {
-        // Start from the user's version: usually the one they already rewrote.
-        const item = dialog.plan?.items.find((entry) => entry.id === id)
-        if (!item || !isEditable(item)) return
-        dialog.edits = { ...dialog.edits, [id]: editStartText(item) }
-    }
+    const item = dialog.plan?.items.find((entry) => entry.id === id)
+    if (!item || !offersPick(item, pick)) return
+    // Start from the user's version: usually the one they already rewrote.
+    if (pick === 'edit' && dialog.edits[id] === undefined) dialog.edits = { ...dialog.edits, [id]: editStartText(item) }
     dialog.choices = { ...dialog.choices, [id]: pick }
 }
 
@@ -350,9 +353,13 @@ export async function loadContentUpdateBaseFile() {
         const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
         if (pending !== session || dialog.target !== target) return
         const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
-        const ids = new Set(plan.items.map((item) => item.id))
+        const items = new Map(plan.items.map((item) => [item.id, item]))
         dialog.plan = plan
-        dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id]) => ids.has(id)))
+        // A pick the item compared with this file no longer offers, such as both on what is now a conflict, is asked again.
+        dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id, pick]) => {
+            const item = items.get(id)
+            return !!item && offersPick(item, pick)
+        }))
         dialog.baseSource = { kind: 'file', name: file.name }
     } catch (error) {
         const unsupported = await import('./baseFile').then(
