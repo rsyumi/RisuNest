@@ -23,7 +23,7 @@ import { afterPluginsStarted, keepPluginsOffForThisStart, loadPlugins, loadPlugi
 import { setPluginStartupSyncExcluded } from './plugins/pluginStartupGate';
 import { alertActionConfirm, alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertToast, alertTOS, waitAlert } from "./alert";
 import { backgroundErrorMessage } from "./storage/backgroundErrorMessage";
-import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL } from "./characterCards";
+import { applyHubSelection, characterURLImport, downloadRisuHub, hubURL, registerOpenedFileImports } from "./characterCards";
 import { initializeNativeLocalUrls } from "./nativeLocalUrls";
 import { loadRisuAccountData } from "./drive/accounter";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -861,6 +861,7 @@ export async function loadData() {
             void initializeNativeLocalUrls((id) => {
                 if (getDatabase().didFirstSetup) void downloadRisuHub(id)
             })
+        registerOpenedFileImports()
         if (getDatabase().didFirstSetup) void characterURLImport()
 
         await transition('format-update', language.risuNest.startup.data)

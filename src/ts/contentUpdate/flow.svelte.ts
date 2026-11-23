@@ -8,7 +8,9 @@ import { DBState, alertStore } from '../stores.svelte'
 import type { character } from '../storage/database.svelte'
 import type { RisuModule } from '../process/modules'
 import type { CharacterDetail } from '../storage/persistentDataStore'
+import type { UpdateBaseSource } from './baseFile'
 import { generatingConversations } from '../storage/generatingConversationRegistry'
+import { isTauriDesktop, isTauriMobile } from '../platform'
 import {
     getCatalogConversationCount,
     isArchivedCharacter,
@@ -23,7 +25,7 @@ import {
 } from '../storage/persistentDataRuntime.svelte'
 import { collectOwnedAssetKeys, scheduleDeletedOwnerAssetCleanup } from '../storage/deletedOwnerAssetCleanup'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from '../storage/characterOrderMutation'
-import { editableText, editedValue, isEditable, loreFolderNames, updateGroupOf } from './view'
+import { editStartText, editedChoice, isEditable, loreFolderNames, updateGroupOf } from './view'
 import {
     CHARACTER_UPDATE,
     MODULE_UPDATE,
@@ -39,6 +41,7 @@ import {
     type UpdateChoice,
     type UpdateItem,
     type UpdatePlan,
+    type UpdateResolution,
     type UpdateSide,
     type UpdateSpec,
 } from './merge'
@@ -59,8 +62,8 @@ export interface ContentUpdateRequest {
 
 type Decision = { kind: 'new' } | { kind: 'cancel' } | { kind: 'update', id: string, plan: UpdatePlan, choices: Record<string, UpdateChoice> }
 
-/** A side, or 'edit' for the text the user wrote (kept in edits). */
-export type UpdatePick = UpdateSide | 'edit'
+/** A resolution, or 'edit' for the text the user wrote (kept in edits). */
+export type UpdatePick = UpdateResolution | 'edit'
 
 /** What differs between updating a character and updating a module. */
 interface Entity<T extends object> {
@@ -298,14 +301,17 @@ export function backToContentUpdateTargets() {
     contentUpdateDialog.error = ''
 }
 
+/** Both sides together only for an item merged field by field, and an edit only where there is text to rewrite. */
+function offersPick(item: UpdateItem, pick: UpdatePick) {
+    return pick === 'both' ? item.status === 'merged' : pick === 'edit' ? isEditable(item) : true
+}
+
 export function setContentUpdateChoice(id: string, pick: UpdatePick) {
     const dialog = contentUpdateDialog
-    if (pick === 'edit' && dialog.edits[id] === undefined) {
-        // Start from the user's version: usually the one they already rewrote.
-        const item = dialog.plan?.items.find((entry) => entry.id === id)
-        if (!item || !isEditable(item)) return
-        dialog.edits = { ...dialog.edits, [id]: editableText(item, 'mine') }
-    }
+    const item = dialog.plan?.items.find((entry) => entry.id === id)
+    if (!item || !offersPick(item, pick)) return
+    // Start from the user's version: usually the one they already rewrote.
+    if (pick === 'edit' && dialog.edits[id] === undefined) dialog.edits = { ...dialog.edits, [id]: editStartText(item) }
     dialog.choices = { ...dialog.choices, [id]: pick }
 }
 
@@ -323,6 +329,30 @@ export function chooseContentUpdateMany(ids: string[], side: UpdateSide) {
     contentUpdateDialog.choices = next
 }
 
+const baseFileExtensions = ['charx', 'png', 'json', 'lorebook', 'risum', 'jpg', 'jpeg']
+
+/**
+ * Lets the user pick an earlier file and reads it with `read` while the pick holds it. The native
+ * apps pass its path, so its card and module are read without its assets reaching the WebView.
+ */
+async function pickUpdateBaseFile(read: (file: UpdateBaseSource) => Promise<void>): Promise<void> {
+    if (isTauriMobile) {
+        const [{ fileAccept }, { withNativeSelectedPath }] = await Promise.all([import('../util'), import('../storage/nativeFileSelection')])
+        await withNativeSelectedPath({ accept: fileAccept(baseFileExtensions) }, (file) => read({ name: file.name, path: file.path }))
+        return
+    }
+    if (isTauriDesktop) {
+        const [{ fileAccept }, { open }] = await Promise.all([import('../util'), import('../storage/fileSelection')])
+        const filters = fileAccept(baseFileExtensions) === '*' ? undefined : [{ name: baseFileExtensions.join(', '), extensions: baseFileExtensions }]
+        const path = await open({ multiple: false, directory: false, filters })
+        if (typeof path === 'string') await read({ name: path.split(/[\\/]/).at(-1) || path, path })
+        return
+    }
+    const { selectSingleFile } = await import('../util')
+    const file = await selectSingleFile(baseFileExtensions)
+    if (file) await read(file)
+}
+
 /**
  * Uses an earlier file of this character or module as the base, for an install
  * that has no record of the version it came from. The file's assets are not
@@ -332,27 +362,33 @@ export async function loadContentUpdateBaseFile() {
     const dialog = contentUpdateDialog
     const session = pending
     if (!session || dialog.busy) return
-    const { selectSingleFile } = await import('../util')
-    const file = await selectSingleFile(['charx', 'png', 'json', 'lorebook', 'risum', 'jpg', 'jpeg'])
-    // Another import may have opened the dialog meanwhile.
-    if (!file || pending !== session || dialog.busy) return
     const { entity, incoming } = session
-    const target = dialog.target
-    dialog.busy = true
-    dialog.error = ''
+    let reading = false
     try {
-        const value = await entity.read(target)
-        if (!value) throw new Error(language.errors.noData)
-        const mine = await entity.normalize(value)
-        // The card readers load only when a file is chosen.
-        const { readUpdateBaseFile } = await import('./baseFile')
-        const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
-        if (pending !== session || dialog.target !== target) return
-        const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
-        const ids = new Set(plan.items.map((item) => item.id))
-        dialog.plan = plan
-        dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id]) => ids.has(id)))
-        dialog.baseSource = { kind: 'file', name: file.name }
+        await pickUpdateBaseFile(async (file) => {
+            // Another import may have opened the dialog meanwhile.
+            if (pending !== session || dialog.busy) return
+            const target = dialog.target
+            reading = true
+            dialog.busy = true
+            dialog.error = ''
+            const value = await entity.read(target)
+            if (!value) throw new Error(language.errors.noData)
+            const mine = await entity.normalize(value)
+            // The card readers load only when a file is chosen.
+            const { readUpdateBaseFile } = await import('./baseFile')
+            const base = await entity.normalize(await readUpdateBaseFile(entity.kind, file) as Partial<typeof mine>)
+            if (pending !== session || dialog.target !== target) return
+            const plan = planUpdate(entity.spec, mine, incoming, base, (field) => updateGroupOf({ field }) === 'asset')
+            const items = new Map(plan.items.map((item) => [item.id, item]))
+            dialog.plan = plan
+            // A pick the item compared with this file no longer offers, such as both on what is now a conflict, is asked again.
+            dialog.choices = Object.fromEntries(Object.entries(dialog.choices).filter(([id, pick]) => {
+                const item = items.get(id)
+                return !!item && offersPick(item, pick)
+            }))
+            dialog.baseSource = { kind: 'file', name: file.name }
+        })
     } catch (error) {
         const unsupported = await import('./baseFile').then(
             ({ UnsupportedUpdateBaseFileError }) => error instanceof UnsupportedUpdateBaseFileError,
@@ -363,7 +399,7 @@ export async function loadContentUpdateBaseFile() {
             ? text.baseFileUnsupported
             : `${text.baseFileFailed} ${error instanceof Error ? error.message : String(error)}`
     } finally {
-        if (pending === session) dialog.busy = false
+        if (reading && pending === session) dialog.busy = false
     }
 }
 
@@ -380,7 +416,7 @@ export function chooseContentUpdate(kind: 'new' | 'cancel' | 'update') {
     const choices: Record<string, UpdateChoice> = {}
     for (const item of plan.items) {
         const pick = picks[item.id]
-        if (pick === 'edit') choices[item.id] = { value: editedValue(item, dialog.edits[item.id] ?? editableText(item, 'mine')) }
+        if (pick === 'edit') choices[item.id] = editedChoice(item, dialog.edits[item.id] ?? editStartText(item))
         else if (pick) choices[item.id] = pick
     }
     finish({ kind: 'update', id: dialog.target, plan, choices })
@@ -558,9 +594,11 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
     }
     const update = decision.kind === 'update' ? decision : null
     return underLoading(loading, async () => {
-        signal?.throwIfAborted()
+        if (signal?.aborted) return cancelImport(incoming, signal)
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
+        // An operation that ended while the base was saved stores nothing, and the base goes with the import's assets.
+        if (signal?.aborted) return cancelImport(incoming, signal)
         await commitImport(commit, incoming)
         if (!update) return incoming.chaId
         try {
@@ -626,9 +664,11 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
     }
     const update = decision.kind === 'update' ? decision : null
     return underLoading(loading, async () => {
-        signal?.throwIfAborted()
+        if (signal?.aborted) return cancelImport(incoming, signal)
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.updateBase = baseKey
+        // An operation that ended while the base was saved stores nothing, and the base goes with the import's assets.
+        if (signal?.aborted) return cancelImport(incoming, signal)
         await commitImport(commit, incoming)
         if (!update) return incoming.id
         try {

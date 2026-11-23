@@ -66,7 +66,7 @@ describe('toggle definition editor', () => {
     it('changes only the edited line and keeps its inputs when the saved text comes back', async () => {
         const text = 'a=A\r\n\n=G=group\nb=B\n=G=groupEnd\n  junk line\r\nc=C=select=x,y\r\n'
         await open(text)
-        expect(names().map((input) => input.value)).toEqual(['A', 'G', 'B', 'C'])
+        expect(names().map((input) => input.value)).toEqual(['A', 'G', 'B', '', 'C'])
         const name = names()[2]
         await type(name, 'Bee')
         const saved = 'a=A\r\n\n=G=group\nb=Bee\n=G=groupEnd\n  junk line\r\nc=C=select=x,y\r\n'
@@ -95,7 +95,7 @@ describe('toggle definition editor', () => {
     it('shows each row type, changes it, and offers groups only outside a group', async () => {
         const text = '=G=group\nc=C=select=x\n=G=groupEnd\nd=D=textarea\n==divider\n=Cap=caption\ne=E=text\r\nf=F'
         await open(text)
-        expect(types().map((select) => select.value)).toEqual(['group', 'select', 'textarea', 'divider', 'caption', 'switch', 'switch'])
+        expect(types().map((select) => select.value)).toEqual(['group', 'select', 'textarea', 'divider', 'caption', 'text', 'switch'])
         const offered = (select: HTMLSelectElement) => [...select.options].map((option) => option.value)
         expect(offered(types()[0])).toContain('group')
         expect(offered(types()[1])).not.toContain('group')
@@ -120,6 +120,27 @@ describe('toggle definition editor', () => {
         await tick()
         expect(props.onChange).toHaveBeenLastCalledWith('b=B\na=A\n=\n')
         expect(names().map((input) => input.value)).toEqual(['B', 'A', ''])
+    })
+
+    it('shows a line the sidebar skips as a row with a warning on its empty field, and leaves blank lines out', async () => {
+        const copy = language.risuNest.toggleEditor
+        await open('a=A\n\n=Orphan\nb=\n=G=group\n==caption\n=G=groupEnd\n  \nc=C')
+        expect(names().map((input) => input.value)).toEqual(['A', 'Orphan', '', 'G', '', 'C'])
+        const warning = (input: HTMLInputElement) => input.getAttribute('aria-invalid') === 'true'
+            ? document.getElementById(input.getAttribute('aria-describedby')!)?.textContent
+            : undefined
+        expect(keys().map(warning)).toEqual([undefined, copy.missingKey, undefined, undefined])
+        expect(names().map(warning)).toEqual([undefined, undefined, copy.missingName, undefined, copy.missingName, undefined])
+        expect(preview()?.textContent).not.toContain('Orphan')
+
+        // Filling in the empty field makes it a row the sidebar shows.
+        await type(keys()[1], 'orphan')
+        expect(props.onChange).toHaveBeenLastCalledWith('a=A\n\norphan=Orphan\nb=\n=G=group\n==caption\n=G=groupEnd\n  \nc=C')
+        expect(warning(keys()[1])).toBeUndefined()
+        expect(preview()?.textContent).toContain('Orphan')
+        buttons(language.remove)[2].click()
+        await tick()
+        expect(props.onChange).toHaveBeenLastCalledWith('a=A\n\norphan=Orphan\n=G=group\n==caption\n=G=groupEnd\n  \nc=C')
     })
 
     it('shows the same text in the raw view and saves raw edits', async () => {

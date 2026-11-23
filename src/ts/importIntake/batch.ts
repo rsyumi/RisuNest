@@ -123,7 +123,7 @@ async function importCharacter(
     if (item.format === 'json') {
         // JSON spools keep the JavaScript converter, as the Android content picker does.
         const data = await readImportSourceBytes(item.source, context.signal)
-        const index = await importCharacterProcess({ name: characterImportName(item), data, quiet: true })
+        const index = await importCharacterProcess({ name: characterImportName(item), data, quiet: true, signal: context.signal })
         characterId = typeof index === 'number' ? getDatabase().characters[index]?.chaId ?? null : null
     } else {
         // The native importer reads the format from the content, and an Android spool is claimed only under the name it recorded.
@@ -155,7 +155,7 @@ async function importModuleBytes(
 ): Promise<string | null> {
     const { importModuleData } = await import('../process/modules')
     const data = await readImportSourceBytes(item.source, context.signal)
-    const location = await importModuleData({ name: jsonImportName(item.name), data })
+    const location = await importModuleData({ name: jsonImportName(item.name), data, signal: context.signal })
     if (!location) return null
     context.setLocation(location)
     return location.kind

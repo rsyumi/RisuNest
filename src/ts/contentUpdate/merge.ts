@@ -106,6 +106,8 @@ export interface UpdateSpec {
     maps: Record<string, Set<string>>
     /** Lists of lore entries: ids and caches are ignored and the installed id is kept. */
     lore: Set<string>
+    /** Lists whose entries both sides changed are merged field by field. */
+    fieldMerged: Set<string>
 }
 
 const loreKey = (entry: loreBook) => JSON.stringify([entry?.mode ?? '', entry?.comment ?? '', entry?.key ?? '', entry?.secondkey ?? ''])
@@ -131,6 +133,7 @@ export const CHARACTER_UPDATE: UpdateSpec = {
     },
     maps: { extentions: new Set(['risuRealmImportId', UPDATE_BASE_EXTENSION_KEY]) },
     lore: new Set(['globalLore']),
+    fieldMerged: new Set(['globalLore', 'customscript']),
 }
 
 export const MODULE_UPDATE: UpdateSpec = {
@@ -140,6 +143,7 @@ export const MODULE_UPDATE: UpdateSpec = {
     lists: { lorebook: loreKey, regex: regexKey, trigger: triggerKey, assets: assetKey },
     maps: {},
     lore: new Set(['lorebook']),
+    fieldMerged: new Set(['lorebook', 'regex']),
 }
 
 function isEmpty(value: unknown): boolean {
@@ -180,11 +184,17 @@ export type UpdateItemStatus =
     | 'removed'   // the author removed it, the user had not changed it
     | 'mineOnly'  // the user added it
     | 'conflict'  // both changed it
+    | 'merged'    // both changed it, in different fields
     | 'differs'   // no base: who changed it is unknown
 
 export type UpdateSide = 'mine' | 'theirs'
-/** A side, or a value the user wrote while comparing the two. */
-export type UpdateChoice = UpdateSide | { value: unknown }
+/** A side, or both sides' changes of an entry merged field by field. */
+export type UpdateResolution = UpdateSide | 'both'
+/**
+ * A resolution, a value the user wrote while comparing the two, or fields the user wrote into an entry,
+ * which otherwise keeps what 내 버전 writes.
+ */
+export type UpdateChoice = UpdateResolution | { value: unknown } | { edited: Record<string, unknown> }
 
 export interface UpdateItem {
     id: string
@@ -200,7 +210,16 @@ export interface UpdateItem {
     base: unknown
     baseKnown: boolean
     /** Preselected side, or null when the user has to decide. */
-    choice: UpdateSide | null
+    choice: UpdateResolution | null
+    /**
+     * An entry merged field by field: what mine and new write, as shown. On a conflict they settle only the
+     * fields both sides changed; on a merged item both hold the merged entry. The update writes the fields
+     * only the author changed (`authored`) and, for new, those both changed (`overlap`) onto the entry as
+     * it is stored then.
+     */
+    resolved?: { mine: Record<string, unknown>, theirs: Record<string, unknown>, authored: string[], overlap: string[] }
+    /** An entry only the author changed, compared field by field: the fields new writes onto the entry as it is stored then. */
+    authored?: string[]
 }
 
 export interface UpdatePlan {
@@ -219,6 +238,37 @@ function decide(hasBase: boolean, base: string, mine: string, theirs: string, pr
     if (mine === base && present.mine) return present.theirs ? { status: 'update', choice: 'theirs' } : { status: 'removed', choice: 'theirs' }
     if (theirs === base && present.theirs) return { status: 'mine', choice: 'mine' }
     return { status: 'conflict', choice: null }
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+const fieldCanon = (value: unknown) => value === undefined ? undefined : JSON.stringify(stable(value))
+
+/**
+ * One entry both sides changed, merged field by field against the base: a field one side alone
+ * changed takes that side, and one both changed takes each side in turn. Lore ids and caches are
+ * the installed entry's. Null when the entry is not a record on every side.
+ */
+function mergeFields(lore: boolean, base: unknown, mine: unknown, theirs: unknown): NonNullable<UpdateItem['resolved']> | null {
+    if (!isRecord(base) || !isRecord(mine) || !isRecord(theirs)) return null
+    const out = { mine: {} as Record<string, unknown>, theirs: {} as Record<string, unknown>, authored: [] as string[], overlap: [] as string[] }
+    for (const key of new Set([...Object.keys(mine), ...Object.keys(theirs), ...Object.keys(base)])) {
+        let values: [unknown, unknown]
+        if (lore && (key === 'id' || key === 'loreCache')) values = [mine[key], mine[key]]
+        else {
+            const [b, m, t] = [fieldCanon(base[key]), fieldCanon(mine[key]), fieldCanon(theirs[key])]
+            if (m === t || t === b) values = [mine[key], mine[key]]
+            else if (m === b) {
+                out.authored.push(key)
+                values = [theirs[key], theirs[key]]
+            } else {
+                out.overlap.push(key)
+                values = [mine[key], theirs[key]]
+            }
+        }
+        if (values[0] !== undefined) out.mine[key] = values[0]
+        if (values[1] !== undefined) out.theirs[key] = values[1]
+    }
+    return out
 }
 
 function keyed(keyOf: (item: any) => string, list: unknown): Map<string, unknown> {
@@ -291,9 +341,22 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
         if (spec.preserved.has(field)) continue
         const known = !!base && !unread?.(field)
         const push = (key: string, values: { b?: unknown, m?: unknown, t?: unknown }, present: { mine: boolean, theirs: boolean, base: boolean }) => {
-            const verdict = decide(known, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
+            let verdict = decide(known, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
             if (!verdict || spec.silent.has(field)) return
-            items.push({ id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b, baseKnown: known && present.base, ...verdict })
+            let resolved: UpdateItem['resolved']
+            let authored: string[] | undefined
+            if (key && spec.fieldMerged.has(field) && present.base && present.mine && present.theirs) {
+                if (verdict.status === 'conflict') {
+                    resolved = mergeFields(spec.lore.has(field), values.b, values.m, values.t) ?? undefined
+                    if (resolved && !resolved.overlap.length) verdict = { status: 'merged', choice: 'both' }
+                } else if (verdict.status === 'update') {
+                    authored = mergeFields(spec.lore.has(field), values.b, values.m, values.t)?.authored
+                }
+            }
+            items.push({
+                id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b,
+                baseKnown: known && present.base, ...verdict, ...(resolved ? { resolved } : {}), ...(authored ? { authored } : {}),
+            })
         }
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
@@ -335,7 +398,7 @@ export function unresolvedItems(plan: UpdatePlan): UpdateItem[] {
  * Merges a list in the order of one side, the author's unless `mineOrder`.
  * Items only the other side has follow the item they came after there.
  */
-function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknown, theirsList: unknown, choices: Map<string, UpdateChoice>, mineOrder = false): unknown[] {
+function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknown, theirsList: unknown, choices: Map<string, AppliedChoice>, mineOrder = false): unknown[] {
     const mineMap = keyed(keyOf, mineList)
     const theirsMap = keyed(keyOf, theirsList)
     const keepId = (chosen: unknown, own: unknown) => lore && own && chosen && typeof chosen === 'object'
@@ -346,7 +409,7 @@ function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknow
         const choice = choices.get(key)
         // Without a choice both sides had the same entry when they were compared: one removed since stays removed.
         if (!choice) return own
-        if (typeof choice === 'object') return keepId(choice.value, own)
+        if (typeof choice === 'object') return keepId(chosenValue(choice, own, other), own)
         return choice === 'mine' ? own : keepId(other, own)
     }
     const [lead, other] = mineOrder ? [mineMap, theirsMap] : [theirsMap, mineMap]
@@ -371,21 +434,67 @@ function mergeList(keyOf: (item: any) => string, lore: boolean, mineList: unknow
 }
 
 /**
+ * A choice on one entry, written onto the entry as it is stored when the update is written: the fields
+ * `taken` get the author's value, a field the author removed included, and `set` holds the fields the user
+ * wrote. An entry the user removed since the comparison stays removed unless `restore`.
+ */
+interface EntryPatch {
+    taken: string[]
+    set?: Record<string, unknown>
+    restore: boolean
+}
+
+type AppliedChoice = UpdateResolution | { value: unknown } | EntryPatch
+
+function chosenValue(choice: Exclude<AppliedChoice, string>, own: unknown, other: unknown): unknown {
+    return 'value' in choice ? choice.value : patchEntry(choice, own, other)
+}
+
+function patchEntry(patch: EntryPatch, own: unknown, other: unknown): unknown {
+    const start = own ?? (patch.restore ? other : undefined)
+    if (!isRecord(start)) return start
+    const out: Record<string, unknown> = { ...start }
+    for (const key of patch.taken) {
+        const value = isRecord(other) ? other[key] : undefined
+        if (value === undefined) delete out[key]
+        else out[key] = value
+    }
+    return { ...out, ...patch.set }
+}
+
+/**
+ * What a choice writes. On an entry merged field by field 둘 다 반영 and, on a conflict, a side take the
+ * author's fields onto the stored entry, while a side of a merged item is that whole entry. New on an entry
+ * only the author changed takes the fields the author changed. A written field goes into what 내 버전 writes.
+ */
+function resolvedChoice(item: UpdateItem, side: UpdateChoice): AppliedChoice {
+    const authored = item.resolved?.authored ?? []
+    if (typeof side === 'object') return 'edited' in side ? { taken: authored, set: side.edited, restore: true } : side
+    if (side === 'theirs' && item.authored) return { taken: item.authored, restore: true }
+    if (side === 'both') {
+        if (!item.resolved || item.status !== 'merged') throw new Error(`Update item ${item.id} has no merged entry`)
+        return { taken: authored, restore: false }
+    }
+    if (!item.resolved || item.status !== 'conflict') return side
+    return side === 'mine' ? { taken: authored, restore: false } : { taken: [...authored, ...item.resolved.overlap], restore: true }
+}
+
+/**
  * The installed entity with the update applied by the plan's choices. Every
  * unresolved item must have a choice. Preserved fields stay as they are.
  */
 export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: T, plan: UpdatePlan, choices: Record<string, UpdateChoice> = {}): T {
-    const chosen = new Map<string, Map<string, UpdateChoice>>()
+    const chosen = new Map<string, Map<string, AppliedChoice>>()
     for (const item of plan.items) {
         const side = choices[item.id] ?? item.choice
         if (!side) throw new Error(`Update choice missing for ${item.id}`)
         if (!chosen.has(item.field)) chosen.set(item.field, new Map())
-        chosen.get(item.field)!.set(item.key, side)
+        chosen.get(item.field)!.set(item.key, resolvedChoice(item, side))
     }
     const result: Record<string, any> = { ...mine }
     for (const field of Object.keys(theirs)) {
         if (spec.preserved.has(field)) continue
-        const fieldChoices = chosen.get(field) ?? new Map<string, UpdateChoice>()
+        const fieldChoices = chosen.get(field) ?? new Map<string, AppliedChoice>()
         const m = (mine as any)[field]
         const t = (theirs as any)[field]
         if (has(spec.lists, field)) {
@@ -396,7 +505,8 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
             const mineMap = mapEntries(m), theirsMap = mapEntries(t)
             for (const key of new Set([...mineMap.keys(), ...theirsMap.keys()])) {
                 const side = silentKeys.has(key) && theirsMap.has(key) ? 'theirs' : fieldChoices.get(key)
-                const value = typeof side === 'object' ? side.value : side === 'theirs' ? theirsMap.get(key) : mineMap.get(key)
+                const value = typeof side === 'object' ? chosenValue(side, mineMap.get(key), theirsMap.get(key))
+                    : side === 'theirs' ? theirsMap.get(key) : mineMap.get(key)
                 if (value !== undefined) out[key] = value
             }
             result[field] = out
@@ -404,7 +514,7 @@ export function applyUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs:
             result[field] = t
         } else {
             const side = fieldChoices.get('')
-            if (typeof side === 'object') result[field] = side.value
+            if (typeof side === 'object') result[field] = chosenValue(side, m, t)
             else if (side === 'theirs') result[field] = t
             else if (side !== 'mine' && m === undefined) result[field] = t
         }
@@ -426,7 +536,7 @@ export function baseSnapshot<T extends object>(spec: UpdateSpec, value: T): Part
 }
 
 export function summarizePlan(plan: UpdatePlan, choices: Record<string, UpdateChoice | 'edit'> = {}) {
-    const counts = { update: 0, mine: 0, added: 0, removed: 0, mineOnly: 0, conflict: 0, differs: 0, unresolved: 0 }
+    const counts = { update: 0, mine: 0, added: 0, removed: 0, mineOnly: 0, conflict: 0, merged: 0, differs: 0, unresolved: 0 }
     for (const item of plan.items) {
         counts[item.status]++
         if (!(choices[item.id] ?? item.choice)) counts.unresolved++

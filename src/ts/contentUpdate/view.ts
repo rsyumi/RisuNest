@@ -1,7 +1,7 @@
 // Adapted from RisuBard (https://github.com/rpaddict/RisuBard, src/ts/characterUpdateView.ts
 // and src/ts/storage/externalChangeDiff.ts), GPL-3.0.
 
-import type { UpdateItem } from './merge'
+import type { UpdateChoice, UpdateItem } from './merge'
 
 // Body fields are always shown as blocks so both sides line up in the diff.
 const blockKeys = new Set(['content', 'in', 'out'])
@@ -63,21 +63,41 @@ export function isEditable(item: UpdateItem): boolean {
     return editableKey(item) !== null
 }
 
-export function editableText(item: UpdateItem, side: 'mine' | 'theirs'): string {
+/** What 내 버전 or 새 버전 writes: on an entry merged field by field, only the fields both changed differ. */
+export function updateSideValue(item: UpdateItem, side: 'mine' | 'theirs'): unknown {
+    if (item.resolved && item.status === 'conflict') return item.resolved[side]
+    return side === 'mine' ? item.mine : item.theirs
+}
+
+/** The entry the user's text goes into: the merged entry, or what 내 버전 writes. */
+function editBase(item: UpdateItem): unknown {
+    return item.resolved?.mine ?? item.mine ?? item.theirs
+}
+
+function textOf(item: UpdateItem, value: unknown): string {
     const key = editableKey(item)
-    const value = side === 'mine' ? item.mine ?? item.theirs : item.theirs ?? item.mine
     if (key === null || value === undefined) return ''
     // The other side may hold another shape, which has no text to start from.
     const text = key === '' ? value : (value as Record<string, unknown> | null)?.[key]
     return typeof text === 'string' ? text : ''
 }
 
-/** The item with the user's text in place: the rest of the entry comes from the user's version. */
-export function editedValue(item: UpdateItem, text: string): unknown {
+export function editableText(item: UpdateItem, side: 'mine' | 'theirs'): string {
+    return textOf(item, updateSideValue(item, side) ?? updateSideValue(item, side === 'mine' ? 'theirs' : 'mine'))
+}
+
+/** The text an edit starts from before the user picks a side to start from. */
+export function editStartText(item: UpdateItem): string {
+    return textOf(item, editBase(item))
+}
+
+/**
+ * What the user's text writes: a text field itself, or the text in an entry whose other fields are what
+ * 내 버전 writes when the update is written.
+ */
+export function editedChoice(item: UpdateItem, text: string): UpdateChoice {
     const key = editableKey(item)
-    if (key === '') return text
-    const value = item.mine ?? item.theirs
-    return { ...(value as object), [key as string]: text }
+    return key === '' ? { value: text } : { edited: { [key as string]: text } }
 }
 
 export type UpdateGroupId = 'info' | 'prompt' | 'lore' | 'regex' | 'trigger' | 'asset' | 'other'

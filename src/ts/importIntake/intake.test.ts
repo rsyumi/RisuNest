@@ -405,7 +405,7 @@ describe('destination choices', () => {
         await submitImportDelivery(drop(dropped('book.json', '{"type":"risu","data":[{"key":"synthetic"}]}')))
 
         expect(get(importSheet)).toBeNull()
-        expect(mocks.moduleData).toHaveBeenCalledOnce()
+        expect(mocks.moduleData).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
         expect(mocks.appendLorebook).not.toHaveBeenCalled()
     })
 
@@ -667,8 +667,8 @@ describe('Android shares', () => {
             [{ source: { type: 'androidSpool', token: 'card-token' }, displayName: 'card.json' }],
             [{ source: { type: 'desktopPath', path: presetPath }, displayName: 'preset.risup' }],
         ])
-        // The batch outcome reports the import, so the card importer stays quiet.
-        expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.json', data: encode('{"name":"Synthetic"}'), quiet: true })
+        // The batch outcome reports the import, so the card importer stays quiet, and it ends with the batch.
+        expect(mocks.characterProcess).toHaveBeenCalledExactlyOnceWith({ name: 'card.json', data: encode('{"name":"Synthetic"}'), quiet: true, signal: expect.any(AbortSignal) })
         expect(mocks.preset).toHaveBeenCalledExactlyOnceWith({ name: 'preset.risup', data: encode('synthetic preset') })
         expect(outcomes).toEqual([expect.objectContaining({
             state: 'succeeded',
@@ -784,9 +784,6 @@ describe('drops on the window', () => {
         ['the onboarding hold', () => onboardingHold.set(true)],
         ['the app lock', () => setAppLockInputBlocked(true, false)],
         ['loading', () => loadedStore.set(false)],
-        ['a blocked library', () => workingSetBlocked.set(true)],
-        ['the update popup', () => showUpdatePopup(true)],
-        ['a full-screen editor', () => openTextEditorPopup(editorRequest)],
     ])('does nothing during %s but still keeps the WebView from opening the file', async (_name, refuse) => {
         refuse()
         const over = dragEvent('dragover', [])
@@ -800,6 +797,26 @@ describe('drops on the window', () => {
         await new Promise(resolve => setTimeout(resolve, 0))
         expect(mocks.files.size).toBe(0)
         expect(outcomes).toEqual([])
+    })
+
+    it.each([
+        ['the library recovery screen', () => workingSetBlocked.set(true), () => workingSetBlocked.set(false)],
+        ['the update popup', () => showUpdatePopup(true), () => showUpdatePopup(false)],
+        ['a full-screen editor', () => openTextEditorPopup(editorRequest), () => closeTextEditorPopup(editorRequest)],
+    ])('takes a drop over %s and imports it once that screen closes', async (_name, open, close) => {
+        open()
+        const over = dragEvent('dragover', [])
+        document.body.dispatchEvent(dragEvent('dragenter', []))
+        document.body.dispatchEvent(over)
+        expect(get(importDropOverlayVisible)).toBe(true)
+        expect(over.dataTransfer!.dropEffect).toBe('copy')
+        document.body.dispatchEvent(dragEvent('drop', [dropped('card.png')]))
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(mocks.files.size).toBe(0)
+        expect(mocks.characterPath).not.toHaveBeenCalled()
+        close()
+        await vi.waitFor(() => expect(outcomes).toHaveLength(1))
+        expect(mocks.characterPath).toHaveBeenCalledOnce()
     })
 
     it('leaves in-app drags alone', () => {

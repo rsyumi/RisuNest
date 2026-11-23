@@ -76,7 +76,8 @@ describe('iOS native content picker', () => {
         mocks.pick.mockResolvedValue({ files: [{ ...picked, name: 'source.JSON' }], failures: [] })
         await expect(importIOSContentFromPicker(destination)).resolves.toBe(destination === 'character' ? 'json-character' : 'module')
         expect(mocks.read).toHaveBeenCalledWith(picked.path)
-        expect(destination === 'character' ? mocks.jsonCharacter : mocks.jsonModule).toHaveBeenCalledOnce()
+        // The import ends with the picker's operation, closing an update dialog it opened.
+        expect(destination === 'character' ? mocks.jsonCharacter : mocks.jsonModule).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
         expect(mocks.location).toHaveBeenCalledExactlyOnceWith(destination === 'character'
             ? { kind: 'character', chaId: 'json-character' }
             : { kind: 'module-from-lorebook' })

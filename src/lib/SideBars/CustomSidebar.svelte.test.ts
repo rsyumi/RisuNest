@@ -9,8 +9,15 @@ import Toggles from './Toggles.svelte'
 import CustomSidebarConfig from '../Others/CustomSidebarConfig.svelte'
 
 vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
-vi.mock('./ModelBind.svelte', () => ({ default: () => {} }))
-vi.mock('./PersonaBind.svelte', () => ({ default: () => {} }))
+// The model and persona bindings have their own tests; here they leave a marker where they show.
+vi.mock('./ModelBind.svelte', () => ({ default: (anchor: ChildNode) => anchor.before(bindingMarker('model')) }))
+vi.mock('./PersonaBind.svelte', () => ({ default: (anchor: ChildNode) => anchor.before(bindingMarker('persona')) }))
+
+function bindingMarker(name: string) {
+    const marker = document.createElement('div')
+    marker.dataset.bindingMarker = name
+    return marker
+}
 
 let mounted: ReturnType<typeof mount> | undefined
 let configMounted: ReturnType<typeof mount> | undefined
@@ -104,4 +111,46 @@ it.each([
         await clickConfig('Delete')
         expectBindingOrder()
     }
+})
+
+it('offers the text editor preview only the pinned settings and the save of a bound chat', async () => {
+    const database = normalizeDatabaseDefaults({} as Database)
+    database.characters = [{ chaId: 'sidebar-character', chatPage: 0, chats: [{ id: 'sidebar-chat' }] } as character]
+    database.customPromptTemplateToggle = 'example=Example toggle'
+    database.lastLoadedLoadoutName = 'Synthetic loadout'
+    database.customSidebarItems = (['model', 'preset', 'loadout', 'persona', 'setting'] as const)
+        .map((type) => ({ id: type, type, subType: type === 'setting' ? 'acc.fixedChatTextarea' : '', label: type }))
+    DBState.db = database
+    selectedCharID.set(0)
+    const offered = async (editorPreview: boolean) => {
+        mounted = mount(Toggles, { target: document.body, props: { noContainer: true, editorPreview } })
+        await tick()
+        const shown = {
+            controls: [...document.querySelectorAll('button')].map((button) => button.title || button.textContent!.trim()),
+            bindings: [...document.querySelectorAll<HTMLElement>('[data-binding-marker]')].map((marker) => marker.dataset.bindingMarker),
+            text: document.body.textContent!,
+        }
+        await unmount(mounted)
+        mounted = undefined
+        document.body.replaceChildren()
+        return shown
+    }
+
+    const sidebar = await offered(false)
+    expect(sidebar.bindings).toEqual(['model', 'persona'])
+    expect(sidebar.controls).toEqual(expect.arrayContaining([
+        languageEnglish.risuNest.presetBinding.label, database.botPresets[0].name, 'Synthetic loadout',
+        languageEnglish.bindToggles, languageEnglish.togglePresets,
+    ]))
+
+    const unbound = await offered(true)
+    expect(unbound.bindings).toEqual([])
+    expect(unbound.controls).toEqual([])
+    expect(unbound.text).toContain(languageEnglish.fixedChatTextarea)
+    expect(unbound.text).toContain('Example toggle')
+
+    DBState.db.characters[0].chats[0].savedToggleValues = { toggle_example: '0' }
+    const bound = await offered(true)
+    expect(bound.controls).toEqual([languageEnglish.saveToggleChanges])
+    expect(bound.text).toContain(languageEnglish.fixedChatTextarea)
 })

@@ -51,7 +51,10 @@ export interface ToggleLine {
     id: number
     /** The line as stored, without its '\n'. A CRLF line keeps its '\r'. */
     raw: string
-    /** What the sidebar reads from the line, or null when it skips the line. */
+    /**
+     * What the sidebar reads from the line. A line the sidebar skips for an empty key or name has the type
+     * its text names, so it stays an editor row; a blank line is null.
+     */
     kind: ToggleLineKind | null
 }
 
@@ -74,11 +77,21 @@ function createLine(raw: string, kind: ToggleLineKind | null = classifyToggleLin
     return { id: nextToggleLineId++, raw, kind }
 }
 
-/** Reads one line exactly as the sidebar does. */
+/** Reads one line exactly as the sidebar does, and a line it skips by the type its text names. */
 function classifyToggleLine(raw: string): ToggleLineKind | null {
     const [toggle] = parseToggleSyntax(raw)
-    if (!toggle) return null
-    return toggle.type ?? 'switch'
+    if (toggle) return toggle.type ?? 'switch'
+    if (!raw.trim()) return null
+    const type = raw.replace(/\r$/, '').split('=')[2]
+    return type === 'select' || type === 'text' || type === 'textarea' || type === 'caption' ? type : 'switch'
+}
+
+/** The empty fields that keep the sidebar from showing a line; none for a line it shows or a blank line. */
+export function missingToggleFields(raw: string): Array<keyof ToggleFields> {
+    const kind = classifyToggleLine(raw)
+    if (kind === null || parseToggleSyntax(raw).length > 0) return []
+    const { key, name } = toggleLineFields(raw)
+    return [...(kind !== 'caption' && !key ? ['key' as const] : []), ...(!name ? ['name' as const] : [])]
 }
 
 export function parseToggleDefinitions(text: string): ToggleLine[] {
@@ -113,7 +126,7 @@ function lineText(kind: ToggleLineKind, fields: ToggleFields): string {
     }
 }
 
-/** Rows and groups in the order the sidebar shows them. Lines the sidebar skips are left out. */
+/** Rows and groups in the order the sidebar shows them, with the lines it skips in their place. Blank lines are left out. */
 export function toggleOutline(lines: readonly ToggleLine[]): ToggleOutlineItem[] {
     const items: ToggleOutlineItem[] = []
     let open: ToggleGroupItem | null = null

@@ -979,10 +979,11 @@ function getTranStream(args:{
     saveSignature:boolean
 }):TransformStream<Uint8Array, StreamResponseChunk> {
     let buffer = '';
+    const decoder = new TextDecoder()
     const { modelInfo, saveSignature } = args
     return new TransformStream<Uint8Array, StreamResponseChunk>({
         transform(chunk, control) {
-            buffer += new TextDecoder().decode(chunk);
+            buffer += decoder.decode(chunk, { stream: true });
             const lines = buffer.split('\n');
 
             let readed = initStreamState();

@@ -15,6 +15,8 @@ vi.mock('../characters', () => ({ createBlankChar: vi.fn() }))
 vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
 vi.mock('../globalApi.svelte', async () => ({ ...await import('../appendableBuffer'), VirtualWriter: class {} }))
 vi.mock('../util', () => ({ blobToUint8Array: vi.fn() }))
+const core = vi.hoisted(() => ({ invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: core.invoke }))
 
 import { encodeRPack } from '../rpack/rpack_js'
 import { readUpdateBaseFile, UnsupportedUpdateBaseFileError } from './baseFile'
@@ -111,6 +113,35 @@ describe('readUpdateBaseFile', () => {
         const asModule = await readUpdateBaseFile('module', { name: 'Luna.charx', data: zipSync({ 'card.json': encode(cardV3), 'module.risum': await risum({ ...module, name: 'Embedded' }) }) }) as any
         expect(asModule.name).toBe('Luna')
         expect(asModule.lorebook.map((entry: any) => entry.comment)).toContain('From Character Description')
+    })
+
+    it('reads a picked file natively by its path to the same base as reading it whole', async () => {
+        const module = { name: 'Luna', description: '', id: 'm', lorebook: [{ key: 'k', comment: 'From module', content: 'c', mode: 'normal', insertorder: 1, alwaysActive: false, secondkey: '', selective: false }], regex: [], trigger: [] }
+        // The native reply: a tag, a little-endian length and the bytes of each part.
+        const reply = (...parts: [number, Uint8Array][]) => {
+            const out = new Uint8Array(parts.reduce((size, [, bytes]) => size + 5 + bytes.length, 0))
+            let at = 0
+            for (const [tag, bytes] of parts) {
+                out[at] = tag
+                new DataView(out.buffer).setUint32(at + 1, bytes.length, true)
+                out.set(bytes, at + 5)
+                at += 5 + bytes.length
+            }
+            return out.buffer
+        }
+        core.invoke.mockResolvedValueOnce(reply([2, encode(cardV3)], [3, encode({ type: 'risuModule', module })]))
+        const charx = zipSync({ 'card.json': encode(cardV3), 'module.risum': await risum(module) })
+        expect(await readUpdateBaseFile('character', { name: 'Luna.charx', path: '/picked/source' }))
+            .toEqual(await readUpdateBaseFile('character', { name: 'Luna.charx', data: charx }))
+        expect(core.invoke).toHaveBeenCalledWith('native_content_update_base_read', { path: '/picked/source', format: 'charx' })
+        core.invoke.mockResolvedValueOnce(reply([5, new TextEncoder().encode(base64(cardV3))]))
+        expect(await readUpdateBaseFile('character', { name: 'Luna.png', path: '/picked/Luna.png' }))
+            .toEqual(await readUpdateBaseFile('character', { name: 'Luna.png', data: png({ chara: base64(cardV3) }) }))
+        // A file the native reader finds no module in, and a reply cut short.
+        core.invoke.mockRejectedValueOnce({ code: 'unsupported-format', message: 'not a Risu module' })
+        await expect(readUpdateBaseFile('module', { name: 'Lore.risum', path: '/picked/Lore.risum' })).rejects.toBeInstanceOf(UnsupportedUpdateBaseFileError)
+        core.invoke.mockResolvedValueOnce(reply([2, encode(cardV3)]).slice(0, 9))
+        await expect(readUpdateBaseFile('character', { name: 'Luna.charx', path: '/picked/source' })).rejects.toThrow('invalid update base')
     })
 
     it('reads the CHARX a JPEG carries after image bytes that look like a ZIP header', async () => {

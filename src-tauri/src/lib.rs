@@ -920,6 +920,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         device_backup::native_device_backup_bootstrap,
         device_backup::native_device_backup_recovery_complete,
         native_file_jobs::native_content_source_metadata,
+        native_file_jobs::native_content_update_base_read,
         native_file_jobs::native_file_job_status,
         native_file_jobs::native_file_job_prepared_content,
         native_file_jobs::native_file_job_stage_inline_asset,

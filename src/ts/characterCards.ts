@@ -23,6 +23,7 @@ import { readFile } from "@tauri-apps/plugin-fs"
 import { open } from "./storage/fileSelection"
 import { REALM_HUB_URL, REALM_NIGHTLY_HUB_URL, REALM_SITE_URL } from "./realmEndpoints"
 import { openedFileSource, registerOpenedFileListeners } from "./openedFiles"
+import { onboardingFinished } from "src/lib/Others/Onboarding/onboardingGate"
 import { type DeviceMarkerStorage } from './storage/deviceMarkers'
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import { importContentBatch } from './storage/contentImportBatch'
@@ -182,7 +183,7 @@ export async function importCharacterPathInOperation(
         nativeEnabled: () => nativeCharacterContentImportEnabled,
         nativeImport: (input) => importPreparedNativeCharacterContent({ ...input, displayName }, { signal: context.signal, onStatus: context.onStatus }),
         legacyImport: async ({ data }) => {
-            const importedIndex = await importCharacterProcess({ name: displayName, data, quiet: true })
+            const importedIndex = await importCharacterProcess({ name: displayName, data, quiet: true, signal: context.signal })
             return typeof importedIndex === 'number'
                 ? (getDatabase().characters[importedIndex]?.chaId ?? null)
                 : null
@@ -219,10 +220,12 @@ async function importCharacterWithNotices<T extends boolean = false>(f: {
     returnCharacter?: T //note That this option only works with v3 charx
     /** Leaves the success notice to a caller that shows its own result. */
     quiet?: boolean
+    /** The operation the import runs in; when it ends, an update dialog the import opened closes and nothing is stored. */
+    signal?: AbortSignal
 }): Promise<T extends true ? character | number | null : number | null> {
     // Shadows the exported importer so every card branch below honours `quiet`.
     const importCharacterCardSpec = ((...args: Parameters<CharacterCardSpecImporter>) =>
-        importCharacterCardSpecWithPolicy(args[0], args[1], args[2], args[3], args[4], args[5], undefined, !f.quiet)) as CharacterCardSpecImporter
+        importCharacterCardSpecWithPolicy(args[0], args[1], args[2], args[3], args[4], args[5], undefined, !f.quiet, f.signal)) as CharacterCardSpecImporter
     const fileName = f.name.split(/[\\/]/).at(-1) ?? f.name
     const separator = fileName.lastIndexOf('.')
     const extension =
@@ -270,7 +273,7 @@ async function importCharacterWithNotices<T extends boolean = false>(f: {
             (da.char_persona || da.description) &&
             (da.char_greeting || da.first_mes)
         ) {
-            const importedId = await commitImportedCharacterCard(convertOffSpecCards(da))
+            const importedId = await commitImportedCharacterCard(convertOffSpecCards(da), f.signal)
             if (!importedId) return null
             if (!f.quiet) alertNormal(language.importedCharacter)
             return getDatabase().characters.findIndex(
@@ -524,6 +527,7 @@ async function importCharacterWithNotices<T extends boolean = false>(f: {
                         // A cancelled import, such as a declined update, installs nothing.
                         return
                     } catch (error) {
+                        if (f.signal?.aborted) throw error
                         alertError(language.errors.wrongPassword)
                         return
                     }
@@ -546,6 +550,7 @@ async function importCharacterWithNotices<T extends boolean = false>(f: {
                         )
                     }
                 } catch (error) {
+                    if (f.signal?.aborted) throw error
                     alertError(language.errors.noData)
                     return
                 }
@@ -570,6 +575,7 @@ async function importCharacterWithNotices<T extends boolean = false>(f: {
         const imgp = await saveAsset(img)
         const importedId = await commitImportedCharacterCard(
             convertOffSpecCards(charaData, imgp),
+            f.signal,
         )
         if (!importedId) return null
         if (!f.quiet) alertNormal(language.importedCharacter)
@@ -625,6 +631,18 @@ export const getRealmInfo = async (realmPath:string) => {
 }
 
 export const showRealmInfoStore:Writable<null|hubType> = writable(null)
+
+/**
+ * Files a file association or share hands over arrive together as one intake delivery. Registered
+ * at every startup, so files opened while onboarding is on screen are not imported and are still
+ * let go of once their delivery ends.
+ */
+export function registerOpenedFileImports() {
+    registerOpenedFileListeners(async (files) => {
+        const { submitImportDelivery } = await import('./importIntake/intake')
+        await submitImportDelivery({ origin: 'opened', sources: files.map(openedFileSource) })
+    }, () => onboardingFinished(getDatabase()))
+}
 
 export async function characterURLImport() {
     const realmPath = new URLSearchParams(location.search).get('realm')
@@ -768,12 +786,6 @@ export async function characterURLImport() {
             }
         })
     }
-
-    // Files a file association or share hands over arrive together as one intake delivery.
-    registerOpenedFileListeners(async (files) => {
-        const { submitImportDelivery } = await import('./importIntake/intake')
-        await submitImportDelivery({ origin: 'opened', sources: files.map(openedFileSource) })
-    })
 
     async function importFile(name: string, data: Uint8Array): Promise<void | 'failed'> {
         if (
@@ -1180,6 +1192,7 @@ async function importCharacterCardSpecWithPolicy<T extends boolean = false>(
     returnValue: T = false as T,
     assetPolicy?: CardAssetImportPolicy,
     notify = true,
+    signal?: AbortSignal,
 ): Promise<T extends true ? character | false : string | false> {
     if (
         !card ||
@@ -1557,16 +1570,16 @@ async function importCharacterCardSpecWithPolicy<T extends boolean = false>(
         return char as any
     }
 
-    const importedId = await commitImportedCharacterCard(char)
+    const importedId = await commitImportedCharacterCard(char, signal)
     if (!importedId) return false
     if (notify) alertNormal(language.importedCharacter)
     return importedId as any
 }
 
 /** Commits an imported character, or the installed one it updates when the user chooses that. */
-async function commitImportedCharacterCard(char: character): Promise<string | null> {
+async function commitImportedCharacterCard(char: character, signal?: AbortSignal): Promise<string | null> {
     const { commitImportedCharacter } = await import('./contentUpdate/flow.svelte')
-    return commitImportedCharacter(char, (value) => commitDetachedCharacter(value, 'import-character-card'))
+    return commitImportedCharacter(char, (value) => commitDetachedCharacter(value, 'import-character-card'), signal)
 }
 
 export function convertCharbook(arg:{

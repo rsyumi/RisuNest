@@ -26,7 +26,7 @@ vi.mock('src/ts/storage/database.svelte', async () => {
 })
 vi.mock('src/ts/globalApi.svelte', () => ({ aiWatermarkingLawApplies: () => false, getFileSrc: async () => '', globalFetch: vi.fn() }))
 vi.mock('src/ts/plugins/plugins.svelte', () => ({ pluginV2: { providerOptions: new Map() } }))
-const toggles = vi.hoisted(() => ({ props: undefined as { presetDatabase?: Database } | undefined }))
+const toggles = vi.hoisted(() => ({ props: undefined as { presetDatabase?: Database, editorPreview?: boolean } | undefined }))
 // The toggle list is covered by Toggles.svelte.test.ts; here it exposes the preset it receives.
 vi.mock('../SideBars/Toggles.svelte', () => ({ default: (_anchor: unknown, props: typeof toggles.props) => { toggles.props = props } }))
 
@@ -58,6 +58,8 @@ async function preview(presetEditor: boolean, tokens: number): Promise<[string, 
     showToggles.click()
     await tick()
     const toggleTemplate = toggles.props?.presetDatabase?.customPromptTemplateToggle
+    // The panel leaves out the binding controls other than the toggle binding's save.
+    expect(toggles.props?.editorPreview).toBe(true)
     await unmount(instance)
     instance = undefined
     return [parsed, toggleTemplate]

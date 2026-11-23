@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
         modules: [] as any[],
         statics: { imports: 0 },
         blockedRealmCreators: [] as any[],
+        didFirstSetup: true,
     },
     commitDetachedCharacter: vi.fn(async (character: any, _reason: string) => {
         mocks.database.characters.push(character)
@@ -47,6 +48,8 @@ vi.mock('./characters', () => ({
     changeChar: vi.fn(),
     characterFormatUpdate: (value: unknown) => value,
     commitDetachedCharacter: mocks.commitDetachedCharacter,
+    // The update comparison brings lorebooks to the current format.
+    updateLorebooks: (books: unknown[]) => books,
 }))
 vi.mock('./storage/database.svelte', () => ({
     defaultSdDataFunc: () => [['always', 'synthetic']],
@@ -111,8 +114,9 @@ vi.mock('./storage/nativeCharacterCardExportRoute', () => ({
 vi.mock('@tauri-apps/plugin-dialog', () => ({
     open: mocks.openDesktopPicker,
 }))
-vi.mock('./stores.svelte', () => ({
+vi.mock('./stores.svelte', async () => ({
     DBState: { db: mocks.database },
+    alertStore: (await import('./alertQueue')).alertStore,
     SettingsMenuIndex: { set: vi.fn() },
     ShowRealmFrameStore: { set: vi.fn() },
     selectedCharID: { set: vi.fn() },
@@ -176,10 +180,12 @@ import {
     importCharacterProcess,
     isNativeCharacterContentImportEnabled,
     mapPreparedNativeCharacterCard,
+    registerOpenedFileImports,
     showRealmInfoStore,
     type CharacterCardV2Risu,
 } from './characterCards'
 import {
+    cancelActiveNativeFileOperation,
     dismissNativeFileOperationOutcome,
     nativeFileOperationOutcome,
     NativeFileOperationBusyError,
@@ -197,6 +203,7 @@ import { hasher } from './parser/parser.svelte'
 import { decryptBuffer } from './util'
 import { readUpdateBaseFile } from './contentUpdate/baseFile'
 import { CHARACTER_UPDATE, UPDATE_BASE_EXTENSION_KEY, planUpdate } from './contentUpdate/merge'
+import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
 
 describe('character card additions', () => {
     beforeEach(() => {
@@ -204,6 +211,8 @@ describe('character card additions', () => {
         mocks.database.characters = []
         mocks.database.statics.imports = 0
         mocks.database.blockedRealmCreators = []
+        mocks.database.didFirstSetup = true
+        onboardingHold.set(false)
         mocks.nextId = 0
         mocks.charxWrites = []
         mocks.pngWrites = []
@@ -401,6 +410,46 @@ describe('character card additions', () => {
         })
     })
 
+    it.each([
+        ['a JSON card', 'card.json', false],
+        ['a sealed PNG card', 'card.png', false],
+        ['a password PNG card', 'card.png', true],
+    ])('takes the update dialog down and stores nothing when %s the desktop reads in TypeScript is cancelled while it asks', async (_kind, file, usePassword) => {
+        mocks.database.characters = [{ chaId: 'installed', name: 'Synthetic', type: 'character', chats: [] }]
+        mocks.desktopPickerPaths = [`C:/chosen/${file}`]
+        const legacy = { name: 'Synthetic', description: 'Description', first_mes: 'Hello' }
+        if (file === 'card.png') {
+            // A sealed card, which the PNG reader opens and imports itself.
+            if (usePassword) vi.mocked(alertInput).mockResolvedValueOnce('synthetic-password')
+            const base64 = (value: string) => Buffer.from(value).toString('base64')
+            vi.mocked(hasher).mockResolvedValueOnce('synthetic-hash')
+            vi.mocked(decryptBuffer).mockResolvedValueOnce(new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v2', spec_version: '2.0', data: {
+                ...legacy, first_mes: 'Hello', personality: '', scenario: '', mes_example: '', creator_notes: '', system_prompt: '',
+                post_history_instructions: '', alternate_greetings: [], tags: [], creator: '', character_version: '', extensions: {},
+            } })).buffer)
+            mocks.pngChunks = [
+                { key: 'chara', value: ['rcc', 'rccv1', base64('sealed'), 'synthetic-hash', base64(JSON.stringify({ usePassword }))].join('||') },
+                Object.assign(new AppendableBuffer(), { buffer: new Uint8Array([1]) }),
+            ]
+        }
+        const data = file === 'card.png' ? new Uint8Array([1]) : new TextEncoder().encode(JSON.stringify(legacy))
+        mocks.importDesktopNativeCharacterPath.mockImplementationOnce(async (_path: string, route: any, name: string) => {
+            const value = await route.legacyImport({ name, data })
+            return value ? { kind: 'imported', mode: 'legacy', value } : { kind: 'cancelled' }
+        })
+        // Loaded ahead, as the app has them by the time a card is imported.
+        const [{ contentUpdateDialog }] = await Promise.all([import('./contentUpdate/flow.svelte'), import('./process/inlayScreen'), import('./storage/persistentDataRuntime.svelte')])
+        dismissNativeFileOperationOutcome()
+        const imported = importCharacter()
+        await vi.waitFor(() => expect(contentUpdateDialog.request && !contentUpdateDialog.busy).toBe(true))
+        cancelActiveNativeFileOperation()
+        await expect(imported).resolves.toBeNull()
+        expect(contentUpdateDialog.request).toBeNull()
+        expect(get(nativeFileOperationOutcome)).toMatchObject({ kind: 'import', state: 'cancelled' })
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
     it('processes every selected desktop path through the native character route', async () => {
         mocks.desktopPickerPaths = [
             'C:\\chosen\\card.png',
@@ -483,7 +532,7 @@ describe('character card additions', () => {
 
     it('hands the files of one desktop file association opening to the import intake together', async () => {
         const { consumeOpenedFiles } = await import('./openedFiles')
-        await characterURLImport()
+        registerOpenedFileImports()
 
         await consumeOpenedFiles(['C:\\opened\\card.charx', 'C:\\opened\\preset.risup'])
         await consumeOpenedFiles(['C:\\opened\\backup.risunest'])
@@ -496,6 +545,25 @@ describe('character card additions', () => {
             { origin: 'opened', sources: [{ type: 'path', path: 'C:\\opened\\backup.risunest' }] },
         ])
         expect(mocks.importDesktopNativeCharacterPath).not.toHaveBeenCalled()
+        expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ['onboarding', (on: boolean) => { mocks.database.didFirstSetup = !on }],
+        ['the onboarding hold', (on: boolean) => onboardingHold.set(on)],
+    ])('does not import files opened during %s', async (_label, during) => {
+        const { consumeOpenedFiles } = await import('./openedFiles')
+        registerOpenedFileImports()
+        during(true)
+
+        await consumeOpenedFiles(['C:\\opened\\during.charx'])
+        expect(mocks.submitDelivery).not.toHaveBeenCalled()
+
+        during(false)
+        await consumeOpenedFiles(['C:\\opened\\after.charx'])
+        expect(mocks.submitDelivery.mock.calls.map(([delivery]) => delivery)).toEqual([
+            { origin: 'opened', sources: [{ type: 'path', path: 'C:\\opened\\after.charx' }] },
+        ])
         expect(mocks.alertError).not.toHaveBeenCalled()
     })
 

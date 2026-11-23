@@ -119,6 +119,7 @@ describe('Android bounded JSON compatibility replay', () => {
             name: source.displayName,
             data: new TextEncoder().encode(text),
             quiet: true,
+            signal: expect.any(AbortSignal),
         })
     })
     it('accepts the bytes as a number array', async () => {
@@ -128,6 +129,7 @@ describe('Android bounded JSON compatibility replay', () => {
             name: source.displayName,
             data: new TextEncoder().encode('{"entries":{}}'),
             parsedJson: { value: { entries: {} } },
+            signal: expect.any(AbortSignal),
         })
     })
     it('rejects bytes that are not UTF-8 before any converter executes', async () => {

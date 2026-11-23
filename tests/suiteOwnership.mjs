@@ -146,6 +146,7 @@ export const nodeAppTests = [
   'src/ts/process/request/anthropic.bedrock.test.ts',
   'src/ts/process/request/openAI/requests.responses.test.ts',
   'src/ts/process/request/request.ollama.test.ts',
+  'src/ts/process/request/streamTextDecoding.test.ts',
   'src/ts/process/request/tests/additionalParams.test.ts',
   'src/ts/process/streamingDisplayScheduler.test.ts',
   'src/ts/process/streamingDisplayStream.test.ts',

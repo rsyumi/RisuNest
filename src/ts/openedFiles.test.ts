@@ -182,6 +182,60 @@ describe('opened file delivery', () => {
         }
     })
 
+    it('lets go of desktop files opened while openings are refused, also when that ends before they are taken', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+        try {
+            let pending: string[] = []
+            mocks.invoke.mockImplementation(async () => {
+                const files = pending
+                pending = []
+                return files
+            })
+            const { delivered, deliver } = deliverySpy()
+            let accepting = false
+            registerOpenedFileListeners(deliver, () => accepting)
+            await flush()
+
+            // Opened while onboarding is on screen, which ends before the selection settles.
+            pending.push('C:\\cards\\during.charx')
+            mocks.listeners[0]?.({ payload: {} })
+            accepting = true
+            await vi.advanceTimersByTimeAsync(api.DESKTOP_OPENED_FILES_SETTLE_MS)
+            await flush()
+            expect(pending).toEqual([])
+            expect(delivered).toEqual([])
+
+            // Opened afterwards, so it is imported even when openings are refused by the time it is taken.
+            pending.push('C:\\cards\\after.charx')
+            mocks.listeners[0]?.({ payload: {} })
+            accepting = false
+            await vi.advanceTimersByTimeAsync(api.DESKTOP_OPENED_FILES_SETTLE_MS)
+            await flush()
+            expect(delivered).toEqual([['C:\\cards\\after.charx']])
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('discards an iOS opening that arrived while openings are refused, also when that ends before it is taken', async () => {
+        mocks.ios = true
+        let accepting = false
+        let release: (() => void) | undefined
+        mocks.invoke.mockImplementation(async command => {
+            if (!command.endsWith('take_opened_files')) return undefined
+            await new Promise<void>(resolve => { release = resolve })
+            return { files: [{ path: '/staged/during.charx' }] }
+        })
+        const { delivered, deliver } = deliverySpy()
+        registerOpenedFileListeners(deliver, () => accepting)
+        await vi.waitFor(() => expect(release).toBeDefined())
+        accepting = true
+        release!()
+        await vi.waitFor(() => expect(mocks.invoke.mock.calls.filter(([command]) => command.endsWith('discard_file'))
+            .map(([, args]) => args)).toEqual([{ path: '/staged/during.charx' }]))
+        expect(delivered).toEqual([])
+    })
+
     it('delivers files queued while the desktop subscription is still being established', async () => {
         let subscriptionReady!: (unlisten: () => void) => void
         mocks.listen.mockImplementationOnce(

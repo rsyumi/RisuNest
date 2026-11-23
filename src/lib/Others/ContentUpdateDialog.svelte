@@ -6,7 +6,7 @@
     import { summarizePlan, type UpdateItem, type UpdateSide } from 'src/ts/contentUpdate/merge'
     import {
         editableText, isEditable, lineDiff, loreFolderNames, updateGroupOf, updateGroupOrder, updateItemName,
-        updateSearchText, updateSubgroupOf, updateValueText, type UpdateGroupId,
+        updateSearchText, updateSideValue, updateSubgroupOf, updateValueText, type UpdateGroupId,
     } from 'src/ts/contentUpdate/view'
     import {
         contentUpdateDialog as dialog, backToContentUpdateTargets, chooseContentUpdate, chooseContentUpdateMany,
@@ -158,7 +158,7 @@
         chooseContentUpdateMany(items.map((item) => item.id), side)
     }
 
-    const summaryKeys = ['update', 'mine', 'added', 'removed', 'mineOnly', 'conflict', 'differs'] as const
+    const summaryKeys = ['update', 'mine', 'merged', 'added', 'removed', 'mineOnly', 'conflict', 'differs'] as const
     const segment = 'min-h-8 px-2.5 py-1 text-[13px] whitespace-nowrap text-subtext transition-colors hover:bg-selected hover:text-textcolor'
     const segmentOn = 'bg-selected font-medium text-textcolor'
 </script>
@@ -194,11 +194,14 @@
                 <ChevronRightIcon size={14} class="shrink-0 text-subtext transition-transform {opened[item.id] ? 'rotate-90' : ''}" />
                 {#if !current}<span class="size-2 shrink-0 rounded-full bg-danger-400" title={text.pendingMark}></span>{/if}
                 {#if item.key || item.order}<span class="truncate">{name || text.unnamed}</span>{:else}<span class="font-medium">{fieldLabel(item.field)}</span>{/if}
-                <span class="ml-auto shrink-0 text-xs {item.status === 'conflict' || item.status === 'differs' ? 'text-danger-400' : item.status === 'added' || item.status === 'update' ? 'text-success-400' : 'text-subtext'}">{text.status[item.status]}</span>
+                <span class="ml-auto shrink-0 text-xs {item.status === 'conflict' || item.status === 'differs' ? 'text-danger-400' : item.status === 'added' || item.status === 'update' || item.status === 'merged' ? 'text-success-400' : 'text-subtext'}">{text.status[item.status]}</span>
             </button>
             <span class="inline-flex shrink-0 overflow-hidden rounded-md border border-darkborderc" role="group" aria-label={name || fieldLabel(item.field)}>
                 <button type="button" aria-pressed={current === 'mine'} class="{segment} {current === 'mine' ? segmentOn : ''}" onclick={() => pick(item, 'mine')}>{text.keepMine}</button>
                 <button type="button" aria-pressed={current === 'theirs'} class="{segment} border-l border-darkborderc {current === 'theirs' ? segmentOn : ''}" onclick={() => pick(item, 'theirs')}>{text.takeTheirs}</button>
+                {#if item.status === 'merged'}
+                    <button type="button" aria-pressed={current === 'both'} class="{segment} border-l border-darkborderc {current === 'both' ? segmentOn : ''}" onclick={() => pick(item, 'both')}>{text.takeBoth}</button>
+                {/if}
                 {#if editable}
                     <button type="button" aria-pressed={current === 'edit'} class="{segment} border-l border-darkborderc {current === 'edit' ? segmentOn : ''}" onclick={() => pick(item, 'edit')}>{text.editOwn}</button>
                 {/if}
@@ -206,7 +209,7 @@
         </div>
         {#if opened[item.id]}
             <div class="mt-1 mb-2 ml-5 flex flex-col gap-1.5">
-                {#if item.baseKnown && item.theirs !== undefined}
+                {#if item.baseKnown}
                     <h4 class="text-xs font-semibold text-subtext">{text.authorChange}</h4>
                     {#if updateValueText(item.base) === updateValueText(item.theirs)}
                         <p class="text-sm text-subtext">{text.authorUnchanged}</p>
@@ -215,7 +218,11 @@
                     {/if}
                 {/if}
                 <h4 class="text-xs font-semibold text-subtext">{text.mineVsTheirs}</h4>
-                {@render diffView(updateValueText(item.mine), updateValueText(item.theirs), text.mineSide, text.theirsSide)}
+                {@render diffView(updateValueText(updateSideValue(item, 'mine')), updateValueText(updateSideValue(item, 'theirs')), text.mineSide, text.theirsSide)}
+                {#if item.status === 'merged' && item.resolved}
+                    <h4 class="text-xs font-semibold text-subtext">{text.takeBoth}</h4>
+                    {@render diffView(updateValueText(item.mine), updateValueText(item.resolved.mine), text.mineSide, text.takeBoth)}
+                {/if}
                 {#if current === 'edit'}
                     <div class="flex flex-col gap-1">
                         <div class="flex flex-wrap items-center justify-between gap-2">

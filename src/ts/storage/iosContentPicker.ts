@@ -61,13 +61,13 @@ async function importPickedContent(
         }
         if (destination === 'module') {
             const { importModuleData } = await import('../process/modules')
-            const location = await importModuleData({ name: picked.name, data })
+            const location = await importModuleData({ name: picked.name, data, signal: context.signal })
             if (!location) return null
             context.setLocation(location)
             return 'module'
         }
         const { importCharacterProcess } = await import('../characterCards')
-        const index = await importCharacterProcess({ name: picked.name, data, quiet: true })
+        const index = await importCharacterProcess({ name: picked.name, data, quiet: true, signal: context.signal })
         const { getDatabase } = await import('./database.svelte')
         const chaId = typeof index === 'number'
             ? getDatabase().characters[index]?.chaId ?? null

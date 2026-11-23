@@ -16,15 +16,18 @@ const mocks = vi.hoisted(() => ({
     duringNormalize: null as (() => void) | null,
     /** Awaited before the installed character is read for a comparison. */
     beforeRead: null as (() => Promise<void>) | null,
+    /** Awaited while an asset, such as the base of an import, is saved. */
+    duringSave: null as (() => Promise<void>) | null,
 }))
-const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web' }))
-vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: 'windows' })))
-const core = vi.hoisted(() => ({ invoke: vi.fn(async (_command: string, _args?: unknown) => ({ revision: 2 })) }))
+const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web', os: 'windows' as 'windows' | 'android' }))
+vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: platform.os })))
+const core = vi.hoisted(() => ({ invoke: vi.fn(async (_command: string, _args?: unknown): Promise<unknown> => ({ revision: 2 })) }))
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOriginal<typeof import('@tauri-apps/api/core')>(), invoke: core.invoke }))
 
 vi.mock('../globalApi.svelte', () => ({
     loadAsset: async (key: string) => mocks.assets.get(key) ?? null,
     saveAsset: async (data: Uint8Array) => {
+        await mocks.duringSave?.()
         const key = `assets/base-${mocks.assets.size + 1}.json`
         mocks.assets.set(key, data)
         return key
@@ -50,7 +53,10 @@ vi.mock('../characters', () => ({
     },
 }))
 vi.mock('../process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
-vi.mock('../util', () => ({ selectSingleFile: vi.fn() }))
+vi.mock('../util', () => ({ selectSingleFile: vi.fn(), fileAccept: () => '*' }))
+// The pickers the apps use for an earlier file, which the native reader then reads by path.
+vi.mock('../storage/fileSelection', () => ({ open: vi.fn() }))
+vi.mock('../storage/nativeFileSelection', () => ({ withNativeSelectedPath: vi.fn() }))
 // The earlier-file reader's lorebook converter, without the app state its module loads.
 vi.mock('../characterCards', () => ({ convertCharbook: vi.fn() }))
 vi.mock('../storage/database.svelte', () => ({ defaultSdDataFunc: () => [] }))
@@ -99,6 +105,8 @@ import {
     setContentUpdateChoice,
 } from './flow.svelte'
 import { selectSingleFile } from '../util'
+import { open } from '../storage/fileSelection'
+import { withNativeSelectedPath } from '../storage/nativeFileSelection'
 import { registerGeneratingConversation } from '../storage/generatingConversationRegistry'
 import type { RisuModule } from '../process/modules'
 
@@ -156,11 +164,13 @@ beforeEach(() => {
     mocks.duringBackup = null
     mocks.duringNormalize = null
     mocks.beforeRead = null
+    mocks.duringSave = null
     mocks.alertError.mockClear()
     mocks.alertConfirm.mockReset().mockResolvedValue(true)
     alertStore.set({ type: 'none', msg: '' })
     alertStore.clearStatus()
     platform.runtime = 'web'
+    platform.os = 'windows'
     core.invoke.mockClear()
     commitCharacter.mockClear()
     commitModule.mockClear()
@@ -260,6 +270,21 @@ describe('character update', () => {
         expect(contentUpdateDialog.request).toBeNull()
         expect(commitCharacter).not.toHaveBeenCalled()
         expect(commitModule).not.toHaveBeenCalled()
+    })
+
+    it.each(['character', 'module'] as const)('stores nothing when the import operation ends while the base is saved, and hands that base to the cleanup (%s)', async (kind) => {
+        platform.runtime = 'tauri'
+        const operation = new AbortController()
+        const expired = new Error('background time ended')
+        mocks.duringSave = async () => operation.abort(expired)
+        const stored = kind === 'character'
+            ? commitImportedCharacter(card('new', 'Luna'), commitCharacter, operation.signal)
+            : commitImportedModule({ id: 'new-module', name: 'Lore', description: '', lorebook: [] } as RisuModule, commitModule, operation.signal)
+        await expect(stored).rejects.toBe(expired)
+        expect(commitCharacter).not.toHaveBeenCalled()
+        expect(commitModule).not.toHaveBeenCalled()
+        expect(mocks.assets.size).toBe(1)
+        expect(await releasedKeys()).toEqual([...mocks.assets.keys()])
     })
 
     it.each(['character', 'module'] as const)('hands the base it saved to the cleanup when the import cannot be stored (%s)', async (kind) => {
@@ -371,6 +396,87 @@ describe('character update', () => {
         expect(await pending).toBe('old')
         // The order picked before the file was read still holds.
         expect(mocks.details.get('old').additionalAssets.map((entry: string[]) => entry[0])).toEqual(['b', 'map', 'a'])
+    })
+
+    it('asks again about an entry another earlier file turns from merged into a conflict', async () => {
+        const bold = (fields: Record<string, unknown>) => ({ comment: 'bold', type: 'editdisplay', in: '**', out: '<b>', ...fields })
+        install(card('old', 'Luna', { customscript: [bold({ out: '<strong>' })] }))
+        const pending = commitImportedCharacter(card('next', 'Luna', { customscript: [bold({ in: '**(.+?)**' })] }), commitCharacter)
+        await opened()
+        await reviewContentUpdate()
+        const earlier = (script: object) => ({ name: 'Luna.json', data: new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v2', data: { name: 'Luna', extensions: { risuai: { customScripts: [script] } } } })) })
+        vi.mocked(selectSingleFile).mockResolvedValueOnce(earlier(bold({})))
+        await loadContentUpdateBaseFile()
+        const [item] = contentUpdateDialog.plan!.items
+        expect(item).toMatchObject({ status: 'merged', choice: 'both' })
+        setContentUpdateChoice(item.id, 'mine')
+        setContentUpdateChoice(item.id, 'both')
+        // In an earlier version the pattern was another one, which both sides changed.
+        vi.mocked(selectSingleFile).mockResolvedValueOnce(earlier(bold({ in: '__' })))
+        await loadContentUpdateBaseFile()
+        expect(contentUpdateDialog.plan!.items).toMatchObject([{ id: item.id, status: 'conflict', choice: null }])
+        expect(contentUpdateDialog.choices[item.id]).toBeUndefined()
+        setContentUpdateChoice(item.id, 'both')
+        expect(contentUpdateDialog.choices[item.id]).toBeUndefined()
+        setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        expect(await pending).toBe('old')
+        expect(mocks.details.get('old').customscript).toEqual([bold({ in: '**(.+?)**', out: '<strong>' })])
+    })
+
+    it.each([
+        ['desktop', 'windows', 'C:\\Cards\\Luna.charx'],
+        // The picked copy goes by the picker's name for it, which keeps the extension the reader is chosen by.
+        ['Android', 'android', '/data/cache/selected_documents/1/source'],
+    ] as const)('reads an earlier file on the %s app natively by its path', async (_label, os, path) => {
+        platform.runtime = 'tauri'
+        platform.os = os
+        install(card('old', 'Luna', { desc: 'mine' }))
+        const pending = commitImportedCharacter(card('next', 'Luna', { desc: 'new' }), commitCharacter)
+        await opened()
+        await reviewContentUpdate()
+        expect(contentUpdateDialog.plan!.items).toMatchObject([{ field: 'desc', status: 'differs' }])
+        const webPicks = vi.mocked(selectSingleFile).mock.calls.length
+        if (os === 'windows') vi.mocked(open).mockResolvedValueOnce(path)
+        else vi.mocked(withNativeSelectedPath).mockImplementationOnce(async (_options, consume) => consume({ path, name: 'Luna.charx', bytes: 1, mimeType: '' }))
+        const earlier = new TextEncoder().encode(JSON.stringify({ spec: 'chara_card_v3', data: { name: 'Luna', description: 'mine', extensions: {} } }))
+        const reply = new Uint8Array(5 + earlier.length)
+        reply[0] = 2
+        new DataView(reply.buffer).setUint32(1, earlier.length, true)
+        reply.set(earlier, 5)
+        core.invoke.mockImplementation(async (command) => command === 'native_content_update_base_read' ? reply.buffer : { revision: 2 })
+        try {
+            await loadContentUpdateBaseFile()
+        } finally {
+            core.invoke.mockImplementation(async () => ({ revision: 2 }))
+        }
+        expect(core.invoke).toHaveBeenCalledWith('native_content_update_base_read', { path, format: 'charx' })
+        expect(vi.mocked(selectSingleFile).mock.calls.length).toBe(webPicks)
+        expect([contentUpdateDialog.error, contentUpdateDialog.busy, contentUpdateDialog.baseSource]).toEqual(['', false, { kind: 'file', name: 'Luna.charx' }])
+        expect(contentUpdateDialog.plan!.items).toMatchObject([{ field: 'desc', status: 'update', choice: 'theirs' }])
+        chooseContentUpdate('cancel')
+        expect(await pending).toBeNull()
+    })
+
+    it('stores nothing and hands the assets of the import to the cleanup when the operation ends while low-level access is asked', async () => {
+        await commitImportedCharacter(card('first', 'Luna v1.0', { lowLevelAccess: false, triggerscript: [] }), commitCharacter)
+        mocks.details.get('first').lowLevelAccess = true
+        platform.runtime = 'tauri'
+        const operation = new AbortController()
+        const expired = new Error('background time ended')
+        mocks.alertConfirm.mockImplementationOnce(async () => {
+            operation.abort(expired)
+            return true
+        })
+        const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
+        const pending = commitImportedCharacter(card('next', 'Luna v1.1', { image: 'assets/next.png', triggerscript: [trigger] }), commitCharacter, operation.signal)
+        await opened()
+        await reviewContentUpdate()
+        for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        await expect(pending).rejects.toBe(expired)
+        expect(mocks.details.has('next')).toBe(false)
+        expect(await releasedKeys()).toContain('assets/next.png')
     })
 
     it('asks before low-level access the user turned on covers triggers the update takes', async () => {
@@ -521,6 +627,27 @@ describe('module update', () => {
         expect(mocks.alertConfirm).toHaveBeenCalledOnce()
         expect(mocks.db.modules).toHaveLength(1)
         expect(mocks.db.modules[0]).toMatchObject({ lowLevelAccess: true, trigger: [] })
+    })
+
+    it('stores nothing and hands the assets of the import to the cleanup when the operation ends while low-level access is asked', async () => {
+        await commitImportedModule(imported('file-3', { name: 'Lua Pack', trigger: [] }), commitModule)
+        mocks.db.modules[0].lowLevelAccess = true
+        platform.runtime = 'tauri'
+        const operation = new AbortController()
+        const expired = new Error('background time ended')
+        mocks.alertConfirm.mockImplementationOnce(async () => {
+            operation.abort(expired)
+            return true
+        })
+        const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
+        const pending = commitImportedModule(imported('file-3', { name: 'Lua Pack', trigger: [trigger], assets: [['icon', 'assets/next.png', 'png']] } as Partial<RisuModule>), commitModule, operation.signal)
+        await opened()
+        await reviewContentUpdate()
+        for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        await expect(pending).rejects.toBe(expired)
+        expect(mocks.db.modules).toHaveLength(1)
+        expect(await releasedKeys()).toContain('assets/next.png')
     })
 
     it('installs the import as new when the installed module was removed before the update', async () => {
