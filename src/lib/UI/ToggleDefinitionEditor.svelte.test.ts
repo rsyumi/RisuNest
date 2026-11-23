@@ -347,11 +347,30 @@ describe('toggle definition editor', () => {
         const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
         expect(buttons(language.risuNest.textEditor.open, dialog)).toEqual([])
         expect(views(dialog)).toEqual([language.hotkeyDesc.edit, language.preview, language.risuNest.toggleEditor.raw])
+        // The window's title names the editor once; the editor inside leaves out its own label.
+        expect(dialog.textContent!.split(language.customPromptTemplateToggle).length - 1).toBe(1)
         await type(names(dialog)[1], 'Bee')
         expect(props.onChange).toHaveBeenLastCalledWith('a=A\nb=Bee')
         props.value = 'a=A\nb=Bee'
         await tick()
-        await show(language.close, dialog)
+
+        // Escape closes an open add menu first, then the window.
+        const escape = async () => {
+            names(dialog)[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+            await tick()
+        }
+        all<HTMLButtonElement>('button[aria-haspopup="menu"]', dialog)[0].click()
+        await tick()
+        expect(all('[role="menu"]', dialog)).toHaveLength(1)
+        await escape()
+        expect(all('[role="menu"]', dialog)).toEqual([])
+        expect(dialog.isConnected).toBe(true)
+        await escape()
+        expect(document.querySelector('[role="dialog"]')).toBeNull()
+
+        buttons(language.risuNest.textEditor.open)[0].click()
+        await tick()
+        await show(language.close, document.querySelector<HTMLElement>('[role="dialog"]')!)
         expect(document.querySelector('[role="dialog"]')).toBeNull()
         expect(names().map((input) => input.value)).toEqual(['A', 'Bee'])
     })
