@@ -168,6 +168,7 @@ describe('Plugin v3 network access', () => {
                     `https://nested.api.${domain}:8443/`,
                     `https://${domain.toUpperCase()}/`,
                     `https://${domain}./`,
+                    `https://${domain}../`,
                     `https://api.${domain.toUpperCase()}.:8443/`,
                     `https://allowed.example.invalid@${domain}/`,
                     `https://${domain.replace('i', '%69')}/`,

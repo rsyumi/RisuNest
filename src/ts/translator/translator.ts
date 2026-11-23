@@ -569,7 +569,7 @@ export async function translateHTML(
             }
 
             // Replace the old node with the new one
-            const newNode = document.createElement(
+            const newNode = dom.createElement(
                 node.nodeType === Node.TEXT_NODE ? "span" : node.nodeName
             );
             newNode.innerHTML = processedTranslated;

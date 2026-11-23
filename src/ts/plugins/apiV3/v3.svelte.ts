@@ -745,10 +745,10 @@ const getPluginPermission = async (context: PluginPermissionContext, permissionD
 const urlBlacklist = ['risuai.xyz', 'risuai.net', 'sionyw.com']
 
 function assertPluginRequestUrlAllowed(url: string): void {
-    // A trailing DNS root dot does not change the destination domain.
+    // Trailing DNS root dots do not change the destination domain.
     const hostname = new URL(url, document.baseURI).hostname
         .toLowerCase()
-        .replace(/\.$/, '')
+        .replace(/\.+$/, '')
     const blocked = urlBlacklist.find(
         (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
     )
