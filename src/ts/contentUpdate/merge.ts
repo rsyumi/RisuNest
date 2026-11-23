@@ -218,6 +218,8 @@ export interface UpdateItem {
      * it is stored then.
      */
     resolved?: { mine: Record<string, unknown>, theirs: Record<string, unknown>, authored: string[], overlap: string[] }
+    /** An entry only the author changed, compared field by field: the fields new writes onto the entry as it is stored then. */
+    authored?: string[]
 }
 
 export interface UpdatePlan {
@@ -342,13 +344,18 @@ export function planUpdate<T extends object>(spec: UpdateSpec, mine: T, theirs: 
             let verdict = decide(known, canon(spec, field, values.b), canon(spec, field, values.m), canon(spec, field, values.t), present)
             if (!verdict || spec.silent.has(field)) return
             let resolved: UpdateItem['resolved']
-            if (verdict.status === 'conflict' && key && spec.fieldMerged.has(field) && present.base && present.mine && present.theirs) {
-                resolved = mergeFields(spec.lore.has(field), values.b, values.m, values.t) ?? undefined
-                if (resolved && !resolved.overlap.length) verdict = { status: 'merged', choice: 'both' }
+            let authored: string[] | undefined
+            if (key && spec.fieldMerged.has(field) && present.base && present.mine && present.theirs) {
+                if (verdict.status === 'conflict') {
+                    resolved = mergeFields(spec.lore.has(field), values.b, values.m, values.t) ?? undefined
+                    if (resolved && !resolved.overlap.length) verdict = { status: 'merged', choice: 'both' }
+                } else if (verdict.status === 'update') {
+                    authored = mergeFields(spec.lore.has(field), values.b, values.m, values.t)?.authored
+                }
             }
             items.push({
                 id: key ? `${field}\u0000${key}` : field, field, key, mine: values.m, theirs: values.t, base: values.b,
-                baseKnown: known && present.base, ...verdict, ...(resolved ? { resolved } : {}),
+                baseKnown: known && present.base, ...verdict, ...(resolved ? { resolved } : {}), ...(authored ? { authored } : {}),
             })
         }
         const m = (mine as any)[field]
@@ -457,12 +464,13 @@ function patchEntry(patch: EntryPatch, own: unknown, other: unknown): unknown {
 
 /**
  * What a choice writes. On an entry merged field by field 둘 다 반영 and, on a conflict, a side take the
- * author's fields onto the stored entry, while a side of a merged item is that whole entry. A written field
- * goes into what 내 버전 writes.
+ * author's fields onto the stored entry, while a side of a merged item is that whole entry. New on an entry
+ * only the author changed takes the fields the author changed. A written field goes into what 내 버전 writes.
  */
 function resolvedChoice(item: UpdateItem, side: UpdateChoice): AppliedChoice {
     const authored = item.resolved?.authored ?? []
     if (typeof side === 'object') return 'edited' in side ? { taken: authored, set: side.edited, restore: true } : side
+    if (side === 'theirs' && item.authored) return { taken: item.authored, restore: true }
     if (side === 'both') {
         if (!item.resolved || item.status !== 'merged') throw new Error(`Update item ${item.id} has no merged entry`)
         return { taken: authored, restore: false }

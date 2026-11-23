@@ -241,6 +241,19 @@ describe('applyUpdate', () => {
         expect(apply({ [town.id]: 'mine' }, removed)).toMatchObject({ globalLore: [], customscript: [] })
         expect(apply({ [town.id]: 'theirs' }, removed).globalLore).toEqual(theirs.globalLore)
         expect(apply({ [town.id]: { edited: { content: 'written' } } }, removed).globalLore).toEqual([{ ...theirs.globalLore[0], content: 'written' }])
+
+        // An entry only the author changed takes the fields the author changed, so what changed since stays as well.
+        const authorBase = { name: 'Luna', globalLore: [lore('Inn', 'inn')], customscript: [rx()] }
+        const authorNew = { ...authorBase, globalLore: [{ ...lore('Inn', 'inn'), insertorder: 300 }], customscript: [rx({ out: '<em>' })] }
+        const installed = { ...authorBase, globalLore: [lore('Inn', 'inn', 'id-i')] }
+        const authorPlan = planUpdate(CHARACTER_UPDATE, installed as any, authorNew as any, authorBase as any)
+        expect(authorPlan.items.map((item) => item.status)).toEqual(['update', 'update'])
+        const applyAuthor = (from: object) => applyUpdate(CHARACTER_UPDATE, from as any, authorNew as any, authorPlan) as any
+        const since = applyAuthor({ ...authorBase, globalLore: [lore('Inn', '여관', 'id-i')], customscript: [rx({ flag: 'g' })] })
+        expect(since.globalLore).toEqual([{ ...lore('Inn', '여관', 'id-i'), insertorder: 300 }])
+        expect(since.customscript).toEqual([rx({ out: '<em>', flag: 'g' })])
+        expect(applyAuthor(installed)).toMatchObject({ globalLore: [{ ...authorNew.globalLore[0], id: 'id-i' }], customscript: authorNew.customscript })
+        expect(applyAuthor({ ...authorBase, globalLore: [], customscript: [] })).toMatchObject({ globalLore: authorNew.globalLore, customscript: authorNew.customscript })
     })
 
     it('tells apart assets that share a name from one named like a second copy', () => {
