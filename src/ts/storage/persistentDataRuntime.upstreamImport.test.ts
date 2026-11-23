@@ -297,6 +297,9 @@ describe('direct native upstream import publication',()=>{
     ] as const)('retains read-only activation and resumes only after strict recovery: %s, account=%s',async(failure,account)=>{
         const h=await createHarness({pin:async()=>({publish:async()=>{},dispose:async()=>{}})})
         const incoming={...makeDatabase(),username:'Imported after recovery',globalChatVariables:{shared:'1'}}
+        if(account) incoming.characters.push(...[
+            {type:'group',chaId:'group-a',name:'Group',chats:[]},{type:'character',chaId:'§temp',name:'Room',chats:[]},
+        ] as unknown as Database['characters'])
         if(failure==='refresh') h.replaceDatabase.mockImplementationOnce(()=>{throw new Error('refresh failed')})
         else vi.mocked(h.store.replaceFromDatabase).mockImplementationOnce(async database=>{
             h.nativeCommit(database)
@@ -307,8 +310,13 @@ describe('direct native upstream import publication',()=>{
             : h.runtime.replacePersistentDatabase(incoming,'upstream-import',{upstreamImport:true,publishOfficial:true})
         if(account) await expect(operation).rejects.toMatchObject({code:'activation-outcome-unresolved',recoveryRequired:true})
         else await expect(operation).rejects.toThrow()
-        // The account restore hands over a candidate prepared as an upstream import.
-        if(account) expect(vi.mocked(h.store.replaceFromDatabase).mock.calls[0][0]).toMatchObject({explicitGlobalChatVariables:{shared:'1'}})
+        // The account restore hands over a candidate prepared as an upstream import, without
+        // the group and temporary characters a file import leaves out.
+        if(account){
+            const handed=vi.mocked(h.store.replaceFromDatabase).mock.calls[0][0]
+            expect(handed).toMatchObject({explicitGlobalChatVariables:{shared:'1'}})
+            expect(handed.characters.map(character=>character.chaId)).toEqual(['char-a'])
+        }
         expect(()=>h.runtime.markPersistentDataDirty(1)).toThrow()
         expect(binding.resume).not.toHaveBeenCalled()
         await expect(retryCommittedWorkingSetRefreshWithContinuation(h.runtime)).resolves.toEqual({kind:'committed',revision:2,projection:'applied'})

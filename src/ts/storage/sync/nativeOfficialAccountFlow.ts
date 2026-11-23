@@ -4,6 +4,7 @@ import type { DataRevision } from '../persistentDataStore'
 import type { PersistentDataRuntime } from '../persistentDataRuntime'
 import type { PinnedPublication } from '../saveCoordinator'
 import { NativeFileJobActivationCommittedError, NativeFileJobActivationUnresolvedError, NativeFileJobError, syntheticNativeFileJobStatus, type NativeFileJobStatus, type NativeFileRestoreJobOptions } from '../nativeFileJobs'
+import { prepareExternalDatabaseImport } from '../upstreamImport'
 import type { OfficialAccountAssetOptions, OfficialAccountAssetOutcome } from './officialAccountAssetOutcome'
 import type { OfficialPublicationOptions } from './officialAccountSnapshot'
 import type { OfficialPullResult } from './officialAccountSnapshot'
@@ -31,7 +32,7 @@ export async function restoreNativeOfficialAccountCandidate(
 ): Promise<{ revision: DataRevision }> {
     try {
         const { prepareUpstreamImport } = await import('../importedIdentity')
-        const outcome = await runtime.replacePersistentDatabase(prepareUpstreamImport(candidate), 'native-official-compatibility-restore', {
+        const outcome = await runtime.replacePersistentDatabase(prepareUpstreamImport(prepareExternalDatabaseImport(candidate)), 'native-official-compatibility-restore', {
             upstreamImport: true,
             upstreamImportWarnings: warnings,
             expectedRevision,
