@@ -123,7 +123,8 @@
     }
   })
 
-  type SearchRecord = { key: string, all: boolean, changes: PromptFieldChange[], count: number }
+  // `listing` is set by replacing every match, until the query or an option changes.
+  type SearchRecord = { key: string, listing: boolean, changes: PromptFieldChange[], count: number }
   let searchOpen = $state(false)
   let searchQuery = $state('')
   let appliedQuery = $state('')
@@ -163,7 +164,13 @@
     }
     return { matches, blocks }
   })
-  const changesView = $derived(searchResults && searchRecord?.all && searchRecord.key === searchKey ? searchRecord : null)
+  const changesView = $derived(searchResults && searchRecord?.listing && searchRecord.key === searchKey ? searchRecord : null)
+  $effect(() => {
+    const key = searchKey
+    untrack(() => {
+      if (searchRecord?.listing && searchRecord.key !== key) searchRecord = { ...searchRecord, listing: false }
+    })
+  })
   const searchShown = $derived.by(() => {
     if (!searchResults) return null
     const template = DBState.db.promptTemplate
@@ -233,7 +240,7 @@
 
   function recordSearchReplace(changes: PromptFieldChange[], all: boolean) {
     writeSearchFields(changes.map(change => ({ block: change.block, field: change.field, value: change.after })))
-    searchRecord = { key: searchKey, all, changes, count: changes.reduce((sum, change) => sum + change.written.length, 0) }
+    searchRecord = { key: searchKey, listing: all, changes, count: changes.reduce((sum, change) => sum + change.written.length, 0) }
   }
 
   function replaceAllSearchMatches() {

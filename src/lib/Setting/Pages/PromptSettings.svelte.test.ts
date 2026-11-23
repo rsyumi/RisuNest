@@ -345,6 +345,16 @@ describe('prompt search', () => {
         expect(marks('Intro')).toEqual(['{{persona}}', '{{persona}}'])
         expect(lineTexts('{{persona}} rules')).toEqual([[language.name, '{{persona}} rules']])
 
+        // A changed query ends that list for good, so the query typed again lists only what it matches.
+        await type(searchInput(), 'Lore')
+        await vi.waitFor(() => expect(listed()).toEqual(['Lore']))
+        await type(searchInput(), '{{USER}}')
+        await vi.waitFor(() => expect(bar()!.textContent)
+            .toContain(`${text.matchCount.replace('{0}', '0')} · ${language.risuNest.promptList.count.replace('{0}', '0')}`))
+        expect(listed()).toEqual([])
+        expect(document.body.textContent).toContain(text.noMatch)
+        expect(bar()!.textContent).toContain(text.replaced.replace('{0}', '4'))
+
         barButton(text.undo).click()
         await tick()
         expect(DBState.db.promptTemplate.map(item => [item.name, (item as { text?: string }).text])).toEqual([
