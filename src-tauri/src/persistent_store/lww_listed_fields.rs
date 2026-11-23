@@ -82,7 +82,7 @@ fn lacks_field(tx: &Transaction<'_>, generation: &str, key: &UnitKey) -> StoreRe
 
 /// Whether a large unit's body is stored. A build that did not share a field kept no body for
 /// its large units, so such a unit waits for a later receive.
-fn body_stored(tx: &Transaction<'_>, value: &UnitValue) -> StoreResult<bool> {
+pub(in crate::persistent_store) fn body_stored(tx: &Transaction<'_>, value: &UnitValue) -> StoreResult<bool> {
     let UnitValue::Object { descriptor, .. } = value else { return Ok(true) };
     Ok(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM message_page_objects WHERE hash=?1)",

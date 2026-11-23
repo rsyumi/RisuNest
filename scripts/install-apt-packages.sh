@@ -25,8 +25,10 @@ for attempt in 1 2 3; do
     exit "$status"
   fi
   mirror=$(grep -m 1 -v -E '^[[:space:]]*(#|$)' "$mirrors" 2>/dev/null || true)
+  # An indented line names a mirror too.
+  mirror=${mirror#"${mirror%%[![:space:]]*}"}
   if [ -n "$mirror" ] && [ "$(grep -c -v -E '^[[:space:]]*(#|$)' "$mirrors")" -gt 1 ]; then
-    sudo sed -i "0,/^[^#[:space:]]/{//d}" "$mirrors"
+    sudo sed -i "0,/^[[:space:]]*[^#[:space:]]/{//d}" "$mirrors"
     echo "APT attempt $attempt failed (exit $status); retrying without ${mirror%%[[:space:]]*}." >&2
   else
     echo "APT attempt $attempt failed (exit $status); retrying." >&2

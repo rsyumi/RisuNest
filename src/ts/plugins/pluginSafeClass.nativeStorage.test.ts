@@ -163,6 +163,44 @@ describe('native JSON plugin values', () => {
         expect(received).toEqual([])
     })
 
+    it('stages large values written at once within the native session limits, leaving room for sessions a reloaded page left open', async () => {
+        const sessions = new Map<string, { owner: string; key: string; parts: string[] }>()
+        const saved = new Map<string, string>()
+        // A reloaded page left one session of this plugin and three of others open until they expire.
+        sessions.set('left-owner', { owner: 'owner', key: 'old', parts: [] })
+        for (let index = 0; index < 3; index++) sessions.set(`left-${index}`, { owner: `left-${index}`, key: 'old', parts: [] })
+        native.invoke.mockImplementation(async (command, args) => {
+            if (command === 'pds_open_plugin_device_write') {
+                // The native side refuses a session past two per plugin or eight in all.
+                const owned = [...sessions.values()].filter(session => session.owner === args.owner).length
+                if (owned >= 2 || sessions.size >= 8) throw new Error('plugin device write sessions are full')
+                const sessionId = `session-${sessions.size}-${Math.random()}`
+                sessions.set(sessionId, { owner: args.owner, key: args.key, parts: [] })
+                return { sessionId }
+            }
+            if (command === 'pds_append_plugin_device_write') {
+                sessions.get(args.sessionId)!.parts.push(args.part)
+                return args.offset + new TextEncoder().encode(args.part).length
+            }
+            if (command === 'pds_write_plugin_device_values') {
+                for (const mutation of args.mutations) {
+                    const session = sessions.get(mutation.sessionId)!
+                    sessions.delete(mutation.sessionId)
+                    saved.set(`${session.owner}/${session.key}`, session.parts.join(''))
+                }
+                return
+            }
+            if (command === 'pds_abort_plugin_device_write') { sessions.delete(args.sessionId); return }
+            throw new Error(`Unexpected native command ${command}`)
+        })
+        const value = (name: string) => name + 'x'.repeat(PLUGIN_DEVICE_PART_BYTES)
+        const writes = [['owner', 'a'], ['owner', 'b'], ['p1', 'v'], ['p2', 'v'], ['p3', 'v'], ['p4', 'v']]
+        await Promise.all(writes.map(([owner, key]) => writeNativePluginDeviceValues(owner, [{ type: 'set', space: 'string', key, value: value(`${owner}/${key}`) }])))
+        expect([...saved.keys()].sort()).toEqual(writes.map(([owner, key]) => `${owner}/${key}`).sort())
+        for (const [name, stored] of saved) expect(stored === value(name)).toBe(true)
+        expect(sessions.size).toBe(4)
+    })
+
     it('preserves ordinary JSON and rejects unsupported values before the native boundary', async () => {
         const storage = new SafeLocalPluginStorage('native-json')
         for (const value of [{ nested: true }, [1, null], null, 42, 'text']) {

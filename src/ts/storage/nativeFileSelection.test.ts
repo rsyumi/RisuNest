@@ -9,7 +9,7 @@ vi.mock('../platform', async () => (await import('../platform.testSupport')).pla
 vi.mock('@tauri-apps/api/core', async original => ({ ...(await original<typeof import('@tauri-apps/api/core')>()), invoke: mocks.invoke }))
 vi.mock('@tauri-apps/plugin-fs', async () => (await import('./tauriFs.testSupport')).pluginFsModule({ open: mocks.open }))
 import { language } from 'src/lang'
-import { selectNativeFileData, selectNativeFiles, withNativeSelectedFile, type NativeSelectedFile } from './nativeFileSelection'
+import { selectNativeFileData, selectNativeFiles, withNativeSelectedFile, withNativeSelectedPath, type NativeSelectedFile } from './nativeFileSelection'
 import { selectDomFiles } from './fileSelection'
 import { isLibraryFileOperationReserved } from './libraryFileOperation'
 import { readableFile } from './tauriFs.testSupport'
@@ -242,6 +242,18 @@ describe('native mobile file selection', () => {
         expect(mocks.discard).toHaveBeenCalledOnce()
         expect(mocks.invoke).toHaveBeenCalledWith('native_log_error', { message: expect.stringContaining('cleanup denied') })
         expect(isLibraryFileOperationReserved()).toBe(false)
+    })
+
+    it('keeps the picked copy while a native reader given its path runs, then removes it', async () => {
+        expect(await withNativeSelectedPath({}, async file => {
+            expect(mocks.discard).not.toHaveBeenCalled()
+            return file.path
+        })).toBe('/owned/selection/source')
+        expect(mocks.discard).toHaveBeenCalledWith('/owned/selection/source')
+        await expect(withNativeSelectedPath({}, async () => { throw new Error('unreadable') })).rejects.toThrow('unreadable')
+        expect(mocks.discard).toHaveBeenCalledTimes(2)
+        // The page reads none of the file itself.
+        expect(mocks.open).not.toHaveBeenCalled()
     })
 
     it('returns cancellation without attempting a read', async () => {

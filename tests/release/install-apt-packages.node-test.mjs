@@ -61,6 +61,11 @@ test("a stalled download drops its mirror, retries, and installs from the downlo
   ]);
   assert.match(result.stderr, /retrying without http:\/\/azure\.archive\.ubuntu\.com\/ubuntu\//);
   assert.equal(result.mirrors, runnerMirrors.replace(/^http:\/\/azure.*\n/m, ""));
+  // An indented mirror is the one dropped and named.
+  const indented = run('[ "$action" != download ] || [ "$seen" -ge 2 ] || return 124', runnerMirrors.replace("http://azure", "  http://azure"));
+  assert.equal(indented.status, 0, indented.stderr);
+  assert.match(indented.stderr, /retrying without http:\/\/azure\.archive\.ubuntu\.com\/ubuntu\/\./);
+  assert.equal(indented.mirrors, runnerMirrors.replace(/^http:\/\/azure.*\n/m, ""));
 
   const unlisted = run('[ "$action" != update ] || [ "$seen" -ge 2 ] || return 100', null);
   assert.equal(unlisted.status, 0, unlisted.stderr);

@@ -25,9 +25,11 @@
         noContainer?: boolean
         /** The preset whose toggles show; the applied preset unless the settings window's preview passes the one it edits. */
         presetDatabase?: Database
+        /** The full-screen text editor's preview: no model, persona or preset controls, and of the toggle binding only its save. */
+        editorPreview?: boolean
     }
 
-    let { chara = $bindable(), noContainer, presetDatabase }: Props = $props();
+    let { chara = $bindable(), noContainer, presetDatabase, editorPreview = false }: Props = $props();
     let presetFields = $derived(presetDatabase ?? DBState.db)
 
     const jailbreakToggleToken = '{{jbtoggled}}'
@@ -160,6 +162,10 @@
         (toggleEditor.unpinKeys.includes(`toggle_${key}`)
             || toggleValueChanged(toggleEditor.values[`toggle_${key}`], savedToggles[`toggle_${key}`]))
 
+    // The editor preview keeps the pinned settings, and the toggle binding's save that a bound chat needs to apply edits.
+    let customItemsShown = $derived(!!DBState.db.customSidebarItems?.some((item) => !editorPreview || item.type === 'setting'))
+    let toggleBindShown = $derived(!editorPreview || savedToggles !== undefined)
+
     // Switch rows sit in the same list as the select/text rows below, which set their own spacing.
     const switchRow = 'mt-2 px-1'
 
@@ -195,13 +201,19 @@
     />
 {/snippet}
 
-<div class="flex flex-col gap-4 w-full mt-3">
-    {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
-    {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
-    <PresetBind />
-    {#if DBState.db.customSidebarItems?.length}<CustomSideBar />{/if}
-    <ToggleBind values={toggleEditor.values} unpinKeys={toggleEditor.unpinKeys} onApplyPreset={applyTogglePreset} bind:saving={savingToggles} />
-</div>
+{#if customItemsShown || toggleBindShown}
+    <div class="flex flex-col gap-4 w-full mt-3">
+        {#if !editorPreview}
+            {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'model')}<ModelBind />{/if}
+            {#if !DBState.db.customSidebarItems?.some((item) => item.type === 'persona')}<PersonaBind />{/if}
+            <PresetBind />
+        {/if}
+        {#if customItemsShown}<CustomSideBar settingsOnly={editorPreview} />{/if}
+        {#if toggleBindShown}
+            <ToggleBind values={toggleEditor.values} unpinKeys={toggleEditor.unpinKeys} onApplyPreset={applyTogglePreset} saveOnly={editorPreview} bind:saving={savingToggles} />
+        {/if}
+    </div>
+{/if}
 {#if !noContainer && groupedToggles.length > 4}
     <div class="h-48 border-darkborderc p-2 border rounded-sm flex flex-col items-start mt-2 overflow-y-auto">
         {#if hasJailbreakPrompt}

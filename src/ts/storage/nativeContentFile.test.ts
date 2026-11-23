@@ -25,8 +25,24 @@ vi.mock("@tauri-apps/plugin-fs", () => ({
 vi.mock("../process/modules", () => ({
   importPreparedNativeModuleContent: vi.fn(),
 }));
+// A card only the TypeScript reader imports, which the route hands back as its bytes.
+vi.mock("./nativeCharacterFileRoute", () => ({
+  importDesktopNativeCharacterPath: async (
+    _path: string,
+    route: { legacyImport(input: { name: string; data: Uint8Array }): Promise<string | null> },
+  ) => {
+    const value = await route.legacyImport({ name: "synthetic.png", data: new Uint8Array([1]) });
+    return value ? { kind: "imported", value } : { kind: "cancelled" };
+  },
+}));
+vi.mock("../characterCards", () => ({
+  importCharacterProcess: vi.fn(async () => 0),
+  importPreparedNativeCharacterContent: vi.fn(),
+}));
+vi.mock("./database.svelte", () => ({ getDatabase: () => ({ characters: [{ chaId: "card" }] }) }));
 import { open, readDir, remove, stat } from "@tauri-apps/plugin-fs";
 import { importPreparedNativeModuleContent } from "../process/modules";
+import { importCharacterProcess } from "../characterCards";
 import { importNativeContentFile } from "./nativeContentFile";
 
 beforeEach(() => {
@@ -74,6 +90,14 @@ it("spools partial writes correctly, closes before native import, and removes th
     expect.objectContaining({ displayName: file.name }),
     expect.anything(),
   );
+});
+
+it("imports a card the TypeScript reader takes inside the import, so an update dialog it opens ends with the import", async () => {
+  vi.mocked(open).mockResolvedValue({ write: async (bytes: Uint8Array) => bytes.length, close: vi.fn() } as never);
+  const file = Object.assign(source(), { name: "synthetic.png" });
+  expect(await importNativeContentFile(file, "character")).toBe("card");
+  expect(importCharacterProcess).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ quiet: true, signal: expect.any(AbortSignal) }));
+  expect(remove).toHaveBeenCalledOnce();
 });
 
 it("cleans a failed spool without activating content or touching unrelated inbox files", async () => {

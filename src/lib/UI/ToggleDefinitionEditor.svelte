@@ -5,6 +5,7 @@
     import {
         addToggleRow,
         groupSidebarToggles,
+        missingToggleFields,
         moveToggleRow,
         parseToggleDefinitions,
         removeToggleRow,
@@ -68,6 +69,8 @@
 
     const outline = $derived(toggleOutline(lines))
     const preview = $derived(groupSidebarToggles(parseToggleSyntax(serializeToggleDefinitions(lines))))
+    // The preview list leaves out empty groups.
+    const previewShown = $derived(preview.some((toggle) => toggle.type !== 'group' || toggle.children.length > 0))
 
     function commit(next: ToggleLine[]) {
         lines = next
@@ -91,6 +94,12 @@
         commit(setToggleRowField(lines, id, field, next))
     }
 
+    function missingMessage(missing: Array<keyof ToggleFields>) {
+        const copy = language.risuNest.toggleEditor
+        if (missing.length > 1) return copy.missingKeyAndName
+        return missing[0] === 'key' ? copy.missingKey : copy.missingName
+    }
+
     function kindName(kind: RowKind) {
         const copy = language.risuNest.toggleEditor
         switch (kind) {
@@ -107,6 +116,8 @@
 
 {#snippet row(line: ToggleLine, nested: boolean, first: boolean, last: boolean)}
     {@const fields = toggleLineFields(line.raw)}
+    {@const missing = missingToggleFields(line.raw)}
+    {@const missingId = `toggle-row-${line.id}-missing`}
     <div class="grid items-center gap-x-2 gap-y-1.5 rounded-md border border-darkborderc bg-darkbg px-2 py-1.5 grid-cols-[minmax(0,1fr)_auto] @md/rows:grid-cols-[9rem_minmax(0,1fr)_auto]">
         <SelectInput size="sm" className="min-w-0" ariaLabel={language.type} value={line.kind ?? 'switch'} onchange={(event) => {
             commit(setToggleRowKind(lines, line.id, event.currentTarget.value as RowKind))
@@ -123,14 +134,17 @@
             <button class="{actionButton} hover:text-draculared hover:bg-draculared/15" title={language.remove} aria-label={language.remove} onclick={() => commit(removeToggleRow(lines, line.id))}><Trash size={16} /></button>
         </div>
         {#if keyed(line.kind)}
-            <label class="flex items-center min-w-0 rounded-md border border-darkborderc focus-within:border-borderc focus-within:ring-2 focus-within:ring-borderc text-sm col-span-2 col-start-1 @md/rows:col-span-1 @md/rows:col-start-1 @md/rows:row-start-2">
+            <label class="flex items-center min-w-0 rounded-md border {missing.includes('key') ? 'border-draculared' : 'border-darkborderc'} focus-within:border-borderc focus-within:ring-2 focus-within:ring-borderc text-sm col-span-2 col-start-1 @md/rows:col-span-1 @md/rows:col-start-1 @md/rows:row-start-2">
                 <span class="pl-2 text-subtext">toggle_</span>
-                <input class="min-w-0 flex-1 bg-transparent py-1 pr-2 text-textcolor focus:outline-hidden" aria-label={language.key} value={fields.key} oninput={(event) => editField(line.id, 'key', event.currentTarget)} />
+                <input class="min-w-0 flex-1 bg-transparent py-1 pr-2 text-textcolor focus:outline-hidden" aria-label={language.key} aria-invalid={missing.includes('key') || undefined} aria-describedby={missing.includes('key') ? missingId : undefined} value={fields.key} oninput={(event) => editField(line.id, 'key', event.currentTarget)} />
             </label>
         {/if}
-        <TextInput size="sm" className="min-w-0 col-span-2 col-start-1 @md/rows:col-span-1 @md/rows:col-start-2 @md/rows:row-start-1" ariaLabel={language.name} value={fields.name} oninput={(event) => editField(line.id, 'name', event.currentTarget)} />
+        <TextInput size="sm" className="min-w-0 col-span-2 col-start-1 @md/rows:col-span-1 @md/rows:col-start-2 @md/rows:row-start-1 aria-[invalid=true]:border-draculared" ariaLabel={language.name} ariaInvalid={missing.includes('name') || undefined} ariaDescribedby={missing.includes('name') ? missingId : undefined} value={fields.name} oninput={(event) => editField(line.id, 'name', event.currentTarget)} />
         {#if line.kind === 'select'}
             <TextInput size="sm" className="min-w-0 col-span-2 col-start-1 @md/rows:col-span-2 @md/rows:col-start-2 @md/rows:row-start-2" ariaLabel={language.options} value={fields.options} oninput={(event) => editField(line.id, 'options', event.currentTarget)} />
+        {/if}
+        {#if missing.length > 0}
+            <p id={missingId} class="text-xs text-draculared col-span-2 col-start-1 @md/rows:col-span-3">{missingMessage(missing)}</p>
         {/if}
     </div>
 {/snippet}
@@ -167,7 +181,7 @@
                 {/each}
                 <button class="bg-transparent hover:bg-darkbg focus:ring-selected border-darkborderc text-textcolor2 border rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 px-3 py-1.5 text-sm inline-flex items-center gap-1.5 self-start mt-1" onclick={() => commit(addToggleRow(lines))}><Plus size={16} />{language.add}</button>
             </div>
-            {#if preview.length > 0}
+            {#if previewShown}
                 <div class="rounded-md border border-darkborderc bg-darkbg p-3 self-start min-w-0 w-full">
                     <div class="text-xs text-subtext">{language.preview}</div>
                     <div class="flex flex-col mt-1">

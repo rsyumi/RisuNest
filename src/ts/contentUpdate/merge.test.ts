@@ -148,6 +148,12 @@ describe('applyUpdate', () => {
             applyUpdate(CHARACTER_UPDATE, lists.m, lists.t, lists.plan, choices).customscript.map((script: any) => script.comment)
         expect(merge(plan(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'N', 'C']))).toEqual(['C', 'A', 'B', 'N'])
         expect(merge(plan(['A', 'B', 'C'], ['A', 'B', 'C', 'Own'], ['B', 'A', 'C']))).toEqual(['B', 'A', 'C', 'Own'])
+        // The order one side alone changed is an item of its own, like any other one-sided change.
+        const order = (lists: ReturnType<typeof plan>) => lists.plan.items.find((item) => item.order)
+        expect(order(plan(['A', 'B', 'C'], ['C', 'A', 'B'], ['A', 'B', 'C']))).toMatchObject({ status: 'mine', choice: 'mine', mine: ['C', 'A', 'B'], theirs: ['A', 'B', 'C'] })
+        const authorOnly = plan(['A', 'B', 'C'], ['A', 'B', 'C'], ['B', 'A', 'C'])
+        expect(authorOnly.plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'update', choice: 'theirs' }])
+        expect(merge(authorOnly, { customscript: 'mine' })).toEqual(['A', 'B', 'C'])
         expect(plan(['A', 'B', 'C'], ['B', 'A', 'C'], ['B', 'A', 'C']).plan.items).toEqual([])
 
         const both = plan(['A', 'B', 'C'], ['B', 'A', 'C'], ['A', 'C', 'B'])
@@ -161,7 +167,7 @@ describe('applyUpdate', () => {
         expect(plan(['A', 'B'], ['A', 'X', 'B'], ['B', 'X', 'A']).plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'conflict' }])
         // In the same place, it leaves the base to settle the others.
         const alike = plan(['A', 'B', 'C', 'D'], ['A', 'X', 'B', 'C', 'D'], ['A', 'X', 'B', 'D', 'C'])
-        expect(alike.plan.items).toEqual([])
+        expect(alike.plan.items).toMatchObject([{ id: 'customscript', order: true, status: 'update', choice: 'theirs' }])
         expect(merge(alike)).toEqual(['A', 'X', 'B', 'D', 'C'])
         // Without a base, who reordered it is unknown.
         expect(planUpdate(CHARACTER_UPDATE, both.m, both.t, null).items).toMatchObject([{ id: 'customscript', order: true, status: 'differs', choice: null }])
@@ -169,6 +175,85 @@ describe('applyUpdate', () => {
         const typed = (type: string) => ({ comment: 'T', type, in: type, out: '' })
         const typedPlan = planUpdate(CHARACTER_UPDATE, { name: 'Luna', customscript: [typed('editinput'), regex('A'), regex('B')] } as any, { name: 'Luna', customscript: [typed('editoutput'), regex('B'), regex('A')] } as any, null)
         expect(typedPlan.items.find((item) => item.order)).toMatchObject({ mine: [`T (${language.editInput})`, 'A', 'B'], theirs: [`T (${language.editOutput})`, 'B', 'A'] })
+    })
+
+    it('merges a lore entry or regex both sides changed field by field, asking only about fields both changed', () => {
+        const bold = (out: string, more = {}) => ({ comment: 'bold', type: 'editdisplay', in: '**', out, ...more })
+        const base = { name: 'Luna', globalLore: [lore('Town', 'town'), lore('Inn', 'inn')], customscript: [bold('<b>')] }
+        const mine = {
+            ...base, globalLore: [lore('Town', '마을', 'id-t'), { ...lore('Inn', '여관', 'id-i'), insertorder: 5 }],
+            customscript: [bold('<strong>')],
+        }
+        const theirs = {
+            ...base, globalLore: [{ ...lore('Town', 'town'), insertorder: 300 }, { ...lore('Inn', 'inn!'), insertorder: 7, alwaysActive: true }],
+            customscript: [bold('<b>', { in: '**(.+?)**', flag: 'g' })],
+        }
+        const plan = planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, base as any)
+        expect(plan.items.map((item) => [(item.mine as any).comment, item.status, item.choice])).toEqual([
+            ['Town', 'merged', 'both'], ['Inn', 'conflict', null], ['bold', 'merged', 'both'],
+        ])
+        expect(summarizePlan(plan)).toMatchObject({ merged: 2, conflict: 1, unresolved: 1 })
+        const apply = (choices: Record<string, any>) => applyUpdate(CHARACTER_UPDATE, mine as any, theirs as any, plan, choices) as any
+        const [, inn] = plan.items
+        // On a conflict a side settles only the fields both changed; the author's alwaysActive stays either way.
+        const keptMine = apply({ [inn.id]: 'mine' })
+        expect(keptMine.globalLore.map((entry: any) => [entry.content, entry.insertorder, entry.alwaysActive, entry.id])).toEqual([
+            ['마을', 300, false, 'id-t'], ['여관', 5, true, 'id-i'],
+        ])
+        expect(keptMine.customscript).toEqual([bold('<strong>', { in: '**(.+?)**', flag: 'g' })])
+        expect(apply({ [inn.id]: 'theirs' }).globalLore[1]).toMatchObject({ content: 'inn!', insertorder: 7, alwaysActive: true, id: 'id-i' })
+        expect(() => apply({ [inn.id]: 'both' })).toThrow()
+        // On a merged item a side is that whole entry.
+        expect(apply({ [inn.id]: 'mine', [plan.items[0].id]: 'mine' }).globalLore[0]).toMatchObject({ content: '마을', insertorder: 100 })
+        expect(apply({ [inn.id]: 'mine', [plan.items[2].id]: 'theirs' }).customscript).toEqual(theirs.customscript)
+        // Without a base nothing is known to be one side's change.
+        expect(planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, null).items.every((item) => item.status === 'differs' && !item.resolved)).toBe(true)
+    })
+
+    it('writes a merged entry onto the entry as stored then, so a change made after the comparison stays', () => {
+        const rx = (more = {}) => ({ comment: 'bold', type: 'editdisplay', in: '**', out: '<b>', flag: 'i', ...more })
+        const base = { name: 'Luna', globalLore: [lore('Town', 'town')], customscript: [rx()] }
+        const mine = { ...base, globalLore: [lore('Town', '마을', 'id-t')], customscript: [rx({ out: '<strong>' })] }
+        // The author changed the text and order of the entry and removed the regex flag.
+        const { flag: _flag, ...unflagged } = rx()
+        const theirs = { ...base, globalLore: [{ ...lore('Town', 'town!'), insertorder: 7 }], customscript: [unflagged] }
+        const plan = planUpdate(CHARACTER_UPDATE, mine as any, theirs as any, base as any)
+        const [town, bold] = plan.items
+        expect([town.status, bold.status]).toEqual(['conflict', 'merged'])
+        // Since the comparison the user turned on the regex flag option and made the entry selective.
+        const stored = {
+            ...mine, globalLore: [{ ...lore('Town', '마을', 'id-t'), selective: true }],
+            customscript: [rx({ out: '<strong>', ableFlag: true })],
+        }
+        const apply = (choices: Record<string, any>, from: object = stored) => applyUpdate(CHARACTER_UPDATE, from as any, theirs as any, plan, choices) as any
+
+        const both = apply({ [town.id]: 'mine' })
+        expect(both.customscript).toEqual([{ ...unflagged, out: '<strong>', ableFlag: true }])
+        expect(both.globalLore).toEqual([{ ...lore('Town', '마을', 'id-t'), insertorder: 7, selective: true }])
+        expect(apply({ [town.id]: 'theirs' }).globalLore).toEqual([{ ...lore('Town', 'town!', 'id-t'), insertorder: 7, selective: true }])
+        expect(apply({ [town.id]: { edited: { content: 'written' } } }).globalLore).toEqual([{ ...lore('Town', 'written', 'id-t'), insertorder: 7, selective: true }])
+        // A side of a merged item is that whole entry: the one stored now, or the author's.
+        expect(apply({ [town.id]: 'mine', [bold.id]: 'mine' }).customscript).toEqual(stored.customscript)
+        expect(apply({ [town.id]: 'mine', [bold.id]: 'theirs' }).customscript).toEqual([unflagged])
+
+        // An entry removed since the comparison stays removed unless the author's version or an edit is chosen.
+        const removed = { ...mine, globalLore: [], customscript: [] }
+        expect(apply({ [town.id]: 'mine' }, removed)).toMatchObject({ globalLore: [], customscript: [] })
+        expect(apply({ [town.id]: 'theirs' }, removed).globalLore).toEqual(theirs.globalLore)
+        expect(apply({ [town.id]: { edited: { content: 'written' } } }, removed).globalLore).toEqual([{ ...theirs.globalLore[0], content: 'written' }])
+
+        // An entry only the author changed takes the fields the author changed, so what changed since stays as well.
+        const authorBase = { name: 'Luna', globalLore: [lore('Inn', 'inn')], customscript: [rx()] }
+        const authorNew = { ...authorBase, globalLore: [{ ...lore('Inn', 'inn'), insertorder: 300 }], customscript: [rx({ out: '<em>' })] }
+        const installed = { ...authorBase, globalLore: [lore('Inn', 'inn', 'id-i')] }
+        const authorPlan = planUpdate(CHARACTER_UPDATE, installed as any, authorNew as any, authorBase as any)
+        expect(authorPlan.items.map((item) => item.status)).toEqual(['update', 'update'])
+        const applyAuthor = (from: object) => applyUpdate(CHARACTER_UPDATE, from as any, authorNew as any, authorPlan) as any
+        const since = applyAuthor({ ...authorBase, globalLore: [lore('Inn', '여관', 'id-i')], customscript: [rx({ flag: 'g' })] })
+        expect(since.globalLore).toEqual([{ ...lore('Inn', '여관', 'id-i'), insertorder: 300 }])
+        expect(since.customscript).toEqual([rx({ out: '<em>', flag: 'g' })])
+        expect(applyAuthor(installed)).toMatchObject({ globalLore: [{ ...authorNew.globalLore[0], id: 'id-i' }], customscript: authorNew.customscript })
+        expect(applyAuthor({ ...authorBase, globalLore: [], customscript: [] })).toMatchObject({ globalLore: authorNew.globalLore, customscript: authorNew.customscript })
     })
 
     it('tells apart assets that share a name from one named like a second copy', () => {

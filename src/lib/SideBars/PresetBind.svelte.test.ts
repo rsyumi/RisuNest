@@ -79,6 +79,9 @@ it('opens the preset list in bind mode for the selected chat unless a response i
     mocks.blocked.mockReturnValue(false)
     chat().promptPresetId = 'preset-b'
     button()!.click()
+    flushSync()
+    // The layer that will hold the list shows that it is loading.
+    expect(document.querySelector('.z-modal [role="status"]')?.textContent).toContain(languageEnglish.loading)
     await vi.waitFor(() => expect(mocks.list).toHaveBeenCalled())
     expect(listProps()).toMatchObject({ mode: 'bind', boundId: 'preset-b', chatPresetId: 'preset-a' })
     // The modal layer keeps the list above the editor popups that also show this row.

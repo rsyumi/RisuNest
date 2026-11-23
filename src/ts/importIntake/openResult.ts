@@ -1,4 +1,4 @@
-import { get } from 'svelte/store'
+import { fromStore, get } from 'svelte/store'
 import { showRealmInfoStore } from '../characterCards'
 import type { NativeFileOperationImportLocation } from '../storage/nativeFileJobManager'
 import {
@@ -54,10 +54,11 @@ export function openImportResult(location: NativeFileOperationImportLocation): v
 /**
  * Whether what an import added can be opened now. The HypaV3 summaries, the Realm upload, EasyPanel,
  * loadouts and Iris work on the selected character until they close, so no other character opens over them.
+ * Read while a dialog draws, it follows the stores it depends on.
  */
 export function canOpenImportResult(location: NativeFileOperationImportLocation): boolean {
-    if (!('chaId' in location) || location.chaId === DBState.db.characters?.[get(selectedCharID)]?.chaId) return true
-    return ![get(hypaV3ModalOpen), get(ShowRealmFrameStore), easyPanelStore.open, loadoutModalStore.open, irisStore.open].some(Boolean)
+    if (!('chaId' in location) || location.chaId === DBState.db.characters?.[fromStore(selectedCharID).current]?.chaId) return true
+    return ![fromStore(hypaV3ModalOpen).current, fromStore(ShowRealmFrameStore).current, easyPanelStore.open, loadoutModalStore.open, irisStore.open].some(Boolean)
 }
 
 /**

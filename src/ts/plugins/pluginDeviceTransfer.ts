@@ -65,6 +65,37 @@ async function send<T>(command: string, request: Record<string, unknown>, bytes:
     return await invoke<T>(command, request)
 }
 
+/** Runs at most `limit` streams at once, the rest in the order they asked. */
+function streamLimit(limit: number) {
+    const waiters: (() => void)[] = []
+    let open = 0
+    return async <T>(stream: () => Promise<T>): Promise<T> => {
+        while (open >= limit) await new Promise<void>(resolve => waiters.push(resolve))
+        open++
+        try {
+            return await stream()
+        } finally {
+            open--
+            waiters.shift()?.()
+        }
+    }
+}
+
+/** Runs `run` after every earlier run of the same owner settled. */
+function inOwnerOrder<T>(queues: Map<string, Promise<void>>, owner: string, run: () => Promise<T>): Promise<T> {
+    const result = (queues.get(owner) ?? Promise.resolve()).then(run)
+    const settled = result.then(() => undefined, () => undefined)
+    queues.set(owner, settled)
+    void settled.then(() => { if (queues.get(owner) === settled) queues.delete(owner) })
+    return result
+}
+
+// The native side keeps at most two write sessions open per plugin and eight
+// in all. Staging for one write per plugin and four in all leaves room for
+// sessions that a reloaded page left open until they expire.
+const ownerWrites = new Map<string, Promise<void>>()
+const withWriteStream = streamLimit(4)
+
 export async function writeNativePluginDeviceValues(owner: string, mutations: readonly PluginDeviceMutation[], observations: readonly PluginDeviceObservation[] = []): Promise<PluginDeviceObservation[]> {
     if (mutations.length === 0) return []
     if (mutations.length > 1024) throw new Error('Plugin device write batch is too large')
@@ -72,29 +103,33 @@ export async function writeNativePluginDeviceValues(owner: string, mutations: re
     const planned = mutations.map((mutation, index): NativeMutation => sizes[index] > PLUGIN_DEVICE_PART_BYTES
         ? { type: 'staged', sessionId: '00000000-0000-0000-0000-000000000000' } : mutation)
     if (requestSize(owner, planned, observations) > REQUEST_BYTES) throw new Error('Plugin device write batch is too large')
-    const sessions: string[] = []
-    try {
-        for (let index = 0; index < mutations.length; index++) {
-            const mutation = mutations[index]
-            if (mutation.type !== 'set' || sizes[index] <= PLUGIN_DEVICE_PART_BYTES) continue
-            const { sessionId } = await invoke<{ sessionId: string }>('pds_open_plugin_device_write', {
-                owner, space: mutation.space, key: mutation.key, encodedLength: sizes[index],
-            })
-            sessions.push(sessionId)
-            let offset = 0
-            for (const { part, byteLength } of pluginDeviceParts(mutation.value)) {
-                const request = { owner, sessionId, offset, part }
-                const size = pluginDeviceValueSize(part) - 2 + encoder.encode(JSON.stringify({ ...request, part: '' })).length
-                const next = await send<number>('pds_append_plugin_device_write', request, size, 'pds_plugin_part_android_finish')
-                if (next !== offset + byteLength) throw new Error('Invalid plugin device part acknowledgement')
-                offset = next
+    const commit = async () => await send<PluginDeviceObservation[]>('pds_write_plugin_device_values', { owner, mutations: planned, observations }, requestSize(owner, planned, observations), 'pds_plugin_write_android_finish') ?? []
+    if (!planned.some((mutation) => mutation.type === 'staged')) return await commit()
+    return await inOwnerOrder(ownerWrites, owner, () => withWriteStream(async () => {
+        const sessions: string[] = []
+        try {
+            for (let index = 0; index < mutations.length; index++) {
+                const mutation = mutations[index]
+                if (mutation.type !== 'set' || sizes[index] <= PLUGIN_DEVICE_PART_BYTES) continue
+                const { sessionId } = await invoke<{ sessionId: string }>('pds_open_plugin_device_write', {
+                    owner, space: mutation.space, key: mutation.key, encodedLength: sizes[index],
+                })
+                sessions.push(sessionId)
+                let offset = 0
+                for (const { part, byteLength } of pluginDeviceParts(mutation.value)) {
+                    const request = { owner, sessionId, offset, part }
+                    const size = pluginDeviceValueSize(part) - 2 + encoder.encode(JSON.stringify({ ...request, part: '' })).length
+                    const next = await send<number>('pds_append_plugin_device_write', request, size, 'pds_plugin_part_android_finish')
+                    if (next !== offset + byteLength) throw new Error('Invalid plugin device part acknowledgement')
+                    offset = next
+                }
+                planned[index] = { type: 'staged', sessionId }
             }
-            planned[index] = { type: 'staged', sessionId }
+            return await commit()
+        } finally {
+            await Promise.all(sessions.map((sessionId) => invoke('pds_abort_plugin_device_write', { owner, sessionId }).catch(() => undefined)))
         }
-        return await send<PluginDeviceObservation[]>('pds_write_plugin_device_values', { owner, mutations: planned, observations }, requestSize(owner, planned, observations), 'pds_plugin_write_android_finish') ?? []
-    } finally {
-        await Promise.all(sessions.map((sessionId) => invoke('pds_abort_plugin_device_write', { owner, sessionId }).catch(() => undefined)))
-    }
+    }))
 }
 
 type ReadStart = string | { byteSize: number; version: string } | null
@@ -122,21 +157,8 @@ export async function readNativePluginDeviceValue(owner: string, space: PluginDe
 // The native side keeps at most two part uploads open per plugin and eight in
 // all. One per plugin and four in all leave room for uploads that a reloaded
 // page left open until they expire.
-const PART_STREAMS = 4
 const ownerStreams = new Map<string, Promise<void>>()
-const streamWaiters: (() => void)[] = []
-let openStreams = 0
-
-async function withPartStream<T>(stream: () => Promise<T>): Promise<T> {
-    while (openStreams >= PART_STREAMS) await new Promise<void>(resolve => streamWaiters.push(resolve))
-    openStreams++
-    try {
-        return await stream()
-    } finally {
-        openStreams--
-        streamWaiters.shift()?.()
-    }
-}
+const withPartStream = streamLimit(4)
 
 /**
  * Stores every part of a structure-form value as a device object and returns
@@ -144,11 +166,7 @@ async function withPartStream<T>(stream: () => Promise<T>): Promise<T> {
  */
 export function storeNativePluginDeviceParts(owner: string, value: StructuredLocalPluginValue): Promise<string[]> {
     if (value.byteLength === 0) return Promise.resolve([])
-    const stored = (ownerStreams.get(owner) ?? Promise.resolve()).then(() => withPartStream(() => storeParts(owner, value)))
-    const settled = stored.then(() => undefined, () => undefined)
-    ownerStreams.set(owner, settled)
-    void settled.then(() => { if (ownerStreams.get(owner) === settled) ownerStreams.delete(owner) })
-    return stored
+    return inOwnerOrder(ownerStreams, owner, () => withPartStream(() => storeParts(owner, value)))
 }
 
 async function storeParts(owner: string, value: StructuredLocalPluginValue): Promise<string[]> {

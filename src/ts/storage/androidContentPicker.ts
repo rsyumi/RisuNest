@@ -164,7 +164,7 @@ async function consumeAndroidContentSpool(
             )
             if (destination === 'module' || moduleJson) {
                 const { importModuleData } = await import('../process/modules')
-                const location = await importModuleData({ name: displayName, data, ...(parsedJson && { parsedJson }) })
+                const location = await importModuleData({ name: displayName, data, signal: context.signal, ...(parsedJson && { parsedJson }) })
                 if (!location) return null
                 context.setLocation(location)
                 return 'module'
@@ -175,6 +175,7 @@ async function consumeAndroidContentSpool(
                 name: displayName,
                 data,
                 quiet: true,
+                signal: context.signal,
                 ...(parsedJson && { parsedJson }),
             })
             const chaId = typeof index === 'number'

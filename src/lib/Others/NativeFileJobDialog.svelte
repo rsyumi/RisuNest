@@ -16,6 +16,7 @@
     } from 'src/ts/storage/nativeFileJobManager'
 
     import { retrySnapshotRestoreBodiesFromOutcome } from 'src/ts/storage/nativePersistentMaintenance'
+    import { modalNavigation } from 'src/ts/ui/modalNavigation'
 
     /** Whether what an import added can be opened over what is on screen now. */
     let { canOpen = () => true }: { canOpen?: (location: NativeFileOperationImportLocation) => boolean } = $props()
@@ -97,6 +98,7 @@
             aria-modal="true"
             aria-labelledby="native-file-job-dialog-title"
             data-testid="native-file-job-dialog"
+            use:modalNavigation={{ enabled: model.closeVisible, close: dismiss }}
             class="flex max-h-[90dvh] w-full max-w-lg flex-col gap-4 overflow-y-auto rounded-lg border border-darkborderc bg-darkbg p-5 text-textcolor outline-hidden">
             <header class="flex flex-col gap-1">
                 <div class="flex items-baseline justify-between gap-3">

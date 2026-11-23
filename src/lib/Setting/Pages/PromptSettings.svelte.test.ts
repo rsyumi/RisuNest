@@ -166,10 +166,10 @@ describe('prompt list', () => {
         Object.assign(DBState.db.promptTemplate[0], { text: 'Synthetic text', role: 'user' })
         toggle('First').click()
         await tick()
-        const select = () => header('First').parentElement!.querySelector('select')!
-        const choose = async (type: string) => {
-            select().value = type
-            select().dispatchEvent(new Event('change', { bubbles: true }))
+        const select = (title = 'First') => header(title).parentElement!.querySelector('select')!
+        const choose = async (type: string, title?: string) => {
+            select(title).value = type
+            select(title).dispatchEvent(new Event('change', { bubbles: true }))
             await tick()
         }
         for (const type of ['jailbreak', 'cot', 'plain']) {
@@ -179,6 +179,14 @@ describe('prompt list', () => {
         await choose('chat')
         await choose('jailbreak')
         expect(DBState.db.promptTemplate[0]).toMatchObject({ type: 'jailbreak', text: '', role: 'system' })
+
+        // A block added as a type without text starts with none when it becomes a type with text.
+        DBState.db.promptTemplate[1] = { name: 'Second', type: 'chat', rangeStart: -1000, rangeEnd: 'end' }
+        await tick()
+        toggle('Second').click()
+        await tick()
+        await choose('chatML', 'Second')
+        expect(DBState.db.promptTemplate[1]).toMatchObject({ type: 'chatML', text: '' })
     })
 
     it('counts the blocks and expands or collapses all of them', async () => {

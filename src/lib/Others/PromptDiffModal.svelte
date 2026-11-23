@@ -177,7 +177,7 @@
         }
     }
 
-    function handleClose() {
+    export function handleClose() {
         savePrefsToDB()
         onClose()
     }

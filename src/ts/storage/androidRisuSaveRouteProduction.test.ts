@@ -74,7 +74,7 @@ import {
 } from './androidRisuSaveRouteProduction.svelte'
 import type { ImportIntakeDelivery } from '../importIntake/types'
 import type { PreparedNativeContent, PreparedNativeContentReceipt } from './nativeFileJobs'
-import type { AndroidSafJavascriptBridge } from './androidSafBridge'
+import type { AndroidSafJavascriptBridge, AndroidSpoolReady } from './androidSafBridge'
 import { createPortableExportIntentStore, rememberPortableExport, resumePendingPortableExport, portableAndroidPublicationDependencies } from './deviceBackup/job'
 
 describe('Android opened spool production route', () => {
@@ -284,16 +284,18 @@ describe('Android opened spool production route', () => {
 
     it('hands each spool batch after first setup to the import intake as one delivery, in arrival order', async () => {
         const dispatch = vi.fn(async () => {})
+        const discard = vi.fn(async (_source: AndroidSpoolReady) => {})
         const deliveries: ImportIntakeDelivery[] = []
         let releaseFirst!: () => void
         let checks = 0
         let firstSetupDone = false
         const route = createAndroidSpoolBatchRouter({
-            firstSetupDone: () => ++checks === 2
+            firstSetupDone: () => ++checks === 3
                 ? new Promise<boolean>(resolve => { releaseFirst = () => resolve(firstSetupDone) })
                 : Promise.resolve(firstSetupDone),
             loadIntake: async () => async (delivery) => { deliveries.push(delivery) },
             dispatch,
+            discard,
         })
         const save = { token: 'save-token', displayName: 'backup.risunest', bytes: 30 }
         const card = { token: 'card-token', displayName: 'card.json', bytes: 10 }
@@ -302,14 +304,16 @@ describe('Android opened spool production route', () => {
         const broken = { displayName: 'broken.png', code: 'source-copy-failed' }
         const lost = { displayName: 'lost.charx', code: 'source-copy-failed' }
 
-        // Spools that arrive before first setup keep their own handling.
-        const early = { requestId: 'early', ready: [save], failures: [] }
-        await route(early)
-        expect(dispatch).toHaveBeenCalledExactlyOnceWith(early)
+        // Files opened or shared while onboarding is on screen are let go, and a content picker result keeps its destination.
+        await route({ requestId: 'early', ready: [save, card], failures: [broken] })
+        await route({ requestId: 'early-picker', ready: [picked], failures: [lost] })
+        await vi.waitFor(() => expect(discard.mock.calls.map(([source]) => source)).toEqual([save, card]))
+        expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'early-picker', ready: [picked], failures: [lost] })
         expect(deliveries).toEqual([])
 
         firstSetupDone = true
         dispatch.mockClear()
+        discard.mockClear()
         const first = route({ requestId: 'first', ready: [save, card], failures: [broken] })
         const second = route({ requestId: 'second', ready: [card, book], failures: [] })
         await vi.waitFor(() => expect(releaseFirst).toBeDefined())
@@ -328,6 +332,33 @@ describe('Android opened spool production route', () => {
         ])
         // A content picker result that outlived its page keeps the destination chosen in the picker, and its failures.
         expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'picker', ready: [picked], failures: [lost] })
+        expect(discard).not.toHaveBeenCalled()
+    })
+
+    it('lets go of a batch shared during onboarding that waits behind another until onboarding ended', async () => {
+        const deliveries: ImportIntakeDelivery[] = []
+        const discard = vi.fn(async (_source: AndroidSpoolReady) => {})
+        let firstSetupDone = false
+        let releaseAhead: (() => void) | undefined
+        let checks = 0
+        const route = createAndroidSpoolBatchRouter({
+            firstSetupDone: () => ++checks === 1
+                ? new Promise<boolean>(resolve => { releaseAhead = () => resolve(false) })
+                : Promise.resolve(firstSetupDone),
+            loadIntake: async () => async (delivery) => { deliveries.push(delivery) },
+            dispatch: vi.fn(async () => {}),
+            discard,
+        })
+        const ahead = { token: 'ahead-token', displayName: 'ahead.charx', bytes: 10 }
+        const during = { token: 'during-token', displayName: 'during.charx', bytes: 10 }
+        const first = route({ requestId: 'ahead', ready: [ahead], failures: [] })
+        const second = route({ requestId: 'during', ready: [during], failures: [] })
+        await vi.waitFor(() => expect(releaseAhead).toBeDefined())
+        firstSetupDone = true
+        releaseAhead!()
+        await Promise.all([first, second])
+        await vi.waitFor(() => expect(discard.mock.calls.map(([source]) => source)).toEqual([ahead, during]))
+        expect(deliveries).toEqual([])
     })
 
     it('treats first setup as unfinished while a restored onboarding stays on screen', async () => {
@@ -349,6 +380,7 @@ describe('Android opened spool production route', () => {
             Object.assign(new EventTarget(), { RisuLifecycleBridge: { acknowledgeOpenedFile } })
         vi.stubGlobal('window', holder)
         const dispatch = vi.fn(async () => {})
+        const discard = vi.fn(async (_source: AndroidSpoolReady) => {})
         const deliveries: ImportIntakeDelivery[] = []
         const ends: Array<() => void> = []
         let firstSetupDone = false
@@ -359,6 +391,7 @@ describe('Android opened spool production route', () => {
                 return new Promise<void>(resolve => { ends.push(resolve) })
             },
             dispatch,
+            discard,
         })
         const early = { token: 'early-token', displayName: 'early.risunest', bytes: 30 }
         const save = { token: 'save-token', displayName: 'backup.risunest', bytes: 30 }
@@ -369,10 +402,13 @@ describe('Android opened spool production route', () => {
         const uncopied = { name: 'uncopied.risup', code: 'source-copy-failed' }
         const alone = '/cache/opened_files/3-0-alone.risupreset'
         try {
-            // Before first setup the copied files wait for the opened-files listener, as their own event did.
+            // Before first setup the share is not imported, and Android is told its copied files are done with.
             await route({ requestId: 'early', ready: [early], failures: [], openedFiles: [earlyPreset, uncopied] })
-            expect(dispatch).toHaveBeenCalledExactlyOnceWith({ requestId: 'early', ready: [early], failures: [] })
-            expect(holder.tauriOpenedFiles).toEqual([earlyPreset, uncopied])
+            await vi.waitFor(() => expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path)).toEqual([earlyPreset]))
+            expect(discard).toHaveBeenCalledExactlyOnceWith(early)
+            expect(dispatch).not.toHaveBeenCalled()
+            expect(holder.tauriOpenedFiles).toBeUndefined()
+            acknowledgeOpenedFile.mockClear()
 
             firstSetupDone = true
             await route({
@@ -399,8 +435,8 @@ describe('Android opened spool production route', () => {
             ends[0]()
             await vi.waitFor(() => expect(acknowledgeOpenedFile.mock.calls.map(([path]) => path))
                 .toEqual([alone, preset, script]))
-            expect(holder.tauriOpenedFiles).toEqual([earlyPreset, uncopied])
-            expect(dispatch).toHaveBeenCalledOnce()
+            expect(holder.tauriOpenedFiles).toBeUndefined()
+            expect(dispatch).not.toHaveBeenCalled()
         } finally {
             vi.unstubAllGlobals()
         }

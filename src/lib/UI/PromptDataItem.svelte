@@ -14,7 +14,7 @@
     import { presetEditorDBState as DBState } from 'src/ts/storage/presetEditor.svelte';
     import { RISU_PROMPT_DRAG_TYPE } from "src/ts/dragTypes";
     import { alertConfirm } from "src/ts/alert";
-    import { promptBlockTypeName, promptBlockTypes } from "src/ts/process/promptBlockTypes";
+    import { newPromptBlock, promptBlockTypeName, promptBlockTypes } from "src/ts/process/promptBlockTypes";
     
     interface Props {
         promptItem: PromptItem;
@@ -139,6 +139,11 @@
         }
         if(hasPromptBlockRole(promptItem) && !isPromptRole(promptItem.role2)){
             promptItem.role2 = 'system'
+        }
+        // A field the new type has and the block lacks starts as it does in a new block of that type.
+        const block = promptItem as unknown as Record<string, unknown>
+        for(const [key, value] of Object.entries(newPromptBlock(next))){
+            if(block[key] === undefined) block[key] = value
         }
     }
 

@@ -1,11 +1,10 @@
 import { get } from 'svelte/store'
-import { onboardingHold } from 'src/lib/Others/Onboarding/onboardingGate'
+import { onboardingFinished } from 'src/lib/Others/Onboarding/onboardingGate'
 import { language } from 'src/lang'
 import { alertNormal } from '../alert'
 import { isAppLockInputBlocked } from '../appLock/input'
 import { RISU_APP_INTERNAL_DRAG_TYPE, RISU_SIDEBAR_DRAG_TYPE } from '../dragTypes'
 import { isTauri } from '../platform'
-import { persistentWorkingSetInputBlocked } from '../storage/persistentDataRuntime.svelte'
 import { DBState, loadedStore } from '../stores.svelte'
 import { importDropOverlayVisible } from './sheetStore'
 import type { ImportIntakeDelivery } from './types'
@@ -26,13 +25,14 @@ function isFileDrag(e: DragEvent): boolean {
     return getMainDropEffect(e) === 'copy'
 }
 
-/** Drops are refused while onboarding is on screen or the app lock covers the app. */
+/**
+ * Drops are refused while onboarding is on screen or the app lock covers the app. A drop over any other
+ * screen, such as a full-screen editor or the update popup, waits in the intake until that screen closes.
+ */
 export function importDropsAccepted(): boolean {
     return get(loadedStore)
-        && !!DBState.db?.didFirstSetup
-        && !get(onboardingHold)
+        && onboardingFinished(DBState.db)
         && !isAppLockInputBlocked()
-        && !get(persistentWorkingSetInputBlocked)
 }
 
 export function handleAppDragOver(e: DragEvent): void {

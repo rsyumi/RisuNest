@@ -1006,7 +1006,9 @@ export function parseToggleSyntax(template:string){
     
         const splited = template.split('\n')
 
-        for(const line of splited){
+        for(const raw of splited){
+            // A definition saved with CRLF line breaks reads as the same toggles.
+            const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
             const [key, value, type, option] = line.split('=')
             if(type === 'group' || type === 'groupEnd' || type === 'divider'){
                 keyValue.push({

@@ -11,8 +11,10 @@
         unpinKeys?: string[]
         onApplyPreset?: (values: ToggleValues, keys: readonly string[]) => Promise<boolean>
         saving?: boolean
+        /** Leaves out unbinding and the toggle presets, so a bound chat offers only saving its changed values. */
+        saveOnly?: boolean
     }
-    let { values, unpinKeys = [], onApplyPreset, saving = $bindable(false) }: Props = $props()
+    let { values, unpinKeys = [], onApplyPreset, saving = $bindable(false), saveOnly = false }: Props = $props()
     let currentValues = $derived(values ?? DBState.db.globalChatVariables)
     let presetsOpen = $state(false)
     let chat = $derived(
@@ -61,13 +63,15 @@
     <div class="text-xs text-textcolor2 px-0.5">{language.toggleBinding}</div>
     <div class="flex gap-1 items-stretch">
         {#if bound}
-            <button
-                class="{button} shrink-0 w-10 px-0 bg-primary-500 border-primary-500 text-primary-foreground hover:bg-primary-600"
-                title={language.unbindToggles}
-                aria-pressed="true"
-                disabled={disabled || saving}
-                onclick={unbind}><PinIcon size={16} /></button
-            >
+            {#if !saveOnly}
+                <button
+                    class="{button} shrink-0 w-10 px-0 bg-primary-500 border-primary-500 text-primary-foreground hover:bg-primary-600"
+                    title={language.unbindToggles}
+                    aria-pressed="true"
+                    disabled={disabled || saving}
+                    onclick={unbind}><PinIcon size={16} /></button
+                >
+            {/if}
             <button
                 class="{button} flex-1 min-w-0 {changes > 0
                     ? 'bg-draculared/15 border-draculared/40 text-draculared hover:bg-draculared/25'
@@ -95,15 +99,17 @@
                 <span class="truncate">{language.bindTogglesLabel}</span>
             </button>
         {/if}
-        <button
-            class="{button} {neutral} shrink-0 w-10 px-0"
-            title={language.togglePresets}
-            aria-haspopup="dialog"
-            disabled={saving}
-            onclick={() => {
-                presetsOpen = true
-            }}><FolderHeartIcon size={16} /></button
-        >
+        {#if !saveOnly}
+            <button
+                class="{button} {neutral} shrink-0 w-10 px-0"
+                title={language.togglePresets}
+                aria-haspopup="dialog"
+                disabled={saving}
+                onclick={() => {
+                    presetsOpen = true
+                }}><FolderHeartIcon size={16} /></button
+            >
+        {/if}
     </div>
     {#if disabled}
         <span class="text-xs text-textcolor2 px-0.5">{language.toggleBindingDisabled}</span>

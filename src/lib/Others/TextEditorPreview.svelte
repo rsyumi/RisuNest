@@ -50,7 +50,7 @@
     </div>
     {#if showToggles}
         <div class="max-h-[45%] shrink-0 overflow-y-auto border-t border-darkborderc p-4 sm:max-h-none sm:w-80 sm:border-t-0 sm:border-l">
-            <Toggles noContainer presetDatabase={database} />
+            <Toggles noContainer presetDatabase={database} editorPreview />
         </div>
     {/if}
 </div>
