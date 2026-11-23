@@ -438,6 +438,18 @@ impl RootSpool {
         Ok(Some(selector.as_ref().and_then(Value::as_u64).unwrap_or(0).min(count-1).to_string()))
     }
 
+    /// The member the preset selection addresses, by id or by position. A missing selection
+    /// is the first preset, and one that names no preset is none.
+    fn selected_preset(&self) -> StoreResult<Option<String>> {
+        let Some(selector) = self.scalar("botPresetsId")? else { return Ok(Some("0".to_owned())); };
+        if let Value::String(id) = &selector {
+            return Ok(self.db.query_row("SELECT key FROM members WHERE field='botPresets' AND json_extract(value,'$.id')=?1 ORDER BY rowid LIMIT 1",
+                [id],|r|r.get(0)).optional()?);
+        }
+        let count = self.count("botPresets")?;
+        Ok(selector.as_u64().filter(|index| *index < count).map(|index| index.to_string()))
+    }
+
     fn normalize(&self) -> StoreResult<()> {
         for field in ["modules","loadouts","customModels","personas","botPresets"] {
             if self.kind(field)? != Some(FieldKind::Array) { continue; }
@@ -465,7 +477,8 @@ impl RootSpool {
         // Upstream RisuAI edits only `globalChatVariables`, so a copy an earlier export left
         // in the file is replaced.
         self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
-        if let Some(key) = self.selected("botPresets","botPresetsId")? {
+        if self.count("botPresets")? == 0 { return Ok(()); }
+        if let Some(key) = self.selected_preset()? {
             let text = self.member_text("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             let document = Document::parse(&text, Depth::Unlimited)?;
             let preset = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
@@ -485,6 +498,10 @@ impl RootSpool {
             let mut out = Vec::new();
             write_updated(&preset, &updates, &mut out)?;
             self.put_member_json("botPresets",&key,Some(stored_json::text(out)?.as_str()))?;
+        } else {
+            // The TypeScript import stores a selection that names no preset as an empty id
+            // and writes no mirror.
+            self.put("botPresetsId",Some(&Value::String(String::new())))?;
         }
         Ok(())
     }
@@ -532,7 +549,8 @@ impl RootSpool {
             }
         }
         self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
-        if let Some(key) = self.selected("botPresets","botPresetsId")? {
+        if self.count("botPresets")? == 0 { return Ok(()); }
+        if let Some(key) = self.selected_preset()? {
             let mut preset = self.member("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             for (key,field) in super::export::PRESET_MIRRORS {
                 if let Some(value) = self.value(key)? {
@@ -546,6 +564,8 @@ impl RootSpool {
             }
             self.put("botPresetsId",Some(&preset["id"]))?;
             self.put_member("botPresets",&key,Some(&preset))?;
+        } else {
+            self.put("botPresetsId",Some(&Value::String(String::new())))?;
         }
         Ok(())
     }
@@ -979,6 +999,21 @@ mod tests {
             let normalized_values = values.normalize_values();
             assert_eq!(normalized_texts, normalized_values, "{fixture}");
             assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
+        }
+        // A selection that names no preset selects none, and no preset takes the root's values.
+        for selection in [json!(-1), json!("gone"), json!(2)] {
+            let fixture = json!({
+                "botPresets": [{"id": "first", "temperature": 1}, {"id": "second"}], "botPresetsId": selection,
+                "temperature": 0.25, "fallbackModels": ["live"], "doNotChangeFallbackModels": true,
+            });
+            let texts = spool(&fixture);
+            let values = spool(&fixture);
+            texts.normalize().unwrap();
+            values.normalize_values().unwrap();
+            assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
+            assert_eq!(texts.scalar("botPresetsId").unwrap(), Some(json!("")), "{fixture}");
+            assert_eq!(texts.member("botPresets", "0").unwrap(), Some(json!({"id": "first", "temperature": 1})), "{fixture}");
+            assert_eq!(texts.kind("protectedPresetValues").unwrap(), None, "{fixture}");
         }
     }
 }

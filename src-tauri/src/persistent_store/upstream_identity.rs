@@ -83,8 +83,30 @@ fn normalize_root(mut root: Value) -> StoreResult<Value> {
     }
     Ok(root)
 }
+/// The preset the selection addresses, by id or by position. A missing selection is the
+/// first preset, and one that names no preset is none.
+fn selected_preset(root: &Value, presets: &[Value]) -> Option<usize> {
+    match root.get("botPresetsId") {
+        Some(Value::String(id)) => presets
+            .iter()
+            .position(|preset| preset.get("id").and_then(Value::as_str) == Some(id)),
+        Some(value) => value
+            .as_u64()
+            .map(|index| index as usize)
+            .filter(|index| *index < presets.len()),
+        None => Some(0),
+    }
+}
 fn preserve_preset_mirrors(root: &mut Value, presets: &mut [Value]) {
-    let index = selected_index(root, "botPresetsId", presets);
+    if presets.is_empty() {
+        return;
+    }
+    let Some(index) = selected_preset(root, presets) else {
+        // The TypeScript import stores a selection that names no preset as an empty id and
+        // writes no mirror.
+        root["botPresetsId"] = json!("");
+        return;
+    };
     if let Some(preset) = presets.get_mut(index) {
         for (key, field) in super::export::PRESET_MIRRORS {
             let flag = super::export::protected_preset_flag(key);
@@ -231,6 +253,7 @@ mod tests {
         assert_eq!(exported["botPresetsId"], 1);
         assert_eq!(exported["selectedPersona"], 0);
         assert_eq!(exported["fallbackModels"], json!(["protected"]));
+        let mut file = Value::Null;
         for no_preset in [json!("missing-preset"), json!(""), json!(-1)] {
             let mut exported = root.as_object().unwrap().clone();
             exported.insert("botPresetsId".into(), no_preset);
@@ -239,6 +262,20 @@ mod tests {
                 .unwrap();
             assert_eq!(exported["botPresetsId"], -1);
             assert_eq!(exported["temperature"], 999);
+            file = Value::Object(exported);
+        }
+        // Imported again, such a file selects no preset and no preset takes its values.
+        for selection in [json!(-1), json!("gone"), json!(3)] {
+            file["botPresetsId"] = selection;
+            let stage = store.replace_begin().unwrap().staging_id;
+            store.replace_put_upstream_root(&stage, &file).unwrap();
+            store
+                .replace_put_upstream_presets(&stage, staged["botPresets"].as_array().unwrap())
+                .unwrap();
+            let imported = store.materialize_staging(&stage).unwrap();
+            assert_eq!(imported["botPresets"], staged["botPresets"]);
+            assert_eq!(imported["botPresetsId"], "");
+            assert_eq!(imported["temperature"], 999);
         }
     }
 }
