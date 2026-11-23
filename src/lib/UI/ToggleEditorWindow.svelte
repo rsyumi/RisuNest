@@ -4,7 +4,7 @@
     const windowKey = Symbol('toggleEditorWindow')
 
     export interface ToggleEditorWindowState {
-        /** Whether the window is wide enough to show the preview beside the rows. */
+        /** Whether the window is wide enough to show the preview beside rows that keep one line. */
         readonly wide: boolean
     }
 
@@ -32,9 +32,13 @@
     let viewportTop = $state(0)
     let viewportHeight: number | null = $state(null)
 
+    // The preview goes beside the rows only while the rows keep their one-line layout: 672 px of rows,
+    // the 16 px gap, the 20rem (320 px) preview and the 32 px body padding.
+    const sideBySideWidth = 672 + 16 + 320 + 32
+
     setContext<ToggleEditorWindowState>(windowKey, {
         get wide() {
-            return width >= 896
+            return width >= sideBySideWidth
         },
     })
 

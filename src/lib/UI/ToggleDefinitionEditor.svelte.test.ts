@@ -375,14 +375,21 @@ describe('toggle definition editor', () => {
         expect(names().map((input) => input.value)).toEqual(['A', 'Bee'])
     })
 
-    it('keeps the preview beside the rows in a wide pop-out window', async () => {
-        vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(1000)
-        await open('p=Power')
-        buttons(language.risuNest.textEditor.open)[0].click()
-        await tick()
-        const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
-        expect(views(dialog)).toEqual([language.hotkeyDesc.edit, language.risuNest.toggleEditor.raw])
-        await type(names(dialog)[0], 'Boost')
-        expect(previewSwitch('Boost')).not.toBeNull()
+    it('keeps the preview beside the rows only in a pop-out window wide enough for one-line rows beside it', async () => {
+        const width = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+        for (const [windowWidth, beside] of [[1000, false], [1040, true]] as const) {
+            width.mockReturnValue(windowWidth)
+            await open('p=Power')
+            buttons(language.risuNest.textEditor.open)[0].click()
+            await tick()
+            const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
+            expect(views(dialog), String(windowWidth)).toEqual(beside
+                ? [language.hotkeyDesc.edit, language.risuNest.toggleEditor.raw]
+                : [language.hotkeyDesc.edit, language.preview, language.risuNest.toggleEditor.raw])
+            await type(names(dialog)[0], 'Boost')
+            expect(previewSwitch('Boost') !== null, String(windowWidth)).toBe(beside)
+            await unmount(instance!)
+            instance = undefined
+        }
     })
 })
