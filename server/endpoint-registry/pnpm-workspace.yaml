@@ -1,0 +1,6 @@
+minimumReleaseAge: 0
+
+allowBuilds:
+  esbuild: false
+  fsevents: false
+  workerd: false

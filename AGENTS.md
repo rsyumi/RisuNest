@@ -14,7 +14,7 @@ Platform targets: Windows, macOS, Linux, Android, and iOS, all equal. A feature,
 ## Layout
 
 - `src/ts/` TypeScript logic with tests colocated as `*.test.ts`; `src/lib/` Svelte components; `src/lang/` i18n; `src-tauri/` Rust backend and the generated Android shell; `crates/` RisuNest's own Rust crates and the patched upstream crates that `[patch.crates-io]` substitutes.
-- `server/` holds RisuNest Sync: the Rust server and manager, plus two independent frontends (`server/manager/gui`, `server/endpoint-registry`) with their own lockfiles, installed with `pnpm --ignore-workspace`.
+- `server/` holds RisuNest Sync: the Rust server and manager, plus two independent frontends (`server/manager/gui`, `server/endpoint-registry`) with their own lockfiles and `pnpm-workspace.yaml` settings, installed with `pnpm --dir <frontend> install`.
 - `tests/` and `benchmarks/` hold verification harnesses that consume product code; `tests/README.md` describes the product/verification boundary.
 
 ## Building and Testing

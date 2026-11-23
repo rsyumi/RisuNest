@@ -1,5 +1,14 @@
-onlyBuiltDependencies:
-  - better-sqlite3
+sideEffectsCache: false
+ignoreScripts: false
+minimumReleaseAge: 0
+
+allowBuilds:
+  better-sqlite3: true
+  core-js: false
+  esbuild: false
+  fsevents: false
+  msgpackr-extract: false
+  protobufjs: false
 overrides:
   '@huggingface/transformers>onnxruntime-node': '-'
   '@huggingface/transformers>sharp': '-'

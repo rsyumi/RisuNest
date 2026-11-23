@@ -133,7 +133,7 @@ function preflight(config) {
     if (!command("hdiutil", ["help"])) throw new Error("hdiutil is required to create the macOS Sync DMG.");
   }
   if (config.gui && !existsSync(join(repository, "server/manager/gui/node_modules/@tauri-apps/cli/tauri.js")))
-    throw new Error("Install Sync GUI dependencies with `pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile`.");
+    throw new Error("Install Sync GUI dependencies with `pnpm --dir server/manager/gui install --frozen-lockfile`.");
 }
 
 function sourceCommit() {

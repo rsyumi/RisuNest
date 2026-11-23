@@ -33,7 +33,7 @@ Linux 관리형 압축 파일은 일반 사용자로 `sh install.sh`를 실행�
 ```sh
 cargo test --manifest-path server/sync/Cargo.toml --locked
 cargo test --manifest-path server/manager/Cargo.toml --locked
-pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
+pnpm --dir server/manager/gui install --frozen-lockfile
 pnpm --dir server/manager/gui run check
 pnpm --dir server/manager/gui run test
 ```
