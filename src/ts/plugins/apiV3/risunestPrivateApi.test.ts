@@ -7,6 +7,7 @@ function setup(granted: boolean | Promise<boolean> = true) {
     const context = { revision: 1 } as ConversationContext
     const readConversationContext = vi.fn(async () => context)
     const hasDatabasePermission = vi.fn(async () => granted)
+    const hasDatabaseWritePermission = vi.fn(async () => granted)
     const hasHostToolPermission = vi.fn(async () => granted)
     const lifetime = new AbortController()
     const patchConversation = vi.fn(async (_request: unknown, _signal?: AbortSignal): Promise<ConversationPatchResult> => ({ status: 'applied', revision: 2 }))
@@ -21,10 +22,11 @@ function setup(granted: boolean | Promise<boolean> = true) {
         chatView,
         generationEnd,
         hasDatabasePermission,
+        hasDatabaseWritePermission,
         hasHostToolPermission,
         lifetimeSignal: lifetime.signal,
     })
-    return { api, context, readConversationContext, hasDatabasePermission, hasHostToolPermission, lifetime, patchConversation, listTools, callTool, chatView, generationEnd }
+    return { api, context, readConversationContext, hasDatabasePermission, hasDatabaseWritePermission, hasHostToolPermission, lifetime, patchConversation, listTools, callTool, chatView, generationEnd }
 }
 
 describe('risunestReadConversationContext', () => {
@@ -120,6 +122,15 @@ describe('risunestPatchConversation', () => {
         ])
     })
 
+    it('rejects a patch the user declined dbWrite for, without patching or recording the mutation ID', async () => {
+        const { api, patchConversation, hasDatabaseWritePermission } = setup()
+        hasDatabaseWritePermission.mockResolvedValueOnce(false)
+
+        await expect(api.patchConversation(input)).rejects.toThrow('Conversation patches require the dbWrite permission')
+        expect(patchConversation).not.toHaveBeenCalled()
+        await expect(api.patchConversation(input)).resolves.toEqual({ status: 'applied', revision: 2 })
+    })
+
     it('stops for an aborted signal without recording the mutation ID', async () => {
         const { api, patchConversation, lifetime } = setup()
         const controller = new AbortController()
@@ -139,6 +150,13 @@ describe('risunestPatchConversation', () => {
         lifetime.abort()
         finish()
         await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+
+        const unloading = setup()
+        unloading.hasDatabaseWritePermission.mockImplementationOnce(async () => {
+            unloading.lifetime.abort()
+            return false
+        })
+        await expect(unloading.api.patchConversation(input)).rejects.toMatchObject({ name: 'AbortError' })
     })
 })
 

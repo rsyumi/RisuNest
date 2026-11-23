@@ -153,6 +153,7 @@ const createPatches = () => createRisunestPrivateApi({
     chatView: { register: vi.fn(), unregister: vi.fn(), dispose: vi.fn() } as any,
     generationEnd: { register: vi.fn(), unregister: vi.fn(), dispose: vi.fn() } as any,
     hasDatabasePermission: async () => true,
+    hasDatabaseWritePermission: async () => true,
     hasHostToolPermission: async () => true,
     lifetimeSignal: new AbortController().signal,
 })

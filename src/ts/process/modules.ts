@@ -325,6 +325,9 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
     markModuleImport(module)
     module.id = v4()
     delete module.mcp
+    if(module.lowLevelAccess && !(await alertConfirm(language.lowLevelAccessConfirm))){
+        module.lowLevelAccess = false
+    }
     return module
 }
 
