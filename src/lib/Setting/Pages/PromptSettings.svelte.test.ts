@@ -248,6 +248,201 @@ describe('prompt list', () => {
     })
 })
 
+describe('prompt search', () => {
+    const text = language.risuNest.promptSearch
+    const bar = () => document.querySelector<HTMLElement>('[role="search"]')
+    const searchInput = () => bar()!.querySelector<HTMLInputElement>(`input[aria-label="${language.search}"]`)!
+    const barButton = (label: string) => [...bar()!.querySelectorAll('button')]
+        .find(button => button.getAttribute('aria-label') === label || button.textContent?.trim() === label)!
+    const toolbarSearch = () => document.querySelector<HTMLButtonElement>('button[aria-pressed]')!
+    const toggles = () => [...document.querySelectorAll<HTMLButtonElement>('button[aria-expanded]:not([aria-haspopup])')]
+        .filter(button => !bar()?.contains(button))
+    const listed = () => toggles().map(button => button.querySelector('span span')?.textContent)
+    const card = (title: string) => toggles().find(button => button.querySelector('span span')?.textContent === title)!.parentElement!.parentElement!
+    const lines = (title: string) => [...card(title).querySelectorAll<HTMLButtonElement>('[data-prompt-search-line]')]
+    // Each line shows the field's label, then the text of the line.
+    const lineTexts = (title: string) => lines(title).map(line => [...line.children].map(part => part.textContent))
+    const marks = (title: string) => [...card(title).querySelectorAll('mark')].map(mark => mark.textContent)
+    const authorNote = language.formating.authorNote
+    async function type(input: HTMLInputElement, value: string) {
+        input.value = value
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        await tick()
+    }
+    async function openSearch() {
+        toolbarSearch().click()
+        await tick()
+    }
+
+    beforeEach(async () => {
+        DBState.db.promptTemplate = [
+            { name: 'Intro', type: 'plain', type2: 'normal', role: 'system', text: 'Talk to {{user}} kindly.\nNever speak for {{user}}.' },
+            { name: 'Lore', type: 'lorebook', text: 'leftover {{user}}' },
+            { name: '{{user}} rules', type: 'jailbreak', type2: 'normal', role: 'user', text: 'Stay in character.' },
+            { type: 'authornote', innerFormat: '[{{user}} note] {{slot}}', defaultText: 'none' },
+        ] as typeof DBState.db.promptTemplate
+        await tick()
+    })
+
+    it('lists only matching blocks, with their matched lines and no reordering or adding', async () => {
+        await openSearch()
+        expect(document.activeElement).toBe(searchInput())
+        await type(searchInput(), '{{user}}')
+        await vi.waitFor(() => expect(listed()).toEqual(['Intro', '{{user}} rules', authorNote]))
+        expect(bar()!.textContent).toContain(`${text.matchCount.replace('{0}', '4')} · ${language.risuNest.promptList.count.replace('{0}', '3')}`)
+        expect(lineTexts('Intro')).toEqual([
+            [language.prompt, 'Talk to {{user}} kindly.'], [language.prompt, 'Never speak for {{user}}.'],
+        ])
+        expect(marks('Intro')).toEqual(['{{user}}', '{{user}}'])
+        expect(lineTexts(authorNote)).toEqual([[language.innerFormat, '[{{user}} note] {{slot}}']])
+        expect(document.querySelector('[draggable="true"], [role="doc-pagebreak"], button[aria-haspopup="menu"]')).toBeNull()
+        expect(document.querySelector(`button[aria-label="${language.movePresetUp}"]`)).toBeNull()
+        expect(document.querySelectorAll(`button[aria-label="${language.remove}"]`)).toHaveLength(3)
+
+        // Enter moves to the first match line.
+        searchInput().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+        await vi.waitFor(() => expect(document.activeElement).toBe(lines('Intro')[0]))
+
+        // A block lists its first three matches and shows the rest on request.
+        await type(searchInput(), 'e')
+        await vi.waitFor(() => expect(lines('Intro')).toHaveLength(3))
+        const more = [...card('Intro').querySelectorAll('button')].find(button => button.textContent === text.showMore.replace('{0}', '2'))!
+        more.click()
+        await tick()
+        expect(lines('Intro')).toHaveLength(5)
+
+        await type(searchInput(), 'nothing like this')
+        await vi.waitFor(() => expect(listed()).toEqual([]))
+        expect(document.body.textContent).toContain(text.noMatch)
+
+        // An invalid pattern shows the whole list and offers no replacing.
+        barButton(language.regex).click()
+        await type(searchInput(), '({{user}}')
+        await vi.waitFor(() => expect(bar()!.textContent).toContain(text.invalidRegex))
+        expect(listed()).toEqual(['Intro', 'Lore', '{{user}} rules', authorNote])
+        barButton(text.replace).click()
+        await tick()
+        expect(barButton(text.replaceAll).disabled).toBe(true)
+    })
+
+    it('replaces every match, lists what it wrote, and restores the text and the matches on undo', async () => {
+        await openSearch()
+        barButton(text.replace).click()
+        await tick()
+        await type(bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!, '{{persona}}')
+        await type(searchInput(), '{{USER}}')
+        await vi.waitFor(() => expect(barButton(text.replaceAll).disabled).toBe(false))
+        barButton(text.replaceAll).click()
+        await tick()
+        expect(DBState.db.promptTemplate).toMatchObject([
+            { name: 'Intro', text: 'Talk to {{persona}} kindly.\nNever speak for {{persona}}.' },
+            { name: 'Lore', text: 'leftover {{user}}' },
+            { name: '{{persona}} rules', text: 'Stay in character.' },
+            { innerFormat: '[{{persona}} note] {{slot}}', defaultText: 'none' },
+        ])
+        expect(bar()!.textContent).toContain(text.replaced.replace('{0}', '4'))
+        expect(listed()).toEqual(['Intro', '{{persona}} rules', authorNote])
+        expect(marks('Intro')).toEqual(['{{persona}}', '{{persona}}'])
+        expect(lineTexts('{{persona}} rules')).toEqual([[language.name, '{{persona}} rules']])
+
+        barButton(text.undo).click()
+        await tick()
+        expect(DBState.db.promptTemplate.map(item => [item.name, (item as { text?: string }).text])).toEqual([
+            ['Intro', 'Talk to {{user}} kindly.\nNever speak for {{user}}.'], ['Lore', 'leftover {{user}}'],
+            ['{{user}} rules', 'Stay in character.'], [undefined, undefined],
+        ])
+        expect((DBState.db.promptTemplate[3] as { innerFormat?: string }).innerFormat).toBe('[{{user}} note] {{slot}}')
+        expect(listed()).toEqual(['Intro', '{{user}} rules', authorNote])
+        expect(marks('Intro')).toEqual(['{{user}}', '{{user}}'])
+        expect(bar()!.textContent).not.toContain(text.undo)
+    })
+
+    it('replaces one match and keeps its block listed until the query changes', async () => {
+        await openSearch()
+        barButton(text.replace).click()
+        await tick()
+        await type(bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!, 'Remain')
+        await type(searchInput(), 'Stay')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} rules']))
+        const replace = [...card('{{user}} rules').querySelectorAll('button')].find(button => button.textContent === text.replace)!
+        replace.click()
+        await tick()
+        expect((DBState.db.promptTemplate[2] as { text: string }).text).toBe('Remain in character.')
+        expect(listed()).toEqual(['{{user}} rules'])
+        expect(lines('{{user}} rules')).toEqual([])
+        expect(bar()!.textContent).toContain(text.replaced.replace('{0}', '1'))
+        await type(searchInput(), 'Stay ')
+        await vi.waitFor(() => expect(listed()).toEqual([]))
+        // Undo is offered for the preset it was made in.
+        expect(bar()!.textContent).toContain(text.undo)
+        DBState.db.botPresetsId = 1
+        await tick()
+        expect(bar()!.textContent).not.toContain(text.undo)
+    })
+
+    it('keeps a block listed while it is edited, until it is closed', async () => {
+        await openSearch()
+        await type(searchInput(), 'rules')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} rules']))
+        lines('{{user}} rules')[0].click()
+        await vi.waitFor(() => expect(card('{{user}} rules').contains(document.activeElement)).toBe(true))
+        const name = document.activeElement as HTMLInputElement
+        expect(name.value.slice(name.selectionStart!, name.selectionEnd!)).toBe('rules')
+        await type(name, '{{user}} laws')
+        expect(DBState.db.promptTemplate[2].name).toBe('{{user}} laws')
+        expect(listed()).toEqual(['{{user}} laws'])
+        toggles()[0].click()
+        await tick()
+        expect(listed()).toEqual([])
+        // Once closed, opening it again some other way does not list it.
+        ;[...document.querySelectorAll('button')].find(button => button.textContent?.trim() === language.expandAll)!.click()
+        await tick()
+        expect(listed()).toEqual([])
+    })
+
+    it('closes the search before the settings window on back navigation', async () => {
+        const settingsLayer = document.createElement('div')
+        document.body.append(settingsLayer)
+        const closeSettings = vi.fn()
+        const layer = modalNavigation(settingsLayer, { close: closeSettings })
+        try {
+            await openSearch()
+            await type(searchInput(), 'Intro')
+            await vi.waitFor(() => expect(listed()).toEqual(['Intro']))
+            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+            await tick()
+            expect(bar()).toBeNull()
+            expect(listed()).toEqual(['Intro', 'Lore', '{{user}} rules', authorNote])
+            await openSearch()
+            expect(searchInput().value).toBe('')
+            history.back()
+            await vi.waitFor(() => expect(bar()).toBeNull())
+            expect(closeSettings).not.toHaveBeenCalled()
+        } finally {
+            layer.destroy()
+        }
+    })
+
+    it('opens the search with Ctrl+F, or focuses and selects its text when it is open', async () => {
+        const press = (init: KeyboardEventInit) => {
+            const event = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true, ...init })
+            document.body.dispatchEvent(event)
+            return event
+        }
+        // Ctrl+Alt+F stays with the chat shortcut that uses it.
+        expect(press({ altKey: true }).defaultPrevented).toBe(false)
+        await tick()
+        expect(bar()).toBeNull()
+        expect(press({}).defaultPrevented).toBe(true)
+        await vi.waitFor(() => expect(document.activeElement).toBe(searchInput()))
+        await type(searchInput(), 'Intro')
+        searchInput().blur()
+        press({})
+        await vi.waitFor(() => expect(document.activeElement).toBe(searchInput()))
+        expect([searchInput().selectionStart, searchInput().selectionEnd]).toEqual([0, 5])
+    })
+})
+
 describe('custom toggles', () => {
     it('edits the preset custom toggles through the toggle editor', async () => {
         DBState.db.customPromptTemplateToggle = 'a=A'

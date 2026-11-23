@@ -318,6 +318,47 @@
         if (editorRequest) cancelTextEditorPopup(editorRequest)
     })
 
+    /** Scrolls to the field, focuses it and selects `range` of its value. False when only the focus could be given. */
+    export function selectRange(range: { start: number, end: number } | null): boolean {
+        highlightDom?.scrollIntoView?.({ block: 'center' })
+        const text = value ?? ''
+        const valid = !!range && range.start >= 0 && range.start <= range.end && range.end <= text.length
+        if (textareaDom) {
+            textareaDom.focus({ preventScroll: true })
+            if (!valid || textareaDom.value !== text) return false
+            textareaDom.setSelectionRange(range.start, range.end)
+            return true
+        }
+        if (!inputDom) return false
+        inputDom.focus({ preventScroll: true })
+        // The editor's text nodes make up its value, so offsets map onto them only while the two agree.
+        if (!valid || inputDom.textContent !== text) return false
+        const { start, end } = range
+        const domRange = document.createRange()
+        const walker = document.createTreeWalker(inputDom, NodeFilter.SHOW_TEXT)
+        let offset = 0
+        let started = false
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            const length = node.textContent?.length ?? 0
+            if (!started && start <= offset + length) {
+                domRange.setStart(node, start - offset)
+                started = true
+            }
+            if (started && end <= offset + length) {
+                domRange.setEnd(node, end - offset)
+                const selection = window.getSelection()
+                selection?.removeAllRanges()
+                selection?.addRange(domRange)
+                const box = inputDom.getBoundingClientRect()
+                const target = domRange.getBoundingClientRect?.()
+                if (target && target.height > 0) inputDom.scrollTop += target.top - box.top - box.height / 3
+                return true
+            }
+            offset += length
+        }
+        return false
+    }
+
     const highlightChange = async (value:string, highlightId:number) => {
         await sleep(1)
         highlighter(highlightDom, highlightId)
