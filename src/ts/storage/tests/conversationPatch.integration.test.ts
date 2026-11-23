@@ -130,6 +130,7 @@ async function setup(database = makeDatabase()) {
             return runtime.commitPreparedUnitIntent(reason, prepare)
         },
     })
+    const permission = { current: Promise.resolve(true) }
     const api = createRisunestPrivateApi({
         databaseAccess: { readConversationContext: vi.fn() },
         patchAccess: access,
@@ -137,6 +138,7 @@ async function setup(database = makeDatabase()) {
         chatView: { register: vi.fn(), unregister: vi.fn(), dispose: vi.fn() },
         generationEnd: { register: vi.fn(), unregister: vi.fn(), dispose: vi.fn() },
         hasDatabasePermission: async () => true,
+        hasDatabaseWritePermission: () => permission.current,
         hasHostToolPermission: async () => true,
         lifetimeSignal: new AbortController().signal,
     })
@@ -155,7 +157,7 @@ async function setup(database = makeDatabase()) {
         return close
     }
     const patch = (input: Record<string, unknown>) => api.patchConversation(input)
-    return { store, adapter, runtime, generation, commitGate, live, stored, reloaded, openRequestPhase, patch }
+    return { store, adapter, runtime, generation, commitGate, permission, live, stored, reloaded, openRequestPhase, patch }
 }
 
 type Harness = Awaited<ReturnType<typeof setup>>
@@ -455,7 +457,7 @@ describe('risunestPatchConversation during a generation', () => {
         expect(harness.live(selected).message[1]).toMatchObject({ __tr: 'reroll' })
     })
 
-    it('keeps the generation waiting until a request-phase patch lands', async () => {
+    it('keeps the generation waiting for a request-phase patch, but not for a permission answer', async () => {
         const harness = await setup()
         harness.generation.target = selected
         const close = harness.openRequestPhase(selected)
@@ -464,6 +466,12 @@ describe('risunestPatchConversation during a generation', () => {
         let closed = false
 
         const pending = harness.patch({ ...selected, mutationId: 'slow', messages: [{ index: 1, messageId: 'm1', set: { __tr: 'slow' } }] })
+        // The patch joins the request phase once its permission answer is in.
+        for (let tick = 0; tick < 20; tick++) await Promise.resolve()
+        let answer!: (granted: boolean) => void
+        harness.permission.current = new Promise<boolean>((resolve) => { answer = resolve })
+        const unanswered = harness.patch({ ...selected, mutationId: 'unanswered', messages: [{ index: 1, messageId: 'm1', set: { __tr: 'unanswered' } }] })
+        harness.permission.current = Promise.resolve(true)
         const closing = close().then(() => { closed = true })
         for (let tick = 0; tick < 20; tick++) await Promise.resolve()
         expect(isGenerationRequestPhaseOpen(selected)).toBe(false)
@@ -474,6 +482,8 @@ describe('risunestPatchConversation during a generation', () => {
 
         await expect(pending).resolves.toMatchObject({ status: 'applied' })
         await closing
+        answer(true)
+        await expect(unanswered).resolves.toMatchObject({ status: 'busy' })
         expect(harness.live(selected).message[1]).toMatchObject({ __tr: 'slow' })
     })
 })
