@@ -247,15 +247,95 @@ export function removeToggleRow(lines: readonly ToggleLine[], id: number): Toggl
     return next
 }
 
-/** Adds an empty switch row at the end, outside any group. */
-export function addToggleRow(lines: readonly ToggleLine[]): ToggleLine[] {
+/**
+ * Adds an empty row of a type at the end, outside any group, or at the end of the group with this header id.
+ * A new group comes with its groupEnd line and is only added at the top level.
+ */
+export function addToggleRow(
+    lines: readonly ToggleLine[],
+    kind: Exclude<ToggleLineKind, 'groupEnd'> = 'switch',
+    group: number | null = null,
+): ToggleLine[] {
     let next = [...lines]
+    const row = createLine(lineText(kind, { key: '', name: '', options: '' }), kind)
+    const added = kind === 'group' ? [row, endLine(row)] : [row]
+    if (group !== null) {
+        const target = groupOf(next, group)
+        if (!target || kind === 'group') return next
+        next.splice((target.children.at(-1) ?? target.line) + 1, 0, ...added)
+        return next
+    }
     const last = toggleOutline(next).at(-1)
-    if (last?.type === 'group') next = closeGroup(next, next[last.line].id)
-    const row = createLine('=', 'switch')
-    if (next.length === 1 && next[0].raw === '') return [row]
+    // A new group header ends an open group by itself.
+    if (last?.type === 'group' && kind !== 'group') next = closeGroup(next, next[last.line].id)
+    if (next.length === 1 && next[0].raw === '') return added
     // Keep a final line break after the new row.
-    next.splice(next.at(-1)?.raw === '' ? next.length - 1 : next.length, 0, row)
+    next.splice(next.at(-1)?.raw === '' ? next.length - 1 : next.length, 0, ...added)
+    return next
+}
+
+/** A place between rows: inside a group or at the top level, before a row or after the last one. */
+export interface ToggleGap {
+    /** Id of the header line of the group the gap is in, or null at the top level. */
+    group: number | null
+    /** Id of the row, or of the group header at the top level, that the gap is before; null after the last one. */
+    before: number | null
+}
+
+/** The last line an outline item spans: a group's end line, or its last row while it has none. */
+function lastLineOf(item: ToggleOutlineItem): number {
+    return item.type === 'group' ? item.end ?? item.children.at(-1) ?? item.line : item.line
+}
+
+/**
+ * Places a row, or a group with its rows and end line, at a gap. A group is not placed inside a group, and an
+ * item placed at a gap it already occupies stays where it is. Every other line keeps its bytes and its place,
+ * blank lines included; the only lines added are the end lines that keep the groups around the gap as they were.
+ */
+export function placeToggleRow(lines: readonly ToggleLine[], id: number, gap: ToggleGap): ToggleLine[] {
+    const outline = toggleOutline(lines)
+    const position = locate(outline, lines, id)
+    if (!position) return [...lines]
+    const item = outline[position.item]
+    const movingGroup = item.type === 'group' && position.child === -1
+    if (movingGroup && gap.group !== null) return [...lines]
+    const target = gap.group === null ? null : groupOf(lines, gap.group)
+    if (gap.group !== null && !target) return [...lines]
+    const siblings = (target ? target.children : outline.map((entry) => entry.line)).map((index) => lines[index].id)
+    if (gap.before !== null && !siblings.includes(gap.before)) return [...lines]
+    // An item occupies the gap before it and the one after it.
+    if ((position.child === -1 ? null : lines[item.line].id) === gap.group) {
+        const following = siblings[siblings.indexOf(id) + 1] ?? null
+        if (gap.before === id || gap.before === following) return [...lines]
+    }
+
+    let next = [...lines]
+    // Without the moved group, a row after it would join an unclosed group before it.
+    if (movingGroup && outline[position.item + 1]?.type === 'row') next = closeGroupBefore(next, id)
+    const start = indexOfLine(next, id)
+    const end = movingGroup ? lastLineOf(groupOf(next, id)!) : start
+    let moved = next.splice(start, end - start + 1)
+
+    let at: number
+    if (gap.group !== null) {
+        const group = groupOf(next, gap.group)!
+        at = gap.before !== null ? indexOfLine(next, gap.before) : (group.children.at(-1) ?? group.line) + 1
+    } else {
+        const rest = toggleOutline(next)
+        const index = gap.before !== null ? rest.findIndex((entry) => next[entry.line].id === gap.before) : rest.length
+        const previous = rest[index - 1]
+        // A row after an unclosed group would join it; a group header ends it by itself.
+        if (!movingGroup && previous?.type === 'group' && previous.end === null) {
+            next = closeGroup(next, next[previous.line].id)
+        }
+        // A moved group without an end line would take in the rows after it.
+        if (movingGroup && moved.at(-1)?.kind !== 'groupEnd' && rest[index]?.type === 'row') {
+            moved = [...moved, endLine(moved[0])]
+        }
+        const last = toggleOutline(next).at(-1)
+        at = gap.before !== null ? indexOfLine(next, gap.before) : last ? lastLineOf(last) + 1 : 0
+    }
+    next.splice(at, 0, ...moved)
     return next
 }
 
