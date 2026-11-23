@@ -13,7 +13,8 @@
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import Help from "src/lib/Others/Help.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
-    import ToggleDefinitionEditor from "src/lib/UI/ToggleDefinitionEditor.svelte";
+    import PresetToggleEditor from "./PresetToggleEditor.svelte";
+    import DependentOptions from "./DependentOptions.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
     import Accordion from "src/lib/UI/Accordion.svelte";
@@ -242,42 +243,30 @@
     <span class="text-textcolor2 text-sm mt-2">{tokens} {language.fixedTokens}</span>
     <span class="text-textcolor2 mb-6 text-sm mt-2">{extokens} {language.exactTokens}</span>
 {:else}
-    <span class="text-textcolor mt-4">{language.postEndInnerFormat}</span>
-    <TextInput bind:value={DBState.db.promptSettings.postEndInnerFormat}/>
-
+    <h3 class="{mode === 'independent' ? 'mt-4' : 'mt-1'} pb-1 font-semibold text-textcolor border-b border-darkborderc">{language.risuNest.promptOptions.messages}</h3>
     <Check bind:check={DBState.db.promptSettings.sendChatAsSystem} name={language.sendChatAsSystem} className="mt-4"/>
     <Check bind:check={DBState.db.promptSettings.sendName} name={language.formatMessageWithName} className="mt-4"/>
+    <DependentOptions parentOn={DBState.db.promptSettings.sendName}>
+        <span class="text-textcolor mt-4">{language.namedMessageRole} <Help key="namedMessageRole"/></span>
+        <SelectInput bind:value={DBState.db.namedMessageRole}>
+            <OptionInput value="user">User</OptionInput>
+            <OptionInput value="system">System</OptionInput>
+            <OptionInput value="assistant">assistant</OptionInput>
+        </SelectInput>
+        <span class="text-textcolor mt-4">{language.messageNameFormat} <Help key='messageNameFormat' /></span>
+        <TextAreaInput placeholder={`<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`} bind:value={DBState.db.messageNameTemplate}/>
+    </DependentOptions>
     <Check bind:check={DBState.db.promptSettings.trimStartNewChat} name={language.trimStartNewChat} className="mt-4"/>
     <Check bind:check={DBState.db.promptSettings.utilOverride} name={language.utilOverride} className="mt-4"/>
-    <Check bind:check={DBState.db.jsonSchemaEnabled} name={language.enableJsonSchema} className="mt-4"/>
-    <Check bind:check={DBState.db.outputImageModal} name={language.outputImageModal} className="mt-4"/>
-
-    <Check bind:check={DBState.db.strictJsonSchema} name={language.strictJsonSchema} className="mt-4"/>
-
+    <span class="text-textcolor mt-4">{language.maxThoughtTagDepth}</span>
+    <NumberInput bind:value={DBState.db.promptSettings.maxThoughtTagDepth}/>
     {#if DBState.db.showUnrecommended}
         <Check bind:check={DBState.db.promptSettings.customChainOfThought} name={language.customChainOfThought} className="mt-4">
             <Help unrecommended key='customChainOfThought' />
         </Check>
     {/if}
-    <span class="text-textcolor mt-4">{language.maxThoughtTagDepth}</span>
-    <NumberInput bind:value={DBState.db.promptSettings.maxThoughtTagDepth}/>
-    <span class="text-textcolor mt-4">{language.namedMessageRole} <Help key="namedMessageRole"/></span>
-    <SelectInput bind:value={DBState.db.namedMessageRole}>
-        <OptionInput value="user">User</OptionInput>
-        <OptionInput value="system">System</OptionInput>
-        <OptionInput value="assistant">assistant</OptionInput>
-    </SelectInput>
-    <ToggleDefinitionEditor className="mt-4" value={DBState.db.customPromptTemplateToggle} onChange={(text) => {
-        DBState.db.customPromptTemplateToggle = text
-    }} />
-    <span class="text-textcolor mt-4">{language.defaultVariables} <Help key='defaultVariables' /></span>
-    <TextAreaInput bind:value={DBState.db.templateDefaultVariables}/>
-    <span class="text-textcolor mt-4">{language.predictedOutput}</span>
-    <TextAreaInput bind:value={DBState.db.OAIPrediction}/>
-    <span class="text-textcolor mt-4">{language.autoSuggest} <Help key='autoSuggest' /></span>
-    <TextAreaInput bind:value={DBState.db.autoSuggestPrompt} placeholder={defaultAutoSuggestPrompt}/>
-    <span class="text-textcolor mt-4">{language.messageNameFormat} <Help key='messageNameFormat' /></span>
-    <TextAreaInput placeholder={`<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`} bind:value={DBState.db.messageNameTemplate}/>
+    <span class="text-textcolor mt-4">{language.postEndInnerFormat}</span>
+    <TextInput bind:value={DBState.db.promptSettings.postEndInnerFormat}/>
     <span class="text-textcolor mt-4">{language.systemContentReplacement} <Help key="systemContentReplacement"/></span>
     <TextAreaInput bind:value={DBState.db.systemContentReplacement}/>
     <span class="text-textcolor mt-4">{language.systemRoleReplacement} <Help key="systemRoleReplacement"/></span>
@@ -285,12 +274,27 @@
         <OptionInput value="user">User</OptionInput>
         <OptionInput value="assistant">assistant</OptionInput>
     </SelectInput>
+    <span class="text-textcolor mt-4">{language.defaultVariables} <Help key='defaultVariables' /></span>
+    <TextAreaInput bind:value={DBState.db.templateDefaultVariables}/>
+
+    <h3 class="mt-6 pb-1 font-semibold text-textcolor border-b border-darkborderc">{language.risuNest.promptOptions.output}</h3>
+    <Check bind:check={DBState.db.jsonSchemaEnabled} name={language.enableJsonSchema} className="mt-4"/>
     {#if DBState.db.jsonSchemaEnabled}
-        <span class="text-textcolor mt-4">{language.jsonSchema} <Help key='jsonSchema' /></span>
-        <TextAreaInput bind:value={DBState.db.jsonSchema}/>
-        <span class="text-textcolor mt-4">{language.extractJson} <Help key='extractJson' /></span>
-        <TextInput bind:value={DBState.db.extractJson}/>
+        <DependentOptions parentOn={DBState.db.jsonSchemaEnabled}>
+            <span class="text-textcolor mt-4">{language.jsonSchema} <Help key='jsonSchema' /></span>
+            <TextAreaInput bind:value={DBState.db.jsonSchema}/>
+            <span class="text-textcolor mt-4">{language.extractJson} <Help key='extractJson' /></span>
+            <TextInput bind:value={DBState.db.extractJson}/>
+        </DependentOptions>
     {/if}
+    <Check bind:check={DBState.db.strictJsonSchema} name={language.strictJsonSchema} className="mt-4"/>
+    <Check bind:check={DBState.db.outputImageModal} name={language.outputImageModal} className="mt-4"/>
+    <span class="text-textcolor mt-4">{language.predictedOutput}</span>
+    <TextAreaInput bind:value={DBState.db.OAIPrediction}/>
+
+    <h3 class="mt-6 pb-1 font-semibold text-textcolor border-b border-darkborderc">{language.risuNest.promptOptions.assistive}</h3>
+    <span class="text-textcolor mt-4">{language.autoSuggest} <Help key='autoSuggest' /></span>
+    <TextAreaInput bind:value={DBState.db.autoSuggestPrompt} placeholder={defaultAutoSuggestPrompt}/>
 
     {#if !DBState.db.auxModelUnderModelSettings}
         <AuxModelSelectors />
@@ -338,4 +342,7 @@
         </Accordion>
     </Accordion>
 
+    {#if mode === 'independent'}
+        <PresetToggleEditor className="mt-4" />
+    {/if}
 {/if}

@@ -258,4 +258,60 @@ describe('custom toggles', () => {
         mocks.toggleEditor.props.onChange!('b=B\n=G=group')
         expect(DBState.db.customPromptTemplateToggle).toBe('b=B\n=G=group')
     })
+    it('offers no toggle editor in the inline settings', async () => {
+        DBState.db.customPromptTemplateToggle = 'a=A'
+        await unmount(instance)
+        mocks.toggleEditor.props = {}
+        instance = mount(PromptSettings, { target: document.body, props: { mode: 'inline', subMenu: 1 } })
+        await tick()
+        expect(document.querySelector(`input[alt="${language.formatMessageWithName}"]`)).not.toBeNull()
+        expect(mocks.toggleEditor.props).toEqual({})
+    })
+})
+
+describe('prompt options', () => {
+    /** The label span of an option, matched on its whole text. */
+    const label = (text: string) => [...document.querySelectorAll('span')].find(span => span.textContent?.trim() === text)
+    const checkbox = (name: string) => document.querySelector<HTMLInputElement>(`input[alt="${name}"]`)!
+    async function click(name: string) {
+        checkbox(name).click()
+        await tick()
+    }
+    async function showInline(values: Record<string, unknown>) {
+        Object.assign(DBState.db, values)
+        await unmount(instance)
+        instance = mount(PromptSettings, { target: document.body, props: { mode: 'inline', subMenu: 1 } })
+        await tick()
+    }
+
+    it('offers the named message role and format only while names are included, keeping their values', async () => {
+        await showInline({ namedMessageRole: 'assistant', messageNameTemplate: 'Synthetic {{slot}}' })
+        expect(label(language.namedMessageRole)).toBeUndefined()
+        expect(label(language.messageNameFormat)).toBeUndefined()
+        await click(language.formatMessageWithName)
+        expect(label(language.messageNameFormat)).toBeDefined()
+        expect((label(language.namedMessageRole)!.nextElementSibling as HTMLSelectElement).value).toBe('assistant')
+        await click(language.formatMessageWithName)
+        expect(label(language.namedMessageRole)).toBeUndefined()
+        expect(label(language.messageNameFormat)).toBeUndefined()
+        await click(language.formatMessageWithName)
+        expect((label(language.namedMessageRole)!.nextElementSibling as HTMLSelectElement).value).toBe('assistant')
+        expect(DBState.db).toMatchObject({ namedMessageRole: 'assistant', messageNameTemplate: 'Synthetic {{slot}}' })
+    })
+
+    it('offers the JSON schema and extraction only while the schema is enabled, and strict schema at all times', async () => {
+        await showInline({ jsonSchema: 'Synthetic schema', extractJson: 'answer', strictJsonSchema: true })
+        expect(label(language.jsonSchema)).toBeUndefined()
+        expect(label(language.extractJson)).toBeUndefined()
+        expect(checkbox(language.strictJsonSchema).checked).toBe(true)
+        await click(language.enableJsonSchema)
+        expect(label(language.jsonSchema)).toBeDefined()
+        expect((label(language.extractJson)!.nextElementSibling as HTMLInputElement).value).toBe('answer')
+        await click(language.enableJsonSchema)
+        expect(label(language.jsonSchema)).toBeUndefined()
+        expect(label(language.extractJson)).toBeUndefined()
+        await click(language.enableJsonSchema)
+        expect((label(language.extractJson)!.nextElementSibling as HTMLInputElement).value).toBe('answer')
+        expect(DBState.db).toMatchObject({ jsonSchema: 'Synthetic schema', extractJson: 'answer', strictJsonSchema: true })
+    })
 })

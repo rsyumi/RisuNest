@@ -1908,6 +1908,12 @@ export const languageKorean = {
             missingName: '이름이 비어 있어 사이드바에 표시되지 않습니다.',
             missingKeyAndName: '키와 이름이 비어 있어 사이드바에 표시되지 않습니다.',
         },
+        promptOptions: {
+            messages: '메시지 구성',
+            output: '출력',
+            assistive: '보조 기능',
+            count: '{0}개',
+        },
         presetBinding: {
             label: '프리셋 바인딩',
             missing: '바인딩한 프리셋 없음 · 현재 프리셋 사용',
