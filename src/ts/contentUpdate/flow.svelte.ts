@@ -594,9 +594,11 @@ export async function commitImportedCharacter(incoming: character, commit: (valu
     }
     const update = decision.kind === 'update' ? decision : null
     return underLoading(loading, async () => {
-        signal?.throwIfAborted()
+        if (signal?.aborted) return cancelImport(incoming, signal)
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.extentions = { ...(incoming.extentions ?? {}), [UPDATE_BASE_EXTENSION_KEY]: baseKey }
+        // An operation that ended while the base was saved stores nothing, and the base goes with the import's assets.
+        if (signal?.aborted) return cancelImport(incoming, signal)
         await commitImport(commit, incoming)
         if (!update) return incoming.chaId
         try {
@@ -662,9 +664,11 @@ export async function commitImportedModule(incoming: RisuModule, commit: (value:
     }
     const update = decision.kind === 'update' ? decision : null
     return underLoading(loading, async () => {
-        signal?.throwIfAborted()
+        if (signal?.aborted) return cancelImport(incoming, signal)
         const baseKey = await saveUpdateBase(baseData)
         if (baseKey) incoming.updateBase = baseKey
+        // An operation that ended while the base was saved stores nothing, and the base goes with the import's assets.
+        if (signal?.aborted) return cancelImport(incoming, signal)
         await commitImport(commit, incoming)
         if (!update) return incoming.id
         try {

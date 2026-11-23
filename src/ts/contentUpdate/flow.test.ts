@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
     duringNormalize: null as (() => void) | null,
     /** Awaited before the installed character is read for a comparison. */
     beforeRead: null as (() => Promise<void>) | null,
+    /** Awaited while an asset, such as the base of an import, is saved. */
+    duringSave: null as (() => Promise<void>) | null,
 }))
 const platform = vi.hoisted(() => ({ runtime: 'web' as 'tauri' | 'web', os: 'windows' as 'windows' | 'android' }))
 vi.mock('../platform', async () => (await import('../platform.testSupport')).platformModule(() => ({ runtime: platform.runtime, os: platform.os })))
@@ -25,6 +27,7 @@ vi.mock('@tauri-apps/api/core', async (importOriginal) => ({ ...await importOrig
 vi.mock('../globalApi.svelte', () => ({
     loadAsset: async (key: string) => mocks.assets.get(key) ?? null,
     saveAsset: async (data: Uint8Array) => {
+        await mocks.duringSave?.()
         const key = `assets/base-${mocks.assets.size + 1}.json`
         mocks.assets.set(key, data)
         return key
@@ -161,6 +164,7 @@ beforeEach(() => {
     mocks.duringBackup = null
     mocks.duringNormalize = null
     mocks.beforeRead = null
+    mocks.duringSave = null
     mocks.alertError.mockClear()
     mocks.alertConfirm.mockReset().mockResolvedValue(true)
     alertStore.set({ type: 'none', msg: '' })
@@ -266,6 +270,21 @@ describe('character update', () => {
         expect(contentUpdateDialog.request).toBeNull()
         expect(commitCharacter).not.toHaveBeenCalled()
         expect(commitModule).not.toHaveBeenCalled()
+    })
+
+    it.each(['character', 'module'] as const)('stores nothing when the import operation ends while the base is saved, and hands that base to the cleanup (%s)', async (kind) => {
+        platform.runtime = 'tauri'
+        const operation = new AbortController()
+        const expired = new Error('background time ended')
+        mocks.duringSave = async () => operation.abort(expired)
+        const stored = kind === 'character'
+            ? commitImportedCharacter(card('new', 'Luna'), commitCharacter, operation.signal)
+            : commitImportedModule({ id: 'new-module', name: 'Lore', description: '', lorebook: [] } as RisuModule, commitModule, operation.signal)
+        await expect(stored).rejects.toBe(expired)
+        expect(commitCharacter).not.toHaveBeenCalled()
+        expect(commitModule).not.toHaveBeenCalled()
+        expect(mocks.assets.size).toBe(1)
+        expect(await releasedKeys()).toEqual([...mocks.assets.keys()])
     })
 
     it.each(['character', 'module'] as const)('hands the base it saved to the cleanup when the import cannot be stored (%s)', async (kind) => {
@@ -437,6 +456,27 @@ describe('character update', () => {
         expect(contentUpdateDialog.plan!.items).toMatchObject([{ field: 'desc', status: 'update', choice: 'theirs' }])
         chooseContentUpdate('cancel')
         expect(await pending).toBeNull()
+    })
+
+    it('stores nothing and hands the assets of the import to the cleanup when the operation ends while low-level access is asked', async () => {
+        await commitImportedCharacter(card('first', 'Luna v1.0', { lowLevelAccess: false, triggerscript: [] }), commitCharacter)
+        mocks.details.get('first').lowLevelAccess = true
+        platform.runtime = 'tauri'
+        const operation = new AbortController()
+        const expired = new Error('background time ended')
+        mocks.alertConfirm.mockImplementationOnce(async () => {
+            operation.abort(expired)
+            return true
+        })
+        const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
+        const pending = commitImportedCharacter(card('next', 'Luna v1.1', { image: 'assets/next.png', triggerscript: [trigger] }), commitCharacter, operation.signal)
+        await opened()
+        await reviewContentUpdate()
+        for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        await expect(pending).rejects.toBe(expired)
+        expect(mocks.details.has('next')).toBe(false)
+        expect(await releasedKeys()).toContain('assets/next.png')
     })
 
     it('asks before low-level access the user turned on covers triggers the update takes', async () => {
