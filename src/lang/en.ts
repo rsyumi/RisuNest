@@ -2100,6 +2100,12 @@ export const languageEnglish = {
             missingName: 'Not shown in the sidebar because the name is empty.',
             missingKeyAndName: 'Not shown in the sidebar because the key and name are empty.',
         },
+        promptOptions: {
+            messages: 'Messages',
+            output: 'Output',
+            assistive: 'Assistive features',
+            count: '{0}',
+        },
         presetBinding: {
             label: 'Preset binding',
             missing: 'Preset unavailable, using current preset',

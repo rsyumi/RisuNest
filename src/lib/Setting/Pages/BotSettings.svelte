@@ -37,6 +37,8 @@
     import OpenrouterSettings from "./OpenrouterSettings.svelte";
     import ChatFormatSettings from "./ChatFormatSettings.svelte";
     import PromptSettings from "./PromptSettings.svelte";
+    import PresetToggleEditor from "./PresetToggleEditor.svelte";
+    import { customFlagsSummary, customTogglesSummary, listSummary, moduleIntegrationSummary, toolsSummary } from "src/ts/setting/othersTabSummaries";
     import PresetHeader from "./PresetHeader.svelte";
     import { openPresetList } from "src/ts/stores.svelte";
     import { updateActivePresetImage } from "src/ts/storage/database.svelte";
@@ -627,7 +629,7 @@
 {/if}
 
 {#if submenu === 3 || submenu === -1}
-    <Accordion styled name="Bias " help="bias">
+    <Accordion styled name="Bias " help="bias" summary={listSummary(DBState.db.bias)} openKey="botSettings.others.bias">
         <table class="contain w-full max-w-full tabler">
             <tbody>
             <tr>
@@ -680,7 +682,7 @@
         </div>
     </Accordion>
 
-    <Accordion styled name="{language.additionalParams} " help="additionalParams">
+    <Accordion styled name="{language.additionalParams} " help="additionalParams" summary={listSummary(DBState.db.additionalParams)} openKey="botSettings.others.additionalParams">
         <table class="contain w-full max-w-full tabler">
             <tbody>
             <tr>
@@ -719,7 +721,7 @@
     </Accordion>
 
 
-    <Accordion styled name={language.promptTemplate}>
+    <Accordion styled name={language.promptTemplate} openKey="botSettings.others.promptTemplate">
         {#if DBState.db.promptTemplate}
             {#if submenu !== -1}
                 <PromptSettings mode='inline' subMenu={1} />
@@ -730,6 +732,12 @@
             }}/>
         {/if}
     </Accordion>
+
+    {#if DBState.db.promptTemplate && submenu !== -1}
+        <Accordion styled name={language.customPromptTemplateToggle} help="customPromptTemplateToggle" summary={customTogglesSummary(DBState.db.customPromptTemplateToggle)} openKey="botSettings.others.customToggles">
+            <PresetToggleEditor hideLabel />
+        </Accordion>
+    {/if}
 
     {#snippet CustomFlagButton(name:string,flag:number)}
         <Button className="mt-2" onclick={(e) => {
@@ -744,7 +752,7 @@
         </Button>
     {/snippet}
 
-    <Accordion styled name={language.customFlags}>
+    <Accordion styled name={language.customFlags} summary={customFlagsSummary(DBState.db.enableCustomFlags, DBState.db.customFlags)} openKey="botSettings.others.customFlags">
         <Check bind:check={DBState.db.enableCustomFlags} name={language.enableCustomFlags}/>
 
 
@@ -777,11 +785,11 @@
         {/if}
     </Accordion>
 
-    <Accordion styled name={language.moduleIntergration} help="moduleIntergration">
+    <Accordion styled name={language.moduleIntergration} help="moduleIntergration" summary={moduleIntegrationSummary(DBState.db.moduleIntergration)} openKey="botSettings.others.moduleIntegration">
         <TextAreaInput bind:value={DBState.db.moduleIntergration} fullwidth height={"32"} autocomplete="off"/>
     </Accordion>
 
-    <Accordion styled name={language.tools}>
+    <Accordion styled name={language.tools} summary={toolsSummary(DBState.db.modelTools)} openKey="botSettings.others.tools">
         <Check name={language.search} check={DBState.db.modelTools.includes('search')} onChange={() => {
             if(DBState.db.modelTools.includes('search')){
                 DBState.db.modelTools = DBState.db.modelTools.filter((tool) => tool !== 'search')
@@ -792,11 +800,11 @@
         }} />
     </Accordion>
     
-    <Accordion styled name={language.regexScript}>
+    <Accordion styled name={language.regexScript} summary={listSummary(DBState.db.presetRegex)} openKey="botSettings.others.regexScript">
         <RegexList bind:value={DBState.db.presetRegex} buttons onImport={() => importPresetRegex(() => DBState.db, importRegex, () => alertError(language.presetActionFailed))} />
     </Accordion>
 
-    <Accordion styled name={language.icon}>
+    <Accordion styled name={language.icon} openKey="botSettings.others.icon">
         <div class="p-2 rounded-md border border-darkborderc flex flex-col items-center gap-2">
             <span>
                 {language.preview}
