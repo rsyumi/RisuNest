@@ -289,7 +289,7 @@ describe('toggle edits over the whole corpus', () => {
     ])
     /** The tree with one item taken out and put at a gap. */
     function moveInTree(items: Tree, id: number, gap: ToggleGap): Tree {
-        const next = items.map((item) => ({ ...item, children: item.children && [...item.children] }))
+        const next: Tree = items.map((item) => ({ ...item, children: item.children && [...item.children] }))
         const top = next.findIndex((item) => item.id === id)
         const [moved] = top !== -1 ? next.splice(top, 1) : [{ id }]
         for (const item of next) if (item.children?.includes(id)) item.children.splice(item.children.indexOf(id), 1)
@@ -360,7 +360,7 @@ describe('toggle edits over the whole corpus', () => {
                     const [row, ...ends] = after.filter((line) => !known.has(line.id) && line.kind !== 'groupEnd')
                     expect(ends, label).toEqual([])
                     expect(parseToggleDefinitions(row.raw)[0].kind, label).toBe(kind)
-                    const expected = tree(lines).map((item) => ({ ...item, children: item.children && [...item.children] }))
+                    const expected: Tree = tree(lines).map((item) => ({ ...item, children: item.children && [...item.children] }))
                     if (group === null) expected.push(kind === 'group' ? { id: row.id, children: [] } : { id: row.id })
                     else expected.find((item) => item.id === group)!.children!.push(row.id)
                     expect(tree(after), label).toEqual(expected)
