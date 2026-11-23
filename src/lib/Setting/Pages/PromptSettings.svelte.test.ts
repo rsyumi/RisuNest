@@ -345,6 +345,16 @@ describe('prompt search', () => {
         expect(marks('Intro')).toEqual(['{{persona}}', '{{persona}}'])
         expect(lineTexts('{{persona}} rules')).toEqual([[language.name, '{{persona}} rules']])
 
+        // A changed query ends that list for good, so the query typed again lists only what it matches.
+        await type(searchInput(), 'Lore')
+        await vi.waitFor(() => expect(listed()).toEqual(['Lore']))
+        await type(searchInput(), '{{USER}}')
+        await vi.waitFor(() => expect(bar()!.textContent)
+            .toContain(`${text.matchCount.replace('{0}', '0')} · ${language.risuNest.promptList.count.replace('{0}', '0')}`))
+        expect(listed()).toEqual([])
+        expect(document.body.textContent).toContain(text.noMatch)
+        expect(bar()!.textContent).toContain(text.replaced.replace('{0}', '4'))
+
         barButton(text.undo).click()
         await tick()
         expect(DBState.db.promptTemplate.map(item => [item.name, (item as { text?: string }).text])).toEqual([
@@ -376,6 +386,18 @@ describe('prompt search', () => {
         // Undo is offered for the preset it was made in.
         expect(bar()!.textContent).toContain(text.undo)
         DBState.db.botPresetsId = 1
+        await tick()
+        expect(bar()!.textContent).not.toContain(text.undo)
+
+        // Nor once none of the blocks it changed is in the list, which can be replaced while the preset stays.
+        await type(bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!, 'Keep')
+        await type(searchInput(), 'Remain')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} rules']))
+        ;[...card('{{user}} rules').querySelectorAll('button')].find(button => button.textContent === text.replace)!.click()
+        await tick()
+        expect((DBState.db.promptTemplate[2] as { text: string }).text).toBe('Keep in character.')
+        expect(bar()!.textContent).toContain(text.undo)
+        DBState.db.promptTemplate = DBState.db.promptTemplate.map(item => ({ ...item }))
         await tick()
         expect(bar()!.textContent).not.toContain(text.undo)
     })
@@ -423,7 +445,7 @@ describe('prompt search', () => {
         }
     })
 
-    it('opens the search with Ctrl+F, or focuses and selects its text when it is open', async () => {
+    it('opens the search with Ctrl+F or focuses and selects its text, and closes it with the last block', async () => {
         const press = (init: KeyboardEventInit) => {
             const event = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true, ...init })
             document.body.dispatchEvent(event)
@@ -440,6 +462,18 @@ describe('prompt search', () => {
         press({})
         await vi.waitFor(() => expect(document.activeElement).toBe(searchInput()))
         expect([searchInput().selectionStart, searchInput().selectionEnd]).toEqual([0, 5])
+
+        // The bar sits under the list's toolbar, which goes with the last block, so the search closes and Ctrl+F is left alone.
+        const removes = () => document.querySelectorAll<HTMLButtonElement>(`button[aria-label="${language.remove}"]`)
+        await type(searchInput(), '')
+        await vi.waitFor(() => expect(removes()).toHaveLength(4))
+        for (const remove of removes()) remove.click()
+        await vi.waitFor(() => expect(DBState.db.promptTemplate).toEqual([]))
+        await tick()
+        expect(bar()).toBeNull()
+        expect(press({}).defaultPrevented).toBe(false)
+        await tick()
+        expect(bar()).toBeNull()
     })
 })
 

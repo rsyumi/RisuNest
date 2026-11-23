@@ -84,3 +84,42 @@ describe('popup editor keyboard entry', () => {
         expect(highlight ? target.textContent : (target as HTMLTextAreaElement).value).toBe('preserve text')
     })
 })
+
+describe('selectRange', () => {
+    // The instance function a parent reaches through bind:this.
+    const selectRange = (range: { start: number, end: number } | null): boolean => component!.selectRange(range)
+
+    it('selects the range in the plain textarea, or only focuses it when there is no range that fits', async () => {
+        const textarea = await input() as HTMLTextAreaElement
+        expect(selectRange({ start: 9, end: 13 })).toBe(true)
+        expect(document.activeElement).toBe(textarea)
+        expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([9, 13])
+        textarea.blur()
+        expect(selectRange(null)).toBe(false)
+        expect(document.activeElement).toBe(textarea)
+        expect(selectRange({ start: 3, end: 99 })).toBe(false)
+    })
+
+    it('selects the range in the highlighted editor, across its text nodes', async () => {
+        const editor = await input(true)
+        expect(selectRange({ start: 9, end: 13 })).toBe(true)
+        expect(document.activeElement).toBe(editor)
+        expect(window.getSelection()!.toString()).toBe('text')
+        editor.replaceChildren(document.createTextNode('preserve '), document.createTextNode('text'))
+        expect(selectRange({ start: 6, end: 11 })).toBe(true)
+        expect(window.getSelection()!.toString()).toBe('ve te')
+        expect(window.getSelection()!.getRangeAt(0).startContainer).toBe(editor.childNodes[0])
+        expect(window.getSelection()!.getRangeAt(0).endContainer).toBe(editor.childNodes[1])
+        expect(selectRange({ start: 10, end: 12 })).toBe(true)
+        expect(window.getSelection()!.toString()).toBe('ex')
+    })
+
+    it('only focuses the highlighted editor while its text differs from the value', async () => {
+        const editor = await input(true)
+        editor.replaceChildren(document.createTextNode('changed text'))
+        window.getSelection()!.removeAllRanges()
+        expect(selectRange({ start: 0, end: 5 })).toBe(false)
+        expect(document.activeElement).toBe(editor)
+        expect(window.getSelection()!.toString()).toBe('')
+    })
+})

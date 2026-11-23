@@ -327,6 +327,10 @@
             textareaDom.focus({ preventScroll: true })
             if (!valid || textareaDom.value !== text) return false
             textareaDom.setSelectionRange(range.start, range.end)
+            // Selecting does not scroll the textarea, so the start of the range is brought to about a third of its height.
+            if (textareaDom.scrollHeight > textareaDom.clientHeight) {
+                textareaDom.scrollTop = textareaTextTop(textareaDom, range.start) - textareaDom.clientHeight / 3
+            }
             return true
         }
         if (!inputDom) return false
@@ -357,6 +361,32 @@
             offset += length
         }
         return false
+    }
+
+    /** The top of the text at `index` in the textarea's scrolled content, measured on a hidden copy laid out at the same width, since wrapped lines have no fixed height. */
+    function textareaTextTop(textarea: HTMLTextAreaElement, index: number): number {
+        const style = getComputedStyle(textarea)
+        const width = textarea.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+        const mirror = document.createElement('div')
+        mirror.style.cssText = `position:absolute;top:0;left:0;visibility:hidden;pointer-events:none;box-sizing:content-box;border:0;margin:0;height:auto;overflow:hidden;width:${width}px`
+        for (const property of [
+            'font-family', 'font-size', 'font-weight', 'font-style', 'font-variant', 'font-stretch', 'font-kerning',
+            'font-feature-settings', 'font-variation-settings', 'line-height', 'letter-spacing', 'word-spacing',
+            'text-transform', 'text-indent', 'tab-size', 'white-space', 'overflow-wrap', 'word-break', 'direction',
+            'padding-top', 'padding-right', 'padding-left',
+        ]) {
+            mirror.style.setProperty(property, style.getPropertyValue(property))
+        }
+        const text = textarea.value
+        const lineEnd = text.indexOf('\n', index)
+        const marker = document.createElement('span')
+        // The rest of the line makes a word around `index` wrap where it does in the textarea.
+        marker.textContent = text.slice(index, lineEnd === -1 ? undefined : lineEnd) || '.'
+        mirror.append(text.slice(0, index), marker)
+        document.body.append(mirror)
+        const top = marker.offsetTop
+        mirror.remove()
+        return top
     }
 
     const highlightChange = async (value:string, highlightId:number) => {

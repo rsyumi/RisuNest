@@ -124,7 +124,8 @@
     }
   })
 
-  type SearchRecord = { key: string, all: boolean, changes: PromptFieldChange[], count: number }
+  // `listing` is set by replacing every match, until the query or an option changes.
+  type SearchRecord = { key: string, listing: boolean, changes: PromptFieldChange[], count: number }
   let searchOpen = $state(false)
   let searchQuery = $state('')
   let appliedQuery = $state('')
@@ -164,7 +165,13 @@
     }
     return { matches, blocks }
   })
-  const changesView = $derived(searchResults && searchRecord?.all && searchRecord.key === searchKey ? searchRecord : null)
+  const changesView = $derived(searchResults && searchRecord?.listing && searchRecord.key === searchKey ? searchRecord : null)
+  $effect(() => {
+    const key = searchKey
+    untrack(() => {
+      if (searchRecord?.listing && searchRecord.key !== key) searchRecord = { ...searchRecord, listing: false }
+    })
+  })
   const searchShown = $derived.by(() => {
     if (!searchResults) return null
     const template = DBState.db.promptTemplate
@@ -192,14 +199,21 @@
     })
   })
 
+  // The search closes on leaving the list, and with the last block, which takes the toolbar the bar sits under.
   $effect(() => {
-    if (subMenu !== 0) untrack(closeSearch)
+    if (searchOpen && (subMenu !== 0 || DBState.db.promptTemplate.length === 0)) untrack(closeSearch)
   })
 
   const editedPreset = $derived(DBState.db.botPresets?.[DBState.db.botPresetsId]?.id ?? DBState.db.botPresetsId)
   $effect(() => {
     void editedPreset
     untrack(() => { searchRecord = null })
+  })
+  // The template can be swapped without the preset changing, so the undo also ends once none of its blocks is left.
+  $effect(() => {
+    if (searchRecord && !searchRecord.changes.some(change => DBState.db.promptTemplate.includes(change.block))) {
+      untrack(() => { searchRecord = null })
+    }
   })
 
   function closeSearch() {
@@ -234,7 +248,7 @@
 
   function recordSearchReplace(changes: PromptFieldChange[], all: boolean) {
     writeSearchFields(changes.map(change => ({ block: change.block, field: change.field, value: change.after })))
-    searchRecord = { key: searchKey, all, changes, count: changes.reduce((sum, change) => sum + change.written.length, 0) }
+    searchRecord = { key: searchKey, listing: all, changes, count: changes.reduce((sum, change) => sum + change.written.length, 0) }
   }
 
   function replaceAllSearchMatches() {
@@ -285,7 +299,7 @@
     if (e.ctrlKey && e.altKey && e.key === 'o') {
       toggleAllOpened()
     }
-    if (subMenu === 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+    if (subMenu === 0 && DBState.db.promptTemplate.length > 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
       e.preventDefault()
       openSearch()
     }
@@ -332,7 +346,7 @@
 
 {#if subMenu === 0}
     {#if DBState.db.promptTemplate.length > 0}
-        <div class="flex items-center gap-2 px-3 mt-4">
+        <div class="relative z-[51] flex items-center gap-2 px-3 mt-4">
             <span class="grow text-sm text-textcolor2">{language.risuNest.promptList.count.replace('{0}', String(DBState.db.promptTemplate.length))}</span>
             <button class="hover:bg-darkbg focus:ring-selected border-darkborderc border rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 inline-flex items-center gap-1.5 px-2 py-1 text-sm {searchOpen ? 'bg-selected text-textcolor' : 'bg-transparent text-textcolor2'}" aria-pressed={searchOpen} onclick={() => searchOpen ? closeSearch() : openSearch()}>
                 <SearchIcon size={14} />{language.search}
