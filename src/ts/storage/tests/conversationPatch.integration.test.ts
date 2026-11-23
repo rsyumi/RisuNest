@@ -137,6 +137,7 @@ async function setup(database = makeDatabase()) {
         chatView: { register: vi.fn(), unregister: vi.fn(), dispose: vi.fn() },
         generationEnd: { register: vi.fn(), unregister: vi.fn(), dispose: vi.fn() },
         hasDatabasePermission: async () => true,
+        hasDatabaseWritePermission: async () => true,
         hasHostToolPermission: async () => true,
         lifetimeSignal: new AbortController().signal,
     })
@@ -464,6 +465,8 @@ describe('risunestPatchConversation during a generation', () => {
         let closed = false
 
         const pending = harness.patch({ ...selected, mutationId: 'slow', messages: [{ index: 1, messageId: 'm1', set: { __tr: 'slow' } }] })
+        // The patch joins the request phase once its permission answer is in.
+        for (let tick = 0; tick < 20; tick++) await Promise.resolve()
         const closing = close().then(() => { closed = true })
         for (let tick = 0; tick < 20; tick++) await Promise.resolve()
         expect(isGenerationRequestPhaseOpen(selected)).toBe(false)

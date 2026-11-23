@@ -665,11 +665,11 @@ const unloadV3Plugin = async (pluginName: string) => {
     }
 }
 
-type PluginPermission = 'fetchLogs' | 'db' | 'mainDom' | 'replacer' | 'provider' | 'sendChat' | 'inlay' | 'hostTools'
+type PluginPermission = 'fetchLogs' | 'db' | 'dbWrite' | 'mainDom' | 'replacer' | 'provider' | 'sendChat' | 'inlay' | 'hostTools'
 
 const permissionWrites = new Mutex()
 let permissionEpoch = 0
-const periodicPermissions = new Set<PluginPermission>(['db', 'replacer', 'provider', 'inlay', 'hostTools'])
+const periodicPermissions = new Set<PluginPermission>(['db', 'dbWrite', 'replacer', 'provider', 'inlay', 'hostTools'])
 const permissionReconfirmInterval = 7 * 24 * 60 * 60 * 1000
 interface PluginPermissionContext {
     name: string
@@ -719,6 +719,7 @@ const getPluginPermission = async (context: PluginPermissionContext, permissionD
     const alertTitle =
         permissionDesc === 'fetchLogs' ? language.fetchLogConsent.replace("{}", pluginName)
         : permissionDesc === 'db' ? language.getFullDatabaseConsent.replace("{}", pluginName)
+        : permissionDesc === 'dbWrite' ? language.dbWriteConsent.replace("{}", pluginName)
         : permissionDesc === 'mainDom' ? language.mainDomAccessConsent.replace("{}", pluginName)
         : permissionDesc === 'replacer' ? language.replacerPermissionConsent.replace("{}", pluginName)
         : permissionDesc === 'provider' ? language.providerPermissionConsent.replace("{}", pluginName)
@@ -798,6 +799,7 @@ const makeRisuaiAPIV3 = (
         chatView: chatViewEvents.forOwner(plugin.name),
         generationEnd: generationEndEvents.forOwner(plugin.name),
         hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
+        hasDatabaseWritePermission: () => getPluginPermission(permissionContext, 'dbWrite', 'periodically'),
         hasHostToolPermission: () => getPluginPermission(permissionContext, 'hostTools', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
@@ -807,11 +809,17 @@ const makeRisuaiAPIV3 = (
     })
     const getCompleteCurrentCharacter = () =>
         databaseAccess.getFullObjectSnapshotStream({}, fullObjectContext())
-    const setCompleteCurrentCharacter = (character: unknown) =>
+    // A write the user declines is skipped, and the call still resolves.
+    const withDbWrite = <A extends unknown[]>(write: (...args: A) => unknown) =>
+        async (...args: A): Promise<void> => {
+            if (!(await getPluginPermission(permissionContext, 'dbWrite', 'periodically'))) return
+            await write(...args)
+        }
+    const setCompleteCurrentCharacter = withDbWrite((character: unknown) =>
         databaseAccess.setCurrentCharacter(
             character as any,
             fullObjectContext(),
-        )
+        ))
     addPluginUnloadCallback(plugin.name, () => {
         pluginLifetime.abort()
         databaseAccess.closeReadBaselines?.()
@@ -932,10 +940,10 @@ const makeRisuaiAPIV3 = (
             if (mode !== 'output') throw (`chat listener mode ${mode} not found`)
             removeChatOutputListener(pluginV2.chatOutput, func as ChatOutputListener)
         },
-        setDatabaseLite: (database: Record<string, unknown>) =>
-            databaseAccess.setDatabaseLite(database, allowedDbKeys),
-        setDatabase: (database: Record<string, unknown>) =>
-            databaseAccess.setDatabase(database, allowedDbKeys),
+        setDatabaseLite: withDbWrite((database: Record<string, unknown>) =>
+            databaseAccess.setDatabaseLite(database, allowedDbKeys)),
+        setDatabase: withDbWrite((database: Record<string, unknown>) =>
+            databaseAccess.setDatabase(database, allowedDbKeys)),
         loadPlugins: oldApis.loadPlugins,
         readImage: (path: string) => oldApis.readImage(path, { background: true }),
         readInlay: async (id: string) => {
@@ -1110,13 +1118,13 @@ const makeRisuaiAPIV3 = (
                 { characterIndex: index }, fullObjectContext(),
             )
         },
-        setCharacterToIndex: (index:number, char:any) => {
+        setCharacterToIndex: withDbWrite((index:number, char:any) => {
             return databaseAccess.setCharacterToIndex(
                 index,
                 char,
                 fullObjectContext(),
             )
-        },
+        }),
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
             return databaseAccess.getFullObjectSnapshotStream(
                 { characterIndex, chatIndex },
@@ -1125,14 +1133,14 @@ const makeRisuaiAPIV3 = (
         },
         parseRisuChat: (text: string, options?: Parameters<typeof parseRisuChat>[1]) =>
             parseRisuChat(text, options, pluginLifetime.signal),
-        setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
+        setChatToIndex: withDbWrite((characterIndex:number, chatIndex:number, chat:any) => {
             return databaseAccess.setChatToIndex(
                 characterIndex,
                 chatIndex,
                 chat,
                 fullObjectContext(),
             )
-        },
+        }),
         getCurrentCharacterIndex: () => {
             const selected = get(selectedCharID)
             if (selected < 0) return selected

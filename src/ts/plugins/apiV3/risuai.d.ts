@@ -2295,7 +2295,7 @@ interface RisuaiPluginAPI {
      * @param permission - Permission string (e.g. 'fetchLogs'|'db'|'dbWrite'|'mainDom')
      * @returns True if permission granted, false otherwise
      */
-    requestPluginPermission(permission: 'fetchLogs' | 'db' | 'mainDom' | 'replacer' | 'provider' | 'sendChat' | 'inlay'): Promise<boolean>;
+    requestPluginPermission(permission: 'fetchLogs' | 'db' | 'dbWrite' | 'mainDom' | 'replacer' | 'provider' | 'sendChat' | 'inlay'): Promise<boolean>;
 
     /**
      * Unwraps a SafeClassArray into a standard array

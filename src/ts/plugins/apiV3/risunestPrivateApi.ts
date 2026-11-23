@@ -25,6 +25,8 @@ export interface RisunestPrivateApiDependencies {
     generationEnd: GenerationEndListenerAccess
     /** The periodic `db` permission, the one `getDatabase` asks for. */
     hasDatabasePermission(): Promise<boolean>
+    /** The periodic `dbWrite` permission, the one `setChatToIndex` asks for. */
+    hasDatabaseWritePermission(): Promise<boolean>
     /** The periodic `hostTools` permission that the host tool methods ask for. */
     hasHostToolPermission(): Promise<boolean>
     lifetimeSignal: AbortSignal
@@ -79,6 +81,10 @@ export function createRisunestPrivateApi(dependencies: RisunestPrivateApiDepende
             return patchLedger.run(request.mutationId, async () => {
                 const linked = linkPluginQueryAbortSignals(signal, dependencies.lifetimeSignal)
                 try {
+                    throwIfAborted(linked.signal)
+                    if (!(await dependencies.hasDatabaseWritePermission())) {
+                        throw new Error('Conversation patches require the dbWrite permission')
+                    }
                     throwIfAborted(linked.signal)
                     return await dependencies.patchAccess.patchConversation(request, linked.signal)
                 } finally {
