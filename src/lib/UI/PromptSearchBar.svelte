@@ -20,7 +20,7 @@
         /** Shown while a query is active. */
         counts: { matches: number, blocks: number } | null
         canReplace: boolean
-        /** The result of the last replace, shown with 되돌리기. */
+        /** The result of the last replace, shown with the undo button. */
         status: string
         onReplaceAll: () => void
         onUndo: () => void

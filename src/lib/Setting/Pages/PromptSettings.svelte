@@ -131,9 +131,9 @@
   let searchMatchCase = $state(false)
   let searchRegex = $state(false)
   let searchShowReplace = $state(false)
-  // The last replace, for 되돌리기 and for listing what 모두 바꾸기 wrote.
+  // The last replace, for undo and for listing what replacing every match wrote.
   let searchRecord: SearchRecord | null = $state.raw(null)
-  // Blocks listed while open, and blocks one 바꾸기 changed, stay listed for the query they were listed under.
+  // Blocks listed while open, and blocks a single replace changed, stay listed for the query they were listed under.
   let keptOpen = $state.raw({ key: '', items: new Set<PromptItem>() })
   let keptReplaced = $state.raw({ key: '', items: new Set<PromptItem>() })
   let searchBar: { focusQuery?: () => void } | undefined = $state()

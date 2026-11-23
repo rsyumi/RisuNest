@@ -98,10 +98,11 @@ describe('replacing', () => {
         expect(change.after).toBe('Minji Kim, Jiwoo Lee')
         expect(change.written).toEqual([{ start: 0, end: 9 }, { start: 11, end: 20 }])
         const text = 'ab-cd-ef'
-        for (const template of ['$1$2', '$&!', '$`|', "$'|", '$$', '$0', '$01', '$10', '$3', '$<n>', '$<x', 'end$', '$<missing>']) {
-            const pattern = '(\\w)(?<n>\\w)'
-            const [replaced] = replaceAllInBlocks([block(text)], regex(pattern), template)
-            expect(replaced?.after ?? text, template).toBe(text.replace(new RegExp(pattern, 'gmi'), template))
+        for (const pattern of ['(\\w)(?<n>\\w)', '(\\w)(\\w)']) {
+            for (const template of ['$1$2', '$&!', '$`|', "$'|", '$$', '$0', '$01', '$10', '$3', '$<n>', '$<x', 'end$', '$<missing>']) {
+                const [replaced] = replaceAllInBlocks([block(text)], regex(pattern), template)
+                expect(replaced?.after ?? text, `${pattern} ${template}`).toBe(text.replace(new RegExp(pattern, 'gmi'), template))
+            }
         }
     })
 
