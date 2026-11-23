@@ -82,10 +82,9 @@ export function createRisunestPrivateApi(dependencies: RisunestPrivateApiDepende
                 const linked = linkPluginQueryAbortSignals(signal, dependencies.lifetimeSignal)
                 try {
                     throwIfAborted(linked.signal)
-                    if (!(await dependencies.hasDatabaseWritePermission())) {
-                        throw new Error('Conversation patches require the dbWrite permission')
-                    }
+                    const granted = await dependencies.hasDatabaseWritePermission()
                     throwIfAborted(linked.signal)
+                    if (!granted) throw new Error('Conversation patches require the dbWrite permission')
                     return await dependencies.patchAccess.patchConversation(request, linked.signal)
                 } finally {
                     linked.dispose()

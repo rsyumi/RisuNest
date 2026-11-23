@@ -387,6 +387,26 @@ describe('Plugin v3 runtime consent and ownership', () => {
         expect(fixture.replacers.get('beforeRequest')?.size).toBe(0)
     })
 
+    it('ends the writes waiting on the dbWrite question when the plugin unloads', async () => {
+        const api = await start()
+        vi.mocked(alertConfirm).mockImplementation(() => new Promise(() => {}))
+        vi.mocked(linkPluginQueryAbortSignals).mockImplementation(() => ({ signal: new AbortController().signal, dispose() {} }))
+        const write = api.setDatabaseLite({ username: 'synthetic' })
+        const patch = api.risunestPatchConversation({
+            characterId: 'active',
+            conversationId: 'active-chat',
+            mutationId: 'unloaded',
+            messages: [{ index: 0, messageId: 'm0', set: { __tr: 'text' } }],
+        })
+        await vi.waitFor(() => expect(alertConfirm).toHaveBeenCalled())
+
+        await loadV3Plugins([])
+
+        await expect(write).resolves.toBeUndefined()
+        await expect(patch).rejects.toThrow()
+        expect(fixture.scopedAccess.setDatabaseLite).not.toHaveBeenCalled()
+    })
+
     it('replaces provider metadata and cleans up the currently owned registration', async () => {
         const api = await start()
         api.addProvider('provider', vi.fn(), { model: { name: 'First' } })

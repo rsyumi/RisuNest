@@ -150,6 +150,13 @@ describe('risunestPatchConversation', () => {
         lifetime.abort()
         finish()
         await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+
+        const unloading = setup()
+        unloading.hasDatabaseWritePermission.mockImplementationOnce(async () => {
+            unloading.lifetime.abort()
+            return false
+        })
+        await expect(unloading.api.patchConversation(input)).rejects.toMatchObject({ name: 'AbortError' })
     })
 })
 
