@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { language } from 'src/lang'
 import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
 
@@ -42,9 +42,9 @@ async function setup() {
     instance = mount(TriggerV2List, { target: document.body, props: {
         get value() { return value }, set value(next) { value = next },
     } })
-    await tick()
+    await domSettled()
     buttonNamed(language.edit).click()
-    await tick()
+    await domSettled()
 }
 
 function hold(element: Element, y: number) {
@@ -62,7 +62,7 @@ function drag(element: Element, fromY: number, toY: number) {
 async function openMenu(element: Element, y: number) {
     hold(element, y)
     touch(element, 'touchend', 30, y)
-    await tick()
+    await domSettled()
 }
 
 beforeEach(() => {
@@ -126,16 +126,16 @@ describe('TriggerV2List touch on a phone-width screen', () => {
         const rows = triggerRows()
         await openMenu(rows[1], 60)
         buttonNamed(language.copy).click()
-        await tick()
+        await domSettled()
         await openMenu(rows[2], 100)
         buttonNamed(language.paste).click()
-        await tick()
+        await domSettled()
         expect(value.map(trigger => trigger.comment)).toEqual(['', 'First', 'Second', 'Second', 'Third'])
 
         await openMenu(rows[0], 20)
         expect(offersPaste()).toBe(true)
         touch(document.body, 'touchstart', 5, 5)
-        await tick()
+        await domSettled()
         expect(offersPaste()).toBe(false)
     })
 
@@ -143,10 +143,10 @@ describe('TriggerV2List touch on a phone-width screen', () => {
         await setup()
         await openMenu(effectRows()[0].firstElementChild!.firstElementChild!, 20)
         buttonNamed(language.copy).click()
-        await tick()
+        await domSettled()
         await openMenu(buttonNamed('...'), 200)
         buttonNamed(language.paste).click()
-        await tick()
+        await domSettled()
         expect(value[1].effect.map((effect: { value: string }) => effect.value)).toEqual(['one', 'two', 'three', 'one'])
     })
 })

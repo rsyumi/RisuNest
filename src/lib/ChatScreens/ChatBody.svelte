@@ -12,7 +12,8 @@
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
     import { DeferredInlayMarkerRegistry, mountDeferredInlaySources, resolveDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
-    import { onDestroy, tick, untrack } from 'svelte'
+    // settled() resolves once the DOM update commits; tick() would also wait for a frame or timer.
+    import { onDestroy, settled as domSettled, untrack } from 'svelte'
     import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
@@ -726,7 +727,7 @@
             displayedHtml = html
             if (job.reads) displayRow?.track('body', job.reads)
             pendingPreview = null
-            await tick()
+            await domSettled()
             if (previousDisplay !== job) disposeParseJob(previousDisplay)
             if (destroyed || job.disposed || job !== markParsingResult) {
                 if (job !== displayedParseJob) disposeParseJob(job)
@@ -764,7 +765,7 @@
                 return
             }
             job.releaseObjectUrls = releaseObjectUrls
-            await tick()
+            await domSettled()
             if (
                 destroyed ||
                 job.disposed ||
@@ -818,7 +819,7 @@
             displayedParseJob = null
             displayedHtml = ''
             const settled = onDisplaySettled
-            void tick().then(() => {
+            void domSettled().then(() => {
                 if (!destroyed && (currentThoughtPreview || shouldRenderRawStreaming)) settled?.()
             })
             return

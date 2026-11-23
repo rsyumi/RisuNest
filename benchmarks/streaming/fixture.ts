@@ -1,5 +1,5 @@
 import "../../src/styles.css";
-import { mount, tick, unmount } from "svelte";
+import { mount, settled as domSettled, unmount } from "svelte";
 import Fixture from "./Fixture.svelte";
 import { DBState, selectedCharID } from "../../src/ts/stores.svelte";
 import {
@@ -92,11 +92,11 @@ export function startStreamingSmoke() {
     marker: "synthetic-v1",
     configure: async (mode: "recent" | "collapsed" | "off", defer: boolean) => {
       fixture.configure(mode, defer);
-      await tick();
+      await domSettled();
     },
     publish: async (source: string, active = true) => {
       fixture.publish(source, active);
-      await tick();
+      await domSettled();
     },
     sourceMatches: fixture.sourceMatches,
     debugState: () => ({
@@ -122,7 +122,7 @@ export function startStreamingSmoke() {
       const scripts = enabled ? removalScripts : [];
       DBState.db.characters[0].customscript = scripts;
       fixture.setScripts(scripts);
-      await tick();
+      await domSettled();
     },
   };
   let regexFixtureStarted = false;

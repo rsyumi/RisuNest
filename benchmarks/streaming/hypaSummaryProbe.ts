@@ -1,4 +1,4 @@
-import { mount, tick, unmount } from "svelte";
+import { mount, settled as domSettled, unmount } from "svelte";
 import SummaryItem from "../../src/lib/Others/HypaV3Modal/modal-summary-item.svelte";
 import type { SerializableHypaV3Data, SerializableSummary } from "../../src/ts/process/memory/hypav3";
 import type { SummaryItemState } from "../../src/lib/Others/HypaV3Modal/types";
@@ -86,7 +86,7 @@ export async function runHypaSummaryProbe(stopStreamingFixture: () => Promise<vo
       await runtime.initializeActiveWorkingSet(DBState.db);
       requireProbe(runtime.tryDemoteSelectedConversation(), "metadata-demotion-required");
       requireProbe(isMetadataOnlySelectedConversation(DBState.db.characters[0].chats[0]), "metadata-only-selection-required");
-      await tick();
+      await domSettled();
     };
     const measure = async (concurrentSave: boolean) => {
       await prepareSelection();
@@ -158,13 +158,13 @@ export async function runHypaSummaryProbe(stopStreamingFixture: () => Promise<vo
             expandedMessageState: null, searchState: null, filterSelected: false, categories: [] },
         }));
       }
-      await tick();
+      await domSettled();
       const buttons = [...host.querySelectorAll<SVGElement>("svg.lucide-refresh-cw")]
         .map((icon) => icon.closest("button")!);
       requireProbe(buttons.length === SUMMARY_COUNT, "reroll-controls-required");
       let enabled = 0;
       while (performance.now() - started < DEADLINE_MS) {
-        await tick();
+        await domSettled();
         enabled = buttons.filter((button) => !button.disabled).length;
         if (enabled === SUMMARY_COUNT) break;
         await pause();

@@ -129,8 +129,10 @@ describe('app lock settings', () => {
         expect(host.textContent).not.toContain(language.risuNest.appLock.noRecovery)
         toggle(language.risuNest.appLock.native).click()
         await tick()
-        await vi.waitFor(() => expect(toggle(language.risuNest.appLock.native).disabled).toBe(false))
-        expect(toggle(language.risuNest.appLock.native).checked).toBe(false)
+        await vi.waitFor(() => {
+            expect(toggle(language.risuNest.appLock.native).disabled).toBe(false)
+            expect(toggle(language.risuNest.appLock.native).checked).toBe(false)
+        })
         expect(host.textContent).not.toContain(language.risuNest.appLock.nativeUnavailable)
         boundary.outcome = 'success'
         toggle(language.risuNest.appLock.native).click()

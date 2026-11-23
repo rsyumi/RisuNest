@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 
 vi.mock('src/ts/platform', async () => (await import('src/ts/platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
@@ -46,7 +46,7 @@ let component: ReturnType<typeof mount> | undefined
 let target: HTMLDivElement | undefined
 
 async function settle(): Promise<void> {
-    for (let index = 0; index < 8; index += 1) await tick()
+    for (let index = 0; index < 8; index += 1) await domSettled()
 }
 
 async function open(seed = true, pluginNames?: string[]): Promise<HTMLDivElement> {

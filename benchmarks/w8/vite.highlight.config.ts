@@ -16,6 +16,7 @@ export default defineConfig({
                 if (warning.code.startsWith('a11y-')) return
                 handler(warning)
             },
+            compilerOptions: { experimental: { async: true } },
         }),
         wasm(),
     ],

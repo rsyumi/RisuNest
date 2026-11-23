@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { languageEnglish } from 'src/lang/en'
 import type { PlatformShape } from 'src/ts/platform.testSupport'
 const f = vi.hoisted(() => ({ pending: vi.fn(async (): Promise<number | undefined> => undefined), ensure: vi.fn(), connect: vi.fn(), dismiss: vi.fn(), complete: vi.fn(), configure: vi.fn(), bind: vi.fn(), disconnect: vi.fn(), hold: vi.fn(), release: vi.fn(), status: vi.fn(), policy: vi.fn(), evict: vi.fn(), cancel: vi.fn(), checkbox: vi.fn(), action: vi.fn(), native: true, scan: false, scanner: { scan: vi.fn(), cancel: vi.fn() }, switchFormat: vi.fn(), retry: vi.fn(), os: 'windows', listeners: new Set<(value: Record<string, unknown>) => void>(), bindingState: vi.fn(), preset: vi.fn(), state: { db: {} as Record<string, unknown> }, view: { status: { configured: false }, paused: false } as Record<string, unknown> }))
@@ -58,9 +58,9 @@ beforeEach(() => {
     f.pending.mockResolvedValue(undefined)
 })
 afterEach(async () => { if (component) await unmount(component); component = undefined; host.remove() })
-const settle = async () => { for (let i = 0; i < 12; i++) await tick() }
+const settle = async () => { for (let i = 0; i < 12; i++) await domSettled() }
 function click(text: string) { const button = [...host.querySelectorAll('button')].find(button => button.textContent?.trim() === text); expect(button).toBeDefined(); button!.click() }
-async function registration() { await tick(); const input = host.querySelector('textarea')!; input.value = 'synthetic-registration'; input.dispatchEvent(new Event('input', { bubbles: true })); await tick(); click(languageEnglish.risuNest.serverSync.readRegistration); await tick() }
+async function registration() { await domSettled(); const input = host.querySelector('textarea')!; input.value = 'synthetic-registration'; input.dispatchEvent(new Event('input', { bubbles: true })); await domSettled(); click(languageEnglish.risuNest.serverSync.readRegistration); await domSettled() }
 function publish(view: Record<string, unknown>) { f.view = view; for (const listener of f.listeners) listener(view) }
 const findButton = (text: string) => [...host.querySelectorAll('button')].find(button => button.textContent?.trim() === text)
 it('shows cleanup phases immediately, survives remount, and refreshes after cancellation', async () => {
@@ -465,7 +465,7 @@ it('dismisses a registration without connecting', async () => {
     expect(connectTarget).not.toHaveBeenCalled(); expect(f.connect).not.toHaveBeenCalled()
 })
 it('hides the native server connection UI on web', async () => {
-    f.native = false; component = mount(ServerSyncSettings, { target: host }); await tick()
+    f.native = false; component = mount(ServerSyncSettings, { target: host }); await domSettled()
     expect(host.querySelector('textarea')).toBeNull(); expect(host.querySelector('button')).toBeNull()
 })
 
@@ -715,7 +715,7 @@ describe('asset storage chosen before connecting', () => {
         expect(host.querySelector('[role="radiogroup"]')?.getAttribute('aria-label')).toBe(sync.residency.title)
         expect(host.textContent).toContain(sync.residency.description)
         expect(shownChoices()).toEqual([[sync.residency.full, true], [sync.residency.remote, false]])
-        choices()[1].click(); await tick()
+        choices()[1].click(); await domSettled()
         expect(shownChoices()).toEqual([[sync.residency.full, false], [sync.residency.remote, true]])
         expect(f.policy).not.toHaveBeenCalled()
         click(sync.connect); await settle()
@@ -737,7 +737,7 @@ describe('asset storage chosen before connecting', () => {
         const connectTarget = vi.fn(async () => { publish({ status: { configured: true, bound: true }, paused: false, error: '' }) })
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
         await settle(); await registration()
-        choices()[0].click(); await tick()
+        choices()[0].click(); await domSettled()
         click(sync.connect); await settle()
         expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, false, 'full')
         expect(f.policy).toHaveBeenCalledExactlyOnceWith('full')
@@ -749,7 +749,7 @@ describe('asset storage chosen before connecting', () => {
         const connectTarget = vi.fn(async () => ({ kind: 'cancelled' }))
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
         await settle(); await registration()
-        choices()[0].click(); await tick()
+        choices()[0].click(); await domSettled()
         click(sync.connect); await settle()
         expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, false, 'full')
         expect(f.policy).not.toHaveBeenCalled(); expect(f.hold).not.toHaveBeenCalled()
@@ -759,7 +759,7 @@ describe('asset storage chosen before connecting', () => {
         f.status.mockResolvedValue(residencyStatus({ policy: 'full' }))
         const connectTarget = vi.fn(async () => {})
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
-        await settle(); click(sync.enterCode); await tick(); await registration()
+        await settle(); click(sync.enterCode); await domSettled(); await registration()
         expect(host.querySelectorAll('[role="radiogroup"]')).toHaveLength(1)
         click(sync.connect); await settle()
         expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, false, undefined)
@@ -767,7 +767,7 @@ describe('asset storage chosen before connecting', () => {
     it('mounted onboarding connects with the asset storage chosen on its screen', async () => {
         f.connect.mockResolvedValue({ kind: 'bound' })
         await openOnboardingServer(); await registration()
-        choices()[1].click(); await tick()
+        choices()[1].click(); await domSettled()
         click(sync.connect); await settle()
         expect(f.connect).toHaveBeenCalledExactlyOnceWith(registered, false, 'remote')
         expect(heading()).toBe(onboarding.done.title)
@@ -903,7 +903,7 @@ describe('asset storage before its breakdown loads', () => {
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget } })
         await settle(); await registration()
         expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
-        choices()[0].click(); await tick()
+        choices()[0].click(); await domSettled()
         click(sync.connect); await settle()
         expect(connectTarget).toHaveBeenCalledExactlyOnceWith(registered, false, 'full')
         expect(f.policy).toHaveBeenCalledExactlyOnceWith('full')
@@ -940,7 +940,7 @@ describe('asset storage before its breakdown loads', () => {
         f.view = { status: { configured: false, assetPolicy: 'full' }, paused: false, error: '' }
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
         await settle(); await registration()
-        choices()[1].click(); await tick()
+        choices()[1].click(); await domSettled()
         publish({ status: { configured: false, assetPolicy: 'full' }, paused: false, error: '' }); await settle()
         expect(shownChoices()).toEqual([[sync.residency.full, false, false], [sync.residency.remote, true, false]])
     })
@@ -950,9 +950,9 @@ const onboarding = languageEnglish.risuNest.onboarding
 const heading = () => host.querySelector('h1')?.textContent
 function pick(title: string) { const entry = [...host.querySelectorAll('button')].find(button => button.querySelector('b')?.textContent === title); expect(entry).toBeDefined(); entry!.click() }
 async function openOnboardingServer(expectConnectionScreen = true) {
-    component = mount(Onboarding, { target: host }); await tick()
-    pick(onboarding.home.syncTitle); await tick()
-    pick(onboarding.sync.hubTitle); await tick()
+    component = mount(Onboarding, { target: host }); await domSettled()
+    pick(onboarding.home.syncTitle); await domSettled()
+    pick(onboarding.sync.hubTitle); await domSettled()
     if (expectConnectionScreen) expect(heading()).toBe(onboarding.hub.title)
 }
 const registered = { endpoint: 'https://synthetic.invalid', libraryId: 'library', deviceId: 'registration', token: 'synthetic' }
@@ -1008,7 +1008,7 @@ describe('onboarding on a device already connected to the server', () => {
 describe('starting fresh from onboarding', () => {
     const startingValues = ['preset', 'textTheme', 'maxContext', 'maxResponse', 'claudeCachingExperimental']
     it('applies the starting settings to an empty library that is not connected', async () => {
-        component = mount(Onboarding, { target: host }); await tick()
+        component = mount(Onboarding, { target: host }); await domSettled()
         pick(onboarding.home.freshTitle); await settle()
         expect(f.preset).toHaveBeenCalledOnce()
         expect(f.state.db).toMatchObject({ preset: 'starting', textTheme: 'highcontrast', maxContext: 16000, maxResponse: 1000, claudeCachingExperimental: true })
@@ -1022,7 +1022,7 @@ describe('starting fresh from onboarding', () => {
     ])('keeps the shared settings of a library $name', async ({ binding, characters, summary }) => {
         f.bindingState.mockResolvedValue(binding)
         f.state.db.characters = characters
-        component = mount(Onboarding, { target: host }); await tick()
+        component = mount(Onboarding, { target: host }); await domSettled()
         pick(onboarding.home.freshTitle); await settle()
         expect(f.preset).not.toHaveBeenCalled()
         for (const key of startingValues) expect(f.state.db).not.toHaveProperty(key)
@@ -1031,7 +1031,7 @@ describe('starting fresh from onboarding', () => {
     })
     it('keeps the shared settings when the connection state cannot be read', async () => {
         f.bindingState.mockRejectedValue(new Error('binding-state-unavailable'))
-        component = mount(Onboarding, { target: host }); await tick()
+        component = mount(Onboarding, { target: host }); await domSettled()
         pick(onboarding.home.freshTitle); await settle()
         expect(f.preset).not.toHaveBeenCalled()
         for (const key of startingValues) expect(f.state.db).not.toHaveProperty(key)
@@ -1041,7 +1041,7 @@ describe('starting fresh from onboarding', () => {
     })
 })
 it('mounted web onboarding offers no native server entry', async () => {
-    f.native = false; component = mount(Onboarding, { target: host }); await tick()
+    f.native = false; component = mount(Onboarding, { target: host }); await domSettled()
     expect(host.textContent).not.toContain(languageEnglish.risuNest.onboarding.sync.hubTitle)
     expect(host.querySelector('#server-registration')).toBeNull()
 })
@@ -1061,7 +1061,7 @@ it('a late bound response does not advance a dismissed server screen', async () 
     let finish!: (value: { kind: string }) => void
     f.connect.mockImplementation(() => new Promise(resolve => { finish = resolve }))
     await openOnboardingServer(); await registration(); click(languageEnglish.risuNest.serverSync.connect); await settle()
-    click(languageEnglish.risuNest.onboarding.back); await tick()
+    click(languageEnglish.risuNest.onboarding.back); await domSettled()
     finish({ kind: 'bound' }); await settle()
     expect(host.querySelector('h1')?.textContent).toBe(languageEnglish.risuNest.onboarding.sync.title)
 })
@@ -1073,7 +1073,7 @@ describe('layout', () => {
         component = mount(ServerSyncSettings, { target: host, props: { connectTarget: vi.fn() } })
         await settle()
         expect(host.querySelector('textarea')).toBeNull()
-        click(sync.enterCode); await tick()
+        click(sync.enterCode); await domSettled()
         expect(host.querySelector('textarea')).not.toBeNull()
     })
     it.each([

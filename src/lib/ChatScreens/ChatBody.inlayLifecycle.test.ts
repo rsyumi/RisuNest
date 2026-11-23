@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 
 const inlayMocks = vi.hoisted(() => ({
     getInlayAssetBlob: vi.fn(),
@@ -269,8 +269,8 @@ describe('ChatBody deferred inlay lifecycle', () => {
             url: 'https://synthetic.invalid/image.png', contentHash: 'a'.repeat(64), width: 640, height: 480,
             metadata: { kind: 'asset', key: 'assets/synthetic.png', mime: 'image/png', name: 'synthetic.png', size: 1 },
         })
-        await tick()
-        await tick()
+        await domSettled()
+        await domSettled()
         expect(target.querySelector('img')).toBeNull()
         expect(target.textContent).toContain('second')
         expect(settled).toHaveBeenCalledOnce()
@@ -308,20 +308,20 @@ describe('ChatBody deferred inlay lifecycle', () => {
                 streamingThoughtMode: 'collapsed',
             },
         })
-        await tick()
+        await domSettled()
         const details = target.querySelector('details')!
         expect(details.open).toBe(false)
         expect(target.textContent!.length).toBeLessThan(100)
         details.open = true
         details.dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         // The large body is mounted over animation frames.
         expect(details.textContent).toContain(body.slice(0, 1024))
         await vi.waitFor(() => expect(details.textContent).toContain(body))
         ;(mounted as { setMessage(value: string): void }).setMessage(
             `<Thoughts>${body}LATEST</Thoughts>Answer`,
         )
-        await tick()
+        await domSettled()
         expect(target.querySelector('details')).toBe(details)
         expect(details.open).toBe(true)
         expect(details.textContent).toContain('LATEST')
@@ -383,11 +383,11 @@ describe('ChatBody deferred inlay lifecycle', () => {
             target,
             props: { initialMessage: `<Thoughts>${body}</Thoughts>`, initialThoughtPreview: true, streamingThoughtMode: 'collapsed' },
         })
-        await tick()
+        await domSettled()
         const preview = target.querySelector('details')!
         preview.open = true
         preview.dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         ;(mounted as { setThoughtPreview(value: boolean): void }).setThoughtPreview(false)
         ;(mounted as { setThoughtMode(value: string): void }).setThoughtMode('off')
         await vi.waitFor(() => {
@@ -395,7 +395,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
             expect(element?.textContent).toBe('Thought')
             expect(element).not.toBe(preview)
         })
-        await tick()
+        await domSettled()
         const settled = target.querySelector<HTMLDetailsElement>('details[data-risu-thought]')!
         expect(settled.open).toBe(false)
         expect(settled.querySelectorAll('[data-risu-thought-unit]')).toHaveLength(0)
@@ -415,11 +415,11 @@ describe('ChatBody deferred inlay lifecycle', () => {
         const details = target.querySelector('details')!
         details.open = true
         details.dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         ;(mounted as { setThoughtPreview(value: boolean): void }).setThoughtPreview(false)
         ;(mounted as { setThoughtMode(value: string): void }).setThoughtMode('off')
         await vi.waitFor(() => expect(target.querySelector('details[data-risu-thought]')?.textContent).toContain('reasoning'))
-        await tick()
+        await domSettled()
         expect(target.querySelector<HTMLDetailsElement>('details[data-risu-thought]')!.open).toBe(true)
     })
 
@@ -429,11 +429,11 @@ describe('ChatBody deferred inlay lifecycle', () => {
             target,
             props: { initialMessage: '<Thoughts>first</Thoughts><Thoughts>last</Thoughts>', initialThoughtPreview: true, streamingThoughtMode: 'collapsed' },
         })
-        await tick()
+        await domSettled()
         const preview = target.querySelector('details')!
         preview.open = true
         preview.dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         ;(mounted as { setThoughtPreview(value: boolean): void }).setThoughtPreview(false)
         ;(mounted as { setThoughtMode(value: string): void }).setThoughtMode('off')
         await vi.waitFor(() => expect(target.querySelectorAll('details[data-risu-thought]')).toHaveLength(2))
@@ -450,7 +450,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
             setTranslated(value: boolean): void
         }
         harness.setRaw(true)
-        await tick()
+        await domSettled()
         expect(parserMocks.ParseMarkdown).not.toHaveBeenCalled()
         expect(target.textContent).toBe('streaming')
         const gate = deferred<string>()
@@ -499,7 +499,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
             target,
             props: { initialMessage: original, initialThoughtPreview: true },
         })
-        await tick()
+        await domSettled()
         const preview = target.querySelector('[data-streaming-thought-preview]')
         expect(preview?.textContent).toContain('LATEST')
         expect(preview!.textContent!.length).toBeLessThan(1_000)
@@ -542,7 +542,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         }
         harness.setMessage('<Thoughts>Partial reasoning')
         harness.setThoughtPreview(true)
-        await tick()
+        await domSettled()
         expect(target.querySelector('img')).toBeNull()
         expect(revokeObjectURL).toHaveBeenCalledWith('blob:first')
         const gate = deferred<string>()
@@ -554,7 +554,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         await unmount(mounted)
         mounted = undefined
         gate.resolve('<strong>Stale result</strong>')
-        await tick()
+        await domSettled()
         expect(target.textContent).toBe('')
     })
 
@@ -566,7 +566,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
                 initialThoughtPreview: true,
             },
         })
-        await tick()
+        await domSettled()
         expect(target.textContent).toContain('Only thoughts')
         parserMocks.ParseMarkdown.mockResolvedValue('')
         ;(mounted as { setThoughtPreview(value: boolean): void }).setThoughtPreview(
@@ -583,14 +583,14 @@ describe('ChatBody deferred inlay lifecycle', () => {
                 initialThoughtPreview: true,
             },
         })
-        await tick()
+        await domSettled()
         const preview = target.querySelector('[data-streaming-thought-preview]')
         expect(target.querySelector('img')).toBeNull()
         expect(preview?.textContent).toContain('<img src=x')
         ;(mounted as { setMessage(value: string): void }).setMessage(
             '<Thoughts>Replaced reasoning</Thoughts>Answer',
         )
-        await tick()
+        await domSettled()
         expect(target.querySelector('[data-streaming-thought-preview]')).toBe(
             preview,
         )
@@ -608,12 +608,12 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:first'))
         ;(mounted as { setMessage(value: string): void }).setMessage('second')
-        await tick()
+        await domSettled()
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:second'))
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first')).toHaveLength(1)
 
         ;(mounted as { setRaw(value: boolean): void }).setRaw(true)
-        await tick()
+        await domSettled()
         expect(target.querySelector('img')).toBeNull()
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:second')).toHaveLength(1)
 
@@ -761,7 +761,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
             expect(target.querySelector('button')?.textContent).toBe('latest'),
         )
         stale.resolve('<button>obsolete</button>')
-        await tick()
+        await domSettled()
         await Promise.resolve()
         expect(target.querySelector('button')?.textContent).toBe('latest')
     })
@@ -839,7 +839,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         )
         controller.abort()
         pending.resolve('<button>obsolete panel</button>')
-        await tick()
+        await domSettled()
         await new Promise((resolve) => setTimeout(resolve, 0))
         expect(target.querySelector('button')).toBe(button)
         expect(target.querySelector('style')).toBe(style)
@@ -861,7 +861,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
     test('defers live parsing to a later main-thread task', async () => {
         schedulingMocks.state.controlled = true
         mounted = mount(ChatBodyInlayHarness, { target })
-        await tick()
+        await domSettled()
         await Promise.resolve()
 
         expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce()
@@ -881,7 +881,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         )
 
         ;(mounted as { setMessage(value: string): void }).setMessage('second')
-        await tick()
+        await domSettled()
         await vi.waitFor(() =>
             expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledTimes(2),
         )
@@ -929,7 +929,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         await vi.waitFor(() => expect(target.textContent).toContain('latest translation'))
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:second'))
         stale.resolve(`${staleMarkup}<span>obsolete translation</span>`)
-        await tick()
+        await domSettled()
         await Promise.resolve()
         expect(target.textContent).toContain('latest translation')
         expect(target.textContent).not.toContain('obsolete translation')
@@ -1020,7 +1020,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         ;(mounted as { setTranslated(value: boolean): void }).setTranslated(
             true,
         )
-        await tick()
+        await domSettled()
         await vi.waitFor(() =>
             expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce(),
         )
@@ -1070,7 +1070,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         schedulingMocks.yieldToMainThread.mockClear()
         schedulingMocks.state.controlled = true
         ;(mounted as { setAssetWidth(value: number): void }).setAssetWidth(7)
-        await tick()
+        await domSettled()
         await vi.waitFor(() =>
             expect(schedulingMocks.yieldToMainThread).toHaveBeenCalledOnce(),
         )
@@ -1131,12 +1131,12 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
             if (cleanupKind === 'rerender') {
                 ;(mounted as { setMessage(value: string): void }).setMessage('second')
-                await tick()
+                await domSettled()
                 await vi.waitFor(() => expect(target.querySelector('img')?.dataset.risuInlayId).toBe('second'))
             }
             else if (cleanupKind === 'raw switch') {
                 ;(mounted as { setRaw(value: boolean): void }).setRaw(true)
-                await tick()
+                await domSettled()
             }
             else {
                 await unmount(mounted)
@@ -1144,7 +1144,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
             }
 
             firstRead.resolve({ data: new Blob(['first']), type: 'image', name: 'first.png' })
-            await Promise.resolve(); await Promise.resolve(); await tick()
+            await Promise.resolve(); await Promise.resolve(); await domSettled()
             expect(target.querySelector('[src="blob:first"]')).toBeNull()
             expect(createObjectURL.mock.calls.filter(([blob]) => blob.size === 5)).toHaveLength(0)
             expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first')).toHaveLength(0)
@@ -1180,11 +1180,11 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
         const clearRegistry = vi.spyOn(firstRegistry!, 'clear')
         ;(mounted as { setMessage(value: string): void }).setMessage('second')
-        await tick()
+        await domSettled()
         await vi.waitFor(() => expect(target.querySelector('img')?.dataset.risuInlayId).toBe('second'))
         expect(clearRegistry).toHaveBeenCalled()
         firstParse.resolve(exposedMarkup)
-        await Promise.resolve(); await Promise.resolve(); await tick()
+        await Promise.resolve(); await Promise.resolve(); await domSettled()
 
         const stolen = document.createElement('div')
         stolen.innerHTML = exposedMarkup
@@ -1205,12 +1205,12 @@ describe('ChatBody deferred inlay lifecycle', () => {
         await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalled())
 
         ;(mounted as { setMessage(value: string): void }).setMessage('second')
-        await tick()
+        await domSettled()
         await vi.waitFor(() => expect(onCaptureSettled).toHaveBeenCalledOnce())
         const activeGeneration = onCaptureSettled.mock.calls[0][0]
 
         firstParse.resolve('<span>first</span>')
-        await Promise.resolve(); await Promise.resolve(); await tick()
+        await Promise.resolve(); await Promise.resolve(); await domSettled()
 
         expect(onCaptureSettled).toHaveBeenCalledOnce()
         expect(activeGeneration).toBeGreaterThan(1)
@@ -1345,13 +1345,13 @@ describe('ChatBody deferred inlay lifecycle', () => {
         const onCaptureSettled = vi.fn()
 
         mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
-        await Promise.resolve(); await tick()
+        await Promise.resolve(); await domSettled()
 
         expect(onCaptureSettled).not.toHaveBeenCalled()
         await vi.advanceTimersByTimeAsync(10)
-        await tick()
+        await domSettled()
         await vi.runAllTimersAsync()
-        await tick()
+        await domSettled()
         expect(translateHTML).toHaveBeenCalled()
         expect(onCaptureSettled).toHaveBeenCalledOnce()
     })
@@ -1427,11 +1427,11 @@ describe('ChatBody deferred inlay lifecycle', () => {
                 name: 'Frozen Character',
             },
         })
-        await Promise.resolve(); await tick()
+        await Promise.resolve(); await domSettled()
         await vi.advanceTimersByTimeAsync(10)
-        await tick()
+        await domSettled()
         await vi.runAllTimersAsync()
-        await tick()
+        await domSettled()
 
         expect(translateHTML).toHaveBeenCalledWith(
             expect.any(String),
@@ -1538,7 +1538,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         await unmount(mounted)
         mounted = undefined
         pendingParse.resolve('<span>late</span>')
-        await Promise.resolve(); await Promise.resolve(); await tick()
+        await Promise.resolve(); await Promise.resolve(); await domSettled()
 
         expect(onCaptureSettled).not.toHaveBeenCalled()
     })
@@ -1689,7 +1689,7 @@ describe('ChatBody settings navigation round trip', () => {
         await vi.waitFor(() => expect(displayedSources(returned.host)).toEqual([replacedUrl, replacedUrl]))
 
         stale.resolve()
-        await Promise.resolve(); await Promise.resolve(); await tick()
+        await Promise.resolve(); await Promise.resolve(); await domSettled()
         expect(displayedSources(document)).toEqual([replacedUrl, replacedUrl])
         expect(aliases.get('synthetic')?.revision).toBe(2)
         expect(createObjectURL).not.toHaveBeenCalled()
@@ -1718,7 +1718,7 @@ describe('ChatBody settings navigation round trip', () => {
         await vi.waitFor(() => expect(failed.host.querySelector('img[data-risu-inlay-token]')).not.toBeNull())
         showAll()
         await vi.waitFor(() => expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(1))
-        await Promise.resolve(); await tick()
+        await Promise.resolve(); await domSettled()
         expect(displayedSources(failed.host)).toEqual([null])
 
         // Settings round trip: the failure was not remembered as a missing asset.

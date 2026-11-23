@@ -451,7 +451,7 @@ async function main() {
     }, "product Svelte app did not initialize");
     const { DBState } = await import("../../src/ts/stores.svelte");
     const { changeChar } = await import("../../src/ts/characters");
-    const { tick } = await import("svelte");
+    const { settled: domSettled } = await import("svelte");
     const index = DBState.db.characters.findIndex(
       (character) => character.chaId === "char-a",
     );
@@ -491,7 +491,7 @@ async function main() {
       }
     };
     const conversationId = await editLastMessage(marker);
-    await tick();
+    await domSettled();
     await getPersistentDataRuntime().flushPendingData("macos-ui-smoke");
     await until(
       async () => document.getElementById("app")!.textContent!.includes(marker),
@@ -591,7 +591,7 @@ async function main() {
       return;
     }
     check(await editLastMessage(nativeMarker) === conversationId, "native save uses the same synthetic conversation");
-    await tick();
+    await domSettled();
     await until(async () => document.getElementById("app")!.textContent!.includes(nativeMarker),
       "fresh native quit edit did not render");
     release();

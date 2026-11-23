@@ -1,7 +1,7 @@
 vi.mock('src/ts/parser/parser.svelte', async () => (await import('src/ts/parser/parser.testSupport')).parserStubModule())
 import 'src/ts/stores.svelte'
 import { afterEach, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { get } from 'svelte/store'
 import { changeLanguage, language } from 'src/lang'
 import { languageKorean } from 'src/lang/ko'
@@ -36,7 +36,7 @@ afterEach(async () => {
 })
 async function render() {
     component = mount(PluginStartupNotice, { target: document.body })
-    await tick()
+    await domSettled()
 }
 const labels = () => [...document.querySelectorAll('aside button')].map(button => button.getAttribute('aria-label') ?? button.textContent?.trim())
 const close = () => document.querySelector<HTMLButtonElement>(`aside button[aria-label="${language.close}"]`)!.click()
@@ -49,29 +49,29 @@ it('waits one second, closes until the next wait, stop or failure, and hides aft
     expect(document.querySelector('aside')).toBeNull()
     await vi.advanceTimersByTimeAsync(999)
     expect(document.querySelector('aside')).toBeNull()
-    await vi.advanceTimersByTimeAsync(1); await tick()
+    await vi.advanceTimersByTimeAsync(1); await domSettled()
     expect(document.querySelector('[role="status"]')?.textContent).toBe(language.risuNest.pluginStartup.waiting)
-    close(); await tick()
+    close(); await domSettled()
     expect(document.querySelector('aside')).toBeNull()
 
     // A stop while plugins still wait shows again; closing it holds even after it clears.
     syncStatus.set({ target: 'server', syncNow: async () => {}, pendingChanges: async () => 0,
-        view: { status: { configured: true, bound: true }, running: false, paused: true, error: 'clock-skew' } as ServerSyncView }); await tick()
+        view: { status: { configured: true, bound: true }, running: false, paused: true, error: 'clock-skew' } as ServerSyncView }); await domSettled()
     expect(document.querySelector('[role="alert"]')).not.toBeNull()
-    close(); await tick()
-    syncStatus.set(null); await tick()
+    close(); await domSettled()
+    syncStatus.set(null); await domSettled()
     expect(document.querySelector('aside')).toBeNull()
 
     // A failure keeps the wait's start time and still shows.
-    pluginStartupState.set({ phase: 'failed', since, error: { code: 'unauthorized' }, target: 'server' }); await tick()
+    pluginStartupState.set({ phase: 'failed', since, error: { code: 'unauthorized' }, target: 'server' }); await domSettled()
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(language.risuNest.pluginStartup.syncUnfinished)
-    close(); await tick()
+    close(); await domSettled()
     expect(document.querySelector('aside')).toBeNull()
 
     pluginStartupState.set({ phase: 'waiting', since: Date.now() })
-    await vi.advanceTimersByTimeAsync(1000); await tick()
+    await vi.advanceTimersByTimeAsync(1000); await domSettled()
     expect(document.querySelector('[role="status"]')).not.toBeNull()
-    pluginStartupState.set({ phase: 'released', since: 0 }); await tick()
+    pluginStartupState.set({ phase: 'released', since: 0 }); await domSettled()
     expect(document.querySelector('aside')).toBeNull()
 })
 
@@ -80,17 +80,17 @@ it.each(['unauthorized', 'invalid-device-token', 'rate-limited'])('reports the s
     DBState.db.risunestSyncStatusUi = false
     pluginStartupState.set({ phase: 'waiting', since: Date.now() })
     await render()
-    await vi.advanceTimersByTimeAsync(1000); await tick()
+    await vi.advanceTimersByTimeAsync(1000); await domSettled()
     expect(document.querySelector('aside')).toBeNull()
     const source: SyncStatusSource = {
         target: 'server', syncNow: async () => {}, pendingChanges: async () => 0,
         view: { status: { configured: true, bound: true }, running: false, paused: true, error: code } as ServerSyncView,
     }
-    syncStatus.set(source); await tick()
+    syncStatus.set(source); await domSettled()
     const display = syncStatusDisplay(source, externalStorageStrings(DBState.db.language), false)
     // The stop shows while plugins still wait.
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
-    pluginStartupState.set({ phase: 'failed', since: Date.now(), error: new Error('Sync binding is unavailable'), target: 'server' }); await tick()
+    pluginStartupState.set({ phase: 'failed', since: Date.now(), error: new Error('Sync binding is unavailable'), target: 'server' }); await domSettled()
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(language.risuNest.pluginStartup.syncUnfinished)
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.label)
     if (code !== 'rate-limited') expect(document.querySelector('[role="alert"]')?.textContent).toContain(display.error)
@@ -102,7 +102,7 @@ it('uses the language loaded after the app mounted', async () => {
     pluginStartupState.set({ phase: 'waiting', since: Date.now() })
     await render()
     changeLanguage('ko')
-    await vi.advanceTimersByTimeAsync(1000); await tick()
+    await vi.advanceTimersByTimeAsync(1000); await domSettled()
     expect(document.querySelector('[role="status"]')?.textContent).toBe(languageKorean.risuNest.pluginStartup.waiting)
     expect(labels()).toEqual([languageKorean.close, languageKorean.risuNest.pluginStartup.loadNow])
 })
@@ -113,10 +113,10 @@ it('shows failure actions immediately and opens the sync tab', async () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(language.risuNest.pluginStartup.syncUnfinished)
     expect(labels()).toEqual([language.risuNest.tabs.sync, language.close, language.retry, language.risuNest.pluginStartup.loadNow])
     const settings = [...document.querySelectorAll('button')].find(button => button.textContent === language.risuNest.tabs.sync)!
-    settings.click(); await tick()
+    settings.click(); await domSettled()
     expect(get(settingsOpen)).toBe(true)
     expect(get(SettingsMenuIndex)).toBe(17)
-    activeRisuNestSettingsTab.set('sync'); await tick()
+    activeRisuNestSettingsTab.set('sync'); await domSettled()
     expect([...document.querySelectorAll('button')].some(button => button.textContent === language.risuNest.tabs.sync)).toBe(false)
 })
 
@@ -124,9 +124,9 @@ it('leaves the plugin settings page to its inline notice', async () => {
     pluginStartupState.set({ phase: 'failed', since: Date.now(), error: { code: 'unauthorized' }, target: 'server' })
     await render()
     inlineComponent = mount(PluginStartupNotice, { target: document.body, props: { inline: true } })
-    await tick()
+    await domSettled()
     expect(document.querySelectorAll('aside')).toHaveLength(1)
-    await unmount(inlineComponent); inlineComponent = undefined; await tick()
+    await unmount(inlineComponent); inlineComponent = undefined; await domSettled()
     expect(document.querySelectorAll('aside')).toHaveLength(1)
 })
 
@@ -180,9 +180,9 @@ it('signs in again instead of retrying an external startup that failed on its si
     expect([get(settingsOpen), get(SettingsMenuIndex), get(risuNestSettingsTabRequest)]).toEqual([true, 17, 'sync'])
 
     // The form takes the top of the settings page; closing it with plugins still held brings the notice back.
-    externalRenewalOpen.set(true); await tick()
+    externalRenewalOpen.set(true); await domSettled()
     expect(document.querySelector('aside')).toBeNull()
-    externalRenewalOpen.set(false); await tick()
+    externalRenewalOpen.set(false); await domSettled()
     expect(document.querySelector('aside')).not.toBeNull()
 })
 

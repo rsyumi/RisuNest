@@ -1,4 +1,4 @@
-import { mount, tick, unmount } from "svelte";
+import { mount, settled as domSettled, unmount } from "svelte";
 import DefaultChatScreen from "../../src/lib/ChatScreens/DefaultChatScreen.svelte";
 import { DBState, selectedCharID } from "../../src/ts/stores.svelte";
 import type { Database, character } from "../../src/ts/storage/database.svelte";
@@ -36,14 +36,14 @@ export async function runParserScreenProbe(assets: number, baseline: boolean, st
   document.body.replaceChildren(host);
   const component = mount(DefaultChatScreen, { target: host });
   const ready = async (characterId: string) => {
-    await tick();
+    await domSettled();
     const deadline = performance.now() + 60000;
     let previous = '';
     let stableFrames = 0;
     while (true) {
       if (performance.now() > deadline) throw new Error('parser-screen-not-ready');
       await pause();
-      await tick();
+      await domSettled();
       const target = runtime.captureSelectedConversationTarget();
       const selectedConversation = target && { characterId: target.characterId, conversationId: target.conversationId };
       const rowIdentities = [...host.querySelectorAll<HTMLElement>('[data-chat-render-key]')].map(row => {

@@ -1,4 +1,4 @@
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import RegexFixture from './RegexFixture.svelte'
 import { DBState } from '../../src/ts/stores.svelte'
 import type { customscript } from '../../src/ts/storage/database.svelte'
@@ -62,7 +62,7 @@ export async function runRegexTimeLimitProbe(cleanup: () => Promise<void>, count
         const scripts = rules(count, workload)
         const started = performance.now()
         const fixture = mount(RegexFixture, { target: document.getElementById('app')!, props: { scripts, initial } })
-        await tick()
+        await domSettled()
         await rendered(markers, workload === 'cbs' && count > 0)
         const openMs = performance.now() - started
         const updates: number[] = []
@@ -70,7 +70,7 @@ export async function runRegexTimeLimitProbe(cleanup: () => Promise<void>, count
             markers[rowCount - 1] = `UPDATE-${nonce}-${update}-READY`
             const started = performance.now()
             fixture.publish(rowCount - 1, source(bytes, count, markers[rowCount - 1], workload))
-            await tick()
+            await domSettled()
             await rendered(markers, workload === 'cbs' && count > 0)
             updates.push(performance.now() - started)
         }

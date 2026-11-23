@@ -25,6 +25,9 @@ export default defineConfig(({ mode }) => {
                 if (owner.endsWith('/src/ts/ui/modalNavigation.ts') && /(?:^|\/)stores\.svelte$/.test(source)) {
                     return adapter('modalNavigationAdapters.ts')
                 }
+                if (owner.endsWith('/src/lib/UI/PresetListPopup.svelte') && source === 'src/ts/alert') {
+                    return adapter('presetListAdapters.ts')
+                }
                 if (/\/src\/lib\/(SideBars\/(LoreBook\/|Scripts\/(Regex|TriggerV1))|Setting\/Pages\/PromptSettings|UI\/(PromptDataItem|GUI\/ListPager|Accordion))/.test(owner)) {
                     if (/(^|\/)(stores\.svelte|presetEditor\.svelte|util|alert|lang|database\.svelte|tokenizer|scripts|prompt|templateCheck)$/.test(source)) {
                         return adapter('dragDropAdapters.svelte.ts')
@@ -57,7 +60,7 @@ export default defineConfig(({ mode }) => {
                 if (!resolved?.id.replaceAll('\\', '/').endsWith('/src/ts/realmEndpoints.ts')) return null
                 return resolved.id.replace(/realmEndpoints\.ts$/, 'realmEndpoints.blocked.ts')
             },
-        }, svelte()],
+        }, svelte({ compilerOptions: { experimental: { async: true } } })],
         resolve: { alias: [
             { find: /^monaco-editor$/, replacement: resolve(import.meta.dirname, '../../src/ts/gui/codearea/monacoRuntime.ts') },
             { find: 'src', replacement: resolve(import.meta.dirname, '../../src') },
@@ -68,7 +71,7 @@ export default defineConfig(({ mode }) => {
             outDir: resolve(import.meta.dirname, '../../.tmp/test-results/browser/dist'), emptyOutDir: true,
             rollupOptions: {
                 preserveEntrySignatures: 'strict',
-                input: [resolve(import.meta.dirname, 'imageFormats.html'), resolve(import.meta.dirname, 'index.html'), resolve(import.meta.dirname, 'dragDrop.html'), resolve(import.meta.dirname, 'chatList.html'), resolve(import.meta.dirname, 'sidebarTouch.html'), resolve(import.meta.dirname, 'modalNavigation.html'), resolve(import.meta.dirname, 'lazyApp.html'), resolve(import.meta.dirname, 'monaco.html'), resolve(import.meta.dirname, 'settledThought.html'), resolve(import.meta.dirname, 'switchContainment.html'), resolve(import.meta.dirname, 'chatRendering.html')],
+                input: [resolve(import.meta.dirname, 'imageFormats.html'), resolve(import.meta.dirname, 'index.html'), resolve(import.meta.dirname, 'dragDrop.html'), resolve(import.meta.dirname, 'chatList.html'), resolve(import.meta.dirname, 'sidebarTouch.html'), resolve(import.meta.dirname, 'modalNavigation.html'), resolve(import.meta.dirname, 'lazyApp.html'), resolve(import.meta.dirname, 'monaco.html'), resolve(import.meta.dirname, 'settledThought.html'), resolve(import.meta.dirname, 'switchContainment.html'), resolve(import.meta.dirname, 'chatRendering.html'), resolve(import.meta.dirname, 'presetList.html')],
             },
         },
     }

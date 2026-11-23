@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount, unmount, tick } from 'svelte'
+import { mount, unmount, settled as domSettled } from 'svelte'
 import { language } from 'src/lang'
 import { NativeExportError } from 'src/ts/storage/nativeExportFile'
 const mock = vi.hoisted(() => ({ call: vi.fn(), download: vi.fn() }))
@@ -12,7 +12,7 @@ const record = { id: 'synthetic', source: 'native-http', startedAt: 0, elapsedMs
     response: { method: null, url: 'https://synthetic.example/chat', status: 200, headers: [], body }, streamKind: null, eventBytes: 0 }
 const t = language.risuNest.networkLog
 let host: HTMLElement, component: ReturnType<typeof mount>
-async function settle() { for (let i = 0; i < 18; i++) { await Promise.resolve(); await tick() } }
+async function settle() { for (let i = 0; i < 18; i++) { await Promise.resolve(); await domSettled() } }
 function refreshButton() { return host.querySelector<HTMLButtonElement>(`button[aria-label="${t.refresh}"]`)! }
 function button(text: string) { const result = [...host.querySelectorAll('button')].find(b => b.textContent?.trim() === text); if (!result) throw new Error(`missing ${text}`); return result }
 beforeEach(async () => {

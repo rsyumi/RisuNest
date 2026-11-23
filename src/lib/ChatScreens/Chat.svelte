@@ -21,7 +21,8 @@
     import { DBState, ReloadChatPointer, CurrentTriggerIdStore, popupStore } from 'src/ts/stores.svelte'
 
     import { capitalize, getUserIcon, getUserName, sleep } from "src/ts/util"
-    import { onDestroy, onMount, tick, untrack } from "svelte"
+    // settled() resolves once the DOM update commits; tick() would also wait for a frame or timer.
+    import { onDestroy, onMount, settled as domSettled, untrack } from "svelte"
     import { type Unsubscriber } from "svelte/store"
     import { v4 as uuidv4 } from 'uuid'
     import { language } from "../../lang"
@@ -1060,14 +1061,14 @@
             !(captureSettings?.guiHTML ?? DBState.db.guiHTML)?.toLocaleLowerCase().includes('<risutextbox')
         if (!blankMessage && !inlineEditMode && !customWithoutTextBox) return
         const settled = onDisplaySettled
-        void tick().then(() => settled?.())
+        void domSettled().then(() => settled?.())
     })
     $effect(() => {
         const customWithoutTextBox = captureTheme === 'customHTML' &&
             !captureSettings?.guiHTML?.toLocaleLowerCase().includes('<risutextbox')
         if (!captureContext || staticCaptureSettled || (!blankMessage && !customWithoutTextBox)) return
         staticCaptureSettled = true
-        tick().then(() => onCaptureSettled?.(0))
+        domSettled().then(() => onCaptureSettled?.(0))
     })
 
     async function toggleBookmark(target: CapturedChatMessageTarget) {
