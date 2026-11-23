@@ -629,6 +629,27 @@ describe('module update', () => {
         expect(mocks.db.modules[0]).toMatchObject({ lowLevelAccess: true, trigger: [] })
     })
 
+    it('stores nothing and hands the assets of the import to the cleanup when the operation ends while low-level access is asked', async () => {
+        await commitImportedModule(imported('file-3', { name: 'Lua Pack', trigger: [] }), commitModule)
+        mocks.db.modules[0].lowLevelAccess = true
+        platform.runtime = 'tauri'
+        const operation = new AbortController()
+        const expired = new Error('background time ended')
+        mocks.alertConfirm.mockImplementationOnce(async () => {
+            operation.abort(expired)
+            return true
+        })
+        const trigger = { comment: 'lua', type: 'start', conditions: [], effect: [{ type: 'triggerlua', code: 'x' }], lowLevelAccess: false }
+        const pending = commitImportedModule(imported('file-3', { name: 'Lua Pack', trigger: [trigger], assets: [['icon', 'assets/next.png', 'png']] } as Partial<RisuModule>), commitModule, operation.signal)
+        await opened()
+        await reviewContentUpdate()
+        for (const item of unresolvedItems(contentUpdateDialog.plan!)) setContentUpdateChoice(item.id, 'theirs')
+        chooseContentUpdate('update')
+        await expect(pending).rejects.toBe(expired)
+        expect(mocks.db.modules).toHaveLength(1)
+        expect(await releasedKeys()).toContain('assets/next.png')
+    })
+
     it('installs the import as new when the installed module was removed before the update', async () => {
         mocks.db.modules.push({ id: 'gone', name: 'Lore', description: 'old' } as RisuModule)
         const incoming = imported('file-2', { name: 'Lore', description: 'new' })
