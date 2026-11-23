@@ -286,7 +286,7 @@ window.acceptance = (async () => {
         expect((frame.contentWindow as any).listenerEvent.chat.note).toBe('final live output')
         expect(fixture.projectScalable).toHaveBeenCalledOnce()
         expect(fixture.projectScalable).toHaveBeenCalledWith(expect.objectContaining({ history: 'current' }))
-        expect(fixture.requestedPermissions).toEqual(['replacer'])
+        expect(fixture.requestedPermissions).toEqual(['dbWrite', 'replacer'])
     })
 
     it('aborts an in-flight guest getter and removes its listener on unload', async () => {

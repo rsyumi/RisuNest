@@ -27,6 +27,8 @@ const fixture = vi.hoisted(() => ({
         setCurrentCharacter: vi.fn(),
         setCharacterToIndex: vi.fn(),
         setChatToIndex: vi.fn(),
+        setDatabase: vi.fn(),
+        setDatabaseLite: vi.fn(),
     },
     database: {
         characters: [
@@ -113,6 +115,8 @@ import { getInlayAsset } from 'src/ts/process/files/inlays'
 import { customProviderStore, pluginV2 } from '../plugins.svelte'
 import { get } from 'svelte/store'
 import { getPluginPermissionStore } from 'src/ts/storage/nativePluginPermissions'
+import { language } from 'src/lang'
+import { linkPluginQueryAbortSignals } from '../pluginDatabaseAccess'
 
 function resetDatabase(): void {
     fixture.database = {
@@ -131,6 +135,7 @@ function resetDatabase(): void {
 }
 
 describe('Plugin v3 full-object access routing', () => {
+    let pluginName = ''
     beforeEach(async () => {
         vi.clearAllMocks()
         resetDatabase()
@@ -143,10 +148,12 @@ describe('Plugin v3 full-object access routing', () => {
         fixture.scopedAccess.setCurrentCharacter.mockReset()
         fixture.scopedAccess.setCharacterToIndex.mockReset()
         fixture.scopedAccess.setChatToIndex.mockReset()
-        await executePluginV3({
-            name: `contract-plugin-${crypto.randomUUID()}`,
-            script: '',
-        } as any)
+        fixture.scopedAccess.setDatabase.mockReset()
+        fixture.scopedAccess.setDatabaseLite.mockReset()
+        fixture.permissionValues.clear()
+        vi.mocked(alertConfirm).mockResolvedValue(true)
+        pluginName = `contract-plugin-${crypto.randomUUID()}`
+        await executePluginV3({ name: pluginName, script: '' } as any)
     })
 
     it('routes getters through scoped access', async () => {
@@ -219,8 +226,44 @@ describe('Plugin v3 full-object access routing', () => {
         )
         expect(fixture.database.characters[1].name).toBe('Trash')
         expect(fixture.pluginPermissionReads).not.toHaveBeenCalledWith(
-            expect.stringContaining('_db'),
+            expect.stringMatching(/_db$/),
         )
+    })
+
+    it.each([true, false])('asks for dbWrite once and writes only when it is granted (%s)', async (granted) => {
+        vi.mocked(alertConfirm).mockResolvedValue(granted)
+        const api = fixture.api!
+        const character = structuredClone(fixture.database.characters[1])
+        const writes = fixture.scopedAccess
+
+        await expect(api.setChar(character)).resolves.toBeUndefined()
+        await expect(api.setCharacter(character)).resolves.toBeUndefined()
+        await expect(api.setCharacterToIndex(1, character)).resolves.toBeUndefined()
+        await expect(api.setChatToIndex(1, 0, character.chats[0])).resolves.toBeUndefined()
+        await expect(api.setDatabase({ username: 'synthetic' })).resolves.toBeUndefined()
+        await expect(api.setDatabaseLite({ username: 'synthetic' })).resolves.toBeUndefined()
+
+        expect(alertConfirm).toHaveBeenCalledOnce()
+        expect(alertConfirm).toHaveBeenCalledWith(language.dbWriteConsent.replace('{}', pluginName))
+        expect([
+            writes.setCurrentCharacter, writes.setCharacterToIndex, writes.setChatToIndex,
+            writes.setDatabase, writes.setDatabaseLite,
+        ].map((write) => write.mock.calls.length)).toEqual(granted ? [2, 1, 1, 1, 1] : [0, 0, 0, 0, 0])
+    })
+
+    it('rejects risunestPatchConversation when dbWrite is declined', async () => {
+        vi.mocked(alertConfirm).mockResolvedValue(false)
+        vi.mocked(linkPluginQueryAbortSignals).mockImplementation(() => ({ signal: new AbortController().signal, dispose() {} }))
+
+        await expect(fixture.api!.risunestPatchConversation({
+            characterId: 'active',
+            conversationId: 'active-chat',
+            mutationId: 'declined',
+            messages: [{ index: 0, messageId: 'm0', set: { __tr: 'text' } }],
+        })).rejects.toThrow('Conversation patches require the dbWrite permission')
+
+        expect(alertConfirm).toHaveBeenCalledOnce()
+        expect(alertConfirm).toHaveBeenCalledWith(language.dbWriteConsent.replace('{}', pluginName))
     })
 })
 
@@ -303,23 +346,23 @@ describe('Plugin v3 runtime consent and ownership', () => {
         expect(alertConfirm).toHaveBeenCalledTimes(2)
     })
 
-    it('honors periodic upfront grants across reload and rechecks at the deadline', async () => {
+    it.each(['db', 'dbWrite'])('honors periodic upfront %s grants across reload and rechecks at the deadline', async (permission) => {
         let now = 1000
         vi.spyOn(Date, 'now').mockImplementation(() => now)
         const first = await start()
-        expect(await first.requestPluginPermission('db')).toBe(true)
+        expect(await first.requestPluginPermission(permission)).toBe(true)
         await loadV3Plugins([])
         const next = await start()
-        expect(await next.requestPluginPermission('db')).toBe(true)
+        expect(await next.requestPluginPermission(permission)).toBe(true)
         expect(alertConfirm).toHaveBeenCalledOnce()
         now += 7 * 24 * 60 * 60 * 1000 - 1
-        expect(await next.requestPluginPermission('db')).toBe(true)
+        expect(await next.requestPluginPermission(permission)).toBe(true)
         expect(alertConfirm).toHaveBeenCalledOnce()
         now += 1
-        expect(await next.requestPluginPermission('db')).toBe(true)
+        expect(await next.requestPluginPermission(permission)).toBe(true)
         expect(alertConfirm).toHaveBeenCalledTimes(2)
         await resetAllPluginPermissions()
-        expect(await next.requestPluginPermission('db')).toBe(true)
+        expect(await next.requestPluginPermission(permission)).toBe(true)
         expect(alertConfirm).toHaveBeenCalledTimes(3)
     })
 
@@ -342,6 +385,26 @@ describe('Plugin v3 runtime consent and ownership', () => {
         approve(true)
         await pending
         expect(fixture.replacers.get('beforeRequest')?.size).toBe(0)
+    })
+
+    it('ends the writes waiting on the dbWrite question when the plugin unloads', async () => {
+        const api = await start()
+        vi.mocked(alertConfirm).mockImplementation(() => new Promise(() => {}))
+        vi.mocked(linkPluginQueryAbortSignals).mockImplementation(() => ({ signal: new AbortController().signal, dispose() {} }))
+        const write = api.setDatabaseLite({ username: 'synthetic' })
+        const patch = api.risunestPatchConversation({
+            characterId: 'active',
+            conversationId: 'active-chat',
+            mutationId: 'unloaded',
+            messages: [{ index: 0, messageId: 'm0', set: { __tr: 'text' } }],
+        })
+        await vi.waitFor(() => expect(alertConfirm).toHaveBeenCalled())
+
+        await loadV3Plugins([])
+
+        await expect(write).resolves.toBeUndefined()
+        await expect(patch).rejects.toThrow()
+        expect(fixture.scopedAccess.setDatabaseLite).not.toHaveBeenCalled()
     })
 
     it('replaces provider metadata and cleans up the currently owned registration', async () => {
