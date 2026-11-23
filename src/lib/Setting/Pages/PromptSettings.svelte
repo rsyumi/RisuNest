@@ -198,8 +198,9 @@
     })
   })
 
+  // The search closes on leaving the list, and with the last block, which takes the toolbar the bar sits under.
   $effect(() => {
-    if (subMenu !== 0) untrack(closeSearch)
+    if (searchOpen && (subMenu !== 0 || DBState.db.promptTemplate.length === 0)) untrack(closeSearch)
   })
 
   const editedPreset = $derived(DBState.db.botPresets?.[DBState.db.botPresetsId]?.id ?? DBState.db.botPresetsId)
@@ -297,7 +298,7 @@
     if (e.ctrlKey && e.altKey && e.key === 'o') {
       toggleAllOpened()
     }
-    if (subMenu === 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+    if (subMenu === 0 && DBState.db.promptTemplate.length > 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
       e.preventDefault()
       openSearch()
     }
@@ -344,7 +345,7 @@
 
 {#if subMenu === 0}
     {#if DBState.db.promptTemplate.length > 0}
-        <div class="flex items-center gap-2 px-3 mt-4">
+        <div class="relative z-[51] flex items-center gap-2 px-3 mt-4">
             <span class="grow text-sm text-textcolor2">{language.risuNest.promptList.count.replace('{0}', String(DBState.db.promptTemplate.length))}</span>
             <button class="hover:bg-darkbg focus:ring-selected border-darkborderc border rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 inline-flex items-center gap-1.5 px-2 py-1 text-sm {searchOpen ? 'bg-selected text-textcolor' : 'bg-transparent text-textcolor2'}" aria-pressed={searchOpen} onclick={() => searchOpen ? closeSearch() : openSearch()}>
                 <SearchIcon size={14} />{language.search}

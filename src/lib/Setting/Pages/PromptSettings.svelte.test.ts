@@ -445,7 +445,7 @@ describe('prompt search', () => {
         }
     })
 
-    it('opens the search with Ctrl+F, or focuses and selects its text when it is open', async () => {
+    it('opens the search with Ctrl+F or focuses and selects its text, and closes it with the last block', async () => {
         const press = (init: KeyboardEventInit) => {
             const event = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, bubbles: true, cancelable: true, ...init })
             document.body.dispatchEvent(event)
@@ -462,6 +462,18 @@ describe('prompt search', () => {
         press({})
         await vi.waitFor(() => expect(document.activeElement).toBe(searchInput()))
         expect([searchInput().selectionStart, searchInput().selectionEnd]).toEqual([0, 5])
+
+        // The bar sits under the list's toolbar, which goes with the last block, so the search closes and Ctrl+F is left alone.
+        const removes = () => document.querySelectorAll<HTMLButtonElement>(`button[aria-label="${language.remove}"]`)
+        await type(searchInput(), '')
+        await vi.waitFor(() => expect(removes()).toHaveLength(4))
+        for (const remove of removes()) remove.click()
+        await vi.waitFor(() => expect(DBState.db.promptTemplate).toEqual([]))
+        await tick()
+        expect(bar()).toBeNull()
+        expect(press({}).defaultPrevented).toBe(false)
+        await tick()
+        expect(bar()).toBeNull()
     })
 })
 
