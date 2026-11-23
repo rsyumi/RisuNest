@@ -2073,6 +2073,19 @@ export const languageEnglish = {
         promptList: {
             count: '{0} prompts',
         },
+        promptSearch: {
+            matchCase: 'Match case',
+            replaceWith: 'Replace with',
+            replace: 'Replace',
+            replaceAll: 'Replace all',
+            matchCount: '{0} matches',
+            blockCount: '{0}',
+            replaced: 'Replaced {0}.',
+            undo: 'Undo',
+            invalidRegex: 'The regular expression is not valid.',
+            noMatch: 'No results.',
+            showMore: 'Show more ({0})',
+        },
         toggleEditor: {
             view: 'Custom toggle view',
             raw: 'Raw',

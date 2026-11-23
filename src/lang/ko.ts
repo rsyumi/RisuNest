@@ -1894,6 +1894,19 @@ export const languageKorean = {
         promptList: {
             count: '프롬프트 {0}개',
         },
+        promptSearch: {
+            matchCase: '대소문자 구분',
+            replaceWith: '바꿀 내용',
+            replace: '바꾸기',
+            replaceAll: '모두 바꾸기',
+            matchCount: '일치 {0}개',
+            blockCount: '{0}개',
+            replaced: '{0}개를 바꿨습니다.',
+            undo: '되돌리기',
+            invalidRegex: '정규식이 올바르지 않습니다.',
+            noMatch: '검색 결과가 없습니다.',
+            showMore: '더 보기 ({0}개)',
+        },
         toggleEditor: {
             view: '커스텀 토글 보기',
             raw: '원문',
