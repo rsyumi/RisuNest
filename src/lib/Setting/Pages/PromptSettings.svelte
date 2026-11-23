@@ -207,6 +207,12 @@
     void editedPreset
     untrack(() => { searchRecord = null })
   })
+  // The template can be swapped without the preset changing, so the undo also ends once none of its blocks is left.
+  $effect(() => {
+    if (searchRecord && !searchRecord.changes.some(change => DBState.db.promptTemplate.includes(change.block))) {
+      untrack(() => { searchRecord = null })
+    }
+  })
 
   function closeSearch() {
     searchOpen = false

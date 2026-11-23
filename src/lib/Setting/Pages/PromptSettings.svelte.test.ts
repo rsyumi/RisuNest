@@ -388,6 +388,18 @@ describe('prompt search', () => {
         DBState.db.botPresetsId = 1
         await tick()
         expect(bar()!.textContent).not.toContain(text.undo)
+
+        // Nor once none of the blocks it changed is in the list, which can be replaced while the preset stays.
+        await type(bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!, 'Keep')
+        await type(searchInput(), 'Remain')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} rules']))
+        ;[...card('{{user}} rules').querySelectorAll('button')].find(button => button.textContent === text.replace)!.click()
+        await tick()
+        expect((DBState.db.promptTemplate[2] as { text: string }).text).toBe('Keep in character.')
+        expect(bar()!.textContent).toContain(text.undo)
+        DBState.db.promptTemplate = DBState.db.promptTemplate.map(item => ({ ...item }))
+        await tick()
+        expect(bar()!.textContent).not.toContain(text.undo)
     })
 
     it('keeps a block listed while it is edited, until it is closed', async () => {
