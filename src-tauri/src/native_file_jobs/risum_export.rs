@@ -348,6 +348,11 @@ fn write_projected_risum(
             }
             descriptors.push((hash, size));
             tuple[1] = Value::String(String::new());
+            // RisuAI writes an extension that was never set as null, and released importers
+            // refuse a tuple without the element.
+            if tuple.len() == 2 {
+                tuple.push(Value::Null);
+            }
         }
     }
     let metadata = serde_json::to_vec_pretty(&json!({"module": module, "type": "risuModule"}))
@@ -795,7 +800,7 @@ mod tests {
         )
         .unwrap();
 
-        // The importer's parser reads both tuples as assets without an extension.
+        // Both tuples are written with a null extension, which the parser reads as none.
         let parse_root = directory.path().join("parse");
         fs::create_dir(&parse_root).unwrap();
         let staging = JobStaging::open(&parse_root).unwrap();
@@ -808,7 +813,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             parsed.metadata["module"]["assets"],
-            json!([["null extension", "", null], ["no extension", ""]])
+            json!([["null extension", "", null], ["no extension", "", null]])
         );
         for asset in &parsed.assets {
             assert_eq!(asset.declared_extension, "");
