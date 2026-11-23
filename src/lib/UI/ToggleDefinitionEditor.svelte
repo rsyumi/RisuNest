@@ -285,7 +285,7 @@
     {@const fields = toggleLineFields(line.raw)}
     {@const missing = missingToggleFields(line.raw)}
     {@const missingId = `toggle-row-${line.id}-missing`}
-    <div class="grid items-center gap-x-2 gap-y-1.5 rounded-md border border-darkborderc bg-darkbg px-1 py-1 grid-cols-[1.5rem_minmax(0,1fr)_auto] @md/rows:grid-cols-[1.5rem_9rem_minmax(0,1fr)_auto] @2xl/rows:grid-cols-[1.5rem_7rem_11rem_minmax(0,1fr)_auto]" data-toggle-row>
+    <div class="grid items-center gap-x-2 gap-y-1.5 rounded-md border border-darkborderc bg-darkbg px-1 py-1 grid-cols-[1.5rem_minmax(0,1fr)_auto] @md/rows:grid-cols-[1.5rem_9rem_minmax(0,1fr)_auto] @2xl/rows:grid-cols-[1.5rem_9rem_11rem_minmax(0,1fr)_auto]" data-toggle-row>
         <span class="col-start-1 row-start-1 h-10 flex items-center justify-center text-textcolor2 cursor-grab" draggable="true" aria-hidden="true" ondragstart={(event) => startDrag(event, line.id)} ondragend={endDrag}><GripVertical size={16} /></span>
         <SelectInput size="sm" className="min-w-0 col-start-2 row-start-1" ariaLabel={language.type} value={line.kind ?? 'switch'} onchange={(event) => {
             commit(setToggleRowKind(lines, line.id, event.currentTarget.value as RowKind))
@@ -299,7 +299,7 @@
         <div class="flex items-center col-start-3 row-start-1 @md/rows:col-start-4 @2xl/rows:col-start-5">
             <button class="{actionButton} hover:text-textcolor hover:bg-selected" title={language.movePresetUp} aria-label={language.movePresetUp} disabled={first} onclick={() => commit(moveToggleRow(lines, line.id, -1))}><ArrowUp size={16} /></button>
             <button class="{actionButton} hover:text-textcolor hover:bg-selected" title={language.movePresetDown} aria-label={language.movePresetDown} disabled={last} onclick={() => commit(moveToggleRow(lines, line.id, 1))}><ArrowDown size={16} /></button>
-            <span class="mx-1 h-5 w-px bg-darkborderc" aria-hidden="true"></span>
+            <span class="mx-0.5 @md/rows:mx-1 h-5 w-px bg-darkborderc" aria-hidden="true"></span>
             <button class="{actionButton} hover:text-draculared hover:bg-draculared/15" title={language.remove} aria-label={language.remove} onclick={() => commit(removeToggleRow(lines, line.id))}><Trash size={16} /></button>
         </div>
         {#if keyed(line.kind)}
@@ -336,7 +336,7 @@
                 {#if gapShown(null, id)}{@render dropLine('inset-x-0 -top-1')}{/if}
                 {@render row(lines[item.line], false, index === 0, lastItem)}
                 {#if item.type === 'group'}
-                    <div class="relative ml-3 pl-3 border-l-2 border-selected flex flex-col gap-1.5" data-toggle-children>
+                    <div class="relative ml-1 pl-1.5 @md/rows:ml-3 @md/rows:pl-3 border-l-2 border-selected flex flex-col gap-1.5" data-toggle-children>
                         {#each item.children as child, childIndex (lines[child].id)}
                             {@const childId = lines[child].id}
                             <div class="relative transition-transform {draggedId === childId ? 'opacity-50 scale-[0.98]' : ''}" data-toggle-item={childId}>
@@ -345,7 +345,7 @@
                                 {#if childIndex === item.children.length - 1 && gapShown(id, null)}{@render dropLine('inset-x-0 -bottom-1')}{/if}
                             </div>
                         {/each}
-                        {#if item.children.length === 0 && gapShown(id, null)}{@render dropLine('left-3 right-0 -top-1')}{/if}
+                        {#if item.children.length === 0 && gapShown(id, null)}{@render dropLine('left-1.5 @md/rows:left-3 right-0 -top-1')}{/if}
                         {@render addControl(id)}
                     </div>
                 {/if}
@@ -372,17 +372,21 @@
 <div class="flex flex-col gap-2 {className}">
     <div class="flex flex-wrap items-center gap-2">
         {#if !hideLabel}
-            <span class="text-textcolor">{language.customPromptTemplateToggle}</span>
-            <Help key="customPromptTemplateToggle" />
+            <div class="flex items-center gap-2">
+                <span class="text-textcolor">{language.customPromptTemplateToggle}</span>
+                <Help key="customPromptTemplateToggle" />
+            </div>
         {/if}
-        <div class="flex rounded-md border border-darkborderc text-sm" role="group" aria-label={language.risuNest.toggleEditor.view}>
-            {#each views as option, index (option)}
-                <button class="px-3 py-1 {index === 0 ? 'rounded-l-md' : 'border-l border-darkborderc'} {index === views.length - 1 ? 'rounded-r-md' : ''} {option === shownView ? 'bg-darkbutton' : 'text-textcolor2 hover:text-textcolor'}" aria-pressed={option === shownView} onclick={() => { view = option }}>{viewName(option)}</button>
-            {/each}
+        <div class="flex items-center gap-1">
+            <div class="flex rounded-md border border-darkborderc text-sm" role="group" aria-label={language.risuNest.toggleEditor.view}>
+                {#each views as option, index (option)}
+                    <button class="px-2.5 py-1 {index === 0 ? 'rounded-l-md' : 'border-l border-darkborderc'} {index === views.length - 1 ? 'rounded-r-md' : ''} {option === shownView ? 'bg-darkbutton' : 'text-textcolor2 hover:text-textcolor'}" aria-pressed={option === shownView} onclick={() => { view = option }}>{viewName(option)}</button>
+                {/each}
+            </div>
+            {#if !popout}
+                <button class="size-8 flex items-center justify-center rounded-md text-textcolor2 hover:text-textcolor hover:bg-selected transition-colors" title={language.risuNest.textEditor.open} aria-label={language.risuNest.textEditor.open} onclick={() => { windowOpen = true }}><Maximize2 size={16} /></button>
+            {/if}
         </div>
-        {#if !popout}
-            <button class="size-8 flex items-center justify-center rounded-md text-textcolor2 hover:text-textcolor hover:bg-selected transition-colors" title={language.risuNest.textEditor.open} aria-label={language.risuNest.textEditor.open} onclick={() => { windowOpen = true }}><Maximize2 size={16} /></button>
-        {/if}
     </div>
     {#if shownView === 'raw'}
         <TextAreaInput bind:value={rawDraft} optimaizedInput={false} onInput={commitRaw} onchange={commitRaw} />
