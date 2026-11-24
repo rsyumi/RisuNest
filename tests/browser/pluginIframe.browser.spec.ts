@@ -665,6 +665,27 @@ test.describe('floating plugin window', () => {
         expect(await show(page, 0, inside)).toEqual({ bounds: inside, viewport })
         expect(await frameRect(page, 0)).toEqual(inside)
         expect(await request(page, 0, { type: 'read' }, 'read')).toBe('kept')
+        // The host draws the window edge in the theme colors.
+        const chrome = await page.evaluate(() => {
+            const probe = document.createElement('div')
+            probe.style.cssText = 'border: 1px solid var(--risu-theme-darkborderc); background-color: var(--risu-theme-bgcolor)'
+            document.body.append(probe)
+            const read = (style: CSSStyleDeclaration) => ({
+                border: ['Top', 'Right', 'Bottom', 'Left'].map(side =>
+                    [style.getPropertyValue(`border-${side.toLowerCase()}-width`), style.getPropertyValue(`border-${side.toLowerCase()}-style`), style.getPropertyValue(`border-${side.toLowerCase()}-color`)].join(' ')),
+                background: style.backgroundColor,
+            })
+            const theme = read(getComputedStyle(probe))
+            probe.remove()
+            const style = getComputedStyle(document.querySelector('iframe[data-risu-plugin-frame]')!)
+            return { theme, frame: { ...read(style), radius: style.borderTopLeftRadius, shadow: style.boxShadow } }
+        })
+        expect(chrome.theme.background).not.toBe('rgba(0, 0, 0, 0)')
+        expect(chrome.frame).toEqual({
+            ...chrome.theme,
+            radius: '8px',
+            shadow: 'rgba(0, 0, 0, 0.1) 0px 10px 15px -3px, rgba(0, 0, 0, 0.1) 0px 4px 6px -4px',
+        })
         const adjusted = [
             [{ x: -50, y: 900, width: 100, height: 50 }, {}, { x: 0, y: 570, width: 200, height: 150 }],
             [{ x: 10, y: 10, width: 2000, height: 1000 }, {}, { x: 0, y: 0, width: 1280, height: 720 }],
@@ -685,14 +706,25 @@ test.describe('floating plugin window', () => {
         await show(page, 1, other)
         await request(page, 0, { type: 'region', region: { x: 0, y: 0, width: 398, height: 32 } }, 'region')
         const start = { x: 100, y: 100, width: 400, height: 300 }
+        const changes = async (tag: string) => (await settledChanges(page, 0)).filter(change => change.tag === tag)
+        await show(page, 0, start, { tag: 'plain' })
+        await drag(page, { x: 160, y: 116 }, { x: 100, y: 196, steps: 4 })
         const moved = { x: 40, y: 180, width: 400, height: 300 }
-        for (const tag of ['plain', 'crossing']) {
-            await show(page, 0, start, { tag })
-            // Crossing first reaches this frame below its drag region, then the other plugin's frame.
-            await drag(page, { x: 160, y: 116 }, ...(tag === 'crossing' ? [{ x: 160, y: 300 }, { x: 900, y: 500 }] : []), { x: 100, y: 196, steps: 4 })
-            expect(await frameRect(page, 0), tag).toEqual(moved)
-            expect((await settledChanges(page, 0)).filter(change => change.tag === tag), tag).toEqual([{ tag, state: { bounds: moved, viewport } }])
-        }
+        expect(await frameRect(page, 0)).toEqual(moved)
+        expect(await changes('plain')).toEqual([{ tag: 'plain', state: { bounds: moved, viewport } }])
+        // Each move lands on a plugin frame as it was before the move: first this frame below its drag
+        // region, then the other plugin's frame. The button is released over this frame's content.
+        await show(page, 0, start, { tag: 'crossing' })
+        await page.mouse.move(160, 116)
+        await page.mouse.down()
+        await page.mouse.move(160, 300)
+        expect(await frameRect(page, 0)).toEqual({ ...start, y: 284 })
+        await page.mouse.move(900, 500)
+        // The bottom of the viewport stops the window.
+        const crossed = { x: 840, y: 420, width: 400, height: 300 }
+        expect(await frameRect(page, 0)).toEqual(crossed)
+        await page.mouse.up()
+        expect(await changes('crossing')).toEqual([{ tag: 'crossing', state: { bounds: crossed, viewport } }])
         expect(await frameRect(page, 1)).toEqual(other)
         expect(await floatingEvents(page, 'change', 1)).toEqual([])
     })
@@ -760,7 +792,7 @@ test.describe('floating plugin window', () => {
         }
     })
 
-    test('a smaller viewport moves or shrinks the window and only the latest callback hears of it', async ({ page }) => {
+    test('a viewport change moves or shrinks the window as needed and only the latest callback hears of it', async ({ page }) => {
         await loadFloating(page)
         await page.evaluate(() => window.addEventListener('unhandledrejection', event => { document.body.dataset.unhandled = String(event.reason) }))
         const bounds = { x: 800, y: 400, width: 400, height: 300 }
@@ -775,7 +807,12 @@ test.describe('floating plugin window', () => {
         const shrunk = { bounds: { x: 0, y: 0, width: 350, height: 250 }, viewport: { width: 350, height: 250 } }
         await expect.poll(() => floatingEvents(page, 'change', 0)).toEqual([{ tag: 'current', state: moved }, { tag: 'current', state: shrunk }])
         expect(await frameRect(page, 0)).toEqual(shrunk.bounds)
-        expect(await settledChanges(page, 0)).toHaveLength(2)
+        // A larger viewport keeps the window where it is and still reports the new size.
+        await page.setViewportSize(viewport)
+        const enlarged = { bounds: shrunk.bounds, viewport }
+        await expect.poll(() => floatingEvents(page, 'change', 0)).toEqual([moved, shrunk, enlarged].map(state => ({ tag: 'current', state })))
+        expect(await frameRect(page, 0)).toEqual(shrunk.bounds)
+        expect(await settledChanges(page, 0)).toHaveLength(3)
         expect(await page.locator('body').getAttribute('data-unhandled')).toBeNull()
     })
 
@@ -838,7 +875,7 @@ test.describe('floating plugin window', () => {
         expect(await bodyChildren()).toEqual(children.filter(tag => tag !== 'IFRAME'))
     })
 
-    test('a drag ends when the app loses focus, a move comes without a button or the plugin hides, and frames take input again', async ({ page }) => {
+    test('a drag ends when the app loses focus, the pointer is cancelled or taken, a move comes without a button or the plugin hides, and frames take input again', async ({ page }) => {
         await loadFloating(page, 2)
         await show(page, 1, { x: 820, y: 420, width: 400, height: 260 })
         await request(page, 0, { type: 'region', region: { x: 0, y: 0, width: 398, height: 32 } }, 'region')
@@ -851,6 +888,20 @@ test.describe('floating plugin window', () => {
             buttonless: () => page.evaluate(() => {
                 window.dispatchEvent(new PointerEvent('pointermove', { pointerId: Number(document.body.dataset.pointer), buttons: 0, clientX: 300, clientY: 300, isPrimary: true }))
             }),
+            cancel: () => page.evaluate(() => {
+                document.body.dispatchEvent(new PointerEvent('pointercancel', { pointerId: Number(document.body.dataset.pointer), bubbles: true, isPrimary: true }))
+            }),
+            // Releases the pointer from the element holding it, as the browser does when it takes the pointer
+            // away. The browser reports the loss before the next pointer event, here a move with the button held.
+            taken: async () => {
+                await page.evaluate(() => {
+                    const pointerId = Number(document.body.dataset.pointer)
+                    const holder = [...document.querySelectorAll('div')].find(element => element.hasPointerCapture(pointerId))
+                    if (!holder) throw new Error('No element holds the pointer')
+                    holder.releasePointerCapture(pointerId)
+                })
+                await page.mouse.move(191, 137)
+            },
             hide: () => request(page, 0, { type: 'hide' }, 'hidden'),
         }
         for (const [ending, endDrag] of Object.entries(endings)) {
@@ -860,12 +911,12 @@ test.describe('floating plugin window', () => {
             await page.mouse.move(190, 136)
             expect(await framePointerInput(), ending).toEqual(['none', 'none'])
             await endDrag()
-            expect(await framePointerInput(), ending).toEqual(['auto', 'auto'])
+            await expect.poll(framePointerInput, { message: ending }).toEqual(['auto', 'auto'])
             await page.mouse.move(400, 400)
             await page.mouse.up()
             if (ending !== 'hide') expect(await frameRect(page, 0), ending).toEqual(stopped)
         }
-        expect(await settledChanges(page, 0)).toEqual(['blur', 'buttonless'].map(tag => ({ tag, state: { bounds: stopped, viewport } })))
+        expect(await settledChanges(page, 0)).toEqual(['blur', 'buttonless', 'cancel', 'taken'].map(tag => ({ tag, state: { bounds: stopped, viewport } })))
         expect(await frameRect(page, 1)).toEqual({ x: 820, y: 420, width: 400, height: 260 })
     })
 })
