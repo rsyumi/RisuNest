@@ -425,6 +425,17 @@ describe('prompt search', () => {
         const latest = counted - 'Talk to {{user}} kindly.\nNever speak for {{user}}.'.length + 3
         await vi.waitFor(() => expect(tokenCounts()).toEqual([latest, latest]))
         expect(vi.mocked(tokenizePreset).mock.calls.length).toBe(runs + 4)
+
+        // Opening the page shows the first count it makes; a second count would wait on the hold that stays closed.
+        await unmount(instance)
+        const opening: (() => void)[] = []
+        mocks.tokenHolds = [0, 1, 2].map(() => new Promise<void>(resolve => { opening.push(resolve) }))
+        instance = mount(PromptSettings, { target: document.body })
+        await tick()
+        opening[0]()
+        opening[1]()
+        await vi.waitFor(() => expect(tokenCounts()).toEqual([latest, latest]))
+        mocks.tokenHolds = []
     })
 
     it('replaces one match and keeps its block listed until the query changes', async () => {

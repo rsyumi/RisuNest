@@ -38,7 +38,6 @@
     // One count runs at a time; a change while it runs queues one more count, and an outdated count is not shown.
     let tokenizing = false
     let tokenizeQueued: PromptItem[] | null = null
-    executeTokenize(DBState.db.promptTemplate)
   interface Props {
     onGoBack?: () => void;
     mode?: 'independent'|'inline';
