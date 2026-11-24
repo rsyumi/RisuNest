@@ -22,6 +22,7 @@ const promptDiffModal = readFileSync('src/lib/Others/PromptDiffModal.svelte', 'u
 const easyPanel = readFileSync('src/lib/Others/ProTools/EasyPanel.svelte', 'utf8')
 const defaultChatScreen = readFileSync('src/lib/ChatScreens/DefaultChatScreen.svelte', 'utf8')
 const chatScreenshotDialog = readFileSync('src/lib/ChatScreens/ChatScreenshotDialog.svelte', 'utf8')
+const partialEditController = readFileSync('src/lib/ChatScreens/PartialEditController.svelte', 'utf8')
 const presetManager = readFileSync('src/lib/Setting/PresetManager.svelte', 'utf8')
 const triggerV2List = readFileSync('src/lib/SideBars/Scripts/TriggerV2List.svelte', 'utf8')
 const textAreaInput = readFileSync('src/lib/UI/GUI/TextAreaInput.svelte', 'utf8')
@@ -152,6 +153,8 @@ describe('modal layering', () => {
             expect(count(source, 'z-[1000]'), name).toBe(1)
             expect(count(source, 'z-modal'), name).toBe(0)
         }
+        // The partial edit dialogs mount on the body, so their own z-index decides what covers them.
+        expect(partialEditController.match(/\.partial-edit-overlay \{[^}]*z-index: (\d+);/)?.[1]).toBe('1000')
     })
 
     it('names the layers of the work dialogs that cover the others', () => {
