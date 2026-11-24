@@ -499,7 +499,7 @@ function validatePluginCompleteChat(value: unknown): asserts value is Chat {
     }
 }
 
-function validatePluginCompleteCharacter(
+export function validatePluginCompleteCharacter(
     value: unknown,
 ): asserts value is PluginCompleteCharacter {
     if (!value || typeof value !== 'object') {

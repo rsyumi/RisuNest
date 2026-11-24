@@ -887,12 +887,25 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
             requireChecked: true,
         })).confirmed) return
     }
+    await removeConfirmedCharacter(targetId, type)
+}
+
+/**
+ * Removes a character without asking, closing the open character first. Resolves
+ * 'blocked' when the open character cannot be closed and 'missing' when no such
+ * character is stored; nothing is removed in either case.
+ */
+export async function removeConfirmedCharacter(
+    targetId: string,
+    type: 'normal'|'permanent'|'permanentForce',
+): Promise<'removed' | 'missing' | 'blocked'> {
+    const liveDatabase = getDatabase()
     const selected = liveDatabase.characters[get(selectedCharID)]
     const targetTrashTime = liveDatabase.characters.find(
         (character) => character.chaId === targetId,
     )?.trashTime
     const selectedCharacterId = selected?.chaId ?? null
-    if (!await deactivateActiveWorkingSet()) return
+    if (!await deactivateActiveWorkingSet()) return 'blocked'
     const deactivatedGeneration = getPersistentNavigationGeneration()
     // Releasing the selected character clears the selection, so an empty
     // selection still belongs to this removal unless navigation moved on.
@@ -982,7 +995,7 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
     }
     if (!changed) {
         await restoreSelectionAfterFailedMutation()
-        return
+        return 'missing'
     }
     if (type !== 'normal') {
         void forgetDisplayRecovery((target) => target.characterId === targetId)
@@ -990,6 +1003,7 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
     } else {
         clearSelectionAfterCommittedDetail()
     }
+    return 'removed'
 }
 
 export async function addCharacter(arg:{
