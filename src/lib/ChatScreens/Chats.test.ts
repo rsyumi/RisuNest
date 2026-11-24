@@ -477,6 +477,26 @@ describe('Chats imperative mount lifecycle', () => {
         expect(remainingInstances.every((instanceId) => chatMountProbe.unmounts.includes(instanceId))).toBe(true)
     })
 
+    test('mounts dialogs from chat rows and the conversation start in the chat screen window layer', async () => {
+        // Rows past the first mount batch mount after a yield, outside any component context.
+        const messages = Array.from({ length: 6 }, (_, index) => makeMessage(index))
+        const windowLayer = document.createElement('div')
+        document.body.append(windowLayer)
+        chatMountProbe.windowDialogs = true
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages), windowLayer },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(6))
+        expect(conversationStartProbe(target)).not.toBeNull()
+        // The chat pane clips fixed layers inside it, so each mounted row reaches the layer outside it.
+        await vi.waitFor(() =>
+            expect(windowLayer.querySelectorAll('[data-window-dialog]')).toHaveLength(target.querySelectorAll('[data-chat-probe]').length),
+        )
+        expect(target.querySelector('[data-window-dialog]')).toBeNull()
+    })
+
     test('mounts duplicate and missing IDs, including the same object twice, as distinct occurrences', async () => {
         const repeated = makeMessage(0, { chatId: undefined, data: 'repeated' })
         const messages = [

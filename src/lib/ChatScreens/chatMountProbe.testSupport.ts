@@ -36,6 +36,7 @@ export const chatMountProbe = {
     }[],
     throwNextMount: false,
     holdDisplay: false,
+    windowDialogs: false,
     pendingDisplays: new Map<number, () => void>(),
     activeEditors: new Set<number>(),
     closeEditors: new Map<number, () => void>(),
@@ -52,6 +53,7 @@ export function resetChatMountProbe() {
     chatMountProbe.viewportBindings = []
     chatMountProbe.throwNextMount = false
     chatMountProbe.holdDisplay = false
+    chatMountProbe.windowDialogs = false
     chatMountProbe.pendingDisplays.clear()
     chatMountProbe.activeEditors = new Set()
     chatMountProbe.closeEditors = new Map()

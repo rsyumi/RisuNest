@@ -5,7 +5,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from 'src/lang';
     import { modalNavigation } from 'src/ts/ui/modalNavigation';
-    import Portal from 'src/lib/UI/GUI/Portal.svelte';
+    import ChatWindowLayer from './ChatWindowLayer.svelte';
     import { 
         findAllOriginalRangesFromHtml,
         findAllOriginalRangesFromText,
@@ -715,7 +715,7 @@
 </script>
 
 {#snippet MatchSelectionModal(mode: MatchingMode, matches: RangeResultWithContext[], title: string)}
-    <Portal>
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) cancelMatchSelection(); }}>
@@ -760,12 +760,12 @@
             </div>
         </div>
     </div>
-    </Portal>
+    </ChatWindowLayer>
 {/snippet}
 
 <!-- Match failed modal -->
 {#if showMatchFailedModal}
-    <Portal>
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) showMatchFailedModal = false; }}>
@@ -786,12 +786,12 @@
             </div>
         </div>
     </div>
-    </Portal>
+    </ChatWindowLayer>
 {/if}
 
 <!-- Delete confirmation modal -->
 {#if isConfirmingDelete}
-    <Portal>
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) handleCancelDelete(); }}>
@@ -831,7 +831,7 @@
             </div>
         </div>
     </div>
-    </Portal>
+    </ChatWindowLayer>
 {/if}
 
 <!-- Match selection modal (shared for edit/delete) -->
@@ -843,7 +843,7 @@
 
 <!-- Edit modal (shown only during edit) -->
 {#if isEditing}
-    <Portal>
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }}>
@@ -890,7 +890,7 @@
             </div>
         </div>
     </div>
-    </Portal>
+    </ChatWindowLayer>
 {/if}
 
 <style>
@@ -1029,8 +1029,7 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        /* Work dialog layer on the body: alerts and the app lock stack above it. */
-        z-index: 1000;
+        z-index: 10000;
     }
 
     .partial-edit-modal {

@@ -89,6 +89,11 @@ describe('ChatScreen navigation activity', () => {
             target.querySelector('[role="status"]')?.textContent?.trim(),
         ).toBe(language.loadingChatData)
         expect(oldChatControl?.closest('[inert]')).toBe(content)
+        // A dialog covering the whole window leaves the paint containment and goes inert with the old chat.
+        const dialog = target.querySelector('[data-window-dialog]')
+        expect(dialog).not.toBeNull()
+        expect(content.contains(dialog)).toBe(false)
+        expect(dialog?.closest('[inert]')?.parentElement).toBe(pane)
         const chatListControl = target.querySelector('[data-chat-list-control]')
         expect(chatListControl?.closest('[inert]')).toBeNull()
         const overlay = chatListControl?.closest('.z-40')

@@ -18,9 +18,12 @@
     import { derived } from 'svelte/store';
     import { onDestroy } from 'svelte';
     import { restoreFocusAfterInputBlock } from '../../ts/ui/restoreFocusAfterInputBlock';
+    import { provideChatWindowLayer } from './ChatWindowLayer.svelte';
     const navigationBlocked = derived(navigationActivity, activity => activity !== null)
     onDestroy(restoreFocusAfterInputBlock(navigationBlocked))
     let openChatList = $state(false)
+    let windowLayer = $state<HTMLElement>()
+    provideChatWindowLayer(() => windowLayer)
 
     const wallPaper = `background: url(${defaultWallpaper})`
     const externalStyles = 
@@ -41,11 +44,11 @@
 </script>
 
 <div class="relative min-w-0 grow h-full" aria-busy={$navigationBlocked}>
-    <!-- Paint containment lays out fixed layers from card and module HTML in the chat pane and clips them to it, so they never cover the sidebar. -->
-    <div class="relative z-0 min-w-0 h-full [contain:paint]" inert={$navigationBlocked}>
+    <!-- With a chat open, paint containment lays out fixed layers from card and module HTML in the chat pane and clips them to it, so they never cover the sidebar. -->
+    <div class="relative z-0 min-w-0 h-full {$selectedCharID >= 0 ? 'contain-paint' : ''}" inert={$navigationBlocked}>
     {#if DBState.db.theme === 'waifu'}
         <div class="grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
-            <SideBarArrow />
+            {#if $selectedCharID < 0}<SideBarArrow />{/if}
             <BackgroundDom />
             {#if $selectedCharID >= 0}
                 {#if DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
@@ -60,7 +63,7 @@
         </div>
     {:else if DBState.db.theme === 'waifuMobile'}
         <div class="grow h-full relative" style={bgImg.length < 4 ? wallPaper : bgImg}>
-            <SideBarArrow />
+            {#if $selectedCharID < 0}<SideBarArrow />{/if}
             <BackgroundDom />
             <div class="w-full absolute z-10 bottom-0 left-0"
                 class:per33={$selectedCharID >= 0 && DBState.db.characters[$selectedCharID].viewScreen !== 'none'}
@@ -78,7 +81,7 @@
         </div>
     {:else}
         <div class="grow h-full min-w-0 relative justify-center flex">
-            <SideBarArrow />
+            {#if $selectedCharID < 0}<SideBarArrow />{/if}
             <BackgroundDom />
             <div style={bgImg} class="h-full w-full" class:max-w-6xl={DBState.db.classicMaxWidth}>
                 {#if $selectedCharID >= 0}
@@ -90,6 +93,11 @@
             </div>
         </div>
     {/if}
+    </div>
+    <!-- Above the chat and its HTML, below the loading overlay and the conversation list: the sidebar arrow while a chat is open (the home screen keeps it under its own dialogs) and the chat's dialogs that cover the whole window. -->
+    <div class="absolute top-0 left-0 z-10" inert={$navigationBlocked}>
+        {#if $selectedCharID >= 0}<SideBarArrow />{/if}
+        <div bind:this={windowLayer}></div>
     </div>
     {#if $navigationActivity}
         <div class="absolute inset-0 z-30 flex items-center justify-center bg-darkbg/70">

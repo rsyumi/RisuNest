@@ -80,8 +80,10 @@ afterEach(async () => {
 test('retains the original source and draft when an asynchronous partial save is refused', async () => {
     const saved = deferred<boolean>()
     const onSave = vi.fn(() => saved.promise)
+    const windowLayer = document.createElement('div')
+    document.body.append(windowLayer)
     mounted = mount(PartialEditControllerHarness, { target, props: {
-        getTranslationEditContext: async () => null, onSave,
+        getTranslationEditContext: async () => null, onSave, windowLayer,
     } })
     ;(mounted as HarnessInstance).setTranslatedView(false)
     await tick()
@@ -94,8 +96,8 @@ test('retains the original source and draft when an asynchronous partial save is
     await tick()
     document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!.click()
     await vi.waitFor(() => expect(document.querySelector('.partial-edit-modal textarea')).not.toBeNull())
-    // The chat pane clips fixed layers inside it, so the dialog is mounted outside the message.
-    expect(target.contains(document.querySelector('.partial-edit-overlay'))).toBe(false)
+    // The chat pane clips fixed layers inside it, so the dialog mounts in the chat screen's window layer.
+    expect(windowLayer.contains(document.querySelector('.partial-edit-overlay'))).toBe(true)
     const input = document.querySelector<HTMLTextAreaElement>('.partial-edit-modal textarea')!
     input.value = 'Retained draft'
     input.dispatchEvent(new Event('input', { bubbles: true }))
