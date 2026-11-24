@@ -132,6 +132,20 @@
         {/each}
     </div>
 </div>
+<script module lang="ts">
+    /**
+     * A textarea gives its value with each CRLF and lone CR as LF. This is `text` as the textarea gives it, with `range`
+     * moved onto it; an offset between a CR and its LF lands before the LF.
+     */
+    export function textareaRange(text: string, range: { start: number, end: number }) {
+        const shift = (offset: number) => {
+            let removed = 0
+            for (let index = text.indexOf('\r\n'); index !== -1 && index < offset; index = text.indexOf('\r\n', index + 2)) removed++
+            return offset - removed
+        }
+        return { value: text.replace(/\r\n?/g, '\n'), start: shift(range.start), end: shift(range.end) }
+    }
+</script>
 <script lang="ts">
     import { textAreaSize, textAreaTextSize } from 'src/ts/gui/guisize'
     import { highlighter, getNewHighlightId, removeHighlight, AllCBS } from 'src/ts/gui/highlight'
@@ -325,11 +339,13 @@
         const valid = !!range && range.start >= 0 && range.start <= range.end && range.end <= text.length
         if (textareaDom) {
             textareaDom.focus({ preventScroll: true })
-            if (!valid || textareaDom.value !== text) return false
-            textareaDom.setSelectionRange(range.start, range.end)
+            if (!valid) return false
+            const shown = textareaRange(text, range)
+            if (textareaDom.value !== shown.value) return false
+            textareaDom.setSelectionRange(shown.start, shown.end)
             // Selecting does not scroll the textarea, so the start of the range is brought to about a third of its height.
             if (textareaDom.scrollHeight > textareaDom.clientHeight) {
-                textareaDom.scrollTop = textareaTextTop(textareaDom, range.start) - textareaDom.clientHeight / 3
+                textareaDom.scrollTop = textareaTextTop(textareaDom, shown.start) - textareaDom.clientHeight / 3
             }
             return true
         }

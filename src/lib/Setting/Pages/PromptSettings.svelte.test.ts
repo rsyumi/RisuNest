@@ -5,11 +5,15 @@ import { RISU_PROMPT_DRAG_TYPE } from 'src/ts/dragTypes'
 import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
 import { language } from 'src/lang'
 import { modalNavigation } from 'src/ts/ui/modalNavigation'
+import { tokenizePreset } from 'src/ts/process/prompt'
+import { matchLine } from 'src/ts/process/promptSearch'
 import PromptSettings from './PromptSettings.svelte'
 
 const mocks = vi.hoisted(() => ({
     confirm: vi.fn(async (_message: string) => true),
     toggleEditor: { props: {} as { value?: unknown, onChange?: (value: string) => void } },
+    // Each token count takes the next of these, if any, and waits on it.
+    tokenHolds: [] as Promise<void>[],
 }))
 
 vi.mock('src/ts/stores.svelte', async () => {
@@ -17,7 +21,25 @@ vi.mock('src/ts/stores.svelte', async () => {
     const DBState = $state({ db: {} })
     return { DBState, alertStore: writable({ type: 'none', msg: '' }) }
 })
-vi.mock('src/ts/process/prompt', () => ({ tokenizePreset: vi.fn(async () => 0) }))
+// Counts the characters of the fields tokenizePreset counts, reading each block after an await as it does.
+vi.mock('src/ts/process/prompt', () => ({
+    tokenizePreset: vi.fn(async (prompts: { type: string, text?: string, innerFormat?: string }[]) => {
+        const hold = mocks.tokenHolds.shift()
+        let total = 0
+        for (const prompt of prompts) {
+            const counted = prompt.type === 'plain' || prompt.type === 'jailbreak' ? prompt.text
+                : ['persona', 'description', 'lorebook', 'postEverything', 'authornote', 'memory'].includes(prompt.type) ? prompt.innerFormat : undefined
+            total += counted?.length ?? 0
+            await hold
+        }
+        return total
+    }),
+}))
+// Records the match lines built, which the search builds only for the lines it shows.
+vi.mock('src/ts/process/promptSearch', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('src/ts/process/promptSearch')>()
+    return { ...actual, matchLine: vi.fn(actual.matchLine) }
+})
 vi.mock('src/ts/process/templates/templateCheck', () => ({ templateCheck: () => [] }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: mocks.confirm }))
 vi.mock('src/lib/Others/Help.svelte', () => ({ default: () => {} }))
@@ -263,6 +285,13 @@ describe('prompt search', () => {
     // Each line shows the field's label, then the text of the line.
     const lineTexts = (title: string) => lines(title).map(line => [...line.children].map(part => part.textContent))
     const marks = (title: string) => [...card(title).querySelectorAll('mark')].map(mark => mark.textContent)
+    // Whether each line shows the ellipsis that says the text before its match was cut.
+    const cuts = (title: string) => lines(title).map(line => !line.querySelector<HTMLElement>('[aria-hidden="true"]')!.hidden)
+    const replaceInput = () => bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!
+    const more = (title: string) => [...card(title).querySelectorAll('button')].find(button => button.textContent?.startsWith(text.showMore.split('{0}')[0]))!
+    const tokenCounts = () => [language.fixedTokens, language.exactTokens].map(label =>
+        Number([...document.querySelectorAll('span')].find(span => span.textContent?.endsWith(` ${label}`))!.textContent!.split(' ')[0]))
+    const noMatches = `${text.matchCount.replace('{0}', '0')} · ${language.risuNest.promptList.count.replace('{0}', '0')}`
     const authorNote = language.formating.authorNote
     async function type(input: HTMLInputElement, value: string) {
         input.value = value
@@ -275,6 +304,7 @@ describe('prompt search', () => {
     }
 
     beforeEach(async () => {
+        mocks.tokenHolds = []
         DBState.db.promptTemplate = [
             { name: 'Intro', type: 'plain', type2: 'normal', role: 'system', text: 'Talk to {{user}} kindly.\nNever speak for {{user}}.' },
             { name: 'Lore', type: 'lorebook', text: 'leftover {{user}}' },
@@ -294,6 +324,7 @@ describe('prompt search', () => {
             [language.prompt, 'Talk to {{user}} kindly.'], [language.prompt, 'Never speak for {{user}}.'],
         ])
         expect(marks('Intro')).toEqual(['{{user}}', '{{user}}'])
+        expect(cuts('Intro')).toEqual([false, false])
         expect(lineTexts(authorNote)).toEqual([[language.innerFormat, '[{{user}} note] {{slot}}']])
         expect(document.querySelector('[draggable="true"], [role="doc-pagebreak"], button[aria-haspopup="menu"]')).toBeNull()
         expect(document.querySelector(`button[aria-label="${language.movePresetUp}"]`)).toBeNull()
@@ -365,6 +396,35 @@ describe('prompt search', () => {
         expect(listed()).toEqual(['Intro', '{{user}} rules', authorNote])
         expect(marks('Intro')).toEqual(['{{user}}', '{{user}}'])
         expect(bar()!.textContent).not.toContain(text.undo)
+
+        // The token counts follow a replace that changes only a later block, and its undo.
+        const counted = 'Talk to {{user}} kindly.\nNever speak for {{user}}.'.length + 'Stay in character.'.length + '[{{user}} note] {{slot}}'.length
+        await vi.waitFor(() => expect(tokenCounts()).toEqual([counted, counted]))
+        await type(replaceInput(), 'remark')
+        await type(searchInput(), 'note')
+        await vi.waitFor(() => expect(listed()).toEqual([authorNote]))
+        barButton(text.replaceAll).click()
+        await vi.waitFor(() => expect(tokenCounts()).toEqual([counted + 2, counted + 2]))
+        barButton(text.undo).click()
+        await vi.waitFor(() => expect(tokenCounts()).toEqual([counted, counted]))
+
+        // One count runs at a time: changes made while it runs lead to one more count, and the outdated count is not shown.
+        const release: (() => void)[] = []
+        mocks.tokenHolds = [0, 1, 2].map(() => new Promise<void>(resolve => { release.push(resolve) }))
+        const runs = vi.mocked(tokenizePreset).mock.calls.length
+        for (const value of ['x', 'xy', 'xyz']) {
+            (DBState.db.promptTemplate[0] as { text: string }).text = value
+            await tick()
+        }
+        expect(vi.mocked(tokenizePreset).mock.calls.length).toBe(runs + 1)
+        release[0]()
+        release[1]()
+        await vi.waitFor(() => expect(vi.mocked(tokenizePreset).mock.calls.length).toBe(runs + 3))
+        expect(tokenCounts()).toEqual([counted, counted])
+        release[2]()
+        const latest = counted - 'Talk to {{user}} kindly.\nNever speak for {{user}}.'.length + 3
+        await vi.waitFor(() => expect(tokenCounts()).toEqual([latest, latest]))
+        expect(vi.mocked(tokenizePreset).mock.calls.length).toBe(runs + 4)
     })
 
     it('replaces one match and keeps its block listed until the query changes', async () => {
@@ -383,6 +443,13 @@ describe('prompt search', () => {
         expect(bar()!.textContent).toContain(text.replaced.replace('{0}', '1'))
         await type(searchInput(), 'Stay ')
         await vi.waitFor(() => expect(listed()).toEqual([]))
+        // The first query typed again lists only what it matches.
+        await type(searchInput(), 'Remain')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} rules']))
+        await type(searchInput(), 'Stay')
+        await vi.waitFor(() => expect(bar()!.textContent).toContain(noMatches))
+        expect(listed()).toEqual([])
+        expect(document.body.textContent).toContain(text.noMatch)
         // Undo is offered for the preset it was made in.
         expect(bar()!.textContent).toContain(text.undo)
         DBState.db.botPresetsId = 1
@@ -420,6 +487,46 @@ describe('prompt search', () => {
         ;[...document.querySelectorAll('button')].find(button => button.textContent?.trim() === language.expandAll)!.click()
         await tick()
         expect(listed()).toEqual([])
+
+        // An open block kept under a query is not kept once the query changes, even to an empty one and back.
+        await type(searchInput(), 'laws')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} laws']))
+        await type(searchInput(), '')
+        await vi.waitFor(() => expect(listed()).toHaveLength(4))
+        DBState.db.promptTemplate[2].name = '{{user}} rules'
+        await type(searchInput(), 'laws')
+        await vi.waitFor(() => expect(bar()!.textContent).toContain(noMatches))
+        expect(listed()).toEqual([])
+    })
+
+    it('builds the line of a match only when it is shown, for the matches and for what replacing wrote', async () => {
+        const built = (fieldValue: string) => new Set(vi.mocked(matchLine).mock.calls
+            .filter(([value]) => value === fieldValue).map(([, range]) => range.start)).size
+        const many = `${'y'.repeat(30)}${'x'.repeat(50)}`
+        DBState.db.promptTemplate.push({ name: 'Many', type: 'plain', type2: 'normal', role: 'system', text: many })
+        await openSearch()
+        await type(searchInput(), 'x')
+        await vi.waitFor(() => expect(lines('Many')).toHaveLength(3))
+        expect(built(many)).toBe(3)
+        // The 30 characters before each match are more than a line shows, so each line says its text was cut.
+        expect(cuts('Many')).toEqual([true, true, true])
+        expect(lineTexts('Many')[0]).toEqual([language.prompt, `${'y'.repeat(24)}x${'x'.repeat(49)}`])
+        more('Many').click()
+        await tick()
+        expect(lines('Many')).toHaveLength(23)
+        expect(built(many)).toBe(23)
+
+        barButton(text.replace).click()
+        await tick()
+        await type(replaceInput(), 'z')
+        barButton(text.replaceAll).click()
+        await tick()
+        const written = `${'y'.repeat(30)}${'z'.repeat(50)}`
+        expect(lines('Many')).toHaveLength(3)
+        expect(built(written)).toBe(3)
+        more('Many').click()
+        await tick()
+        expect(built(written)).toBe(23)
     })
 
     it('closes the search before the settings window on back navigation', async () => {
@@ -451,6 +558,15 @@ describe('prompt search', () => {
             document.body.dispatchEvent(event)
             return event
         }
+        // Another screen in front of the list keeps Ctrl+F.
+        const screen = document.createElement('div')
+        document.body.append(screen)
+        const layer = modalNavigation(screen, { close: vi.fn() })
+        expect(press({}).defaultPrevented).toBe(false)
+        await tick()
+        expect(bar()).toBeNull()
+        layer.destroy()
+        await new Promise(resolve => setTimeout(resolve, 0))
         // Ctrl+Alt+F stays with the chat shortcut that uses it.
         expect(press({ altKey: true }).defaultPrevented).toBe(false)
         await tick()

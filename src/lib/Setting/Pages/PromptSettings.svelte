@@ -23,7 +23,7 @@
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
     import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
-    import { backNavigationLayer } from "src/ts/ui/modalNavigation";
+    import { backNavigationLayer, receivesInput } from "src/ts/ui/modalNavigation";
     import PromptSearchBar from "src/lib/UI/PromptSearchBar.svelte";
     import PromptSearchMatches, { type PromptSearchLine } from "src/lib/UI/PromptSearchMatches.svelte";
     import { blockMatches, buildMatcher, fieldText, matchLine, replaceAllInBlocks, replaceOneInBlock, undoWrites, type PromptFieldChange, type PromptFieldMatch, type PromptFieldWrite, type PromptSearchField, type TextRange } from "src/ts/process/promptSearch";
@@ -35,6 +35,9 @@
     let draggedIndex = $state(-1)
     let dragOverIndex = $state(-1)
     let openedItems = $state(new Set<PromptItem>())
+    // One count runs at a time; a change while it runs queues one more count, and an outdated count is not shown.
+    let tokenizing = false
+    let tokenizeQueued: PromptItem[] | null = null
     executeTokenize(DBState.db.promptTemplate)
   interface Props {
     onGoBack?: () => void;
@@ -45,14 +48,31 @@
   let { onGoBack = () => {}, mode = 'independent', subMenu = $bindable(0) }: Props = $props();
 
     async function executeTokenize(prest: PromptItem[]){
-        tokens = await tokenizePreset(prest, true, DBState.db)
-        extokens = await tokenizePreset(prest, false, DBState.db)
+        tokenizeQueued = prest
+        if (tokenizing) return
+        tokenizing = true
+        try {
+            while (tokenizeQueued) {
+                const template = tokenizeQueued
+                tokenizeQueued = null
+                const fixed = await tokenizePreset(template, true, DBState.db)
+                const exact = await tokenizePreset(template, false, DBState.db)
+                if (!tokenizeQueued) {
+                    tokens = fixed
+                    extokens = exact
+                }
+            }
+        } finally {
+            tokenizing = false
+        }
     }
 
     $effect.pre(() => {
     warns = templateCheck(DBState.db)
   });
   $effect.pre(() => {
+    // The count reads blocks across awaits, so every counted field is read here for the count to follow it.
+    for (const prompt of DBState.db.promptTemplate) void [prompt.type, (prompt as { text?: string }).text, (prompt as { innerFormat?: string }).innerFormat]
     executeTokenize(DBState.db.promptTemplate)
   });
 
@@ -140,6 +160,7 @@
   let keptReplaced = $state.raw({ key: '', items: new Set<PromptItem>() })
   let searchBar: { focusQuery?: () => void } | undefined = $state()
   let promptListDom: HTMLDivElement | undefined = $state()
+  let promptListArea: HTMLDivElement | undefined = $state()
 
   $effect(() => {
     const query = searchQuery
@@ -166,10 +187,13 @@
     return { matches, blocks }
   })
   const changesView = $derived(searchResults && searchRecord?.listing && searchRecord.key === searchKey ? searchRecord : null)
+  // What a query lists beyond its matches ends for good at the first change of the query or an option.
   $effect(() => {
     const key = searchKey
     untrack(() => {
       if (searchRecord?.listing && searchRecord.key !== key) searchRecord = { ...searchRecord, listing: false }
+      if (keptReplaced.key !== key) keptReplaced = { key, items: new Set() }
+      if (keptOpen.key !== key) keptOpen = { key, items: new Set() }
     })
   })
   const searchShown = $derived.by(() => {
@@ -278,28 +302,51 @@
     return searchResults?.get(item)?.length ?? 0
   }
 
-  function searchLinesFor(item: PromptItem, reveal: (field: PromptSearchField, range: TextRange | null) => void): PromptSearchLine[] {
+  // A block's match lines, each built only when it is shown: a block can hold many matches, and three are shown at first.
+  function searchLinesFor(item: PromptItem, reveal: (field: PromptSearchField, range: TextRange | null) => void): { count: number, line: (index: number) => PromptSearchLine } {
     if (changesView) {
-      return changesView.changes.filter(change => change.block === item).flatMap(change => change.written.map(range => ({
-        label: searchFieldLabel(change.field),
-        ...matchLine(change.after, range),
-        // A field edited since the replace is focused without a selection.
-        onPick: () => reveal(change.field, fieldText(item, change.field) === change.after ? range : null),
-      })))
+      const changes = changesView.changes.filter(change => change.block === item)
+      return {
+        count: changes.reduce((sum, change) => sum + change.written.length, 0),
+        line: index => {
+          let change = changes[0]
+          for (const next of changes) {
+            change = next
+            if (index < next.written.length) break
+            index -= next.written.length
+          }
+          const range = change.written[index]
+          return {
+            label: searchFieldLabel(change.field),
+            ...matchLine(change.after, range),
+            // A field edited since the replace is focused without a selection.
+            onPick: () => reveal(change.field, fieldText(item, change.field) === change.after ? range : null),
+          }
+        },
+      }
     }
-    return (searchResults?.get(item) ?? []).map(match => ({
-      label: searchFieldLabel(match.field),
-      ...matchLine(fieldText(item, match.field) ?? '', match),
-      onPick: () => reveal(match.field, match),
-      onReplace: searchShowReplace ? () => replaceSearchMatch(item, match) : undefined,
-    }))
+    const matches = searchResults?.get(item) ?? []
+    return {
+      count: matches.length,
+      line: index => {
+        const match = matches[index]
+        return {
+          label: searchFieldLabel(match.field),
+          ...matchLine(fieldText(item, match.field) ?? '', match),
+          onPick: () => reveal(match.field, match),
+          onReplace: searchShowReplace ? () => replaceSearchMatch(item, match) : undefined,
+        }
+      },
+    }
   }
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.ctrlKey && e.altKey && e.key === 'o') {
       toggleAllOpened()
     }
-    if (subMenu === 0 && DBState.db.promptTemplate.length > 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+    // Ctrl+F belongs to the list only while no other screen or dialog is in front of it.
+    if (subMenu === 0 && DBState.db.promptTemplate.length > 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f'
+      && promptListArea && receivesInput(promptListArea)) {
       e.preventDefault()
       openSearch()
     }
@@ -345,8 +392,10 @@
 {/if}
 
 {#if subMenu === 0}
+    <!-- The toolbar, the search bar and the list stack among themselves, so none of them paints over a screen outside them. -->
+    <div class="isolate flex flex-col" bind:this={promptListArea}>
     {#if DBState.db.promptTemplate.length > 0}
-        <div class="relative z-[51] flex items-center gap-2 px-3 mt-4">
+        <div class="relative z-20 flex items-center gap-2 px-3 mt-4">
             <span class="grow text-sm text-textcolor2">{language.risuNest.promptList.count.replace('{0}', String(DBState.db.promptTemplate.length))}</span>
             <button class="hover:bg-darkbg focus:ring-selected border-darkborderc border rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 inline-flex items-center gap-1.5 px-2 py-1 text-sm {searchOpen ? 'bg-selected text-textcolor' : 'bg-transparent text-textcolor2'}" aria-pressed={searchOpen} onclick={() => searchOpen ? closeSearch() : openSearch()}>
                 <SearchIcon size={14} />{language.search}
@@ -367,7 +416,7 @@
             status={searchRecord ? language.risuNest.promptSearch.replaced.replace('{0}', String(searchRecord.count)) : ''}
             onReplaceAll={replaceAllSearchMatches} onUndo={undoSearchReplace} onClose={closeSearch} onSubmit={focusFirstSearchLine} />
     {/if}
-    <div class="contain w-full max-w-full mt-2 flex flex-col px-3 rounded-md" use:htmlTouchDrag bind:this={promptListDom}>
+    <div class="contain isolate w-full max-w-full mt-2 flex flex-col px-3 rounded-md" use:htmlTouchDrag bind:this={promptListDom}>
         {#if DBState.db.promptTemplate.length === 0}
                 <div class="text-textcolor2">No Format</div>
         {/if}
@@ -421,11 +470,12 @@
                     }}>
                     {#snippet matchLines(reveal)}
                         {#if searchShown}
-                            <PromptSearchMatches lines={searchLinesFor(prompt, reveal)} resetKey={changesView ? `${searchKey}:written` : searchKey} />
+                            <PromptSearchMatches {...searchLinesFor(prompt, reveal)} resetKey={changesView ? `${searchKey}:written` : searchKey} />
                         {/if}
                     {/snippet}
                 </PromptDataItem>
             {/each}
+    </div>
     </div>
 
     {#if !searchShown}

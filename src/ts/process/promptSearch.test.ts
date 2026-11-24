@@ -73,14 +73,13 @@ describe('matching', () => {
     })
 
     it('shows the line that holds a match, cutting long text before it', () => {
-        expect(matchLine('first\nsecond line\nthird', { start: 13, end: 17 })).toEqual({ before: 'second ', hit: 'line', after: '' })
+        expect(matchLine('first\nsecond line\nthird', { start: 13, end: 17 })).toEqual({ before: 'second ', hit: 'line', after: '', cut: false })
         // A match across lines shows its first line.
-        expect(matchLine('ab\r\ncd', { start: 1, end: 5 })).toEqual({ before: 'a', hit: 'b', after: '' })
-        expect(matchLine('\nx', { start: 0, end: 2 })).toEqual({ before: '', hit: '', after: '' })
+        expect(matchLine('ab\r\ncd', { start: 1, end: 5 })).toEqual({ before: 'a', hit: 'b', after: '', cut: false })
+        expect(matchLine('\nx', { start: 0, end: 2 })).toEqual({ before: '', hit: '', after: '', cut: false })
+        expect(matchLine(`${'w'.repeat(24)}hit`, { start: 24, end: 27 }).cut).toBe(false)
         const long = `${'w'.repeat(40)}hit after`
-        const line = matchLine(long, { start: 40, end: 43 })
-        expect(line.before).toBe(`…${'w'.repeat(24)}`)
-        expect([line.hit, line.after]).toEqual(['hit', ' after'])
+        expect(matchLine(long, { start: 40, end: 43 })).toEqual({ before: 'w'.repeat(24), hit: 'hit', after: ' after', cut: true })
     })
 })
 
@@ -124,6 +123,17 @@ describe('replacing', () => {
         const blocks = [block('keep'), { type: 'lorebook', name: 'drop me' } as PromptItem]
         expect(replaceAllInBlocks(blocks, ready(' me'), '').map(change => change.after)).toEqual(['drop'])
         expect(replaceAllInBlocks(blocks, ready('keep'), 'keep')).toEqual([])
+        expect(replaceAllInBlocks([block('Foo FOO')], regex('foo'), '$&')).toEqual([])
+    })
+
+    it('records only the matches whose text changes, however they are spread over fields', () => {
+        const written = (blocks: PromptItem[], matcher: Extract<PromptSearchMatcher, { kind: 'ready' }>, replacement: string) =>
+            replaceAllInBlocks(blocks, matcher, replacement).flatMap(change => change.written.map(range => change.after.slice(range.start, range.end) + '@' + range.start))
+        expect(written([block('foo Foo')], ready('foo'), 'Foo')).toEqual(['Foo@0'])
+        expect(written([block('Foo foo')], ready('foo'), 'Foo')).toEqual(['Foo@4'])
+        expect(written([block('foo'), block('Foo')], ready('foo'), 'Foo')).toEqual(['Foo@0'])
+        // Positions after an unchanged match follow the text written before it.
+        expect(written([block('a aa aaa')], regex('a+'), 'aa')).toEqual(['aa@0', 'aa@6'])
     })
 })
 

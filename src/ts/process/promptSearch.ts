@@ -158,7 +158,8 @@ function replaceInText(text: string, matcher: Extract<PromptSearchMatcher, { kin
     for (const match of nonEmptyMatches(text, matcher.pattern)) {
         after += text.slice(last, match.index)
         const inserted = replacementFor(matcher, replacement, match, text)
-        written.push({ start: after.length, end: after.length + inserted.length })
+        // A match replaced by the same text is left as it was, so it is not one that was written.
+        if (inserted !== match[0]) written.push({ start: after.length, end: after.length + inserted.length })
         after += inserted
         last = match.index! + match[0].length
     }
@@ -211,22 +212,26 @@ export function undoWrites(changes: readonly PromptFieldChange[], blocks: readon
 const CONTEXT_BEFORE = 24
 const CONTEXT_AFTER = 200
 
-/** The line that holds the start of `range`, split around the part of the range on that line. */
-export function matchLine(text: string, range: TextRange): { before: string, hit: string, after: string } {
+/**
+ * The line that holds the start of `range`, split around the part of the range on that line.
+ * `cut` is set when the text before the match starts later than the line does.
+ */
+export function matchLine(text: string, range: TextRange): { before: string, hit: string, after: string, cut: boolean } {
     const lineStart = range.start === 0 ? 0 : text.lastIndexOf('\n', range.start - 1) + 1
     let lineEnd = text.indexOf('\n', range.start)
     if (lineEnd === -1) lineEnd = text.length
     if (lineEnd > range.start && text[lineEnd - 1] === '\r') lineEnd--
     const hitEnd = Math.min(range.end, lineEnd)
     let before = text.slice(lineStart, range.start)
-    if (before.length > CONTEXT_BEFORE) {
-        let cut = before.length - CONTEXT_BEFORE
-        const code = before.charCodeAt(cut)
-        if (code >= 0xdc00 && code <= 0xdfff) cut++
-        before = '…' + before.slice(cut)
+    const cut = before.length > CONTEXT_BEFORE
+    if (cut) {
+        let start = before.length - CONTEXT_BEFORE
+        const code = before.charCodeAt(start)
+        if (code >= 0xdc00 && code <= 0xdfff) start++
+        before = before.slice(start)
     }
     const hitOnLine = text.slice(range.start, hitEnd)
     const hit = hitOnLine.slice(0, CONTEXT_AFTER)
     const after = hit.length < hitOnLine.length ? '' : text.slice(hitEnd, Math.min(lineEnd, hitEnd + CONTEXT_AFTER))
-    return { before, hit, after }
+    return { before, hit, after, cut }
 }
