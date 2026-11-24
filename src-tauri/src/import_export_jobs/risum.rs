@@ -139,10 +139,10 @@ fn module_asset_extensions(metadata: &Value) -> Result<Vec<String>, FormatError>
         .iter()
         .enumerate()
         .map(
-            |(position, asset)| match asset.as_array().and_then(|tuple| tuple.get(2)) {
-                Some(Value::String(extension)) => Ok(extension.clone()),
-                // RisuAI exports an asset whose extension was never set as null.
-                Some(Value::Null) => Ok(String::new()),
+            |(position, asset)| match asset.as_array().map(|tuple| tuple.get(2)) {
+                Some(Some(Value::String(extension))) => Ok(extension.clone()),
+                // RisuAI exports an asset whose extension was never set as null, or without it.
+                Some(Some(Value::Null) | None) => Ok(String::new()),
                 _ => Err(FormatError::invalid(format!(
                     "Risu module asset {position} has no declared extension"
                 ))),

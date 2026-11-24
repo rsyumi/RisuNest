@@ -34,5 +34,8 @@ export const RISU_PROMPT_DRAG_TYPE = 'application/x-risu-prompt-drag'
 /** Sidebar character/folder reorder — also checked in App.svelte, hotkey.ts */
 export const RISU_SIDEBAR_DRAG_TYPE = 'application/x-risu-sidebar-drag'
 
+/** Custom toggle editor row and group reorder */
+export const RISU_TOGGLE_DRAG_TYPE = 'application/x-risu-toggle-drag'
+
 /** TriggerV2 trigger reorder */
 export const RISU_TRIGGER_DRAG_TYPE = 'application/x-risu-trigger-drag'

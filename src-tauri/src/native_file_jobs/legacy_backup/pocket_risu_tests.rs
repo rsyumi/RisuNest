@@ -164,6 +164,9 @@ fn pocket_versions_restore_database_and_media_into_the_persistent_store() {
         expected["botPresetsId"] = expected["botPresets"][0]["id"].clone();
         let archived = expected["characters"].as_array_mut().unwrap().remove(1);
         expected["characters"].as_array_mut().unwrap().push(archived);
+        for character in expected["characters"].as_array_mut().unwrap() {
+            restore::default_character_fields(character.as_object_mut().unwrap());
+        }
         for (key, expected_value) in expected.as_object().unwrap() {
             assert_eq!(&actual[key], expected_value, "lost database field: {key}");
         }

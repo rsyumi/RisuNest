@@ -22,6 +22,8 @@
         pinned?: (name: string) => boolean
         pinDisabled?: boolean
         onUnpin?: (name: string) => void
+        /** Draws groups open. */
+        openGroups?: boolean
     }
 
     let {
@@ -34,6 +36,7 @@
         pinned = () => false,
         pinDisabled = false,
         onUnpin = () => {},
+        openGroups = false,
     }: Props = $props();
 
     const dirtyClass = (key: string | undefined) => (dirty(key) ? 'bg-draculared/15' : '')
@@ -68,7 +71,7 @@
         {/if}
         {#if toggle.type === 'group' && toggle.children.length > 0}
             <div class="w-full mt-1">
-                <Accordion styled name={toggle.value}>
+                <Accordion styled name={toggle.value} startOpen={openGroups}>
                     {@render toggles((toggle as sidebarToggleGroup).children, reverse)}
                 </Accordion>
             </div>

@@ -724,10 +724,16 @@ fn validate_module_overlay(
         ("regex", "customscript"),
         ("lorebook", "globalLore"),
     ] {
-        let expected = character
-            .get(character_key)
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
+        // An absent or null list is an empty one, and the importer refuses anything but a list.
+        let expected = match character.get(character_key) {
+            None | Some(Value::Null) => Value::Array(Vec::new()),
+            Some(value) if value.is_array() => value.clone(),
+            Some(_) => {
+                return Err(invalid_input(format!(
+                    "pinned character {character_key} must be an array"
+                )))
+            }
+        };
         if module.get(module_key) != Some(&expected) {
             return Err(invalid_input(
                 "character module overlay does not match the pinned character",
@@ -1785,5 +1791,24 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(error, StoreError::RevisionConflict { .. }));
+    }
+
+    #[test]
+    fn module_overlay_reads_an_absent_or_null_list_as_empty_and_refuses_another_shape() {
+        let card = json!({"data": {"extensions": {"risuai": {}}}});
+        let empty = json!({"trigger": [], "regex": [], "lorebook": []});
+        for character in [
+            json!({}),
+            json!({"triggerscript": null, "customscript": null, "globalLore": null}),
+        ] {
+            validate_module_overlay(&character, &card, &empty).unwrap();
+        }
+        // The importer refuses a module list that is not an array, so the file is not written.
+        validate_module_overlay(
+            &json!({"triggerscript": "text"}),
+            &card,
+            &json!({"trigger": "text", "regex": [], "lorebook": []}),
+        )
+        .unwrap_err();
     }
 }

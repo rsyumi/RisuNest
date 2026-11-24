@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 vi.mock('../stores.svelte', async () => ({ alertStore: (await import('../alertQueue')).createAlertQueue({ type: 'none', msg: '' }, { gapMs: 0 }) }))
 import { alertStore } from '../stores.svelte'
 import { get } from 'svelte/store'
-import { modalNavigation, backNavigationLayer, handleRootBack } from './modalNavigation'
+import { modalNavigation, backNavigationLayer, handleRootBack, receivesInput } from './modalNavigation'
 import { installAppLockInput, registerAppLockSurface, setAppLockInputBlocked } from '../appLock/input'
 
 const rootBack = () => {
@@ -285,6 +285,35 @@ it('receives the root Back event that MainActivity sends', () => {
     const app = readFileSync('src/App.svelte', 'utf8')
     expect(activity).toContain('private const val ROOT_BACK_EVENT = "risunest-root-back"')
     expect(app).toContain("window.addEventListener('risunest-root-back', handleRootBack)")
+})
+it('gives keyboard input to content in the topmost layer, or around it, while no dialog or lock takes it', async () => {
+    vi.spyOn(history, 'go').mockImplementation(() => {})
+    const screen = document.createElement('div'), page = document.createElement('div'), bar = document.createElement('div')
+    const popup = document.createElement('div')
+    page.append(bar)
+    screen.append(page)
+    document.body.append(screen, popup)
+    expect(receivesInput(page)).toBe(true)
+    const screenLayer = modalNavigation(screen, { close: vi.fn() })
+    expect(receivesInput(page)).toBe(true)
+    // A layer opened inside the content, such as its own search bar, leaves the input with it.
+    const barLayer = backNavigationLayer(bar, { close: vi.fn() })
+    expect(receivesInput(page)).toBe(true)
+    const popupLayer = modalNavigation(popup, { close: vi.fn() })
+    expect(receivesInput(page)).toBe(false)
+    expect(receivesInput(popup)).toBe(true)
+    popupLayer.destroy()
+    expect(receivesInput(page)).toBe(true)
+    const confirmation = alertStore.open({ type: 'ask', msg: 'confirm' })
+    expect(receivesInput(page)).toBe(false)
+    alertStore.set({ type: 'none', msg: '' })
+    await expect(confirmation).resolves.toBe('')
+    expect(receivesInput(page)).toBe(true)
+    setAppLockInputBlocked(true)
+    expect(receivesInput(page)).toBe(false)
+    setAppLockInputBlocked(false)
+    barLayer.destroy()
+    screenLayer.destroy()
 })
 it('lets a Back-only layer close on Back while Escape stays with its content', async () => {
     const go = vi.spyOn(history, 'go').mockImplementation(() => {})

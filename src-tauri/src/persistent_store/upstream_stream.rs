@@ -410,13 +410,21 @@ impl RootSpool {
         let record = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
         let id = record.get("id").map(|id| id.as_str()).transpose()?.flatten();
         let mut updates = vec![("id", serde_json::to_vec(&self.record_id(scope,id)?)?)];
+        if scope == "modules" {
+            if let Some(assets) = filled_assets(&record)? { updates.push(("assets", assets)); }
+        }
         if scope == "personas" {
             if let Some(module) = record.get("embeddedModule") {
                 let module = module.object()?.ok_or_else(||invalid("Imported record must be an object"))?;
                 let id = module.get("id").map(|id| id.as_str()).transpose()?.flatten();
+                let mut module_updates = Vec::new();
                 if id.is_none_or(|id| id.is_empty()) {
+                    module_updates.push(("id", serde_json::to_vec(&uuid::Uuid::new_v4().to_string())?));
+                }
+                if let Some(assets) = filled_assets(&module)? { module_updates.push(("assets", assets)); }
+                if !module_updates.is_empty() {
                     let mut text = Vec::new();
-                    write_updated(&module, &[("id", serde_json::to_vec(&uuid::Uuid::new_v4().to_string())?)], &mut text)?;
+                    write_updated(&module, &module_updates, &mut text)?;
                     updates.push(("embeddedModule", text));
                 }
             }
@@ -436,6 +444,24 @@ impl RootSpool {
             if found.is_some() { return Ok(found); }
         }
         Ok(Some(selector.as_ref().and_then(Value::as_u64).unwrap_or(0).min(count-1).to_string()))
+    }
+
+    /// The member the preset selection addresses, by id or by position. A missing selection
+    /// is the first preset, and one that names no preset is none.
+    fn selected_preset(&self) -> StoreResult<Option<String>> {
+        let Some(selector) = self.scalar("botPresetsId")? else { return Ok(Some("0".to_owned())); };
+        if let Value::String(id) = &selector {
+            return Ok(self.db.query_row("SELECT key FROM members WHERE field='botPresets' AND json_extract(value,'$.id')=?1 ORDER BY rowid LIMIT 1",
+                [id],|r|r.get(0)).optional()?);
+        }
+        let count = self.count("botPresets")?;
+        Ok(selector.as_u64().filter(|index| *index < count).map(|index| index.to_string()))
+    }
+
+    /// Whether the root's flag keeps `key` from following the selected preset.
+    fn protected_preset_field(&self, key: &str) -> StoreResult<bool> {
+        Ok(super::export::protected_preset_flag(key)
+            .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false))
     }
 
     fn normalize(&self) -> StoreResult<()> {
@@ -462,27 +488,37 @@ impl RootSpool {
                 self.put_member_json("personas",&key,Some(stored_json::text(out)?.as_str()))?;
             }
         }
-        if self.kind("explicitGlobalChatVariables")?.is_none() { self.copy_field("globalChatVariables","explicitGlobalChatVariables")?; }
-        if let Some(key) = self.selected("botPresets","botPresetsId")? {
+        // Upstream RisuAI edits only `globalChatVariables`, so a copy an earlier export left
+        // in the file is replaced.
+        self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
+        // The TypeScript import records a protected field's value whether or not a preset
+        // is selected.
+        for (key,_) in super::export::PRESET_MIRRORS {
+            if !self.protected_preset_field(key)? { continue; }
+            if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
+            match self.field_json(key)? {
+                Some(text) => self.put_member_json("protectedPresetValues",key,Some(stored_json::text(text)?.as_str()))?,
+                None => self.remove_member("protectedPresetValues",key)?,
+            }
+        }
+        if self.count("botPresets")? == 0 { return Ok(()); }
+        if let Some(key) = self.selected_preset()? {
             let text = self.member_text("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             let document = Document::parse(&text, Depth::Unlimited)?;
             let preset = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
             let mut updates = Vec::new();
             for (key,field) in super::export::PRESET_MIRRORS {
-                if let Some(text) = self.field_json(key)? {
-                    let protected = super::export::protected_preset_flag(key)
-                        .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false);
-                    if protected {
-                        if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
-                        self.put_member_json("protectedPresetValues",key,Some(stored_json::text(text)?.as_str()))?;
-                    } else { updates.push((*field, text)); }
-                }
+                if let Some(text) = self.field_json(key)? { updates.push((*field, text)); }
             }
             let id = preset.get("id").map(|id| id.parse_value()).transpose()?.unwrap_or(Value::Null);
             self.put("botPresetsId",Some(&id))?;
             let mut out = Vec::new();
             write_updated(&preset, &updates, &mut out)?;
             self.put_member_json("botPresets",&key,Some(stored_json::text(out)?.as_str()))?;
+        } else {
+            // The TypeScript import stores a selection that names no preset as an empty id
+            // and writes no mirror.
+            self.put("botPresetsId",Some(&Value::String(String::new())))?;
         }
         Ok(())
     }
@@ -508,12 +544,16 @@ impl RootSpool {
             if self.kind(field)? != Some(FieldKind::Array) { continue; }
             self.visit(field,|key,mut record| {
                 self.assign_record_id(field,&mut record)?;
+                if field == "modules" {
+                    if let Some(assets) = record.get_mut("assets") { fill_asset_extensions(assets); }
+                }
                 if field == "personas" {
                     if let Some(module) = record.get_mut("embeddedModule") {
                         let object = module.as_object_mut().ok_or_else(||invalid("Imported record must be an object"))?;
                         if object.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
                             object.insert("id".into(),Value::String(uuid::Uuid::new_v4().to_string()));
                         }
+                        if let Some(assets) = object.get_mut("assets") { fill_asset_extensions(assets); }
                     }
                 }
                 self.put_member(field,key,Some(&record))
@@ -529,24 +569,52 @@ impl RootSpool {
                 self.put_member("personas",&key,Some(&persona))?;
             }
         }
-        if self.kind("explicitGlobalChatVariables")?.is_none() { self.copy_field("globalChatVariables","explicitGlobalChatVariables")?; }
-        if let Some(key) = self.selected("botPresets","botPresetsId")? {
+        self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
+        for (key,_) in super::export::PRESET_MIRRORS {
+            if !self.protected_preset_field(key)? { continue; }
+            if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
+            match self.value(key)? {
+                Some(value) => self.put_member("protectedPresetValues",key,Some(&value))?,
+                None => self.remove_member("protectedPresetValues",key)?,
+            }
+        }
+        if self.count("botPresets")? == 0 { return Ok(()); }
+        if let Some(key) = self.selected_preset()? {
             let mut preset = self.member("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             for (key,field) in super::export::PRESET_MIRRORS {
-                if let Some(value) = self.value(key)? {
-                    let protected = super::export::protected_preset_flag(key)
-                        .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false);
-                    if protected {
-                        if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
-                        self.put_member("protectedPresetValues",key,Some(&value))?;
-                    } else { preset[*field]=value; }
-                }
+                if let Some(value) = self.value(key)? { preset[*field]=value; }
             }
             self.put("botPresetsId",Some(&preset["id"]))?;
             self.put_member("botPresets",&key,Some(&preset))?;
+        } else {
+            self.put("botPresetsId",Some(&Value::String(String::new())))?;
         }
         Ok(())
     }
+}
+
+/// Gives every `[name, key]` and `[name, key, null]` tuple of an asset list an empty
+/// extension, and tells whether one changed. RisuAI wrote assets without an extension before
+/// it stored one, and the store builds an owner manifest only from three strings.
+pub(crate) fn fill_asset_extensions(assets: &mut Value) -> bool {
+    let mut changed = false;
+    for tuple in assets.as_array_mut().into_iter().flatten().filter_map(Value::as_array_mut) {
+        if tuple.len() < 2 || !tuple[0].is_string() || !tuple[1].is_string() { continue; }
+        match tuple.get(2) {
+            None => tuple.push(Value::String(String::new())),
+            Some(Value::Null) => tuple[2] = Value::String(String::new()),
+            Some(_) => continue,
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// The text of `owner`'s asset list with every extension filled, when one was missing.
+fn filled_assets(owner: &Object<'_>) -> StoreResult<Option<Vec<u8>>> {
+    let Some(assets) = owner.get("assets") else { return Ok(None); };
+    let mut assets = assets.parse_value()?;
+    Ok(if fill_asset_extensions(&mut assets) { Some(serde_json::to_vec(&assets)?) } else { None })
 }
 
 /// Appends what `to_string` writes for a stored object after `object[name] =`
@@ -690,9 +758,12 @@ mod tests {
         let fixture=json!({
             "botPresetsId":1,"selectedPersona":1,"temperature":0.8,"NAIsettings":{"synthetic":true},
             "username":"edited","doNotChangeFallbackModels":true,"fallbackModels":["protected"],
-            "personas":[{"id":"persona-one","name":"one"},{"id":"persona-two","name":"stale","embeddedModule":{"id":"embedded","assets":[]}}],
-            "modules":[{"id":"module"}],"loadouts":[{"id":"loadout"}],"customModels":[{"id":"model"}],
-            "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},
+            "personas":[{"id":"persona-one","name":"one"},{"id":"persona-two","name":"stale",
+                "embeddedModule":{"id":"embedded","assets":[["short","assets/e.png"],["null","assets/f.png",null]]}}],
+            "modules":[{"id":"module","assets":[["short","assets/m.png"],["tail","assets/n.png",null,"extra"],["kept","assets/o.png","png"],["odd",5]]}],
+            "loadouts":[{"id":"loadout"}],"customModels":[{"id":"model"}],
+            "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},"explicitGlobalChatVariables":{"stale":"0"},
+            "protectedPresetValues":{"fallbackWhenBlankResponse":true,"seperateModels":{"kept":1}},
             "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]},
                 {"name":"Binary \"preset\"\n","id":"preset-binary","image":"preset.png","NAISettings":{"blob":binary,"n":-0.0}}],
             "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value","binary":{"blob":binary,"text":"\u{d55c}\n"},"owned-binary":binary,
@@ -710,6 +781,14 @@ mod tests {
         root.put_member_json("pluginCustomStorage","spaced",Some(" { \"b\" : 1 , \"a\" : -0.0 , \"c\" : \"\\u00e9\" } ")).unwrap();
         streamed.replace_put_upstream_stream(&b,&root).unwrap();
         assert_eq!(streamed.materialize_staging(&b).unwrap(),old.materialize_staging(&a).unwrap());
+        assert_eq!(streamed.materialize_staging(&b).unwrap()["explicitGlobalChatVariables"],json!({"toggle_synthetic":"1","ordinary":"2"}));
+        // A protected field takes the root's value, one the root lacks is dropped, and a field whose flag is off is kept.
+        assert_eq!(streamed.materialize_staging(&b).unwrap()["protectedPresetValues"],json!({"seperateModels":{"kept":1},"fallbackModels":["protected"]}));
+        // An asset without an extension gets an empty one, and any other entry is kept.
+        assert_eq!(streamed.materialize_staging(&b).unwrap()["modules"][0]["assets"],
+            json!([["short","assets/m.png",""],["tail","assets/n.png","","extra"],["kept","assets/o.png","png"],["odd",5]]));
+        assert_eq!(streamed.materialize_staging(&b).unwrap()["personas"][1]["embeddedModule"]["assets"],
+            json!([["short","assets/e.png",""],["null","assets/f.png",""]]));
         for sql in [
             "SELECT preset_id,configured_index,name,image,value FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
             "SELECT owner,storage_key,byte_size,ordinal,value,import_batch_id=?1 FROM plugin_storage WHERE generation=?1 ORDER BY owner,storage_key",
@@ -962,9 +1041,22 @@ mod tests {
                 "botPresetsId": "b", "temperature": 0.25, "mainPrompt": binary(5), "aiModel": "model",
                 "fallbackModels": ["protected", binary(2)], "doNotChangeFallbackModels": true,
                 "seperateModels": {"a": "b"}, "doNotChangeSeperateModels": false,
-                "explicitGlobalChatVariables": {"kept": 1}, "globalChatVariables": {"other": 2},
+                "explicitGlobalChatVariables": {"stale": 1}, "globalChatVariables": {"other": 2},
             }),
-            json!({"botPresets": [{"id": "x"}], "protectedPresetValues": {"fallbackModels": []}, "fallbackModels": [], "doNotChangeFallbackModels": true}),
+            json!({"botPresets": [{"id": "x"}], "protectedPresetValues": {"fallbackModels": [], "fallbackWhenBlankResponse": true},
+                "fallbackModels": [], "doNotChangeFallbackModels": true}),
+            json!({
+                "modules": [
+                    {"id": "m", "assets": [["short", "assets/a"], ["null", "assets/b", null], ["kept", "assets/c", "png"],
+                        ["tail", "assets/d", null, 1E5], ["odd", 5], "text", []], "after": 1E5},
+                    {"id": "n", "assets": null}, {"id": "o", "assets": [["kept", "assets/e", ""]]}, {"assets": [["short", "assets/f"]]},
+                ],
+                "personas": [
+                    {"id": "p", "embeddedModule": {"assets": [["short", "assets/g"]]}},
+                    {"id": "q", "embeddedModule": {"id": "e", "assets": [["null", "assets/h", null]], "binary": binary(40)}},
+                    {"id": "r", "embeddedModule": {"id": "kept", "assets": [["kept", "assets/i", "png"]]}},
+                ],
+            }),
             json!({"modules": [{"id": "m"}, "not a record"]}),
             json!({"personas": [{"id": "p", "embeddedModule": null}]}),
             json!({"personas": [], "modules": {"id": "not an array"}}),
@@ -976,6 +1068,22 @@ mod tests {
             let normalized_values = values.normalize_values();
             assert_eq!(normalized_texts, normalized_values, "{fixture}");
             assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
+        }
+        // A selection that names no preset selects none, and no preset takes the root's values.
+        // The protected value is recorded all the same.
+        for selection in [json!(-1), json!("gone"), json!(2)] {
+            let fixture = json!({
+                "botPresets": [{"id": "first", "temperature": 1}, {"id": "second"}], "botPresetsId": selection,
+                "temperature": 0.25, "fallbackModels": ["live"], "doNotChangeFallbackModels": true,
+            });
+            let texts = spool(&fixture);
+            let values = spool(&fixture);
+            texts.normalize().unwrap();
+            values.normalize_values().unwrap();
+            assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
+            assert_eq!(texts.scalar("botPresetsId").unwrap(), Some(json!("")), "{fixture}");
+            assert_eq!(texts.member("botPresets", "0").unwrap(), Some(json!({"id": "first", "temperature": 1})), "{fixture}");
+            assert_eq!(texts.value("protectedPresetValues").unwrap(), Some(json!({"fallbackModels": ["live"]})), "{fixture}");
         }
     }
 }

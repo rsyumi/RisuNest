@@ -741,7 +741,16 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     cha.backgroundHTML ??= ''
     cha.backgroundCSS ??= ''
     cha.creation_date ??= Date.now()
-    cha.globalLore = updateLorebooks(cha.globalLore)
+    // A character restored from another app's backup can lack the fields below, and an imported
+    // card can hold something other than a list where a list belongs.
+    cha.firstMessage ??= ''
+    cha.viewScreen ??= 'none'
+    cha.emotionImages ??= []
+    cha.bias ??= []
+    cha.desc ??= ''
+    if(!Array.isArray(cha.triggerscript)) cha.triggerscript = []
+    if(!Array.isArray(cha.customscript)) cha.customscript = []
+    cha.globalLore = updateLorebooks(Array.isArray(cha.globalLore) ? cha.globalLore : [])
     if(!cha.newGenData){
         cha = updateInlayScreen(cha)
     }
