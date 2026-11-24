@@ -7,7 +7,7 @@ import { type Chat, type character, type customscript, type Database, type loreB
 import { downloadFile } from "../globalApi.svelte";
 import { getStartupExclusions } from "../storage/deviceSettings";
 import { isStartupExcluded } from "../storage/recoveryMode.svelte";
-import { alertError, alertNormal } from "../alert";
+import { alertError, alertNormal, type alertData } from "../alert";
 import { language } from "src/lang";
 import { selectSingleFile } from "../util";
 import { assetRegex, type CbsConditions, risuChatParser as risuChatParserOrg, type simpleCharacterArgument } from "../parser/parser.svelte";
@@ -67,6 +67,8 @@ export interface ProcessScriptOptions {
     variableReads?: DisplayReadRecord
     /** When the view asked for this display, from `nextDisplayListenerOrder`. */
     displayRequestOrder?: number
+    /** Holds Lua handler errors for the caller to show, instead of showing them now. */
+    luaErrors?: alertData[]
 }
 
 export interface ProcessScriptInvocationContext {
@@ -677,6 +679,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             options.onConversationCommit,
             options.signal,
             options.displayRequestOrder,
+            options.luaErrors,
         )
         options.signal?.throwIfAborted()
     }

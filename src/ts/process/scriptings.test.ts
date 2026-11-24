@@ -34,6 +34,7 @@ import {
 import { captureGenerationConversationOperation } from './generationConversationOperation'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
+import { alertStore } from '../alertQueue'
 import { language } from '../../lang'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 import { pluginV2 } from '../plugins/plugins.svelte'
@@ -757,6 +758,46 @@ test('records nil, null, false, arrays, and JSON round trips', async () => {
     data: { nullValue: null } as never,
     mode: 'editInput',
   })).resolves.toMatchObject({ res: {}, stopSending: false })
+})
+
+/** The error dialogs opened until `restore`. */
+function watchErrorDialogs() {
+  const set = vi.spyOn(alertStore, 'set')
+  return {
+    messages: () => set.mock.calls.flatMap(([value]) => value.type === 'error' ? [value.msg] : []),
+    restore: () => set.mockRestore(),
+  }
+}
+
+test.each([
+  { mode: 'editInput', code: `listenEdit('editInput', function(id, value) local missing = nil; return missing.value end)` },
+  { mode: 'editDisplay', code: `listenEdit('editDisplay', function(id, value) local missing = nil; return missing.value end)` },
+  { mode: 'display', code: `function display(id) local missing = nil; return missing.value end` },
+])('reports a failing $mode handler in an error dialog only outside display', async ({ mode, code }) => {
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const dialogs = watchErrorDialogs()
+  try {
+    await runScripted(code, {
+      char: { chaId: `handler-error-dialog-${mode}` } as never,
+      chat: { message: [] } as never,
+      data: 'text',
+      mode,
+    })
+    expect(dialogs.messages()).toEqual(mode === 'editInput'
+      ? [`Lua (editInput)\n[string "..."]:1: attempt to index a nil value (local 'missing')`]
+      : [])
+  } finally {
+    dialogs.restore()
+    errors.mockRestore()
+  }
+})
+
+test('numbers a load error from the first line of the script', async () => {
+  await expect(runScripted('local ok = 1\nlocal broken = = 1', {
+    char: { chaId: 'load-error-line' } as never,
+    chat: { message: [] } as never,
+    mode: 'start',
+  })).rejects.toThrow(`[string "..."]:2: unexpected symbol near '='`)
 })
 
 test('records sparse arrays as a current-runtime handler error', async () => {
@@ -2358,6 +2399,7 @@ test.each(['after', 'before'].flatMap(edit => ['content', 'metadata'].map(change
     return new Promise<boolean>((resolve) => { confirm = resolve })
   })
   const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const dialogs = watchErrorDialogs()
   const { runLuaInteractionTrigger } = await import('./scriptings')
   try {
     const click = runLuaInteractionTrigger('button', fixture.char, 'click')
@@ -2382,8 +2424,10 @@ test.each(['after', 'before'].flatMap(edit => ['content', 'metadata'].map(change
       : { data: 'external' })
     expect(fixture.chat.scriptstate).toEqual({ $asked: 'yes', $answered: 'yes' })
     expect(fixture.session.activePinReasons).toEqual([])
+    expect(dialogs.messages()).toEqual([])
   } finally {
     confirm?.(true)
+    dialogs.restore()
     errors.mockRestore()
     continuationRuntime.session = null
     vi.mocked(alertConfirm).mockReset()
@@ -2561,6 +2605,7 @@ test('stops a Lua handler at the next wait once its conversation is no longer cu
     .mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }) as never)
     .mockResolvedValue({ type: 'success', result: 'second' } as never)
   const { runLuaInteractionTrigger } = await import('./scriptings')
+  const dialogs = watchErrorDialogs()
   try {
     const settled = runLuaInteractionTrigger('button', fixture.char, 'click').then(
       () => null,
@@ -2574,7 +2619,9 @@ test('stops a Lua handler at the next wait once its conversation is no longer cu
     expect(requestChatData).toHaveBeenCalledOnce()
     expect(fixture.chat.scriptstate).toEqual({ $before: '1' })
     expect(other.chat.scriptstate).toBeUndefined()
+    expect(dialogs.messages()).toEqual([])
   } finally {
+    dialogs.restore()
     vi.mocked(requestChatData).mockReset()
     continuationRuntime.session = null
   }

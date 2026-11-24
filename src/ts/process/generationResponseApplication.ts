@@ -21,12 +21,16 @@ import { historyLength } from './historyWindowIndex'
 import type { ConversationCommitObserver } from './conversationOperationContext'
 import type { GenerationDiagnosticTrace, GenerationDiagnosticPhase, GenerationDiagnosticOutcome, GenerationFailureReason } from '../generationDiagnostics'
 import { createGenerationCheckpoints, type GenerationCheckpointPersistence } from './generationCheckpoints'
+import type { alertData } from '../alert'
+import { alertStore } from '../alertQueue'
 
 export interface GenerationResponseProcessingOptions {
     onConversationCommit?: ConversationCommitObserver
     cache: 'normal' | 'bypass'
     signal: AbortSignal
     regexWorker: true
+    /** Holds Lua handler errors for the caller to show, instead of showing them now. */
+    luaErrors?: alertData[]
 }
 
 export interface GenerationResponseOperationContext {
@@ -210,6 +214,9 @@ export async function applyGenerationResponse(
             const prefix = options.continueGeneration ? initialOutput.data : ''
             const outputMessageId = outputTarget.messageId
             const performanceMode = options.streamingDisplayOptimizationMode()
+            // A Lua listener can fail on a partial response that it handles once complete,
+            // so only the errors of the latest run, which saw the complete response, are shown.
+            let latestLuaErrors: alertData[] = []
             const processStreamingSnapshot = async (
                 snapshot: string,
                 cache: 'normal' | 'bypass',
@@ -217,11 +224,14 @@ export async function applyGenerationResponse(
             ) => {
                 try {
                     beginPhase('semantic-output')
-                    return await options.callbacks.processOutput(
+                    const luaErrors: alertData[] = []
+                    const processed = await options.callbacks.processOutput(
                         prefix + snapshot,
                         outputTarget!.absoluteIndex,
-                        { cache, signal, regexWorker: true, onConversationCommit },
+                        { cache, signal, regexWorker: true, onConversationCommit, luaErrors },
                     )
+                    latestLuaErrors = luaErrors
+                    return processed
                 } catch (error) {
                     if (signal.aborted) return null
                     if (
@@ -305,6 +315,7 @@ export async function applyGenerationResponse(
             endPhase('semantic-output')
 
             if (!outputTarget.isOwned()) return null
+            for (const notice of latestLuaErrors) alertStore.set(notice)
             beginPhase('current-chat-parser')
             let currentChat = options.callbacks.runCurrentChatParser(targetChat)
             endPhase('current-chat-parser')
