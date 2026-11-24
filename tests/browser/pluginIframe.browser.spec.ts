@@ -569,3 +569,303 @@ test.describe('guest reference release', () => {
         expect(await page.evaluate(() => window.boundary.localInstances)).toBe(0)
     })
 })
+
+// A plugin that floats its frame on request and reports what the host answers.
+const floatingScript = (plugin: number) => `
+const report = (kind, value) => parent.postMessage({ fixture: 'floating', plugin: ${plugin}, kind, value }, '*');
+window.addEventListener('message', async event => {
+    const command = event.data?.floatingCommand;
+    if (!command) return;
+    try {
+        if (command.type === 'show') {
+            const { tag, throwing } = command;
+            report('shown', await risuai.risunestShowFloatingWindow(command.options, state => {
+                report('change', { tag, state });
+                if (throwing) throw new Error('Synthetic callback failure');
+            }));
+        } else if (command.type === 'region') {
+            await risuai.risunestSetFloatingDragRegion(command.region);
+            report('region', null);
+        } else if (command.type === 'fullscreen') {
+            await risuai.showContainer('fullscreen');
+            report('fullscreen', null);
+        } else if (command.type === 'hide') {
+            await risuai.hideContainer();
+            report('hidden', null);
+        } else if (command.type === 'store') {
+            window.stored = command.value;
+            report('stored', null);
+        } else if (command.type === 'read') report('read', window.stored ?? null);
+        else if (command.type === 'ping') report('pong', null);
+    } catch (error) { report('error', String(error)); }
+});
+report('ready', null);
+`
+
+type Rect = { x: number; y: number; width: number; height: number }
+const viewport = { width: 1280, height: 720 }
+
+async function loadFloating(page: Page, count = 1) {
+    await page.goto('/')
+    await page.evaluate(() => window.boundary.loadAppStyles())
+    await page.evaluate(scripts => window.boundary.loadAll(scripts), Array.from({ length: count }, (_, plugin) => floatingScript(plugin)))
+    await expect.poll(() => floatingEvents(page, 'ready')).toHaveLength(count)
+}
+
+function floatingEvents(page: Page, kind: string, plugin?: number): Promise<any[]> {
+    return page.evaluate(([kind, plugin]) => window.boundary.events
+        .filter((event: any) => event.fixture === 'floating' && event.kind === kind && (plugin === null || event.plugin === plugin))
+        .map((event: any) => event.value), [kind, plugin ?? null] as const)
+}
+
+/** Sends a command to a plugin frame and returns its answer. */
+async function request(page: Page, plugin: number, command: object, answer: string): Promise<any> {
+    const count = async () => ({ answers: await floatingEvents(page, answer, plugin), errors: await floatingEvents(page, 'error', plugin) })
+    const before = await count()
+    await page.evaluate(([plugin, command]) => {
+        document.querySelectorAll<HTMLIFrameElement>('iframe[data-risu-plugin-frame]')[plugin].contentWindow!.postMessage({ floatingCommand: command }, '*')
+    }, [plugin, command] as const)
+    let after = before
+    await expect.poll(async () => {
+        after = await count()
+        return after.answers.length + after.errors.length
+    }).toBe(before.answers.length + before.errors.length + 1)
+    expect(after.errors.slice(before.errors.length)).toEqual([])
+    return after.answers.at(-1)
+}
+
+const show = (page: Page, plugin: number, bounds: Rect, extra: object = {}) =>
+    request(page, plugin, { type: 'show', options: { bounds }, ...extra }, 'shown')
+
+function frameRect(page: Page, plugin: number): Promise<Rect> {
+    return page.evaluate(plugin => {
+        const rect = document.querySelectorAll('iframe[data-risu-plugin-frame]')[plugin].getBoundingClientRect()
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+    }, plugin)
+}
+
+/** Changes the plugin reported, after a round trip that any pending change would have preceded. */
+async function settledChanges(page: Page, plugin: number) {
+    await request(page, plugin, { type: 'ping' }, 'pong')
+    return floatingEvents(page, 'change', plugin)
+}
+
+async function drag(page: Page, from: { x: number; y: number }, ...path: { x: number; y: number; steps?: number }[]) {
+    await page.mouse.move(from.x, from.y)
+    await page.mouse.down()
+    for (const point of path) await page.mouse.move(point.x, point.y, { steps: point.steps ?? 1 })
+    await page.mouse.up()
+}
+
+test.describe('floating plugin window', () => {
+    test('shows the frame at the bounds the host applied without reloading it', async ({ page }) => {
+        await loadFloating(page)
+        await request(page, 0, { type: 'store', value: 'kept' }, 'stored')
+        const inside = { x: 100, y: 80, width: 400, height: 300 }
+        expect(await show(page, 0, inside)).toEqual({ bounds: inside, viewport })
+        expect(await frameRect(page, 0)).toEqual(inside)
+        expect(await request(page, 0, { type: 'read' }, 'read')).toBe('kept')
+        const adjusted = [
+            [{ x: -50, y: 900, width: 100, height: 50 }, {}, { x: 0, y: 570, width: 200, height: 150 }],
+            [{ x: 10, y: 10, width: 2000, height: 1000 }, {}, { x: 0, y: 0, width: 1280, height: 720 }],
+            [{ x: 1000, y: 10, width: 400, height: 300 }, { minSize: { width: 500, height: 350 } }, { x: 780, y: 10, width: 500, height: 350 }],
+        ] as const
+        for (const [bounds, options, applied] of adjusted) {
+            expect(await request(page, 0, { type: 'show', options: { bounds, ...options } }, 'shown')).toEqual({ bounds: applied, viewport })
+            expect(await frameRect(page, 0)).toEqual(applied)
+        }
+        expect(await request(page, 0, { type: 'show', options: {} }, 'shown')).toEqual({ bounds: { x: 836, y: 40, width: 420, height: 640 }, viewport })
+        expect(await request(page, 0, { type: 'read' }, 'read')).toBe('kept')
+        expect(await floatingEvents(page, 'ready')).toHaveLength(1)
+    })
+
+    test('dragging the drag region moves the window by the distance, also across this and another plugin frame', async ({ page }) => {
+        await loadFloating(page, 2)
+        const other = { x: 820, y: 420, width: 400, height: 260 }
+        await show(page, 1, other)
+        await request(page, 0, { type: 'region', region: { x: 0, y: 0, width: 398, height: 32 } }, 'region')
+        const start = { x: 100, y: 100, width: 400, height: 300 }
+        const moved = { x: 40, y: 180, width: 400, height: 300 }
+        for (const tag of ['plain', 'crossing']) {
+            await show(page, 0, start, { tag })
+            // Crossing first reaches this frame below its drag region, then the other plugin's frame.
+            await drag(page, { x: 160, y: 116 }, ...(tag === 'crossing' ? [{ x: 160, y: 300 }, { x: 900, y: 500 }] : []), { x: 100, y: 196, steps: 4 })
+            expect(await frameRect(page, 0), tag).toEqual(moved)
+            expect((await settledChanges(page, 0)).filter(change => change.tag === tag), tag).toEqual([{ tag, state: { bounds: moved, viewport } }])
+        }
+        expect(await frameRect(page, 1)).toEqual(other)
+        expect(await floatingEvents(page, 'change', 1)).toEqual([])
+    })
+
+    test('the drag region covers its rectangle of the frame content, clipped to the frame, until null removes it', async ({ page }) => {
+        await loadFloating(page)
+        const start = { x: 100, y: 100, width: 400, height: 300 }
+        // Each press starts at a point and moves 10 px right and down; the window either follows or stays.
+        const pressMoves = async (x: number, y: number) => {
+            await show(page, 0, start)
+            await drag(page, { x, y }, { x: x + 10, y: y + 10, steps: 2 })
+            const rect = await frameRect(page, 0)
+            return rect.x === start.x + 10 && rect.y === start.y + 10
+        }
+        // Inside the 1 px border, the region spans x 151 to 171 and y 105 to 125.
+        await request(page, 0, { type: 'region', region: { x: 50, y: 4, width: 20, height: 20 } }, 'region')
+        expect(await pressMoves(170.5, 124.5)).toBe(true)
+        expect(await pressMoves(171.5, 115)).toBe(false)
+        expect(await pressMoves(160, 125.5)).toBe(false)
+        await request(page, 0, { type: 'region', region: { x: 300, y: 0, width: 5000, height: 32 } }, 'region')
+        expect(await pressMoves(450, 116)).toBe(true)
+        expect(await pressMoves(520, 116)).toBe(false)
+        await request(page, 0, { type: 'region', region: null }, 'region')
+        expect(await pressMoves(450, 116)).toBe(false)
+    })
+
+    test('each resize zone moves only its edges and stops at the minimum size and the viewport', async ({ page }) => {
+        await loadFloating(page)
+        const start = { x: 300, y: 200, width: 400, height: 300 }
+        const edgesOf = (rect: Rect) => ({ left: rect.x, top: rect.y, right: rect.x + rect.width, bottom: rect.y + rect.height })
+        const before = edgesOf(start)
+        for (const edge of ['n', 'e', 's', 'w', 'ne', 'se', 'sw', 'nw']) {
+            // 2 px inside the frame edge, in the middle of an edge or at a corner.
+            const press = {
+                x: edge.includes('w') ? before.left + 2 : edge.includes('e') ? before.right - 2 : before.left + start.width / 2,
+                y: edge.includes('n') ? before.top + 2 : edge.includes('s') ? before.bottom - 2 : before.top + start.height / 2,
+            }
+            const outward = {
+                x: edge.includes('w') ? 0 : edge.includes('e') ? viewport.width - 1 : press.x,
+                y: edge.includes('n') ? 0 : edge.includes('s') ? viewport.height - 1 : press.y,
+            }
+            const inward = {
+                x: edge.includes('w') ? viewport.width - 1 : edge.includes('e') ? 0 : press.x,
+                y: edge.includes('n') ? viewport.height - 1 : edge.includes('s') ? 0 : press.y,
+            }
+            const drags = [
+                [{ x: press.x + 37, y: press.y + 23 }, {
+                    left: before.left + (edge.includes('w') ? 37 : 0), top: before.top + (edge.includes('n') ? 23 : 0),
+                    right: before.right + (edge.includes('e') ? 37 : 0), bottom: before.bottom + (edge.includes('s') ? 23 : 0),
+                }],
+                [outward, {
+                    left: edge.includes('w') ? 0 : before.left, top: edge.includes('n') ? 0 : before.top,
+                    right: edge.includes('e') ? viewport.width : before.right, bottom: edge.includes('s') ? viewport.height : before.bottom,
+                }],
+                [inward, {
+                    left: edge.includes('w') ? before.right - 200 : before.left, top: edge.includes('n') ? before.bottom - 150 : before.top,
+                    right: edge.includes('e') ? before.left + 200 : before.right, bottom: edge.includes('s') ? before.top + 150 : before.bottom,
+                }],
+            ] as const
+            for (const [to, expected] of drags) {
+                await show(page, 0, start)
+                await drag(page, press, { ...to, steps: 3 })
+                expect(edgesOf(await frameRect(page, 0)), `${edge} to ${to.x},${to.y}`).toEqual(expected)
+            }
+        }
+    })
+
+    test('a smaller viewport moves or shrinks the window and only the latest callback hears of it', async ({ page }) => {
+        await loadFloating(page)
+        await page.evaluate(() => window.addEventListener('unhandledrejection', event => { document.body.dataset.unhandled = String(event.reason) }))
+        const bounds = { x: 800, y: 400, width: 400, height: 300 }
+        await show(page, 0, bounds, { tag: 'replaced' })
+        // This callback throws in the plugin, which must not stop later reports.
+        await show(page, 0, bounds, { tag: 'current', throwing: true })
+        await page.setViewportSize({ width: 1000, height: 600 })
+        const moved = { bounds: { x: 600, y: 300, width: 400, height: 300 }, viewport: { width: 1000, height: 600 } }
+        await expect.poll(() => floatingEvents(page, 'change', 0)).toEqual([{ tag: 'current', state: moved }])
+        expect(await frameRect(page, 0)).toEqual(moved.bounds)
+        await page.setViewportSize({ width: 350, height: 250 })
+        const shrunk = { bounds: { x: 0, y: 0, width: 350, height: 250 }, viewport: { width: 350, height: 250 } }
+        await expect.poll(() => floatingEvents(page, 'change', 0)).toEqual([{ tag: 'current', state: moved }, { tag: 'current', state: shrunk }])
+        expect(await frameRect(page, 0)).toEqual(shrunk.bounds)
+        expect(await settledChanges(page, 0)).toHaveLength(2)
+        expect(await page.locator('body').getAttribute('data-unhandled')).toBeNull()
+    })
+
+    test('alerts, work dialogs and fullscreen frames cover it, and the window shown or pressed last is on top', async ({ page }) => {
+        await loadFloating(page, 2)
+        await show(page, 0, { x: 100, y: 100, width: 400, height: 300 })
+        await show(page, 1, { x: 300, y: 200, width: 400, height: 300 })
+        await request(page, 0, { type: 'region', region: { x: 0, y: 0, width: 150, height: 32 } }, 'region')
+        // Both windows cover this point.
+        const topAt = () => page.evaluate(() => {
+            const element = document.elementFromPoint(400, 300)
+            const frames = [...document.querySelectorAll('iframe[data-risu-plugin-frame]')]
+            return element instanceof HTMLIFrameElement ? `frame ${frames.indexOf(element)}` : element?.getAttribute('data-layer') ?? element?.tagName
+        })
+        expect(await topAt()).toBe('frame 1')
+        await drag(page, { x: 160, y: 116 })
+        expect(await topAt()).toBe('frame 0')
+        await show(page, 1, { x: 300, y: 200, width: 400, height: 300 })
+        expect(await topAt()).toBe('frame 1')
+        for (const [layer, covers] of [['z-100', false], ['z-[1000]', true], ['z-modal', true]] as const) {
+            await page.evaluate(layer => {
+                const element = document.createElement('div')
+                element.className = `fixed inset-0 ${layer}`
+                element.dataset.layer = layer
+                document.body.append(element)
+            }, layer)
+            expect(await topAt(), layer).toBe(covers ? layer : 'frame 1')
+            await page.evaluate(() => document.querySelector('[data-layer]')!.remove())
+        }
+        await request(page, 0, { type: 'fullscreen' }, 'fullscreen')
+        expect(await topAt()).toBe('frame 0')
+    })
+
+    test('fullscreen and hiding end it without reloading the frame, and unloading leaves nothing of it', async ({ page }) => {
+        await loadFloating(page)
+        const bodyChildren = () => page.evaluate(() => [...document.body.children].map(element => element.tagName))
+        const frameStyle = () => page.evaluate(() => document.querySelector('iframe[data-risu-plugin-frame]')!.getAttribute('style'))
+        const children = await bodyChildren()
+        await request(page, 0, { type: 'store', value: 'kept' }, 'stored')
+        await request(page, 0, { type: 'region', region: { x: 0, y: 0, width: 300, height: 30 } }, 'region')
+        await request(page, 0, { type: 'fullscreen' }, 'fullscreen')
+        const fullscreen = await frameStyle()
+        await request(page, 0, { type: 'hide' }, 'hidden')
+        const hidden = await frameStyle()
+        const bounds = { x: 200, y: 100, width: 500, height: 400 }
+        for (const end of ['fullscreen', 'hide'] as const) {
+            await show(page, 0, bounds)
+            expect(await frameRect(page, 0)).toEqual(bounds)
+            expect(await bodyChildren()).not.toEqual(children)
+            await request(page, 0, { type: end }, end === 'hide' ? 'hidden' : 'fullscreen')
+            expect(await frameStyle(), end).toBe(end === 'hide' ? hidden : fullscreen)
+            expect(await bodyChildren(), end).toEqual(children)
+            if (end === 'fullscreen') expect(await frameRect(page, 0)).toEqual({ x: 0, y: 0, ...viewport })
+        }
+        expect(await show(page, 0, bounds)).toEqual({ bounds, viewport })
+        expect(await frameRect(page, 0)).toEqual(bounds)
+        expect(await request(page, 0, { type: 'read' }, 'read')).toBe('kept')
+        expect(await floatingEvents(page, 'ready')).toHaveLength(1)
+        await page.evaluate(() => window.boundary.unload())
+        expect(await bodyChildren()).toEqual(children.filter(tag => tag !== 'IFRAME'))
+    })
+
+    test('a drag ends when the app loses focus, a move comes without a button or the plugin hides, and frames take input again', async ({ page }) => {
+        await loadFloating(page, 2)
+        await show(page, 1, { x: 820, y: 420, width: 400, height: 260 })
+        await request(page, 0, { type: 'region', region: { x: 0, y: 0, width: 398, height: 32 } }, 'region')
+        await page.evaluate(() => window.addEventListener('pointerdown', event => { document.body.dataset.pointer = String(event.pointerId) }, true))
+        const framePointerInput = () => page.evaluate(() => [...document.querySelectorAll('iframe')].map(frame => getComputedStyle(frame).pointerEvents))
+        const start = { x: 100, y: 100, width: 400, height: 300 }
+        const stopped = { ...start, x: 130, y: 120 }
+        const endings = {
+            blur: () => page.evaluate(() => { window.dispatchEvent(new FocusEvent('blur')) }),
+            buttonless: () => page.evaluate(() => {
+                window.dispatchEvent(new PointerEvent('pointermove', { pointerId: Number(document.body.dataset.pointer), buttons: 0, clientX: 300, clientY: 300, isPrimary: true }))
+            }),
+            hide: () => request(page, 0, { type: 'hide' }, 'hidden'),
+        }
+        for (const [ending, endDrag] of Object.entries(endings)) {
+            await show(page, 0, start, { tag: ending })
+            await page.mouse.move(160, 116)
+            await page.mouse.down()
+            await page.mouse.move(190, 136)
+            expect(await framePointerInput(), ending).toEqual(['none', 'none'])
+            await endDrag()
+            expect(await framePointerInput(), ending).toEqual(['auto', 'auto'])
+            await page.mouse.move(400, 400)
+            await page.mouse.up()
+            if (ending !== 'hide') expect(await frameRect(page, 0), ending).toEqual(stopped)
+        }
+        expect(await settledChanges(page, 0)).toEqual(['blur', 'buttonless'].map(tag => ({ tag, state: { bounds: stopped, viewport } })))
+        expect(await frameRect(page, 1)).toEqual({ x: 820, y: 420, width: 400, height: 260 })
+    })
+})
