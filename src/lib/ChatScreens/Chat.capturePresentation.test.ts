@@ -4,7 +4,7 @@ import { fromStore, get, writable } from 'svelte/store'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import { ReloadChatPointer, ReloadGUIPointer } from 'src/ts/stores.svelte'
-import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
+import { ActiveConversationSession, ConversationSessionInactiveError } from 'src/ts/storage/activeConversationSession'
 import type { character, Chat as ChatRecord, Message } from 'src/ts/storage/database.svelte'
 import type { ConversationViewportKey } from 'src/ts/conversationViewportSource'
 import type { SelectedConversationOperations } from 'src/ts/selectedConversationOperations'
@@ -2272,6 +2272,31 @@ describe('Chat frozen capture presentation', () => {
         await vi.waitFor(() => expect(requireCurrent).toHaveBeenCalledTimes(4))
         expect(row.rebuildRevision).not.toBe(revision)
         expect(get(ReloadChatPointer)[1]).toBe(pointer + 1)
+    })
+
+    test('passes a failing message button script to the app error handler but not one whose conversation was left', async () => {
+        const unhandled: unknown[] = []
+        const record = (reason: unknown) => { unhandled.push(reason) }
+        process.on('unhandledRejection', record)
+        try {
+            const failure = new Error('synthetic script failure')
+            actionMocks.runLuaInteractionTrigger
+                .mockRejectedValueOnce(new ConversationSessionInactiveError())
+                .mockRejectedValueOnce(failure)
+            const { body } = await mountWindowedTriggerRow()
+            const button = document.createElement('button')
+            button.setAttribute('risu-btn', 'click')
+            body.append(button)
+
+            button.click()
+            await vi.waitFor(() => expect(actionMocks.runLuaInteractionTrigger).toHaveBeenCalledOnce())
+            button.click()
+            // Rejections surface in order, so the left conversation would arrive before the failure.
+            await vi.waitFor(() => expect(unhandled).not.toEqual([]))
+            expect(unhandled).toEqual([failure])
+        } finally {
+            process.off('unhandledRejection', record)
+        }
     })
 
     test('submits form values captured at submit time through the complete conversation gateway', async () => {

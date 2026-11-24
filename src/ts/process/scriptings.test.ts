@@ -772,6 +772,7 @@ function watchErrorDialogs() {
 
 test.each([
   { mode: 'editInput', code: `listenEdit('editInput', function(id, value) local missing = nil; return missing.value end)` },
+  { mode: 'onButtonClick', code: `function onButtonClick(id, data) local missing = nil; return missing.value end` },
   { mode: 'editDisplay', code: `listenEdit('editDisplay', function(id, value) local missing = nil; return missing.value end)` },
   { mode: 'display', code: `function display(id) local missing = nil; return missing.value end` },
 ])('reports a failing $mode handler in an error dialog only outside display', async ({ mode, code }) => {
@@ -784,8 +785,8 @@ test.each([
       data: 'text',
       mode,
     })
-    expect(dialogs.messages()).toEqual(mode === 'editInput'
-      ? [`Lua (editInput)\n[string "..."]:1: attempt to index a nil value (local 'missing')`]
+    expect(dialogs.messages()).toEqual(mode === 'editInput' || mode === 'onButtonClick'
+      ? [`Lua (${mode})\n[string "..."]:1: attempt to index a nil value (local 'missing')`]
       : [])
   } finally {
     dialogs.restore()
@@ -798,7 +799,7 @@ test('numbers a load error from the first line of the script', async () => {
     char: { chaId: 'load-error-line' } as never,
     chat: { message: [] } as never,
     mode: 'start',
-  })).rejects.toThrow(`[string "..."]:2: unexpected symbol near '='`)
+  })).rejects.toHaveProperty('message', `[string "..."]:2: unexpected symbol near '='`)
 })
 
 test.runIf(inject('luaWorker') === true)('rejects with the abort reason when a script stops while loading', async () => {
