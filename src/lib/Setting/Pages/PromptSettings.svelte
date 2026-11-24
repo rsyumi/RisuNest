@@ -345,8 +345,10 @@
 {/if}
 
 {#if subMenu === 0}
+    <!-- The toolbar, the search bar and the list stack among themselves, so none of them paints over a screen outside them. -->
+    <div class="isolate flex flex-col">
     {#if DBState.db.promptTemplate.length > 0}
-        <div class="relative z-[51] flex items-center gap-2 px-3 mt-4">
+        <div class="relative z-20 flex items-center gap-2 px-3 mt-4">
             <span class="grow text-sm text-textcolor2">{language.risuNest.promptList.count.replace('{0}', String(DBState.db.promptTemplate.length))}</span>
             <button class="hover:bg-darkbg focus:ring-selected border-darkborderc border rounded-md shadow-xs focus:outline-hidden focus:ring-2 transition-colors duration-200 inline-flex items-center gap-1.5 px-2 py-1 text-sm {searchOpen ? 'bg-selected text-textcolor' : 'bg-transparent text-textcolor2'}" aria-pressed={searchOpen} onclick={() => searchOpen ? closeSearch() : openSearch()}>
                 <SearchIcon size={14} />{language.search}
@@ -367,7 +369,7 @@
             status={searchRecord ? language.risuNest.promptSearch.replaced.replace('{0}', String(searchRecord.count)) : ''}
             onReplaceAll={replaceAllSearchMatches} onUndo={undoSearchReplace} onClose={closeSearch} onSubmit={focusFirstSearchLine} />
     {/if}
-    <div class="contain w-full max-w-full mt-2 flex flex-col px-3 rounded-md" use:htmlTouchDrag bind:this={promptListDom}>
+    <div class="contain isolate w-full max-w-full mt-2 flex flex-col px-3 rounded-md" use:htmlTouchDrag bind:this={promptListDom}>
         {#if DBState.db.promptTemplate.length === 0}
                 <div class="text-textcolor2">No Format</div>
         {/if}
@@ -426,6 +428,7 @@
                     {/snippet}
                 </PromptDataItem>
             {/each}
+    </div>
     </div>
 
     {#if !searchShown}

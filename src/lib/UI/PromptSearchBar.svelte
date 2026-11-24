@@ -57,7 +57,7 @@
     }
 </script>
 
-<div class="@container/search sticky top-0 z-50 bg-bgcolor px-3 pt-1 pb-2 flex flex-col gap-1.5" role="search" use:backNavigationLayer={{ close: onClose }}>
+<div class="@container/search sticky top-0 z-10 bg-bgcolor px-3 pt-1 pb-2 flex flex-col gap-1.5" role="search" use:backNavigationLayer={{ close: onClose }}>
     <!-- The bar sticks below the scroll pane's top padding; this covers that strip so the list does not show through it. The toolbar above the bar sits higher, so the cover stays under it while the bar is not stuck. -->
     <div class="absolute inset-x-3 bottom-full h-6 bg-bgcolor" aria-hidden="true"></div>
     <div class="flex flex-wrap items-center gap-1.5">
