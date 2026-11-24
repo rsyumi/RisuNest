@@ -78,8 +78,8 @@ async function openLibrary(name: string) {
             const character = db.characters[get(library.stores.selectedCharID)]
             library.database.flushEffectiveToggleEdits(db)
             library.database.deriveEffectiveToggleVariables(db, character.chats[character.chatPage])
-            await flushPendingData('test-settle')
         },
+        settle: () => flushPendingData('test-settle'),
         revision: async () => (await library.store.readRoot()).revision,
         storedVariables: async () => (await library.store.readRoot()).value.explicitGlobalChatVariables,
         storedLoadouts: async () => (await library.store.readRoot()).value.loadouts,
@@ -96,15 +96,29 @@ describe('plugin global variables', { timeout: 30_000 }, () => {
         expect(await library.access.writeGlobalVariables({ shared: 'plugin', added: 'new', kept: null }))
             .toEqual({ status: 'applied' })
 
-        expect(await library.storedVariables()).toEqual({ shared: 'plugin', added: 'new', toggle_mode: 'global', edited: 'app' })
+        const written = { shared: 'plugin', added: 'new', toggle_mode: 'global', edited: 'app' }
+        expect(await library.storedVariables()).toStrictEqual(written)
         expect(library.getGlobalChatVar('shared')).toBe('plugin')
         expect(library.getGlobalChatVar('added')).toBe('new')
         expect(library.getGlobalChatVar('kept')).toBe('null')
         expect(library.getGlobalChatVar('edited')).toBe('app')
-        expect(await library.access.readGlobalVariables()).toStrictEqual({
-            values: { shared: 'plugin', added: 'new', toggle_mode: 'global', edited: 'app' },
-        })
+        expect(await library.access.readGlobalVariables()).toStrictEqual({ values: written })
         expect(await library.access.readGlobalVariables({ names: ['added', 'kept'] })).toStrictEqual({ values: { added: 'new' } })
+    })
+
+    it('keeps nothing of a write whose commit fails', async () => {
+        const library = await openLibrary('risunest-variables-failed')
+        await library.open('char-a')
+        vi.spyOn(library.store, 'commit').mockRejectedValueOnce(new Error('synthetic storage failure'))
+
+        await expect(library.access.writeGlobalVariables({ shared: 'plugin', added: 'new', kept: null }))
+            .rejects.toThrow('synthetic storage failure')
+
+        expect(library.getGlobalChatVar('shared')).toBe('stored')
+        expect(library.getGlobalChatVar('added')).toBe('null')
+        expect(library.getGlobalChatVar('kept')).toBe('stored')
+        await library.settle()
+        expect(await library.storedVariables()).toStrictEqual({ shared: 'stored', kept: 'stored', toggle_mode: 'global' })
     })
 
     it('changes the shared toggle value and leaves the one the open chat keeps for itself', async () => {
@@ -139,6 +153,11 @@ describe('plugin global variables', { timeout: 30_000 }, () => {
         }
         expect(await library.access.writeGlobalVariables({ shared: 'plugin', count: 1 }))
             .toEqual({ status: 'rejected', reason: 'type', key: 'count' })
+        // Names the parsed JSON of a plugin call can hold.
+        for (const name of ['__proto__', 'constructor']) {
+            expect(await library.access.writeGlobalVariables({ shared: 'plugin', ...JSON.parse(`{"${name}":"plugin"}`) }))
+                .toEqual({ status: 'rejected', reason: 'unavailable', key: name })
+        }
         expect(state.writeAsked).toBe(0)
 
         state.writeGranted = false
@@ -209,6 +228,8 @@ describe('plugin loadouts', { timeout: 30_000 }, () => {
             .toEqual({ status: 'rejected', reason: 'type', key: 'characterIds' })
         expect(await library.access.writeLoadout({ globalVariables: { shared: null } }))
             .toEqual({ status: 'rejected', reason: 'type', key: 'globalVariables' })
+        expect(await library.access.writeLoadout({ globalVariables: JSON.parse('{"shared":"x","__proto__":"x"}') }))
+            .toEqual({ status: 'rejected', reason: 'unavailable', key: 'globalVariables' })
         expect(state.writeAsked).toBe(asked)
 
         state.writeGranted = false

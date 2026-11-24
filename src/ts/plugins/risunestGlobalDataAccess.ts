@@ -50,6 +50,11 @@ const loadoutFieldKinds = {
     icons: 'array',
 } satisfies Record<Exclude<keyof Loadout, 'id'>, RisunestJsonKind>
 
+// The app's working copy holds no variable named like a member every object inherits.
+function isUnavailableName(name: string): boolean {
+    return name in Object.prototype
+}
+
 /** Checks the loadout fields a plugin gives: every array and object a loadout holds is made of strings. */
 function rejectLoadoutFields(fields: Record<string, unknown>): RisunestKeyedRejection | null {
     for (const [key, value] of Object.entries(fields)) {
@@ -58,6 +63,9 @@ function rejectLoadoutFields(fields: Record<string, unknown>): RisunestKeyedReje
         if (kind !== loadoutFieldKinds[key as keyof typeof loadoutFieldKinds]) return { status: 'rejected', reason: 'type', key }
         if ((kind === 'array' || kind === 'object') && Object.values(value as object).some((entry) => typeof entry !== 'string')) {
             return { status: 'rejected', reason: 'type', key }
+        }
+        if (kind === 'object' && Object.keys(value as object).some(isUnavailableName)) {
+            return { status: 'rejected', reason: 'unavailable', key }
         }
     }
     return null
@@ -90,6 +98,7 @@ export function createRisunestGlobalDataAccessCore(
             if (!isPlainJsonObject(set)) throw new TypeError('set must be an object')
             const entries = Object.entries(set)
             for (const [key, value] of entries) {
+                if (isUnavailableName(key)) return { status: 'rejected', reason: 'unavailable', key }
                 if (value !== null && typeof value !== 'string') return { status: 'rejected', reason: 'type', key }
             }
             return runDatabaseWrite(context, async () => {
@@ -173,18 +182,25 @@ const productionGlobalDataStore: RisunestGlobalDataStore = {
         // The shared set is edited directly: a toggle sent through the unit commit would go to
         // the conversation the open chat binds.
         const shared = database.getExplicitGlobalChatVariables(db)
-        for (const [name, value] of entries) {
-            if (value === null) delete shared[name]
-            else {
-                if (!Object.hasOwn(shared, name) && name in shared) defineOwnEnumerableProperty(shared, name, value)
-                shared[name] = value
+        const apply = (values: [string, string | null][]) => {
+            for (const [name, value] of values) {
+                if (value === null) delete shared[name]
+                else shared[name] = value
             }
+            // The variables the app uses follow the shared set, except the toggles the open chat binds.
+            const character = db.characters[get(stores.selectedCharID)]
+            const chat = character?.chats?.[character.chatPage]
+            database.deriveEffectiveToggleVariables(db, chat && !isConversationSummaryStub(chat) ? chat : undefined)
         }
-        // The variables the app uses follow the shared set, except the toggles the open chat binds.
-        const character = db.characters[get(stores.selectedCharID)]
-        const chat = character?.chats?.[character.chatPage]
-        database.deriveEffectiveToggleVariables(db, chat && !isConversationSummaryStub(chat) ? chat : undefined)
-        await runtime.flushPendingData('plugin-write-global-variables')
+        const previous = entries.map(([name]): [string, string | null] => [name, Object.hasOwn(shared, name) ? shared[name] : null])
+        apply(entries)
+        try {
+            await runtime.flushPendingData('plugin-write-global-variables')
+        } catch (error) {
+            // A later save must not store what the plugin was told failed.
+            apply(previous)
+            throw error
+        }
     },
     async readLoadouts() {
         return (await readStoredRoot('plugin-read-loadouts')).loadouts ?? []
