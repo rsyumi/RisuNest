@@ -158,7 +158,8 @@ function replaceInText(text: string, matcher: Extract<PromptSearchMatcher, { kin
     for (const match of nonEmptyMatches(text, matcher.pattern)) {
         after += text.slice(last, match.index)
         const inserted = replacementFor(matcher, replacement, match, text)
-        written.push({ start: after.length, end: after.length + inserted.length })
+        // A match replaced by the same text is left as it was, so it is not one that was written.
+        if (inserted !== match[0]) written.push({ start: after.length, end: after.length + inserted.length })
         after += inserted
         last = match.index! + match[0].length
     }

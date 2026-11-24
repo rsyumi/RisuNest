@@ -124,6 +124,17 @@ describe('replacing', () => {
         const blocks = [block('keep'), { type: 'lorebook', name: 'drop me' } as PromptItem]
         expect(replaceAllInBlocks(blocks, ready(' me'), '').map(change => change.after)).toEqual(['drop'])
         expect(replaceAllInBlocks(blocks, ready('keep'), 'keep')).toEqual([])
+        expect(replaceAllInBlocks([block('Foo FOO')], regex('foo'), '$&')).toEqual([])
+    })
+
+    it('records only the matches whose text changes, however they are spread over fields', () => {
+        const written = (blocks: PromptItem[], matcher: Extract<PromptSearchMatcher, { kind: 'ready' }>, replacement: string) =>
+            replaceAllInBlocks(blocks, matcher, replacement).flatMap(change => change.written.map(range => change.after.slice(range.start, range.end) + '@' + range.start))
+        expect(written([block('foo Foo')], ready('foo'), 'Foo')).toEqual(['Foo@0'])
+        expect(written([block('Foo foo')], ready('foo'), 'Foo')).toEqual(['Foo@4'])
+        expect(written([block('foo'), block('Foo')], ready('foo'), 'Foo')).toEqual(['Foo@0'])
+        // Positions after an unchanged match follow the text written before it.
+        expect(written([block('a aa aaa')], regex('a+'), 'aa')).toEqual(['aa@0', 'aa@6'])
     })
 })
 
