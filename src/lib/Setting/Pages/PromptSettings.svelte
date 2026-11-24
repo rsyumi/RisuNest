@@ -187,10 +187,13 @@
     return { matches, blocks }
   })
   const changesView = $derived(searchResults && searchRecord?.listing && searchRecord.key === searchKey ? searchRecord : null)
+  // What a query lists beyond its matches ends for good at the first change of the query or an option.
   $effect(() => {
     const key = searchKey
     untrack(() => {
       if (searchRecord?.listing && searchRecord.key !== key) searchRecord = { ...searchRecord, listing: false }
+      if (keptReplaced.key !== key) keptReplaced = { key, items: new Set() }
+      if (keptOpen.key !== key) keptOpen = { key, items: new Set() }
     })
   })
   const searchShown = $derived.by(() => {

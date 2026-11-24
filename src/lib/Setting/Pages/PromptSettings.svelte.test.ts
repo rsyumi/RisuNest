@@ -282,6 +282,7 @@ describe('prompt search', () => {
     const replaceInput = () => bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!
     const tokenCounts = () => [language.fixedTokens, language.exactTokens].map(label =>
         Number([...document.querySelectorAll('span')].find(span => span.textContent?.endsWith(` ${label}`))!.textContent!.split(' ')[0]))
+    const noMatches = `${text.matchCount.replace('{0}', '0')} · ${language.risuNest.promptList.count.replace('{0}', '0')}`
     const authorNote = language.formating.authorNote
     async function type(input: HTMLInputElement, value: string) {
         input.value = value
@@ -432,6 +433,13 @@ describe('prompt search', () => {
         expect(bar()!.textContent).toContain(text.replaced.replace('{0}', '1'))
         await type(searchInput(), 'Stay ')
         await vi.waitFor(() => expect(listed()).toEqual([]))
+        // The first query typed again lists only what it matches.
+        await type(searchInput(), 'Remain')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} rules']))
+        await type(searchInput(), 'Stay')
+        await vi.waitFor(() => expect(bar()!.textContent).toContain(noMatches))
+        expect(listed()).toEqual([])
+        expect(document.body.textContent).toContain(text.noMatch)
         // Undo is offered for the preset it was made in.
         expect(bar()!.textContent).toContain(text.undo)
         DBState.db.botPresetsId = 1
@@ -468,6 +476,16 @@ describe('prompt search', () => {
         // Once closed, opening it again some other way does not list it.
         ;[...document.querySelectorAll('button')].find(button => button.textContent?.trim() === language.expandAll)!.click()
         await tick()
+        expect(listed()).toEqual([])
+
+        // An open block kept under a query is not kept once the query changes, even to an empty one and back.
+        await type(searchInput(), 'laws')
+        await vi.waitFor(() => expect(listed()).toEqual(['{{user}} laws']))
+        await type(searchInput(), '')
+        await vi.waitFor(() => expect(listed()).toHaveLength(4))
+        DBState.db.promptTemplate[2].name = '{{user}} rules'
+        await type(searchInput(), 'laws')
+        await vi.waitFor(() => expect(bar()!.textContent).toContain(noMatches))
         expect(listed()).toEqual([])
     })
 
