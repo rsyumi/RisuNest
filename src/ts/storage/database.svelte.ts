@@ -2377,6 +2377,22 @@ export function clearPresetPluginProvider(names: readonly string[]): Promise<voi
     return presetWorkingSetController.clearPluginProvider(names)
 }
 
+export function changeToPresetById(id: string): Promise<void> {
+    return presetWorkingSetController.changeToPresetById(id)
+}
+
+export function removePresetById(id: string): Promise<void> {
+    return presetWorkingSetController.removePresetById(id)
+}
+
+export function addPresetFrom(source: string | botPreset, edit: (preset: botPreset) => void): Promise<string> {
+    return presetWorkingSetController.addPresetFrom(source, edit)
+}
+
+export function updatePresetById(id: string, edit: (preset: botPreset) => void): Promise<void> {
+    return presetWorkingSetController.updatePresetById(id, edit)
+}
+
 export function setPreset(db:Database, newPres: botPreset){
     newPres = Object.fromEntries(Object.values(identity.presetMirrorMap)
         .filter(field => Object.hasOwn(newPres, field))
