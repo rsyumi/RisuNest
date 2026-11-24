@@ -7205,10 +7205,11 @@ mod tests {
                     "assets": [
                         ["duplicate", "legacy-a", ".unsafe/path", { "future": true }],
                         ["duplicate", "legacy-b", "bin"],
-                        ["undeclared", "legacy-c", null]
+                        ["undeclared", "legacy-c", null],
+                        ["short", "legacy-d"]
                     ]
                 }),
-                &[b"exact ordinary bytes", b"", b"RIFF\x04\0\0\0WEBPVP8 "],
+                &[b"exact ordinary bytes", b"", b"RIFF\x04\0\0\0WEBPVP8 ", b"\x89PNG\r\n\x1a\n"],
             ),
         )
         .unwrap();
@@ -7269,6 +7270,12 @@ mod tests {
             )
         );
         assert_eq!(serialized.pointer("/metadata/assets/2/2"), Some(&json!("")));
+        // A tuple without an extension is read as one whose extension was never set.
+        assert_eq!(serialized.pointer("/assets/3/ext"), Some(&json!("png")));
+        assert_eq!(
+            serialized.pointer("/metadata/assets/3"),
+            Some(&json!(["short", "", ""]))
+        );
         assert_eq!(
             serialized.pointer("/metadata/assets/0/3/future"),
             Some(&json!(true))
@@ -7276,7 +7283,7 @@ mod tests {
         assert!(serialized.pointer("/assets/0/token").is_none());
         assert!(serialized.pointer("/assets/0/referenceKey").is_none());
         assert_eq!(serialized.pointer("/ownerHead/present"), Some(&json!(true)));
-        assert_eq!(serialized.pointer("/ownerHead/entryCount"), Some(&json!(3)));
+        assert_eq!(serialized.pointer("/ownerHead/entryCount"), Some(&json!(4)));
         let manifest = crate::asset_repository::owner_manifest_codec::decode_owner_manifest(
             &crate::asset_repository::PayloadCas::new(directory.path())
                 .unwrap()
@@ -7335,7 +7342,7 @@ mod tests {
             &started.job_id,
         )
         .unwrap();
-        assert_eq!(session.pin_count(), 4);
+        assert_eq!(session.pin_count(), 5);
         assert!(!session.is_sealed());
     }
 
