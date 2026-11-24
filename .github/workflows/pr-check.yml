@@ -84,13 +84,13 @@ jobs:
           check-latest: true
       - uses: pnpm/action-setup@v4
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
-      - run: pnpm --dir server/endpoint-registry --ignore-workspace install --frozen-lockfile
+      - run: pnpm --dir server/manager/gui install --frozen-lockfile
+      - run: pnpm --dir server/endpoint-registry install --frozen-lockfile
       - run: npm ci --prefix tools/web-risu-export
       - run: pnpm check:test-inventory
-      - run: pnpm --dir server/manager/gui --ignore-workspace check
+      - run: pnpm --dir server/manager/gui check
       - run: pnpm test:manager
-      - run: pnpm --dir server/endpoint-registry --ignore-workspace check
+      - run: pnpm --dir server/endpoint-registry check
       - run: pnpm test:registry
       - run: pnpm test:web-export
 

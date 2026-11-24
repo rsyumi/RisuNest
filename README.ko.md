@@ -109,7 +109,7 @@ RisuNest Sync는 여러 기기가 같은 라이브러리를 공유하도록 돕�
 
 ## 소스에서 빌드
 
-Node.js 22.12 이상, pnpm, Rust와 Cargo가 필요합니다. Android 빌드에는 Android SDK/NDK(compile·target SDK 36, min SDK 24, NDK 28)가, iOS 빌드에는 macOS와 Xcode가 필요합니다.
+Node.js 22.13 이상, pnpm, Rust와 Cargo가 필요합니다. Android 빌드에는 Android SDK/NDK(compile·target SDK 36, min SDK 24, NDK 28)가, iOS 빌드에는 macOS와 Xcode가 필요합니다.
 
 ```bash
 pnpm install

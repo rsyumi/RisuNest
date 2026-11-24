@@ -2,10 +2,10 @@
   "name": "risunest",
   "private": true,
   "version": "1.4.1",
-  "packageManager": "pnpm@10.34.5",
+  "packageManager": "pnpm@11.29.0",
   "type": "module",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "dev": "vite",
@@ -28,8 +28,8 @@
     "check:tests": "svelte-check --tsconfig tests/tsconfig.json --config ./vite.config.ts",
     "test:watch": "vitest --watch --project app --project app-node",
     "test:related": "vitest related --run --project app --project app-node",
-    "test:manager": "pnpm --dir server/manager/gui --ignore-workspace test",
-    "test:registry": "pnpm --dir server/endpoint-registry --ignore-workspace test",
+    "test:manager": "pnpm --dir server/manager/gui test",
+    "test:registry": "pnpm --dir server/endpoint-registry test",
     "test:web-export": "npm --prefix tools/web-risu-export test",
     "test:node": "node scripts/runNodeTests.mjs",
     "test:harness": "vitest run --project harness && node scripts/runNodeTests.mjs --harness",

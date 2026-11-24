@@ -113,7 +113,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       packageManager,
       dependencies: referenceDependencyVersions(directory, libraries[target]),
     }, null, 2) + "\n");
-    fs.writeFileSync(path.join(destination, "pnpm-workspace.yaml"), "packages: []\nonlyBuiltDependencies:\n  - better-sqlite3\nignoredBuiltDependencies:\n  - msgpackr-extract\n");
+    fs.writeFileSync(path.join(destination, "pnpm-workspace.yaml"), "packages: []\nminimumReleaseAge: 0\nallowBuilds:\n  better-sqlite3: true\n  msgpackr-extract: false\n");
     fs.copyFileSync(path.join(directory, "pnpm-lock.yaml"), path.join(destination, "pnpm-lock.yaml"));
     console.log(`${target}: prepared isolated library manifest in ${destination}`);
   }

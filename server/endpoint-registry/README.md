@@ -4,7 +4,7 @@ Endpoint Registry is a private Cloudflare Worker and D1 service that stores an e
 
 ## Local development
 
-Requires Node.js 22.12 or newer and pnpm 10.34.1. Run from this directory:
+Requires Node.js 22.13 or newer and pnpm 11. Run from this directory:
 
 ```powershell
 pnpm install --frozen-lockfile

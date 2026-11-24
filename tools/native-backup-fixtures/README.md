@@ -3,7 +3,7 @@
 Generate synthetic historical RisuSave files and account-encryption ciphertext:
 
 ```text
-pnpm --ignore-workspace install --frozen-lockfile --ignore-scripts
+pnpm install --frozen-lockfile --ignore-scripts
 pnpm run generate <risuai-source-checkout>
 ```
 
