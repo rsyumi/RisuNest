@@ -12,7 +12,8 @@ import type { LuaEngine, LuaFactory } from "wasmoon";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Chat, type Database, type Message, type character, type triggerscript } from "../storage/database.svelte";
 import { get } from "svelte/store";
 import { DBState, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
-import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
+import { alertSelect, alertError, alertInput, alertNormal, alertConfirm, type alertData } from "../alert";
+import { alertStore } from '../alertQueue';
 import { HypaProcesser } from "./memory/hypamemory";
 import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
 import { writeInlayImage, getInlayAsset } from "./files/inlays";
@@ -30,6 +31,7 @@ import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory, runLuaSource } from './luaRuntime';
 import { LuaWorkerExecutor, LuaWorkerUnavailableError } from './luaWorkerExecutor';
+import { luaErrorMessage } from './luaWorkerProtocol';
 import { createLuaHistoryJSON } from './luaHistoryJSON';
 import { luaCodeWrapper } from './luaCodeWrapper';
 import { withObjectUrl } from '../objectUrl';
@@ -42,7 +44,13 @@ import {
     getActiveConversationViewportSource,
     peekActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte';
-import type { ActiveConversationSession } from '../storage/activeConversationSession';
+import {
+    ConversationNotFoundError,
+    ConversationSessionInactiveError,
+    ConversationSessionStaleError,
+    MessageLocatorMismatchError,
+    type ActiveConversationSession,
+} from '../storage/activeConversationSession';
 import { runSerializedUserTrigger } from './conversationUserTrigger';
 import {
     findActiveHistoryWindow,
@@ -126,6 +134,8 @@ interface BasicScriptingEngineState {
     flushVariables?: () => void
     historyJSON?: ReturnType<typeof createLuaHistoryJSON>
     stopSending?: boolean
+    /** A host call in this run stopped because its conversation was left or changed. */
+    conversationStopped?: boolean
     displayListenerEngine?: string
 }
 
@@ -188,6 +198,8 @@ export async function runScripted(code:string, arg:{
     createConversationChat?: () => Chat
     /** An editDisplay request, which skips a listener that timed out for it. */
     displayListener?: DisplayListenerRequest
+    /** Holds handler errors for the caller to show, instead of showing them now. */
+    luaErrors?: alertData[]
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
     if (type === 'py' && isTauriMobile) {
@@ -296,6 +308,7 @@ export async function runScripted(code:string, arg:{
             }
         ScriptingEngineState.flushVariables = access ? () => { access.flushVariables() } : undefined
         ScriptingEngineState.stopSending = false
+        ScriptingEngineState.conversationStopped = false
         if (code !== ScriptingEngineState.code || (ScriptingEngineState.type === 'lua' && ScriptingEngineState.worker?.isClosed())) {
             try {
             let declareAPI:(name: string, func:Function) => void
@@ -321,6 +334,7 @@ export async function runScripted(code:string, arg:{
                     })
                 }
                 declareAPI = (name: string, func: Function) => {
+                    func = observeConversationStops(ScriptingEngineState, func)
                     luaCallbacks.set(name, func)
                     if (ScriptingEngineState.worker) ScriptingEngineState.worker.register(name, func)
                     else ScriptingEngineState.engine.global.set(name, func)
@@ -1449,7 +1463,7 @@ export async function runScripted(code:string, arg:{
                 discardFailedScriptingEngineState(ScriptingEngineState)
                 // Top-level code that times out would spend the same budget again for every queued row.
                 if (displayEngine && isLuaTimeoutError(error)) noteDisplayListenerTimeout(displayEngine, displayListener!, data as string)
-                throw error
+                throw withScriptLineNumbers(error)
             }
         }
         let accessKey = v4()
@@ -1547,6 +1561,11 @@ export async function runScripted(code:string, arg:{
                     noticeScriptTimeout(mode === 'editDisplay')
                 } else {
                     console.error(error)
+                    if (mode !== 'editDisplay' && mode !== 'display' && !ScriptingEngineState.conversationStopped) {
+                        const notice = luaHandlerErrorNotice(mode, error)
+                        if (arg.luaErrors) arg.luaErrors.push(notice)
+                        else alertStore.set(notice)
+                    }
                 }
             }
         }
@@ -1699,6 +1718,64 @@ function finishScriptingEngineUse(state: ScriptingEngineState) {
     evictIdleScriptingEngines()
 }
 
+/** Lines the wrapper puts before the script, so reported lines count from the script's first line. */
+const luaWrapperLeadingLines = luaCodeWrapper('\0').split('\n').findIndex((line) => line.includes('\0'))
+
+function scriptLineNumbers(text: string): string {
+    return text.replace(/(\[string "\.\.\."\]:)(\d+)/g, (match, chunk: string, line: string) => {
+        const scriptLine = Number(line) - luaWrapperLeadingLines
+        return scriptLine > 0 ? chunk + scriptLine : match
+    })
+}
+
+function withScriptLineNumbers(error: unknown): unknown {
+    if (typeof error === 'string') return scriptLineNumbers(error)
+    if (error instanceof Error) {
+        // Other errors pass through untouched; an abort reason's DOMException message cannot be assigned.
+        const message = scriptLineNumbers(error.message)
+        if (message !== error.message) error.message = message
+        const stack = error.stack && scriptLineNumbers(error.stack)
+        if (stack !== error.stack) error.stack = stack
+    }
+    return error
+}
+
+function luaHandlerErrorNotice(mode: string, error: unknown): alertData {
+    return {
+        type: 'error',
+        msg: `Lua (${mode})\n${scriptLineNumbers(luaErrorMessage(error))}`,
+        stackTrace: error instanceof Error && error.stack ? scriptLineNumbers(error.stack) : undefined,
+    }
+}
+
+/** Host errors that end a handler because its conversation was left or changed, not because the script failed. */
+function isConversationStop(error: unknown): boolean {
+    return error instanceof ConversationSessionInactiveError
+        || error instanceof ConversationSessionStaleError
+        || error instanceof ConversationNotFoundError
+        || error instanceof MessageLocatorMismatchError
+        || error instanceof PersistentMutationFencedError
+}
+
+/** Marks the run when a host call stops on a conversation change, which Lua sees only as an error message. */
+function observeConversationStops(state: BasicScriptingEngineState, func: Function): Function {
+    const note = (error: unknown): never => {
+        if (isConversationStop(error)) state.conversationStopped = true
+        throw error
+    }
+    return function (this: unknown, ...args: unknown[]) {
+        let value: unknown
+        try {
+            value = func.apply(this, args)
+        } catch (error) {
+            note(error)
+        }
+        return typeof (value as PromiseLike<unknown> | null | undefined)?.then === 'function'
+            ? Promise.resolve(value).catch(note)
+            : value
+    }
+}
+
 function isLuaTimeoutError(error: unknown): boolean {
     // Async coroutine rejection preserves the Lua string; synchronous calls wrap it in Error.
     const firstLine = (typeof error === 'string' ? error : error instanceof Error ? error.message : '').split('\n', 1)[0]
@@ -1736,9 +1813,13 @@ export async function runLuaEditTrigger<T extends string | OpenAIChat[]>(
     signal?: AbortSignal,
     /** When the view asked for this display, from `nextDisplayListenerOrder`. */
     displayRequestOrder?: number,
+    /** Holds handler errors for the caller to show, instead of showing them now. */
+    luaErrors?: alertData[],
 ): Promise<T> {
     if (mode !== 'editdisplay' && mode !== 'editDisplay') {
-        return runLuaEditTriggerForMode(char, mode, content, meta, conversationOperation, onConversationCommit, signal)
+        return runLuaEditTriggerForMode(
+            char, mode, content, meta, conversationOperation, onConversationCommit, signal, undefined, luaErrors,
+        )
     }
     const order = displayRequestOrder ?? nextDisplayListenerOrder()
     const run = () => runLuaEditTriggerForMode(
@@ -1761,6 +1842,7 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
     onConversationCommit?: ConversationCommitObserver,
     signal?: AbortSignal,
     displayRequestOrder?: number,
+    luaErrors?: alertData[],
 ): Promise<T> {
     switch (mode) {
         case 'editinput':
@@ -1833,6 +1915,7 @@ async function runLuaEditTriggerForMode<T extends string | OpenAIChat[]>(
         onConversationCommit,
         signal,
         displayRequest(conversationOperation ? null : getCurrentChat()),
+        luaErrors,
     )
 }
 
@@ -1866,6 +1949,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     onConversationCommit?: ConversationCommitObserver,
     signal?: AbortSignal,
     displayRequest?: DisplayListenerRequest,
+    luaErrors?: alertData[],
 ): Promise<T> {
     let operationContext = conversationOperation
     let historyWindowCopy: HistoryWindowCopy | null = null
@@ -1923,6 +2007,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     createConversationChat: createWindowChat,
                     displayListener: displayRequest,
                     signal,
+                    luaErrors,
                 })
                 data = runResult.res ?? data
             }

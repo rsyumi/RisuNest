@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
+import { alertStore } from '../alertQueue'
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
 import { DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
@@ -581,6 +582,45 @@ describe('a windowed send through the production runtime', () => {
             reservation.release()
             unsubscribe()
             settingsOpen.set(false)
+        }
+    })
+
+    const tagListener = `
+        listenEdit('editOutput', function(id, value)
+            local tag = value:match('<s>(.-)</s>')
+            return value .. tag
+        end)
+    `
+    it.each([
+        {
+            send: 'a start handler that fails after stopping the send',
+            code: 'function onStart(id) stopChat(id); local ctor = nil; return ctor.value end',
+            snapshots: ['answer'], sent: false, dialog: /^Lua \(start\)\n.*attempt to index a nil value \(local 'ctor'\)/,
+        },
+        { send: 'a start handler that stops the send', code: 'function onStart(id) stopChat(id) end', snapshots: ['answer'], sent: false, dialog: null },
+        { send: 'an output listener that fails only on a partial response', code: tagListener, snapshots: ['<s>hal', '<s>half</s> done'], sent: true, dialog: null },
+        {
+            send: 'an output listener that fails on the complete response',
+            code: tagListener, snapshots: ['<s>half</s>', 'done without the tag'], sent: true,
+            dialog: /^Lua \(editOutput\)\n.*attempt to concatenate a nil value \(local 'tag'\)/,
+        },
+    ])('shows a Lua error dialog for $send only when the handler fails on its final input', async ({ code, snapshots, sent, dialog }) => {
+        await bootWindowedConversation(storedMessages(), seed => {
+            seed.characters[0].customscript = []
+            seed.characters[0].triggerscript = [{ type: 'start', comment: '', conditions: [], effect: [{ type: 'triggerlua', code }] }] as never
+        })
+        const { sendChat } = await import('./index.svelte')
+        current.snapshots = snapshots
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        try {
+            await expect(sendChat({ historyLimit: true })).resolves.toBe(sent)
+            if (dialog) expect(get(alertStore)).toMatchObject({ type: 'error', msg: expect.stringMatching(dialog) })
+            else expect(alertStore.hasDialogs()).toBe(false)
+        } finally {
+            alertStore.set({ type: 'none', msg: '' })
+            current.snapshots = ['answer']
+            errors.mockRestore()
         }
     })
 
