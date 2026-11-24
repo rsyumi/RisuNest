@@ -5,6 +5,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from 'src/lang';
     import { modalNavigation } from 'src/ts/ui/modalNavigation';
+    import Portal from 'src/lib/UI/GUI/Portal.svelte';
     import { 
         findAllOriginalRangesFromHtml,
         findAllOriginalRangesFromText,
@@ -714,6 +715,7 @@
 </script>
 
 {#snippet MatchSelectionModal(mode: MatchingMode, matches: RangeResultWithContext[], title: string)}
+    <Portal>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) cancelMatchSelection(); }}>
@@ -758,10 +760,12 @@
             </div>
         </div>
     </div>
+    </Portal>
 {/snippet}
 
 <!-- Match failed modal -->
 {#if showMatchFailedModal}
+    <Portal>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) showMatchFailedModal = false; }}>
@@ -782,10 +786,12 @@
             </div>
         </div>
     </div>
+    </Portal>
 {/if}
 
 <!-- Delete confirmation modal -->
 {#if isConfirmingDelete}
+    <Portal>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) handleCancelDelete(); }}>
@@ -825,6 +831,7 @@
             </div>
         </div>
     </div>
+    </Portal>
 {/if}
 
 <!-- Match selection modal (shared for edit/delete) -->
@@ -836,6 +843,7 @@
 
 <!-- Edit modal (shown only during edit) -->
 {#if isEditing}
+    <Portal>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }}>
@@ -882,6 +890,7 @@
             </div>
         </div>
     </div>
+    </Portal>
 {/if}
 
 <style>

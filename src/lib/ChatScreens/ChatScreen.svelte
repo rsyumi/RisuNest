@@ -41,7 +41,8 @@
 </script>
 
 <div class="relative min-w-0 grow h-full" aria-busy={$navigationBlocked}>
-    <div class="relative z-0 min-w-0 h-full" inert={$navigationBlocked}>
+    <!-- Paint containment lays out fixed layers from card and module HTML in the chat pane and clips them to it, so they never cover the sidebar. -->
+    <div class="relative z-0 min-w-0 h-full [contain:paint]" inert={$navigationBlocked}>
     {#if DBState.db.theme === 'waifu'}
         <div class="grow h-full flex justify-center relative" style="{bgImg.length < 4 ? wallPaper : bgImg}">
             <SideBarArrow />

@@ -94,6 +94,8 @@ test('retains the original source and draft when an asynchronous partial save is
     await tick()
     document.querySelector<HTMLButtonElement>('.partial-edit-btn-edit')!.click()
     await vi.waitFor(() => expect(document.querySelector('.partial-edit-modal textarea')).not.toBeNull())
+    // The chat pane clips fixed layers inside it, so the dialog is mounted outside the message.
+    expect(target.contains(document.querySelector('.partial-edit-overlay'))).toBe(false)
     const input = document.querySelector<HTMLTextAreaElement>('.partial-edit-modal textarea')!
     input.value = 'Retained draft'
     input.dispatchEvent(new Event('input', { bubbles: true }))
