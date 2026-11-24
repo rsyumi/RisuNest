@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
+import { alertStore } from '../alertQueue'
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
 import { DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
@@ -581,6 +582,33 @@ describe('a windowed send through the production runtime', () => {
             reservation.release()
             unsubscribe()
             settingsOpen.set(false)
+        }
+    })
+
+    it.each([false, true])('shows a dialog only when a stopped Lua send has a handler error (error=%s)', async (fail) => {
+        await bootWindowedConversation(storedMessages(), seed => {
+            seed.characters[0].triggerscript = [{
+                type: 'start', comment: '', conditions: [], effect: [{ type: 'triggerlua', code: `
+                    function onStart(id)
+                        stopChat(id)
+                        ${fail ? 'local ctor = nil; return ctor.value' : ''}
+                    end
+                ` }],
+            }]
+        })
+        const { sendChat } = await import('./index.svelte')
+        try {
+            await expect(sendChat({ historyLimit: true })).resolves.toBe(false)
+            if (fail) {
+                expect(get(alertStore)).toMatchObject({
+                    type: 'error',
+                    msg: expect.stringMatching(/Lua \(start\)[\s\S]*attempt to index a nil value \(local 'ctor'\)/),
+                })
+            } else {
+                expect(alertStore.hasDialogs()).toBe(false)
+            }
+        } finally {
+            alertStore.set({ type: 'none', msg: '' })
         }
     })
 

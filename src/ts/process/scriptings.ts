@@ -13,6 +13,7 @@ import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Cha
 import { get } from "svelte/store";
 import { DBState, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
 import { alertSelect, alertError, alertInput, alertNormal, alertConfirm } from "../alert";
+import { alertStore } from '../alertQueue';
 import { HypaProcesser } from "./memory/hypamemory";
 import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
 import { writeInlayImage, getInlayAsset } from "./files/inlays";
@@ -30,6 +31,7 @@ import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory, runLuaSource } from './luaRuntime';
 import { LuaWorkerExecutor, LuaWorkerUnavailableError } from './luaWorkerExecutor';
+import { luaErrorMessage } from './luaWorkerProtocol';
 import { createLuaHistoryJSON } from './luaHistoryJSON';
 import { luaCodeWrapper } from './luaCodeWrapper';
 import { withObjectUrl } from '../objectUrl';
@@ -1547,6 +1549,13 @@ export async function runScripted(code:string, arg:{
                     noticeScriptTimeout(mode === 'editDisplay')
                 } else {
                     console.error(error)
+                    if (mode !== 'editDisplay' && mode !== 'display') {
+                        alertStore.set({
+                            type: 'error',
+                            msg: `Lua (${mode})\n${luaErrorMessage(error)}`,
+                            stackTrace: error instanceof Error ? error.stack : undefined,
+                        })
+                    }
                 }
             }
         }
