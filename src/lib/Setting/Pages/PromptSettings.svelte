@@ -15,6 +15,7 @@
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import PresetToggleEditor from "./PresetToggleEditor.svelte";
     import DependentOptions from "./DependentOptions.svelte";
+    import DependentOptionsHint from "./DependentOptionsHint.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
     import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
     import Accordion from "src/lib/UI/Accordion.svelte";
@@ -495,7 +496,7 @@
 {:else}
     <h3 class="{mode === 'independent' ? 'mt-4' : 'mt-1'} pb-1 font-semibold text-textcolor border-b border-darkborderc">{language.risuNest.promptOptions.messages}</h3>
     <Check bind:check={DBState.db.promptSettings.sendChatAsSystem} name={language.sendChatAsSystem} className="mt-4"/>
-    <Check bind:check={DBState.db.promptSettings.sendName} name={language.formatMessageWithName} className="mt-4"/>
+    <Check bind:check={DBState.db.promptSettings.sendName} name={language.formatMessageWithName} className="mt-4"><DependentOptionsHint parentOn={DBState.db.promptSettings.sendName} /></Check>
     <DependentOptions parentOn={DBState.db.promptSettings.sendName}>
         <span class="text-textcolor mt-4">{language.namedMessageRole} <Help key="namedMessageRole"/></span>
         <SelectInput bind:value={DBState.db.namedMessageRole}>
@@ -528,7 +529,7 @@
     <TextAreaInput bind:value={DBState.db.templateDefaultVariables}/>
 
     <h3 class="mt-6 pb-1 font-semibold text-textcolor border-b border-darkborderc">{language.risuNest.promptOptions.output}</h3>
-    <Check bind:check={DBState.db.jsonSchemaEnabled} name={language.enableJsonSchema} className="mt-4"/>
+    <Check bind:check={DBState.db.jsonSchemaEnabled} name={language.enableJsonSchema} className="mt-4"><DependentOptionsHint parentOn={DBState.db.jsonSchemaEnabled} /></Check>
     {#if DBState.db.jsonSchemaEnabled}
         <DependentOptions parentOn={DBState.db.jsonSchemaEnabled}>
             <span class="text-textcolor mt-4">{language.jsonSchema} <Help key='jsonSchema' /></span>

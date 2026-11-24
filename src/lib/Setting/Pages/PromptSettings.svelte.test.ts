@@ -629,6 +629,9 @@ describe('prompt options', () => {
     /** The label span of an option, matched on its whole text. */
     const label = (text: string) => [...document.querySelectorAll('span')].find(span => span.textContent?.trim() === text)
     const checkbox = (name: string) => document.querySelector<HTMLInputElement>(`input[alt="${name}"]`)!
+    /** Which way the mark after an option's label points, or undefined when the option has none. */
+    const mark = (name: string) => checkbox(name).closest('label')!.querySelector('svg[class*="lucide-chevron-"]')
+        ?.getAttribute('class')?.match(/lucide-chevron-(right|down)/)?.[1]
     async function click(name: string) {
         checkbox(name).click()
         await tick()
@@ -644,12 +647,15 @@ describe('prompt options', () => {
         await showInline({ namedMessageRole: 'assistant', messageNameTemplate: 'Synthetic {{slot}}' })
         expect(label(language.namedMessageRole)).toBeUndefined()
         expect(label(language.messageNameFormat)).toBeUndefined()
+        expect(mark(language.formatMessageWithName)).toBe('right')
         await click(language.formatMessageWithName)
         expect(label(language.messageNameFormat)).toBeDefined()
         expect((label(language.namedMessageRole)!.nextElementSibling as HTMLSelectElement).value).toBe('assistant')
+        expect(mark(language.formatMessageWithName)).toBe('down')
         await click(language.formatMessageWithName)
         expect(label(language.namedMessageRole)).toBeUndefined()
         expect(label(language.messageNameFormat)).toBeUndefined()
+        expect(mark(language.formatMessageWithName)).toBe('right')
         await click(language.formatMessageWithName)
         expect((label(language.namedMessageRole)!.nextElementSibling as HTMLSelectElement).value).toBe('assistant')
         expect(DBState.db).toMatchObject({ namedMessageRole: 'assistant', messageNameTemplate: 'Synthetic {{slot}}' })
@@ -660,8 +666,11 @@ describe('prompt options', () => {
         expect(label(language.jsonSchema)).toBeUndefined()
         expect(label(language.extractJson)).toBeUndefined()
         expect(checkbox(language.strictJsonSchema).checked).toBe(true)
+        expect(mark(language.enableJsonSchema)).toBe('right')
+        expect(mark(language.strictJsonSchema)).toBeUndefined()
         await click(language.enableJsonSchema)
         expect(label(language.jsonSchema)).toBeDefined()
+        expect(mark(language.enableJsonSchema)).toBe('down')
         expect((label(language.extractJson)!.nextElementSibling as HTMLInputElement).value).toBe('answer')
         await click(language.enableJsonSchema)
         expect(label(language.jsonSchema)).toBeUndefined()
