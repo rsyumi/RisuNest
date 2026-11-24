@@ -38,6 +38,8 @@
             const content = box.firstElementChild
             const clipped = !!content && content.getBoundingClientRect().width - box.getBoundingClientRect().width > 0.5
             ellipsis.hidden = !(cut || clipped)
+            // A character the box cuts partway fades in rather than showing as a sliver.
+            box.style.maskImage = clipped ? 'linear-gradient(to right, transparent, black 0.7em)' : ''
         }
         // The row's width does not depend on the ellipsis, so showing it does not resize what is observed.
         const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update)
