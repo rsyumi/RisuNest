@@ -1,6 +1,7 @@
 <script lang="ts">
     import type { character, Message } from 'src/ts/storage/database.svelte'
     import Chats from './Chats.svelte'
+    import { provideChatWindowLayer } from './ChatWindowLayer.svelte'
     import type {
         ChatViewportHandle,
         ChatViewportJumpOptions,
@@ -22,6 +23,7 @@
         acquireConversationStartParserLease,
         selectedConversationOperations,
         onScrollMove,
+        windowLayer,
     }: {
         initialMessages?: Message[]
         initialCharacter: character
@@ -33,7 +35,10 @@
         ) => Promise<{ release(): void } | null>
         selectedConversationOperations?: SelectedConversationOperations
         onScrollMove?: () => void
+        windowLayer?: HTMLElement
     } = $props()
+    // svelte-ignore state_referenced_locally
+    if (windowLayer) provideChatWindowLayer(() => windowLayer)
 
     let messages = $state<Message[] | undefined>()
     let currentCharacter = $state<character>(null as unknown as character)

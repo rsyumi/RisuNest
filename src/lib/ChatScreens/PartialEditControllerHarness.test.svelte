@@ -1,5 +1,6 @@
 <script lang="ts">
     import PartialEditController from './PartialEditController.svelte'
+    import { provideChatWindowLayer } from './ChatWindowLayer.svelte'
 
     type SaveDetail = {
         newData: string
@@ -10,10 +11,16 @@
     let {
         getTranslationEditContext,
         onSave,
+        windowLayer,
+        messageData = 'Shared text',
     }: {
         getTranslationEditContext: () => Promise<{ key: string; data: string } | null>
         onSave?: (detail: SaveDetail & { sourceData: string }) => Promise<boolean>
+        windowLayer?: HTMLElement
+        messageData?: string
     } = $props()
+    // svelte-ignore state_referenced_locally
+    if (windowLayer) provideChatWindowLayer(() => windowLayer)
 
     let translatedView = $state(true)
     let bodyRoot = $state<HTMLElement | null>(null)
@@ -38,7 +45,7 @@
 
 {#if bodyRoot}
     <PartialEditController
-        messageData="Shared text"
+        {messageData}
         chatIndex={0}
         {bodyRoot}
         blockEditEnabled={true}

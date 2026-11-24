@@ -9,6 +9,7 @@
     } from 'src/ts/chatScreenshotRange'
     import NumberInput from '../UI/GUI/NumberInput.svelte'
     import { modalNavigation } from 'src/ts/ui/modalNavigation'
+    import ChatWindowLayer from './ChatWindowLayer.svelte'
 
     interface Props {
         totalTurns: number
@@ -87,6 +88,7 @@
 
 </script>
 
+<ChatWindowLayer>
 <!-- Work dialog layer: alerts and pickers stack above it on the shared modal layer. -->
 <div class="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50 p-4" role="presentation">
     <div
@@ -165,3 +167,4 @@
         {/if}
     </div>
 </div>
+</ChatWindowLayer>

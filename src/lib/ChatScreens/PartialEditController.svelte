@@ -5,6 +5,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { language } from 'src/lang';
     import { modalNavigation } from 'src/ts/ui/modalNavigation';
+    import ChatWindowLayer from './ChatWindowLayer.svelte';
     import { 
         findAllOriginalRangesFromHtml,
         findAllOriginalRangesFromText,
@@ -714,6 +715,7 @@
 </script>
 
 {#snippet MatchSelectionModal(mode: MatchingMode, matches: RangeResultWithContext[], title: string)}
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) cancelMatchSelection(); }}>
@@ -758,10 +760,12 @@
             </div>
         </div>
     </div>
+    </ChatWindowLayer>
 {/snippet}
 
 <!-- Match failed modal -->
 {#if showMatchFailedModal}
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) showMatchFailedModal = false; }}>
@@ -782,10 +786,12 @@
             </div>
         </div>
     </div>
+    </ChatWindowLayer>
 {/if}
 
 <!-- Delete confirmation modal -->
 {#if isConfirmingDelete}
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) handleCancelDelete(); }}>
@@ -825,6 +831,7 @@
             </div>
         </div>
     </div>
+    </ChatWindowLayer>
 {/if}
 
 <!-- Match selection modal (shared for edit/delete) -->
@@ -836,6 +843,7 @@
 
 <!-- Edit modal (shown only during edit) -->
 {#if isEditing}
+    <ChatWindowLayer>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <div class="partial-edit-overlay" onclick={(e) => { if (e.target === e.currentTarget) handleCancel(); }}>
@@ -882,6 +890,7 @@
             </div>
         </div>
     </div>
+    </ChatWindowLayer>
 {/if}
 
 <style>
@@ -1020,7 +1029,8 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        z-index: 10000;
+        /* Work dialog layer: alerts and the app lock stack above it. */
+        z-index: 1000;
     }
 
     .partial-edit-modal {

@@ -174,13 +174,18 @@ describe('ChatScreenshotDialog', () => {
 
     test('cancels a running job when its parent destroys the dialog', async () => {
         const onCancel = vi.fn()
-        mounted = mount(ChatScreenshotDialogHarness, { target, props: { onCancel } })
+        const windowLayer = document.createElement('div')
+        document.body.append(windowLayer)
+        mounted = mount(ChatScreenshotDialogHarness, { target, props: { onCancel, windowLayer } })
         await tick()
+        // The chat pane clips fixed layers inside it, so the dialog mounts in the chat screen's window layer.
+        expect(windowLayer.querySelector('[role="dialog"]')).not.toBeNull()
+        expect(target.querySelector('[role="dialog"]')).toBeNull()
 
         ;(mounted as { destroyDialog(): void }).destroyDialog()
         await tick()
 
-        expect(target.querySelector('[role="dialog"]')).toBeNull()
+        expect(windowLayer.querySelector('[role="dialog"]')).toBeNull()
         expect(onCancel).toHaveBeenCalledOnce()
     })
 })

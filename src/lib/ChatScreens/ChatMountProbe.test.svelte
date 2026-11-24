@@ -2,6 +2,7 @@
     import { onDestroy, onMount, settled as domSettled, untrack } from 'svelte'
     import type { StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
     import { chatMountProbe } from './chatMountProbe.testSupport'
+    import ChatWindowLayer from './ChatWindowLayer.svelte'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { ChatDisplayRefresh, ChatPresentationRefresh } from 'src/ts/chatDisplayRefresh'
     import type { ChatEditorDraft } from 'src/ts/chatEditorDrafts'
@@ -37,6 +38,7 @@
     } = $props()
 
     const instanceId = chatMountProbe.nextInstanceId++
+    const windowDialog = chatMountProbe.windowDialogs
     if (untrack(() => idx) >= 0 && chatMountProbe.throwNextMount) {
         chatMountProbe.throwNextMount = false
         throw new Error('chat mount probe failure')
@@ -167,3 +169,6 @@
     data-refresh-count={refreshCount}
     data-restored-draft={restored?.draft}
 ></div>
+{#if windowDialog}
+    <ChatWindowLayer><span data-window-dialog={instanceId}></span></ChatWindowLayer>
+{/if}

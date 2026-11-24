@@ -89,12 +89,21 @@ describe('ChatScreen navigation activity', () => {
             target.querySelector('[role="status"]')?.textContent?.trim(),
         ).toBe(language.loadingChatData)
         expect(oldChatControl?.closest('[inert]')).toBe(content)
+        // A dialog covering the whole window sits outside the chat pane and above the loading overlay, so it is hidden while loading.
+        const dialog = target.querySelector('[data-window-dialog]')
+        expect(dialog).not.toBeNull()
+        expect(content.contains(dialog)).toBe(false)
+        expect(dialog?.closest('[hidden]')?.parentElement).toBe(pane)
         const chatListControl = target.querySelector('[data-chat-list-control]')
         expect(chatListControl?.closest('[inert]')).toBeNull()
         const overlay = chatListControl?.closest('.z-40')
         expect(overlay?.parentElement).toBe(pane)
         expect(overlay?.classList.contains('absolute')).toBe(true)
         expect(overlay?.classList.contains('inset-0')).toBe(true)
+
+        navigationActivity.set(null)
+        await tick()
+        expect(dialog?.closest('[hidden]')).toBeNull()
     })
 })
 

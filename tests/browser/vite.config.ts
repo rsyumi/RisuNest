@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import { lazyAppBoundaries } from './lazyAppPlugin'
 import { settledThoughtBoundaries } from './settledThoughtPlugin'
 import { sidebarProductBoundaries } from './sidebarProductPlugin'
+import { chatPaneBoundaries } from './chatPanePlugin'
 import tailwindcss from '@tailwindcss/vite'
 import { autoStubs, stubbed } from './autoStubPlugin'
 
@@ -13,7 +14,7 @@ export default defineConfig(({ mode }) => {
     return {
         root: resolve(import.meta.dirname),
         define: { 'import.meta.env.VITE_RISU_LEGAL_CONFIGURED': 'true' },
-        plugins: [tailwindcss(), autoStubs(), lazyAppBoundaries(), settledThoughtBoundaries(), sidebarProductBoundaries(), {
+        plugins: [tailwindcss(), autoStubs(), lazyAppBoundaries(), settledThoughtBoundaries(), sidebarProductBoundaries(), chatPaneBoundaries(), {
             name: 'fixture-host-boundaries', enforce: 'pre',
             async resolveId(requested, importer, options) {
                 const source = requested.replaceAll('\\', '/').replace(resolve(import.meta.dirname, '../../src').replaceAll('\\', '/') + '/', 'src/')
@@ -71,7 +72,7 @@ export default defineConfig(({ mode }) => {
             outDir: resolve(import.meta.dirname, '../../.tmp/test-results/browser/dist'), emptyOutDir: true,
             rollupOptions: {
                 preserveEntrySignatures: 'strict',
-                input: [resolve(import.meta.dirname, 'imageFormats.html'), resolve(import.meta.dirname, 'index.html'), resolve(import.meta.dirname, 'dragDrop.html'), resolve(import.meta.dirname, 'chatList.html'), resolve(import.meta.dirname, 'sidebarTouch.html'), resolve(import.meta.dirname, 'modalNavigation.html'), resolve(import.meta.dirname, 'lazyApp.html'), resolve(import.meta.dirname, 'monaco.html'), resolve(import.meta.dirname, 'settledThought.html'), resolve(import.meta.dirname, 'switchContainment.html'), resolve(import.meta.dirname, 'chatRendering.html'), resolve(import.meta.dirname, 'presetList.html')],
+                input: [resolve(import.meta.dirname, 'imageFormats.html'), resolve(import.meta.dirname, 'index.html'), resolve(import.meta.dirname, 'dragDrop.html'), resolve(import.meta.dirname, 'chatList.html'), resolve(import.meta.dirname, 'sidebarTouch.html'), resolve(import.meta.dirname, 'modalNavigation.html'), resolve(import.meta.dirname, 'lazyApp.html'), resolve(import.meta.dirname, 'monaco.html'), resolve(import.meta.dirname, 'settledThought.html'), resolve(import.meta.dirname, 'switchContainment.html'), resolve(import.meta.dirname, 'chatRendering.html'), resolve(import.meta.dirname, 'presetList.html'), resolve(import.meta.dirname, 'chatPane.html')],
             },
         },
     }

@@ -8,6 +8,7 @@
     import { chatScreenState } from 'src/ts/ui/chatScreenState.svelte'
     import type { ChatDisplayRefresh, ChatPresentationRefresh } from 'src/ts/chatDisplayRefresh'
     import ChatConversationStart from './ChatConversationStart.svelte'
+    import { chatWindowLayerContext } from './ChatWindowLayer.svelte'
     import { getCharImage } from 'src/ts/characters'
     import { createSimpleCharacter, DBState, selectedCharID, ReloadChatPointer, ReloadGUIPointer } from 'src/ts/stores.svelte'
     import {
@@ -111,6 +112,7 @@
         hasNewUnreadMessage?: boolean
         onScrollMove?: () => void
     } = $props()
+    const windowLayerContext = chatWindowLayerContext()
 
     const ESTIMATED_MESSAGE_HEIGHT = 256
     const VIEWPORT_OVERSCAN = 8
@@ -1315,6 +1317,7 @@
                             : null
                         const instance: ChatInstance = mount(Chat, {
                             target: element,
+                            context: windowLayerContext,
                             props: {
                                 restoredEditor: restoredEditor ?? undefined,
                                 onEditorOpen: () => holdOpenedEditor(instance),
@@ -1781,6 +1784,7 @@
                 element.replaceChildren()
                 const instance = mount(ChatConversationStart, {
                     target: element,
+                    context: windowLayerContext,
                     props: {
                         currentCharacter: character,
                         resolvedImage: resolvedCharacterImage ?? '',

@@ -7,6 +7,7 @@
     import { MobileGUI, RealmInitialOpenChar } from "src/ts/stores.svelte";
     import RealmPopUp from "./RealmPopUp.svelte";
     import RealmBlockedCreators from "./RealmBlockedCreators.svelte";
+    import ChatWindowLayer from "src/lib/ChatScreens/ChatWindowLayer.svelte";
 
     let openedData:null|hubType = $state(null)
 
@@ -175,6 +176,7 @@
     </div>
 {/if}
 
+<ChatWindowLayer>
 {#if openedData}
     <RealmPopUp bind:openedData={openedData} onBlock={(creatorId) => {
         charas = charas.filter((card) => card.creator !== creatorId)
@@ -227,3 +229,4 @@
         </div>
     </div>
 {/if}
+</ChatWindowLayer>
