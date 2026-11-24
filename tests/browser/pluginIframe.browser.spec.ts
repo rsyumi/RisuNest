@@ -723,6 +723,8 @@ test.describe('floating plugin window', () => {
         // The bottom of the viewport stops the window.
         const crossed = { x: 840, y: 420, width: 400, height: 300 }
         expect(await frameRect(page, 0)).toEqual(crossed)
+        // Nothing is reported while the button is still held.
+        expect(await changes('crossing')).toEqual([])
         await page.mouse.up()
         expect(await changes('crossing')).toEqual([{ tag: 'crossing', state: { bounds: crossed, viewport } }])
         expect(await frameRect(page, 1)).toEqual(other)
