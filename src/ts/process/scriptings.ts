@@ -1731,8 +1731,11 @@ function scriptLineNumbers(text: string): string {
 function withScriptLineNumbers(error: unknown): unknown {
     if (typeof error === 'string') return scriptLineNumbers(error)
     if (error instanceof Error) {
-        error.message = scriptLineNumbers(error.message)
-        if (error.stack) error.stack = scriptLineNumbers(error.stack)
+        // Other errors pass through untouched; an abort reason's DOMException message cannot be assigned.
+        const message = scriptLineNumbers(error.message)
+        if (message !== error.message) error.message = message
+        const stack = error.stack && scriptLineNumbers(error.stack)
+        if (stack !== error.stack) error.stack = stack
     }
     return error
 }

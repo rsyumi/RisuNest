@@ -35,6 +35,7 @@ import { captureGenerationConversationOperation } from './generationConversation
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { alertStore } from '../alertQueue'
+import { LuaWorkerExecutor } from './luaWorkerExecutor'
 import { language } from '../../lang'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 import { pluginV2 } from '../plugins/plugins.svelte'
@@ -798,6 +799,20 @@ test('numbers a load error from the first line of the script', async () => {
     chat: { message: [] } as never,
     mode: 'start',
   })).rejects.toThrow(`[string "..."]:2: unexpected symbol near '='`)
+})
+
+test.runIf(inject('luaWorker') === true)('rejects with the abort reason when a script stops while loading', async () => {
+  const reason = new DOMException('stopped', 'AbortError')
+  const initialize = vi.spyOn(LuaWorkerExecutor.prototype, 'initialize').mockRejectedValueOnce(reason)
+  try {
+    await expect(runScripted('local ok = 1', {
+      char: { chaId: 'load-abort' } as never,
+      chat: { message: [] } as never,
+      mode: 'start',
+    })).rejects.toBe(reason)
+  } finally {
+    initialize.mockRestore()
+  }
 })
 
 test('records sparse arrays as a current-runtime handler error', async () => {
