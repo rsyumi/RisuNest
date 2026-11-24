@@ -159,8 +159,8 @@ jobs:
         if: inputs.product == 'app'
         with: { distribution: temurin, java-version: "21" }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
-      - run: pnpm --dir server/endpoint-registry --ignore-workspace install --frozen-lockfile
+      - run: pnpm --dir server/manager/gui install --frozen-lockfile
+      - run: pnpm --dir server/endpoint-registry install --frozen-lockfile
       - run: pnpm check:test-inventory
       - uses: ./.github/actions/test-references
       - run: pnpm test:node
@@ -318,9 +318,9 @@ jobs:
         run: |
           mv .workflow-apt/scripts/install-apt-packages.sh "$RUNNER_TEMP/" && rm -rf .workflow-apt
           bash "$RUNNER_TEMP/install-apt-packages.sh" pkg-config libwebkit2gtk-4.1-dev libssl-dev libdbus-1-dev libayatana-appindicator3-dev librsvg2-dev
-      - run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
-      - run: pnpm --dir server/manager/gui --ignore-workspace check
-      - run: pnpm --dir server/manager/gui --ignore-workspace test
+      - run: pnpm --dir server/manager/gui install --frozen-lockfile
+      - run: pnpm --dir server/manager/gui check
+      - run: pnpm --dir server/manager/gui test
       - run: cargo test --manifest-path server/manager/gui/src-tauri/Cargo.toml --release --locked
 
   endpoint-registry-tests:
@@ -332,9 +332,9 @@ jobs:
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with: { node-version: "24", package-manager-cache: false }
-      - run: pnpm --dir server/endpoint-registry --ignore-workspace install --frozen-lockfile
-      - run: pnpm --dir server/endpoint-registry --ignore-workspace check
-      - run: pnpm --dir server/endpoint-registry --ignore-workspace test
+      - run: pnpm --dir server/endpoint-registry install --frozen-lockfile
+      - run: pnpm --dir server/endpoint-registry check
+      - run: pnpm --dir server/endpoint-registry test
 
   shared-wasm-tests:
     needs: source
@@ -852,7 +852,7 @@ jobs:
 
       - name: Install Sync GUI dependencies
         if: matrix.os != 'linux' && needs.prepare-draft.outputs.already_published != 'true'
-        run: pnpm --dir server/manager/gui --ignore-workspace install --frozen-lockfile
+        run: pnpm --dir server/manager/gui install --frozen-lockfile
       - name: Fetch and verify pinned cloudflared
         timeout-minutes: 30
         if: needs.prepare-draft.outputs.already_published != 'true'

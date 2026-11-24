@@ -357,7 +357,7 @@ async function app() {
     assetAliases: [],
   });
   const { runtime, DBState, index } = await mountProduct();
-  const { tick } = await import("svelte");
+  const { settled: domSettled } = await import("svelte");
   const lease = await runtime.acquireCompleteConversation("edit-message");
   let conversationId: string;
   try {
@@ -384,7 +384,7 @@ async function app() {
   } finally {
     lease.release();
   }
-  await tick();
+  await domSettled();
   await runtime.flushPendingData("linux-ui-smoke");
   await until(
     () => document.getElementById("app")!.textContent!.includes(productMarker),

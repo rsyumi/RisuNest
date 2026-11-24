@@ -55,7 +55,7 @@
         try {
             if (!await appLock.setEnabled(false)) errors.enable = language.risuNest.localData.applyFailed
         } catch { errors.enable = language.risuNest.localData.applyFailed }
-        finally { pending = false; await restoreControls() }
+        finally { await restoreControls(); pending = false }
     }
 
     async function changeTiming(event: Event & { currentTarget: HTMLSelectElement }): Promise<void> {
@@ -66,7 +66,7 @@
         try {
             if (!await appLock.setTiming(value)) errors.timing = language.risuNest.localData.applyFailed
         } catch { errors.timing = language.risuNest.localData.applyFailed }
-        finally { pending = false; await restoreControls() }
+        finally { await restoreControls(); pending = false }
     }
 
     async function changeNative(value: boolean): Promise<void> {
@@ -81,7 +81,7 @@
             } else if (outcome === 'saveFailed') errors.native = language.risuNest.localData.applyFailed
             else if (outcome === 'unavailable' || outcome === 'failed') errors.native = text.nativeUnavailable
         } catch { errors.native = language.risuNest.localData.applyFailed }
-        finally { pending = false; await restoreControls() }
+        finally { await restoreControls(); pending = false }
     }
 
     async function changePreview(value: boolean): Promise<void> {
@@ -91,7 +91,7 @@
         try {
             if (!await appLock.setHideRecentsPreview(value)) errors.preview = language.risuNest.localData.applyFailed
         } catch { errors.preview = language.risuNest.localData.applyFailed }
-        finally { pending = false; await restoreControls() }
+        finally { await restoreControls(); pending = false }
     }
 </script>
 

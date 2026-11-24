@@ -1,4 +1,4 @@
-import { tick } from "svelte";
+import { settled as domSettled } from "svelte";
 import { get } from "svelte/store";
 import { failureRecord, type FailureEntry, type FailureRecord } from "../failureRecord";
 
@@ -209,7 +209,7 @@ export class SyncDriver {
     const tab = await until(() => document.querySelector<HTMLButtonElement>('[data-risunest-tab="sync"]'),
       30_000, step, "RisuNest settings tabs did not render");
     tab.click();
-    await tick();
+    await domSettled();
     await until(() => document.querySelector('[data-risunest-panel="sync"]'), 15_000, step, "sync tab did not open");
     await until(() => this.section(), 30_000, step, "Sync server settings did not render");
     return { tab: "sync" };
@@ -304,11 +304,11 @@ export class SyncDriver {
       15_000, "registration", "registration input is not shown");
     area.value = registration;
     area.dispatchEvent(new Event("input", { bubbles: true }));
-    await tick();
+    await domSettled();
     const read = this.buttons(section, copy.readRegistration);
     if (read.length !== 1 || read[0].disabled) fail("registration", "read button unavailable", { buttons: read.length });
     read[0].click();
-    await tick();
+    await domSettled();
     await until(async () => !section.querySelector("#server-registration") && this.buttons(section, copy.connect).length === 1,
       15_000, "registration", "registration review did not open", async () => ({ uiAlert: await this.uiAlert() }));
     return { reviewed: true };
@@ -371,7 +371,7 @@ export class SyncDriver {
       if (action.length !== 1 || !box) fail("connect", "replacement dialog controls missing", { actions: action.length, checkbox: !!box });
       outcome.replacementGatedByCheckbox = action[0].disabled && !box.checked;
       box.click();
-      await tick();
+      await domSettled();
       if (!box.checked || action[0].disabled) fail("connect", "replacement action stayed disabled after acknowledging", outcome);
       action[0].click();
     } else if (title === language.lwwSync.previousFilesTitle) {
@@ -466,7 +466,7 @@ export class SyncDriver {
     } finally {
       lease.release();
     }
-    await tick();
+    await domSettled();
     await runtime.flushPendingData(reason);
     const saved = await runtime.store.readConversation(characterId, conversationId);
     if (saved?.value.message.at(-1)?.data !== value) fail("edit", "edit did not persist", { messages: saved?.value.message.length ?? null });
@@ -481,7 +481,7 @@ export class SyncDriver {
     const { DBState, settingsOpen } = await import("../../src/ts/stores.svelte");
     await this.waitForNoDialog("render");
     settingsOpen.set(false);
-    await tick();
+    await domSettled();
     const { changeChar } = await import("../../src/ts/characters");
     const { getPersistentDataRuntime } = await import("../../src/ts/storage/persistentDataRuntime.svelte");
     const index = DBState.db.characters.findIndex((character) => character.chaId === location.characterId);

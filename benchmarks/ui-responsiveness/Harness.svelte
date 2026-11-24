@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount, tick } from 'svelte'
+    import { onMount, settled as domSettled } from 'svelte'
     import Chats from '../../src/lib/ChatScreens/Chats.svelte'
     import { DBState, selectedCharID } from '../../src/ts/stores.svelte'
     import type { character } from '../../src/ts/storage/database.svelte'
@@ -152,7 +152,7 @@
     ): Promise<RenderVerification> {
         const deadline = performance.now() + 20_000
         while (performance.now() < deadline) {
-            await tick()
+            await domSettled()
             const verification = verifyRenderedCharacter(characterIndex)
             if (verification.validOutput) return verification
             await new Promise<void>((resolve) =>

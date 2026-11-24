@@ -108,14 +108,17 @@
             .filter(({ preset }) => !filter || filter(preset)),
     )
     let sortable = $derived(!!dragType && movable)
-    let dialog = $state<HTMLElement>()
+    /** The dialog's height as last laid out. */
+    let dialogHeight = $state(0)
     /** The dialog's height when filtering began, kept so a search does not move the dialog under the field. */
     let filteringHeight = $state<number | null>(null)
     $effect.pre(() => {
         const filtering = listScroll && visible.length < (presets?.length ?? 0)
+        // The list has already left the filtered rows out of the DOM here, so the height comes
+        // from the layout before this update rather than from measuring now.
         untrack(() => {
             if (!filtering) filteringHeight = null
-            else if (filteringHeight === null && dialog) filteringHeight = dialog.offsetHeight
+            else if (filteringHeight === null && dialogHeight > 0) filteringHeight = dialogHeight
         })
     })
     let dragged: T | null = null
@@ -267,7 +270,7 @@
 
 <div class="{layer} bg-black/50 flex justify-center items-center p-4" use:modalNavigation={{ close: dismiss }}>
     <div
-        bind:this={dialog}
+        bind:offsetHeight={dialogHeight}
         class="relative z-10 bg-darkbg text-textcolor rounded-md flex flex-col {width} max-w-full max-h-full"
         style:min-height={filteringHeight === null ? null : `min(${filteringHeight}px, 100%)`}
         role="dialog"

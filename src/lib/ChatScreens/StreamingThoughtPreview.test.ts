@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { getStreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
 import {
     asciiControlText,
@@ -33,7 +33,7 @@ describe('expanded streaming thought', () => {
         while (runFrame()) {
             if (++count > 10_000) throw new Error('frames did not settle')
         }
-        await tick()
+        await domSettled()
         return count
     }
 
@@ -45,7 +45,7 @@ describe('expanded streaming thought', () => {
         const details = target.querySelector('details')!
         details.open = true
         details.dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         return details
     }
 
@@ -82,7 +82,7 @@ describe('expanded streaming thought', () => {
         expect(source.length).toBe(500_049)
         const full = getStreamingThoughtPreview(source, true)!.full!
         start(source)
-        await tick()
+        await domSettled()
         expect(body()).toBeNull()
         await open()
         const first = body()!.textContent!
@@ -104,7 +104,7 @@ describe('expanded streaming thought', () => {
         ]) {
             const source = wrapThought(text)
             start(source)
-            await tick()
+            await domSettled()
             await open()
             await runFrames()
             expect(body()!.textContent).toBe(getStreamingThoughtPreview(source, true)!.full)
@@ -115,25 +115,25 @@ describe('expanded streaming thought', () => {
 
     test('keeps a split closing tag out of the expanded text', async () => {
         const harness = start('<Thoughts>alpha</Thou')
-        await tick()
+        await domSettled()
         await open()
         expect(body()!.textContent).toBe('alpha')
         harness.setSource('<Thoughts>alpha</Thoughts>middle<Thoughts>beta')
-        await tick()
+        await domSettled()
         await runFrames()
         expect(body()!.textContent).toBe('alpha\n\nbeta')
     })
 
     test('collapsing during incremental work stops further work', async () => {
         start(wrapThought(repeatedKoreanEmojiThought()))
-        await tick()
+        await domSettled()
         const details = await open()
         runFrame()
-        await tick()
+        await domSettled()
         expect(frames.size).toBe(1)
         details.open = false
         details.dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         expect(body()).toBeNull()
         expect(cancelFrame).toHaveBeenCalled()
         expect(frames.size).toBe(0)
@@ -142,21 +142,21 @@ describe('expanded streaming thought', () => {
     test('a new streaming input continues or restarts the expansion', async () => {
         const thought = repeatedKoreanEmojiThought(20_000)
         const harness = start(`<Thoughts>${thought}`)
-        await tick()
+        await domSettled()
         await open()
         runFrame()
-        await tick()
+        await domSettled()
         const firstUnit = body()!.firstElementChild
         const appended = `<Thoughts>${thought}appended ${'\u{1f468}\u{200d}\u{1f469}'}</Thoughts>`
         harness.setSource(appended)
-        await tick()
+        await domSettled()
         await runFrames()
         expect(body()!.firstElementChild).toBe(firstUnit)
         expect(body()!.textContent).toBe(getStreamingThoughtPreview(appended, true)!.full)
 
         const replaced = `<Thoughts>REPLACED ${asciiControlText(60_000)}`
         harness.setSource(replaced)
-        await tick()
+        await domSettled()
         expect(body()!.textContent!.startsWith('REPLACED')).toBe(true)
         await runFrames()
         expect(body()!.textContent).toBe(getStreamingThoughtPreview(replaced, true)!.full)

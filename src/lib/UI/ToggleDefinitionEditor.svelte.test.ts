@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, tick, unmount } from 'svelte'
 import { writable } from 'svelte/store'
 import { language } from 'src/lang'
 import { RISU_TOGGLE_DRAG_TYPE } from 'src/ts/dragTypes'
@@ -329,7 +329,7 @@ describe('toggle definition editor', () => {
             expect(grip.parentElement!.classList).toContain('risu-sort-held')
             touch(grip, 'touchmove', 10, y)
             touch(grip, 'touchend', 10, y)
-            await tick()
+            await domSettled()
             expect(props.onChange).toHaveBeenCalledTimes(1)
             expect(props.onChange).toHaveBeenLastCalledWith('c=C\na=A\nb=B')
         } finally {

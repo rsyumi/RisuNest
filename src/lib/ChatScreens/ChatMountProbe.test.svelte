@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onDestroy, onMount, tick, untrack } from 'svelte'
+    import { onDestroy, onMount, settled as domSettled, untrack } from 'svelte'
     import type { StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
     import { chatMountProbe } from './chatMountProbe.testSupport'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
@@ -109,7 +109,7 @@
         parserAbortSignal = state.parserAbortSignal
         onDisplaySettled = state.onDisplaySettled
         const settled = onDisplaySettled
-        void tick().then(() => reportDisplay(settled))
+        void domSettled().then(() => reportDisplay(settled))
         refreshCount = untrack(() => refreshCount) + 1
         chatMountProbe.displayUpdates.push({
             instanceId,
@@ -128,7 +128,7 @@
 
     onMount(() => {
         const settled = onDisplaySettled
-        void tick().then(() => reportDisplay(settled))
+        void domSettled().then(() => reportDisplay(settled))
         chatMountProbe.closeEditors.set(instanceId, () => {
             chatMountProbe.activeEditors.delete(instanceId)
             restored = undefined

@@ -1,4 +1,4 @@
-import { mount, tick, unmount } from "svelte";
+import { mount, settled as domSettled, unmount } from "svelte";
 import ViewportFixture from "./ViewportFixture.svelte";
 import { DBState, selectedCharID } from "../../src/ts/stores.svelte";
 import type { character, Message } from "../../src/ts/storage/database.svelte";
@@ -35,7 +35,7 @@ async function until(test: () => boolean, label: string) {
   }
 }
 async function ready() {
-  await tick();
+  await domSettled();
   await until(() => rows().length > 0 && !host.querySelector("[data-chat-mount-pending]") && metrics.active === 0, "viewport-not-ready");
   await pause();
   await pause();
@@ -131,7 +131,7 @@ export const viewportProbe = {
     for (let chunk = 1; chunk <= 40; chunk++) {
       await until(() => performance.now() - started >= chunk * 50, 'stream-chunk-deadline');
       session.edit(session.locate(index), { role: 'char', chatId: 'synthetic-stream', data: ('Synthetic streamed paragraph. '.repeat(5) + '\n\n').repeat(chunk) });
-      await tick();
+      await domSettled();
       await pause();
       if (chunk === options.manualAtChunk) {
         container.dispatchEvent(new WheelEvent('wheel', { deltaY: -240 }));
@@ -266,7 +266,7 @@ export const viewportProbe = {
       for (let chunk = 1; chunk <= 20; chunk++) {
         await until(() => performance.now() - started >= chunk * 50, "stream-chunk-deadline");
         active.edit(active.locate(index), { role: "char", chatId: "display-variable-stream", data: `chunk-${chunk} shown={{getvar::shownChunk}} ` + "streamed ".repeat(chunk * 4) });
-        await tick();
+        await domSettled();
         await pause();
       }
       clearStreamingConversation(chat.id!);

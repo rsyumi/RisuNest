@@ -6,7 +6,7 @@ import { separateRunnerPaths, testExcludes } from './suiteOwnership.mjs'
 
 export function sharedVitestConfig() {
   return defineConfig({
-    plugins: [responsesInternalsPlugin(), svelte(), {
+    plugins: [responsesInternalsPlugin(), svelte({ compilerOptions: { experimental: { async: true } } }), {
       name: 'lua-node-wasm-asset',
       enforce: 'pre',
       resolveId(id) {

@@ -1,6 +1,6 @@
 import { configurePluginStartup, pluginStartupState } from 'src/ts/plugins/pluginStartupGate'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { get, writable } from 'svelte/store'
 import { language } from 'src/lang'
 import { DBState, onboardingModalStore, ScriptDisplayRebuildPointer } from 'src/ts/stores.svelte'
@@ -109,7 +109,7 @@ beforeEach(async () => {
         sendWithEnter: true, username: 'User', userIcon: '', personas: [{ name: 'User', icon: '' }], selectedPersona: 0,
     } as any
     instance = mount(DefaultChatScreen, { target: document.body })
-    await tick()
+    await domSettled()
 })
 
 it('sends plain input through the bounded controller without complete-history acquisition', async () => {
@@ -137,7 +137,7 @@ it('shows the scroll buttons for a while after the chat scrolls and runs each mo
     vi.useFakeTimers()
     try {
         mocks.chatsProps.onScrollMove()
-        await tick()
+        await domSettled()
         expect(nav.classList.contains('invisible')).toBe(false)
         await vi.advanceTimersByTimeAsync(1_000)
         button('Scroll Up').click()
@@ -156,11 +156,11 @@ it('shows the scroll buttons for a while after the chat scrolls and runs each mo
     expect(mocks.viewport.jumpToBottom).toHaveBeenCalledOnce()
     DBState.db.risunestScrollNavigation = false
     mocks.chatsProps.onScrollMove()
-    await tick()
+    await domSettled()
     expect(nav.classList.contains('invisible')).toBe(true)
     DBState.db.risunestScrollNavigation = true
     mocks.chatsProps.onScrollMove()
-    await tick()
+    await domSettled()
     expect(nav.classList.contains('invisible')).toBe(false)
 })
 
@@ -168,7 +168,7 @@ it('keeps the scroll buttons hidden while the chat menu is open', async () => {
     const nav = document.querySelector<HTMLElement>('[data-chat-scroll-nav]')!
     document.querySelector<HTMLButtonElement>('.button-icon-send')!.nextElementSibling!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     mocks.chatsProps.onScrollMove()
-    await tick()
+    await domSettled()
     expect(nav.classList.contains('invisible')).toBe(true)
 })
 
@@ -176,7 +176,7 @@ it('admits only one send while input processing is pending', async () => {
     type('Submitted')
     send()
     send()
-    await tick()
+    await domSettled()
     expect(mocks.trigger).toHaveBeenCalledTimes(1)
     finishTrigger()
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledTimes(1))
@@ -215,7 +215,7 @@ it('holds the reroll shortcut until the submitted input has finished', async () 
     const input = type('Submitted')
     send()
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
-    await tick()
+    await domSettled()
     expect(mocks.generate).not.toHaveBeenCalled()
     finishTrigger()
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledTimes(1))
@@ -229,10 +229,10 @@ it('retains attachments on input failure and preserves files added for the next 
         if (!fileItem()) {
             const menu = document.querySelector('.button-icon-send')!.nextElementSibling as HTMLButtonElement
             menu.click()
-            await tick()
+            await domSettled()
         }
         fileItem()!.parentElement!.click()
-        await tick()
+        await domSettled()
     }
     await attach('file-a')
     mocks.trigger.mockRejectedValueOnce(new Error('Synthetic input failure'))
@@ -415,7 +415,7 @@ it('rerolls with a user message last by reading only the newest messages', async
     const before = structuredClone(store)
     type('').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
     await vi.waitFor(() => expect(mocks.openWindow).toHaveBeenCalled())
-    await tick()
+    await domSettled()
     for (const [options] of mocks.openWindow.mock.calls) expect(options.tailStart(store.length)).toBeGreaterThan(30)
     expect(mocks.generate).not.toHaveBeenCalled()
     expect(mocks.error).not.toHaveBeenCalled()
@@ -425,15 +425,15 @@ it('rerolls with a user message last by reading only the newest messages', async
 
 it('restores paired composer fields after the chat screen is destroyed and remounted', async () => {
     DBState.db.useAutoTranslateInput = true
-    await tick()
+    await domSettled()
     type('Unsent original')
     const translated = document.querySelector<HTMLTextAreaElement>('#messageInputTranslate')!
     translated.value = 'Unsent translation'
     translated.dispatchEvent(new Event('input', { bubbles: true }))
-    await tick()
+    await domSettled()
     await unmount(instance!)
     instance = mount(DefaultChatScreen, { target: document.body })
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('Unsent original')
     expect(document.querySelector<HTMLTextAreaElement>('#messageInputTranslate')!.value).toBe('Unsent translation')
 })
@@ -443,17 +443,17 @@ it('keeps each composer with its conversation and discards a removed conversatio
     character.chats.push({ id: 'other', message: [] } as any)
     type('First draft')
     character.chatPage = 1
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('')
     type('Second draft')
     character.chatPage = 0
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('First draft')
     character.chats.splice(1, 1)
-    await tick()
+    await domSettled()
     character.chats.push({ id: 'other', message: [] } as any)
     character.chatPage = 1
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('')
 })
 
@@ -463,7 +463,7 @@ it('a send completing after remount preserves new typing in the restored compose
     await vi.waitFor(() => expect(mocks.trigger).toHaveBeenCalledOnce())
     await unmount(instance!)
     instance = mount(DefaultChatScreen, { target: document.body })
-    await tick()
+    await domSettled()
     type('Typed after Settings')
     finishTrigger()
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
@@ -497,10 +497,10 @@ it.each(['send', 'continue', 'reroll'] as const)('stops a pending %s after the c
             { role: 'user', data: 'Question', chatId: 'question' },
             { role: 'char', data: 'Previous', chatId: 'previous' },
         ]
-        await tick()
+        await domSettled()
         const menu = document.querySelector('.button-icon-send')!.nextElementSibling as HTMLButtonElement
         menu.click()
-        await tick()
+        await domSettled()
         const continueAction = [...document.querySelectorAll('span')].find(span => span.textContent === language.continueResponse)!.parentElement!
         continueAction.click()
     } else {
@@ -512,10 +512,10 @@ it.each(['send', 'continue', 'reroll'] as const)('stops a pending %s after the c
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
     await unmount(instance!)
     instance = mount(DefaultChatScreen, { target: document.body })
-    await tick()
+    await domSettled()
     send()
     type('Next draft').dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
-    await tick()
+    await domSettled()
     expect(mocks.generate).toHaveBeenCalledOnce()
     document.querySelector<HTMLButtonElement>('button[aria-labelledby="cancel"]')!.click()
     const aborted = requestSignal!.aborted
@@ -539,13 +539,13 @@ it.each([false, true])('uses the current raw input on translation failure (rever
     DBState.db.useAutoTranslateInput = true
     mocks.bounded = true
     mocks.translate.mockRejectedValue(new TypeError('Load failed'))
-    await tick()
+    await domSettled()
     const source = document.querySelector<HTMLTextAreaElement>(reverse ? '#messageInputTranslate' : 'textarea.input-text')!
     const target = document.querySelector<HTMLTextAreaElement>(reverse ? 'textarea.input-text' : '#messageInputTranslate')!
     async function enter(value: string) {
         source.value = value
         source.dispatchEvent(new Event('input', { bubbles: true }))
-        await tick(); await tick()
+        await domSettled(); await domSettled()
     }
     mocks.translate.mockResolvedValueOnce('Earlier translation')
     await enter('Earlier draft')
@@ -569,26 +569,26 @@ it.each([false, true])('ignores a stale translation failure (reverse: %s)', asyn
     DBState.db.useAutoTranslateInput = true
     let rejectTranslation: (error: Error) => void = () => {}
     mocks.translate.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectTranslation = reject }))
-    await tick()
+    await domSettled()
     const source = document.querySelector<HTMLTextAreaElement>(reverse ? '#messageInputTranslate' : 'textarea.input-text')!
     const target = document.querySelector<HTMLTextAreaElement>(reverse ? 'textarea.input-text' : '#messageInputTranslate')!
     source.value = 'Old input'
     source.dispatchEvent(new Event('input', { bubbles: true }))
-    await tick()
+    await domSettled()
     mocks.translate.mockResolvedValueOnce('Current translation')
     source.value = 'Current input'
     source.dispatchEvent(new Event('input', { bubbles: true }))
-    await tick(); await tick()
+    await domSettled(); await domSettled()
     expect(target.value).toBe('Current translation')
     rejectTranslation(new TypeError('Load failed'))
-    await tick(); await tick()
+    await domSettled(); await domSettled()
     expect(target.value).toBe('Current translation')
     expect(mocks.error).not.toHaveBeenCalled()
 })
 
 it('ordinary typing does not invoke translation when input translation is disabled', async () => {
     mocks.translate.mockRejectedValue(new TypeError('Load failed'))
-    type('Ordinary input'); await tick()
+    type('Ordinary input'); await domSettled()
     expect(mocks.translate).not.toHaveBeenCalled()
     expect(mocks.error).not.toHaveBeenCalled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('Ordinary input')
@@ -599,19 +599,19 @@ it('a late translation cannot replace newer text or write into another conversat
     DBState.db.characters[0].chats.push({ id: 'other', message: [] } as any)
     let finishTranslation: (value: string) => void = () => {}
     mocks.translate.mockImplementationOnce(() => new Promise(resolve => { finishTranslation = resolve }))
-    await tick()
+    await domSettled()
     type('Original for translation')
     await vi.waitFor(() => expect(mocks.translate).toHaveBeenCalledWith('Original for translation', false, undefined, 'throw'))
     type('New original')
     DBState.db.characters[0].chatPage = 1
-    await tick()
+    await domSettled()
     type('Other conversation draft')
     finishTranslation('Late result')
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('Other conversation draft')
     expect(document.querySelector<HTMLTextAreaElement>('#messageInputTranslate')!.value).toBe('')
     DBState.db.characters[0].chatPage = 0
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('New original')
     expect(document.querySelector<HTMLTextAreaElement>('#messageInputTranslate')!.value).toBe('')
 })
@@ -623,7 +623,7 @@ it('clears the same submitted composer after it was restored by a remount', asyn
     await vi.waitFor(() => expect(mocks.trigger).toHaveBeenCalledOnce())
     await unmount(instance!)
     instance = mount(DefaultChatScreen, { target: document.body })
-    await tick()
+    await domSettled()
     expect(document.querySelector<HTMLTextAreaElement>('textarea.input-text')!.value).toBe('Submitted before grid')
     finishTrigger()
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
@@ -634,7 +634,7 @@ it('does not send or reroll from composing keyboard events', async () => {
     const input = type('Composition draft')
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true }))
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, isComposing: true, bubbles: true }))
-    await tick()
+    await domSettled()
     expect(mocks.trigger).not.toHaveBeenCalled()
     expect(mocks.generate).not.toHaveBeenCalled()
     expect(input.value).toBe('Composition draft')
@@ -645,13 +645,13 @@ it.each(['textarea.input-text', '#messageInputTranslate'])('%s sends with the ke
     mocks.bounded = true
     DBState.db.sendWithEnter = false
     DBState.db.useAutoTranslateInput = true
-    await tick()
+    await domSettled()
     const draft = type('Synthetic send-key draft')
     updateDeviceSettings({ messageSendKey: 'ctrl-shift-enter' })
     const input = document.querySelector<HTMLTextAreaElement>(selector)!
     const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
     input.dispatchEvent(enter)
-    await tick()
+    await domSettled()
     expect(enter.defaultPrevented).toBe(false)
     expect(mocks.generate).not.toHaveBeenCalled()
     expect(draft.value).toBe('Synthetic send-key draft')
@@ -717,7 +717,7 @@ it.each(['completed', 'failed'] as const)('finishes a %s send once while its cha
     await vi.waitFor(() => expect(records).toEqual([endOf(status)]))
     if (status === 'failed') expect(mocks.error).toHaveBeenCalledExactlyOnceWith(failure)
     instance = mount(DefaultChatScreen, { target: document.body })
-    await tick()
+    await domSettled()
     expect(document.querySelector('.button-icon-send')).not.toBeNull()
     expect(mocks.generate).toHaveBeenCalledOnce()
 })
@@ -746,7 +746,7 @@ it('reports a send the user stopped as aborted', async () => {
     mocks.bounded = true
     const records = listenGenerationEnd()
     mocks.generate.mockImplementation(async (options: { signal: AbortSignal }) => generation(false, async () => {
-        await tick()
+        await domSettled()
         document.querySelector<HTMLButtonElement>('button[aria-labelledby="cancel"]')!.click()
         expect(options.signal.aborted).toBe(true)
     })())
@@ -773,7 +773,7 @@ it('reports nothing for a send that never entered generation', async () => {
     type('Hello')
     send()
     await vi.waitFor(() => expect(mocks.generate).toHaveBeenCalledOnce())
-    await tick()
+    await domSettled()
     expect(records).toEqual([])
 })
 
@@ -835,7 +835,7 @@ it('refuses send and regenerate while plugins wait, retaining the draft and conv
         const before = JSON.parse(JSON.stringify(DBState.db.characters[0].chats[0].message))
         send()
         input.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', ctrlKey: true, bubbles: true }))
-        await tick()
+        await domSettled()
         expect(input.value).toBe('Keep this draft')
         expect(DBState.db.characters[0].chats[0].message).toEqual(before)
         expect(mocks.generate).not.toHaveBeenCalled()
@@ -861,18 +861,18 @@ it('shows the onboarding banner on a chat with messages until it is done or skip
         { role: 'char', data: 'First', chatId: 'm1' }, { role: 'user', data: 'Second', chatId: 'm2' }, { role: 'char', data: 'Third', chatId: 'm3' },
     ] as any
     setOnboarding()
-    await tick()
+    await domSettled()
     onboardingBanner()!.click()
     expect(onboardingModalStore.open).toBe(true)
     DBState.db.characters[0].chats[0].onboardingDone = true
-    await tick()
+    await domSettled()
     expect(onboardingBanner()).toBeUndefined()
     DBState.db.characters[0].chats.push({ id: 'new', message: [] } as any)
     DBState.db.characters[0].chatPage = 1
-    await tick()
+    await domSettled()
     expect(onboardingBanner()).toBeDefined()
     setOnboarding({ enabled: false })
-    await tick()
+    await domSettled()
     expect(onboardingBanner()).toBeUndefined()
 })
 
@@ -880,7 +880,7 @@ it('does not offer the onboarding for a chat that is only a summary', async () =
     setOnboarding()
     const chat = DBState.db.characters[0].chats[0]
     DBState.db.characters[0].chats[0] = createConversationSummaryStubFromChat('character', chat, 0)
-    await tick()
+    await domSettled()
     expect(onboardingBanner()).toBeUndefined()
 })
 
@@ -889,20 +889,20 @@ it('opens the onboarding from the side menu and from its optional floating butto
     const menuItem = () => [...document.querySelectorAll('span')].find(span => span.textContent === language.onboarding)
     const openMenu = async () => {
         document.querySelector<HTMLButtonElement>('.button-icon-send')!.nextElementSibling!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-        await tick()
+        await domSettled()
     }
     await openMenu()
     expect(menuItem()).toBeUndefined()
     setOnboarding()
-    await tick()
+    await domSettled()
     expect(floatingButton()).toBeNull()
     menuItem()!.parentElement!.click()
-    await tick()
+    await domSettled()
     expect(onboardingModalStore.open).toBe(true)
     expect(menuItem()).toBeUndefined()
     onboardingModalStore.open = false
     setOnboarding({ floatingButton: true })
-    await tick()
+    await domSettled()
     floatingButton()!.click()
     expect(onboardingModalStore.open).toBe(true)
 })
@@ -912,7 +912,7 @@ it('tells that a chat left in the display recovery record opened without Modify 
     const notice = () => document.querySelector('[data-display-recovery]')
     try {
         await installDisplayRecovery(device.store)
-        await tick()
+        await domSettled()
         expect(notice()?.textContent).toContain(language.risuNest.displayRecovery.notice)
         const rebuilds = get(ScriptDisplayRebuildPointer)
 

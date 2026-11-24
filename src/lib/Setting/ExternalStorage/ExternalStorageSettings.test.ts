@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { get } from 'svelte/store'
 import { beginExternalProgress, clearExternalProgress } from 'src/ts/storage/sync/external/progress'
 
@@ -148,15 +148,15 @@ async function openStorageUsage(): Promise<void> {
     const tab = [...target.querySelectorAll('button')].find(item => item.textContent?.trim() === strings.quota)
     if (!tab) throw new Error('Missing the storage usage tab')
     tab.click()
-    await tick()
+    await domSettled()
     await Promise.resolve()
-    await tick()
+    await domSettled()
 }
 
 async function settle(): Promise<void> {
     for (let step = 0; step < 4; step += 1) {
         await Promise.resolve()
-        await tick()
+        await domSettled()
     }
 }
 
@@ -909,7 +909,7 @@ describe('the storage usage tab', () => {
         const input = labelled(strings.transferConcurrency)
         input.value = '8'
         input.dispatchEvent(new Event('change', { bubbles: true }))
-        await tick()
+        await domSettled()
         expect(state.setTransferConcurrency).toHaveBeenCalledWith('connection-1', 8)
         expect(input.disabled).toBe(true)
         fail({ kind: 'transient' })

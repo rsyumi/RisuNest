@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, tick, unmount } from 'svelte'
 import { DBState } from 'src/ts/stores.svelte'
 import { RISU_PROMPT_DRAG_TYPE } from 'src/ts/dragTypes'
 import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
@@ -66,7 +66,7 @@ async function dragEvent(element: Element, type: string, dataTransfer: ReturnTyp
     const event = new Event(type, { bubbles: true, cancelable: true })
     Object.assign(event, { dataTransfer, clientY })
     element.dispatchEvent(event)
-    await tick()
+    await domSettled()
     return event
 }
 beforeEach(async () => {
@@ -74,7 +74,7 @@ beforeEach(async () => {
         name, type: 'plain', text: '', role: 'system', type2: 'normal',
     })), promptSettings: {} } as any
     instance = mount(PromptSettings, { target: document.body })
-    await tick()
+    await domSettled()
 })
 afterEach(async () => {
     await unmount(instance)
@@ -84,10 +84,10 @@ afterEach(async () => {
 describe('prompt drag ordering', () => {
     it('keeps the same prompt open when another operation inserts an earlier item', async () => {
         toggle('Second').click()
-        await tick()
+        await domSettled()
         const input = header('Second').parentElement!.querySelector('input')!
         DBState.db.promptTemplate.unshift({ type: 'plain', name: 'Inserted', text: '', role: 'system', type2: 'normal' })
-        await tick()
+        await domSettled()
         expect(header('Second').parentElement!.querySelector('input')).toBe(input)
         expect(header('First').parentElement!.querySelector('input')).toBeNull()
     })
@@ -114,7 +114,7 @@ describe('prompt drag ordering', () => {
             vi.advanceTimersByTime(450)
             touch(grip, 'touchmove', 30, 20)
             touch(grip, 'touchend', 30, 20)
-            await tick()
+            await domSettled()
             expect(DBState.db.promptTemplate.map(item => item.name)).toEqual(['Last', 'First', 'Second'])
         } finally {
             vi.runOnlyPendingTimers()
@@ -126,7 +126,7 @@ describe('prompt drag ordering', () => {
     it('keeps the source and open editors stable during hover, drop, and subsequent editing', async () => {
         const first = header('First')
         toggle('First').click()
-        await tick()
+        await domSettled()
         const input = first.parentElement!.querySelector('input')!
         const data = transfer()
         await dragEvent(first, 'dragstart', data)
@@ -140,6 +140,7 @@ describe('prompt drag ordering', () => {
         expect(first.parentElement!.querySelector('input')).toBe(input)
         input.value = 'Edited'
         input.dispatchEvent(new Event('input', { bubbles: true }))
+        // The input binding reads its value again one tick after the event.
         await tick()
         expect(DBState.db.promptTemplate.map(item => item.name)).toEqual(['Second', 'Last', 'Edited'])
     })
@@ -172,11 +173,11 @@ describe('prompt list', () => {
 
     it('asks before removing a block, naming it or its type when it has no name', async () => {
         DBState.db.promptTemplate[1].name = ''
-        await tick()
+        await domSettled()
         mocks.confirm.mockResolvedValueOnce(false)
         header(language.formating.plain).querySelector<HTMLButtonElement>(`button[aria-label="${language.remove}"]`)!.click()
         await vi.waitFor(() => expect(mocks.confirm).toHaveBeenCalledWith(language.removeConfirm + language.formating.plain))
-        await tick()
+        await domSettled()
         expect(names()).toEqual(['First', '', 'Last'])
         header('Last').querySelector<HTMLButtonElement>(`button[aria-label="${language.remove}"]`)!.click()
         await vi.waitFor(() => expect(names()).toEqual(['First', '']))
@@ -187,12 +188,12 @@ describe('prompt list', () => {
         DBState.db.promptSettings.customChainOfThought = true
         Object.assign(DBState.db.promptTemplate[0], { text: 'Synthetic text', role: 'user' })
         toggle('First').click()
-        await tick()
+        await domSettled()
         const select = (title = 'First') => header(title).parentElement!.querySelector('select')!
         const choose = async (type: string, title?: string) => {
             select(title).value = type
             select(title).dispatchEvent(new Event('change', { bubbles: true }))
-            await tick()
+            await domSettled()
         }
         for (const type of ['jailbreak', 'cot', 'plain']) {
             await choose(type)
@@ -204,9 +205,9 @@ describe('prompt list', () => {
 
         // A block added as a type without text starts with none when it becomes a type with text.
         DBState.db.promptTemplate[1] = { name: 'Second', type: 'chat', rangeStart: -1000, rangeEnd: 'end' }
-        await tick()
+        await domSettled()
         toggle('Second').click()
-        await tick()
+        await domSettled()
         await choose('chatML', 'Second')
         expect(DBState.db.promptTemplate[1]).toMatchObject({ type: 'chatML', text: '' })
     })
@@ -217,26 +218,26 @@ describe('prompt list', () => {
             .map(button => button.getAttribute('aria-expanded'))
         expect(document.body.textContent).toContain(language.risuNest.promptList.count.replace('{0}', '3'))
         toggle('Second').click()
-        await tick()
+        await domSettled()
         buttonWithText(language.expandAll).click()
-        await tick()
+        await domSettled()
         expect(expanded()).toEqual(['true', 'true', 'true'])
         buttonWithText(language.collapseAll).click()
-        await tick()
+        await domSettled()
         expect(expanded()).toEqual(['false', 'false', 'false'])
     })
 
     it('adds a block of the chosen type, offering chain of thought only when it is enabled', async () => {
         const add = () => document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!
         add().click()
-        await tick()
+        await domSettled()
         expect(menuItems()).toContain(language.Chat)
         expect(menuItems()).not.toContain(language.cot)
         DBState.db.promptSettings.customChainOfThought = true
-        await tick()
+        await domSettled()
         expect(menuItems()).toContain(language.cot)
         buttonWithText(language.Chat).click()
-        await tick()
+        await domSettled()
         expect(DBState.db.promptTemplate.at(-1)).toEqual({ type: 'chat', rangeStart: -1000, rangeEnd: 'end' })
         expect(menuItems()).toEqual([])
 
@@ -246,9 +247,9 @@ describe('prompt list', () => {
         const closeSettings = vi.fn()
         const layer = modalNavigation(settingsLayer, { close: closeSettings })
         add().click()
-        await tick()
+        await domSettled()
         document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-        await tick()
+        await domSettled()
         layer.destroy()
         expect(menuItems()).toEqual([])
         expect(closeSettings).not.toHaveBeenCalled()
@@ -260,7 +261,7 @@ describe('prompt list', () => {
             { type: 'lorebook' },
             { type: 'description', innerFormat: '[Info] {{slot}}' },
         ] as typeof DBState.db.promptTemplate
-        await tick()
+        await domSettled()
         const summary = (title: string) => [...toggle(title).querySelectorAll('span')].map(span => span.textContent)
         expect(summary('Main')).toEqual([`Main${language.user}`, 'Main', language.user, `${language.formating.plain} · Line one line two`])
         expect(summary(language.formating.lorebook)).toEqual([language.formating.lorebook, language.formating.lorebook])
@@ -609,7 +610,7 @@ describe('custom toggles', () => {
         DBState.db.customPromptTemplateToggle = 'a=A'
         const settingsTab = [...document.querySelectorAll('button')].find(button => button.textContent?.trim() === language.settings)!
         settingsTab.click()
-        await tick()
+        await domSettled()
         expect(mocks.toggleEditor.props.value).toBe('a=A')
         mocks.toggleEditor.props.onChange!('b=B\n=G=group')
         expect(DBState.db.customPromptTemplateToggle).toBe('b=B\n=G=group')

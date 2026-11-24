@@ -1,7 +1,8 @@
 <script lang="ts">
     import { CbsHistoryDependencies, hasCbsHistoryChanges } from 'src/ts/cbsHistoryAccess'
     import type { character, Message, StreamingDisplayOptimizationMode } from 'src/ts/storage/database.svelte'
-    import { mount, onDestroy, onMount, tick, unmount, untrack } from 'svelte'
+    // settled() resolves once the DOM update commits; tick() would also wait for a frame or timer.
+    import { mount, onDestroy, onMount, settled as domSettled, unmount, untrack } from 'svelte'
     import { get } from 'svelte/store'
     import Chat from './Chat.svelte'
     import { chatScreenState } from 'src/ts/ui/chatScreenState.svelte'
@@ -1831,7 +1832,7 @@
         blurredEditorPins.add(key)
         if (!draft.caret) return
         const caret = draft.caret
-        void tick().then(() => {
+        void domSettled().then(() => {
             const focused = document.activeElement
             if (focused && focused !== document.body && !element.contains(focused)) return
             const editor = element.querySelector<HTMLTextAreaElement>('textarea.message-edit-area')
@@ -1963,7 +1964,7 @@
         const anchor = chatScreenState.readAnchor({ characterId, conversationId })
         if (!anchor || anchor.latest) return
         const generation = navigationGeneration
-        void tick().then(async () => {
+        void domSettled().then(async () => {
             const current = () => !destroyed && generation === navigationGeneration &&
                 currentCharacter.chaId === characterId &&
                 currentCharacter.chats[currentCharacter.chatPage]?.id === conversationId
@@ -1996,7 +1997,7 @@
         const draft = pendingConversationDrafts()[0]
         if (!draft) return
         const generation = navigationGeneration
-        void tick().then(() => {
+        void domSettled().then(() => {
             if (destroyed || generation !== navigationGeneration) return
             // The pinned row may already have taken the draft; a discarded one is not followed.
             if (!restoredDrafts.has(draft) && !pendingConversationDrafts().includes(draft)) return
@@ -2672,7 +2673,7 @@
 
     async function waitForLayout(): Promise<void> {
         const generation = navigationGeneration
-        await tick()
+        await domSettled()
         if (destroyed || generation !== navigationGeneration) return
         await new Promise<void>((resolve) => {
             if (typeof requestAnimationFrame !== 'function') {
@@ -2759,7 +2760,7 @@
                             reason: 'jump',
                             signal: controller.signal,
                         })
-                        await tick()
+                        await domSettled()
                     } catch {
                         if (
                             currentPendingJump() === jump &&

@@ -1,4 +1,4 @@
-import { mount, tick } from 'svelte'
+import { mount, settled as domSettled } from 'svelte'
 import '../../src/styles.css'
 import { DBState, selectedCharID } from '../../src/ts/stores.svelte'
 import { navigationActivity } from '../../src/ts/ui/navigationActivity'
@@ -27,7 +27,7 @@ window.__risuUiVisualUnderlyingActivations = 0
 
 const { default: VisualHarness } = await import('./VisualHarness.svelte')
 mount(VisualHarness, { target: document.getElementById('app')! })
-await tick()
+await domSettled()
 await new Promise<void>((resolve) =>
     requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
 )

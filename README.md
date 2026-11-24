@@ -109,7 +109,7 @@ Download [RisuNest Sync v1.1.3](https://github.com/rsyumi/RisuNest/releases/tag/
 
 ## Building from Source
 
-Node.js 22.12 or later, pnpm, Rust, and Cargo are required. Android builds require the Android SDK/NDK (compile and target SDK 36, min SDK 24, NDK 28), while iOS builds require macOS and Xcode.
+Node.js 22.13 or later, pnpm, Rust, and Cargo are required. Android builds require the Android SDK/NDK (compile and target SDK 36, min SDK 24, NDK 28), while iOS builds require macOS and Xcode.
 
 ```bash
 pnpm install

@@ -71,7 +71,7 @@ export async function productApp(restart: boolean) {
   }, "product Svelte app did not initialize");
   const { DBState } = await import("../../src/ts/stores.svelte");
   const { changeChar } = await import("../../src/ts/characters");
-  const { tick } = await import("svelte");
+  const { settled: domSettled } = await import("svelte");
   const index = DBState.db.characters.findIndex(
     (character) => character.chaId === "char-a",
   );
@@ -107,7 +107,7 @@ export async function productApp(restart: boolean) {
   } finally {
     lease.release();
   }
-  await tick();
+  await domSettled();
   await runtime.flushPendingData("ios-ui-smoke");
   await until(
     () => document.getElementById("app")!.textContent!.includes(marker),
