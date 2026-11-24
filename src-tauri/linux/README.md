@@ -6,7 +6,7 @@ DEB packages require glibc 2.39 or newer and Ubuntu's OpenSSL 3 package. AppImag
 
 ## Build
 
-Use the CI toolchain, Node.js 24, pnpm 10.34.1, and Rust 1.97.1. Install the platform dependencies:
+Use the CI toolchain, Node.js 24, pnpm 11, and Rust 1.97.1. Install the platform dependencies:
 
 ```sh
 sudo apt-get update
