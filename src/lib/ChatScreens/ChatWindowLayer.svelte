@@ -3,7 +3,7 @@
 
     const key = Symbol('chat-window-layer')
 
-    /** Gives dialogs in the chat pane that cover the whole window a layer outside its paint containment. */
+    /** Gives dialogs in the chat screen that cover the whole window a layer outside the chat pane's stacking context and paint containment. */
     export function provideChatWindowLayer(layer: () => HTMLElement | undefined) {
         setContext(key, layer)
     }

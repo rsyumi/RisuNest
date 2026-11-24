@@ -1029,7 +1029,8 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        z-index: 10000;
+        /* Work dialog layer: alerts and the app lock stack above it. */
+        z-index: 1000;
     }
 
     .partial-edit-modal {

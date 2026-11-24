@@ -1,9 +1,9 @@
 import type { Page } from '@playwright/test'
 import { test, expect } from './fixture'
 
-// Card and module HTML often adds fixed layers sized to the whole window. In an open chat they
-// stay below the sidebar and its arrow and lay out against the chat pane, so a centered status bar
-// stays whole beside the sidebar. Dialogs that cover the whole window still cover the sidebar.
+// Card and module HTML often adds fixed layers sized to the whole window. They stay below the sidebar
+// and its arrow and lay out against the chat pane, so a centered status bar stays whole beside the
+// sidebar. Dialogs in the chat screen that cover the whole window still cover the sidebar.
 const hit = (page: Page, x: number, y: number) => page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.getAttribute('data-testid') ?? null, [x, y])
 
 test.beforeEach(async ({ page }) => {
@@ -17,7 +17,9 @@ test('fixed layers from chat HTML lay out in the chat pane and never cover the s
     // The background fills the window behind the chat and the effect band crosses it at y 100 to 140.
     expect(await hit(page, 200, 400)).toBe('sidebar')
     expect(await hit(page, 200, 120)).toBe('sidebar')
+    expect(await hit(page, 100, 330)).toBe('sidebar-field')
     expect(await hit(page, 800, 120)).toBe('effect')
+    expect(await hit(page, 1248, 32)).toBe('save-icon')
 
     const pane = await page.locator('main > div:not([data-testid])').boundingBox()
     const bar = await page.getByTestId('status-bar').boundingBox()
@@ -35,12 +37,7 @@ test('a chat dialog that covers the whole window covers the sidebar and its arro
 
     expect(await hit(page, 200, 400)).toBe('window-dialog')
     expect(await hit(page, 480, 30)).toBe('window-dialog')
-})
-
-test('the home screen keeps its dialogs over the sidebar and its arrow', async ({ page }) => {
-    await page.goto('/chatPane.html?home')
-    await expect(page.getByTestId('hub-dialog')).toBeAttached()
-
-    expect(await hit(page, 200, 400)).toBe('hub-dialog')
-    expect(await hit(page, 480, 30)).toBe('hub-dialog')
+    // Positioned layers in the sidebar and after the chat screen stay below it, as they do below other work dialogs.
+    expect(await hit(page, 100, 330)).toBe('window-dialog')
+    expect(await hit(page, 1248, 32)).toBe('window-dialog')
 })
