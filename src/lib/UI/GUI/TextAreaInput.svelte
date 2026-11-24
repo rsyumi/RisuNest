@@ -132,6 +132,20 @@
         {/each}
     </div>
 </div>
+<script module lang="ts">
+    /**
+     * A textarea gives its value with each CRLF and lone CR as LF. This is `text` as the textarea gives it, with `range`
+     * moved onto it; an offset between a CR and its LF lands before the LF.
+     */
+    export function textareaRange(text: string, range: { start: number, end: number }) {
+        const shift = (offset: number) => {
+            let removed = 0
+            for (let index = text.indexOf('\r\n'); index !== -1 && index < offset; index = text.indexOf('\r\n', index + 2)) removed++
+            return offset - removed
+        }
+        return { value: text.replace(/\r\n?/g, '\n'), start: shift(range.start), end: shift(range.end) }
+    }
+</script>
 <script lang="ts">
     import { textAreaSize, textAreaTextSize } from 'src/ts/gui/guisize'
     import { highlighter, getNewHighlightId, removeHighlight, AllCBS } from 'src/ts/gui/highlight'
@@ -317,6 +331,79 @@
         // The field this text belongs to is gone, so saving would write into whatever the binding points at now.
         if (editorRequest) cancelTextEditorPopup(editorRequest)
     })
+
+    /** Scrolls to the field, focuses it and selects `range` of its value. False when only the focus could be given. */
+    export function selectRange(range: { start: number, end: number } | null): boolean {
+        highlightDom?.scrollIntoView?.({ block: 'center' })
+        const text = value ?? ''
+        const valid = !!range && range.start >= 0 && range.start <= range.end && range.end <= text.length
+        if (textareaDom) {
+            textareaDom.focus({ preventScroll: true })
+            if (!valid) return false
+            const shown = textareaRange(text, range)
+            if (textareaDom.value !== shown.value) return false
+            textareaDom.setSelectionRange(shown.start, shown.end)
+            // Selecting does not scroll the textarea, so the start of the range is brought to about a third of its height.
+            if (textareaDom.scrollHeight > textareaDom.clientHeight) {
+                textareaDom.scrollTop = textareaTextTop(textareaDom, shown.start) - textareaDom.clientHeight / 3
+            }
+            return true
+        }
+        if (!inputDom) return false
+        inputDom.focus({ preventScroll: true })
+        // The editor's text nodes make up its value, so offsets map onto them only while the two agree.
+        if (!valid || inputDom.textContent !== text) return false
+        const { start, end } = range
+        const domRange = document.createRange()
+        const walker = document.createTreeWalker(inputDom, NodeFilter.SHOW_TEXT)
+        let offset = 0
+        let started = false
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            const length = node.textContent?.length ?? 0
+            if (!started && start <= offset + length) {
+                domRange.setStart(node, start - offset)
+                started = true
+            }
+            if (started && end <= offset + length) {
+                domRange.setEnd(node, end - offset)
+                const selection = window.getSelection()
+                selection?.removeAllRanges()
+                selection?.addRange(domRange)
+                const box = inputDom.getBoundingClientRect()
+                const target = domRange.getBoundingClientRect?.()
+                if (target && target.height > 0) inputDom.scrollTop += target.top - box.top - box.height / 3
+                return true
+            }
+            offset += length
+        }
+        return false
+    }
+
+    /** The top of the text at `index` in the textarea's scrolled content, measured on a hidden copy laid out at the same width, since wrapped lines have no fixed height. */
+    function textareaTextTop(textarea: HTMLTextAreaElement, index: number): number {
+        const style = getComputedStyle(textarea)
+        const width = textarea.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+        const mirror = document.createElement('div')
+        mirror.style.cssText = `position:absolute;top:0;left:0;visibility:hidden;pointer-events:none;box-sizing:content-box;border:0;margin:0;height:auto;overflow:hidden;width:${width}px`
+        for (const property of [
+            'font-family', 'font-size', 'font-weight', 'font-style', 'font-variant', 'font-stretch', 'font-kerning',
+            'font-feature-settings', 'font-variation-settings', 'line-height', 'letter-spacing', 'word-spacing',
+            'text-transform', 'text-indent', 'tab-size', 'white-space', 'overflow-wrap', 'word-break', 'direction',
+            'padding-top', 'padding-right', 'padding-left',
+        ]) {
+            mirror.style.setProperty(property, style.getPropertyValue(property))
+        }
+        const text = textarea.value
+        const lineEnd = text.indexOf('\n', index)
+        const marker = document.createElement('span')
+        // The rest of the line makes a word around `index` wrap where it does in the textarea.
+        marker.textContent = text.slice(index, lineEnd === -1 ? undefined : lineEnd) || '.'
+        mirror.append(text.slice(0, index), marker)
+        document.body.append(mirror)
+        const top = marker.offsetTop
+        mirror.remove()
+        return top
+    }
 
     const highlightChange = async (value:string, highlightId:number) => {
         await sleep(1)

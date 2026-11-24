@@ -7,11 +7,13 @@ import {
     missingToggleFields,
     moveToggleRow,
     parseToggleDefinitions,
+    placeToggleRow,
     removeToggleRow,
     serializeToggleDefinitions,
     setToggleRowField,
     setToggleRowKind,
     toggleOutline,
+    type ToggleGap,
     type ToggleLine,
     type ToggleLineKind,
 } from './toggleDefinitions'
@@ -168,6 +170,60 @@ describe('toggle row edits', () => {
         expect(toggleOutline(lines).at(-1)).toEqual({ type: 'row', line: 3 })
     })
 
+    it('adds a row of the chosen type at the end or at the end of a group', () => {
+        const add = (text: string, kind: Exclude<ToggleLineKind, 'groupEnd'>, group?: string) =>
+            edit(text, (lines) => addToggleRow(lines, kind, group === undefined ? null : idOf(lines, group)))
+        expect(add('a=A\n', 'select')).toBe('a=A\n==select=\n')
+        expect(add('a=A', 'group')).toBe('a=A\n==group\n==groupEnd')
+        // A new group ends an open group by itself; any other row closes it first.
+        expect(add('=G=group\na=A', 'group')).toBe('=G=group\na=A\n==group\n==groupEnd')
+        expect(add('=G=group\na=A', 'caption')).toBe('=G=group\na=A\n=G=groupEnd\n==caption')
+        expect(add('=G=group\r\na=A\r\n\n=G=groupEnd\r\nb=B', 'textarea', '=G=group\r'))
+            .toBe('=G=group\r\na=A\r\n==textarea\n\n=G=groupEnd\r\nb=B')
+        expect(add('=G=group\n=G=groupEnd', 'text', '=G=group')).toBe('=G=group\n==text\n=G=groupEnd')
+        expect(add('=Open=group\na=A\n=Next=group', 'divider', '=Open=group')).toBe('=Open=group\na=A\n==divider\n=Next=group')
+        expect(add('=G=group\na=A\n=G=groupEnd', 'group', '=G=group')).toBe('=G=group\na=A\n=G=groupEnd')
+        for (const kind of ['switch', 'select', 'text', 'textarea', 'group', 'divider', 'caption'] as const) {
+            const lines = addToggleRow(parseToggleDefinitions('a=A'), kind)
+            expect(parseToggleDefinitions(serializeToggleDefinitions(lines))[1].kind).toBe(kind)
+        }
+    })
+
+    it('places a row or a group with its rows at a gap', () => {
+        const place = (text: string, raw: string, group: string | null, before: string | null) =>
+            edit(text, (lines) => placeToggleRow(lines, idOf(lines, raw), {
+                group: group === null ? null : idOf(lines, group),
+                before: before === null ? null : idOf(lines, before),
+            }))
+        const grouped = 'a=A\n=G=group\nb=B\nc=C\n=G=groupEnd\nd=D'
+        expect(place(grouped, 'a=A', '=G=group', 'c=C')).toBe('=G=group\nb=B\na=A\nc=C\n=G=groupEnd\nd=D')
+        expect(place(grouped, 'd=D', '=G=group', null)).toBe('a=A\n=G=group\nb=B\nc=C\nd=D\n=G=groupEnd')
+        expect(place(grouped, 'b=B', null, 'a=A')).toBe('b=B\na=A\n=G=group\nc=C\n=G=groupEnd\nd=D')
+        expect(place(grouped, 'c=C', null, null)).toBe('a=A\n=G=group\nb=B\n=G=groupEnd\nd=D\nc=C')
+        expect(place('a=A\nb=B\n', 'a=A', null, null)).toBe('b=B\na=A\n')
+        // Leaving a group that has no end line for the top level after it writes the end line.
+        expect(place('=G=group\nb=B\nc=C', 'b=B', null, null)).toBe('=G=group\nc=C\n=G=groupEnd\nb=B')
+        expect(place('=G=group\nb=B\n=H=group\nc=C', 'c=C', null, '=H=group')).toBe('=G=group\nb=B\n=G=groupEnd\nc=C\n=H=group')
+        // A group moves with its rows and end line, and one without an end line gets it before a row.
+        expect(place(grouped, '=G=group', null, 'a=A')).toBe('=G=group\nb=B\nc=C\n=G=groupEnd\na=A\nd=D')
+        expect(place(grouped, '=G=group', null, null)).toBe('a=A\nd=D\n=G=group\nb=B\nc=C\n=G=groupEnd')
+        expect(place('a=A\n=G=group\nb=B', '=G=group', null, 'a=A')).toBe('=G=group\nb=B\n=G=groupEnd\na=A')
+        expect(place('=F=group\nf=F\n=G=group\ng=G\n=G=groupEnd\nr=R', '=G=group', null, '=F=group'))
+            .toBe('=G=group\ng=G\n=G=groupEnd\n=F=group\nf=F\n=F=groupEnd\nr=R')
+        // A group is not placed inside a group.
+        const two = '=One=group\na=A\n=One=groupEnd\n=Two=group\nb=B\n=Two=groupEnd'
+        expect(place(two, '=Two=group', '=One=group', null)).toBe(two)
+        expect(place(two, '=Two=group', '=One=group', 'a=A')).toBe(two)
+        // A blank line stays in place, and a row placed at a gap it occupies writes nothing.
+        const spaced = 'a=A\r\n\nb=B\r\n\nc=C\r\n'
+        expect(place(spaced, 'c=C\r', null, 'a=A\r')).toBe('c=C\r\na=A\r\n\nb=B\r\n\n')
+        for (const [raw, before] of [['b=B\r', 'b=B\r'], ['b=B\r', 'c=C\r'], ['c=C\r', null]] as const) {
+            expect(place(spaced, raw, null, before)).toBe(spaced)
+        }
+        expect(place('=G=group\nb=B\n\nc=C', 'c=C', '=G=group', null)).toBe('=G=group\nb=B\n\nc=C')
+        expect(place('=G=group\nb=B\n\nc=C', 'b=B', '=G=group', 'c=C')).toBe('=G=group\nb=B\n\nc=C')
+    })
+
     it('moves rows into, out of and past groups', () => {
         const move = (text: string, raw: string, direction: -1 | 1) =>
             edit(text, (lines) => moveToggleRow(lines, idOf(lines, raw), direction))
@@ -220,12 +276,67 @@ describe('toggle edits over the whole corpus', () => {
         }
     }
 
+    type Tree = { id: number; children?: number[] }[]
+    /** Rows and groups by line id, each group with its rows. */
+    const tree = (lines: ToggleLine[]): Tree => toggleOutline(lines).map((item) => item.type === 'group'
+        ? { id: lines[item.line].id, children: item.children.map((child) => lines[child].id) }
+        : { id: lines[item.line].id })
+    /** Every gap: before each row and after the last, at the top level and in each group. */
+    const gaps = (lines: ToggleLine[]): ToggleGap[] => tree(lines).flatMap((item, index, items) => [
+        { group: null, before: item.id },
+        ...(item.children ? [...item.children, null].map((before) => ({ group: item.id, before })) : []),
+        ...(index === items.length - 1 ? [{ group: null, before: null }] : []),
+    ])
+    /** The tree with one item taken out and put at a gap. */
+    function moveInTree(items: Tree, id: number, gap: ToggleGap): Tree {
+        const next: Tree = items.map((item) => ({ ...item, children: item.children && [...item.children] }))
+        const top = next.findIndex((item) => item.id === id)
+        const [moved] = top !== -1 ? next.splice(top, 1) : [{ id }]
+        for (const item of next) if (item.children?.includes(id)) item.children.splice(item.children.indexOf(id), 1)
+        if (gap.group === null) {
+            next.splice(gap.before === null ? next.length : next.findIndex((item) => item.id === gap.before), 0, moved)
+        } else {
+            const children = next.find((item) => item.id === gap.group)!.children!
+            children.splice(gap.before === null ? children.length : children.indexOf(gap.before), 0, id)
+        }
+        return next
+    }
+
+    /**
+     * A placement moves the item, a group with its rows, to the gap and leaves every other row in its group. Every
+     * line keeps its bytes, lines that do not move keep their order, and only group end lines are added. A group
+     * placed in a group and an item placed at a gap it occupies leave the text as it was.
+     */
+    function checkPlacement(text: string, lines: ToggleLine[], id: number, gap: ToggleGap) {
+        const label = JSON.stringify({ text, id, gap })
+        const after = placeToggleRow(lines, id, gap)
+        const items = tree(lines)
+        const group = toggleOutline(lines).find((item) => item.type === 'group' && lines[item.line].id === id)
+        const container = items.find((item) => item.children?.includes(id))?.id ?? null
+        const siblings = container === null ? items.map((item) => item.id) : items.find((item) => item.id === container)!.children!
+        const occupied = container === gap.group && (gap.before === id || gap.before === (siblings[siblings.indexOf(id) + 1] ?? null))
+        if ((group && gap.group !== null) || occupied) {
+            expect(serializeToggleDefinitions(after), label).toBe(text)
+            return
+        }
+        expect(tree(after), label).toEqual(moveInTree(items, id, gap))
+        check(lines, after, id, true)
+        const known = new Set(lines.map((line) => line.id))
+        expect(after.filter((line) => !known.has(line.id)).every((line) => /^=[^=\r]*=groupEnd$/.test(line.raw)), label).toBe(true)
+        const start = lines.findIndex((line) => line.id === id)
+        const block = new Set(lines.slice(start, (group?.type === 'group' ? (group.end ?? group.children.at(-1) ?? group.line) : start) + 1).map((line) => line.id))
+        const staying = (list: ToggleLine[]) => list.filter((line) => known.has(line.id) && !block.has(line.id)).map((line) => line.id)
+        expect(staying(after), label).toEqual(staying(lines))
+        expect(visible(serializeToggleDefinitions(after)), label).toEqual(visible(text))
+    }
+
     it('keeps every line it does not edit byte for byte, in order', () => {
         for (const text of corpus) {
             const lines = parseToggleDefinitions(text)
             for (const id of lineIds(lines)) {
                 check(lines, setToggleRowField(lines, id, 'name', 'Renamed'), id, false)
                 check(lines, removeToggleRow(lines, id), id, false)
+                for (const gap of gaps(lines)) checkPlacement(text, lines, id, gap)
                 for (const kind of kinds) check(lines, setToggleRowKind(lines, id, kind), id, false)
                 for (const direction of [-1, 1] as const) {
                     const after = moveToggleRow(lines, id, direction)
@@ -235,6 +346,26 @@ describe('toggle edits over the whole corpus', () => {
             }
             // An empty text becomes the new row alone, as checked above.
             if (text !== '') check(lines, addToggleRow(lines), -1, false)
+            for (const group of [null, ...tree(lines).filter((item) => item.children).map((item) => item.id)]) {
+                for (const kind of kinds) {
+                    if (text === '') continue
+                    const label = JSON.stringify({ text, group, kind })
+                    const after = addToggleRow(lines, kind, group)
+                    if (group !== null && kind === 'group') {
+                        expect(serializeToggleDefinitions(after), label).toBe(text)
+                        continue
+                    }
+                    const known = new Set(lines.map((line) => line.id))
+                    expect(after.filter((line) => known.has(line.id)).map((line) => line.raw), label).toEqual(lines.map((line) => line.raw))
+                    const [row, ...ends] = after.filter((line) => !known.has(line.id) && line.kind !== 'groupEnd')
+                    expect(ends, label).toEqual([])
+                    expect(parseToggleDefinitions(row.raw)[0].kind, label).toBe(kind)
+                    const expected: Tree = tree(lines).map((item) => ({ ...item, children: item.children && [...item.children] }))
+                    if (group === null) expected.push(kind === 'group' ? { id: row.id, children: [] } : { id: row.id })
+                    else expected.find((item) => item.id === group)!.children!.push(row.id)
+                    expect(tree(after), label).toEqual(expected)
+                }
+            }
         }
     })
 })

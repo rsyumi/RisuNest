@@ -15,6 +15,8 @@
     import { RISU_PROMPT_DRAG_TYPE } from "src/ts/dragTypes";
     import { alertConfirm } from "src/ts/alert";
     import { newPromptBlock, promptBlockTypeName, promptBlockTypes } from "src/ts/process/promptBlockTypes";
+    import type { PromptSearchField, TextRange } from "src/ts/process/promptSearch";
+    import { tick, type Snippet } from "svelte";
     
     interface Props {
         promptItem: PromptItem;
@@ -29,6 +31,10 @@
         openedItems?: Set<PromptItem>;
         currentIndex?: number;
         displayIndex?: number;
+        /** Set while the list is searched: the count replaces the reorder controls, which are not rendered. */
+        searchCount?: number;
+        /** Rendered under the header, with a function that opens the block and selects a range in a field. */
+        matchLines?: Snippet<[reveal: (field: PromptSearchField, range: TextRange | null) => void]>;
     }
 
     let {
@@ -43,8 +49,33 @@
         dragOverIndex = $bindable(-1),
         openedItems = $bindable(new Set<PromptItem>()),
         currentIndex = -1,
-        displayIndex = -1
+        displayIndex = -1,
+        searchCount = undefined,
+        matchLines
     }: Props = $props();
+
+    const searching = $derived(searchCount !== undefined)
+    const fieldId = $props.id()
+    type SelectableField = { selectRange?: (range: TextRange | null) => boolean }
+    let textField: SelectableField | undefined = $state()
+    let innerFormatField: SelectableField | undefined = $state()
+
+    /** Opens the block, scrolls to the field and focuses it, selecting `range` when given. */
+    async function reveal(field: PromptSearchField, range: TextRange | null){
+        if(!isOpened){
+            openedItems = new Set(openedItems).add(promptItem)
+            await tick()
+        }
+        if(field === 'text' || field === 'innerFormat'){
+            (field === 'text' ? textField : innerFormatField)?.selectRange?.(range)
+            return
+        }
+        const input = document.getElementById(`${fieldId}-${field}`)
+        if(!(input instanceof HTMLInputElement)) return
+        input.scrollIntoView?.({ block: 'center' })
+        input.focus({ preventScroll: true })
+        if(range && range.end <= input.value.length) input.setSelectionRange(range.start, range.end)
+    }
 
     const chatPromptChange = () => {
         const currentprompt = promptItem as PromptItemChat
@@ -159,6 +190,9 @@
 
 </script>
 
+{#if searching}
+<div class="first:mt-0 w-full h-2"></div>
+{:else}
 <div class="first:mt-0 w-full h-2" role="doc-pagebreak"
     class:bg-borderc={draggedIndex !== -1 && dragOverIndex === currentIndex}
     ondrop={(e) => {
@@ -184,6 +218,7 @@
     }}>
 
 </div>
+{/if}
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
     class="flex flex-col border border-selected rounded-md bg-darkbg transition-all duration-200"
@@ -230,7 +265,7 @@
 >
     <div
         class="flex items-center gap-1 px-1"
-        draggable="true"
+        draggable={searching ? 'false' : 'true'}
         ondragstart={(e) => {
             draggedIndex = currentIndex
             markPromptDrag(e)
@@ -250,24 +285,31 @@
             dragOverIndex = -1
         }}
     >
+        {#if !searching}
         <span class="shrink-0 w-6 self-stretch flex items-center justify-center text-textcolor2 cursor-grab" aria-hidden="true"><GripVertical size={16} /></span>
-        <button class="min-w-0 flex-1 py-2 text-left flex flex-col gap-0.5" aria-expanded={isOpened} onclick={toggleOpened}>
+        {/if}
+        <button class="min-w-0 flex-1 py-2 text-left flex flex-col gap-0.5" class:pl-2={searching} aria-expanded={isOpened} onclick={toggleOpened}>
             <span class="flex items-center gap-2 min-w-0"><span class="truncate font-medium">{title}</span>{#if role}<span class="shrink-0 rounded-sm bg-selected px-1.5 text-xs leading-5">{role}</span>{/if}</span>
             {#if detail}
                 <span class="truncate text-xs text-textcolor2">{detail}</span>
             {/if}
         </button>
         <div class="flex items-center shrink-0">
+            {#if searching}
+            <span class="shrink-0 px-2 text-xs text-subtext tabular-nums">{language.risuNest.promptSearch.blockCount.replace('{0}', String(searchCount))}</span>
+            {:else}
             <button class="size-10 flex items-center justify-center rounded-md text-textcolor2 hover:text-textcolor hover:bg-selected transition-colors" title={language.movePresetUp} aria-label={language.movePresetUp} onclick={() => moveUp()}><ArrowUp size={18} /></button>
             <button class="size-10 flex items-center justify-center rounded-md text-textcolor2 hover:text-textcolor hover:bg-selected transition-colors" title={language.movePresetDown} aria-label={language.movePresetDown} onclick={() => moveDown()}><ArrowDown size={18} /></button>
+            {/if}
             <span class="mx-1 h-5 w-px bg-darkborderc" aria-hidden="true"></span>
             <button class="size-10 flex items-center justify-center rounded-md text-textcolor2 hover:text-draculared hover:bg-draculared/15 transition-colors" title={language.remove} aria-label={language.remove} onclick={confirmRemove}><Trash size={18} /></button>
         </div>
     </div>
+    {@render matchLines?.(reveal)}
     {#if isOpened}
     <div class="flex flex-col px-4 pb-4 border-t border-darkborderc">
         <span class="mt-4">{language.name}</span>
-        <TextInput bind:value={promptItem.name} />
+        <TextInput bind:value={promptItem.name} id="{fieldId}-name" />
         <span class="mt-2">{language.type} </span>
         <SelectInput value={promptItem.type} onchange={(event) => changeType(event.currentTarget.value as PromptType)}>
             {#each promptBlockTypes(!!DBState.db.promptSettings.customChainOfThought) as type (type)}
@@ -283,7 +325,7 @@
                 <OptionInput value="globalNote">{language.globalNote}</OptionInput>
             </SelectInput>
             <span>{language.prompt}</span>
-            <TextAreaInput highlight bind:value={promptItem.text} />
+            <TextAreaInput highlight bind:value={promptItem.text} bind:this={textField} />
             <span>{language.role}</span>
             <SelectInput bind:value={promptItem.role}>
                 <OptionInput value="user">{language.user}</OptionInput>
@@ -293,7 +335,7 @@
         {/if}
         {#if promptItem.type === 'chatML'}
             <span>{language.prompt}</span>
-            <TextAreaInput highlight bind:value={promptItem.text} />
+            <TextAreaInput highlight bind:value={promptItem.text} bind:this={textField} />
         {/if}
         {#if promptItem.type === 'cache'}
             <span>{language.depth}</span>
@@ -334,7 +376,7 @@
         {/if}
         {#if promptItem.type === 'authornote'}
             <span>{language.defaultPrompt}</span>
-            <TextInput bind:value={promptItem.defaultText} />
+            <TextInput bind:value={promptItem.defaultText} id="{fieldId}-defaultText" />
         {/if}
         {#if promptItem.type === 'persona' || promptItem.type === 'description' || promptItem.type === 'authornote' || promptItem.type === 'memory'}
             {#if !promptItem.innerFormat}
@@ -345,7 +387,7 @@
                 }} />
             {:else}
                 <span>{language.innerFormat}</span>
-                <TextAreaInput highlight bind:value={promptItem.innerFormat}/>
+                <TextAreaInput highlight bind:value={promptItem.innerFormat} bind:this={innerFormatField}/>
                 <CheckInput name={language.customInnerFormat} check={true} className="mt-2" onChange={() => {
                     if(promptItem.type === 'persona' || promptItem.type === 'description' || promptItem.type === 'authornote' || promptItem.type === 'memory'){
                         promptItem.innerFormat = null

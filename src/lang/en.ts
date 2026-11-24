@@ -2074,6 +2074,19 @@ export const languageEnglish = {
         promptList: {
             count: '{0} prompts',
         },
+        promptSearch: {
+            matchCase: 'Match case',
+            replaceWith: 'Replace with',
+            replace: 'Replace',
+            replaceAll: 'Replace all',
+            matchCount: '{0} matches',
+            blockCount: '{0}',
+            replaced: 'Replaced {0}.',
+            undo: 'Undo',
+            invalidRegex: 'The regular expression is not valid.',
+            noMatch: 'No results.',
+            showMore: 'Show more ({0})',
+        },
         toggleEditor: {
             view: 'Custom toggle view',
             raw: 'Raw',
@@ -2087,6 +2100,12 @@ export const languageEnglish = {
             missingKey: 'Not shown in the sidebar because the key is empty.',
             missingName: 'Not shown in the sidebar because the name is empty.',
             missingKeyAndName: 'Not shown in the sidebar because the key and name are empty.',
+        },
+        promptOptions: {
+            messages: 'Messages',
+            output: 'Output',
+            assistive: 'Assistive features',
+            count: '{0}',
         },
         presetBinding: {
             label: 'Preset binding',
