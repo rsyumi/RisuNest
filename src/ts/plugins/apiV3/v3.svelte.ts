@@ -1196,6 +1196,7 @@ const makeRisuaiAPIV3 = (
             //more types may be added in future
             type: 'fullscreen' = 'fullscreen'
         ) => {
+            risunestHost.floating.stop();
             iframe.style.display = "block";
             
             switch(type) {
@@ -1221,6 +1222,7 @@ const makeRisuaiAPIV3 = (
             }
         },
         hideContainer: () => {
+            risunestHost.floating.stop();
             iframe.style.display = "none";
         },
         getRootDocument: async () => {

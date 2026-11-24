@@ -1,7 +1,9 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
+
+import { floatingWindowLayer, floatingWindowLayers } from '../../ts/plugins/floatingWindowGeometry'
 
 const alertComp = readFileSync('src/lib/Others/AlertComp.svelte', 'utf8')
 const customSidebarConfig = readFileSync('src/lib/Others/CustomSidebarConfig.svelte', 'utf8')
@@ -42,7 +44,8 @@ const observer = readFileSync('src/ts/observer.svelte.ts', 'utf8')
  * the z-[1000] ones name their layer instead of writing it out: `z-work-dialog-update` for
  * the update dialog, `z-work-dialog-recovery` for the working-set recovery and
  * `z-work-dialog-plugin` for the plugin install dialog over the import sheet. The drop overlay
- * sits on `z-drop-overlay` above every work dialog and below the modals. In-screen
+ * sits on `z-drop-overlay` above every work dialog and below the modals. Floating plugin windows
+ * count up from `z-floating-plugin-window`, above every in-screen layer and below the work dialogs. In-screen
  * layers such as chat overlay buttons, context menus, drag ghosts, and the text area stack
  * keep their local z-index so their internal ordering (for example the z-100 autocomplete
  * above the z-50 editor) survives. The code block menu is appended to the body and opens over
@@ -175,5 +178,19 @@ describe('modal layering', () => {
             expect(/z-\[\d+\]/.test(source), `${name} still writes its z-index out`).toBe(false)
             expect(count(source, 'z-modal'), name).toBe(0)
         }
+    })
+
+    it('puts floating plugin windows above every in-screen layer and below the work dialogs', () => {
+        const layer = utilityZIndex('z-floating-plugin-window')
+        expect(floatingWindowLayer).toBe(layer)
+        expect(floatingWindowLayers(0).frame).toBe(layer)
+        expect(floatingWindowLayers(10_000).handles).toBeLessThan(1000)
+        const inScreenLayers = readdirSync('src', { recursive: true, encoding: 'utf8' })
+            .filter(file => /\.(svelte|ts)$/.test(file) && !/\.test\.|\.d\.ts$/.test(file))
+            .flatMap(file => [...readFileSync(join('src', file), 'utf8')
+                .matchAll(/z-index:\s*(\d+)|\bz-\[(\d+)\]|\bz-(\d+)\b|zIndex\s*=\s*['"](\d+)/g)]
+                .map(match => Number(match.slice(1).find(Boolean))))
+            .filter(value => value < 1000)
+        expect(Math.max(...inScreenLayers)).toBeLessThan(layer)
     })
 })
