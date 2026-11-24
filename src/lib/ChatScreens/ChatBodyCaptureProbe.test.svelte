@@ -6,7 +6,7 @@
 </script>
 
 <script lang="ts">
-    import { onMount, tick, untrack } from 'svelte'
+    import { onMount, settled as domSettled, untrack } from 'svelte'
     import type { BoundedLiveChatParserProjection } from 'src/ts/selectedConversationLiveParserProjection'
     import type { StreamingThoughtPreview } from '../../ts/parser/streamingThoughtPreview'
 
@@ -34,7 +34,7 @@
     onMount(() => onCaptureSettled?.(1))
     $effect(() => {
         const settled = onDisplaySettled
-        void tick().then(() => settled?.())
+        void domSettled().then(() => settled?.())
     })
 </script>
 

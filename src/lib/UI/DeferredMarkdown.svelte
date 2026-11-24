@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { onDestroy, tick, untrack } from 'svelte'
+    // settled() resolves once the DOM update commits; tick() would also wait for a frame or timer.
+    import { onDestroy, settled as domSettled, untrack } from 'svelte'
     import { ParseMarkdown } from 'src/ts/parser/parser.svelte'
     import { language } from 'src/lang'
     import {
@@ -100,7 +101,7 @@
         } else if (html === displayedHtml) displayEpoch += 1
         displayedJob = job
         displayedHtml = html
-        await tick()
+        await domSettled()
         dispose(previous)
         if (destroyed || job.disposed || job !== parseJob) {
             if (job !== displayedJob) dispose(job)

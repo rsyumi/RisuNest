@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { SvelteMap } from 'svelte/reactivity'
 const native = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: native.invoke, Channel: class { onmessage = (_value: unknown) => {} } }))
@@ -15,7 +15,7 @@ let target: HTMLDivElement
 const show = async (props: Record<string, unknown> = {}) => {
     target = document.createElement('div'); document.body.append(target)
     component = mount(ExternalTransferProgress, { target, props: { connectionId: 'synthetic', strings, ...props } })
-    await tick()
+    await domSettled()
 }
 const counterRows = () => [...target.querySelectorAll('dt')].map(term => [term.textContent, term.nextElementSibling?.textContent])
 const objectsValue = (size: number, count: string) => `${bytes(size)} · ${strings.transfer.objects.replace('{0}', count)}`
@@ -32,22 +32,22 @@ describe('external storage shared panel', () => {
         await run.invoke('synthetic', {})
         const statusValues = () => [...target.querySelectorAll('[role="status"] .tabular-nums')].map(node => node.textContent)
         const reading = { sequence: 1, stage: 'applying', preparedBytes: '0', uploadedBytes: '0', downloadedBytes: '1024', uploadedObjects: '0', downloadedObjects: '100' }
-        report({ ...reading, staging: { phase: 'validate', done: 25, total: 100 } }); await tick()
+        report({ ...reading, staging: { phase: 'validate', done: 25, total: 100 } }); await domSettled()
         expect(target.textContent).toContain(strings.staging.validate)
         expect(statusValues()).toEqual([strings.transfer.connecting, '25%'])
         expect(counterRows()).toEqual([[strings.transfer.downloaded, objectsValue(1024, '100')]])
         expect(target.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('25')
-        report({ ...reading, sequence: 2, staging: { phase: 'project', done: 3, total: null } }); await tick()
+        report({ ...reading, sequence: 2, staging: { phase: 'project', done: 3, total: null } }); await domSettled()
         expect(target.textContent).toContain(strings.staging.project)
         expect(statusValues()).toEqual([strings.transfer.connecting])
         expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
-        report({ ...reading, sequence: 3, staging: { phase: 'check', done: 100, total: 100 } }); await tick()
+        report({ ...reading, sequence: 3, staging: { phase: 'check', done: 100, total: 100 } }); await domSettled()
         expect(target.textContent).toContain(strings.staging.check)
         expect(target.textContent).not.toContain(strings.transfer.connectionComplete)
-        run.stage('finalizing'); await tick()
+        run.stage('finalizing'); await domSettled()
         expect(target.textContent).not.toContain(strings.staging.check)
         expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
-        run.finish('complete'); await tick()
+        run.finish('complete'); await domSettled()
         expect(target.textContent).toContain(strings.transfer.connectionComplete)
     })
     it.each(['backup', 'restore'] as const)('shows %s network speed from live job samples and hides it when paused', async kind => {
@@ -58,13 +58,13 @@ describe('external storage shared panel', () => {
         const jobs = new SvelteMap([['current', job]])
         target = document.createElement('div'); document.body.append(target)
         component = mount(ExternalTransferProgress, { target, props: { connectionId: 'synthetic', strings, get job() { return jobs.get('current') } } })
-        await tick()
+        await domSettled()
         jobs.set('current', { ...job, transfer: { ...transfer, sequence: 2, network: { ...network, atMs: 1000, sentBytes: '1048576', receivedBytes: '2097152' } } })
-        await tick()
+        await domSettled()
         expect(target.textContent).toContain(kind === 'backup' ? `${strings.transfer.uploadSpeed} 1.0 MiB/s` : `${strings.transfer.downloadSpeed} 2.0 MiB/s`)
-        jobs.set('current', { ...jobs.get('current')!, phase: 'applying-local', kind: 'restore' }); await tick()
+        jobs.set('current', { ...jobs.get('current')!, phase: 'applying-local', kind: 'restore' }); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
-        jobs.set('current', { ...job, state: 'waiting', phase: 'paused' }); await tick()
+        jobs.set('current', { ...job, state: 'waiting', phase: 'paused' }); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
     })
     it('shows partial network transfer before any item completes and hides speed during local work and completion', async () => {
@@ -75,15 +75,15 @@ describe('external storage shared panel', () => {
         native.invoke.mockImplementation(async (_name, { progress }) => { report = progress.onmessage })
         await run.invoke('synthetic', {})
         const reading = { sequence: 1, stage: 'downloading', preparedBytes: '0', uploadedBytes: '0', downloadedBytes: '0', uploadedObjects: '0', downloadedObjects: '0', network: { id: 'native', atMs: 0, sentBytes: '0', receivedBytes: '0', sending: false, receiving: true } }
-        report(reading); await tick()
-        report({ ...reading, sequence: 2, network: { ...reading.network, atMs: 1000, receivedBytes: '1048576' } }); await tick()
+        report(reading); await domSettled()
+        report({ ...reading, sequence: 2, network: { ...reading.network, atMs: 1000, receivedBytes: '1048576' } }); await domSettled()
         expect(target.textContent).toContain(`${strings.transfer.downloadSpeed} 1.0 MiB/s`)
         expect(target.textContent).not.toContain(strings.transfer.downloaded)
-        run.stage('waiting'); await tick()
+        run.stage('waiting'); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
-        run.stage('applying'); await tick()
+        run.stage('applying'); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
-        run.finish('complete'); await tick()
+        run.finish('complete'); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
     })
     it('shows the speed on the heading row, outside its live region, until the transfer finishes', async () => {
@@ -94,18 +94,18 @@ describe('external storage shared panel', () => {
         native.invoke.mockImplementation(async (_name, { progress }) => { report = progress.onmessage })
         await run.invoke('synthetic', {})
         const reading = { sequence: 1, stage: 'downloading', preparedBytes: '0', uploadedBytes: '0', downloadedBytes: '0', uploadedObjects: '0', downloadedObjects: '0', network: { id: 'native', atMs: 0, sentBytes: '0', receivedBytes: '0', sending: false, receiving: true } }
-        report(reading); await tick()
+        report(reading); await domSettled()
         const status = target.querySelector('[data-setting-progress] [role="status"]')!
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
-        report({ ...reading, sequence: 2, network: { ...reading.network, atMs: 1000, receivedBytes: '1048576' } }); await tick()
+        report({ ...reading, sequence: 2, network: { ...reading.network, atMs: 1000, receivedBytes: '1048576' } }); await domSettled()
         const speed = target.querySelector('[data-transfer-speed]')!
         expect(speed.textContent).toContain(`${strings.transfer.downloadSpeed} 1.0 MiB/s`)
         expect(speed.parentElement).toBe(status.parentElement)
         expect(speed.closest('[role="status"]')).toBeNull()
         expect(status.parentElement!.nextElementSibling?.getAttribute('role')).toBe('progressbar')
-        run.stage('applying'); await tick()
+        run.stage('applying'); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
-        run.finish('complete'); await tick()
+        run.finish('complete'); await domSettled()
         expect(target.querySelector('[data-transfer-speed]')).toBeNull()
     })
     it('observes an automatic operation started after mounting and keeps details collapsed', async () => {
@@ -113,7 +113,7 @@ describe('external storage shared panel', () => {
         const run = beginExternalProgress('synthetic', 'sync')
         native.invoke.mockImplementation(async (_name, { progress }) => progress.onmessage({ sequence: 1, stage: 'uploading', uploadedBytes: '4096', uploadedObjects: '2', downloadedBytes: '1024', downloadedObjects: '1', preparedBytes: '2000' }))
         await run.invoke('synthetic', {})
-        await vi.advanceTimersByTimeAsync(650); await tick()
+        await vi.advanceTimersByTimeAsync(650); await domSettled()
         expect(target.textContent).toContain(strings.transfer.uploading)
         expect(target.querySelector('details')?.open).toBe(false)
         expect(counterRows()).toEqual([
@@ -122,7 +122,7 @@ describe('external storage shared panel', () => {
             [strings.transfer.downloaded, objectsValue(1024, '1')],
         ])
         expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
-        run.finish('complete'); await tick()
+        run.finish('complete'); await domSettled()
         expect(target.textContent).toContain(strings.transfer.syncComplete)
     })
     it('keeps a finished sync turn in progress while receiving continues, including during the next hidden check', async () => {
@@ -131,14 +131,14 @@ describe('external storage shared panel', () => {
         component = mount(ExternalTransferProgress, { target, props: { connectionId: 'synthetic', strings, get catchingUp() { return flags.get('catchingUp') } } })
         const status = () => target.querySelector('[data-external-progress="sync"]')?.textContent ?? ''
         const first = beginExternalProgress('synthetic', 'sync')
-        first.stage('applying'); first.finish('complete'); await tick()
+        first.stage('applying'); first.finish('complete'); await domSettled()
         expect(status()).toContain(strings.transfer.syncing)
         expect(status()).not.toContain(strings.transfer.syncComplete)
         expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
-        const next = beginExternalProgress('synthetic', 'sync'); await tick()
+        const next = beginExternalProgress('synthetic', 'sync'); await domSettled()
         expect(status()).toContain(strings.transfer.syncing)
         expect(status()).not.toContain(strings.transfer.syncComplete)
-        next.stage('applying'); next.finish('complete'); flags.set('catchingUp', false); await tick()
+        next.stage('applying'); next.finish('complete'); flags.set('catchingUp', false); await domSettled()
         expect(status()).toContain(strings.transfer.syncComplete)
     })
     it('shows onboarding details directly and remains active while applying a completed download', async () => {
@@ -148,7 +148,7 @@ describe('external storage shared panel', () => {
         expect(target.textContent).toContain(strings.transfer.applying)
         expect(target.querySelector('details')).toBeNull()
         expect(target.querySelector('[role="progressbar"]')?.hasAttribute('aria-valuenow')).toBe(false)
-        run.finish('failed'); await tick()
+        run.finish('failed'); await domSettled()
         expect(target.textContent).toContain(strings.failed)
         expect(target.textContent).not.toContain(strings.transfer.connectionComplete)
     })
@@ -174,7 +174,7 @@ describe('external storage shared panel', () => {
         expect(panels).toHaveLength(2)
         panels[0].open = true
         panels[0].dispatchEvent(new Event('toggle'))
-        await tick()
+        await domSettled()
         expect(panels[0].open).toBe(true)
         expect(panels[1].open).toBe(false)
         binding.finish('complete'); download.finish('complete')
@@ -185,7 +185,7 @@ describe('external storage shared panel', () => {
         await show({ onboarding: true, syncing: true })
         expect(target.textContent).toContain(strings.transfer.waiting)
         expect(target.querySelector('[class*="animate-spin"], [class*="animate-pulse"]')).toBeNull()
-        binding.stage('applying'); await tick()
+        binding.stage('applying'); await domSettled()
         expect(target.textContent).toContain(strings.transfer.applying)
         expect(target.querySelector('[class*="animate-spin"]')).not.toBeNull()
         binding.finish('complete')

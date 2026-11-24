@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { mount, tick } from "svelte";
+import { mount, settled as domSettled } from "svelte";
 import SyncExitDialog from "../../src/lib/Others/SyncExitDialog.svelte";
 import { createMacosExitHandler, type MacosExitRequest } from "../../src/ts/storage/macosLifecycle";
 import { SaveCoordinator } from "../../src/ts/storage/saveCoordinator";
@@ -115,7 +115,7 @@ export async function terminationDispatch(phase: string) {
       const saved = await store.readRoot();
       check(saved.value.username === root.username && saved.revision === save.revision,
         "session response must follow the real local commit");
-      await tick();
+      await domSettled();
       rendererReplies++;
       note(`renderer-response-${exit}`);
       await report("session-dispatch-renderer-response", { ...snapshot(), exit });
@@ -142,7 +142,7 @@ export async function terminationDispatch(phase: string) {
       check(performance.now() < deadline, "native ordinary quit did not reach the requested coordinator stage");
       await pause(10);
     }
-    await tick();
+    await domSettled();
     check(!!dialogTarget.querySelector('[role="dialog"]'), "product exit dialog must be mounted");
     check(dialogTarget.querySelectorAll("button").length === (scenario === "dialog" ? 3 : 0),
       "the confirmation stage must expose the real product choices");

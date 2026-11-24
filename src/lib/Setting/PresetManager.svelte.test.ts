@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 import { languageEnglish } from '../../lang/en'
 import { DBState } from 'src/ts/stores.svelte'
 import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
@@ -70,13 +70,13 @@ const choose = (name: string) => row(name).querySelector('button')!
 const byText = (text: string) => [...document.querySelectorAll('button')].find(button => button.textContent?.trim() === text)!
 async function openActions(name: string) {
     row(name).querySelector<HTMLButtonElement>(`button[title="${languageEnglish.presetActions}"]`)!.click()
-    await tick()
+    await domSettled()
 }
 async function search(value: string) {
     const input = document.querySelector<HTMLInputElement>(`input[placeholder="${languageEnglish.search}"]`)!
     input.value = value
     input.dispatchEvent(new Event('input', { bubbles: true }))
-    await tick()
+    await domSettled()
 }
 async function open(props: Partial<PresetManagerProps> = {}, names = fixture, extra: Record<string, unknown> = {}) {
     if (instance) await unmount(instance)
@@ -86,7 +86,7 @@ async function open(props: Partial<PresetManagerProps> = {}, names = fixture, ex
         ...extra,
     } as any
     instance = mount(PresetManager, { target: document.body, props: { close: mocks.close, ...props } })
-    await tick()
+    await domSettled()
 }
 
 beforeEach(async () => {
@@ -149,7 +149,7 @@ it('renames, duplicates, moves and deletes presets in the stored list', async ()
     await openActions('Gamma')
     byText(languageEnglish.deletePreset).click()
     await vi.waitFor(() => expect(mocks.confirm).toHaveBeenLastCalledWith(`${languageEnglish.removeConfirm}Gamma`))
-    await tick()
+    await domSettled()
     expect(order()).toContain('Gamma')
     byText(languageEnglish.deletePreset).click()
     await vi.waitFor(() => expect(order()).toEqual(['Bravo', 'Alpha', 'Delta', 'Alpha Copy']))
@@ -165,9 +165,9 @@ it('compares two picked presets without changing the selection when prompt compa
     expect(byText(text.compare)).toBeUndefined()
     await open({}, fixture, { showPromptComparison: true })
     byText(text.compare).click()
-    await tick()
+    await domSettled()
     choose('Alpha').click()
-    await tick()
+    await domSettled()
     choose('Gamma').click()
     await vi.waitFor(() => expect(mocks.diff).toHaveBeenCalledWith(['Alpha', 'Gamma']))
     expect(DBState.db.botPresetsId).toBe(0)
@@ -203,7 +203,7 @@ it('binds in bind mode without changing the selection, and unbinds through the i
     onBind.mockResolvedValueOnce(false as never)
     inherit().click()
     await vi.waitFor(() => expect(onBind).toHaveBeenLastCalledWith(null))
-    await tick()
+    await domSettled()
     expect(mocks.close).toHaveBeenCalledTimes(1)
 })
 
@@ -221,7 +221,7 @@ it('moves a held preset by touch to the gap it is dropped on without selecting i
     alpha.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
     await vi.waitFor(() => expect(order()).toEqual(['Beta', 'Gamma', 'Delta', 'Alpha']))
     // The menu that was open stays with its preset.
-    await tick()
+    await domSettled()
     const menu = (name: string) => row(name).querySelector(`button[title="${languageEnglish.movePresetDown}"]`)
     expect(menu('Gamma')).not.toBeNull()
     expect(menu('Delta')).toBeNull()

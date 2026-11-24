@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mount, tick, unmount } from 'svelte'
+import { mount, settled as domSettled, unmount } from 'svelte'
 
 vi.mock('src/ts/gui/guisize', async () => {
     const { writable } = await import('svelte/store')
@@ -45,7 +45,7 @@ async function input(props: Record<string, unknown>) {
     const target = document.createElement('div')
     document.body.append(target)
     component = mount(TextAreaInput, { target, props: { value: 'Field text', ...props } })
-    await tick()
+    await domSettled()
     const expand = target.querySelector<HTMLButtonElement>('button[aria-label="Edit in popup"]')!
     return { target, expand }
 }
@@ -139,7 +139,7 @@ describe('text area popup editor button', () => {
         const target = document.createElement('div')
         document.body.append(target)
         component = mount(TextAreaInputInsidePopupHarness, { target })
-        await tick()
+        await domSettled()
         expect(target.querySelector('button[aria-label="Edit in popup"]')).toBeNull()
 
         hotkey.matches = true
@@ -178,7 +178,7 @@ describe('text area popup editor button', () => {
         const { expand } = await input({ onchange })
         expand.click()
         // The editor renders before anything can remove the field.
-        await tick()
+        await domSettled()
         const request = textEditorPopup.request!
         const cancel = vi.spyOn(request, 'cancel')
 

@@ -3,7 +3,8 @@
     import type { Message } from 'src/ts/storage/database.svelte'
     import type { ChatScreenshotJob, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import { getFileSrc } from 'src/ts/globalApi.svelte'
-    import { onDestroy, tick } from 'svelte'
+    // settled() resolves once the DOM update commits; tick() would also wait for a frame or timer.
+    import { onDestroy, settled as domSettled } from 'svelte'
     import Chat from './Chat.svelte'
     import { CHAT_SCREENSHOT_PARSE_TIMEOUT_MS, CHAT_SCREENSHOT_WIDTH } from 'src/ts/chatScreenshotCapture'
 
@@ -129,7 +130,7 @@
         }
         renderContext = context
         batch = nextBatch
-        await tick()
+        await domSettled()
         if (batch.length === 0) {
             const current = readiness
             if (current?.generation === batchGeneration) {
@@ -148,7 +149,7 @@
         renderContext = null
         characterImage = ''
         userImage = ''
-        await tick()
+        await domSettled()
     }
 
     export async function dispose() {

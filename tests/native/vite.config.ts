@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => {
                 if (!resolved?.id.replaceAll('\\', '/').endsWith('/src/ts/realmEndpoints.ts')) return null
                 return resolved.id.replace(/realmEndpoints\.ts$/, 'realmEndpoints.blocked.ts')
             },
-        }, svelte()],
+        }, svelte({ compilerOptions: { experimental: { async: true } } })],
         resolve: { alias: { src: resolve(import.meta.dirname, '../../src') } },
         build: { outDir: resolve(import.meta.dirname, '../../.tmp/test-results/native/dist'), emptyOutDir: true },
     }
