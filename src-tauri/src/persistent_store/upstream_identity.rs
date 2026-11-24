@@ -43,6 +43,16 @@ fn normalize_root(mut root: Value) -> StoreResult<Value> {
             assign_ids(records)?;
         }
     }
+    for module in root
+        .get_mut("modules")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(assets) = module.get_mut("assets") {
+            super::upstream_stream::fill_asset_extensions(assets);
+        }
+    }
     let index = {
         let records = root
             .get("personas")
@@ -66,6 +76,9 @@ fn normalize_root(mut root: Value) -> StoreResult<Value> {
         for persona in personas.iter_mut() {
             if let Some(module) = persona.get_mut("embeddedModule") {
                 assign_ids(std::slice::from_mut(module))?;
+                if let Some(assets) = module.get_mut("assets") {
+                    super::upstream_stream::fill_asset_extensions(assets);
+                }
             }
         }
         if let Some(persona) = personas.get_mut(index) {

@@ -1206,9 +1206,13 @@ fn prepare_legacy_character(value: &mut Value, seen_ids: &mut HashSet<String>) -
 
 // A save written by upstream RisuAI can lack these character fields. `checkNewFormat` fills them,
 // when absent or null, on the TypeScript import routes. Its `chats` default is not among them:
-// conversations are staged as rows.
+// conversations are staged as rows. An asset the save holds without an extension gets an empty
+// one, which the persistent store requires.
 pub(super) fn default_character_fields(record: &mut Map<String, Value>) {
     default_name(record);
+    if let Some(assets) = record.get_mut("additionalAssets") {
+        crate::persistent_store::upstream_stream::fill_asset_extensions(assets);
+    }
     let text = |value: &str| Value::String(value.to_owned());
     let list = || Value::Array(Vec::new());
     for (key, value) in [
@@ -4556,7 +4560,8 @@ pub(super) mod tests {
         let (directory, sink) = fixture();
         let mut blocks = valid_blocks();
         blocks[6] = block(2, false, "char-1", &json!({
-            "chaId":"char-1","name":"Synthetic","globalLore":null,"desc":"kept","utilityBot":true,"chats":[]
+            "chaId":"char-1","name":"Synthetic","globalLore":null,"desc":"kept","utilityBot":true,"chats":[],
+            "additionalAssets":[["short","assets/a.png"],["null","assets/b.png",null],["kept","assets/c.png","png"]]
         }));
         let path = directory.path().join("defaults.risudat");
         fs::write(&path, save_bytes(blocks)).unwrap();
@@ -4566,6 +4571,7 @@ pub(super) mod tests {
         character.as_object_mut().unwrap().remove("chats");
         assert_eq!(character, json!({
             "chaId":"char-1","name":"Synthetic","globalLore":[],"desc":"kept","utilityBot":true,
+            "additionalAssets":[["short","assets/a.png",""],["null","assets/b.png",""],["kept","assets/c.png","png"]],
             "type":"character","chatPage":0,"customscript":[],"firstMessage":"","viewScreen":"none",
             "emotionImages":[],"bias":[],"characterVersion":"","creator":"","tags":[],"systemPrompt":"","scenario":""
         }));
