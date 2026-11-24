@@ -35,6 +35,9 @@
     let draggedIndex = $state(-1)
     let dragOverIndex = $state(-1)
     let openedItems = $state(new Set<PromptItem>())
+    // One count runs at a time; a change while it runs queues one more count, and an outdated count is not shown.
+    let tokenizing = false
+    let tokenizeQueued: PromptItem[] | null = null
     executeTokenize(DBState.db.promptTemplate)
   interface Props {
     onGoBack?: () => void;
@@ -45,14 +48,31 @@
   let { onGoBack = () => {}, mode = 'independent', subMenu = $bindable(0) }: Props = $props();
 
     async function executeTokenize(prest: PromptItem[]){
-        tokens = await tokenizePreset(prest, true, DBState.db)
-        extokens = await tokenizePreset(prest, false, DBState.db)
+        tokenizeQueued = prest
+        if (tokenizing) return
+        tokenizing = true
+        try {
+            while (tokenizeQueued) {
+                const template = tokenizeQueued
+                tokenizeQueued = null
+                const fixed = await tokenizePreset(template, true, DBState.db)
+                const exact = await tokenizePreset(template, false, DBState.db)
+                if (!tokenizeQueued) {
+                    tokens = fixed
+                    extokens = exact
+                }
+            }
+        } finally {
+            tokenizing = false
+        }
     }
 
     $effect.pre(() => {
     warns = templateCheck(DBState.db)
   });
   $effect.pre(() => {
+    // The count reads blocks across awaits, so every counted field is read here for the count to follow it.
+    for (const prompt of DBState.db.promptTemplate) void [prompt.type, (prompt as { text?: string }).text, (prompt as { innerFormat?: string }).innerFormat]
     executeTokenize(DBState.db.promptTemplate)
   });
 
