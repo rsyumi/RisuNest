@@ -314,9 +314,9 @@ const settingKeyTable: Record<string, SettingKeyEntry> = {
     hypaV3Settings: 'object',
 }
 
-export type RisunestSettingKeyClass =
-    | { access: 'excluded' }
-    | { access: 'available' | 'read-only'; type: RisunestJsonKind; nullable: boolean }
+export type RisunestOfferedSettingKey = { access: 'available' | 'read-only'; type: RisunestJsonKind; nullable: boolean }
+
+export type RisunestSettingKeyClass = { access: 'excluded' } | RisunestOfferedSettingKey
 
 function classify(entry: SettingKeyEntry): RisunestSettingKeyClass {
     if (entry === 'excluded') return { access: 'excluded' }
@@ -333,4 +333,9 @@ function classify(entry: SettingKeyEntry): RisunestSettingKeyClass {
 /** Each classified key in table order. Look keys up here only, never on a plain object. */
 export const risunestSettingKeyClasses: ReadonlyMap<string, RisunestSettingKeyClass> = new Map(
     Object.entries(settingKeyTable).map(([key, entry]) => [key, classify(entry)]),
+)
+
+/** The available and read-only keys in table order: the keys the settings methods offer. */
+export const risunestOfferedSettingKeys: ReadonlyMap<string, RisunestOfferedSettingKey> = new Map(
+    [...risunestSettingKeyClasses].flatMap(([key, entry]) => entry.access === 'excluded' ? [] : [[key, entry] as const]),
 )
