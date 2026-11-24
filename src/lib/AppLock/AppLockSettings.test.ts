@@ -85,8 +85,10 @@ describe('app lock settings', () => {
         await render(true)
         failWrite = true
         toggle(language.risuNest.appLock.enable).click()
-        await vi.waitFor(() => expect(host.querySelector('[role="alert"]')?.textContent).toBe(language.risuNest.localData.applyFailed))
+        await tick()
+        await vi.waitFor(() => expect(toggle(language.risuNest.appLock.enable).disabled).toBe(false))
         expect(toggle(language.risuNest.appLock.enable).checked).toBe(true)
+        expect(host.querySelector('[role="alert"]')?.textContent).toBe(language.risuNest.localData.applyFailed)
         expect([...host.querySelectorAll('[data-notice]')].map(notice => notice.textContent)).toEqual([
             language.risuNest.localData.applyFailed,
             language.risuNest.appLock.noRecovery,
@@ -100,8 +102,10 @@ describe('app lock settings', () => {
         await render()
         failWrite = true
         toggle(language.risuNest.appLock.preview).click()
-        await vi.waitFor(() => expect(host.textContent).toContain(language.risuNest.localData.applyFailed))
+        await tick()
+        await vi.waitFor(() => expect(toggle(language.risuNest.appLock.preview).disabled).toBe(false))
         expect(toggle(language.risuNest.appLock.preview).checked).toBe(false)
+        expect(host.textContent).toContain(language.risuNest.localData.applyFailed)
         failWrite = false
         toggle(language.risuNest.appLock.preview).click()
         await vi.waitFor(() => expect(appLock.state.record.hideRecentsPreview).toBe(true))
@@ -117,8 +121,10 @@ describe('app lock settings', () => {
         failWrite = true
         select.value = 'after-15m'
         select.dispatchEvent(new Event('change', { bubbles: true }))
-        await vi.waitFor(() => expect(host.textContent).toContain(language.risuNest.localData.applyFailed))
-        await vi.waitFor(() => expect(select.value).toBe('launch'))
+        await tick()
+        await vi.waitFor(() => expect(host.querySelector('fieldset')!.disabled).toBe(false))
+        expect(select.value).toBe('launch')
+        expect(host.textContent).toContain(language.risuNest.localData.applyFailed)
         expect(host.textContent).toContain(language.risuNest.appLock.timingLaunchHelp)
     })
 
@@ -129,10 +135,8 @@ describe('app lock settings', () => {
         expect(host.textContent).not.toContain(language.risuNest.appLock.noRecovery)
         toggle(language.risuNest.appLock.native).click()
         await tick()
-        await vi.waitFor(() => {
-            expect(toggle(language.risuNest.appLock.native).disabled).toBe(false)
-            expect(toggle(language.risuNest.appLock.native).checked).toBe(false)
-        })
+        await vi.waitFor(() => expect(toggle(language.risuNest.appLock.native).disabled).toBe(false))
+        expect(toggle(language.risuNest.appLock.native).checked).toBe(false)
         expect(host.textContent).not.toContain(language.risuNest.appLock.nativeUnavailable)
         boundary.outcome = 'success'
         toggle(language.risuNest.appLock.native).click()
