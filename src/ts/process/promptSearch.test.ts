@@ -73,14 +73,13 @@ describe('matching', () => {
     })
 
     it('shows the line that holds a match, cutting long text before it', () => {
-        expect(matchLine('first\nsecond line\nthird', { start: 13, end: 17 })).toEqual({ before: 'second ', hit: 'line', after: '' })
+        expect(matchLine('first\nsecond line\nthird', { start: 13, end: 17 })).toEqual({ before: 'second ', hit: 'line', after: '', cut: false })
         // A match across lines shows its first line.
-        expect(matchLine('ab\r\ncd', { start: 1, end: 5 })).toEqual({ before: 'a', hit: 'b', after: '' })
-        expect(matchLine('\nx', { start: 0, end: 2 })).toEqual({ before: '', hit: '', after: '' })
+        expect(matchLine('ab\r\ncd', { start: 1, end: 5 })).toEqual({ before: 'a', hit: 'b', after: '', cut: false })
+        expect(matchLine('\nx', { start: 0, end: 2 })).toEqual({ before: '', hit: '', after: '', cut: false })
+        expect(matchLine(`${'w'.repeat(24)}hit`, { start: 24, end: 27 }).cut).toBe(false)
         const long = `${'w'.repeat(40)}hit after`
-        const line = matchLine(long, { start: 40, end: 43 })
-        expect(line.before).toBe(`…${'w'.repeat(24)}`)
-        expect([line.hit, line.after]).toEqual(['hit', ' after'])
+        expect(matchLine(long, { start: 40, end: 43 })).toEqual({ before: 'w'.repeat(24), hit: 'hit', after: ' after', cut: true })
     })
 })
 

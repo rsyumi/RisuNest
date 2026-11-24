@@ -6,6 +6,7 @@ import { stubDragEvent, touch } from 'src/ts/gui/htmlTouchDrag.testSupport'
 import { language } from 'src/lang'
 import { modalNavigation } from 'src/ts/ui/modalNavigation'
 import { tokenizePreset } from 'src/ts/process/prompt'
+import { matchLine } from 'src/ts/process/promptSearch'
 import PromptSettings from './PromptSettings.svelte'
 
 const mocks = vi.hoisted(() => ({
@@ -34,6 +35,11 @@ vi.mock('src/ts/process/prompt', () => ({
         return total
     }),
 }))
+// Records the match lines built, which the search builds only for the lines it shows.
+vi.mock('src/ts/process/promptSearch', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('src/ts/process/promptSearch')>()
+    return { ...actual, matchLine: vi.fn(actual.matchLine) }
+})
 vi.mock('src/ts/process/templates/templateCheck', () => ({ templateCheck: () => [] }))
 vi.mock('src/ts/alert', () => ({ alertConfirm: mocks.confirm }))
 vi.mock('src/lib/Others/Help.svelte', () => ({ default: () => {} }))
@@ -279,7 +285,10 @@ describe('prompt search', () => {
     // Each line shows the field's label, then the text of the line.
     const lineTexts = (title: string) => lines(title).map(line => [...line.children].map(part => part.textContent))
     const marks = (title: string) => [...card(title).querySelectorAll('mark')].map(mark => mark.textContent)
+    // Whether each line shows the ellipsis that says the text before its match was cut.
+    const cuts = (title: string) => lines(title).map(line => !line.querySelector<HTMLElement>('[aria-hidden="true"]')!.hidden)
     const replaceInput = () => bar()!.querySelector<HTMLInputElement>(`input[aria-label="${text.replaceWith}"]`)!
+    const more = (title: string) => [...card(title).querySelectorAll('button')].find(button => button.textContent?.startsWith(text.showMore.split('{0}')[0]))!
     const tokenCounts = () => [language.fixedTokens, language.exactTokens].map(label =>
         Number([...document.querySelectorAll('span')].find(span => span.textContent?.endsWith(` ${label}`))!.textContent!.split(' ')[0]))
     const noMatches = `${text.matchCount.replace('{0}', '0')} · ${language.risuNest.promptList.count.replace('{0}', '0')}`
@@ -315,6 +324,7 @@ describe('prompt search', () => {
             [language.prompt, 'Talk to {{user}} kindly.'], [language.prompt, 'Never speak for {{user}}.'],
         ])
         expect(marks('Intro')).toEqual(['{{user}}', '{{user}}'])
+        expect(cuts('Intro')).toEqual([false, false])
         expect(lineTexts(authorNote)).toEqual([[language.innerFormat, '[{{user}} note] {{slot}}']])
         expect(document.querySelector('[draggable="true"], [role="doc-pagebreak"], button[aria-haspopup="menu"]')).toBeNull()
         expect(document.querySelector(`button[aria-label="${language.movePresetUp}"]`)).toBeNull()
@@ -487,6 +497,36 @@ describe('prompt search', () => {
         await type(searchInput(), 'laws')
         await vi.waitFor(() => expect(bar()!.textContent).toContain(noMatches))
         expect(listed()).toEqual([])
+    })
+
+    it('builds the line of a match only when it is shown, for the matches and for what replacing wrote', async () => {
+        const built = (fieldValue: string) => new Set(vi.mocked(matchLine).mock.calls
+            .filter(([value]) => value === fieldValue).map(([, range]) => range.start)).size
+        const many = `${'y'.repeat(30)}${'x'.repeat(50)}`
+        DBState.db.promptTemplate.push({ name: 'Many', type: 'plain', type2: 'normal', role: 'system', text: many })
+        await openSearch()
+        await type(searchInput(), 'x')
+        await vi.waitFor(() => expect(lines('Many')).toHaveLength(3))
+        expect(built(many)).toBe(3)
+        // The 30 characters before each match are more than a line shows, so each line says its text was cut.
+        expect(cuts('Many')).toEqual([true, true, true])
+        expect(lineTexts('Many')[0]).toEqual([language.prompt, `${'y'.repeat(24)}x${'x'.repeat(49)}`])
+        more('Many').click()
+        await tick()
+        expect(lines('Many')).toHaveLength(23)
+        expect(built(many)).toBe(23)
+
+        barButton(text.replace).click()
+        await tick()
+        await type(replaceInput(), 'z')
+        barButton(text.replaceAll).click()
+        await tick()
+        const written = `${'y'.repeat(30)}${'z'.repeat(50)}`
+        expect(lines('Many')).toHaveLength(3)
+        expect(built(written)).toBe(3)
+        more('Many').click()
+        await tick()
+        expect(built(written)).toBe(23)
     })
 
     it('closes the search before the settings window on back navigation', async () => {

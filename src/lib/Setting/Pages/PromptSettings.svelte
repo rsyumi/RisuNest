@@ -302,21 +302,42 @@
     return searchResults?.get(item)?.length ?? 0
   }
 
-  function searchLinesFor(item: PromptItem, reveal: (field: PromptSearchField, range: TextRange | null) => void): PromptSearchLine[] {
+  // A block's match lines, each built only when it is shown: a block can hold many matches, and three are shown at first.
+  function searchLinesFor(item: PromptItem, reveal: (field: PromptSearchField, range: TextRange | null) => void): { count: number, line: (index: number) => PromptSearchLine } {
     if (changesView) {
-      return changesView.changes.filter(change => change.block === item).flatMap(change => change.written.map(range => ({
-        label: searchFieldLabel(change.field),
-        ...matchLine(change.after, range),
-        // A field edited since the replace is focused without a selection.
-        onPick: () => reveal(change.field, fieldText(item, change.field) === change.after ? range : null),
-      })))
+      const changes = changesView.changes.filter(change => change.block === item)
+      return {
+        count: changes.reduce((sum, change) => sum + change.written.length, 0),
+        line: index => {
+          let change = changes[0]
+          for (const next of changes) {
+            change = next
+            if (index < next.written.length) break
+            index -= next.written.length
+          }
+          const range = change.written[index]
+          return {
+            label: searchFieldLabel(change.field),
+            ...matchLine(change.after, range),
+            // A field edited since the replace is focused without a selection.
+            onPick: () => reveal(change.field, fieldText(item, change.field) === change.after ? range : null),
+          }
+        },
+      }
     }
-    return (searchResults?.get(item) ?? []).map(match => ({
-      label: searchFieldLabel(match.field),
-      ...matchLine(fieldText(item, match.field) ?? '', match),
-      onPick: () => reveal(match.field, match),
-      onReplace: searchShowReplace ? () => replaceSearchMatch(item, match) : undefined,
-    }))
+    const matches = searchResults?.get(item) ?? []
+    return {
+      count: matches.length,
+      line: index => {
+        const match = matches[index]
+        return {
+          label: searchFieldLabel(match.field),
+          ...matchLine(fieldText(item, match.field) ?? '', match),
+          onPick: () => reveal(match.field, match),
+          onReplace: searchShowReplace ? () => replaceSearchMatch(item, match) : undefined,
+        }
+      },
+    }
   }
 
   const handleKeyDown = (e: KeyboardEvent) => {
@@ -449,7 +470,7 @@
                     }}>
                     {#snippet matchLines(reveal)}
                         {#if searchShown}
-                            <PromptSearchMatches lines={searchLinesFor(prompt, reveal)} resetKey={changesView ? `${searchKey}:written` : searchKey} />
+                            <PromptSearchMatches {...searchLinesFor(prompt, reveal)} resetKey={changesView ? `${searchKey}:written` : searchKey} />
                         {/if}
                     {/snippet}
                 </PromptDataItem>
