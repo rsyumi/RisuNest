@@ -451,6 +451,15 @@ describe('prompt search', () => {
             document.body.dispatchEvent(event)
             return event
         }
+        // Another screen in front of the list keeps Ctrl+F.
+        const screen = document.createElement('div')
+        document.body.append(screen)
+        const layer = modalNavigation(screen, { close: vi.fn() })
+        expect(press({}).defaultPrevented).toBe(false)
+        await tick()
+        expect(bar()).toBeNull()
+        layer.destroy()
+        await new Promise(resolve => setTimeout(resolve, 0))
         // Ctrl+Alt+F stays with the chat shortcut that uses it.
         expect(press({ altKey: true }).defaultPrevented).toBe(false)
         await tick()

@@ -23,7 +23,7 @@
     import {defaultAutoSuggestPrompt} from "../../../ts/storage/defaultPrompts";
     import AuxModelSelectors from './Model/AuxModelSelectors.svelte'
     import { htmlTouchDrag } from "src/ts/gui/htmlTouchDrag";
-    import { backNavigationLayer } from "src/ts/ui/modalNavigation";
+    import { backNavigationLayer, receivesInput } from "src/ts/ui/modalNavigation";
     import PromptSearchBar from "src/lib/UI/PromptSearchBar.svelte";
     import PromptSearchMatches, { type PromptSearchLine } from "src/lib/UI/PromptSearchMatches.svelte";
     import { blockMatches, buildMatcher, fieldText, matchLine, replaceAllInBlocks, replaceOneInBlock, undoWrites, type PromptFieldChange, type PromptFieldMatch, type PromptFieldWrite, type PromptSearchField, type TextRange } from "src/ts/process/promptSearch";
@@ -140,6 +140,7 @@
   let keptReplaced = $state.raw({ key: '', items: new Set<PromptItem>() })
   let searchBar: { focusQuery?: () => void } | undefined = $state()
   let promptListDom: HTMLDivElement | undefined = $state()
+  let promptListArea: HTMLDivElement | undefined = $state()
 
   $effect(() => {
     const query = searchQuery
@@ -299,7 +300,9 @@
     if (e.ctrlKey && e.altKey && e.key === 'o') {
       toggleAllOpened()
     }
-    if (subMenu === 0 && DBState.db.promptTemplate.length > 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
+    // Ctrl+F belongs to the list only while no other screen or dialog is in front of it.
+    if (subMenu === 0 && DBState.db.promptTemplate.length > 0 && !e.defaultPrevented && !isCompositionKey(e) && shortcutModifier(e) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f'
+      && promptListArea && receivesInput(promptListArea)) {
       e.preventDefault()
       openSearch()
     }
@@ -346,7 +349,7 @@
 
 {#if subMenu === 0}
     <!-- The toolbar, the search bar and the list stack among themselves, so none of them paints over a screen outside them. -->
-    <div class="isolate flex flex-col">
+    <div class="isolate flex flex-col" bind:this={promptListArea}>
     {#if DBState.db.promptTemplate.length > 0}
         <div class="relative z-20 flex items-center gap-2 px-3 mt-4">
             <span class="grow text-sm text-textcolor2">{language.risuNest.promptList.count.replace('{0}', String(DBState.db.promptTemplate.length))}</span>

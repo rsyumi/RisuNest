@@ -5,6 +5,7 @@ import { isCompositionKey } from '../hotkeyModifier'
 
 const key = 'risunestModal'
 const live = new Set<string>()
+const liveNodes = new Map<string, HTMLElement>()
 let cleanupQueued = false
 let cleanupInFlight = false
 let pendingHistoryTokens: string[] = []
@@ -56,6 +57,7 @@ function navigationLayer(node: HTMLElement, initial: NavigationOptions, trapFocu
         opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
         token = crypto.randomUUID()
         live.add(token)
+        liveNodes.set(token, node)
         // A pending traversal must finish before adding a replacement screen's entry.
         if (cleanupInFlight) pendingHistoryTokens.push(token)
         else pushHistoryToken(token)
@@ -99,6 +101,7 @@ function navigationLayer(node: HTMLElement, initial: NavigationOptions, trapFocu
     function deactivate() {
         if (!token) return
         live.delete(token)
+        liveNodes.delete(token)
         token = null
         scheduleCleanup()
         // Focus the user already moved elsewhere, such as a text field tapped to close a menu, stays there.
@@ -137,6 +140,14 @@ export function handleRootBack(event: Event) {
         event.preventDefault()
         history.back()
     }
+}
+
+/** Whether keyboard input belongs to `element`: no dialog or app lock takes it, and the topmost layer, if any, holds `element` or lies within it. */
+export function receivesInput(element: Node): boolean {
+    if (alertVisible() || isAppLockInputBlocked()) return false
+    const top = [...live].at(-1)
+    const node = top === undefined ? undefined : liveNodes.get(top)
+    return !node || node.contains(element) || element.contains(node)
 }
 
 /** Menus participate in Back and Escape without trapping keyboard focus. */
