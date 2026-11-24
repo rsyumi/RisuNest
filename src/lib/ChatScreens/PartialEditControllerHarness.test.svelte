@@ -12,10 +12,12 @@
         getTranslationEditContext,
         onSave,
         windowLayer,
+        messageData = 'Shared text',
     }: {
         getTranslationEditContext: () => Promise<{ key: string; data: string } | null>
         onSave?: (detail: SaveDetail & { sourceData: string }) => Promise<boolean>
         windowLayer?: HTMLElement
+        messageData?: string
     } = $props()
     // svelte-ignore state_referenced_locally
     if (windowLayer) provideChatWindowLayer(() => windowLayer)
@@ -43,7 +45,7 @@
 
 {#if bodyRoot}
     <PartialEditController
-        messageData="Shared text"
+        {messageData}
         chatIndex={0}
         {bodyRoot}
         blockEditEnabled={true}

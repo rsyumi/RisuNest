@@ -13,6 +13,7 @@ vi.mock('src/ts/stores.svelte', async () => ({
     },
 }))
 
+import { language } from 'src/lang'
 import PartialEditControllerHarness from './PartialEditControllerHarness.test.svelte'
 
 type HarnessInstance = {
@@ -110,6 +111,51 @@ test('retains the original source and draft when an asynchronous partial save is
     await Promise.resolve()
     expect(document.querySelector('.partial-edit-modal')).not.toBeNull()
     expect(input.value).toBe('Retained draft')
+})
+
+test('mounts the match, delete and match failure dialogs in the chat screen window layer', async () => {
+    // The hover handler hovers again only after its frame callback has run, so frames run after it returns.
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+        queueMicrotask(() => callback(0))
+        return 1
+    })
+    const windowLayer = document.createElement('div')
+    document.body.append(windowLayer)
+    mounted = mount(PartialEditControllerHarness, { target, props: {
+        getTranslationEditContext: async () => null, windowLayer, messageData: 'Shared text\n\nShared text',
+    } })
+    ;(mounted as HarnessInstance).setTranslatedView(false)
+    await tick()
+    const block = target.querySelector('p')!
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(block)
+    TestIntersectionObserver.instance?.setVisible(target.querySelector('div')!)
+    await tick()
+    const overlayInLayer = () => {
+        const overlays = document.querySelectorAll('.partial-edit-overlay')
+        return overlays.length === 1 && windowLayer.contains(overlays[0])
+    }
+    const press = async (button: string) => {
+        document.dispatchEvent(new MouseEvent('mousemove', { clientX: 10, clientY: 10 }))
+        await tick()
+        document.querySelector<HTMLButtonElement>(button)!.click()
+        await tick()
+    }
+
+    // The block appears twice in the source, so deleting it asks which one first.
+    await press('.partial-edit-btn-delete')
+    await vi.waitFor(() => expect(document.querySelector('.match-item')).not.toBeNull())
+    expect(overlayInLayer()).toBe(true)
+    document.querySelector<HTMLElement>('.match-item')!.click()
+    await vi.waitFor(() => expect(document.querySelector('.match-item')).toBeNull())
+    expect(overlayInLayer()).toBe(true)
+    document.querySelector<HTMLButtonElement>('.partial-edit-cancel-btn')!.click()
+    await vi.waitFor(() => expect(document.querySelector('.partial-edit-overlay')).toBeNull())
+
+    block.textContent = 'Quiz 4096'
+    await press('.partial-edit-btn-edit')
+    await vi.waitFor(() => expect(document.querySelector('.partial-edit-overlay')).not.toBeNull())
+    expect(overlayInLayer()).toBe(true)
+    expect(document.querySelector('.partial-edit-overlay')?.textContent).toContain(language.partialEdit.matchFailedTitle)
 })
 
 test('abandons a deferred translation partial edit when the translated view changes', async () => {
