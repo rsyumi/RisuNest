@@ -81,7 +81,33 @@ fn normalize_root(mut root: Value) -> StoreResult<Value> {
     if let Some(value) = root.get("globalChatVariables").cloned() {
         root["explicitGlobalChatVariables"] = value;
     }
+    record_protected_preset_values(&mut root);
     Ok(root)
+}
+/// Records the root's value of every protected preset field, as the TypeScript import does
+/// whether or not a preset is selected.
+fn record_protected_preset_values(root: &mut Value) {
+    for (key, _) in super::export::PRESET_MIRRORS {
+        let protected = super::export::protected_preset_flag(key)
+            .is_some_and(|flag| root.get(flag).and_then(Value::as_bool).unwrap_or(false));
+        if !protected {
+            continue;
+        }
+        if !root
+            .get("protectedPresetValues")
+            .is_some_and(Value::is_object)
+        {
+            root["protectedPresetValues"] = json!({});
+        }
+        match root.get(*key).cloned() {
+            Some(value) => root["protectedPresetValues"][*key] = value,
+            None => {
+                if let Some(values) = root["protectedPresetValues"].as_object_mut() {
+                    values.shift_remove(*key);
+                }
+            }
+        }
+    }
 }
 /// The preset the selection addresses, by id or by position. A missing selection is the
 /// first preset, and one that names no preset is none.
@@ -109,19 +135,8 @@ fn preserve_preset_mirrors(root: &mut Value, presets: &mut [Value]) {
     };
     if let Some(preset) = presets.get_mut(index) {
         for (key, field) in super::export::PRESET_MIRRORS {
-            let flag = super::export::protected_preset_flag(key);
             if let Some(value) = root.get(*key).cloned() {
-                if flag.is_some_and(|f| root.get(f).and_then(Value::as_bool).unwrap_or(false)) {
-                    if !root
-                        .get("protectedPresetValues")
-                        .is_some_and(Value::is_object)
-                    {
-                        root["protectedPresetValues"] = json!({});
-                    }
-                    root["protectedPresetValues"][*key] = value;
-                } else {
-                    preset[*field] = value;
-                }
+                preset[*field] = value;
             }
         }
         root["botPresetsId"] = preset["id"].clone();
@@ -212,7 +227,7 @@ mod tests {
         let preset: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(preset["temperature"], 0.8);
         assert_eq!(preset["NAISettings"]["synthetic"], true);
-        assert_eq!(preset["fallbackModels"], json!(["preset"]));
+        assert_eq!(preset["fallbackModels"], json!(["protected"]));
         assert_eq!(
             root["protectedPresetValues"]["fallbackModels"],
             json!(["protected"])
@@ -264,7 +279,10 @@ mod tests {
             assert_eq!(exported["temperature"], 999);
             file = Value::Object(exported);
         }
-        // Imported again, such a file selects no preset and no preset takes its values.
+        // Imported again, such a file selects no preset and no preset takes its values. The
+        // protected value is recorded all the same.
+        file.as_object_mut().unwrap().shift_remove("protectedPresetValues");
+        file["fallbackModels"] = json!(["live"]);
         for selection in [json!(-1), json!("gone"), json!(3)] {
             file["botPresetsId"] = selection;
             let stage = store.replace_begin().unwrap().staging_id;
@@ -276,6 +294,10 @@ mod tests {
             assert_eq!(imported["botPresets"], staged["botPresets"]);
             assert_eq!(imported["botPresetsId"], "");
             assert_eq!(imported["temperature"], 999);
+            assert_eq!(
+                imported["protectedPresetValues"],
+                json!({"fallbackModels": ["live"]})
+            );
         }
     }
 }

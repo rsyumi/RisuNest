@@ -450,6 +450,12 @@ impl RootSpool {
         Ok(selector.as_u64().filter(|index| *index < count).map(|index| index.to_string()))
     }
 
+    /// Whether the root's flag keeps `key` from following the selected preset.
+    fn protected_preset_field(&self, key: &str) -> StoreResult<bool> {
+        Ok(super::export::protected_preset_flag(key)
+            .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false))
+    }
+
     fn normalize(&self) -> StoreResult<()> {
         for field in ["modules","loadouts","customModels","personas","botPresets"] {
             if self.kind(field)? != Some(FieldKind::Array) { continue; }
@@ -477,6 +483,16 @@ impl RootSpool {
         // Upstream RisuAI edits only `globalChatVariables`, so a copy an earlier export left
         // in the file is replaced.
         self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
+        // The TypeScript import records a protected field's value whether or not a preset
+        // is selected.
+        for (key,_) in super::export::PRESET_MIRRORS {
+            if !self.protected_preset_field(key)? { continue; }
+            if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
+            match self.field_json(key)? {
+                Some(text) => self.put_member_json("protectedPresetValues",key,Some(stored_json::text(text)?.as_str()))?,
+                None => self.remove_member("protectedPresetValues",key)?,
+            }
+        }
         if self.count("botPresets")? == 0 { return Ok(()); }
         if let Some(key) = self.selected_preset()? {
             let text = self.member_text("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
@@ -484,14 +500,7 @@ impl RootSpool {
             let preset = document.value().object()?.ok_or_else(||invalid("Imported record must be an object"))?;
             let mut updates = Vec::new();
             for (key,field) in super::export::PRESET_MIRRORS {
-                if let Some(text) = self.field_json(key)? {
-                    let protected = super::export::protected_preset_flag(key)
-                        .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false);
-                    if protected {
-                        if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
-                        self.put_member_json("protectedPresetValues",key,Some(stored_json::text(text)?.as_str()))?;
-                    } else { updates.push((*field, text)); }
-                }
+                if let Some(text) = self.field_json(key)? { updates.push((*field, text)); }
             }
             let id = preset.get("id").map(|id| id.parse_value()).transpose()?.unwrap_or(Value::Null);
             self.put("botPresetsId",Some(&id))?;
@@ -549,18 +558,19 @@ impl RootSpool {
             }
         }
         self.copy_field("globalChatVariables","explicitGlobalChatVariables")?;
+        for (key,_) in super::export::PRESET_MIRRORS {
+            if !self.protected_preset_field(key)? { continue; }
+            if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
+            match self.value(key)? {
+                Some(value) => self.put_member("protectedPresetValues",key,Some(&value))?,
+                None => self.remove_member("protectedPresetValues",key)?,
+            }
+        }
         if self.count("botPresets")? == 0 { return Ok(()); }
         if let Some(key) = self.selected_preset()? {
             let mut preset = self.member("botPresets",&key)?.ok_or_else(||invalid("selected preset is missing"))?;
             for (key,field) in super::export::PRESET_MIRRORS {
-                if let Some(value) = self.value(key)? {
-                    let protected = super::export::protected_preset_flag(key)
-                        .map(|flag|self.scalar(flag)).transpose()?.flatten().and_then(|v|v.as_bool()).unwrap_or(false);
-                    if protected {
-                        if self.kind("protectedPresetValues")? != Some(FieldKind::Object) { self.begin("protectedPresetValues",FieldKind::Object)?; }
-                        self.put_member("protectedPresetValues",key,Some(&value))?;
-                    } else { preset[*field]=value; }
-                }
+                if let Some(value) = self.value(key)? { preset[*field]=value; }
             }
             self.put("botPresetsId",Some(&preset["id"]))?;
             self.put_member("botPresets",&key,Some(&preset))?;
@@ -715,6 +725,7 @@ mod tests {
             "personas":[{"id":"persona-one","name":"one"},{"id":"persona-two","name":"stale","embeddedModule":{"id":"embedded","assets":[]}}],
             "modules":[{"id":"module"}],"loadouts":[{"id":"loadout"}],"customModels":[{"id":"model"}],
             "plugins":[],"globalChatVariables":{"toggle_synthetic":"1","ordinary":"2"},"explicitGlobalChatVariables":{"stale":"0"},
+            "protectedPresetValues":{"fallbackWhenBlankResponse":true,"seperateModels":{"kept":1}},
             "botPresets":[{"id":"preset-one","name":"one"},{"id":"preset-two","temperature":0.1,"fallbackModels":["preset"]},
                 {"name":"Binary \"preset\"\n","id":"preset-binary","image":"preset.png","NAISettings":{"blob":binary,"n":-0.0}}],
             "pluginCustomStorage":{"shared":{"synthetic":true},"unowned":"value","binary":{"blob":binary,"text":"\u{d55c}\n"},"owned-binary":binary,
@@ -733,6 +744,8 @@ mod tests {
         streamed.replace_put_upstream_stream(&b,&root).unwrap();
         assert_eq!(streamed.materialize_staging(&b).unwrap(),old.materialize_staging(&a).unwrap());
         assert_eq!(streamed.materialize_staging(&b).unwrap()["explicitGlobalChatVariables"],json!({"toggle_synthetic":"1","ordinary":"2"}));
+        // A protected field takes the root's value, one the root lacks is dropped, and a field whose flag is off is kept.
+        assert_eq!(streamed.materialize_staging(&b).unwrap()["protectedPresetValues"],json!({"seperateModels":{"kept":1},"fallbackModels":["protected"]}));
         for sql in [
             "SELECT preset_id,configured_index,name,image,value FROM bot_presets WHERE generation=?1 ORDER BY configured_index",
             "SELECT owner,storage_key,byte_size,ordinal,value,import_batch_id=?1 FROM plugin_storage WHERE generation=?1 ORDER BY owner,storage_key",
@@ -987,7 +1000,8 @@ mod tests {
                 "seperateModels": {"a": "b"}, "doNotChangeSeperateModels": false,
                 "explicitGlobalChatVariables": {"stale": 1}, "globalChatVariables": {"other": 2},
             }),
-            json!({"botPresets": [{"id": "x"}], "protectedPresetValues": {"fallbackModels": []}, "fallbackModels": [], "doNotChangeFallbackModels": true}),
+            json!({"botPresets": [{"id": "x"}], "protectedPresetValues": {"fallbackModels": [], "fallbackWhenBlankResponse": true},
+                "fallbackModels": [], "doNotChangeFallbackModels": true}),
             json!({"modules": [{"id": "m"}, "not a record"]}),
             json!({"personas": [{"id": "p", "embeddedModule": null}]}),
             json!({"personas": [], "modules": {"id": "not an array"}}),
@@ -1001,6 +1015,7 @@ mod tests {
             assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
         }
         // A selection that names no preset selects none, and no preset takes the root's values.
+        // The protected value is recorded all the same.
         for selection in [json!(-1), json!("gone"), json!(2)] {
             let fixture = json!({
                 "botPresets": [{"id": "first", "temperature": 1}, {"id": "second"}], "botPresetsId": selection,
@@ -1013,7 +1028,7 @@ mod tests {
             assert_eq!(normalized(&texts), normalized(&values), "{fixture}");
             assert_eq!(texts.scalar("botPresetsId").unwrap(), Some(json!("")), "{fixture}");
             assert_eq!(texts.member("botPresets", "0").unwrap(), Some(json!({"id": "first", "temperature": 1})), "{fixture}");
-            assert_eq!(texts.kind("protectedPresetValues").unwrap(), None, "{fixture}");
+            assert_eq!(texts.value("protectedPresetValues").unwrap(), Some(json!({"fallbackModels": ["live"]})), "{fixture}");
         }
     }
 }
