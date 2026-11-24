@@ -3,6 +3,7 @@ import { jsonByteLength, prepareNativePersistenceValue, type PayloadTooLargeKind
 import { invoke } from '@tauri-apps/api/core'
 import { nativeCommitTransport, STAGED_REQUEST_BYTES, type NativeCommitTransport } from './nativeCommitTransport'
 import { rendererDocument } from './rendererDocument'
+import { withCommitAssetExtensions } from './assetTuples'
 
 import type { Chat, Database, botPreset } from './database.svelte'
 import {
@@ -403,7 +404,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
 
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         const { assetAliases = [], ...commit } = input
-        return this.transport.commit({ commit, assetAliases }).catch((error) => {
+        return this.transport.commit({ commit: withCommitAssetExtensions(commit), assetAliases }).catch((error) => {
             throw restoreStoreError(error)
         })
     }
