@@ -77,6 +77,7 @@ import {
     type PluginFullObjectCallContext,
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
+import { createRisunestHostMethods } from '../risunestHostMethods';
 import { chatViewEvents } from '../chatViewHost.svelte';
 import { generationEndEvents } from '../generationEndHost';
 import { conversationPatchAccess } from '../conversationPatchHost';
@@ -811,6 +812,14 @@ const makeRisuaiAPIV3 = (
         hasHostToolPermission: () => getPluginPermission(permissionContext, 'hostTools', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
+    const risunestHost = createRisunestHostMethods({
+        pluginName: plugin.name,
+        databaseAccess,
+        hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
+        hasDatabaseWritePermission,
+        lifetimeSignal: pluginLifetime.signal,
+        iframe,
+    })
     const fullObjectContext = (): PluginFullObjectCallContext => ({
         pluginName: plugin.name,
         signal: pluginLifetime.signal,
@@ -1013,6 +1022,7 @@ const makeRisuaiAPIV3 = (
             risunest.onChatView(callback),
         risunestOnGenerationEnd: (callback?: unknown) =>
             risunest.onGenerationEnd(callback),
+        ...risunestHost.methods,
 
         installPlugin: (plugins: RisuPlugin[]) => handlePluginInstallViaPlugin(plugins, plugin.name, 'installPlugin'),
 

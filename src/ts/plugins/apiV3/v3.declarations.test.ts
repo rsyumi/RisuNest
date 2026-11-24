@@ -83,11 +83,31 @@ describe('plugin API declarations', () => {
     it('exposes the private RisuNest methods to the guest', () => {
         expect(Object.keys(host).filter((name) => name.startsWith('risunest')).sort()).toEqual([
             'risunestCallHostTool',
+            'risunestCheckLuaSyntax',
+            'risunestCreateCharacter',
+            'risunestCreatePreset',
+            'risunestDeleteLoadout',
+            'risunestDeletePreset',
             'risunestListHostTools',
+            'risunestListLoadouts',
+            'risunestListPresets',
+            'risunestListSettingKeys',
             'risunestOnChatView',
             'risunestOnGenerationEnd',
             'risunestPatchConversation',
             'risunestReadConversationContext',
+            'risunestReadGlobalVariables',
+            'risunestReadPreset',
+            'risunestReadSettings',
+            'risunestRestoreCharacter',
+            'risunestSelectPreset',
+            'risunestSetFloatingDragRegion',
+            'risunestShowFloatingWindow',
+            'risunestTrashCharacter',
+            'risunestUpdatePreset',
+            'risunestWriteGlobalVariables',
+            'risunestWriteLoadout',
+            'risunestWriteSettings',
         ])
     })
 
