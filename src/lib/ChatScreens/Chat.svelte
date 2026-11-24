@@ -12,6 +12,7 @@
     import { forgetEditorPopup, type ChatEditorDraft, type ChatEditorPopup, type ChatEditorPopupHandlers } from "src/ts/chatEditorDrafts"
     import { getModelInfo } from "src/ts/model/modellist"
     import { runLuaInteractionTrigger } from 'src/ts/process/scriptings'
+    import { isConversationStop } from 'src/ts/process/conversationStop'
     import { risuChatParser } from "src/ts/process/scripts"
     import { DisplayReadRecord, recordChatVariableReads, registerDisplayRow } from 'src/ts/process/scriptVariableReads'
     import { rebuildScriptDisplayRow } from 'src/ts/process/scriptDisplayRefresh'
@@ -1036,6 +1037,9 @@
                     rebuildScriptDisplayRow(idx)
                 }
             }
+        }).catch((error: unknown) => {
+            // Leaving or changing the conversation ends the script; that is not a failure to show.
+            if (!isConversationStop(error)) throw error
         })
     }
 

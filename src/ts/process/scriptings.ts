@@ -44,13 +44,8 @@ import {
     getActiveConversationViewportSource,
     peekActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte';
-import {
-    ConversationNotFoundError,
-    ConversationSessionInactiveError,
-    ConversationSessionStaleError,
-    MessageLocatorMismatchError,
-    type ActiveConversationSession,
-} from '../storage/activeConversationSession';
+import type { ActiveConversationSession } from '../storage/activeConversationSession';
+import { isConversationStop } from './conversationStop';
 import { runSerializedUserTrigger } from './conversationUserTrigger';
 import {
     findActiveHistoryWindow,
@@ -1746,15 +1741,6 @@ function luaHandlerErrorNotice(mode: string, error: unknown): alertData {
         msg: `Lua (${mode})\n${scriptLineNumbers(luaErrorMessage(error))}`,
         stackTrace: error instanceof Error && error.stack ? scriptLineNumbers(error.stack) : undefined,
     }
-}
-
-/** Host errors that end a handler because its conversation was left or changed, not because the script failed. */
-function isConversationStop(error: unknown): boolean {
-    return error instanceof ConversationSessionInactiveError
-        || error instanceof ConversationSessionStaleError
-        || error instanceof ConversationNotFoundError
-        || error instanceof MessageLocatorMismatchError
-        || error instanceof PersistentMutationFencedError
 }
 
 /** Marks the run when a host call stops on a conversation change, which Lua sees only as an error message. */
