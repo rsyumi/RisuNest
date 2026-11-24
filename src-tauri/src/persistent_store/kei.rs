@@ -873,6 +873,8 @@ fn write_database(
     let root_object = root.as_object_mut().ok_or_else(|| StoreError::Validation {
         message: "Persistent root must be an object".to_owned(),
     })?;
+    // The stored root holds the selections as ids; RisuAI reads them as positions.
+    super::export::derive_identity_root(connection, generation, root_object)?;
     root_object.insert("account".to_owned(), account.clone());
     let root = root.as_object().ok_or_else(|| StoreError::Validation {
         message: "Persistent root must be an object".to_owned(),
@@ -1323,6 +1325,72 @@ mod tests {
         assert_eq!(body, EXPECTED_PAYLOAD);
         drop(payload);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn payload_carries_the_selections_and_their_fields_as_upstream_reads_them() {
+        let directory = tempfile::tempdir().expect("create temp directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open store");
+        let staging = store.replace_begin().expect("begin replacement");
+        store
+            .replace_put_root(
+                &staging.staging_id,
+                &json!({
+                    "botPresetsId": "a-second",
+                    "selectedPersona": "persona-b",
+                    "temperature": 10,
+                    "username": "stale",
+                    "personas": [
+                        { "id": "persona-a", "name": "first", "icon": "", "personaPrompt": "", "note": "" },
+                        { "id": "persona-b", "name": "second", "icon": "icon-b", "personaPrompt": "prompt-b", "note": "note-b" }
+                    ],
+                    "globalChatVariables": { "toggle_bound": "1" },
+                    "explicitGlobalChatVariables": { "toggle_shared": "1" }
+                }),
+            )
+            .expect("stage root");
+        // The configured order differs from the id order, and the index follows the configured one.
+        store
+            .replace_put_presets(
+                &staging.staging_id,
+                &[
+                    json!({ "id": "z-first", "name": "first", "temperature": 20 }),
+                    json!({ "id": "a-second", "name": "second", "temperature": 80 }),
+                ],
+            )
+            .expect("stage presets");
+        store
+            .replace_commit(&staging.staging_id, Some(0))
+            .expect("commit fixture");
+        let lease = store.acquire_revision(1).expect("acquire lease").lease;
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                "http://127.0.0.1/autobackup/save",
+                "account-1",
+                "secret-token",
+                &synthetic_account(),
+            )
+            .expect("prepare upload");
+
+        let payload = prepared.create_payload().expect("create payload");
+        let body: Value =
+            serde_json::from_str(&fs::read_to_string(&payload.path).expect("read payload"))
+                .expect("payload JSON");
+        let database = &body["database"];
+
+        assert_eq!(database["botPresets"][1]["id"], "a-second");
+        assert_eq!(database["botPresetsId"], 1);
+        assert_eq!(database["temperature"], 80);
+        assert_eq!(database["selectedPersona"], 1);
+        assert_eq!(database["username"], "second");
+        assert_eq!(database["userIcon"], "icon-b");
+        assert_eq!(database["personaPrompt"], "prompt-b");
+        assert_eq!(database["userNote"], "note-b");
+        assert_eq!(
+            database["globalChatVariables"],
+            json!({ "toggle_shared": "1" })
+        );
     }
 
     #[test]

@@ -250,6 +250,72 @@ describe('SqlitePersistentDataStore', () => {
         ])
     })
 
+    it('sends every asset tuple of a commit with an extension and leaves the caller\'s lists as they are', async () => {
+        mocks.invoke.mockResolvedValue({ revision: 2 })
+        const store = new SqlitePersistentDataStore()
+        const assets = () => [['short', 'assets/a.png'], ['null', 'assets/b.png', null], ['kept', 'assets/c.png', 'png']]
+        const filled = [['short', 'assets/a.png', ''], ['null', 'assets/b.png', ''], ['kept', 'assets/c.png', 'png']]
+        const module = () => ({ id: 'module', assets: [['trailing', 'assets/d.png', null, 'extra']] })
+        const filledModule = { id: 'module', assets: [['trailing', 'assets/d.png', '', 'extra']] }
+        const persona = () => ({ id: 'persona', embeddedModule: module() })
+        const filledPersona = { id: 'persona', embeddedModule: filledModule }
+        const character = (chaId: string) => ({ chaId, name: chaId, additionalAssets: assets() })
+        const filledCharacter = (chaId: string) => ({ chaId, name: chaId, additionalAssets: filled })
+        const set = (key: unknown, value: unknown) => ({ type: 'set' as const, key: typeof key === 'string' ? key : JSON.stringify(key), value })
+        const whole = {
+            expectedRevision: 1,
+            root: { modules: [module(), { id: 'plain' }], personas: [persona(), { id: 'plain' }] },
+            character: character('a'),
+            characterDetails: [character('b'), { chaId: 'c', name: 'c' }],
+            replaceCharacter: character('d'),
+            addCharacter: character('e'),
+        } as unknown as Parameters<SqlitePersistentDataStore['commit']>[0]
+        const units = (value: { list: unknown; module: unknown; persona: unknown }) => [
+            set(['character', 'a', 'additionalAssets'], value.list),
+            set(['root', 'modules'], [value.module]),
+            set(['root', 'personas'], [value.persona]),
+            set(['record', 'modules', 'module'], value.module),
+            set(['record', 'personas', 'persona'], value.persona),
+            set(['persona', 'persona', 'embeddedModule'], value.module),
+            // The same shapes under keys that hold no asset list stay as sent.
+            set(['character', 'a', 'modules'], assets()),
+            set(['record', 'loadouts', 'modules'], module()),
+            { type: 'delete' as const, key: JSON.stringify(['record', 'modules', 'gone']) },
+        ]
+        const partial = {
+            expectedRevision: 2,
+            rootMutations: [set('modules', [module()]), set('personas', [persona()]), set('username', assets())],
+            unitMutations: units({ list: assets(), module: module(), persona: persona() }),
+        }
+
+        await store.commit(whole)
+        await store.commit(partial)
+
+        expect(mocks.invoke.mock.calls).toEqual([
+            ['pds_commit', {
+                commit: {
+                    expectedRevision: 1,
+                    root: { modules: [filledModule, { id: 'plain' }], personas: [filledPersona, { id: 'plain' }] },
+                    character: filledCharacter('a'),
+                    characterDetails: [filledCharacter('b'), { chaId: 'c', name: 'c' }],
+                    replaceCharacter: filledCharacter('d'),
+                    addCharacter: filledCharacter('e'),
+                },
+                assetAliases: [],
+            }],
+            ['pds_commit', {
+                commit: {
+                    expectedRevision: 2,
+                    rootMutations: [set('modules', [filledModule]), set('personas', [filledPersona]), set('username', assets())],
+                    unitMutations: units({ list: filled, module: filledModule, persona: filledPersona }),
+                },
+                assetAliases: [],
+            }],
+        ])
+        expect(whole.character).toEqual(character('a'))
+        expect(partial.unitMutations).toEqual(units({ list: assets(), module: module(), persona: persona() }))
+    })
+
     it('forwards asset alias kind for current and leased reads', async () => {
         mocks.invoke.mockResolvedValueOnce({ lease: 'lease-alias-kind' }).mockResolvedValue(null)
         const store = new SqlitePersistentDataStore()

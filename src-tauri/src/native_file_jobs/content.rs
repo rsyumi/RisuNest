@@ -558,14 +558,17 @@ fn prepare_risum_content(
                     format!("Risu module asset {position} must be a tuple"),
                 )
             })?;
-            if tuple.len() < 3 {
+            if tuple.len() < 2 {
                 return Err(NativeJobError::new(
                     "invalid-input",
                     format!("Risu module asset {position} tuple is incomplete"),
                 ));
             }
             tuple[1] = Value::String(String::new());
-            if tuple[2].is_null() {
+            // An extension that was never set arrives as null or not at all.
+            if tuple.len() == 2 {
+                tuple.push(Value::String(String::new()));
+            } else if tuple[2].is_null() {
                 tuple[2] = Value::String(String::new());
             }
         }

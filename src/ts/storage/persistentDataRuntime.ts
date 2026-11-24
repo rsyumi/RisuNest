@@ -1514,8 +1514,7 @@ export function createPersistentDataRuntime(
                 )
             }
             if (isTauri && options?.upstreamImport) {
-                const {prepareUpstreamImport} = await import('./importedIdentity')
-                const candidate = await dependencies.prepareDatabase(prepareUpstreamImport(database))
+                const candidate = await dependencies.prepareDatabase(database)
                 const {prepareBoundLibraryReplacement} = await import('./sync/bindingRegistry')
                 const binding = await prepareBoundLibraryReplacement()
                 const {acquireUpstreamImportPause, confirmUpstreamLibraryReplacement} = await import('./upstreamReplacement')

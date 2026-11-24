@@ -562,6 +562,30 @@ mod tests {
         assert_eq!(error.item_kind.as_deref(), Some("card"));
         assert!(error.message.contains("importer limit"));
     }
+
+    #[test]
+    fn script_metadata_reads_an_absent_or_null_list_as_empty_on_either_side() {
+        let validate = |card_scripts: Value, mut character: Value| {
+            character["chaId"] = json!("current-character");
+            character["name"] = json!("Current");
+            validate_metadata(
+                &character,
+                "current-character",
+                &json!({
+                    "spec": "chara_card_v3",
+                    "spec_version": "3.0",
+                    "data": {"name": "Current", "assets": [], "extensions": {"risuai": card_scripts}}
+                }),
+            )
+        };
+        let empty = json!({"triggerscript": [], "customScripts": []});
+        let null = json!({"triggerscript": null, "customScripts": null});
+        validate(json!({}), json!({})).unwrap();
+        validate(json!({}), json!({"triggerscript": [], "customscript": []})).unwrap();
+        validate(empty, json!({"triggerscript": null, "customscript": null})).unwrap();
+        validate(null, json!({})).unwrap();
+        validate(json!({"triggerscript": [{"comment": "other"}]}), json!({})).unwrap_err();
+    }
 }
 use super::content::JSON_CARD_MAX_METADATA_BYTES;
 use super::available_payload::{available_payload_size, open_available_payload};
@@ -872,15 +896,16 @@ pub(super) fn validate_metadata(
         .pointer("/data/extensions/risuai")
         .and_then(Value::as_object)
         .ok_or_else(|| invalid_input("CCv3 risuai extensions must be an object"))?;
+    // An absent or null list is an empty one, in the card and in the character.
+    let list = |value: Option<&Value>| match value {
+        None | Some(Value::Null) => Value::Array(Vec::new()),
+        Some(value) => value.clone(),
+    };
     for (card_key, character_key) in [
         ("triggerscript", "triggerscript"),
         ("customScripts", "customscript"),
     ] {
-        let expected = character
-            .get(character_key)
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        if risuai.get(card_key) != Some(&expected) {
+        if list(risuai.get(card_key)) != list(character.get(character_key)) {
             return Err(invalid_input(
                 "CCv3 script metadata does not match the pinned character",
             ));

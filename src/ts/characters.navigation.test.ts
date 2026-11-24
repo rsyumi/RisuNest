@@ -1415,6 +1415,10 @@ describe('chat list operations', () => {
         const character = buildCharacter()
         character.type = undefined as any
         character.customscript = undefined as any
+        character.globalLore = null as any
+        for (const field of ['firstMessage', 'viewScreen', 'emotionImages', 'bias', 'desc'] as const) {
+            delete (character as Partial<typeof character>)[field]
+        }
         const shell = createMetadataOnlySelectedConversation(character.chats[0])
         delete shell.fmIndex
         delete shell.localLore
@@ -1425,9 +1429,21 @@ describe('chat list operations', () => {
 
         expect(formatted.type).toBe('character')
         expect(formatted.customscript).toEqual([])
+        expect(formatted).toMatchObject({
+            globalLore: [], firstMessage: '', viewScreen: 'none', emotionImages: [], bias: [], desc: '',
+        })
         expect(formatted.chats[0]).toBe(shell)
         expect(formatted.chats[0].fmIndex).toBe(-1)
         expect(formatted.chats[0].localLore).toEqual([])
+    })
+
+    it('replaces a script list or lorebook that is not a list with an empty one', () => {
+        const character = buildCharacter()
+        character.triggerscript = 'not a list' as any
+        character.customscript = {} as any
+        character.globalLore = 7 as any
+
+        expect(characterFormatUpdate(character)).toMatchObject({ triggerscript: [], customscript: [], globalLore: [] })
     })
 
     it('reads a chat authoritatively and navigates only to its duplicate', async () => {

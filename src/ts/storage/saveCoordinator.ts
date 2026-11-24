@@ -613,6 +613,7 @@ export interface PreparedUnitIntent {
 
 export interface PersistentReplacementOptions {
     signal?: AbortSignal
+    /** The database is an upstream import that the caller passed through `prepareUpstreamImport`. */
     upstreamImport?: boolean
     upstreamImportWarnings?: string[]
     firstRun?: boolean
