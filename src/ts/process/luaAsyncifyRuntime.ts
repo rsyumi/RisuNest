@@ -12,6 +12,24 @@ type AsyncifyExports = {
 }
 const formatInLua = Symbol('formatInLua')
 
+/**
+ * LuaThread.assertOk without the traceback it appends. The entry wrappers rethrow a script's
+ * error from their own frame after xpcall unwound the script, so that traceback lists only wrapper code.
+ */
+function threadFailure(thread: LuaThread, status: LuaReturn): Error {
+    const error = new Error(`Lua Error(${LuaReturn[status]}/${status})`)
+    if (thread.getTop() > 0) {
+        if (status === LuaReturn.ErrorMem) {
+            error.message = thread.lua.lua_tolstring(thread.address, -1, null)
+        } else {
+            const value = thread.getValue(-1)
+            if (value instanceof Error) error.stack = value.stack
+            error.message = thread.indexToString(-1)
+        }
+    }
+    return error
+}
+
 export class LuaAsyncifyRuntime {
     private readonly lua
     private readonly module
@@ -248,7 +266,7 @@ export class LuaAsyncifyRuntime {
                 }
                 returned = true
                 this.controlGC(false)
-                thread.assertOk(status)
+                if (status !== LuaReturn.Ok && status !== LuaReturn.Yield) throw threadFailure(thread, status)
                 if (this.budget.expired(this.engine)) throw new Error('thread timeout exceeded')
                 if (status === LuaReturn.Yield) {
                     const count = this.module.getValue(pointer, 'i32') as number
