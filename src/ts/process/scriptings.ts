@@ -34,6 +34,7 @@ import { LuaWorkerExecutor, LuaWorkerUnavailableError } from './luaWorkerExecuto
 import { luaErrorMessage } from './luaWorkerProtocol';
 import { createLuaHistoryJSON } from './luaHistoryJSON';
 import { luaCodeWrapper } from './luaCodeWrapper';
+import { scriptLineNumbers } from './luaScriptLines';
 import { withObjectUrl } from '../objectUrl';
 import {
     type ConversationOperationContext,
@@ -1711,16 +1712,6 @@ function finishScriptingEngineUse(state: ScriptingEngineState) {
         removeScriptingEngineStateIfUnused(state)
     }
     evictIdleScriptingEngines()
-}
-
-/** Lines the wrapper puts before the script, so reported lines count from the script's first line. */
-const luaWrapperLeadingLines = luaCodeWrapper('\0').split('\n').findIndex((line) => line.includes('\0'))
-
-function scriptLineNumbers(text: string): string {
-    return text.replace(/(\[string "\.\.\."\]:)(\d+)/g, (match, chunk: string, line: string) => {
-        const scriptLine = Number(line) - luaWrapperLeadingLines
-        return scriptLine > 0 ? chunk + scriptLine : match
-    })
 }
 
 function withScriptLineNumbers(error: unknown): unknown {

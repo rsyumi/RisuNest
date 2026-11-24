@@ -794,12 +794,16 @@ test.each([
   }
 })
 
-test('numbers a load error from the first line of the script', async () => {
-  await expect(runScripted('local ok = 1\nlocal broken = = 1', {
+test.each([
+  { code: 'local ok = 1\nlocal broken = = 1', message: `[string "..."]:2: unexpected symbol near '='` },
+  // A line the compiler names inside its message counts from the script too.
+  { code: 'local ok = 1\nfunction broken()', message: `[string "..."]:3: 'end' expected (to close 'function' at line 2) near <eof>` },
+])('numbers a load error from the first line of the script: $message', async ({ code, message }) => {
+  await expect(runScripted(code, {
     char: { chaId: 'load-error-line' } as never,
     chat: { message: [] } as never,
     mode: 'start',
-  })).rejects.toHaveProperty('message', `[string "..."]:2: unexpected symbol near '='`)
+  })).rejects.toHaveProperty('message', message)
 })
 
 test.runIf(inject('luaWorker') === true)('rejects with the abort reason when a script stops while loading', async () => {
