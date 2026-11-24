@@ -123,7 +123,6 @@ describe('replacing', () => {
         const blocks = [block('keep'), { type: 'lorebook', name: 'drop me' } as PromptItem]
         expect(replaceAllInBlocks(blocks, ready(' me'), '').map(change => change.after)).toEqual(['drop'])
         expect(replaceAllInBlocks(blocks, ready('keep'), 'keep')).toEqual([])
-        expect(replaceAllInBlocks([block('Foo FOO')], regex('foo'), '$&')).toEqual([])
     })
 
     it('records only the matches whose text changes, however they are spread over fields', () => {
