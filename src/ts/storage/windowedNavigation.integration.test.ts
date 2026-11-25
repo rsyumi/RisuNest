@@ -1404,6 +1404,21 @@ describe('selected chat list edits', () => {
                 const source = runtime.getActiveConversationViewportSource()!
                 await source.ensureRange({ startIndex: history.length - 2, limit: 3, reason: 'viewport' })
                 expect([history.length - 1, history.length].map((index) => source.snapshot().rowAt(index)?.message)).toEqual(moved.slice(-2))
+                // Once the rows are read again, commits while the next reply streams keep that reply.
+                for (const [index, save] of [
+                    () => runtime.commitPersistentUnitIntent('plugin-settings-write', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 8 }]),
+                    () => runtime.flushPendingData('streaming-save'),
+                ].entries()) {
+                    const next = { role: 'char', data: `Synthetic reply ${index} after the rows were read again`, chatId: `synthetic-next-${index}` } as Message
+                    vi.mocked(runtime.store.commit).mockImplementationOnce(async (request) => {
+                        const result = await commit(request)
+                        write(moved.length, 0, next)
+                        return result
+                    })
+                    await save()
+                    expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                    moved.push(next)
+                }
             }
             // Later saves store nothing at the indexes the moved rows had.
             await Promise.resolve().then(() => runtime.flushPendingData('later-save')).catch(() => {})
