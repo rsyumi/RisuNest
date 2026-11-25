@@ -892,6 +892,56 @@ describe('PersistentConversationViewportSource', () => {
         await expect(source.findLatestMessagePair(new AbortController().signal)).resolves.toEqual([0, 2])
     })
 
+    // A save stores a grown conversation while a lookup still reads the earlier revision.
+    it.each(['window', 'metadata window'])('ends a pair lookup as changed when a later revision stores another count before its $0 arrives', async (shape) => {
+        const stored = [{ role: 'user', data: 'a' }, { role: 'char', data: 'b' }, { role: 'char', data: 'c' }] as Message[]
+        const released = deferred<void>()
+        const readConversationWindow = vi.fn(async ({ startIndex, limit }: ConversationWindowQuery) => {
+            await released.promise
+            return { revision: 7, value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), 3) }
+        })
+        const readConversationMessageMetadataWindow = vi.fn(async (query: ConversationWindowQuery) => {
+            const { revision, value } = await readConversationWindow(query)
+            return { revision, value: { ...value, messages: value.messages.map(({ role, disabled }) => ({ role, disabled, parserInert: true })) } }
+        })
+        const source = new PersistentConversationViewportSource({
+            reader: shape === 'window'
+                ? { readConversationWindow }
+                : { readConversationWindow: vi.fn(async () => null), readConversationMessageMetadataWindow },
+            characterId: 'character-a', conversationId: 'conversation-a', revision: 7, totalMessages: 3, rowBudget: 8,
+        })
+        source.applyOptimisticRange(3, 0, [{ role: 'char', data: 'd' }], 1)
+        const lookup = source.findLatestMessagePair(new AbortController().signal)
+        await vi.waitFor(() => expect(readConversationWindow).toHaveBeenCalled())
+        source.advanceUnchangedRevision(8, { totalMessages: 4, sessionVersion: 1 })
+        released.resolve()
+        await expect(lookup).rejects.toMatchObject({ name: 'AbortError' })
+    })
+
+    it('finds the latest message pair again, and tells the screen, once a stored edit lets an evicted row read the store', async () => {
+        const stored = [{ role: 'user', data: 'a' }, { role: 'char', data: 'b' }, { role: 'char', data: 'c' }] as Message[]
+        let revision = 7
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow: vi.fn(async ({ startIndex, limit }: ConversationWindowQuery) => ({
+                revision,
+                value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), stored.length),
+            })) },
+            characterId: 'character-a', conversationId: 'conversation-a', revision: 7, totalMessages: 3, rowBudget: 2,
+        })
+        // The disabled first message is evicted before it is stored.
+        const disabled = { role: 'user', data: 'a', disabled: true } as Message
+        source.applyOptimisticRange(0, 1, [disabled], 1)
+        source.applyOptimisticRange(1, 2, [{ role: 'char', data: 'b' }, { role: 'char', data: 'c' }], 2)
+        await source.findLatestMessagePair(new AbortController().signal)
+        stored[0] = disabled
+        revision = 8
+        const listener = vi.fn()
+        source.subscribe(listener)
+        source.advanceUnchangedRevision(8, { totalMessages: 3, sessionVersion: 1 })
+        expect(listener).toHaveBeenCalled()
+        await expect(source.findLatestMessagePair(new AbortController().signal)).resolves.toEqual([2])
+    })
+
     it('validates authority, range, pin, and monotonic revision inputs', async () => {
         const reader = {
             readConversationWindow: vi.fn(async () => null),

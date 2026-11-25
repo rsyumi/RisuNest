@@ -5,6 +5,7 @@ import type {
     WorkingSetCommit,
 } from './persistentDataStore'
 import { MAX_NATIVE_REQUEST_BYTES, PayloadTooLargeError } from './nativePersistenceValue'
+import { RevisionConflictError } from './persistentDataStore'
 import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
 import {
     captureRoot,
@@ -58,6 +59,7 @@ describe('SaveCoordinator', () => {
             totalMessages?: number
             readRevision?: number
             commit?: Parameters<typeof makeStore>[0]
+            store?: Parameters<typeof makeStore>[1]
         } = {}) {
             const database = makeDatabase()
             const { character: projection, projectedConversation } = makeWindowedProjection()
@@ -89,7 +91,7 @@ describe('SaveCoordinator', () => {
                     hasMoreAfter: true,
                 },
             }))
-            const store = makeStore(commit, { readConversationWindow })
+            const store = makeStore(commit, { readConversationWindow, ...options.store })
             const onPersisted = vi.fn((event) => {
                 if (authority?.sessionToken !== event.sessionToken) return
                 authority = {
@@ -101,6 +103,8 @@ describe('SaveCoordinator', () => {
             // What each local commit told the working set: its revision and, when given, the stored count
             // and the rows it rewrote.
             const localRevisions: [number, number | undefined, readonly ConversationRowsRewrite[] | undefined][] = []
+            // The stored count each flush handed to the working set with its revision.
+            const windowedRevisions: [number, number | undefined][] = []
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -111,7 +115,8 @@ describe('SaveCoordinator', () => {
                     : database.characters.find((item) => item.chaId === id) ?? null,
                 replaceDatabase: () => undefined,
                 onConversationMutationPersisted: onPersisted,
-                onWindowedSelectedConversationRevision: (revision) => {
+                onWindowedSelectedConversationRevision: (revision, _totalMessages, _preserveRows, storedTotalMessages) => {
+                    windowedRevisions.push([revision, storedTotalMessages])
                     if (authority) authority = { ...authority, storeRevision: revision }
                 },
                 onLocalRevision: (revision, storedTotalMessages, rewritten) =>
@@ -130,6 +135,7 @@ describe('SaveCoordinator', () => {
                 coordinator,
                 database,
                 localRevisions,
+                windowedRevisions,
                 onPersisted,
                 projectedConversation,
                 readConversationWindow,
@@ -1299,6 +1305,39 @@ describe('SaveCoordinator', () => {
                     ...conversation ? { conversation: conversation as unknown as Omit<Chat, 'message'> } : {},
                 })))
             expect(harness.localRevisions).toEqual([[3, ...reported]])
+        })
+
+        // A retry that moves past another writer's commit cannot tell whether it moved the open
+        // conversation's rows, so the working set is not told the rows are current.
+        it.each([
+            { commit: 'a save', retried: false, reported: [[3, 40]] },
+            { commit: 'a save', retried: true, reported: [[4, undefined]] },
+            { commit: 'a chat setting change', retried: false, reported: [[3, 40]] },
+            { commit: 'a chat setting change', retried: true, reported: [[4, undefined]] },
+        ])('tells the working set whether the open windowed conversation\'s rows are current after $commit (retried past another writer: $retried)', async ({ commit, retried, reported }) => {
+            let attempts = 0
+            const harness = makeWindowedHarness({
+                totalMessages: 40,
+                commit: vi.fn(async ({ expectedRevision }) => {
+                    if (retried && !attempts++) throw new RevisionConflictError(expectedRevision, expectedRevision + 1)
+                    return { revision: expectedRevision + 1 }
+                }),
+                store: {
+                    readConversationMetadata: vi.fn(async () => ({ revision: harness.coordinator.revision, value: {
+                        characterId: 'char-a', conversationId: 'two', totalMessages: 40,
+                        conversation: { id: 'two', name: 'Two', note: '' } as Omit<Chat, 'message'>,
+                    } })),
+                },
+            })
+            if (commit === 'a save') {
+                harness.database.username = 'Saved while another writer committed'
+                harness.coordinator.markPersistentDataDirty(0)
+                await harness.coordinator.flushPendingData('save')
+                expect(harness.windowedRevisions).toEqual(reported)
+            } else {
+                await harness.coordinator.mutateConversationBinding('char-a', 'two', { note: 'changed' }, () => {}, { note: '' })
+                expect(harness.localRevisions.map(([revision, storedTotalMessages]) => [revision, storedTotalMessages])).toEqual(reported)
+            }
         })
 
         function recordAddedChat(

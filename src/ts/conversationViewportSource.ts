@@ -510,7 +510,10 @@ implements ConversationViewportSource {
         if (resident.size === 2 || index < 0) return this.latestPair = Promise.resolve([...resident.values()].sort((left, right) => left - right))
         const revision = this.currentRevision
         const epoch = this.epoch
+        // A later revision that stores a different count also changes the windows this lookup checks.
+        const persistedTotalMessages = this.persistedTotalMessages
         const sameConversationRevision = (value: number | undefined) => !this.disposed && epoch === this.epoch &&
+            persistedTotalMessages === this.persistedTotalMessages &&
             value !== undefined && value >= revision && value <= this.currentRevision
         const lookup = scanLatestMessagePair(this.totalMessages, async (start, limit, found) => {
             const query = { characterId: this.characterId, conversationId: this.conversationId, startIndex: start, limit }
@@ -735,15 +738,15 @@ implements ConversationViewportSource {
         for (const [index, sessionVersion] of this.optimisticRows) {
             if (sessionVersion <= stored.sessionVersion) this.optimisticRows.delete(index)
         }
-        const rewritten = (stored.rewritten ?? []).filter(({ messages }) => messages.length > 0)
-        if (!rewritten.length) return
-        for (const { start, messages } of rewritten) {
+        for (const { start, messages } of stored.rewritten ?? []) {
+            if (!messages.length) continue
             for (let offset = 0; offset < messages.length; offset++) {
                 const cached = this.rows.get(start + offset)
                 if (cached) cached.row = { ...cached.row, message: safeStructuredClone(messages[offset]) }
             }
             this.recordHistoryChange(start, start + messages.length, false)
         }
+        // Evicted rows of the stored edits now read the store, which may change the latest pair.
         this.latestPair = null
         this.notifyListeners()
     }

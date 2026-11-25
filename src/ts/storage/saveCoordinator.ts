@@ -771,6 +771,9 @@ function defaultClock(): SaveCoordinatorClock {
 export class SaveCoordinator {
     private readonly clock: SaveCoordinatorClock
     private currentRevision: DataRevision | null = null
+    // The latest revision of another writer that a conflict retry moved past without reading its changes. Rows of
+    // the open windowed conversation read before it may not show them.
+    private passedOverRevision: DataRevision = -1
     private authorityEpoch = 0
     private committedRefreshRevision: DataRevision | null = null
     private rootBaseline: string | null = null
@@ -2032,7 +2035,7 @@ export class SaveCoordinator {
                 return await this.dependencies.store.commit(canonicalClone(commit))
             } catch (error) {
                 if (!(error instanceof RevisionConflictError) || error.actualRevision <= commit.expectedRevision) throw error
-                this.currentRevision = error.actualRevision
+                this.currentRevision = this.passedOverRevision = error.actualRevision
             }
         }
     }
@@ -4083,6 +4086,10 @@ export class SaveCoordinator {
         // revision while the two differ, so the evidence moves with the baseline before the working set is told.
         const activation = this.pendingWindowedActivationChange
         const previous = this.windowedCharacterBaseline
+        if (previous && this.passedOverRevision > previous.authority.storeRevision) {
+            rowsUnchanged = false
+            storedTotalMessages = undefined
+        }
         if (activation && previous && sameWindowedAuthority(activation.authority, previous.authority)) {
             activation.authority = { ...activation.authority, storeRevision: revision }
         }
@@ -4117,7 +4124,8 @@ export class SaveCoordinator {
         conversations: readonly ConversationMutation[] = [],
     ): { totalMessages: number, rewritten: ConversationRowsRewrite[] } | undefined {
         const authority = this.windowedCharacterBaseline?.authority
-        if (!authority || unitKeysReachConversationMessages(keys, authority.characterId, authority.conversationId)) return undefined
+        if (!authority || this.passedOverRevision > authority.storeRevision ||
+            unitKeysReachConversationMessages(keys, authority.characterId, authority.conversationId)) return undefined
         const rewritten: ConversationRowsRewrite[] = []
         for (const value of conversations) {
             if (value.type === 'reorder' || value.characterId !== authority.characterId ||
@@ -5201,7 +5209,7 @@ export class SaveCoordinator {
                     throw new ConcurrentRecordChangeError(captured.expectedRevision, rebase.revision, rebase.merge.keys, rebase.merge.characterIds)
                 }
                 captured.expectedRevision = rebase.revision
-                this.currentRevision = rebase.revision
+                this.currentRevision = this.passedOverRevision = rebase.revision
             }
         }
     }
@@ -5395,6 +5403,7 @@ export class SaveCoordinator {
                 this.windowedCharacterBaseline.shell = shell
                 this.windowedCharacterBaseline.shellCanonical = canonicalJson(shell)
             }
+            if (this.passedOverRevision > authority.storeRevision) preserveSelectedRows = selectedMessagesUntouched = false
             authority.storeRevision = revision
             const totalMessages = windowedConversation?.characterId === authority.characterId &&
                 windowedConversation.conversationId === authority.conversationId ? windowedConversation.totalMessages : undefined
@@ -5459,7 +5468,7 @@ export class SaveCoordinator {
                 return result.revision
             } catch (error) {
                 if (committedRevision !== undefined || !(error instanceof RevisionConflictError) || error.actualRevision <= revision) throw error
-                this.currentRevision = error.actualRevision
+                this.currentRevision = this.passedOverRevision = error.actualRevision
             }
         }
     }

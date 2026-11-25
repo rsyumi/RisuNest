@@ -1335,6 +1335,89 @@ describe('selected chat list edits', () => {
         }
     })
 
+    // Another writer (a second connection) moves rows of the open conversation, then this window's
+    // commit retries past that revision. Rows read before the move must not be stored back by index.
+    it.each([
+        { change: 'a plugin settings write', grows: true },
+        { change: 'a preset change', grows: true },
+        { change: 'a plugin settings write', grows: false },
+    ])('keeps every message when another writer moves rows of the open windowed conversation during $change (reply grows: $grows)', async ({ change, grows }) => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const selectedId = `${ownerId}-chat`
+        const marker = 'Changed while another writer moved rows'
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const other = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        const history = Array.from({ length: 300 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `Synthetic windowed message ${index}`,
+            chatId: `synthetic-windowed-${index}`,
+        })) as Message[]
+        const library = syntheticLibrary('character')
+        library.characters[0].chats[0].message = history
+        try {
+            const app = await bootProductionApp(indexedDB, library)
+            const { stores, runtime, characters } = app
+            const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
+            expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
+            await runtime.flushPendingData('activation')
+            const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
+            const write = (start: number, deleteCount: number, message: Message) => {
+                const target = runtime.captureSelectedConversationTarget()!
+                const owner = stores.DBState.db.characters[indexOf(ownerId)]
+                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: deleteCount ? [partial] : [] } as unknown as Chat
+                const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
+                expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
+                controller.release()
+            }
+            write(history.length, 0, partial)
+            await runtime.flushPendingData('partial-reply')
+            await other.open()
+            const moved = [...history.slice(0, -1), partial, history.at(-1)!]
+            const isChange = (request: object) => /loreBookDepth|Changed while another writer/.test(JSON.stringify(request))
+            let commits = 0
+            const commit = runtime.store.commit.bind(runtime.store)
+            vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                const counted = isChange(request) ? ++commits : 0
+                if (counted === 1) {
+                    const stored = (await other.readConversation(ownerId, selectedId))!
+                    await other.commit({ expectedRevision: stored.revision, conversations: [{ type: 'replace-range', characterId: ownerId,
+                        conversationId: selectedId, start: history.length - 1, deleteCount: 2, messages: [partial, history.at(-1)!] }] })
+                }
+                const result = await commit(request)
+                if (counted && grows) write(history.length, 1, { ...partial, data: `Synthetic reply, streamed further ${counted}` })
+                return result
+            })
+
+            const saved = change === 'a preset change'
+                ? runtime.mutatePersistentPresets('preset-rename', (state) => { state.presets[0].name = marker })
+                : runtime.commitPersistentUnitIntent('plugin-settings-write', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 7 }])
+            if (grows) {
+                // The rows the screen holds may not show the move, so the change is stored and the screen is
+                // read again before anything else is saved.
+                await expect(saved).rejects.toBeInstanceOf(Error)
+                expect(runtime.pendingWorkingSetRefreshRevision).not.toBeNull()
+            } else {
+                await saved
+                expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                const source = runtime.getActiveConversationViewportSource()!
+                await source.ensureRange({ startIndex: history.length - 2, limit: 3, reason: 'viewport' })
+                expect([history.length - 1, history.length].map((index) => source.snapshot().rowAt(index)?.message)).toEqual(moved.slice(-2))
+            }
+            // Later saves store nothing at the indexes the moved rows had.
+            await Promise.resolve().then(() => runtime.flushPendingData('later-save')).catch(() => {})
+            await Promise.resolve().then(() => runtime.commitPersistentUnitIntent('plugin-settings-write', [
+                { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 9 },
+            ])).catch(() => {})
+            expect((await other.readConversation(ownerId, selectedId))?.value.message).toEqual(moved)
+            if (!grows) expect(consoleError).not.toHaveBeenCalled()
+        } finally {
+            consoleError.mockRestore()
+            Object.assign(globalThis, previousGlobals)
+        }
+    })
+
     it('keeps the saved body of a summarized chat when it moves into a folder', async () => {
         const indexedDB = new IDBFactory()
         const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
