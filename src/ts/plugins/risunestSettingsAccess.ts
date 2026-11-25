@@ -28,9 +28,11 @@ export interface RisunestSettingsDependencies {
      * stored null of a key the app gives a default on load (`loreBookDepth`) reads as that default.
      */
     readRootValues(keys: readonly string[]): Record<string, unknown>
+    /** The first key whose value the settings screens never set, such as an unknown color scheme name. */
+    findUnknownValue(values: readonly (readonly [string, unknown])[]): Promise<string | null>
     /**
-     * Replaces the whole value of each root key in one commit, whatever it was before, then does
-     * what the settings screens do after a change to it.
+     * Replaces the whole value of each root key in one commit, whatever it was before, together
+     * with the keys the settings screens change with it, then does what they do after the change.
      */
     commitRootValues(reason: string, values: readonly (readonly [string, unknown])[]): Promise<void>
     loadDescriptions(keys: ReadonlySet<string>): Promise<ReadonlyMap<string, RisunestSettingDescription>>
@@ -87,6 +89,9 @@ export function createRisunestSettingsAccess(
                 const reason = writeRejection(key, value)
                 if (reason) return { status: 'rejected', reason, key }
             }
+            const unknown = await dependencies().findUnknownValue(entries)
+            throwIfAborted(context.lifetimeSignal)
+            if (unknown) return { status: 'rejected', reason: 'value', key: unknown }
             return runDatabaseWrite(context, async () => {
                 await dependencies().commitRootValues('plugin-settings-write', entries)
                 return { status: 'applied' as const }

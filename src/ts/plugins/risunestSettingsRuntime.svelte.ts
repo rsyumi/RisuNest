@@ -1,4 +1,5 @@
 import { alertError } from '../alert'
+import { safeStructuredClone } from '../safeStructuredClone'
 import { DBState } from '../stores.svelte'
 import { commitPersistentUnitIntent, flushPendingDataLocally } from '../storage/persistentDataRuntime.svelte'
 import { loadRisunestSettingDescriptions } from './risunestSettingDescriptions'
@@ -49,7 +50,27 @@ async function applySettingEffects(keys: readonly string[]) {
     }
 }
 
+// The colors the app paints with follow the scheme name, and the custom colors while the custom
+// scheme is chosen, as the settings screen sets them together. A written `colorScheme` wins.
+async function colorSchemeFollowing(values: readonly (readonly [string, unknown])[]): Promise<[string, unknown][]> {
+    const written = new Map(values)
+    if (written.has('colorScheme')) return []
+    const name = written.has('colorSchemeName') ? written.get('colorSchemeName') : DBState.db.colorSchemeName
+    if (!written.has('colorSchemeName') && !(written.has('customColorScheme') && name === 'custom')) return []
+    const { colorSchemePresets, defaultColorScheme } = await import('../gui/colorscheme')
+    const scheme = name === 'custom'
+        ? (written.has('customColorScheme') ? written.get('customColorScheme') : $state.snapshot(DBState.db.customColorScheme)) ?? defaultColorScheme
+        : colorSchemePresets[name as keyof typeof colorSchemePresets]
+    return [['colorScheme', safeStructuredClone(scheme)]]
+}
+
 export const productionRisunestSettingsDependencies: RisunestSettingsDependencies = {
+    async findUnknownValue(values) {
+        const name = values.find(([key]) => key === 'colorSchemeName')
+        if (!name || name[1] === 'custom') return null
+        const { colorSchemeList } = await import('../gui/colorscheme')
+        return (colorSchemeList as readonly unknown[]).includes(name[1]) ? null : 'colorSchemeName'
+    },
     flushPendingData: (reason) => flushPendingDataLocally(reason),
     readRootValues(keys) {
         const database = DBState.db as unknown as Record<string, unknown>
@@ -61,12 +82,13 @@ export const productionRisunestSettingsDependencies: RisunestSettingsDependencie
         return values
     },
     async commitRootValues(reason, values) {
-        await commitPersistentUnitIntent(reason, values.map(([key, value]) => ({
+        const committed = [...values, ...await colorSchemeFollowing(values)]
+        await commitPersistentUnitIntent(reason, committed.map(([key, value]) => ({
             key: JSON.stringify(['root', key]),
             type: 'set' as const,
             value,
         })))
-        await applySettingEffects(values.map(([key]) => key))
+        await applySettingEffects(committed.map(([key]) => key))
     },
     loadDescriptions: (keys) => loadRisunestSettingDescriptions(keys),
 }

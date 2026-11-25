@@ -139,6 +139,28 @@ describe('settings by key', { timeout: 60_000 }, () => {
         expect(document.documentElement.style.getPropertyValue('--sidebar-size')).toBe('32rem')
     })
 
+    it('changes the colors with the scheme name and with the custom colors, as the settings screen does', async () => {
+        const { settings, stored } = await openSettings('settings-color-scheme')
+        const { colorSchemePresets } = await import('../gui/colorscheme')
+        const painted = () => document.documentElement.style.getPropertyValue('--risu-theme-bgcolor')
+
+        await expect(settings.writeSettings({ colorSchemeName: 'light' })).resolves.toEqual({ status: 'applied' })
+        expect(await stored()).toMatchObject({ colorSchemeName: 'light', colorScheme: colorSchemePresets.light })
+        expect(painted()).toBe(colorSchemePresets.light.bgcolor)
+
+        const custom = { ...colorSchemePresets.ocean, bgcolor: '#123456' }
+        await expect(settings.writeSettings({ colorSchemeName: 'custom', customColorScheme: custom })).resolves.toEqual({ status: 'applied' })
+        expect((await stored()).colorScheme).toEqual(custom)
+        const edited = { ...custom, bgcolor: '#654321' }
+        await expect(settings.writeSettings({ customColorScheme: edited })).resolves.toEqual({ status: 'applied' })
+        expect((await stored()).colorScheme).toEqual(edited)
+        expect(painted()).toBe('#654321')
+
+        // Colors written with the name are kept as written.
+        await expect(settings.writeSettings({ colorSchemeName: 'dark', colorScheme: custom })).resolves.toEqual({ status: 'applied' })
+        expect(await stored()).toMatchObject({ colorSchemeName: 'dark', colorScheme: custom })
+    })
+
     it('answers applied when what follows a stored change fails, and shows the failure as the settings screen does', async () => {
         const window = { isFullscreen: vi.fn(async () => false), setFullscreen: vi.fn(async () => { throw new Error('window unavailable') }) }
         vi.doMock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
@@ -252,6 +274,7 @@ describe('settings by key', { timeout: 60_000 }, () => {
         await expect(settings.writeSettings({ loreBook: undefined })).resolves.toEqual({ status: 'rejected', reason: 'type', key: 'loreBook' })
         await expect(settings.writeSettings(JSON.parse('{"__proto__": 1}'))).resolves.toEqual({ status: 'rejected', reason: 'unavailable', key: '__proto__' })
         await expect(settings.writeSettings({ constructor: 1 })).resolves.toEqual({ status: 'rejected', reason: 'unavailable', key: 'constructor' })
+        await expect(settings.writeSettings({ loreBookDepth: 3, colorSchemeName: 'missing-scheme' })).resolves.toEqual({ status: 'rejected', reason: 'value', key: 'colorSchemeName' })
         await expect(settings.writeSettings([['loreBookDepth', 3]])).rejects.toThrow(TypeError)
         await expect(settings.writeSettings('loreBookDepth')).rejects.toThrow(TypeError)
 
