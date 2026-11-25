@@ -556,19 +556,19 @@ describe('sandbox script completion', () => {
         host.terminate()
     })
 
-    it('drains admitted storage mutations after termination and refuses late ingress', async () => {
+    it.each(['_setSafeLocalStorage', 'risunestWriteSettings'])('drains admitted %s calls after termination and refuses late ingress', async (method) => {
         let finish!: () => void
         const pending = new Promise<void>(resolve => { finish = resolve })
         const mutation = vi.fn(() => pending)
-        const host = new SandboxHost({ ...bridgeStubs(), _setSafeLocalStorage: mutation })
-        const child = await runGuest(host, `void risuai._setSafeLocalStorage('synthetic', 'value')`)
+        const host = new SandboxHost({ ...bridgeStubs(), [method]: mutation })
+        const child = await runGuest(host, `void risuai.${method}('synthetic', 'value')`)
         await vi.waitFor(() => expect(mutation).toHaveBeenCalledOnce())
         host.terminate()
         const drained = vi.fn()
         const draining = host.drainStorageMutations().then(drained)
         await Promise.resolve()
         expect(drained).not.toHaveBeenCalled()
-        window.dispatchEvent(new MessageEvent('message', { source: child, data: { type: 'CALL_ROOT', reqId: 'late-write', method: '_setSafeLocalStorage', args: ['late', 'value'] } }))
+        window.dispatchEvent(new MessageEvent('message', { source: child, data: { type: 'CALL_ROOT', reqId: 'late-write', method, args: ['late', 'value'] } }))
         expect(mutation).toHaveBeenCalledOnce()
         finish()
         await draining

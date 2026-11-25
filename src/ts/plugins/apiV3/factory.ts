@@ -5,6 +5,7 @@ import { attachPluginReadProvenance, collectPluginReadProvenance, type PluginRea
 import { type PluginDownloadHandler } from './pluginDownload'
 import { installWebviewBridge } from '../../webviewDownload'
 import { installCanvasWebpCompatibility } from './canvasWebp'
+import { risunestStorageWriteMethods } from '../risunestHostContext'
 
 type MsgType =
     | 'CALL_ROOT'
@@ -658,6 +659,13 @@ await (async function() {
 const requestSignalKeys = new Map([['nativeFetch', 'signal'], ['risuFetch', 'abortSignal']]);
 export const UNREAD_PLUGIN_STREAM_TIMEOUT_MS = 60_000;
 
+// Root calls that change stored data. Unloading a plugin waits for the ones already admitted.
+const rootStorageMutations = new Set<string>([
+    'setChar', 'setCharacter', 'setCharacterToIndex', 'setChatToIndex', 'setDatabase', 'setDatabaseLite',
+    '_setPluginStorage', '_removePluginStorage', '_clearPluginStorage', '_setSafeLocalStorage', '_removeSafeLocalStorage', '_clearSafeLocalStorage',
+    ...risunestStorageWriteMethods,
+]);
+
 // A stream may fail with any value (plugin-http fails with plain strings), so
 // the other side gets a message that is never empty.
 function streamErrorMessage(error: unknown): string {
@@ -1237,7 +1245,7 @@ export class SandboxHost {
                 this.activityListener?.();
                 const storageMutation = data.type === 'CALL_INSTANCE'
                     ? ['setItem', 'removeItem', 'clear'].includes(String(data.method))
-                    : ['setChar', 'setCharacter', 'setCharacterToIndex', 'setChatToIndex', 'risunestPatchConversation', 'setDatabase', 'setDatabaseLite', '_setPluginStorage', '_removePluginStorage', '_clearPluginStorage', '_setSafeLocalStorage', '_removeSafeLocalStorage', '_clearSafeLocalStorage'].includes(String(data.method));
+                    : rootStorageMutations.has(String(data.method));
                 if (storageMutation) this.pendingStorageMutations += 1;
                 try {
 

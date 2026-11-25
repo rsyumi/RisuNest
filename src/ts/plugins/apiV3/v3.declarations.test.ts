@@ -32,6 +32,7 @@ vi.mock('src/ts/storage/persistentDataRuntime.svelte', async () => (await import
 vi.mock('../pluginDatabaseAccess', async () => (await import('./v3Host.testSupport')).pluginDatabaseAccessModule())
 
 import { executePluginV3 } from './v3.svelte'
+import { risunestStorageWriteMethods } from '../risunestHostContext'
 
 /** Member names of each interface declared at the top level of the plugin declaration file. */
 function declaredInterfaces(): Map<string, ts.InterfaceDeclaration> {
@@ -78,6 +79,28 @@ describe('plugin API declarations', () => {
 
     it('exposes the upstream parser promise and selected-character error through the public host', async () => {
         await expect(host.parseRisuChat('{{char}}')).rejects.toThrow('No character selected')
+    })
+
+    it('names every private RisuNest method that writes stored data, so unloading a plugin waits for it', () => {
+        const writes = new Set<string>(risunestStorageWriteMethods)
+        const names = Object.keys(host).filter((name) => name.startsWith('risunest'))
+        expect([...writes].filter((name) => !names.includes(name))).toEqual([])
+        expect(names.filter((name) => !writes.has(name)).sort()).toEqual([
+            'risunestCallHostTool',
+            'risunestCheckLuaSyntax',
+            'risunestListHostTools',
+            'risunestListLoadouts',
+            'risunestListPresets',
+            'risunestListSettingKeys',
+            'risunestOnChatView',
+            'risunestOnGenerationEnd',
+            'risunestReadConversationContext',
+            'risunestReadGlobalVariables',
+            'risunestReadPreset',
+            'risunestReadSettings',
+            'risunestSetFloatingDragRegion',
+            'risunestShowFloatingWindow',
+        ])
     })
 
     it('exposes the private RisuNest methods to the guest', () => {

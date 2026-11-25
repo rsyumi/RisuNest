@@ -14,6 +14,22 @@ export type RisunestWriteResult =
 
 export type RisunestJsonKind = 'string' | 'number' | 'boolean' | 'array' | 'object'
 
+/** The risunest* methods that change stored data. Unloading a plugin waits for their calls to settle. */
+export const risunestStorageWriteMethods = [
+    'risunestPatchConversation',
+    'risunestWriteSettings',
+    'risunestUpdatePreset',
+    'risunestCreatePreset',
+    'risunestDeletePreset',
+    'risunestSelectPreset',
+    'risunestCreateCharacter',
+    'risunestTrashCharacter',
+    'risunestRestoreCharacter',
+    'risunestWriteGlobalVariables',
+    'risunestWriteLoadout',
+    'risunestDeleteLoadout',
+] as const
+
 export interface RisunestHostContext {
     /** The plugin every call is confined to. */
     pluginName: string
