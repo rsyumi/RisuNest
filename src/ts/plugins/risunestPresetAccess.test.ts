@@ -308,6 +308,29 @@ describe('risunest preset methods', () => {
         expect(presetEditorDBState.db.mainPrompt).toBe('Prompt B')
     })
 
+    it('applies selections called back to back in the order they were called', async () => {
+        await presetLibrary()
+        const api = plugin()
+        const runtime = installed.runtime!
+        const mutate = runtime.mutatePersistentPresets.bind(runtime)
+        let queued!: () => void
+        const toBQueued = new Promise<void>((resolve) => { queued = resolve })
+        vi.spyOn(runtime, 'mutatePersistentPresets').mockImplementation((reason, change) => {
+            queued()
+            return mutate(reason, change)
+        })
+
+        const toB = api.selectPreset({ id: 'preset-b' })
+        // The second selection is asked for while the first is still being saved.
+        await toBQueued
+        const toA = api.selectPreset({ id: 'preset-a' })
+        await expect(toB).resolves.toEqual({ status: 'applied' })
+        await expect(toA).resolves.toEqual({ status: 'applied' })
+
+        expect(summary((await api.listPresets()).items)).toMatchObject({ selected: ['preset-a'], applied: ['preset-a'] })
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
+    })
+
     it.each([false, true])('keeps edits made to the selection while a bound preset applies, and the binding, on selecting another (catalog=%s)', async (catalog) => {
         const { stored } = await presetLibrary({ catalog, bound: 'preset-c' })
         const api = plugin()

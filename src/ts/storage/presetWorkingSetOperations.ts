@@ -284,10 +284,10 @@ export function createPresetWorkingSetController(
             })
         },
         async changeToPresetById(id) {
-            const database = dependencies.getDatabase()
-            if (database.botPresets[database.botPresetsId]?.id === id && !dependencies.getEffectivePresetOverride?.()) return
+            // Decided in the mutation, after the changes queued before this one.
             await dependencies.mutatePersistentPresets('change-preset', (state) => {
                 const index = presetIndexOf(state.presets, id)
+                if (state.root.botPresetsId === index && !dependencies.getEffectivePresetOverride?.()) return
                 saveActive(state)
                 select(state, index)
             })
