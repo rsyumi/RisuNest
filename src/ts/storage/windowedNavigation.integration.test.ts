@@ -1094,7 +1094,13 @@ describe('selected chat list edits', () => {
         }
     })
 
-    it.each(['create', 'import'] as const)('adds a character by %s while a windowed conversation is open and keeps saving and navigating', async (route) => {
+    // Opening a character leaves its activation edits unsaved until the save debounce runs.
+    it.each([
+        { route: 'create', activation: 'saved' },
+        { route: 'import', activation: 'saved' },
+        { route: 'create', activation: 'unsaved' },
+        { route: 'import', activation: 'unsaved' },
+    ] as const)('adds a character by $route while a windowed conversation is open with its activation $activation and keeps saving and navigating', async ({ route, activation }) => {
         const indexedDB = new IDBFactory()
         const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
         const ownerId = 'edited-owner'
@@ -1116,7 +1122,7 @@ describe('selected chat list edits', () => {
             const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
             expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
             expect(runtime.getSelectedConversationMode()).toBe('windowed')
-            await runtime.flushPendingData('activation')
+            if (activation === 'saved') await runtime.flushPendingData('activation')
             await reader.open()
             const readConversation = vi.spyOn(runtime.store, 'readConversation')
             const committed: { keys: string[], units: string[], added?: string, replaced?: string }[] = []
@@ -1150,6 +1156,10 @@ describe('selected chat list edits', () => {
             for (const messages of historiesAfterCommit) expect(messages).toEqual(history)
             await reader.open()
             expect((await reader.readRoot()).value.characterOrder).toContain(addedId)
+            if (activation === 'unsaved') {
+                await runtime.flushPendingData('activation')
+                expect(get(app.localSaveFailure)).toBeNull()
+            }
             const additionCommitBoundary = committed.length
 
             stores.DBState.db.username = 'Saved beside the windowed chat'

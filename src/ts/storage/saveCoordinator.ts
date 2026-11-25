@@ -4038,6 +4038,13 @@ export class SaveCoordinator {
         revision: DataRevision,
         persistedSessionVersion: number,
     ): void {
+        // Unsaved activation evidence is pinned to the baseline's authority, and the working set refuses a
+        // revision while the two differ, so the evidence moves with the baseline before the working set is told.
+        const activation = this.pendingWindowedActivationChange
+        const previous = this.windowedCharacterBaseline
+        if (activation && previous && sameWindowedAuthority(activation.authority, previous.authority)) {
+            activation.authority = { ...activation.authority, storeRevision: revision }
+        }
         this.windowedCharacterBaseline = {
             shell: captured.shell,
             shellCanonical: captured.shellCanonical,
@@ -5442,7 +5449,6 @@ export class SaveCoordinator {
         if (this.windowedCharacterBaseline) {
             this.setWindowedCharacterBaseline(this.windowedCharacterBaseline, committed.revision,
                 this.windowedCharacterBaseline.authority.persistedSessionVersion)
-            if (this.pendingWindowedActivationChange) this.pendingWindowedActivationChange.authority.storeRevision = committed.revision
         } else this.dependencies.onStorageOnlyRevision?.(committed.revision)
         this.dependencies.onLocalRevision?.(committed.revision)
         if (this.dependencies.officialPublisher) {
