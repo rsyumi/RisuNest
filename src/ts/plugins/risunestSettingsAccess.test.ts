@@ -1,4 +1,5 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { get } from 'svelte/store'
 import { describe, expect, it, vi } from 'vitest'
 import type { SettingItem } from '../setting/types'
 import type { Database } from '../storage/database.svelte'
@@ -136,6 +137,24 @@ describe('settings by key', { timeout: 60_000 }, () => {
         expect(await label()).toBe(lang.language.loreBookDepth)
         expect(lang.language.loreBookDepth).not.toBe(english)
         expect(document.documentElement.style.getPropertyValue('--sidebar-size')).toBe('32rem')
+    })
+
+    it('answers applied when what follows a stored change fails, and shows the failure as the settings screen does', async () => {
+        const window = { isFullscreen: vi.fn(async () => false), setFullscreen: vi.fn(async () => { throw new Error('window unavailable') }) }
+        vi.doMock('../platform', async () => (await import('../platform.testSupport')).platformModule({ runtime: 'tauri', os: 'windows' }))
+        vi.doMock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: () => window }))
+        try {
+            const { settings, stored } = await openSettings('settings-effect-failure')
+            const { alertStore } = await import('../stores.svelte')
+
+            await expect(settings.writeSettings({ fullScreen: true })).resolves.toEqual({ status: 'applied' })
+
+            expect((await stored()).fullScreen).toBe(true)
+            expect(get(alertStore)).toMatchObject({ type: 'error', msg: 'window unavailable' })
+        } finally {
+            vi.doUnmock('../platform')
+            vi.doUnmock('@tauri-apps/api/webviewWindow')
+        }
     })
 
     it('applies a write of every key whose settings screen control does more than store it', async () => {

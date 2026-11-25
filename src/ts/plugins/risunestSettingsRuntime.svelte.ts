@@ -1,3 +1,4 @@
+import { alertError } from '../alert'
 import { DBState } from '../stores.svelte'
 import { commitPersistentUnitIntent, flushPendingDataLocally } from '../storage/persistentDataRuntime.svelte'
 import { loadRisunestSettingDescriptions } from './risunestSettingDescriptions'
@@ -24,15 +25,28 @@ export const risunestSettingEffects: Readonly<Record<string, readonly SettingEff
     fullScreen: ['fullScreen'],
 }
 
+// In the order they run: the text colors follow the scheme's light or dark type, so the scheme goes first.
+const settingEffectRunners: readonly (readonly [SettingEffect, () => Promise<void>])[] = [
+    ['language', async () => (await import('src/lang')).changeLanguage(DBState.db.language)],
+    ['colorScheme', async () => (await import('../gui/colorscheme')).updateColorScheme()],
+    ['textTheme', async () => (await import('../gui/colorscheme')).updateTextThemeAndCSS()],
+    ['guiSize', async () => (await import('../gui/guisize')).updateGuisize()],
+    ['animation', async () => (await import('../gui/animation')).updateAnimationSpeed()],
+    ['fullScreen', async () => (await import('../util')).changeFullscreen()],
+]
+
 async function applySettingEffects(keys: readonly string[]) {
     const effects = new Set(keys.flatMap((key) => Object.hasOwn(risunestSettingEffects, key) ? risunestSettingEffects[key] : []))
-    if (effects.has('language')) (await import('src/lang')).changeLanguage(DBState.db.language)
-    // The text colors follow the scheme's light or dark type, so the scheme goes first.
-    if (effects.has('colorScheme')) (await import('../gui/colorscheme')).updateColorScheme()
-    if (effects.has('textTheme')) (await import('../gui/colorscheme')).updateTextThemeAndCSS()
-    if (effects.has('guiSize')) (await import('../gui/guisize')).updateGuisize()
-    if (effects.has('animation')) (await import('../gui/animation')).updateAnimationSpeed()
-    if (effects.has('fullScreen')) await (await import('../util')).changeFullscreen()
+    for (const [effect, run] of settingEffectRunners) {
+        if (!effects.has(effect)) continue
+        try {
+            await run()
+        } catch (error) {
+            // The value is stored, so the write still applied. The settings screens show the
+            // same failure as an app error.
+            alertError(error instanceof Error ? error : String(error))
+        }
+    }
 }
 
 export const productionRisunestSettingsDependencies: RisunestSettingsDependencies = {
