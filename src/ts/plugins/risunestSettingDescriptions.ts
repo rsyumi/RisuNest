@@ -81,7 +81,7 @@ export function describeSettingItems(
 let definitions: Promise<{ groups: readonly (readonly SettingItem[])[]; resolver: RisunestSettingTextResolver }> | undefined
 
 // The settings screens' own definitions, loaded on first use so the plugin host does not import them at startup.
-function loadSettingDefinitions() {
+export function loadSettingDefinitions() {
     if (definitions) return definitions
     const loading = Promise.all([
         import('../setting/accessibilitySettingsData'),

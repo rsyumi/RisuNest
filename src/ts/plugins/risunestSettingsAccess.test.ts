@@ -1,5 +1,6 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
+import type { SettingItem } from '../setting/types'
 import type { Database } from '../storage/database.svelte'
 import type { PersistentDataStore } from '../storage/persistentDataStore'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
@@ -123,6 +124,34 @@ describe('settings by key', { timeout: 60_000 }, () => {
         const korean = await settings.listSettingKeys()
         expect(korean.items.find((value) => value.key === 'loreBookDepth')?.label).toBe(lang.language.loreBookDepth)
         expect(lang.language.loreBookDepth).not.toBe(item('loreBookDepth')?.label)
+    })
+
+    it('does what the settings screen does after a change, such as switching the language', async () => {
+        const { settings, lang } = await openSettings('settings-effects')
+        const label = async () => (await settings.listSettingKeys()).items.find((value) => value.key === 'loreBookDepth')?.label
+        const english = await label()
+
+        await expect(settings.writeSettings({ language: 'ko', sideBarSize: 2 })).resolves.toEqual({ status: 'applied' })
+
+        expect(await label()).toBe(lang.language.loreBookDepth)
+        expect(lang.language.loreBookDepth).not.toBe(english)
+        expect(document.documentElement.style.getPropertyValue('--sidebar-size')).toBe('32rem')
+    })
+
+    it('applies a write of every key whose settings screen control does more than store it', async () => {
+        const { loadSettingDefinitions } = await import('./risunestSettingDescriptions')
+        const { risunestSettingEffects } = await import('./risunestSettingsRuntime.svelte')
+        const changing: string[] = []
+        const visit = (items: readonly SettingItem[]) => {
+            for (const item of items) {
+                if (item.bindKey && item.onChange) changing.push(item.bindKey)
+                if (item.options?.children) visit(item.options.children)
+            }
+        }
+        for (const items of (await loadSettingDefinitions()).groups) visit(items)
+
+        expect(changing).toContain('language')
+        expect(changing.filter((key) => !Object.hasOwn(risunestSettingEffects, key))).toEqual([])
     })
 
     it('reads available keys with unsaved app edits and lists the rest as unavailable', async () => {

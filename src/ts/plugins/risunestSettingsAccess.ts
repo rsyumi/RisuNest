@@ -25,7 +25,10 @@ export interface RisunestSettingsDependencies {
     flushPendingData(reason: string): Promise<void>
     /** The current value of each named root key; a key without a value has no entry. */
     readRootValues(keys: readonly string[]): Record<string, unknown>
-    /** Replaces the whole value of each root key in one commit, whatever it was before. */
+    /**
+     * Replaces the whole value of each root key in one commit, whatever it was before, then does
+     * what the settings screens do after a change to it.
+     */
     commitRootValues(reason: string, values: readonly (readonly [string, unknown])[]): Promise<void>
     loadDescriptions(keys: ReadonlySet<string>): Promise<ReadonlyMap<string, RisunestSettingDescription>>
 }
