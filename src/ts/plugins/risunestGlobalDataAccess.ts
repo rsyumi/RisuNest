@@ -180,8 +180,12 @@ async function writeSharedGlobalVariables(entries: [string, string | null][]) {
     database.flushEffectiveToggleEdits(db)
     // The shared set is edited directly: a toggle sent through the unit commit would go to
     // the conversation the open chat binds.
-    const shared = database.getExplicitGlobalChatVariables(db)
+    const sharedValue = (name: string) => {
+        const shared = database.getExplicitGlobalChatVariables(db)
+        return Object.hasOwn(shared, name) ? shared[name] : null
+    }
     const apply = (values: [string, string | null][]) => {
+        const shared = database.getExplicitGlobalChatVariables(db)
         for (const [name, value] of values) {
             if (value === null) delete shared[name]
             else shared[name] = value
@@ -191,13 +195,16 @@ async function writeSharedGlobalVariables(entries: [string, string | null][]) {
         const chat = character?.chats?.[character.chatPage]
         database.deriveEffectiveToggleVariables(db, chat && !isConversationSummaryStub(chat) ? chat : undefined)
     }
-    const previous = entries.map(([name]): [string, string | null] => [name, Object.hasOwn(shared, name) ? shared[name] : null])
+    const previous = entries.map(([name]): [string, string | null] => [name, sharedValue(name)])
     apply(entries)
     try {
         await runtime.flushPendingData('plugin-write-global-variables')
     } catch (error) {
-        // A later save must not store what the plugin was told failed.
-        apply(previous)
+        // A later save must not store what the plugin was told failed. The app's edits made while
+        // the save ran reach the shared set or the bound conversation first, and a name the app
+        // changed since keeps the app's value.
+        database.flushEffectiveToggleEdits(db)
+        apply(previous.filter(([name], index) => sharedValue(name) === entries[index][1]))
         throw error
     }
 }

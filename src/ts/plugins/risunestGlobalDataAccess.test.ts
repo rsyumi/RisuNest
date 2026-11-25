@@ -106,15 +106,20 @@ describe('plugin global variables', { timeout: 30_000 }, () => {
         expect(await library.access.readGlobalVariables({ names: ['added', 'kept'] })).toStrictEqual({ values: { added: 'new' } })
     })
 
-    it('keeps nothing of writes whose commits fail, also when they overlap', async () => {
+    it("keeps nothing of writes whose commits fail, also when they overlap, and keeps the app's edits made meanwhile", async () => {
         const library = await openLibrary('risunest-variables-failed')
         await library.open('char-b')
         // The first failure arrives a task later, as storage answers, so the second write is called while it is pending.
+        // The app changes a variable that write set, and a toggle the open chat keeps, while that commit waits.
         vi.spyOn(library.store, 'commit')
-            .mockImplementationOnce(() => new Promise((_, reject) => setTimeout(() => reject(new Error('synthetic storage failure')))))
+            .mockImplementationOnce(() => new Promise((_, reject) => setTimeout(() => {
+                library.live().globalChatVariables.edited = 'app'
+                library.live().globalChatVariables.toggle_app = 'app'
+                reject(new Error('synthetic storage failure'))
+            })))
             .mockRejectedValueOnce(new Error('synthetic storage failure'))
 
-        const first = library.access.writeGlobalVariables({ shared: 'first', added: 'new', kept: null, toggle_mode: 'first' })
+        const first = library.access.writeGlobalVariables({ shared: 'first', added: 'new', kept: null, toggle_mode: 'first', edited: 'first' })
         const second = library.access.writeGlobalVariables({ shared: 'second', toggle_mode: 'second' })
         await expect(first).rejects.toThrow('synthetic storage failure')
         await expect(second).rejects.toThrow('synthetic storage failure')
@@ -123,9 +128,11 @@ describe('plugin global variables', { timeout: 30_000 }, () => {
         expect(library.getGlobalChatVar('added')).toBe('null')
         expect(library.getGlobalChatVar('kept')).toBe('stored')
         expect(library.getGlobalChatVar('toggle_mode')).toBe('bound')
+        expect(library.getGlobalChatVar('edited')).toBe('app')
+        expect(library.getGlobalChatVar('toggle_app')).toBe('app')
         await library.settle()
-        expect(await library.storedVariables()).toStrictEqual({ shared: 'stored', kept: 'stored', toggle_mode: 'global' })
-        expect((await library.store.readConversation('char-b', 'conv-beta'))!.value.savedToggleValues).toEqual({ toggle_mode: 'bound' })
+        expect(await library.storedVariables()).toStrictEqual({ shared: 'stored', kept: 'stored', toggle_mode: 'global', edited: 'app' })
+        expect((await library.store.readConversation('char-b', 'conv-beta'))!.value.savedToggleValues).toEqual({ toggle_mode: 'bound', toggle_app: 'app' })
     })
 
     it('changes the shared toggle value and leaves the one the open chat keeps for itself', async () => {
