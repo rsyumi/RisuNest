@@ -36,8 +36,11 @@ function compile(engine: LuaEngine, source: string, chunk: string, lines: LuaScr
         if (thread.getTop() === 0) throw error
         const compilerMessage = error instanceof Error ? error.message : String(error)
         const message = lines.scriptLineNumbers(compilerMessage)
-        const line = lines.scriptLineOfMessage(compilerMessage)
-        return line !== undefined && line <= luaLineCount(source) ? { ok: false, message, line } : { ok: false, message }
+        const reported = lines.scriptLineOfMessage(compilerMessage)
+        // The wrapper ends the script with a newline, so an error at the end of the text names the line after it.
+        const lastLine = luaLineCount(source)
+        const line = reported === lastLine + 1 ? lastLine : reported
+        return line !== undefined && line <= lastLine ? { ok: false, message, line } : { ok: false, message }
     } finally {
         try {
             thread.close()

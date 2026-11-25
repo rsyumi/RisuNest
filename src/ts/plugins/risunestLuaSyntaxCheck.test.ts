@@ -42,8 +42,9 @@ test.each([
     await expect(checkRisunestLuaSyntax(source)).resolves.toStrictEqual({ ok: true })
 })
 
-// The wrapper ends the script with a newline, so an error found at the end of the text is one line past the script.
-// Each line ending Lua accepts (\n, \r\n, \r and \n\r) counts as one line.
+// The wrapper ends the script with a newline, so the compiler names the line after the script for an error found at
+// the end of the text; `line` is then the script's last line. Each line ending Lua accepts (\n, \r\n, \r and \n\r)
+// counts as one line.
 test.each<{ source: string; result: RisunestLuaSyntaxResult }>([
     {
         source: 'a = 1\nb = 2\nx = = 1',
@@ -55,15 +56,19 @@ test.each<{ source: string; result: RisunestLuaSyntaxResult }>([
     },
     {
         source: 'a = 1\r\n--[[ abc\r\nb = 2',
-        result: { ok: false, message: `[string "..."]:4: unfinished long comment (starting at line 2) near <eof>` },
+        result: { ok: false, line: 3, message: `[string "..."]:4: unfinished long comment (starting at line 2) near <eof>` },
     },
     {
         source: 'a = 1\n\rx = [[ abc',
-        result: { ok: false, message: `[string "..."]:3: unfinished long string (starting at line 2) near <eof>` },
+        result: { ok: false, line: 2, message: `[string "..."]:3: unfinished long string (starting at line 2) near <eof>` },
     },
     {
         source: 'function f()\n    return 1',
-        result: { ok: false, message: `[string "..."]:3: 'end' expected (to close 'function' at line 1) near <eof>` },
+        result: { ok: false, line: 2, message: `[string "..."]:3: 'end' expected (to close 'function' at line 1) near <eof>` },
+    },
+    {
+        source: 'function f()\n',
+        result: { ok: false, line: 2, message: `[string "..."]:3: 'end' expected (to close 'function' at line 1) near <eof>` },
     },
     {
         source: 'function f()\n' + Array.from({ length: 201 }, (_, index) => `    local v${index}`).join('\n') + '\nend',
@@ -73,16 +78,16 @@ test.each<{ source: string; result: RisunestLuaSyntaxResult }>([
             message: `[string "..."]:203: too many local variables (limit is 200) in function at line 1 near 'end'`,
         },
     },
-    { source: 'x = 1\nbreak', result: { ok: false, message: `[string "..."]:3: break outside loop at line 2` } },
+    { source: 'x = 1\nbreak', result: { ok: false, line: 2, message: `[string "..."]:3: break outside loop at line 2` } },
     {
         source: 'goto nowhere\nx = 1',
-        result: { ok: false, message: `[string "..."]:3: no visible label 'nowhere' for <goto> at line 1` },
+        result: { ok: false, line: 2, message: `[string "..."]:3: no visible label 'nowhere' for <goto> at line 1` },
     },
     {
         source: 'goto skip\rlocal x = 1\r::skip::\rx = 2',
         result: { ok: false, line: 4, message: `[string "..."]:4: <goto skip> at line 1 jumps into the scope of local 'x'` },
     },
-    { source: '::a::\n::a::', result: { ok: false, message: `[string "..."]:3: label 'a' already defined on line 2` } },
+    { source: '::a::\n::a::', result: { ok: false, line: 2, message: `[string "..."]:3: label 'a' already defined on line 2` } },
     { source: 'x = ' + '('.repeat(300) + '1' + ')'.repeat(300), result: { ok: false, message: 'C stack overflow' } },
 ])('reports $result.message', async ({ source, result }) => {
     await expect(checkRisunestLuaSyntax(source)).resolves.toStrictEqual(result)
