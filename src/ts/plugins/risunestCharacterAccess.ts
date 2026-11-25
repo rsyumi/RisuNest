@@ -32,9 +32,8 @@ export type RisunestCreateCharacterResult =
     | { status: 'denied' }
     | { status: 'rejected'; reason: string }
 
-// The host assigns the ID, and a plugin creates neither a group nor a trashed character. Low level
-// access is granted only through the confirmation card and module imports ask for.
-const hostOwnedFields = new Set(['chaId', 'type', 'trashTime', 'lowLevelAccess', '__proto__', 'prototype', 'constructor'])
+// The host assigns the ID, and a plugin creates neither a group nor a trashed character.
+const hostOwnedFields = new Set(['chaId', 'type', 'trashTime', '__proto__', 'prototype', 'constructor'])
 
 function changeResult(change: RisunestCharacterChange): RisunestWriteResult {
     if (change === 'applied' || change === 'not-found') return { status: change }

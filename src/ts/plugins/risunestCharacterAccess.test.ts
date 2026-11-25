@@ -73,7 +73,7 @@ describe('plugin character access', { timeout: 30_000 }, () => {
         await library.open('char-b')
 
         const result = await library.access.createCharacter({
-            fields: { name: 'Synthetic', desc: 'Synthetic description', firstMessage: 'Synthetic greeting' },
+            fields: { name: 'Synthetic', desc: 'Synthetic description', firstMessage: 'Synthetic greeting', lowLevelAccess: true },
         })
 
         expect(result).toEqual({ status: 'applied', id: expect.any(String) })
@@ -86,6 +86,7 @@ describe('plugin character access', { timeout: 30_000 }, () => {
             name: 'Synthetic',
             desc: 'Synthetic description',
             firstMessage: 'Synthetic greeting',
+            lowLevelAccess: true,
         })
         const conversations = await library.store.queryConversations({ characterId: id, order: 'configured', limit: 10 })
         expect(conversations.items).toHaveLength(1)
@@ -103,7 +104,7 @@ describe('plugin character access', { timeout: 30_000 }, () => {
         }
         await expect(library.access.trashCharacter({ id: '' })).rejects.toThrow(TypeError)
         await expect(library.access.restoreCharacter('char-c')).rejects.toThrow(TypeError)
-        for (const [key, value] of [['type', 'group'], ['chaId', 'group'], ['trashTime', 1], ['lowLevelAccess', true]] as const) {
+        for (const [key, value] of [['type', 'group'], ['chaId', 'group'], ['trashTime', 1]] as const) {
             expect(await library.access.createCharacter({ fields: { name: 'Synthetic', [key]: value } }))
                 .toEqual({ status: 'rejected', reason: `${key} cannot be set` })
         }
