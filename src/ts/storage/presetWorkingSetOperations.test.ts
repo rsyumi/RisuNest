@@ -62,7 +62,10 @@ describe('store-backed preset operations', () => {
             mutatePersistentPresets: vi.fn(async (_reason, mutate) => {
                 const { characters: _characters, botPresets: _botPresets, ...root } = structuredClone(live)
                 const state = { root, presets: structuredClone(persisted) }
+                const unchanged = JSON.stringify(state)
                 await mutate(state)
+                // As the save coordinator, a mutation that changes nothing commits and publishes nothing.
+                if (JSON.stringify(state) === unchanged) return
                 if (failCommit) throw new Error('commit failed')
                 persisted = state.presets
                 Object.assign(live, state.root)

@@ -181,13 +181,14 @@ export function createPresetWorkingSetController(
             const database = dependencies.getDatabase()
             assertPresetNames(database.botPresets, expectedNames)
             assertPresetIndex(database.botPresets, id)
-            // A conversation's binding may apply another preset; the list still changes the selection.
-            if (database.botPresetsId === id && !dependencies.getEffectivePresetOverride?.()) return
             const before = capturePresetNames(database.botPresets)
             await dependencies.mutatePersistentPresets('change-preset', (state) => {
                 assertPresetNames(dependencies.getDatabase().botPresets, before)
                 assertPresetNames(dependencies.getDatabase().botPresets, expectedNames)
                 assertPresetNames(state.presets, presetNames(expectedNames))
+                // Decided here, after the changes queued before this one. A conversation's binding
+                // may apply another preset; the list still changes the selection.
+                if (state.root.botPresetsId === id && !dependencies.getEffectivePresetOverride?.()) return
                 if (saveCurrent) saveActive(state)
                 select(state, id)
             })
