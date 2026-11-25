@@ -1220,6 +1220,116 @@ describe('selected chat list edits', () => {
         }
     })
 
+    // A reply keeps streaming into the open conversation while another change is stored: the reply
+    // started before the commit and its text grows while the commit runs.
+    it.each([
+        { change: 'a save of another setting' },
+        { change: 'a plugin settings write' },
+        { change: 'a character detail change' },
+        { change: 'a chat setting change' },
+        { change: 'a preset change' },
+        { change: 'a plugin storage change' },
+    ] as const)('keeps a reply that streams while $change is stored in the open windowed conversation', async ({ change }) => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const otherId = 'second-character'
+        const selectedId = `${ownerId}-chat`
+        const marker = 'Changed while streaming'
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const reader = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        const history = Array.from({ length: 300 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `Synthetic windowed message ${index}`,
+            chatId: `synthetic-windowed-${index}`,
+        })) as Message[]
+        const library = syntheticLibrary('character')
+        library.characters[0].chats[0].message = history
+        try {
+            const app = await bootProductionApp(indexedDB, library)
+            const { stores, runtime, characters } = app
+            const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
+            expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            await runtime.flushPendingData('activation')
+            const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
+            const full = { ...partial, data: 'Synthetic reply, streamed further' }
+            const write = (start: number, deleteCount: number, message: Message) => {
+                const target = runtime.captureSelectedConversationTarget()!
+                const owner = stores.DBState.db.characters[indexOf(ownerId)]
+                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: deleteCount ? [partial] : [] } as unknown as Chat
+                const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
+                expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
+                controller.release()
+            }
+            write(history.length, 0, partial)
+
+            // What the conversation shows, loaded from the store, before anything stores the grown text.
+            let shown: { reply?: Message, first?: Message, total: number } | undefined
+            const inspect = async () => {
+                const source = runtime.getActiveConversationViewportSource()!
+                await source.ensureRange({ startIndex: history.length - 2, limit: 4, reason: 'viewport' })
+                await source.ensureRange({ startIndex: 0, limit: 8, reason: 'viewport' })
+                const snapshot = source.snapshot()
+                shown = { reply: snapshot.rowAt(history.length)?.message, first: snapshot.rowAt(0)?.message, total: snapshot.totalMessages }
+            }
+            const isChange = (request: object) => JSON.stringify(request).includes(change.includes('setting') && !change.includes('chat') ? 'loreBookDepth' : marker)
+            let grown = false
+            const commit = runtime.store.commit.bind(runtime.store)
+            vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                if (grown && !shown) await inspect()
+                const result = await commit(request)
+                if (!grown && isChange(request)) {
+                    grown = true
+                    write(history.length, 1, full)
+                }
+                return result
+            })
+
+            if (change === 'a save of another setting') {
+                stores.DBState.db.loreBookDepth = 7
+                runtime.markPersistentDataDirty(1)
+                await runtime.flushPendingData('settings-change')
+            } else if (change === 'a plugin settings write') {
+                await runtime.commitPersistentUnitIntent('plugin-settings-write', [
+                    { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 7 },
+                ])
+            } else if (change === 'a character detail change') {
+                expect(await runtime.mutateCharacterDetailFields(otherId, 'character-detail', ({ character }) => {
+                    character.desc = marker
+                }, () => stores.DBState.db.characters[indexOf(otherId)])).toBe(true)
+            } else if (change === 'a chat setting change') {
+                await runtime.mutateConversationBinding(ownerId, selectedId, { note: marker }, () => {})
+            } else if (change === 'a preset change') {
+                await runtime.mutatePersistentPresets('preset-rename', (state) => {
+                    expect(state.presets.length).toBeGreaterThan(0)
+                    state.presets[0].name = marker
+                })
+            } else {
+                await runtime.mutatePersistentPluginStorage('plugin-storage', [{ type: 'set', owner: 'synthetic-plugin', key: 'note', value: marker }])
+            }
+            expect(grown).toBe(true)
+            if (!shown) await inspect()
+            expect(get(app.localSaveFailure)).toBeNull()
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            expect(shown).toEqual({ reply: full, first: history[0], total: history.length + 1 })
+
+            await runtime.flushPendingData('reply')
+            expect(get(app.localSaveFailure)).toBeNull()
+            await runtime.commitPersistentUnitIntent('plugin-settings-write', [
+                { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 9 },
+            ])
+            expect(consoleError.mock.calls.map((args) => args.map((value) =>
+                value instanceof Error ? `${value.name}: ${value.message}` : String(value).slice(0, 200)))).toEqual([])
+            await reader.open()
+            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual([...history, full])
+            expect((await reader.readRoot()).value.loreBookDepth).toBe(9)
+        } finally {
+            consoleError.mockRestore()
+            Object.assign(globalThis, previousGlobals)
+        }
+    })
+
     it('keeps the saved body of a summarized chat when it moves into a folder', async () => {
         const indexedDB = new IDBFactory()
         const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }

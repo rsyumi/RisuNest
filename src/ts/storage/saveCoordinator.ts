@@ -132,11 +132,18 @@ export interface SaveCoordinatorDependencies {
     /** Message bytes of created conversations in one commit of a split save; defaults to CONVERSATION_INSERT_PAGE_BYTES. */
     conversationInsertPageBytes?: number
     onRoutineUnitsCommitted?(revision: DataRevision, keys: readonly string[]): Promise<void>
-    onLocalRevision?(revision: DataRevision): void
-    /** Advances revision-only working-set state synchronously and must not throw. */
-    onStorageOnlyRevision?(revision: DataRevision): void
-    /** Advances an adopted windowed selected-conversation authority synchronously, with its new message count when that changed. */
-    onWindowedSelectedConversationRevision?(revision: DataRevision, totalMessages?: number, preserveRows?: boolean): void
+    /**
+     * `storedTotalMessages` is the stored message count of the selected windowed conversation, given when
+     * the commit stored nothing in its messages but its session's own edits.
+     */
+    onLocalRevision?(revision: DataRevision, storedTotalMessages?: number): void
+    /** Advances revision-only working-set state synchronously and must not throw. `storedTotalMessages` as for `onLocalRevision`. */
+    onStorageOnlyRevision?(revision: DataRevision, storedTotalMessages?: number): void
+    /**
+     * Advances an adopted windowed selected-conversation authority synchronously, with its new message count
+     * when another writer changed it, or with `storedTotalMessages` as for `onLocalRevision`.
+     */
+    onWindowedSelectedConversationRevision?(revision: DataRevision, totalMessages?: number, preserveRows?: boolean, storedTotalMessages?: number): void
     /**
      * Replaces the selected windowed conversation with the given complete messages synchronously,
      * keeping its live metadata, and returns the published character. Returns null without
@@ -472,6 +479,16 @@ function prepareWindowedActivationChange(
     }
 
     return { persistedShell, change: detached }
+}
+
+/** Whether unit keys reach a conversation's messages: its rows, or the conversation or its character as a whole. */
+export function unitKeysReachConversationMessages(keys: readonly string[], characterId: string, conversationId: string): boolean {
+    return keys.some((key) => {
+        const [kind, first, second, third] = JSON.parse(key) as unknown[]
+        if (kind === 'messages') return first === characterId && second === conversationId
+        if (kind !== 'exists') return false
+        return first === 'character' ? second === characterId : first === 'conversation' && second === characterId && third === conversationId
+    })
 }
 
 function validWindowedAuthority(
@@ -1019,8 +1036,9 @@ export class SaveCoordinator {
             }
             if (revision === expectedRevision) return
             this.currentRevision = revision
-            this.dependencies.onStorageOnlyRevision?.(revision)
-            this.dependencies.onLocalRevision?.(revision)
+            const storedTotal = this.untouchedWindowedTotal()
+            this.dependencies.onStorageOnlyRevision?.(revision, storedTotal)
+            this.dependencies.onLocalRevision?.(revision, storedTotal)
         }, this.authorityEpoch, true)
     }
 
@@ -1694,7 +1712,7 @@ export class SaveCoordinator {
                 const keys = [...presetUnits.map((value) => value.key), ...presetRootMutations.map((value) => JSON.stringify(['root', value.key]))]
                 try { await this.dependencies.onRoutineUnitsCommitted(committed.revision, keys) }
                 catch (error) { this.markCommittedWorkingSetRefreshRequired(committed.revision, error); throw error }
-                this.dependencies.onLocalRevision?.(committed.revision)
+                this.dependencies.onLocalRevision?.(committed.revision, this.untouchedWindowedTotal())
                 await this.finishExplicitCommit(committed.revision)
                 return
             }
@@ -1706,7 +1724,7 @@ export class SaveCoordinator {
                 this.currentRevision = committed.revision
                 this.rootBaseline = canonicalJson(committedRoot)
                 this.presetsBaseline = canonicalJson(committedPresets)
-                this.dependencies.onLocalRevision?.(committed.revision)
+                this.dependencies.onLocalRevision?.(committed.revision, this.untouchedWindowedTotal())
                 await this.flushIterations(`${reason}-concurrent-live-presets`, true)
                 throw new Error('Persistent working set changed during preset mutation')
             }
@@ -1726,7 +1744,7 @@ export class SaveCoordinator {
             })
             const published = this.capture()
             this.presetsBaseline = published.presetsCanonical
-            this.dependencies.onLocalRevision?.(committed.revision)
+            this.dependencies.onLocalRevision?.(committed.revision, this.untouchedWindowedTotal())
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
             await this.finishExplicitCommit(committed.revision)
@@ -1844,7 +1862,7 @@ export class SaveCoordinator {
                 this.rootBaseline = canonicalJson(snapshot.root)
                 this.dependencies.publishRootWorkingSet?.(publishedRoot)
             }
-            this.dependencies.onLocalRevision?.(committed.revision)
+            this.dependencies.onLocalRevision?.(committed.revision, this.untouchedWindowedTotal())
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
             if (this.dependencies.officialPublisher) {
@@ -1932,7 +1950,7 @@ export class SaveCoordinator {
                     }
                 }
             }
-            this.dependencies.onLocalRevision?.(committed.revision)
+            this.dependencies.onLocalRevision?.(committed.revision, this.untouchedWindowedTotal())
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
             await this.finishExplicitCommit(committed.revision, false)
@@ -1980,8 +1998,9 @@ export class SaveCoordinator {
             }
             // The UI must not share nested values with the persisted windowed baseline.
             publish(clonePatch())
-            this.dependencies.onStorageOnlyRevision?.(committed.revision)
-            this.dependencies.onLocalRevision?.(committed.revision)
+            const storedTotal = this.untouchedWindowedTotal()
+            this.dependencies.onStorageOnlyRevision?.(committed.revision, storedTotal)
+            this.dependencies.onLocalRevision?.(committed.revision, storedTotal)
             await this.finishExplicitCommit(committed.revision)
         })
     }
@@ -2082,8 +2101,9 @@ export class SaveCoordinator {
                     ? unchangedCharacterDetailPatch(clonePatch(), resident, fieldsAtStart)
                     : clonePatch())
             }
-            this.dependencies.onStorageOnlyRevision?.(committed.revision)
-            this.dependencies.onLocalRevision?.(committed.revision)
+            const storedTotal = this.untouchedWindowedTotal()
+            this.dependencies.onStorageOnlyRevision?.(committed.revision, storedTotal)
+            this.dependencies.onLocalRevision?.(committed.revision, storedTotal)
             await this.finishExplicitCommit(committed.revision)
             return true
         })
@@ -3406,10 +3426,16 @@ export class SaveCoordinator {
                         const persistedSessionVersion =
                             persistedConversationMutations.at(-1)?.event.sessionVersion ??
                             windowedCapture.authority.persistedSessionVersion
+                        // The captured count is what this commit stored, unless a fallback wrote the conversation.
+                        const { characterId, conversationId, totalMessages } = windowedCapture.authority
                         this.setWindowedCharacterBaseline(
                             windowedCapture,
                             committed.revision,
                             persistedSessionVersion,
+                            false,
+                            fallbackPersistedConversationMutations.some(({ event }) =>
+                                event.characterId === characterId && event.conversationId === conversationId)
+                                ? undefined : totalMessages,
                         )
                     }
                     if (replacementIsAddition && addition) {
@@ -3821,7 +3847,9 @@ export class SaveCoordinator {
                 : null
             this.characterBaselineId = options.committedSelectedCharacter.character?.chaId ?? null
         }
-        this.dependencies.onLocalRevision?.(result.revision)
+        const changed = [result.characterId, ...(options.additionalDeletedCharacterIds ?? [])]
+        this.dependencies.onLocalRevision?.(result.revision,
+            changed.some((id) => id === this.windowedCharacterBaseline?.authority.characterId) ? undefined : this.untouchedWindowedTotal())
         if (!options.preservePendingWork) this.pendingByteCount = 0
         this.lastBackgroundErrorMessage = null
     }
@@ -4047,6 +4075,7 @@ export class SaveCoordinator {
         revision: DataRevision,
         persistedSessionVersion: number,
         rowsUnchanged = false,
+        storedTotalMessages?: number,
     ): void {
         // Unsaved activation evidence is pinned to the baseline's authority, and the working set refuses a
         // revision while the two differ, so the evidence moves with the baseline before the working set is told.
@@ -4066,7 +4095,20 @@ export class SaveCoordinator {
         }
         this.characterBaseline = null
         this.characterBaselineId = null
-        this.dependencies.onWindowedSelectedConversationRevision?.(revision, undefined, rowsUnchanged)
+        this.dependencies.onWindowedSelectedConversationRevision?.(revision, undefined, rowsUnchanged, storedTotalMessages)
+    }
+
+    /**
+     * The stored message count of the selected windowed conversation, when the commit described by these
+     * keys and conversation mutations stored nothing in its messages.
+     */
+    private untouchedWindowedTotal(keys: readonly string[] = [], conversations: readonly ConversationMutation[] = []): number | undefined {
+        const authority = this.windowedCharacterBaseline?.authority
+        if (!authority) return undefined
+        const touched = unitKeysReachConversationMessages(keys, authority.characterId, authority.conversationId) ||
+            conversations.some((value) => value.type !== 'reorder' &&
+                value.characterId === authority.characterId && value.conversationId === authority.conversationId)
+        return touched ? undefined : authority.totalMessages
     }
 
     private requireMatchingWindowedCapture(
@@ -5069,7 +5111,7 @@ export class SaveCoordinator {
             }
             this.rootBaseline = canonicalJson(root)
         }
-        this.dependencies.onLocalRevision?.(revision)
+        this.dependencies.onLocalRevision?.(revision, this.untouchedWindowedTotal(keys))
         await this.finishExplicitCommit(revision)
     }
 
@@ -5310,7 +5352,8 @@ export class SaveCoordinator {
     }
 
     adoptAppliedUnitState(revision: DataRevision, root: RootDatabase | null, presets: botPreset[] | null, characters: readonly CompleteCharacter[], presetRecords: readonly botPreset[] = presets ?? [],
-        windowedConversation?: { characterId: string; conversationId: string; totalMessages: number }, preserveSelectedRows = false): void {
+        windowedConversation?: { characterId: string; conversationId: string; totalMessages: number }, preserveSelectedRows = false,
+        selectedMessagesUntouched = false): void {
         this.currentRevision = revision
         if (root) this.rootBaseline = canonicalJson(root)
         if (presets) this.presetsBaseline = canonicalJson(presets)
@@ -5338,7 +5381,8 @@ export class SaveCoordinator {
             const totalMessages = windowedConversation?.characterId === authority.characterId &&
                 windowedConversation.conversationId === authority.conversationId ? windowedConversation.totalMessages : undefined
             if (totalMessages !== undefined) authority.totalMessages = totalMessages
-            this.dependencies.onWindowedSelectedConversationRevision?.(revision, totalMessages, preserveSelectedRows)
+            this.dependencies.onWindowedSelectedConversationRevision?.(revision, totalMessages, preserveSelectedRows,
+                selectedMessagesUntouched && totalMessages === undefined ? authority.totalMessages : undefined)
         }
     }
 
@@ -5390,7 +5434,8 @@ export class SaveCoordinator {
                 const result = await this.dependencies.store.commit({ expectedRevision: revision, unitMutations: [...prepared.unitMutations], conversations: [...prepared.conversations] })
                 committedRevision = result.revision
                 this.currentRevision = result.revision
-                this.dependencies.onLocalRevision?.(result.revision)
+                this.dependencies.onLocalRevision?.(result.revision,
+                    this.untouchedWindowedTotal(prepared.unitMutations.map((value) => value.key), prepared.conversations))
                 await onCommitted?.(result.revision)
                 await this.finishExplicitCommit(result.revision, false)
                 return result.revision

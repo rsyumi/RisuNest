@@ -557,6 +557,7 @@ export class ActiveWorkingSet {
                         absoluteStartIndex + localStart,
                         deleteCount,
                         detachedMessages,
+                        sessionVersion,
                     )
                     this.dependencies.coordinator.recordActiveConversationMutation({
                         characterId: state.characterId,
@@ -908,7 +909,7 @@ export class ActiveWorkingSet {
         return true
     }
 
-    advanceStoreRevision(revision: DataRevision, totalMessages?: number, preserveRows = false): void {
+    advanceStoreRevision(revision: DataRevision, totalMessages?: number, preserveRows = false, storedTotalMessages?: number): void {
         const state = this.selectedConversationState
         if (state?.kind !== 'windowed') {
             const previousRevision = this.activeSession?.storeRevision
@@ -929,14 +930,20 @@ export class ActiveWorkingSet {
             throw new Error('Windowed selected conversation revision advance is unavailable')
         }
         const authority = { ...state.authority, storeRevision: revision, totalMessages: totalMessages ?? state.authority.totalMessages }
-        if (preserveRows && authority.totalMessages === state.authority.totalMessages) {
+        // Edits made while the commit was stored are not in the store yet. When it stored nothing in this
+        // conversation but the session's own edits, the rows, which hold the later ones, stay.
+        const ahead = storedTotalMessages !== undefined && totalMessages === undefined &&
+            state.authority.sessionVersion !== state.authority.persistedSessionVersion
+        if (ahead || (preserveRows && authority.totalMessages === state.authority.totalMessages)) {
             const previousAuthority = state.authority
             state.authority = authority
             if (!advance.call(this.dependencies.coordinator, revision, authority, true)) {
                 state.authority = previousAuthority
                 throw new Error('Windowed selected conversation revision was not adopted')
             }
-            state.viewportSource.advanceUnchangedRevision(revision)
+            state.viewportSource.advanceUnchangedRevision(revision, ahead
+                ? { totalMessages: storedTotalMessages!, sessionVersion: state.authority.persistedSessionVersion }
+                : undefined)
             return
         }
         const viewportSource = new PersistentConversationViewportSource({

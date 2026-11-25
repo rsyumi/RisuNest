@@ -876,6 +876,22 @@ describe('PersistentConversationViewportSource', () => {
         expect(() => source.advanceUnchangedRevision(9)).toThrow()
     })
 
+    it('finds the latest message pair without a metadata reader while an unsaved row is evicted', async () => {
+        const stored = [{ role: 'user', data: 'stored a' }, { role: 'char', data: 'stored b' }, { role: 'char', data: 'stored c' }] as Message[]
+        const source = new PersistentConversationViewportSource({
+            reader: { readConversationWindow: vi.fn(async ({ startIndex, limit }: ConversationWindowQuery) => ({
+                revision: 7,
+                value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), stored.length),
+            })) },
+            characterId: 'character-a', conversationId: 'conversation-a', revision: 7, totalMessages: 3, rowBudget: 2,
+        })
+        source.applyOptimisticRange(0, 1, [{ role: 'user', data: 'edited a' }], 1)
+        // The row budget evicts the oldest unsaved row.
+        source.applyOptimisticRange(1, 2, [{ role: 'char', data: 'edited b' }, { role: 'char', data: 'edited c' }], 2)
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+        await expect(source.findLatestMessagePair(new AbortController().signal)).resolves.toEqual([0, 2])
+    })
+
     it('validates authority, range, pin, and monotonic revision inputs', async () => {
         const reader = {
             readConversationWindow: vi.fn(async () => null),

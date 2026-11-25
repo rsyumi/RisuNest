@@ -97,6 +97,8 @@ describe('SaveCoordinator', () => {
                     persistedSessionVersion: event.sessionVersion,
                 }
             })
+            // What each local commit told the working set: its revision and, when given, the stored count.
+            const localRevisions: [number, number | undefined][] = []
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -110,6 +112,7 @@ describe('SaveCoordinator', () => {
                 onWindowedSelectedConversationRevision: (revision) => {
                     if (authority) authority = { ...authority, storeRevision: revision }
                 },
+                onLocalRevision: (revision, storedTotalMessages) => localRevisions.push([revision, storedTotalMessages]),
             })
             coordinator.initialize(2, database)
             expect(coordinator.adoptWindowedSelectedConversation(
@@ -123,6 +126,7 @@ describe('SaveCoordinator', () => {
                 commit,
                 coordinator,
                 database,
+                localRevisions,
                 onPersisted,
                 projectedConversation,
                 readConversationWindow,
@@ -1261,6 +1265,22 @@ describe('SaveCoordinator', () => {
             )).toBe(true)
             await harness.coordinator.flushPendingData('advanced-windowed-baseline')
             expect(harness.commit).not.toHaveBeenCalled()
+        })
+
+        // A commit that stores nothing in the open conversation's messages lets the working set keep the
+        // rows that hold edits made meanwhile; one that does write them leaves the rows to be read again.
+        it.each([
+            { commit: 'a root setting', units: [['root', 'loreBookDepth']], ranges: [], keepsRows: true },
+            { commit: 'a range in another conversation', units: [], ranges: [['char-a', 'one']], keepsRows: true },
+            { commit: 'a range in the open conversation', units: [], ranges: [['char-a', 'two']], keepsRows: false },
+            { commit: 'messages of the open conversation', units: [['messages', 'char-a', 'two', 'm1']], ranges: [], keepsRows: false },
+            { commit: 'the removal of the open conversation', units: [['exists', 'conversation', 'char-a', 'two']], ranges: [], keepsRows: false },
+            { commit: 'the removal of its character', units: [['exists', 'character', 'char-a']], ranges: [], keepsRows: false },
+        ])('tells the working set whether $commit leaves the open windowed conversation\'s rows current', async ({ units, ranges, keepsRows }) => {
+            const harness = makeWindowedHarness({ totalMessages: 40 })
+            await harness.coordinator.commitPersistentUnitIntent('unit', units.map((key) => ({ key: JSON.stringify(key), type: 'set' as const, value: 1 })),
+                ranges.map(([characterId, conversationId]) => ({ type: 'replace-range' as const, characterId, conversationId, start: 0, deleteCount: 0, messages: [] })))
+            expect(harness.localRevisions).toEqual([[3, keepsRows ? 40 : undefined]])
         })
 
         function recordAddedChat(

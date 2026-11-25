@@ -430,7 +430,8 @@ implements ConversationViewportSource {
     private readonly listeners = new Set<() => void>()
     private readonly pins = new Map<number, PersistentRangePinState>()
     private rows = new Map<number, PersistentCachedRow>()
-    private optimisticRows = new Set<number>()
+    // The session version of the edit each unsaved row holds.
+    private optimisticRows = new Map<number, number>()
     private historyVersion = 0
     private readonly historyChanges: (CbsHistoryChange & { version: number })[] = []
     private currentRevision: DataRevision
@@ -558,9 +559,8 @@ implements ConversationViewportSource {
             }
             return Array.from({ length: limit }, (_, offset) => {
                 const index = start + offset
-                return this.optimisticRows.has(index)
-                    ? this.rows.get(index)!.row.message
-                    : result.value.messages[offset]
+                return (this.optimisticRows.has(index) ? this.rows.get(index)?.row.message : undefined)
+                    ?? result.value.messages[offset]
             })
         }, signal).then((indices) => {
             if (this.disposed || this.latestPair !== lookup) throw new DOMException('Conversation changed during pair lookup', 'AbortError')
@@ -629,6 +629,7 @@ implements ConversationViewportSource {
         startIndex: number,
         deleteCount: number,
         messages: readonly Message[],
+        sessionVersion = Number.POSITIVE_INFINITY,
     ): () => void {
         this.assertUsable()
         if (
@@ -644,7 +645,7 @@ implements ConversationViewportSource {
         this.recordHistoryChange(startIndex, startIndex + Math.max(deleteCount, messages.length), deleteCount !== messages.length)
         this.latestPair = null
         const previousRows = new Map(this.rows)
-        const previousOptimisticRows = new Set(this.optimisticRows)
+        const previousOptimisticRows = new Map(this.optimisticRows)
         const previousTotalMessages = this.totalMessages
         this.totalMessages = this.totalMessages - deleteCount + messages.length
         for (let offset = 0; offset < Math.max(deleteCount, messages.length); offset += 1) {
@@ -665,7 +666,7 @@ implements ConversationViewportSource {
                 },
                 lastUsed: ++this.accessClock,
             })
-            this.optimisticRows.add(absoluteIndex)
+            this.optimisticRows.set(absoluteIndex, sessionVersion)
         }
         this.evictUnpinnedRows()
         this.notifyListeners()
@@ -703,15 +704,26 @@ implements ConversationViewportSource {
         this.epoch += 1
         this.pins.clear()
         this.rows = new Map()
-        this.optimisticRows = new Set()
+        this.optimisticRows = new Map()
         this.notifyListeners()
     }
 
-    advanceUnchangedRevision(revision: DataRevision): void {
+    /**
+     * Moves to a later revision whose stored messages the rows already show. When that revision stored
+     * edits the rows hold, `stored` gives the count it stores and the session version it stores up to,
+     * and rows of those edits are read from the store again once evicted.
+     */
+    advanceUnchangedRevision(revision: DataRevision, stored?: { totalMessages: number, sessionVersion: number }): void {
         this.assertUsable()
         this.validateRevision(revision)
+        if (stored) this.validateMessageCount(stored.totalMessages)
         if (revision < this.currentRevision) throw new RangeError('Persistent conversation revision moved backwards')
         this.currentRevision = revision
+        if (!stored) return
+        this.persistedTotalMessages = stored.totalMessages
+        for (const [index, sessionVersion] of this.optimisticRows) {
+            if (sessionVersion <= stored.sessionVersion) this.optimisticRows.delete(index)
+        }
     }
 
     acquireRangePin(
