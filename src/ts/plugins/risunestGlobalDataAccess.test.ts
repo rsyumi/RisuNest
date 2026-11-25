@@ -106,19 +106,26 @@ describe('plugin global variables', { timeout: 30_000 }, () => {
         expect(await library.access.readGlobalVariables({ names: ['added', 'kept'] })).toStrictEqual({ values: { added: 'new' } })
     })
 
-    it('keeps nothing of a write whose commit fails', async () => {
+    it('keeps nothing of writes whose commits fail, also when they overlap', async () => {
         const library = await openLibrary('risunest-variables-failed')
-        await library.open('char-a')
-        vi.spyOn(library.store, 'commit').mockRejectedValueOnce(new Error('synthetic storage failure'))
+        await library.open('char-b')
+        // The first failure arrives a task later, as storage answers, so the second write is called while it is pending.
+        vi.spyOn(library.store, 'commit')
+            .mockImplementationOnce(() => new Promise((_, reject) => setTimeout(() => reject(new Error('synthetic storage failure')))))
+            .mockRejectedValueOnce(new Error('synthetic storage failure'))
 
-        await expect(library.access.writeGlobalVariables({ shared: 'plugin', added: 'new', kept: null }))
-            .rejects.toThrow('synthetic storage failure')
+        const first = library.access.writeGlobalVariables({ shared: 'first', added: 'new', kept: null, toggle_mode: 'first' })
+        const second = library.access.writeGlobalVariables({ shared: 'second', toggle_mode: 'second' })
+        await expect(first).rejects.toThrow('synthetic storage failure')
+        await expect(second).rejects.toThrow('synthetic storage failure')
 
         expect(library.getGlobalChatVar('shared')).toBe('stored')
         expect(library.getGlobalChatVar('added')).toBe('null')
         expect(library.getGlobalChatVar('kept')).toBe('stored')
+        expect(library.getGlobalChatVar('toggle_mode')).toBe('bound')
         await library.settle()
         expect(await library.storedVariables()).toStrictEqual({ shared: 'stored', kept: 'stored', toggle_mode: 'global' })
+        expect((await library.store.readConversation('char-b', 'conv-beta'))!.value.savedToggleValues).toEqual({ toggle_mode: 'bound' })
     })
 
     it('changes the shared toggle value and leaves the one the open chat keeps for itself', async () => {

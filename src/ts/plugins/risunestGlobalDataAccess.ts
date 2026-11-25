@@ -168,39 +168,49 @@ async function readStoredRoot(reason: string) {
     return (await getPersistentDataStore().readRoot()).value
 }
 
+// Writes from every plugin run one at a time, so a failed write restores the values the
+// previous write left rather than ones another write has not saved yet.
+let globalVariableWrites: Promise<unknown> = Promise.resolve()
+
+async function writeSharedGlobalVariables(entries: [string, string | null][]) {
+    const { stores, runtime, database } = await appModules()
+    const { isConversationSummaryStub } = await import('../storage/conversationResidency')
+    const db = stores.DBState.db
+    // The app's unsaved variable edits reach the shared set or the bound conversation first.
+    database.flushEffectiveToggleEdits(db)
+    // The shared set is edited directly: a toggle sent through the unit commit would go to
+    // the conversation the open chat binds.
+    const shared = database.getExplicitGlobalChatVariables(db)
+    const apply = (values: [string, string | null][]) => {
+        for (const [name, value] of values) {
+            if (value === null) delete shared[name]
+            else shared[name] = value
+        }
+        // The variables the app uses follow the shared set, except the toggles the open chat binds.
+        const character = db.characters[get(stores.selectedCharID)]
+        const chat = character?.chats?.[character.chatPage]
+        database.deriveEffectiveToggleVariables(db, chat && !isConversationSummaryStub(chat) ? chat : undefined)
+    }
+    const previous = entries.map(([name]): [string, string | null] => [name, Object.hasOwn(shared, name) ? shared[name] : null])
+    apply(entries)
+    try {
+        await runtime.flushPendingData('plugin-write-global-variables')
+    } catch (error) {
+        // A later save must not store what the plugin was told failed.
+        apply(previous)
+        throw error
+    }
+}
+
 const productionGlobalDataStore: RisunestGlobalDataStore = {
     async readGlobalVariables() {
         const root = await readStoredRoot('plugin-read-global-variables')
         return root.explicitGlobalChatVariables ?? root.globalChatVariables ?? {}
     },
-    async writeGlobalVariables(entries) {
-        const { stores, runtime, database } = await appModules()
-        const { isConversationSummaryStub } = await import('../storage/conversationResidency')
-        const db = stores.DBState.db
-        // The app's unsaved variable edits reach the shared set or the bound conversation first.
-        database.flushEffectiveToggleEdits(db)
-        // The shared set is edited directly: a toggle sent through the unit commit would go to
-        // the conversation the open chat binds.
-        const shared = database.getExplicitGlobalChatVariables(db)
-        const apply = (values: [string, string | null][]) => {
-            for (const [name, value] of values) {
-                if (value === null) delete shared[name]
-                else shared[name] = value
-            }
-            // The variables the app uses follow the shared set, except the toggles the open chat binds.
-            const character = db.characters[get(stores.selectedCharID)]
-            const chat = character?.chats?.[character.chatPage]
-            database.deriveEffectiveToggleVariables(db, chat && !isConversationSummaryStub(chat) ? chat : undefined)
-        }
-        const previous = entries.map(([name]): [string, string | null] => [name, Object.hasOwn(shared, name) ? shared[name] : null])
-        apply(entries)
-        try {
-            await runtime.flushPendingData('plugin-write-global-variables')
-        } catch (error) {
-            // A later save must not store what the plugin was told failed.
-            apply(previous)
-            throw error
-        }
+    writeGlobalVariables(entries) {
+        const write = globalVariableWrites.then(() => writeSharedGlobalVariables(entries))
+        globalVariableWrites = write.catch(() => undefined)
+        return write
     },
     async readLoadouts() {
         return (await readStoredRoot('plugin-read-loadouts')).loadouts ?? []
