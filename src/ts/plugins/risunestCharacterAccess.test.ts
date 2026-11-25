@@ -103,8 +103,8 @@ describe('plugin character access', { timeout: 30_000 }, () => {
         }
         await expect(library.access.trashCharacter({ id: '' })).rejects.toThrow(TypeError)
         await expect(library.access.restoreCharacter('char-c')).rejects.toThrow(TypeError)
-        for (const key of ['type', 'chaId', 'trashTime']) {
-            expect(await library.access.createCharacter({ fields: { name: 'Synthetic', [key]: key === 'trashTime' ? 1 : 'group' } }))
+        for (const [key, value] of [['type', 'group'], ['chaId', 'group'], ['trashTime', 1], ['lowLevelAccess', true]] as const) {
+            expect(await library.access.createCharacter({ fields: { name: 'Synthetic', [key]: value } }))
                 .toEqual({ status: 'rejected', reason: `${key} cannot be set` })
         }
         expect(await library.access.createCharacter({
@@ -151,6 +151,20 @@ describe('plugin character access', { timeout: 30_000 }, () => {
         expect(library.resident('char-b')).not.toHaveProperty('trashTime')
         expect((await library.store.readCharacter('char-b'))!.value).not.toHaveProperty('trashTime')
         expect((await library.store.readConversation('char-b', 'conv-beta'))!.value.message).toHaveLength(3)
+    })
+
+    it('applies a trash and a restore called back to back in the order they were called', async () => {
+        const library = await openLibrary('risunest-character-trash-restore-order')
+        await library.open('char-b')
+
+        const trashed = library.access.trashCharacter({ id: 'char-b' })
+        const restored = library.access.restoreCharacter({ id: 'char-b' })
+        expect(await trashed).toEqual({ status: 'applied' })
+        expect(await restored).toEqual({ status: 'applied' })
+
+        expect(library.resident('char-b')).not.toHaveProperty('trashTime')
+        expect((await library.store.readCharacter('char-b'))!.value).not.toHaveProperty('trashTime')
+        expect(await library.storedOrder()).toEqual(['char-a', 'char-b'])
     })
 
     it('moves a character that is not open to the trash without closing the open one, and finds no unknown ID', async () => {

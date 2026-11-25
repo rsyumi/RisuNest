@@ -32,8 +32,9 @@ export type RisunestCreateCharacterResult =
     | { status: 'denied' }
     | { status: 'rejected'; reason: string }
 
-// The host assigns the ID, and a plugin creates neither a group nor a trashed character.
-const hostOwnedFields = new Set(['chaId', 'type', 'trashTime', '__proto__', 'prototype', 'constructor'])
+// The host assigns the ID, and a plugin creates neither a group nor a trashed character. Low level
+// access is granted only through the confirmation card and module imports ask for.
+const hostOwnedFields = new Set(['chaId', 'type', 'trashTime', 'lowLevelAccess', '__proto__', 'prototype', 'constructor'])
 
 function changeResult(change: RisunestCharacterChange): RisunestWriteResult {
     if (change === 'applied' || change === 'not-found') return { status: change }
@@ -92,6 +93,15 @@ async function appModules() {
     return { runtime, catalog, characters, resident, isOpen }
 }
 
+// Trash and restore decide from the working copy before their commit is queued, so they run one
+// at a time and take effect in the order they were called.
+let characterChanges: Promise<unknown> = Promise.resolve()
+function inOrder<T>(change: () => Promise<T>): Promise<T> {
+    const next = characterChanges.then(change)
+    characterChanges = next.catch(() => undefined)
+    return next
+}
+
 const productionCharacterStore: RisunestCharacterStore = {
     async createBlankCharacter() {
         return (await appModules()).characters.createBlankChar()
@@ -106,7 +116,7 @@ const productionCharacterStore: RisunestCharacterStore = {
         await runtime.flushPendingData('plugin-create-character')
         await characters.commitDetachedCharacter(value, 'create-character')
     },
-    async trashCharacter(id) {
+    trashCharacter: (id) => inOrder(async () => {
         const { runtime, catalog, characters, resident, isOpen } = await appModules()
         const current = resident(id)
         // The app deletes an archived character for good instead of moving it to the trash.
@@ -121,8 +131,8 @@ const productionCharacterStore: RisunestCharacterStore = {
             character.trashTime = Date.now()
         })
         return changed ? 'applied' : 'not-found'
-    },
-    async restoreCharacter(id) {
+    }),
+    restoreCharacter: (id) => inOrder(async () => {
         const { runtime, catalog, resident } = await appModules()
         const current = resident(id)
         // An archived character is never in the trash.
@@ -133,7 +143,7 @@ const productionCharacterStore: RisunestCharacterStore = {
             appendCharacterIdToOrder(root, id)
         })
         return changed ? 'applied' : 'not-found'
-    },
+    }),
 }
 
 export function createRisunestCharacterAccess(context: RisunestHostContext) {
