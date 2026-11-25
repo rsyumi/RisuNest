@@ -1,4 +1,5 @@
 import type { PluginStorageWriteCheck } from '../plugins/pluginStorageProtection'
+import type { ConversationRowsRewrite } from '../conversationViewportSource'
 import { captureMaterializedCharacter, diffMaterializedCharacter, diffRecordCollection, recordCollections, diffFields } from './persistentUnitCapture'
 import { isTauri } from '../platform'
 import { Mutex } from '../mutex'
@@ -134,9 +135,10 @@ export interface SaveCoordinatorDependencies {
     onRoutineUnitsCommitted?(revision: DataRevision, keys: readonly string[]): Promise<void>
     /**
      * `storedTotalMessages` is the stored message count of the selected windowed conversation, given when
-     * the commit stored nothing in its messages but its session's own edits.
+     * the commit stored nothing in its messages but its session's own edits and the rows in `rewritten`,
+     * which it replaced one for one.
      */
-    onLocalRevision?(revision: DataRevision, storedTotalMessages?: number): void
+    onLocalRevision?(revision: DataRevision, storedTotalMessages?: number, rewritten?: readonly ConversationRowsRewrite[]): void
     /** Advances revision-only working-set state synchronously and must not throw. `storedTotalMessages` as for `onLocalRevision`. */
     onStorageOnlyRevision?(revision: DataRevision, storedTotalMessages?: number): void
     /**
@@ -4102,13 +4104,29 @@ export class SaveCoordinator {
      * The stored message count of the selected windowed conversation, when the commit described by these
      * keys and conversation mutations stored nothing in its messages.
      */
-    private untouchedWindowedTotal(keys: readonly string[] = [], conversations: readonly ConversationMutation[] = []): number | undefined {
+    private untouchedWindowedTotal(keys: readonly string[] = []): number | undefined {
+        return this.storedWindowedRows(keys)?.totalMessages
+    }
+
+    /**
+     * The open windowed conversation's stored count after a commit of these writes and the rows it
+     * replaced one for one there; undefined when the commit wrote that conversation otherwise.
+     */
+    private storedWindowedRows(
+        keys: readonly string[],
+        conversations: readonly ConversationMutation[] = [],
+    ): { totalMessages: number, rewritten: ConversationRowsRewrite[] } | undefined {
         const authority = this.windowedCharacterBaseline?.authority
-        if (!authority) return undefined
-        const touched = unitKeysReachConversationMessages(keys, authority.characterId, authority.conversationId) ||
-            conversations.some((value) => value.type !== 'reorder' &&
-                value.characterId === authority.characterId && value.conversationId === authority.conversationId)
-        return touched ? undefined : authority.totalMessages
+        if (!authority || unitKeysReachConversationMessages(keys, authority.characterId, authority.conversationId)) return undefined
+        const rewritten: ConversationRowsRewrite[] = []
+        for (const value of conversations) {
+            if (value.type === 'reorder' || value.characterId !== authority.characterId ||
+                value.conversationId !== authority.conversationId) continue
+            if (value.type !== 'replace-range' || value.deleteCount !== value.messages.length ||
+                value.conversation !== undefined || value.configuredIndex !== undefined) return undefined
+            rewritten.push({ start: value.start, messages: value.messages })
+        }
+        return { totalMessages: authority.totalMessages, rewritten }
     }
 
     private requireMatchingWindowedCapture(
@@ -5434,8 +5452,8 @@ export class SaveCoordinator {
                 const result = await this.dependencies.store.commit({ expectedRevision: revision, unitMutations: [...prepared.unitMutations], conversations: [...prepared.conversations] })
                 committedRevision = result.revision
                 this.currentRevision = result.revision
-                this.dependencies.onLocalRevision?.(result.revision,
-                    this.untouchedWindowedTotal(prepared.unitMutations.map((value) => value.key), prepared.conversations))
+                const stored = this.storedWindowedRows(prepared.unitMutations.map((value) => value.key), prepared.conversations)
+                this.dependencies.onLocalRevision?.(result.revision, stored?.totalMessages, stored?.rewritten)
                 await onCommitted?.(result.revision)
                 await this.finishExplicitCommit(result.revision, false)
                 return result.revision

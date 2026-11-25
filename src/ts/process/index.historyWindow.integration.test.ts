@@ -467,6 +467,68 @@ describe('a windowed send through the production runtime', () => {
         } finally { release(); spy.mockRestore() }
     })
 
+    // A reply keeps streaming into the windowed conversation while a plugin's parser call stores an
+    // @@inject write; the reply's text grows while that commit runs.
+    it.each([
+        { target: 'an earlier message', index: 100, adopted: true },
+        { target: 'the streaming reply', index: MESSAGES, adopted: false },
+    ])('keeps a streaming reply when a parser inject stores $target of the windowed conversation', async ({ index, adopted }) => {
+        const { store, reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
+            seed.characters[0].triggerscript = []
+        })
+        const { parseRisuChat } = await import('../plugins/parseRisuChat')
+        const { cloneConversationMetadata } = await import('../storage/selectedConversationLifecycle')
+        const runtime = current.runtime
+        const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
+        const full = { ...partial, data: 'Synthetic reply, streamed further' }
+        const write = (start: number, deleteCount: number, message: Message) => {
+            const target = runtime.captureSelectedConversationTarget()!
+            const chat = { ...cloneConversationMetadata(DBState.db.characters[0].chats[0]),
+                message: deleteCount ? [partial] : [] } as unknown as Chat
+            const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
+            expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
+            controller.release()
+        }
+        write(MESSAGES, 0, partial)
+        await runtime.flushPendingData('partial-reply')
+        const source = runtime.getActiveConversationViewportSource()!
+        await source.ensureRange({ startIndex: 96, limit: 8, reason: 'viewport' })
+        const historyVersion = source.snapshot().historyVersion
+        let grown = false
+        const commit = store.commit.bind(store)
+        const spy = vi.spyOn(store, 'commit').mockImplementation(async (request) => {
+            const result = await commit(request)
+            if (!grown && JSON.stringify(request).includes('STORED:plugin note')) {
+                grown = true
+                write(MESSAGES, 1, full)
+            }
+            return result
+        })
+        try {
+            const parsed = parseRisuChat('WRITE:plugin note', { processRegex: true, messageIndex: index })
+            if (!adopted) {
+                // The commit rewrote the row that holds the unsaved reply, so the screen is read again.
+                await expect(parsed).rejects.toMatchObject({ name: 'PersistentMutationFencedError' })
+                expect(runtime.pendingWorkingSetRefreshRevision).not.toBeNull()
+                return
+            }
+            expect(await parsed).toBe('plugin note')
+            expect(grown).toBe(true)
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            expect(runtime.getActiveConversationViewportSource()).toBe(source)
+            expect(source.snapshot().rowAt(100)?.message.data).toBe('STORED:plugin note')
+            // Parsers that read that message see it changed.
+            expect(source.snapshot().historyChangesSince?.(historyVersion!)).toContainEqual(
+                expect.objectContaining({ start: 100, end: 101, countChanged: false }))
+            await source.ensureRange({ startIndex: MESSAGES - 2, limit: 3, reason: 'viewport' })
+            expect(source.snapshot().rowAt(MESSAGES)?.message).toEqual(full)
+            await runtime.flushPendingData('streamed-reply')
+            const stored = await reopen()
+            expect([stored.message[100].data, stored.message.at(-1)]).toEqual(['STORED:plugin note', full])
+            expect(backgroundErrors).toEqual([])
+        } finally { spy.mockRestore() }
+    })
+
     it('allows parseRisuChat and its variable writes inside the provider callback without waiting for the send', async () => {
         const { reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
             seed.characters[0].customscript = []

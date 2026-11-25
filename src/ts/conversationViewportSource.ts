@@ -55,6 +55,12 @@ export type ConversationViewportPinReason =
     | 'playing-media'
     | 'streaming'
 
+/** Stored rows a commit replaced one for one, from `start`. */
+export interface ConversationRowsRewrite {
+    start: number
+    messages: readonly Message[]
+}
+
 export interface ConversationViewportRangeRequest {
     startIndex: number
     limit: number
@@ -711,9 +717,14 @@ implements ConversationViewportSource {
     /**
      * Moves to a later revision whose stored messages the rows already show. When that revision stored
      * edits the rows hold, `stored` gives the count it stores and the session version it stores up to,
-     * and rows of those edits are read from the store again once evicted.
+     * and rows of those edits are read from the store again once evicted. Rows it `rewritten` take the
+     * stored messages.
      */
-    advanceUnchangedRevision(revision: DataRevision, stored?: { totalMessages: number, sessionVersion: number }): void {
+    advanceUnchangedRevision(revision: DataRevision, stored?: {
+        totalMessages: number
+        sessionVersion: number
+        rewritten?: readonly ConversationRowsRewrite[]
+    }): void {
         this.assertUsable()
         this.validateRevision(revision)
         if (stored) this.validateMessageCount(stored.totalMessages)
@@ -724,6 +735,27 @@ implements ConversationViewportSource {
         for (const [index, sessionVersion] of this.optimisticRows) {
             if (sessionVersion <= stored.sessionVersion) this.optimisticRows.delete(index)
         }
+        const rewritten = (stored.rewritten ?? []).filter(({ messages }) => messages.length > 0)
+        if (!rewritten.length) return
+        for (const { start, messages } of rewritten) {
+            for (let offset = 0; offset < messages.length; offset++) {
+                const cached = this.rows.get(start + offset)
+                if (cached) cached.row = { ...cached.row, message: safeStructuredClone(messages[offset]) }
+            }
+            this.recordHistoryChange(start, start + messages.length, false)
+        }
+        this.latestPair = null
+        this.notifyListeners()
+    }
+
+    /** Whether a row in these ranges holds an edit later than the stored session version. */
+    holdsUnsavedRows(ranges: readonly ConversationRowsRewrite[], storedSessionVersion: number): boolean {
+        return ranges.some(({ start, messages }) => {
+            for (let index = start; index < start + messages.length; index++) {
+                if ((this.optimisticRows.get(index) ?? -1) > storedSessionVersion) return true
+            }
+            return false
+        })
     }
 
     acquireRangePin(

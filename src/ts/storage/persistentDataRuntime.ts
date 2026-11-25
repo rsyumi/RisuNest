@@ -696,8 +696,8 @@ export function createPersistentDataRuntime(
             : undefined,
         clock: dependencies.clock,
         now: dependencies.now,
-        onLocalRevision: (revision, storedTotalMessages) => publishCommittedProjection({ wholeLibrary: true }, () => {
-            workingSet.advanceStoreRevision(revision, undefined, false, storedTotalMessages)
+        onLocalRevision: (revision, storedTotalMessages, rewritten) => publishCommittedProjection({ wholeLibrary: true }, () => {
+            workingSet.advanceStoreRevision(revision, undefined, false, storedTotalMessages, rewritten)
             dependencies.onLocalRevision?.(revision)
         }),
         onStorageOnlyRevision: (revision, storedTotalMessages) => workingSet.advanceStoreRevision(revision, undefined, false, storedTotalMessages),

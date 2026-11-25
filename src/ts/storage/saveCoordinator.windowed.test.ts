@@ -14,6 +14,7 @@ import {
     SaveCoordinator,
 } from './saveCoordinator.testSupport'
 import { safeStructuredClone } from '../polyfill'
+import type { ConversationRowsRewrite } from '../conversationViewportSource'
 
 vi.mock('../polyfill', async (importOriginal) => {
     const actual = await importOriginal<typeof import('../polyfill')>()
@@ -97,8 +98,9 @@ describe('SaveCoordinator', () => {
                     persistedSessionVersion: event.sessionVersion,
                 }
             })
-            // What each local commit told the working set: its revision and, when given, the stored count.
-            const localRevisions: [number, number | undefined][] = []
+            // What each local commit told the working set: its revision and, when given, the stored count
+            // and the rows it rewrote.
+            const localRevisions: [number, number | undefined, readonly ConversationRowsRewrite[] | undefined][] = []
             const coordinator = new SaveCoordinator({
                 store,
                 captureRoot: () => captureRoot(database),
@@ -112,7 +114,8 @@ describe('SaveCoordinator', () => {
                 onWindowedSelectedConversationRevision: (revision) => {
                     if (authority) authority = { ...authority, storeRevision: revision }
                 },
-                onLocalRevision: (revision, storedTotalMessages) => localRevisions.push([revision, storedTotalMessages]),
+                onLocalRevision: (revision, storedTotalMessages, rewritten) =>
+                    localRevisions.push([revision, storedTotalMessages, rewritten]),
             })
             coordinator.initialize(2, database)
             expect(coordinator.adoptWindowedSelectedConversation(
@@ -1267,20 +1270,35 @@ describe('SaveCoordinator', () => {
             expect(harness.commit).not.toHaveBeenCalled()
         })
 
-        // A commit that stores nothing in the open conversation's messages lets the working set keep the
-        // rows that hold edits made meanwhile; one that does write them leaves the rows to be read again.
-        it.each([
-            { commit: 'a root setting', units: [['root', 'loreBookDepth']], ranges: [], keepsRows: true },
-            { commit: 'a range in another conversation', units: [], ranges: [['char-a', 'one']], keepsRows: true },
-            { commit: 'a range in the open conversation', units: [], ranges: [['char-a', 'two']], keepsRows: false },
-            { commit: 'messages of the open conversation', units: [['messages', 'char-a', 'two', 'm1']], ranges: [], keepsRows: false },
-            { commit: 'the removal of the open conversation', units: [['exists', 'conversation', 'char-a', 'two']], ranges: [], keepsRows: false },
-            { commit: 'the removal of its character', units: [['exists', 'character', 'char-a']], ranges: [], keepsRows: false },
-        ])('tells the working set whether $commit leaves the open windowed conversation\'s rows current', async ({ units, ranges, keepsRows }) => {
+        // A commit that stores nothing in the open conversation's messages, or only replaces rows one for
+        // one, lets the working set keep the rows that hold edits made meanwhile; one that writes them
+        // otherwise leaves the rows to be read again.
+        const rewrittenMessage = { role: 'user' as const, data: 'rewritten' }
+        it.each<{
+            commit: string
+            units: string[][]
+            // Each range replaces from row 3 with one message: character, conversation, deleted rows, settings.
+            ranges: [string, string, number, Partial<Chat>?][]
+            reported: [number | undefined, ConversationRowsRewrite[] | undefined]
+        }>([
+            { commit: 'a root setting', units: [['root', 'loreBookDepth']], ranges: [], reported: [40, []] },
+            { commit: 'a range in another conversation', units: [], ranges: [['char-a', 'one', 0]], reported: [40, []] },
+            { commit: 'a row rewrite in the open conversation', units: [], ranges: [['char-a', 'two', 1]],
+                reported: [40, [{ start: 3, messages: [rewrittenMessage] }]] },
+            { commit: 'an insertion in the open conversation', units: [], ranges: [['char-a', 'two', 0]], reported: [undefined, undefined] },
+            { commit: 'a row rewrite with the open conversation\'s settings', units: [], ranges: [['char-a', 'two', 1, { name: 'renamed' }]],
+                reported: [undefined, undefined] },
+            { commit: 'messages of the open conversation', units: [['messages', 'char-a', 'two', 'm1']], ranges: [], reported: [undefined, undefined] },
+            { commit: 'the removal of the open conversation', units: [['exists', 'conversation', 'char-a', 'two']], ranges: [], reported: [undefined, undefined] },
+            { commit: 'the removal of its character', units: [['exists', 'character', 'char-a']], ranges: [], reported: [undefined, undefined] },
+        ])('tells the working set what $commit stored in the open windowed conversation\'s rows', async ({ units, ranges, reported }) => {
             const harness = makeWindowedHarness({ totalMessages: 40 })
             await harness.coordinator.commitPersistentUnitIntent('unit', units.map((key) => ({ key: JSON.stringify(key), type: 'set' as const, value: 1 })),
-                ranges.map(([characterId, conversationId]) => ({ type: 'replace-range' as const, characterId, conversationId, start: 0, deleteCount: 0, messages: [] })))
-            expect(harness.localRevisions).toEqual([[3, keepsRows ? 40 : undefined]])
+                ranges.map(([characterId, conversationId, deleteCount, conversation]) => ({
+                    type: 'replace-range' as const, characterId, conversationId, start: 3, deleteCount, messages: [rewrittenMessage],
+                    ...conversation ? { conversation: conversation as unknown as Omit<Chat, 'message'> } : {},
+                })))
+            expect(harness.localRevisions).toEqual([[3, ...reported]])
         })
 
         function recordAddedChat(
