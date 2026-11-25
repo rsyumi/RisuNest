@@ -23,7 +23,10 @@ export type RisunestSettingKeyInfo = {
 
 export interface RisunestSettingsDependencies {
     flushPendingData(reason: string): Promise<void>
-    /** The current value of each named root key; a key without a value has no entry. */
+    /**
+     * The value the app uses for each named root key; a key without a value has no entry. A
+     * stored null of a key the app gives a default on load (`loreBookDepth`) reads as that default.
+     */
     readRootValues(keys: readonly string[]): Record<string, unknown>
     /**
      * Replaces the whole value of each root key in one commit, whatever it was before, then does
