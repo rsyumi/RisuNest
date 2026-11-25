@@ -1226,6 +1226,7 @@ describe('selected chat list edits', () => {
         { change: 'a save of another setting' },
         { change: 'a plugin settings write' },
         { change: 'a character detail change' },
+        { change: 'a detail change of the open character' },
         { change: 'a chat setting change' },
         { change: 'a preset change' },
         { change: 'a plugin storage change' },
@@ -1298,6 +1299,10 @@ describe('selected chat list edits', () => {
                 expect(await runtime.mutateCharacterDetailFields(otherId, 'character-detail', ({ character }) => {
                     character.desc = marker
                 }, () => stores.DBState.db.characters[indexOf(otherId)])).toBe(true)
+            } else if (change === 'a detail change of the open character') {
+                expect(await runtime.mutateCharacterDetailFields(ownerId, 'character-detail', ({ character }) => {
+                    character.desc = marker
+                }, () => stores.DBState.db.characters[indexOf(ownerId)])).toBe(true)
             } else if (change === 'a chat setting change') {
                 await runtime.mutateConversationBinding(ownerId, selectedId, { note: marker }, () => {})
             } else if (change === 'a preset change') {
