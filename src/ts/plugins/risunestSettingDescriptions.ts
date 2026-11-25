@@ -23,11 +23,17 @@ const controlTypes: ReadonlySet<SettingItem['type']> = new Set([
     'check', 'text', 'number', 'textarea', 'slider', 'select', 'segmented', 'color',
 ])
 
+/** Choices a control offers that start an action instead of setting the value, per key. */
+export const risunestSettingActionChoices: Readonly<Record<string, readonly unknown[]>> = {
+    // Exports a translation file, then sets the language back to English.
+    language: ['translang'],
+}
+
 function nonEmptyText(value: unknown): string | undefined {
     return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
-function describeItem(item: SettingItem, resolver: RisunestSettingTextResolver): RisunestSettingDescription {
+function describeItem(key: string, item: SettingItem, resolver: RisunestSettingTextResolver): RisunestSettingDescription {
     const description: RisunestSettingDescription = {}
     const label = nonEmptyText(resolver.label(item))
     if (label) description.label = label
@@ -43,8 +49,10 @@ function describeItem(item: SettingItem, resolver: RisunestSettingTextResolver):
     const choices = item.type === 'select' ? item.options?.selectOptions
         : item.type === 'segmented' ? item.options?.segmentOptions
             : undefined
-    if (choices?.length) {
-        description.options = choices.map((choice) => {
+    const actions = Object.hasOwn(risunestSettingActionChoices, key) ? risunestSettingActionChoices[key] : []
+    const values = choices?.filter((choice) => !actions.includes(choice.value))
+    if (values?.length) {
+        description.options = values.map((choice) => {
             const translated = choice.labelKey ? resolver.text(choice.labelKey) : undefined
             const optionLabel = nonEmptyText(translated) ?? nonEmptyText(choice.label)
             return optionLabel === undefined ? { value: choice.value } : { value: choice.value, label: optionLabel }
@@ -69,7 +77,7 @@ export function describeSettingItems(
             const key = item.bindKey
             if (typeof key === 'string' && keys.has(key) && !descriptions.has(key) && controlTypes.has(item.type)
                 && item.bindPath === undefined && !item.getValue && !item.setValue) {
-                descriptions.set(key, describeItem(item, resolver))
+                descriptions.set(key, describeItem(key, item, resolver))
             }
             if (item.options?.children) visit(item.options.children)
         }

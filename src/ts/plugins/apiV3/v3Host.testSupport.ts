@@ -184,6 +184,7 @@ export function persistentRuntimeModule(overrides: Overrides<typeof import('src/
     const module = {
         getPersistentRevision: () => 0,
         commitPersistentUnitIntent: vi.fn(),
+        commitPreparedUnitIntent: vi.fn(),
         acquireCompleteConversation: vi.fn(),
         captureSelectedConversationTarget: vi.fn(() => null),
         flushPendingDataLocally: vi.fn(),

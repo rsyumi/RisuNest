@@ -19,6 +19,7 @@ import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, downloadFile, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
+import { isThemeExcluded } from "src/ts/gui/receivedDisplaySettings";
 import { isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
 import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
@@ -1065,7 +1066,7 @@ const makeRisuaiAPIV3 = (
             }
             const db = DBState.db
             db.textTheme = name
-            updateTextThemeAndCSS()
+            if (!isThemeExcluded()) updateTextThemeAndCSS()
         },
         setCustomTextTheme: (theme: {
             FontColorStandard: string,
@@ -1086,7 +1087,7 @@ const makeRisuaiAPIV3 = (
             const db = DBState.db
             db.textTheme = 'custom'
             db.customTextTheme = theme
-            updateTextThemeAndCSS()
+            if (!isThemeExcluded()) updateTextThemeAndCSS()
         },
         getTextTheme: () => {
             const db = DBState.db

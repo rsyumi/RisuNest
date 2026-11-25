@@ -895,7 +895,7 @@ function __postToParent(message) {
     })
 
     it('tells a private method this build lacks, a declined write and an applied write apart in the guest', async () => {
-        const { commitPersistentUnitIntent } = await import('src/ts/storage/persistentDataRuntime.svelte')
+        const { commitPreparedUnitIntent } = await import('src/ts/storage/persistentDataRuntime.svelte')
         const write = `
             const outcomes = [];
             try { await risuai.risunestMethodFromLaterBuild(); } catch (error) { outcomes.push(error.message); }
@@ -915,9 +915,12 @@ function __postToParent(message) {
             [language.dbWriteConsent.replace('{}', 'declined-settings-writer')],
             [language.dbWriteConsent.replace('{}', 'settings-writer')],
         ])
-        expect(commitPersistentUnitIntent).toHaveBeenCalledExactlyOnceWith('plugin-settings-write', [
-            { key: JSON.stringify(['root', 'askRemoval']), type: 'set', value: true },
-        ])
+        expect(vi.mocked(commitPreparedUnitIntent).mock.calls.map(([reason]) => reason)).toEqual(['plugin-settings-write'])
+        const [[, prepare]] = vi.mocked(commitPreparedUnitIntent).mock.calls
+        await expect(prepare({} as never)).resolves.toEqual({
+            unitMutations: [{ key: JSON.stringify(['root', 'askRemoval']), type: 'set', value: true }],
+            conversations: [],
+        })
     })
 
     it('registers message buttons with roles and hands the clicked message to the guest', async () => {

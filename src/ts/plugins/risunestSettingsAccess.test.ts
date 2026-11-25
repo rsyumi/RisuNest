@@ -108,6 +108,8 @@ describe('settings by key', { timeout: 60_000 }, () => {
             help: lang.language.help.gptVisionQuality,
             options: [{ value: 'low', label: 'Low' }, { value: 'high', label: 'High' }],
         })
+        // The language list holds languages only, not the entry that exports a translation file.
+        expect(item('language')?.options?.map((option) => option.value)).toEqual(['en', 'ko'])
         expect(item('risunestInlayFormat')?.options).toEqual([
             { value: 'webp', label: lang.language.risuNest.inlay.formatWebp },
             { value: 'png', label: lang.language.risuNest.inlay.formatPng },
@@ -159,6 +161,30 @@ describe('settings by key', { timeout: 60_000 }, () => {
         // Colors written with the name are kept as written.
         await expect(settings.writeSettings({ colorSchemeName: 'dark', colorScheme: custom })).resolves.toEqual({ status: 'applied' })
         expect(await stored()).toMatchObject({ colorSchemeName: 'dark', colorScheme: custom })
+
+        // Called together, the colors follow both changes in the order they were called.
+        const newer = { ...custom, bgcolor: '#445566' }
+        await expect(Promise.all([
+            settings.writeSettings({ colorSchemeName: 'custom' }),
+            settings.writeSettings({ customColorScheme: newer }),
+        ])).resolves.toEqual([{ status: 'applied' }, { status: 'applied' }])
+        expect(await stored()).toMatchObject({ colorSchemeName: 'custom', customColorScheme: newer, colorScheme: newer })
+        expect(painted()).toBe('#445566')
+
+        // While startup leaves the theme off, the colors change and the custom CSS stays off, as for a received change.
+        const { updateStartupExclusions } = await import('../storage/deviceSettings')
+        const { CustomCSSStore } = await import('../stores.svelte')
+        updateStartupExclusions(['theme'])
+        try {
+            CustomCSSStore.set('')
+            await expect(settings.writeSettings({ customCSS: '.synthetic { color: red }' })).resolves.toEqual({ status: 'applied' })
+            await expect(settings.writeSettings({ colorSchemeName: 'light' })).resolves.toEqual({ status: 'applied' })
+            expect(painted()).toBe(colorSchemePresets.light.bgcolor)
+            expect(get(CustomCSSStore)).toBe('')
+            expect(await stored()).toMatchObject({ customCSS: '.synthetic { color: red }' })
+        } finally {
+            updateStartupExclusions([])
+        }
     })
 
     it('answers applied when what follows a stored change fails, and shows the failure as the settings screen does', async () => {
@@ -275,6 +301,7 @@ describe('settings by key', { timeout: 60_000 }, () => {
         await expect(settings.writeSettings(JSON.parse('{"__proto__": 1}'))).resolves.toEqual({ status: 'rejected', reason: 'unavailable', key: '__proto__' })
         await expect(settings.writeSettings({ constructor: 1 })).resolves.toEqual({ status: 'rejected', reason: 'unavailable', key: 'constructor' })
         await expect(settings.writeSettings({ loreBookDepth: 3, colorSchemeName: 'missing-scheme' })).resolves.toEqual({ status: 'rejected', reason: 'value', key: 'colorSchemeName' })
+        await expect(settings.writeSettings({ loreBookDepth: 3, language: 'translang' })).resolves.toEqual({ status: 'rejected', reason: 'value', key: 'language' })
         await expect(settings.writeSettings([['loreBookDepth', 3]])).rejects.toThrow(TypeError)
         await expect(settings.writeSettings('loreBookDepth')).rejects.toThrow(TypeError)
 
