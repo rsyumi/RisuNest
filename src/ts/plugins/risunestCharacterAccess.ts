@@ -109,11 +109,7 @@ const productionCharacterStore: RisunestCharacterStore = {
         validatePluginCompleteCharacter(value)
     },
     async addCharacter(value) {
-        const { runtime, characters } = await appModules()
-        // An addition fails after it is stored while the open windowed conversation holds
-        // unsaved edits, so those are saved first.
-        await runtime.flushPendingData('plugin-create-character')
-        await characters.commitDetachedCharacter(value, 'create-character')
+        await (await appModules()).characters.commitDetachedCharacter(value, 'create-character')
     },
     trashCharacter: (id) => inOrder(async () => {
         const { runtime, catalog, characters, resident, isOpen } = await appModules()

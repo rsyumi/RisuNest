@@ -19,6 +19,7 @@ import { workingSetResidency } from './workingSetResidency'
 import { clearStreamingConversation, setStreamingConversation } from './streamingConversationRegistry'
 import { indexSideChatListRows } from '../../lib/SideBars/sideChatListRows'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
+import { cloneConversationMetadata } from './activeConversationSession'
 
 afterEach(() => {
     workingSetResidency.clear()
@@ -1094,13 +1095,15 @@ describe('selected chat list edits', () => {
         }
     })
 
-    // Opening a character leaves its activation edits unsaved until the save debounce runs.
+    // Opening a character leaves its activation edits unsaved until the save debounce runs, and a
+    // streamed reply can land while the addition is being stored.
     it.each([
-        { route: 'create', activation: 'saved' },
-        { route: 'import', activation: 'saved' },
-        { route: 'create', activation: 'unsaved' },
-        { route: 'import', activation: 'unsaved' },
-    ] as const)('adds a character by $route while a windowed conversation is open with its activation $activation and keeps saving and navigating', async ({ route, activation }) => {
+        { route: 'create', unsaved: 'nothing' },
+        { route: 'import', unsaved: 'nothing' },
+        { route: 'create', unsaved: 'its activation' },
+        { route: 'import', unsaved: 'its activation' },
+        { route: 'create', unsaved: 'a reply streamed during the addition' },
+    ] as const)('adds a character by $route while a windowed conversation is open with $unsaved unsaved and keeps saving and navigating', async ({ route, unsaved }) => {
         const indexedDB = new IDBFactory()
         const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
         const ownerId = 'edited-owner'
@@ -1122,13 +1125,28 @@ describe('selected chat list edits', () => {
             const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
             expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
             expect(runtime.getSelectedConversationMode()).toBe('windowed')
-            if (activation === 'saved') await runtime.flushPendingData('activation')
+            if (unsaved !== 'its activation') await runtime.flushPendingData('activation')
+            const reply = { role: 'char', data: 'Synthetic streamed reply' } as Message
+            const streamReply = () => {
+                const target = runtime.captureSelectedConversationTarget()!
+                const authority = runtime.captureSelectedConversationAuthority()!
+                const owner = stores.DBState.db.characters[indexOf(ownerId)]
+                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: [] } as unknown as Chat
+                const controller = runtime.captureWindowedConversationMutationController(target, chat, authority.totalMessages)!
+                expect(controller.applyRange(0, 0, [reply], 'append')).toBe(true)
+                controller.release()
+            }
             await reader.open()
             const readConversation = vi.spyOn(runtime.store, 'readConversation')
             const committed: { keys: string[], units: string[], added?: string, replaced?: string }[] = []
             const historiesAfterCommit: Message[][] = []
             const commit = runtime.store.commit.bind(runtime.store)
+            // The row the conversation shows for the reply when the save after the addition starts.
+            let replyRowBeforeItsSave: Message | null | undefined
             vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                if (unsaved === 'a reply streamed during the addition' && replyRowBeforeItsSave === undefined && committed.some((entry) => entry.added)) {
+                    replyRowBeforeItsSave = runtime.getActiveConversationViewportSource()!.snapshot().rowAt(history.length)?.message ?? null
+                }
                 committed.push({
                     keys: Object.keys(request).filter((key) => key !== 'expectedRevision').sort(),
                     units: (request.unitMutations ?? []).map((mutation) => mutation.key),
@@ -1137,6 +1155,7 @@ describe('selected chat list edits', () => {
                 })
                 const result = await commit(request)
                 historiesAfterCommit.push((await reader.readConversation(ownerId, selectedId))!.value.message)
+                if (unsaved === 'a reply streamed during the addition' && request.addCharacter) streamReply()
                 return result
             })
 
@@ -1153,11 +1172,15 @@ describe('selected chat list edits', () => {
             expect(committed.flatMap((entry) => entry.added ? [entry.added] : [])).toEqual([addedId])
             expect(committed.flatMap((entry) => entry.replaced ? [entry.replaced] : [])).toEqual([])
             expect(historiesAfterCommit.length).toBeGreaterThan(0)
-            for (const messages of historiesAfterCommit) expect(messages).toEqual(history)
+            // The addition leaves the conversation alone; the same save then stores a streamed reply.
+            const savedHistory = unsaved === 'a reply streamed during the addition' ? [...history, reply] : history
+            expect(historiesAfterCommit[committed.findIndex((entry) => entry.added)]).toEqual(history)
+            for (const messages of historiesAfterCommit) expect([history, savedHistory]).toContainEqual(messages)
             await reader.open()
             expect((await reader.readRoot()).value.characterOrder).toContain(addedId)
-            if (activation === 'unsaved') {
-                await runtime.flushPendingData('activation')
+            if (unsaved === 'a reply streamed during the addition') expect(replyRowBeforeItsSave).toEqual(reply)
+            if (unsaved !== 'nothing') {
+                await runtime.flushPendingData('unsaved')
                 expect(get(app.localSaveFailure)).toBeNull()
             }
             const additionCommitBoundary = committed.length
@@ -1190,7 +1213,7 @@ describe('selected chat list edits', () => {
             if (route === 'import') {
                 expect((await reader.readConversation(addedId, `${addedId}-chat`))?.value.message).toEqual(importedHistory)
             }
-            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual(history)
+            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual(savedHistory)
         } finally {
             consoleError.mockRestore()
             Object.assign(globalThis, previousGlobals)

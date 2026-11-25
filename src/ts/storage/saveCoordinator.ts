@@ -1141,10 +1141,14 @@ export class SaveCoordinator {
     advanceWindowedSelectedConversationRevision(
         revision: DataRevision,
         authority: WindowedConversationPersistenceAuthority,
+        rowsKept = false,
     ): boolean {
         const baseline = this.windowedCharacterBaseline
         const current = this.dependencies.captureSelectedConversationAuthority?.() ?? null
         const pendingActivation = this.pendingWindowedActivationChange
+        // The baseline is the persisted session. A session with unsaved edits is ahead of it and passes
+        // to a new revision only when the working set keeps its rows, which hold those edits.
+        const unsaved = baseline !== null && authority.sessionVersion !== baseline.authority.sessionVersion
         if (
             !baseline ||
             !current ||
@@ -1157,14 +1161,19 @@ export class SaveCoordinator {
             baseline.authority.conversationId !== authority.conversationId ||
             baseline.authority.sessionToken !== authority.sessionToken ||
             baseline.authority.persistedSessionVersion !== authority.persistedSessionVersion ||
-            baseline.authority.sessionVersion !== authority.sessionVersion ||
-            baseline.authority.totalMessages !== authority.totalMessages ||
+            (unsaved
+                ? !rowsKept ||
+                  authority.sessionVersion < baseline.authority.sessionVersion ||
+                  baseline.authority.sessionVersion !== baseline.authority.persistedSessionVersion
+                : baseline.authority.totalMessages !== authority.totalMessages) ||
             baseline.authority.storeRevision > revision ||
             (pendingActivation !== null &&
                 !sameWindowedAuthority(pendingActivation.authority, baseline.authority))
         )
             return false
-        baseline.authority = safeStructuredClone(authority)
+        baseline.authority = unsaved
+            ? { ...baseline.authority, storeRevision: revision }
+            : safeStructuredClone(authority)
         if (pendingActivation) {
             pendingActivation.authority = {
                 ...safeStructuredClone(pendingActivation.authority),
@@ -4037,6 +4046,7 @@ export class SaveCoordinator {
         captured: WindowedSelectedCharacterCapture,
         revision: DataRevision,
         persistedSessionVersion: number,
+        rowsUnchanged = false,
     ): void {
         // Unsaved activation evidence is pinned to the baseline's authority, and the working set refuses a
         // revision while the two differ, so the evidence moves with the baseline before the working set is told.
@@ -4056,7 +4066,7 @@ export class SaveCoordinator {
         }
         this.characterBaseline = null
         this.characterBaselineId = null
-        this.dependencies.onWindowedSelectedConversationRevision?.(revision)
+        this.dependencies.onWindowedSelectedConversationRevision?.(revision, undefined, rowsUnchanged)
     }
 
     private requireMatchingWindowedCapture(
@@ -5447,8 +5457,9 @@ export class SaveCoordinator {
             this.characterBaselineId = pending.characterId
         }
         if (this.windowedCharacterBaseline) {
+            // The addition leaves the selected conversation as it was.
             this.setWindowedCharacterBaseline(this.windowedCharacterBaseline, committed.revision,
-                this.windowedCharacterBaseline.authority.persistedSessionVersion)
+                this.windowedCharacterBaseline.authority.persistedSessionVersion, true)
         } else this.dependencies.onStorageOnlyRevision?.(committed.revision)
         this.dependencies.onLocalRevision?.(committed.revision)
         if (this.dependencies.officialPublisher) {

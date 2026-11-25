@@ -72,6 +72,7 @@ export interface WorkingSetCoordinator {
     advanceWindowedSelectedConversationRevision?(
         revision: DataRevision,
         authority: WindowedConversationPersistenceAuthority,
+        rowsKept?: boolean,
     ): boolean
     runSelectedConversationTransition?<T>(transition: () => T): T
     recordActiveConversationMutation?(event: ActiveConversationMutationEvent): void
@@ -931,7 +932,7 @@ export class ActiveWorkingSet {
         if (preserveRows && authority.totalMessages === state.authority.totalMessages) {
             const previousAuthority = state.authority
             state.authority = authority
-            if (!advance.call(this.dependencies.coordinator, revision, authority)) {
+            if (!advance.call(this.dependencies.coordinator, revision, authority, true)) {
                 state.authority = previousAuthority
                 throw new Error('Windowed selected conversation revision was not adopted')
             }
