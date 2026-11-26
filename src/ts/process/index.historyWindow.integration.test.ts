@@ -4,13 +4,14 @@ import '../storage/tests/selectedConversationEvictionNodeDom.setup'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { requestChatData } from './request/request'
 import { get } from 'svelte/store'
 import { checkOutputProcessing, checkStreamingWrite, finalText, installOutputTrigger, liveMessage, setterCases, whileStreaming, type SetterCase } from './tests/streamingPluginWrites'
 import { createProductionPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
 import { alertStore } from '../alertQueue'
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
-import { DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
+import { CharEmotion, DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import { createConversationSummaryStubFromChat } from '../storage/conversationResidency'
 import {
@@ -291,6 +292,8 @@ async function bootWindowedConversation(
 
 let restoreFetch: (() => void) | null = null
 
+beforeEach(() => { vi.mocked(requestChatData).mockReset() })
+
 beforeAll(async () => {
     const jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
     const fetch = globalThis.fetch
@@ -538,7 +541,12 @@ describe('a windowed send through the production runtime', () => {
             if (!edit) installOutputTrigger(seed)
         })
         const runtime = current.runtime
-        const access = createProductionPluginDatabaseAccess({
+        const access = createStreamingPluginAccess(runtime)
+        return { runtime, access, connect, length: MESSAGES, windowed: true, backgroundErrors }
+    }
+
+    function createStreamingPluginAccess(runtime: typeof current.runtime) {
+        return createProductionPluginDatabaseAccess({
             owner: 'streaming-plugin',
             getLiveRuntime: () => runtime,
             getPersistentRevision: () => runtime.revision,
@@ -557,7 +565,6 @@ describe('a windowed send through the production runtime', () => {
             readPluginStorageSnapshot: async () => ({}),
             snapshot: <T>(value: T) => JSON.parse(JSON.stringify(value)) as T,
         })
-        return { runtime, access, connect, length: MESSAGES, windowed: true, backgroundErrors }
     }
 
     it.each(setterCases)('keeps a plugin write to a windowed streaming conversation (%s)', async edit => {
@@ -567,6 +574,72 @@ describe('a windowed send through the production runtime', () => {
             await checkStreamingWrite(fixture, edit)
             expect(fixture.backgroundErrors).toEqual([])
         } finally { fixture.access.closeReadBaselines() }
+    })
+
+    it.each([false, true])('stores the processed final chunk once when the complete output regex is held (concurrent setter %s)', async concurrentSetter => {
+        const messages = storedMessages().slice(0, 4)
+        const { reopen, backgroundErrors } = await bootWindowedConversation(messages, seed => {
+            seed.characters[0].emotionImages = [['smile', 'synthetic-smile.png']]
+            seed.characters[0].customscript = [
+                { type: 'editoutput', comment: '', in: 'via hook', out: '@@emo smile', flag: 'g', ableFlag: true },
+                { type: 'editoutput', comment: '', in: 'final chunk', out: 'PROCESSED {{lastmessageindex}} / {{previouschatlog::0}}', flag: 'g', ableFlag: true },
+            ]
+            seed.characters[0].triggerscript = []
+        })
+        const runtime = current.runtime
+        const lease = await runtime.acquireCompleteConversation('complete-output-regex-test', runtime.captureSelectedConversationTarget())
+        const access = createStreamingPluginAccess(runtime)
+        const { InMemoryWorker } = await import('../../../tests/support/regexWorker')
+        const workerClient = await import('./regexWorkerClient')
+        const worker = new InMemoryWorker()
+        let releaseWorker: (() => void) | undefined
+        const postMessage = worker.postMessage.bind(worker)
+        vi.spyOn(worker, 'postMessage').mockImplementation(request => {
+            const input = request.type === 'operation' ? request.operation.input : request.type === 'execute' ? request.input : undefined
+            // Hold the text rule after the emotion rule has run on this snapshot.
+            const afterEmotion = request.type === 'execute' || (request.type === 'operation' && request.operation.pattern === 'final chunk')
+            if (!releaseWorker && afterEmotion && input?.includes(finalText)) {
+                releaseWorker = () => postMessage(request)
+            } else postMessage(request)
+        })
+        const client = vi.spyOn(workerClient, 'getSharedRegexWorkerClient').mockReturnValue(new workerClient.RegexWorkerClient(() => worker))
+        const { pluginV2 } = await import('../plugins/plugins.svelte')
+        let hookPass = 0
+        const hook = async (text: string) => text === finalText ? text + ' via hook ' + ++hookPass : text
+        const previousEmotions = get(CharEmotion)
+        CharEmotion.set({})
+        pluginV2.editoutput.add(hook)
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        try {
+            const reply = await whileStreaming({ runtime, length: messages.length, windowed: false }, async ({ signal, finishStream }) => {
+                const call = { pluginName: 'streaming-plugin', signal }
+                const chat = (await access.getChatFromIndex(0, 0, call))!
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(releaseWorker).toBeDefined())
+                    if (concurrentSetter) {
+                        chat.message[0].data = 'edited during final regex'
+                        await access.setChatToIndex(0, 0, chat, call)
+                        expect((await liveMessage(runtime, 0))?.data).toBe('edited during final regex')
+                    }
+                } finally { releaseWorker?.() }
+            })
+            await runtime.flushPendingDataLocally('complete-output-regex-test')
+            const stored = await reopen()
+            expect(stored.message.map(row => row.chatId)).toEqual([...messages.map(row => row.chatId), reply.chatId])
+            const firstText = concurrentSetter ? 'edited during final regex' : 'm0'
+            expect(stored.message[0].data).toBe(firstText)
+            expect(stored.message.at(-1)?.data).toBe(`streamed prefix and PROCESSED 4 / ${firstText} via hook 1`)
+            expect(hookPass).toBe(1)
+            expect(get(CharEmotion)['character-a']).toEqual([['smile', 'synthetic-smile.png', expect.any(Number)]])
+            expect(backgroundErrors).toEqual([])
+        } finally {
+            CharEmotion.set(previousEmotions)
+            pluginV2.editoutput.delete(hook)
+            client.mockRestore()
+            access.closeReadBaselines()
+            lease.release()
+        }
     })
 
     it('waits for an output trigger before applying a windowed setter and accepts the patch retry', async () => {
@@ -586,7 +659,6 @@ describe('a windowed send through the production runtime', () => {
         })
         const complete = vi.spyOn(current.runtime, 'acquireCompleteConversation')
         const { sendChat } = await import('./index.svelte')
-        const { requestChatData } = await import('./request/request')
         const { parseRisuChat } = await import('../plugins/parseRisuChat')
         const results: string[] = []
         const { registerDisplayRow, DisplayReadRecord } = await import('./scriptVariableReads')
@@ -645,7 +717,6 @@ describe('a windowed send through the production runtime', () => {
     it.each(['success', 'streaming'] as const)('persists a delayed %s response while settings remain open', async (type) => {
         const { reopen, backgroundErrors } = await bootWindowedConversation(storedMessages())
         const { sendChat } = await import('./index.svelte')
-        const { requestChatData } = await import('./request/request')
         const { reserveGeneration } = await import('./generationState')
         const { beginGenerationEndRun, subscribeGenerationEnd } = await import('./generationEnd')
         const controller = new AbortController()
@@ -912,7 +983,6 @@ describe('a windowed send through the production runtime', () => {
             }
             return commit(request)
         })
-        const { requestChatData } = await import('./request/request')
         const { sendChat } = await import('./index.svelte')
         let atRequest: Message[] | undefined
         vi.mocked(requestChatData).mockImplementationOnce(async () => {
