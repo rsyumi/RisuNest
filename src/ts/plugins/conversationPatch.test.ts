@@ -16,19 +16,16 @@ describe('normalizeConversationPatchInput', () => {
     it('accepts data and plugin fields, removal by undefined, and chat variables', () => {
         const request = normalizeConversationPatchInput({
             ...base,
-            baseRevision: 4,
-            messages: [{ index: 2, messageId: null, expected: { role: 'char', __old: undefined }, set: { data: 'text', __tr: { a: [1, 'b', null, true] }, __gone: undefined } }],
-            chatVariables: [{ key: '$a', value: 1 }, { key: '$b', expected: 'x', value: null }],
+            messages: [{ index: 2, messageId: null, set: { data: 'text', __tr: { a: [1, 'b', null, true] }, __gone: undefined } }],
+            chatVariables: [{ key: '$a', value: 1 }, { key: '$b', value: null }],
         })
 
         expect(request).toEqual({
             ...base,
-            baseRevision: 4,
-            messages: [{ index: 2, messageId: null, expected: { role: 'char', __old: undefined }, set: { data: 'text', __tr: { a: [1, 'b', null, true] }, __gone: undefined } }],
-            chatVariables: [{ key: '$a', value: 1 }, { key: '$b', expected: 'x', value: null }],
+            messages: [{ index: 2, messageId: null, set: { data: 'text', __tr: { a: [1, 'b', null, true] }, __gone: undefined } }],
+            chatVariables: [{ key: '$a', value: 1 }, { key: '$b', value: null }],
         })
         expect(Object.hasOwn(request.messages[0].set, '__gone')).toBe(true)
-        expect(Object.hasOwn(request.chatVariables[0], 'expected')).toBe(false)
     })
 
     it.each([
@@ -63,14 +60,11 @@ describe('normalizeConversationPatchInput', () => {
         ['a missing conversation ID', { characterId: 'char', mutationId: 'm' }],
         ['an empty mutation ID', { ...base, mutationId: '' }],
         ['a long mutation ID', { ...base, mutationId: 'x'.repeat(129) }],
-        ['a negative base revision', { ...base, baseRevision: -1 }],
         ['too many messages', { ...base, messages: Array.from({ length: 65 }, (_, index) => ({ index, messageId: `m${index}`, set: {} })) }],
         ['a repeated index', { ...base, messages: [{ index: 1, messageId: 'a', set: {} }, { index: 1, messageId: 'b', set: {} }] }],
         ['a fractional index', { ...base, messages: [{ index: 1.5, messageId: 'a', set: {} }] }],
         ['a missing message ID', { ...base, messages: [{ index: 1, set: {} }] }],
-        ['a null message ID without a base revision', { ...base, messages: [{ index: 1, messageId: null, set: {} }] }],
         ['a missing set', { ...base, messages: [{ index: 1, messageId: 'a' }] }],
-        ['a non-object expected', { ...base, messages: [{ index: 1, messageId: 'a', expected: 'x', set: {} }] }],
         ['too many chat variables', { ...base, chatVariables: Array.from({ length: 65 }, (_, index) => ({ key: `$${index}`, value: 1 })) }],
         ['a repeated chat variable', { ...base, chatVariables: [{ key: '$a', value: 1 }, { key: '$a', value: 2 }] }],
         ['an object chat variable', { ...base, chatVariables: [{ key: '$a', value: {} }] }],
@@ -102,7 +96,7 @@ describe('planLiveConversationPatch', () => {
             ...base,
             messages: [{ index: 3, messageId: 'd', set: { __x: 3 } }, { index: 0, messageId: 'a', set: { __x: 0 } }, { index: 1, messageId: 'b', set: { __x: 1 } }],
         })
-        const planned = planLiveConversationPatch(request, messages, undefined, false)
+        const planned = planLiveConversationPatch(request, messages, undefined)
 
         expect(planned).toEqual({ kind: 'apply', scriptstate: null, runs: [
             { start: 0, messages: [{ ...messages[0], __x: 0 }, { ...messages[1], __x: 1 }] },
@@ -113,9 +107,9 @@ describe('planLiveConversationPatch', () => {
 
     it('skips unchanged values and removes plugin fields', () => {
         const source = [{ ...messages[0], __x: 1, __y: 2 }]
-        const unchanged = planLiveConversationPatch(normalizeConversationPatchInput({ ...base, messages: [{ index: 0, messageId: 'a', set: { __x: 1 } }], chatVariables: [{ key: '$a', value: 1 }] }), source, { $a: 1 }, false)
+        const unchanged = planLiveConversationPatch(normalizeConversationPatchInput({ ...base, messages: [{ index: 0, messageId: 'a', set: { __x: 1 } }], chatVariables: [{ key: '$a', value: 1 }] }), source, { $a: 1 })
         expect(unchanged).toEqual({ kind: 'apply', runs: [], scriptstate: null })
-        const removed = planLiveConversationPatch(normalizeConversationPatchInput({ ...base, messages: [{ index: 0, messageId: 'a', set: { __y: undefined } }] }), source, undefined, false)
+        const removed = planLiveConversationPatch(normalizeConversationPatchInput({ ...base, messages: [{ index: 0, messageId: 'a', set: { __y: undefined } }] }), source, undefined)
         expect(removed).toEqual({ kind: 'apply', scriptstate: null, runs: [{ start: 0, messages: [{ ...messages[0], __x: 1 }] }] })
     })
 })

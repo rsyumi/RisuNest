@@ -123,12 +123,7 @@ export function createConversationPatchAccess(dependencies: ConversationPatchAcc
             }
             const revision = dependencies.getPersistentRevision()
             const messages = session.materializeCompatibilityArray()
-            const planned = planLiveConversationPatch(
-                request,
-                messages,
-                conversation.scriptstate as Record<string, unknown> | undefined,
-                revision === request.baseRevision && session.version === session.persistedVersion,
-            )
+            const planned = planLiveConversationPatch(request, messages, conversation.scriptstate as Record<string, unknown> | undefined)
             if (planned.kind === 'conflict') return { status: 'conflict', conflict: planned.conflict, revision }
             if (!planned.runs.length && !planned.scriptstate) return { status: 'applied', revision }
             const expectedMetadata = cloneConversationMetadata(conversation)

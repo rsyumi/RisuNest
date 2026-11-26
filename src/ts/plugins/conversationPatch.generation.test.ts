@@ -231,13 +231,13 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
             outcomes.push(await patches.patchConversation({
                 ...target,
                 mutationId: 'data-during-request',
-                messages: [{ index: 0, messageId: 'user-message', expected: { data: 'hello' }, set: { data: 'rewritten' } }],
+                messages: [{ index: 0, messageId: 'user-message', set: { data: 'rewritten' } }],
             }))
             outcomes.push(await patches.patchConversation({
                 ...target,
                 mutationId: 'metadata-during-request',
-                messages: [{ index: 0, messageId: 'user-message', expected: { data: 'hello' }, set: { __translation: 'record' } }],
-                chatVariables: [{ key: '$bridge', expected: null, value: 'on' }],
+                messages: [{ index: 0, messageId: 'user-message', set: { __translation: 'record' } }],
+                chatVariables: [{ key: '$bridge', value: 'on' }],
             }))
             return formated
         })
@@ -275,8 +275,8 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
             pending = patches.patchConversation({
                 ...target,
                 mutationId: 'unawaited-during-request',
-                messages: [{ index: 0, messageId: 'user-message', expected: { data: 'hello' }, set: { __summary: 'late' } }],
-                chatVariables: [{ key: '$late', expected: null, value: 'yes' }],
+                messages: [{ index: 0, messageId: 'user-message', set: { __summary: 'late' } }],
+                chatVariables: [{ key: '$late', value: 'yes' }],
             })
             return formated
         })
@@ -315,8 +315,8 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
             pending = patches.patchConversation({
                 ...target,
                 mutationId: 'held-during-request',
-                messages: [{ index: 0, messageId: 'user-message', expected: { data: 'hello' }, set: { __held: 'landed' } }],
-                chatVariables: [{ key: '$held', expected: null, value: 'landed' }],
+                messages: [{ index: 0, messageId: 'user-message', set: { __held: 'landed' } }],
+                chatVariables: [{ key: '$held', value: 'landed' }],
             })
             return formated
         })
@@ -347,12 +347,12 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
             commits.mockRestore()
         }
     })
-    it('refuses conflicting expected values, cancellation and reroll patches outside the request phase', async () => {
+    it('refuses a missing message, cancellation and reroll patches outside the request phase', async () => {
         fixture.replacers.clear()
         fixture.replacers.add(async (formated) => {
             await expect(patches.patchConversation({
                 ...target, mutationId: 'conflicting-metadata',
-                messages: [{ index: 0, messageId: 'user-message', expected: { data: 'wrong' }, set: { __conflict: true } }],
+                messages: [{ index: 0, messageId: 'missing-message', set: { __conflict: true } }],
             })).resolves.toMatchObject({ status: 'conflict' })
             const abort = new AbortController()
             abort.abort()
@@ -413,7 +413,7 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
                     { index: 0, messageId: 'history-0', set: { __outside: 'retained' } },
                     { index: 39, messageId: 'history-39', set: { __tail: 'retained' } },
                 ],
-                chatVariables: [{ key: '$window', expected: null, value: 'retained' }],
+                chatVariables: [{ key: '$window', value: 'retained' }],
             })).resolves.toMatchObject({ status: 'applied' })
             expect(getActiveConversationSession()).toBeNull()
             return formated

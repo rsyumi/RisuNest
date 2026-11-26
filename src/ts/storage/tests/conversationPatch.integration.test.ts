@@ -173,16 +173,6 @@ async function deleteFirstMessage(harness: Harness, target: GeneratingConversati
     }
 }
 
-async function insertFirstMessage(harness: Harness, target: GeneratingConversation, message: Message) {
-    if (target === selected) {
-        const session = harness.runtime.getActiveConversationSession()!
-        session.replaceRange(session.positionAt(0), 0, [message])
-        await harness.runtime.flushPendingDataLocally('test-insert')
-    } else {
-        await harness.runtime.commitPersistentUnitIntent('test-insert', [], [{ type: 'replace-range', ...target, start: 0, deleteCount: 0, messages: [message] }])
-    }
-}
-
 describe('risunestPatchConversation', () => {
     it('applies to the selected conversation through its session and replays the outcome', async () => {
         const harness = await setup()
@@ -192,8 +182,8 @@ describe('risunestPatchConversation', () => {
         const input = {
             ...selected,
             mutationId: 'selected-1',
-            messages: [{ index: 1, messageId: 'm1', expected: { data: 'reply', __tr: { text: 'old', parts: [1, 2] }, __none: undefined }, set: { __tr: { text: 'new' } } }],
-            chatVariables: [{ key: '$a', expected: 1, value: 2 }, { key: '$b', expected: null, value: 'x' }],
+            messages: [{ index: 1, messageId: 'm1', set: { __tr: { text: 'new' } } }],
+            chatVariables: [{ key: '$a', value: 2 }, { key: '$b', value: 'x' }],
         }
 
         const result = await harness.patch(input)
@@ -225,19 +215,30 @@ describe('risunestPatchConversation', () => {
         expect(harness.live(sibling).message[1]).toMatchObject({ data: 'edited', __tr: 'sibling' })
     })
 
-    it.each(paths)('names the first failed target on the %s path and changes nothing', async (_path, target) => {
+    it.each(paths)('applies the preconditions released plugins send without checking them on the %s path', async (_path, target) => {
+        const harness = await setup()
+
+        await expect(harness.patch({
+            ...target,
+            mutationId: 'released',
+            baseRevision: 0,
+            messages: [{ index: 1, messageId: 'm1', expected: { data: 'stale', __tr: undefined }, set: { __tr: 'released' } }],
+            chatVariables: [{ key: '$a', expected: 'stale', value: 2 }],
+        })).resolves.toMatchObject({ status: 'applied' })
+
+        const stored = await harness.stored(target)
+        expect(stored.message[1]).toMatchObject({ data: 'reply', __tr: 'released' })
+        expect(stored.scriptstate).toEqual({ $a: 2 })
+    })
+
+    it.each(paths)('names the first missing message on the %s path and changes nothing', async (_path, target) => {
         const harness = await setup()
         const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
-            [{ messages: [{ index: 1, messageId: 'm1', expected: { data: 'other' }, set: { __x: 1 } }] }, { target: 'message', reason: 'mismatch', index: 1, field: 'data' }],
-            [{ messages: [{ index: 1, messageId: 'm1', expected: { role: 'user' }, set: { __x: 1 } }] }, { target: 'message', reason: 'mismatch', index: 1, field: 'role' }],
-            [{ messages: [{ index: 1, messageId: 'm1', expected: { __tr: { text: 'old', parts: [1, 3] } }, set: { __x: 1 } }] }, { target: 'message', reason: 'mismatch', index: 1, field: '__tr' }],
-            [{ messages: [{ index: 1, messageId: 'm1', expected: { __tr: undefined }, set: { __x: 1 } }] }, { target: 'message', reason: 'mismatch', index: 1, field: '__tr' }],
-            [{ messages: [{ index: 1, messageId: 'm0', set: { __x: 1 } }] }, { target: 'message', reason: 'mismatch', index: 1, field: 'chatId' }],
-            [{ messages: [{ index: 3, messageId: 'm3', set: { __x: 1 } }] }, { target: 'message', reason: 'not-found', index: 3 }],
-            [{ chatVariables: [{ key: '$a', expected: '1', value: 2 }] }, { target: 'chatVariable', reason: 'mismatch', key: '$a' }],
-            [{ chatVariables: [{ key: '$a', expected: null, value: 2 }] }, { target: 'chatVariable', reason: 'mismatch', key: '$a' }],
-            [{ messages: [{ index: 0, messageId: 'm0', set: { __x: 1 } }, { index: 2, messageId: 'm2', expected: { data: 'stale' }, set: { __x: 1 } }], chatVariables: [{ key: '$a', value: 9 }] },
-                { target: 'message', reason: 'mismatch', index: 2, field: 'data' }],
+            [{ messages: [{ index: 1, messageId: 'missing', set: { __x: 1 } }] }, { target: 'message', reason: 'not-found', index: 1 }],
+            [{ messages: [{ index: 3, messageId: 'missing', set: { __x: 1 } }] }, { target: 'message', reason: 'not-found', index: 3 }],
+            [{ messages: [{ index: 0, messageId: null, set: { __x: 1 } }] }, { target: 'message', reason: 'not-found', index: 0 }],
+            [{ messages: [{ index: 0, messageId: 'm0', set: { __x: 1 } }, { index: 2, messageId: 'missing', set: { __x: 1 } }], chatVariables: [{ key: '$a', value: 9 }] },
+                { target: 'message', reason: 'not-found', index: 2 }],
         ]
         const before = await harness.stored(target)
         for (const [index, [input, conflict]] of cases.entries()) {
@@ -260,7 +261,7 @@ describe('risunestPatchConversation', () => {
         }
     })
 
-    it.each(paths)('addresses a repeated or missing message ID only at the read revision on the %s path', async (_path, target) => {
+    it.each(paths)('addresses a message by its ID wherever it moved on the %s path', async (_path, target) => {
         const database = makeDatabase()
         const conversation = database.characters.find((value) => value.chaId === target.characterId)!.chats[0]
         conversation.message = [
@@ -268,41 +269,32 @@ describe('risunestPatchConversation', () => {
             { role: 'char', data: 'same', chatId: 'dup' },
             { role: 'char', data: 'same', chatId: 'dup' },
             { role: 'user', data: 'unnamed' },
+            { role: 'char', data: 'b', chatId: 'b' },
+            { role: 'char', data: 'z', chatId: 'z' },
         ]
         const harness = await setup(database)
-        let revision = harness.runtime.revision
-
-        await expect(harness.patch({ ...target, mutationId: 'dup-1', baseRevision: revision, messages: [{ index: 2, messageId: 'dup', set: { __x: 'second' } }] }))
-            .resolves.toMatchObject({ status: 'applied' })
-        revision = harness.runtime.revision
-        await expect(harness.patch({ ...target, mutationId: 'unnamed', baseRevision: revision, messages: [{ index: 3, messageId: null, set: { __x: 'unnamed' } }] }))
-            .resolves.toMatchObject({ status: 'applied' })
-        expect((await harness.stored(target)).message.map((message) => (message as unknown as Record<string, unknown>).__x))
-            .toEqual([undefined, undefined, 'second', 'unnamed'])
-
-        await expect(harness.patch({ ...target, mutationId: 'no-base', messages: [{ index: 1, messageId: 'dup', set: { __x: 1 } }] }))
-            .rejects.toThrow(/baseRevision/)
-        await expect(harness.patch({ ...target, mutationId: 'null-no-base', messages: [{ index: 3, messageId: null, set: { __x: 1 } }] }))
-            .rejects.toThrow(/baseRevision/)
-
-        revision = harness.runtime.revision
-        await deleteFirstMessage(harness, target)
-        await expect(harness.patch({ ...target, mutationId: 'after-delete', baseRevision: revision, messages: [{ index: 1, messageId: 'dup', set: { __x: 'moved' } }] }))
-            .resolves.toMatchObject({ status: 'conflict', conflict: { target: 'conversation', reason: 'revision' } })
-        revision = harness.runtime.revision
-        await insertFirstMessage(harness, target, { role: 'user', data: 'inserted', chatId: 'inserted' })
-        await expect(harness.patch({ ...target, mutationId: 'after-insert', baseRevision: revision, messages: [{ index: 1, messageId: 'dup', set: { __x: 'moved' } }] }))
-            .resolves.toMatchObject({ status: 'conflict', conflict: { target: 'conversation', reason: 'revision' } })
-        expect((await harness.stored(target)).message.map((message) => (message as unknown as Record<string, unknown>).__x))
-            .toEqual([undefined, undefined, 'second', 'unnamed'])
-    })
-
-    it.each(paths)('returns a mismatch for a moved message with a unique ID on the %s path', async (_path, target) => {
-        const harness = await setup()
         await deleteFirstMessage(harness, target)
 
-        await expect(harness.patch({ ...target, mutationId: 'moved', messages: [{ index: 1, messageId: 'm1', set: { __x: 1 } }] }))
-            .resolves.toMatchObject({ status: 'conflict', conflict: { target: 'message', reason: 'mismatch', index: 1, field: 'chatId' } })
+        // Positions from before the deletion: a unique ID finds its message, a repeated or missing ID only its position.
+        await expect(harness.patch({ ...target, mutationId: 'moved', messages: [
+            { index: 4, messageId: 'b', set: { __x: 'b' } },
+            { index: 5, messageId: 'z', set: { __x: 'z' } },
+            { index: 1, messageId: 'dup', set: { __x: 'dup' } },
+        ] })).resolves.toMatchObject({ status: 'applied' })
+        await expect(harness.patch({ ...target, mutationId: 'unnamed', messages: [{ index: 2, messageId: null, set: { __x: 'unnamed' } }] }))
+            .resolves.toMatchObject({ status: 'applied' })
+        for (const entry of [{ index: 2, messageId: 'dup' }, { index: 3, messageId: null }]) {
+            await expect(harness.patch({ ...target, mutationId: `not-found-${entry.index}`, messages: [{ ...entry, set: { __x: 1 } }] }))
+                .resolves.toMatchObject({ status: 'conflict', conflict: { target: 'message', reason: 'not-found', index: entry.index } })
+        }
+        await expect(harness.patch({ ...target, mutationId: 'same-message', messages: [
+            { index: 0, messageId: 'z', set: { __x: 'first', __y: 1 } },
+            { index: 4, messageId: 'z', set: { __x: 'second' } },
+        ] })).resolves.toMatchObject({ status: 'applied' })
+
+        const stored = (await harness.stored(target)).message as unknown as Array<Record<string, unknown>>
+        expect(stored.map((message) => message.__x)).toEqual([undefined, 'dup', 'unnamed', 'b', 'second'])
+        expect(stored[4]).toMatchObject({ __y: 1 })
     })
 
     it.each(paths)('keeps the selected response variant snapshot in step on the %s path', async (_path, target) => {
@@ -338,15 +330,15 @@ describe('risunestPatchConversation', () => {
         const sibling = { characterId: 'char-a', conversationId: 'chat-a2' }
 
         const pending = harness.patch({ ...selected, mutationId: 'race', messages: [{ index: 1, messageId: 'm1', set: { __tr: 'patched' } }] })
-        const pendingStore = harness.patch({ ...sibling, mutationId: 'race-store', messages: [{ index: 1, messageId: 'm1', expected: { data: 'reply' }, set: { __tr: 'patched' } }] })
+        const pendingStore = harness.patch({ ...sibling, mutationId: 'race-store', messages: [{ index: 1, messageId: 'm1', set: { __tr: 'patched' } }] })
         session.edit(session.locate(1), { ...session.readMessage(session.locate(1)), data: 'user edit' })
         await harness.runtime.commitPersistentUnitIntent('test-edit', [], [{ type: 'replace-range', ...sibling, start: 1, deleteCount: 1, messages: [{ role: 'char', data: 'other edit', chatId: 'm1' }] }])
         flushed.resolve()
 
         await expect(pending).resolves.toMatchObject({ status: 'applied' })
-        await expect(pendingStore).resolves.toMatchObject({ status: 'conflict', conflict: { field: 'data' } })
+        await expect(pendingStore).resolves.toMatchObject({ status: 'applied' })
         expect((await harness.reloaded(selected)).message[1]).toMatchObject({ data: 'user edit', __tr: 'patched' })
-        expect((await harness.reloaded(sibling)).message[1]).toEqual({ role: 'char', data: 'other edit', chatId: 'm1' })
+        expect((await harness.reloaded(sibling)).message[1]).toEqual({ role: 'char', data: 'other edit', chatId: 'm1', __tr: 'patched' })
     })
 })
 

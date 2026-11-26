@@ -23,14 +23,11 @@ export type ChatVariableValue = string | number | boolean
 export interface ConversationPatchMessage {
     index: number
     messageId: string | null
-    expected?: Record<string, unknown>
     set: Record<string, unknown>
 }
 
 export interface ConversationPatchChatVariable {
     key: string
-    /** Absent when the plugin does not check the current value; null requires the key to be absent. */
-    expected?: ChatVariableValue | null
     value: ChatVariableValue | null
 }
 
@@ -38,17 +35,14 @@ export interface ConversationPatchRequest {
     characterId: string
     conversationId: string
     mutationId: string
-    baseRevision?: DataRevision
     messages: ConversationPatchMessage[]
     chatVariables: ConversationPatchChatVariable[]
 }
 
 export interface ConversationPatchConflict {
-    target: 'conversation' | 'message' | 'chatVariable'
-    reason: 'not-found' | 'mismatch' | 'revision'
+    target: 'conversation' | 'message'
+    reason: 'not-found'
     index?: number
-    field?: string
-    key?: string
 }
 
 export interface ConversationPatchResult {
@@ -115,7 +109,7 @@ function chatVariableValue(value: unknown, path: string, allowNull: boolean): Ch
     throw new TypeError(`${path} must be a string, a finite number, a boolean or null`)
 }
 
-function normalizeMessage(input: unknown, position: number, baseRevision: number | undefined): ConversationPatchMessage {
+function normalizeMessage(input: unknown, position: number): ConversationPatchMessage {
     const path = `messages[${position}]`
     if (!isPlainObject(input)) throw new TypeError(`${path} must be an object`)
     const index = safeIndex(input.index, `${path}.index`)
@@ -123,18 +117,6 @@ function normalizeMessage(input: unknown, position: number, baseRevision: number
         throw new TypeError(`${path}.messageId must be a string or null`)
     }
     const messageId = input.messageId as string | null
-    if (messageId === null && baseRevision === undefined) {
-        throw new TypeError(`${path} addresses a message without an ID, so baseRevision is required`)
-    }
-    let expected: Record<string, unknown> | undefined
-    if (input.expected !== undefined) {
-        if (!isPlainObject(input.expected)) throw new TypeError(`${path}.expected must be an object`)
-        expected = {}
-        for (const [field, value] of Object.entries(input.expected)) {
-            if (value !== undefined) assertJsonValue(value, `${path}.expected.${field}`)
-            expected[field] = value === undefined ? undefined : cloneJson(value)
-        }
-    }
     if (!isPlainObject(input.set)) throw new TypeError(`${path}.set must be an object`)
     const set: Record<string, unknown> = {}
     for (const [field, value] of Object.entries(input.set)) {
@@ -150,22 +132,20 @@ function normalizeMessage(input: unknown, position: number, baseRevision: number
         }
         set[field] = value === undefined ? undefined : cloneJson(value)
     }
-    return expected === undefined ? { index, messageId, set } : { index, messageId, expected, set }
+    return { index, messageId, set }
 }
 
 function normalizeChatVariable(input: unknown, position: number): ConversationPatchChatVariable {
     const path = `chatVariables[${position}]`
     if (!isPlainObject(input)) throw new TypeError(`${path} must be an object`)
     requiredId(input.key as string, `${path}.key`)
-    const entry: ConversationPatchChatVariable = {
-        key: input.key as string,
-        value: chatVariableValue(input.value, `${path}.value`, true),
-    }
-    if (input.expected !== undefined) entry.expected = chatVariableValue(input.expected, `${path}.expected`, true)
-    return entry
+    return { key: input.key as string, value: chatVariableValue(input.value, `${path}.value`, true) }
 }
 
-/** Validates plugin input before any read or commit; invalid input rejects the call. */
+/**
+ * Validates plugin input before any read or commit; invalid input rejects the call.
+ * Released plugins also send `baseRevision` and `expected`, which are not read.
+ */
 export function normalizeConversationPatchInput(input: unknown): ConversationPatchRequest {
     if (!isPlainObject(input)) throw new TypeError('Conversation patch input must be an object')
     requiredId(input.characterId as string, 'characterId')
@@ -175,7 +155,6 @@ export function normalizeConversationPatchInput(input: unknown): ConversationPat
         mutationId.length > CONVERSATION_PATCH_MAX_MUTATION_ID_LENGTH) {
         throw new RangeError(`mutationId must be a string of 1 to ${CONVERSATION_PATCH_MAX_MUTATION_ID_LENGTH} characters`)
     }
-    const baseRevision = input.baseRevision === undefined ? undefined : safeIndex(input.baseRevision, 'baseRevision')
     const messages: ConversationPatchMessage[] = []
     if (input.messages !== undefined) {
         if (!Array.isArray(input.messages)) throw new TypeError('messages must be an array')
@@ -184,7 +163,7 @@ export function normalizeConversationPatchInput(input: unknown): ConversationPat
         }
         const indices = new Set<number>()
         input.messages.forEach((entry, position) => {
-            const message = normalizeMessage(entry, position, baseRevision)
+            const message = normalizeMessage(entry, position)
             if (indices.has(message.index)) throw new RangeError(`messages repeats index ${message.index}`)
             indices.add(message.index)
             messages.push(message)
@@ -204,15 +183,13 @@ export function normalizeConversationPatchInput(input: unknown): ConversationPat
             chatVariables.push(variable)
         })
     }
-    const request: ConversationPatchRequest = {
+    return {
         characterId: input.characterId as string,
         conversationId: input.conversationId as string,
         mutationId,
         messages,
         chatVariables,
     }
-    if (baseRevision !== undefined) request.baseRevision = baseRevision
-    return request
 }
 
 export function patchSetsMessageData(request: ConversationPatchRequest): boolean {
@@ -241,45 +218,19 @@ function isTurnStart(message: Message): boolean {
 interface ConversationPatchSource {
     totalMessages: number
     message(index: number): Message
-    /** Whether the message at `index` is the only one with this ID; read only without a base revision. */
-    isUniqueMessageId(messageId: string, index: number): boolean
+    /** Where the only message with this ID is; undefined when no message or several have it. */
+    uniqueMessageIndex(messageId: string): number | undefined
     scriptstate: Record<string, unknown> | undefined
 }
 
-function findConflict(
-    request: ConversationPatchRequest,
-    source: ConversationPatchSource,
-    revisionMatches: boolean,
-): ConversationPatchConflict | null {
-    if (request.baseRevision !== undefined && !revisionMatches) {
-        return { target: 'conversation', reason: 'revision' }
-    }
-    for (const entry of request.messages) {
-        if (entry.index >= source.totalMessages) {
-            return { target: 'message', reason: 'not-found', index: entry.index }
-        }
-        const message = source.message(entry.index)
-        if ((message.chatId ?? null) !== entry.messageId) {
-            return { target: 'message', reason: 'mismatch', index: entry.index, field: 'chatId' }
-        }
-        if (request.baseRevision === undefined && !source.isUniqueMessageId(entry.messageId!, entry.index)) {
-            throw new TypeError(`Message ${entry.index} shares its chatId with another message, so baseRevision is required`)
-        }
-        for (const [field, value] of Object.entries(entry.expected ?? {})) {
-            const current = (message as unknown as Record<string, unknown>)[field]
-            if (value === undefined ? current !== undefined : !jsonEqual(current, value)) {
-                return { target: 'message', reason: 'mismatch', index: entry.index, field }
-            }
-        }
-    }
-    for (const variable of request.chatVariables) {
-        if (!Object.hasOwn(variable, 'expected')) continue
-        const current = source.scriptstate?.[variable.key]
-        if (variable.expected === null ? current !== undefined : current !== variable.expected) {
-            return { target: 'chatVariable', reason: 'mismatch', key: variable.key }
-        }
-    }
-    return null
+function holdsMessage(entry: ConversationPatchMessage, source: ConversationPatchSource): boolean {
+    return entry.index < source.totalMessages && (source.message(entry.index).chatId ?? null) === entry.messageId
+}
+
+/** The message at `index` when it has the ID, else the only message with the ID; a null ID matches only at `index`. */
+function locateMessage(entry: ConversationPatchMessage, source: ConversationPatchSource): number | undefined {
+    if (holdsMessage(entry, source)) return entry.index
+    return entry.messageId === null ? undefined : source.uniqueMessageIndex(entry.messageId)
 }
 
 function applySet(message: Message, set: Record<string, unknown>): Message {
@@ -291,17 +242,22 @@ function applySet(message: Message, set: Record<string, unknown>): Message {
     return updated as unknown as Message
 }
 
+interface PatchTarget {
+    index: number
+    set: Record<string, unknown>
+}
+
 /** Each change takes the user edit's replacement, so a selected response variant keeps its snapshot in step. */
-function planRuns(request: ConversationPatchRequest, source: ConversationPatchSource): ConversationPatchRun[] {
+function planRuns(targets: PatchTarget[], source: ConversationPatchSource): ConversationPatchRun[] {
     const working = new Map<number, Message>()
     const current = (index: number) => working.get(index) ?? source.message(index)
-    for (const entry of [...request.messages].sort((left, right) => left.index - right.index)) {
-        let end = entry.index + 1
+    for (const target of [...targets].sort((left, right) => left.index - right.index)) {
+        let end = target.index + 1
         while (end < source.totalMessages && !isTurnStart(current(end))) end++
         const span: Message[] = []
-        for (let index = entry.index; index < end; index++) span.push(current(index))
-        const replacement = responseEditReplacement(span, 0, applySet(span[0], entry.set))
-        replacement.forEach((message, offset) => working.set(entry.index + offset, message))
+        for (let index = target.index; index < end; index++) span.push(current(index))
+        const replacement = responseEditReplacement(span, 0, applySet(span[0], target.set))
+        replacement.forEach((message, offset) => working.set(target.index + offset, message))
     }
     const changed = [...working]
         .filter(([index, message]) => JSON.stringify(message) !== JSON.stringify(source.message(index)))
@@ -325,40 +281,43 @@ function planScriptstate(request: ConversationPatchRequest, current: Record<stri
     return jsonEqual(next, current ?? {}) ? null : next
 }
 
-function plan(request: ConversationPatchRequest, source: ConversationPatchSource, revisionMatches: boolean): ConversationPatchPlan {
-    const conflict = findConflict(request, source, revisionMatches)
-    if (conflict) return { kind: 'conflict', conflict }
-    return { kind: 'apply', runs: planRuns(request, source), scriptstate: planScriptstate(request, source.scriptstate) }
+function plan(request: ConversationPatchRequest, source: ConversationPatchSource): ConversationPatchPlan {
+    const targets: PatchTarget[] = []
+    for (const entry of request.messages) {
+        const index = locateMessage(entry, source)
+        if (index === undefined) return { kind: 'conflict', conflict: { target: 'message', reason: 'not-found', index: entry.index } }
+        targets.push({ index, set: entry.set })
+    }
+    return { kind: 'apply', runs: planRuns(targets, source), scriptstate: planScriptstate(request, source.scriptstate) }
 }
 
-/** Checks and plans a patch against messages held in memory, such as the active session's. */
+/** Plans a patch against messages held in memory, such as the active session's. */
 export function planLiveConversationPatch(
     request: ConversationPatchRequest,
     messages: readonly Message[],
     scriptstate: Record<string, unknown> | undefined,
-    revisionMatches: boolean,
 ): ConversationPatchPlan {
-    let occurrences: Map<string, number> | undefined
+    let unique: Map<string, number | undefined> | undefined
     return plan(request, {
         totalMessages: messages.length,
         message: (index) => messages[index],
-        isUniqueMessageId(messageId) {
-            if (!occurrences) {
+        uniqueMessageIndex(messageId) {
+            if (!unique) {
                 const addressed = new Set(request.messages.map((entry) => entry.messageId))
-                occurrences = new Map()
-                for (const message of messages) {
-                    if (message.chatId != null && addressed.has(message.chatId)) {
-                        occurrences.set(message.chatId, (occurrences.get(message.chatId) ?? 0) + 1)
-                    }
-                }
+                const found = new Map<string, number | undefined>()
+                messages.forEach((message, index) => {
+                    if (message.chatId == null || !addressed.has(message.chatId)) return
+                    found.set(message.chatId, found.has(message.chatId) ? undefined : index)
+                })
+                unique = found
             }
-            return occurrences.get(messageId) === 1
+            return unique.get(messageId)
         },
         scriptstate,
-    }, revisionMatches)
+    })
 }
 
-/** Checks and plans a patch at the reader's pinned revision, reading only the addressed responses. */
+/** Plans a patch at the reader's pinned revision, reading only the addressed responses. */
 export async function planStoredConversationPatch(
     reader: PersistentRevisionReader,
     request: ConversationPatchRequest,
@@ -369,39 +328,41 @@ export async function planStoredConversationPatch(
     assertPinnedRevision(reader.revision, metadata.revision, 'Patch conversation')
     const totalMessages = metadata.value.totalMessages
     const loaded = new Map<number, Message>()
+    const unique = new Map<string, number | undefined>()
+    const source: ConversationPatchSource = {
+        totalMessages,
+        message: (index) => loaded.get(index)!,
+        uniqueMessageIndex: (messageId) => unique.get(messageId),
+        scriptstate: metadata.value.conversation.scriptstate as Record<string, unknown> | undefined,
+    }
     const load = async (startIndex: number) => {
         const window = await reader.readConversationWindow({ characterId, conversationId, startIndex, limit: SPAN_READ_LIMIT })
         if (!window) throw new Error('Patch conversation disappeared from its pinned revision')
         assertPinnedRevision(reader.revision, window.revision, 'Patch messages')
         window.value.messages.forEach((message, offset) => loaded.set(window.value.startIndex + offset, message))
     }
+    const occurrence = async (messageId: string, anchorOccurrence: 'first' | 'last') => {
+        const window = await reader.readConversationWindow({
+            characterId, conversationId, anchorMessageId: messageId, anchorOccurrence, before: 0, after: 0,
+        })
+        if (window) assertPinnedRevision(reader.revision, window.revision, 'Patch message occurrence')
+        return window?.value.startIndex
+    }
     for (const entry of request.messages) {
-        for (let index = entry.index; index < totalMessages; index++) {
+        if (entry.index < totalMessages && !loaded.has(entry.index)) await load(entry.index)
+        if (entry.messageId !== null && !holdsMessage(entry, source) && !unique.has(entry.messageId)) {
+            const first = await occurrence(entry.messageId, 'first')
+            unique.set(entry.messageId, first !== undefined && first === await occurrence(entry.messageId, 'last') ? first : undefined)
+        }
+        const target = locateMessage(entry, source)
+        // The plan reports this entry as not found.
+        if (target === undefined) break
+        for (let index = target; index < totalMessages; index++) {
             if (!loaded.has(index)) await load(index)
-            if (index > entry.index && isTurnStart(loaded.get(index)!)) break
+            if (index > target && isTurnStart(loaded.get(index)!)) break
         }
     }
-    const unique = new Map<number, boolean>()
-    if (request.baseRevision === undefined) {
-        for (const entry of request.messages) {
-            const message = loaded.get(entry.index)
-            if (!message || message.chatId !== entry.messageId) continue
-            const occurrence = async (anchorOccurrence: 'first' | 'last') => {
-                const window = await reader.readConversationWindow({
-                    characterId, conversationId, anchorMessageId: entry.messageId!, anchorOccurrence, before: 0, after: 0,
-                })
-                if (window) assertPinnedRevision(reader.revision, window.revision, 'Patch message occurrence')
-                return window?.value.startIndex
-            }
-            unique.set(entry.index, await occurrence('first') === entry.index && await occurrence('last') === entry.index)
-        }
-    }
-    return plan(request, {
-        totalMessages,
-        message: (index) => loaded.get(index)!,
-        isUniqueMessageId: (_messageId, index) => unique.get(index) === true,
-        scriptstate: metadata.value.conversation.scriptstate as Record<string, unknown> | undefined,
-    }, reader.revision === request.baseRevision)
+    return plan(request, source)
 }
 
 /** The store writes for a planned patch: one count-preserving range per run and the `scriptstate` unit. */

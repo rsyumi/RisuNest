@@ -101,42 +101,40 @@ export async function verifyConversationPatch(store: PersistentDataStore, fixtur
         equal(stored?.value.scriptstate, scriptstate, `${label} chat variables`)
     }
 
-    let duplicate: unknown
-    try { await planPatch(store, { ...target, mutationId: 'dup', messages: [{ index: 18, messageId: 'patch-dup', set: { __x: 1 } }] }) }
-    catch (error) { duplicate = error }
-    if (!(duplicate instanceof TypeError)) throw new Error('duplicate message ID without a base revision')
-
     await commitPatch(store, { ...target, mutationId: 'runs',
         messages: [{ index: 19, messageId: 'patch-c19', set: { __x: 19 } },
-            { index: 1, messageId: 'patch-c1', expected: { data: 'c1', __tr: undefined }, set: { __tr: { text: 't', parts: [1, 2] } } }],
-        chatVariables: [{ key: '$a', expected: 1, value: 2 }, { key: '$b', value: 'x' }] }, 2)
+            { index: 1, messageId: 'patch-c1', set: { __tr: { text: 't', parts: [1, 2] } } }],
+        chatVariables: [{ key: '$a', value: 2 }, { key: '$b', value: 'x' }] }, 2)
     messages[1] = { ...messages[1], __tr: { text: 't', parts: [1, 2] } } as Message
     messages[19] = { ...messages[19], __x: 19 } as Message
     await readBack('separate runs', { $a: 2, $b: 'x' })
 
-    const head = (await store.readRoot()).revision
-    await commitPatch(store, { ...target, mutationId: 'base', baseRevision: head,
+    await commitPatch(store, { ...target, mutationId: 'positions',
         messages: [{ index: 20, messageId: 'patch-dup', set: { __x: 20 } }, { index: 18, messageId: 'patch-dup', set: { __y: true } },
             { index: 19, messageId: 'patch-c19', set: { data: 'c19 edited', __x: undefined } }, { index: 0, messageId: null, set: { __x: 0 } }] }, 2)
     messages[0] = { ...messages[0], __x: 0 } as Message
     messages[18] = { ...messages[18], __y: true } as Message
     messages[19] = { role: 'char', data: 'c19 edited', chatId: 'patch-c19' }
     messages[20] = { ...messages[20], __x: 20 } as Message
-    await readBack('base revision run', { $a: 2, $b: 'x' })
+    await readBack('repeated and missing IDs', { $a: 2, $b: 'x' })
 
-    const stale = await planPatch(store, { ...target, mutationId: 'stale', baseRevision: head, messages: [{ index: 0, messageId: null, set: { __x: 1 } }] })
-    equal(stale.planned, { kind: 'conflict', conflict: { target: 'conversation', reason: 'revision' } }, 'stale base revision')
-    const mismatch = await planPatch(store, { ...target, mutationId: 'mismatch', messages: [{ index: 1, messageId: 'patch-c1', expected: { __tr: { parts: [1, 2], text: 't' } }, set: { __x: 1 } },
-        { index: 19, messageId: 'patch-c19', expected: { data: 'c19' }, set: { __x: 2 } }] })
-    equal(mismatch.planned, { kind: 'conflict', conflict: { target: 'message', reason: 'mismatch', index: 19, field: 'data' } }, 'field mismatch')
+    // A unique ID finds its message outside the window read at the addressed position, or past the end.
+    await commitPatch(store, { ...target, mutationId: 'moved',
+        messages: [{ index: 1, messageId: 'patch-c19', set: { __m: 1 } }, { index: messages.length, messageId: 'patch-c1', set: { __m: 2 } }] }, 2)
+    messages[1] = { ...messages[1], __m: 2 } as Message
+    messages[19] = { ...messages[19], __m: 1 } as Message
+    await readBack('moved IDs', { $a: 2, $b: 'x' })
+
     const conflicts = await Promise.all([
-        { ...target, mutationId: 'moved', messages: [{ index: 2, messageId: 'patch-c1', set: { __x: 1 } }] },
-        { ...target, mutationId: 'range', messages: [{ index: messages.length, messageId: 'patch-c1', set: { __x: 1 } }] },
+        { ...target, mutationId: 'missing-id', messages: [{ index: 2, messageId: 'patch-missing', set: { __x: 1 } }] },
+        { ...target, mutationId: 'repeated-elsewhere', messages: [{ index: 2, messageId: 'patch-dup', set: { __x: 1 } }] },
+        { ...target, mutationId: 'unnamed-elsewhere', messages: [{ index: 1, messageId: null, set: { __x: 1 } }] },
         { ...target, conversationId: 'patch-missing', mutationId: 'missing', messages: [] },
     ].map(async input => (await planPatch(store, input)).planned))
     equal(conflicts, [
-        { kind: 'conflict', conflict: { target: 'message', reason: 'mismatch', index: 2, field: 'chatId' } },
-        { kind: 'conflict', conflict: { target: 'message', reason: 'not-found', index: messages.length } },
+        { kind: 'conflict', conflict: { target: 'message', reason: 'not-found', index: 2 } },
+        { kind: 'conflict', conflict: { target: 'message', reason: 'not-found', index: 2 } },
+        { kind: 'conflict', conflict: { target: 'message', reason: 'not-found', index: 1 } },
         { kind: 'conflict', conflict: { target: 'conversation', reason: 'not-found' } },
     ], 'addressing conflicts')
     await readBack('after conflicts', { $a: 2, $b: 'x' })
