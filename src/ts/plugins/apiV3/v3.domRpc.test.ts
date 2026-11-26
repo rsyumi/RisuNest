@@ -849,16 +849,15 @@ function __postToParent(message) {
                 characterId: 'char',
                 conversationId: 'conv',
                 mutationId: 'guest-patch',
-                messages: [{ index: 0, messageId: 'm0', expected: { __old: undefined }, set: { __tr: 'text', __gone: undefined } }],
+                messages: [{ index: 0, messageId: 'm0', set: { __tr: 'text', __gone: undefined } }],
             });
             return JSON.stringify(outcome);
         `)
 
         expect(JSON.parse(String(result))).toEqual({ status: 'applied', revision: 4 })
-        const [request] = mocks.patchConversation.mock.calls[0] as unknown as [{ messages: { expected: object; set: object }[] }]
+        const [request] = mocks.patchConversation.mock.calls[0] as unknown as [{ messages: { set: object }[] }]
         expect(request).toMatchObject({ characterId: 'char', conversationId: 'conv', mutationId: 'guest-patch' })
         expect(Object.hasOwn(request.messages[0].set, '__gone')).toBe(true)
-        expect(Object.hasOwn(request.messages[0].expected, '__old')).toBe(true)
     })
 
     it('reaches the private host tools from the guest under their own permission', async () => {
