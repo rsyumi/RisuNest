@@ -1,3 +1,7 @@
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { IndexedDbPersistentDataStore } from './storage/indexedDbPersistentDataStore'
+import { fixtureDatabase } from './storage/tests/persistentDataFixtures'
+import { EditableViewportFixture } from './conversationViewportSource.testSupport'
 import { describe, expect, it, vi } from 'vitest'
 import {
     PersistentConversationViewportSource,
@@ -236,6 +240,36 @@ describe('SynchronousSessionConversationViewportSource', () => {
         expect(source.snapshot().rowAt(1)?.key).toBe(editedKey)
     })
 
+    it('retires positional proof for a same-length legacy splice while keeping it for other rows', () => {
+        const a = message(undefined, 'first'), b = message(undefined, 'second'), c = message(undefined, 'third')
+        const { session, source } = harness([a, b, c])
+        const initial = source.snapshot()
+        session.edit(session.locate(0), { ...a, data: 'edited' })
+        session.append(message(undefined, 'fourth'))
+        expect(source.snapshot().positionKeyAt!(0)).toBe(initial.positionKeyAt!(0))
+        const second = initial.positionKeyAt!(1)
+        session.replaceRange(session.positionAt(1), 2, [c, b])
+        expect(source.snapshot().positionKeyAt!(0)).toBe(initial.positionKeyAt!(0))
+        expect(source.snapshot().positionKeyAt!(1)).not.toBe(second)
+        expect(initial.positionKeyAt!(1)).toBe(second)
+    })
+
+    it('follows unique render keys and expires old positional evidence after complete store adoption', async () => {
+        const { session, source, conversation } = harness([message('a', 'first'), message('b', 'second'), message(undefined, 'legacy')])
+        const original = structuredClone(conversation)
+        const reordered = structuredClone(conversation)
+        reordered.message = [reordered.message[1], reordered.message[0], reordered.message[2]]
+        const before = source.snapshot()
+        session.adoptGenerationHead(original, reordered, 2, -1, false)
+        await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
+        const after = source.snapshot()
+        expect(after.indexOfKey(before.keyAt(0)!)).toBe(1)
+        expect(after.rowAt(0)?.key).toBe(before.keyAt(1))
+        expect(after.rowAt(0)?.message.data).toBe('second')
+        expect(after.positionKeyAt!(2)).not.toBe(before.positionKeyAt!(2))
+        source.dispose()
+    })
+
     it('preserves untouched shifted keys across ordered commands in one transaction', () => {
         const { session, source } = harness([
             message(undefined, 'zero'),
@@ -435,7 +469,7 @@ describe('PersistentConversationViewportSource', () => {
 
     it('does not publish an old pair after an optimistic role change', async () => {
         const pending = deferred<Versioned<ConversationWindow>>()
-        const source = new PersistentConversationViewportSource({
+        const source = new EditableViewportFixture({
             reader: { readConversationWindow: () => pending.promise },
             characterId: 'character-a', conversationId: 'conversation-a', revision: 1, totalMessages: 2, rowBudget: 64,
         })
@@ -461,14 +495,14 @@ describe('PersistentConversationViewportSource', () => {
     })
 
     it('publishes optimistic generated tail rows while persistent reads remain on the pinned base', async () => {
-        const readConversationWindow = vi.fn(async () => ({
+        const readConversationWindow = vi.fn(async ({ startIndex = 0, limit = 3 }: ConversationWindowQuery) => ({
             revision: 7,
-            value: persistentWindow(0, [
+            value: persistentWindow(startIndex, [
                 message('zero', 'stored-zero'),
                 message('one', 'stored-one'),
-            ], 2),
+            ].slice(startIndex, startIndex + limit), 2),
         }))
-        const source = new PersistentConversationViewportSource({
+        const source = new EditableViewportFixture({
             reader: { readConversationWindow },
             characterId: 'character-a',
             conversationId: 'conversation-a',
@@ -490,7 +524,7 @@ describe('PersistentConversationViewportSource', () => {
         expect(source.snapshot().rowAt(2)?.message).toMatchObject({ data: 'streamed' })
         expect(readConversationWindow).toHaveBeenCalledWith(expect.objectContaining({
             startIndex: 0,
-            limit: 3,
+            limit: 2,
         }))
 
         rollback()
@@ -500,7 +534,7 @@ describe('PersistentConversationViewportSource', () => {
     })
 
     it('evicts a large optimistic range in one pass over the cached rows', () => {
-        const source = new PersistentConversationViewportSource({
+        const source = new EditableViewportFixture({
             reader: { readConversationWindow: vi.fn() },
             characterId: 'character-a',
             conversationId: 'conversation-a',
@@ -520,16 +554,16 @@ describe('PersistentConversationViewportSource', () => {
         expect(isPinned.mock.calls.length).toBeLessThanOrEqual(2 * count)
     })
 
-    it('publishes an optimistic tail removal and refuses a count change before the tail', async () => {
-        const readConversationWindow = vi.fn(async () => ({
+    it('projects middle and tail removals and restores the rows on rollback', async () => {
+        const readConversationWindow = vi.fn(async ({ startIndex = 0, limit = 3 }: ConversationWindowQuery) => ({
             revision: 7,
-            value: persistentWindow(0, [
+            value: persistentWindow(startIndex, [
                 message('zero', 'stored-zero'),
                 message('one', 'stored-one'),
                 message('two', 'stored-two'),
-            ], 3),
+            ].slice(startIndex, startIndex + limit), 3),
         }))
-        const source = new PersistentConversationViewportSource({
+        const source = new EditableViewportFixture({
             reader: { readConversationWindow },
             characterId: 'character-a',
             conversationId: 'conversation-a',
@@ -540,11 +574,14 @@ describe('PersistentConversationViewportSource', () => {
         await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
         const keyBefore = source.snapshot().keyAt(1)
 
-        expect(() => source.applyOptimisticRange(0, 1, [])).toThrow(RangeError)
+        const undoMiddle = source.applyOptimisticRange(0, 1, [])
+        expect(source.snapshot().totalMessages).toBe(2)
+        undoMiddle()
+        await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
         const rollback = source.applyOptimisticRange(2, 1, [])
         expect(source.snapshot()).toMatchObject({ totalMessages: 2 })
         expect(source.snapshot().rowAt(2)).toBeUndefined()
-        expect(source.snapshot().keyAt(1)).toBe(keyBefore)
+        expect(source.snapshot().keyAt(1)).not.toBe(keyBefore)
         await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
         expect(source.snapshot().rowAt(2)).toBeUndefined()
 
@@ -557,6 +594,7 @@ describe('PersistentConversationViewportSource', () => {
         replace()
         rollback()
         expect(source.snapshot()).toMatchObject({ totalMessages: 3 })
+        await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
         expect(source.snapshot().rowAt(2)?.message).toMatchObject({ data: 'stored-two' })
     })
 
@@ -876,70 +914,204 @@ describe('PersistentConversationViewportSource', () => {
         expect(() => source.advanceUnchangedRevision(9)).toThrow()
     })
 
-    it('finds the latest message pair without a metadata reader while an unsaved row is evicted', async () => {
-        const stored = [{ role: 'user', data: 'stored a' }, { role: 'char', data: 'stored b' }, { role: 'char', data: 'stored c' }] as Message[]
-        const source = new PersistentConversationViewportSource({
-            reader: { readConversationWindow: vi.fn(async ({ startIndex, limit }: ConversationWindowQuery) => ({
-                revision: 7,
-                value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), stored.length),
-            })) },
-            characterId: 'character-a', conversationId: 'conversation-a', revision: 7, totalMessages: 3, rowBudget: 2,
+    it('keeps an earlier legacy position proven across a tail append and its acknowledgement', async () => {
+        const original = [message(undefined, 'legacy'), message('b', 'second')]
+        const source = new EditableViewportFixture({
+            characterId: 'character-a', conversationId: 'conversation-a', revision: 1, totalMessages: 2, rowBudget: 2,
+            reader: { readConversationWindow: async () => null },
         })
-        source.applyOptimisticRange(0, 1, [{ role: 'user', data: 'edited a' }], 1)
-        // The row budget evicts the oldest unsaved row.
-        source.applyOptimisticRange(1, 2, [{ role: 'char', data: 'edited b' }, { role: 'char', data: 'edited c' }], 2)
-        expect(source.snapshot().rowAt(0)).toBeUndefined()
-        await expect(source.findLatestMessagePair(new AbortController().signal)).resolves.toEqual([0, 2])
+        const first = source.snapshot().positionKeyAt!(0)
+        const oldSecond = source.snapshot().positionKeyAt!(1)
+        const tail = message('tail', 'reply')
+        source.applyOptimisticRange(2, 0, [tail])
+        expect(source.snapshot().positionKeyAt!(0)).toBe(first)
+        const plan = await source.edits.plan(source.edits.freeze(), { revision: 1, readConversationWindow: async () => null }, 2)
+        source.edits.acknowledge(plan, 2)
+        source.installProjection(2, 3, false)
+        expect(source.snapshot().positionKeyAt!(0)).toBe(first)
+
+        source.edits.applyRange(1, [original[1]], [], 2)
+        source.refreshProjection({start: 1, end: 1, structureChanged: true})
+        expect(source.snapshot().positionKeyAt!(0)).toBe(first)
+        expect(source.snapshot().positionKeyAt!(1)).not.toBe(oldSecond)
+        await source.edits.rebase({revision: 3, readConversationWindow: async () => null}, 3)
+        source.installProjection(3, 3, true)
+        expect(source.snapshot().positionKeyAt!(0)).not.toBe(first)
+        source.dispose()
     })
 
-    // A save stores a grown conversation while a lookup still reads the earlier revision.
-    it.each(['window', 'metadata window'])('ends a pair lookup as changed when a later revision stores another count before its $0 arrives', async (shape) => {
-        const stored = [{ role: 'user', data: 'a' }, { role: 'char', data: 'b' }, { role: 'char', data: 'c' }] as Message[]
+    it('publishes a multi-range mutation with both dirty rows and one subscriber notification', async () => {
+        const messages = [message('a', 'a'), message('b', 'b'), message('c', 'c')]
+        const source = new EditableViewportFixture({
+            characterId: 'character-a', conversationId: 'conversation-a', revision: 1, totalMessages: 3, rowBudget: 3,
+            reader: { readConversationWindow: async () => ({ revision: 1, value: persistentWindow(0, messages, 3) }) },
+        })
+        await source.ensureRange({ startIndex: 0, limit: 3, reason: 'viewport' })
+        const observed: string[][] = []
+        source.subscribe(() => {
+            const snapshot = source.snapshot()
+            observed.push([snapshot.rowAt(0)!.message.data, snapshot.rowAt(2)!.message.data])
+        })
+        source.edits.applyRange(0, [messages[0]], [message('a', 'edited a')], 1)
+        source.edits.applyRange(2, [messages[2]], [message('c', 'edited c')], 2)
+        source.refreshProjections([{start: 0, end: 1, structureChanged: false}, {start: 2, end: 3, structureChanged: false}])
+        expect(observed).toEqual([['edited a', 'edited c']])
+    })
+
+    it.each([false, true])('projects evicted replacements, removals and appends across acknowledgement (metadata=%s)', async metadata => {
+        const store = new IndexedDbPersistentDataStore('viewport-edits', new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const seed = structuredClone(fixtureDatabase)
+        const character = seed.characters.find(owner => owner.chaId === 'char-a')!
+        const conversation = character.chats.find(chat => chat.id === 'conv-long')!
+        conversation.message = [
+            { ...message('a', 'zero'), role: 'user' }, message('b', 'one'), message('c', 'two'),
+            { ...message('d', 'three'), role: 'user' }, message('e', 'four'),
+        ]
+        const { revision } = await store.replaceFromDatabase(seed)
+        const reader = { readConversationWindow: store.readConversationWindow.bind(store),
+            readConversationMessageMetadataWindow: metadata ? store.readConversationMessageMetadataWindow.bind(store) : undefined }
+        const source = new EditableViewportFixture({ reader, characterId: character.chaId, conversationId: conversation.id!,
+            revision, totalMessages: 5, rowBudget: 1 })
+        const read = async (index: number) => {
+            await source.ensureRange({ startIndex: index, limit: 1, reason: 'viewport' })
+            return source.snapshot().rowAt(index)?.message
+        }
+        const signal = new AbortController().signal
+        const check = async () => {
+            expect((await read(2))?.chatId).toBe('d')
+            expect((await read(3))?.data).toBe('four')
+            expect(source.snapshot().rowAt(0)).toBeUndefined()
+            expect(source.snapshot().rowAt(4)).toBeUndefined()
+            await expect(source.findLatestMessagePair(signal)).resolves.toEqual([0, 4])
+            expect(await read(0)).toMatchObject({ data: 'edited zero', role: 'char' })
+            expect(await read(4)).toMatchObject({ data: 'local tail', role: 'user' })
+        }
+        try {
+            expect(await source.findLatestMessagePair(signal)).toEqual([3, 4])
+            await read(1)
+            source.applyOptimisticRange(1, 1, [])
+            source.applyOptimisticRange(0, 1, [message('a', 'edited zero')])
+            source.applyOptimisticRange(1, 3, [
+                { ...message('c', 'two'), disabled: true },
+                { ...message('d', 'three'), isComment: true },
+                { ...message('e', 'four'), disabled: true },
+            ])
+            source.applyOptimisticRange(4, 0, [{ ...message('tail', 'local tail'), role: 'user' }])
+            const projected = source.captureProjectedReader(reader)
+            const anchor = (id: string, occurrence: 'first' | 'last') => projected.readConversationWindow({
+                characterId: character.chaId, conversationId: conversation.id!, anchorMessageId: id, anchorOccurrence: occurrence,
+                before: 1, after: 1,
+            })
+            await expect(anchor('b', 'first')).resolves.toBeNull()
+            expect((await anchor('tail', 'last'))?.value.messages.map(row => row.chatId)).toEqual(['e', 'tail'])
+            await check()
+            const pair = source.findLatestMessagePair(signal)
+            source.applyOptimisticRange(4, 1, [{ ...message('tail', 'local tail'), role: 'user', time: 123 }])
+            expect(source.findLatestMessagePair(signal)).toBe(pair)
+            const lease = await store.acquireRevision(revision)
+            const plan = await source.edits.plan(source.edits.freeze(), lease, 5).finally(() => lease.release())
+            const saved = await store.commit({ expectedRevision: revision, conversations: plan.mutations })
+            source.edits.acknowledge(plan, saved.revision)
+            source.installProjection(saved.revision, 5, false)
+            await check()
+        } finally { source.dispose() }
+    })
+
+    it('resolves the surviving first and last occurrences when a projection hides the stored extremes', async () => {
+        const store = new IndexedDbPersistentDataStore('viewport-anchors', new IDBFactory(), IDBKeyRange)
+        await store.open()
+        const seed = structuredClone(fixtureDatabase)
+        const character = seed.characters.find(owner => owner.chaId === 'char-a')!
+        const conversation = character.chats.find(chat => chat.id === 'conv-long')!
+        const rows = Array.from({ length: 132 }, (_, i) => message([0, 64, 128, 131].includes(i) ? 'duplicate' : `m${i}`, String(i)))
+        conversation.message = rows
+        const { revision } = await store.replaceFromDatabase(seed)
+        const source = new EditableViewportFixture({ reader: store, characterId: character.chaId, conversationId: conversation.id!,
+            revision, totalMessages: rows.length, rowBudget: 1 })
+        await source.ensureRange({ startIndex: 131, limit: 1, reason: 'viewport' })
+        source.applyOptimisticRange(131, 1, [message('renamed', '131')])
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        source.applyOptimisticRange(0, 1, [])
+        const reader = source.captureProjectedReader(store)
+        for (const [anchorOccurrence, index] of [['first', 63], ['last', 127]] as const) {
+            const result = await reader.readConversationWindow({ characterId: character.chaId, conversationId: conversation.id!,
+                anchorMessageId: 'duplicate', anchorOccurrence })
+            expect(result?.value).toMatchObject({ startIndex: index, endIndex: index + 1,
+                messages: [message('duplicate', String(index + 1))] })
+        }
+        source.dispose()
+    })
+
+    it.each([false, true])('cancels a pair whose stored count changed when its pending tail was acknowledged (metadata=%s)', async metadata => {
         const released = deferred<void>()
-        const readConversationWindow = vi.fn(async ({ startIndex, limit }: ConversationWindowQuery) => {
+        const stored = [message('a', 'first'), { ...message('b', 'second'), role: 'user' as const }]
+        const readConversationWindow = vi.fn(async ({ startIndex = 0, limit = 2 }: ConversationWindowQuery) => {
             await released.promise
-            return { revision: 7, value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), 3) }
+            return { revision: 1, value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), 2) }
         })
-        const readConversationMessageMetadataWindow = vi.fn(async (query: ConversationWindowQuery) => {
-            const { revision, value } = await readConversationWindow(query)
-            return { revision, value: { ...value, messages: value.messages.map(({ role, disabled }) => ({ role, disabled, parserInert: true })) } }
-        })
-        const source = new PersistentConversationViewportSource({
-            reader: shape === 'window'
-                ? { readConversationWindow }
-                : { readConversationWindow: vi.fn(async () => null), readConversationMessageMetadataWindow },
-            characterId: 'character-a', conversationId: 'conversation-a', revision: 7, totalMessages: 3, rowBudget: 8,
-        })
-        source.applyOptimisticRange(3, 0, [{ role: 'char', data: 'd' }], 1)
+        const source = new EditableViewportFixture({ characterId: 'character-a', conversationId: 'conversation-a',
+            revision: 1, totalMessages: 2, rowBudget: 1, reader: {
+                readConversationWindow,
+                readConversationMessageMetadataWindow: metadata ? async query => {
+                    const { revision, value } = await readConversationWindow(query)
+                    return { revision, value: { ...value, messages: value.messages.map(({ role }) => ({ role, parserInert: true })) } }
+                } : undefined,
+            } })
+        source.applyOptimisticRange(2, 0, [message('tail', 'third')])
         const lookup = source.findLatestMessagePair(new AbortController().signal)
         await vi.waitFor(() => expect(readConversationWindow).toHaveBeenCalled())
-        source.advanceUnchangedRevision(8, { totalMessages: 4, sessionVersion: 1 })
+        const prefix = source.edits.freeze()
+        const plan = await source.edits.plan(prefix, { revision: 1, readConversationWindow: async () => null }, 2)
+        source.edits.acknowledge(plan, 2)
+        source.installProjection(2, 3, false)
         released.resolve()
         await expect(lookup).rejects.toMatchObject({ name: 'AbortError' })
+        source.dispose()
     })
 
-    it('finds the latest message pair again, and tells the screen, once a stored edit lets an evicted row read the store', async () => {
-        const stored = [{ role: 'user', data: 'a' }, { role: 'char', data: 'b' }, { role: 'char', data: 'c' }] as Message[]
-        let revision = 7
-        const source = new PersistentConversationViewportSource({
-            reader: { readConversationWindow: vi.fn(async ({ startIndex, limit }: ConversationWindowQuery) => ({
-                revision,
-                value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), stored.length),
-            })) },
-            characterId: 'character-a', conversationId: 'conversation-a', revision: 7, totalMessages: 3, rowBudget: 2,
+    it.each([false, true])('cancels a stale pair and window on count changes and same-count reorder (metadata=%s)', async metadata => {
+        let gate = deferred<void>()
+        const stored = [message('a', 'first'), { ...message('b', 'second'), role: 'user' as const }]
+        let revision = 1
+        const reader = { readConversationWindow: async ({ startIndex = 0, limit = 1 }: ConversationWindowQuery) => {
+            const result = { revision, value: persistentWindow(startIndex, stored.slice(startIndex, startIndex + limit), stored.length) }
+            await gate.promise
+            return result
+        } }
+        const source = new EditableViewportFixture({ characterId: 'character-a', conversationId: 'conversation-a',
+            reader: { ...reader, readConversationMessageMetadataWindow: metadata ? async query => {
+                const { revision, value } = await reader.readConversationWindow(query)
+                return { revision, value: { ...value, messages: value.messages.map(({ role }) => ({ role, parserInert: true })) } }
+            } : undefined },
+            revision, totalMessages: 2, rowBudget: 1 })
+        const signal = new AbortController().signal
+        const run = async (change: () => unknown) => {
+            const old = source.snapshot().keyAt(0)!
+            const lookup = source.findLatestMessagePair(signal)
+            const load = source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+            await change()
+            gate.resolve()
+            await expect(lookup).rejects.toMatchObject({ name: 'AbortError' })
+            await load
+            expect(source.snapshot().indexOfKey(old)).toBe(-1)
+            expect(source.snapshot().rowAt(0)).toBeUndefined()
+            gate = deferred<void>()
+        }
+        const tail = message('tail', 'third')
+        await run(() => source.applyOptimisticRange(2, 0, [tail]))
+        await run(async () => {
+            stored.reverse()
+            revision++
+            await source.edits.rebase({ revision, readConversationWindow: async query => {
+                const index = stored.findIndex(row => row.chatId === query.anchorMessageId)
+                return index < 0 ? null : { revision, value: persistentWindow(index, [stored[index]], stored.length) }
+            } }, stored.length)
+            source.installProjection(revision, 2, true)
         })
-        // The disabled first message is evicted before it is stored.
-        const disabled = { role: 'user', data: 'a', disabled: true } as Message
-        source.applyOptimisticRange(0, 1, [disabled], 1)
-        source.applyOptimisticRange(1, 2, [{ role: 'char', data: 'b' }, { role: 'char', data: 'c' }], 2)
-        await source.findLatestMessagePair(new AbortController().signal)
-        stored[0] = disabled
-        revision = 8
-        const listener = vi.fn()
-        source.subscribe(listener)
-        source.advanceUnchangedRevision(8, { totalMessages: 3, sessionVersion: 1 })
-        expect(listener).toHaveBeenCalled()
-        await expect(source.findLatestMessagePair(new AbortController().signal)).resolves.toEqual([2])
+        gate.resolve()
+        await expect(source.findLatestMessagePair(signal)).resolves.toEqual([0, 2])
+        source.dispose()
     })
 
     it('validates authority, range, pin, and monotonic revision inputs', async () => {

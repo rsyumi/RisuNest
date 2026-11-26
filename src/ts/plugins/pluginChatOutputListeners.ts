@@ -153,7 +153,7 @@ export async function dispatchChatOutputListeners(
                 char: event.char,
                 chat: event.chat,
                 ...position,
-                messageIndex,
+                messageIndex: projected.messageIndex ?? messageIndex,
             })
         } catch (error) {
             input.onError(error)

@@ -56,7 +56,8 @@ import {
     sliceHistory,
     toHistorySpliceIndex,
 } from './historyWindowIndex';
-import { openHistoryWindowCopy, type HistoryWindowCopy } from './historyWindowWrite';
+import { captureHistoryWindowSource, openHistoryWindowCopy, type HistoryWindowCopy } from './historyWindowWrite';
+import { beginGenerationOutputScript } from './generationOutputPhase';
 import { PersistentMutationFencedError } from '../storage/saveCoordinator';
 import {
     createScriptConversationAccess,
@@ -1931,6 +1932,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     let operationContext = conversationOperation
     let historyWindowCopy: HistoryWindowCopy | null = null
     let access: ScriptConversationAccess | null = null
+    let finishOutputScript: (() => void) | undefined
     try {
         let data = content
 
@@ -1941,19 +1943,15 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
             return content
         }
+        finishOutputScript = beginGenerationOutputScript(onConversationCommit)
         // A send that builds from a history window hands its edit listeners the window.
         const historyWindow = !operationContext && mode !== 'editDisplay'
             ? findActiveHistoryWindow(char.chaId, getCurrentChat()?.id)
             : null
-        const sourceCurrent = historyWindow?.isCurrent()
-        const sourceVersion = historyWindow?.mutationVersion
-        const sourceMessages = historyWindow ? [...historyWindow.chat.message] : null
+        const sourceCurrent = historyWindow && captureHistoryWindowSource(historyWindow)
         const createWindowChat = historyWindow ? () => {
             if (!historyWindowCopy) {
-                if (!sourceCurrent || !historyWindow.isCurrent()
-                    || sourceVersion !== historyWindow.mutationVersion
-                    || sourceMessages!.length !== historyWindow.chat.message.length
-                    || sourceMessages!.some((message, index) => historyWindow.chat.message[index] !== message)) {
+                if (!sourceCurrent?.()) {
                     throw new PersistentMutationFencedError()
                 }
                 historyWindowCopy = openHistoryWindowCopy(historyWindow, onConversationCommit)
@@ -1967,6 +1965,8 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     ? { origin: 'display' as const }
                     : { onVariablesCommitted: (keys) => requestScriptDisplayRefresh({ keys }) }),
             })
+            // The listener's supplied index refers to the messages at invocation.
+            if (finishOutputScript) access?.readChat()
         }
 
         for (let trigger of triggers) {
@@ -1994,11 +1994,17 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     } catch (error) {
         return content
     } finally {
-        if (historyWindowCopy && !historyWindowCopy.commit()) {
-            throw new PersistentMutationFencedError()
+        try {
+            if (historyWindowCopy && !historyWindowCopy.commit() && !finishOutputScript) {
+                throw new PersistentMutationFencedError()
+            }
+            // A listener that changed nothing keeps its result after the conversation closes.
+            access?.commitIfChanged()
+        } catch (error) {
+            if (!finishOutputScript || !isConversationStop(error)) throw error
+        } finally {
+            finishOutputScript?.()
         }
-        // A listener that changed nothing keeps its result after the conversation closes.
-        access?.commitIfChanged()
     }
 }
 

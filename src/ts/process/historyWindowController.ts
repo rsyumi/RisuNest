@@ -1,5 +1,6 @@
 import isEqual from 'lodash/isEqual'
 
+import { attachHistoryWindow } from './historyWindowIndex'
 import { replaceArrayRange } from '../arrayRange'
 import { safeStructuredClone } from '../safeStructuredClone'
 import {
@@ -88,16 +89,43 @@ export function captureSessionHistoryWindowController(
     const pin = session.acquirePin('transaction')
     let released = false
     let expectedVersion = session.version
-    const isCurrent = () => !released
-        && session.isActive
-        && getCurrentSession() === session
-        && session.version === expectedVersion
-        && session.materializeCompatibilityArray() === conversation.message
-        && session.totalMessages === absoluteStartIndex + chat.message.length
+    const isCurrentOwner = () => !released && session.isActive && getCurrentSession() === session
+    const isCurrent = () => {
+        if (!isCurrentOwner() || session.materializeCompatibilityArray() !== conversation.message ||
+            absoluteStartIndex + chat.message.length > session.totalMessages) return false
+        if (session.version === expectedVersion) return true
+        if (!session.canContinueGenerationFrom(expectedVersion)) return false
+        if (session.contentVersion > expectedVersion) {
+            // An admitted metadata publication can replace full message objects with the same content.
+            const rows = conversation.message.slice(absoluteStartIndex, absoluteStartIndex + chat.message.length)
+            replaceArrayRange(chat.message, 0, chat.message.length, safeStructuredClone(rows))
+        }
+        expectedVersion = session.version
+        return true
+    }
     return {
         chat,
-        absoluteStartIndex,
+        get absoluteStartIndex() { return absoluteStartIndex },
+        get mutationVersion() { return session.contentVersion },
+        isOwnerCurrent: isCurrentOwner,
         isCurrent,
+        adoptSessionCommit(commit, localIndex, id) {
+            if (!isCurrentOwner() || !commit.follows(session, expectedVersion, conversation)) return null
+            let index = commit.mapSessionIndex?.(absoluteStartIndex + localIndex)
+            if (index === undefined) {
+                const first = session.findMessageTargetsByIds([id], 'first')[0]
+                const last = session.findMessageTargetsByIds([id], 'last')[0]
+                if (!first || !last || first.absoluteIndex !== last.absoluteIndex) return null
+                index = first.absoluteIndex
+            }
+            if (index === null || conversation.message[index]?.chatId !== id) return null
+            const length = Math.min(session.totalMessages, chat.message.length)
+            absoluteStartIndex = Math.max(0, Math.min(index - localIndex, session.totalMessages - length))
+            replaceArrayRange(chat.message, 0, chat.message.length, safeStructuredClone(conversation.message.slice(absoluteStartIndex, absoluteStartIndex + length)))
+            attachHistoryWindow(chat, absoluteStartIndex)
+            expectedVersion = session.version
+            return index - absoluteStartIndex
+        },
         applyRange(localStart, deleteCount, messages) {
             if (
                 !isCurrent()
@@ -207,8 +235,11 @@ export function createHistoryWindowController(
     const resolve = (): WindowedConversationMutationController | null => {
         if (released) return null
         if (backend?.isCurrent()) return backend
-        backend?.release()
+        // A displaced window still owns its output handle. Positional consumers must reload it.
+        if (backend?.isOwnerCurrent?.()) return null
         const source = environment.captureSession()
+        if (backend?.isOwnerCurrent && !source) return null
+        backend?.release()
         if (source?.session.canAdoptPersistedMetadata && sessionHoldsWindow(source, chat, absoluteStartIndex)) {
             const persisted = source.conversation.message.slice(absoluteStartIndex)
             const contentKeys = ['role', 'data', 'saying', 'chatId', 'name', 'disabled', 'isComment'] as const
@@ -237,7 +268,7 @@ export function createHistoryWindowController(
         messages,
         command,
     ) => {
-        const current = resolve()
+        const current = command === 'update-metadata' && backend?.isOwnerCurrent?.() ? backend : resolve()
         const live = current ? environment.readLiveMetadata() : null
         if (!current || !live) return false
         const changed = mergeLiveMetadata(chat, baseline, live)
@@ -248,8 +279,19 @@ export function createHistoryWindowController(
     }
     return {
         chat,
-        absoluteStartIndex,
-        get mutationVersion() { return mutationVersion },
+        get absoluteStartIndex() { return backend?.absoluteStartIndex ?? absoluteStartIndex },
+        get mutationVersion() { return mutationVersion + (backend?.mutationVersion ?? 0) },
+        isOwnerCurrent: () => !released && (backend?.isOwnerCurrent?.() ?? (resolve() !== null)),
+        adoptSessionCommit: (commit, index, id) => backend?.adoptSessionCommit?.(commit, index, id) ?? null,
+        bindTarget: index => backend?.bindTarget?.(index) ?? null,
+        prepareTarget: index => backend?.prepareTarget?.(index) ?? Promise.resolve(resolve() !== null),
+        async refreshWindow(anchorIndex) {
+            if (released) return false
+            if (!backend?.refreshWindow) return resolve() !== null
+            const current = await backend.refreshWindow(anchorIndex)
+            if (current) attachHistoryWindow(chat, backend.absoluteStartIndex)
+            return current
+        },
         isCurrent: () => resolve() !== null,
         applyRange,
         reconcileMetadata() {

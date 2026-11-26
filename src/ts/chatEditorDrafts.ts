@@ -1,4 +1,5 @@
 import isEqual from 'lodash/isEqual'
+import type { SelectedConversationMessageEditIntent } from './selectedConversationOperations'
 import type { Message } from './storage/database.svelte'
 import { closeTextEditorPopup, type TextEditorPopupRequest } from './gui/textEditorPopup.svelte'
 
@@ -25,6 +26,7 @@ export interface ChatEditorDraft {
     caret?: readonly [number, number]
     popup?: ChatEditorPopup
     translationKey?: string
+    intent?: SelectedConversationMessageEditIntent
 }
 
 const drafts = new Map<string, ChatEditorDraft[]>()
@@ -35,6 +37,8 @@ function conversationKey(characterId: string, conversationId: string): string {
 
 export function keepEditorDraft(characterId: string, conversationId: string, draft: ChatEditorDraft): void {
     const key = conversationKey(characterId, conversationId)
+    const editor = draft.intent?.windowedEditor
+    if (editor) draft.intent = { ...draft.intent!, windowedEditor: editor.retain() }
     drafts.set(key, [...(drafts.get(key) ?? []), draft])
 }
 
@@ -43,7 +47,8 @@ export function pendingEditorDrafts(characterId: string, conversationId: string)
 }
 
 export function editorDraftMatches(draft: ChatEditorDraft, index: number, message: Readonly<Message>): boolean {
-    return draft.index === index && isEqual(message, draft.evidence)
+    const editor = draft.intent?.windowedEditor
+    return editor ? editor.location() === index : draft.index === index && isEqual(message, draft.evidence)
 }
 
 /** Removes and returns the draft whose message is exactly the one now at `index`. */
@@ -72,14 +77,14 @@ export function forgetEditorPopup(popup: ChatEditorPopup | null): void {
     if (!popup) return
     for (const [key, list] of drafts) {
         const draft = list.find((value) => value.popup === popup)
-        if (draft) remove(key, list, draft)
+        if (draft) { remove(key, list, draft); draft.intent?.windowedEditor?.release() }
     }
 }
 
 export function discardEditorDraft(characterId: string, conversationId: string, draft: ChatEditorDraft): void {
     const key = conversationKey(characterId, conversationId)
     const list = drafts.get(key)
-    if (list?.includes(draft)) remove(key, list, draft)
+    if (list?.includes(draft)) { remove(key, list, draft); draft.intent?.windowedEditor?.release() }
     if (draft.popup) closeTextEditorPopup(draft.popup.request)
 }
 
@@ -89,6 +94,9 @@ export function discardEditorDraftsExcept(characterId: string | null, conversati
     for (const [key, list] of [...drafts]) {
         if (key === kept) continue
         drafts.delete(key)
-        for (const draft of list) if (draft.popup) closeTextEditorPopup(draft.popup.request)
+        for (const draft of list) {
+            draft.intent?.windowedEditor?.release()
+            if (draft.popup) closeTextEditorPopup(draft.popup.request)
+        }
     }
 }

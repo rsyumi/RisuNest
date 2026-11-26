@@ -365,7 +365,7 @@
         if (editMode) {
             const evidence = editIntent?.messageEvidence ?? editEvidence
             if (!evidence) return null
-            return { kind: 'original', draft: editDraft, index: idx, evidence, popup: editInPopup ? editPopup ?? undefined : undefined }
+            return { kind: 'original', draft: editDraft, index: idx, evidence, ...(editIntent?.windowedEditor ? { intent: editIntent } : {}), popup: editInPopup ? editPopup ?? undefined : undefined }
         }
         if (editTranslationMode && editTranslationKey !== null && translationEvidence) {
             return { kind: 'translation', draft: editTranslationText, index: idx, evidence: translationEvidence, translationKey: editTranslationKey }
@@ -385,7 +385,12 @@
             return
         }
         editDraft = restored.draft
-        editMode = captureEditTarget()
+        if (restored.intent?.windowedEditor) {
+            editIntent?.windowedEditor?.release()
+            editIntent = restored.intent
+            editTarget = null
+            editMode = true
+        } else editMode = captureEditTarget()
         if (!restored.popup) return
         if (!editMode) {
             closeTextEditorPopup(restored.popup.request)
@@ -511,6 +516,7 @@
     }
 
     function captureEditTarget(): boolean {
+        editIntent?.windowedEditor?.release()
         editIntent = captureViewportEditIntent()
         editTarget = editIntent ? null : captureCurrentMessage()
         editEvidence = editTarget ? safeStructuredClone(editTarget.message) : null
@@ -524,12 +530,14 @@
     }
 
     function beginPartialEdit() {
+        partialEditIntent?.windowedEditor?.release()
         partialEditIntent = captureViewportEditIntent()
         partialEditTarget = partialEditIntent ? null : captureCurrentMessage()
         if (partialEditIntent || partialEditTarget) onEditorOpen?.()
     }
 
     function cancelPartialEdit() {
+        partialEditIntent?.windowedEditor?.release()
         partialEditIntent = null
         partialEditTarget = null
     }
@@ -580,6 +588,7 @@
             if (retainedTarget && !isEqual(resolveChatMessageTarget(retainedTarget, chatMessageContext)?.message, editEvidence)) return reportRowActionRefused()
             const result = saveCapturedChatMessage(acquired.target, chatMessageContext, editDraft)
             if (result.saved) {
+                editIntent?.windowedEditor?.release()
                 editIntent = null
                 editTarget = null
                 message = result.displayData
@@ -627,6 +636,7 @@
             },
             cancel: () => {
                 editMode = false
+                editIntent?.windowedEditor?.release()
                 editIntent = null
                 editTarget = null
                 closeEditPopup()
@@ -671,6 +681,7 @@
     ) {
         if (idx < 0) return false
         if (detail.target === 'translation') {
+            partialEditIntent?.windowedEditor?.release()
             partialEditIntent = null
             partialEditTarget = null
             if (!detail.translationKey) return false
@@ -688,6 +699,7 @@
             if (acquired.target.message.data !== detail.sourceData) return reportRowActionRefused()
             const result = saveCapturedChatMessage(acquired.target, chatMessageContext, detail.newData)
             if (result.saved) {
+                partialEditIntent?.windowedEditor?.release()
                 partialEditIntent = null
                 partialEditTarget = null
                 message = result.displayData
@@ -912,6 +924,8 @@
     })
 
     onDestroy(()=>{
+        editIntent?.windowedEditor?.release()
+        partialEditIntent?.windowedEditor?.release()
         unsubscribers.forEach(u => u())
         displayRow?.dispose()
     })

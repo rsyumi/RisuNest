@@ -1,3 +1,4 @@
+import type { ConversationWindowQuery } from './storage/persistentDataStore'
 import {
     classifyChatParserHistory,
     createLiveChatParserIndirections,
@@ -217,7 +218,7 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
     let released = false
     const release = () => { released = true; completeLease?.release(); completeLease = undefined; signal.removeEventListener('abort', release) }
     signal.addEventListener('abort', release, { once: true })
-    const historyChanged = () => !!source && hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies)
+    const historyChanged = () => !!source && (source.snapshot().version !== version || hasCbsHistoryChanges(source.snapshot(), historyVersion, historyDependencies))
     const assertCurrent = () => {
         signal.throwIfAborted()
         if (released) throw new Error('Live display lease is closed')
@@ -251,14 +252,19 @@ async function prepareLiveDisplayParserProjection(inputs: LiveDisplayParserInput
         let resident: Map<number, Message> | undefined
         let lease: Promise<PersistentRevisionLease> | undefined
         const acquire = () => lease ??= runtime.store.acquireRevision(authority!.storeRevision)
+        const storedReader = {
+            readConversationWindow: async (query: ConversationWindowQuery) => (await acquire()).readConversationWindow(query),
+            readConversationMessageMetadataWindow: async (query: ConversationWindowQuery) => (await acquire()).readConversationMessageMetadataWindow!(query),
+        }
+        const windowReader = source?.captureProjectedReader?.(storedReader) ?? storedReader
         const reader: CbsHistoryReader = {
             revision: authority!.storeRevision,
             readResidentMessage: (index) => preparedRows.get(index) ?? (resident ??= new Map(
                 (source?.captureResidentRows?.() ?? []).map((row) => [row.absoluteIndex, clone(row.message)]))).get(index),
             readRoleWindow: runtime.store.messageMetadataReadMode === 'projected' && authority!.sessionVersion === authority!.persistedSessionVersion
-                ? async (query) => (await acquire()).readConversationMessageMetadataWindow!(query) : undefined,
+                ? (query) => windowReader.readConversationMessageMetadataWindow!(query) : undefined,
             readConversationWindow: async (query) => {
-                const result = await (await acquire()).readConversationWindow(query)
+                const result = await windowReader.readConversationWindow(query)
                 return result ? { ...result, value: { ...result.value, totalMessages } } : null
             },
         }
@@ -353,7 +359,8 @@ export function subscribeLiveDisplayParserSelection(
         const nextIdentity = captureLiveDisplayParserSelection()
         const reads = dependencies?.()
         if (reads && previous && snapshot && identity === nextIdentity && previous.sourceToken === snapshot.sourceToken
-            && previous.version === snapshot.version && !hasCbsHistoryChanges(snapshot, previous.historyVersion, reads)) {
+            && (previous.version === snapshot.version || previous.historyVersion !== snapshot.historyVersion)
+            && !hasCbsHistoryChanges(snapshot, previous.historyVersion, reads)) {
             previous = snapshot
             return
         }

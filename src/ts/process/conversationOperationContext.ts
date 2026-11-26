@@ -21,6 +21,7 @@ export type ConversationOperationMode = 'prefetched' | 'compatibility'
 /** Only a successfully committed operation can advance a caller's captured target. */
 export interface ConversationOperationCommit {
     follows(session: ActiveConversationSession | null, version: number | null, chat: Chat): boolean
+    mapSessionIndex?(index: number): number | null
     remapWindowTarget?(controller: WindowedConversationMutationController, message: Message): number | null
 }
 

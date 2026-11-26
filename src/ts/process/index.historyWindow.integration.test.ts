@@ -6,6 +6,8 @@ import { resolve } from 'node:path'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
+import { checkOutputProcessing, checkStreamingWrite, finalText, installOutputTrigger, liveMessage, setterCases, whileStreaming, type SetterCase } from './tests/streamingPluginWrites'
+import { createProductionPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
 import { alertStore } from '../alertQueue'
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
 import { DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
@@ -45,9 +47,13 @@ vi.mock('../storage/persistentDataRuntime.svelte', async (importOriginal) => ({
     flushPendingData: (reason: string) => current.runtime.flushPendingData(reason),
     flushPendingDataLocally: (reason: string) => current.runtime.flushPendingDataLocally(reason),
     getActiveConversationSession: () => current.runtime.getActiveConversationSession(),
+    getActiveConversationViewportSource: () => current.runtime.getActiveConversationViewportSource(),
     peekActiveConversationSession: () => current.runtime?.getActiveConversationSession() ?? null,
     invalidateActiveConversationSession: () => current.runtime.invalidateActiveConversationSession(),
     getPersistentDataRuntime: () => current.runtime,
+    getPersistentRevision: () => current.runtime.revision,
+    withLiveConversationWrite: <T>(reason: string, operation: () => Promise<T>) => current.runtime.withLiveConversationWrite(reason, operation),
+    commitPreparedUnitIntent: (...args: Parameters<typeof current.runtime.commitPreparedUnitIntent>) => current.runtime.commitPreparedUnitIntent(...args),
 }))
 vi.mock('../storage/persistentDataStoreFactory', async () => (await import('./tests/sendChatTestHarness')).persistentDataStoreFactoryModule(() => current.store))
 vi.mock('../storage/deviceSettings', async (importOriginal) => (await import('./tests/sendChatTestHarness')).historyWindowDeviceSettingsModule(importOriginal, () => true))
@@ -273,10 +279,13 @@ async function bootWindowedConversation(
         () => expect(current.runtime.getSelectedConversationMode()).toBe('windowed'),
         { timeout: 5_000 },
     )
-    return { store, backgroundErrors, async reopen() {
+    async function connect() {
         const reopened = new IndexedDbPersistentDataStore(name, factory, IDBKeyRange)
         await reopened.open()
-        return (await reopened.readConversation('character-a', 'chat-a'))!.value
+        return reopened
+    }
+    return { store, backgroundErrors, connect, async reopen() {
+        return (await (await connect()).readConversation('character-a', 'chat-a'))!.value
     } }
 }
 
@@ -467,66 +476,106 @@ describe('a windowed send through the production runtime', () => {
         } finally { release(); spy.mockRestore() }
     })
 
-    // A reply keeps streaming into the windowed conversation while a plugin's parser call stores an
-    // @@inject write; the reply's text grows while that commit runs.
     it.each([
-        { target: 'an earlier message', index: 100, adopted: true },
-        { target: 'the streaming reply', index: MESSAGES, adopted: false },
-    ])('keeps a streaming reply when a parser inject stores $target of the windowed conversation', async ({ index, adopted }) => {
-        const { store, reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
+        { target: 'an earlier message', index: 100 },
+        { target: 'the streaming reply', index: MESSAGES },
+    ])('keeps a streaming reply when a parser inject stores $target of the windowed conversation', async ({ index }) => {
+        const { store, connect, reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), seed => {
             seed.characters[0].triggerscript = []
         })
+        const reader = await connect()
         const { parseRisuChat } = await import('../plugins/parseRisuChat')
-        const { cloneConversationMetadata } = await import('../storage/selectedConversationLifecycle')
         const runtime = current.runtime
-        const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
-        const full = { ...partial, data: 'Synthetic reply, streamed further' }
-        const write = (start: number, deleteCount: number, message: Message) => {
-            const target = runtime.captureSelectedConversationTarget()!
-            const chat = { ...cloneConversationMetadata(DBState.db.characters[0].chats[0]),
-                message: deleteCount ? [partial] : [] } as unknown as Chat
-            const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
-            expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
-            controller.release()
-        }
-        write(MESSAGES, 0, partial)
-        await runtime.flushPendingData('partial-reply')
-        const source = runtime.getActiveConversationViewportSource()!
-        await source.ensureRange({ startIndex: 96, limit: 8, reason: 'viewport' })
-        const historyVersion = source.snapshot().historyVersion
-        let grown = false
-        const commit = store.commit.bind(store)
-        const spy = vi.spyOn(store, 'commit').mockImplementation(async (request) => {
-            const result = await commit(request)
-            if (!grown && JSON.stringify(request).includes('STORED:plugin note')) {
-                grown = true
-                write(MESSAGES, 1, full)
-            }
-            return result
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        const reply = await whileStreaming({ runtime, length: MESSAGES, windowed: true }, async ({ chunk }) => {
+            await runtime.flushPendingData('partial-reply')
+            const source = runtime.getActiveConversationViewportSource()!
+            await source.ensureRange({ startIndex: index, limit: 1, reason: 'viewport' })
+            const version = source.snapshot().historyVersion!
+            const commit = store.commit.bind(store)
+            let grown = false
+            const spy = vi.spyOn(store, 'commit').mockImplementation(async request => {
+                const result = await commit(request)
+                if (!grown && JSON.stringify(request).includes('STORED:plugin note')) {
+                    grown = true
+                    const committed = await reader.readConversationWindow({
+                        characterId: 'character-a', conversationId: 'chat-a', startIndex: index, limit: 1,
+                    })
+                    expect(committed?.value.messages[0].data).toBe('STORED:plugin note')
+                    chunk('next streamed chunk')
+                    await vi.waitFor(() => expect(source.snapshot().rowAt(MESSAGES)?.message.data).toBe('next streamed chunk'))
+                }
+                return result
+            })
+            try {
+                expect(await parseRisuChat('WRITE:plugin note', { processRegex: true, messageIndex: index })).toBe('plugin note')
+                await runtime.flushPendingData('parser-inject')
+                expect(grown).toBe(true)
+                expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                expect(source.snapshot().historyChangesSince?.(version)?.some(change => change.start <= index && index < change.end)).toBe(true)
+                if (index !== MESSAGES) expect((await liveMessage(runtime, index))?.data).toBe('STORED:plugin note')
+                await runtime.mutateConversationBinding('character-a', 'chat-a', { bindedPersona: 'persona-id' },
+                    patch => Object.assign(DBState.db.characters[0].chats[0], patch))
+                await parseRisuChat('{{setvar::during_stream::kept}}', { runVar: true })
+            } finally { spy.mockRestore() }
         })
+        await runtime.flushPendingData('streamed-reply')
+        const stored = await reopen()
+        expect(stored.message).toHaveLength(MESSAGES + 1)
+        expect(stored.message[100].data).toBe(index === 100 ? 'STORED:plugin note' : 'WRITE:outside')
+        expect(stored.message.at(-1)).toMatchObject({ chatId: reply.chatId, data: finalText })
+        expect(stored).toMatchObject({ bindedPersona: 'persona-id', scriptstate: { $during_stream: 'kept' } })
+        expect(backgroundErrors).toEqual([])
+    })
+
+    async function pluginFixture(edit?: SetterCase) {
+        const messages = storedMessages()
+        if (edit === 'legacy row') delete messages[0].chatId
+        if (edit === 'unread copy predating user message') messages[MESSAGES - 1] = { role: 'user', data: 'latest prompt', chatId: 'latest-user' }
+        const { connect, backgroundErrors } = await bootWindowedConversation(messages, seed => {
+            seed.characters[0].customscript = []
+            seed.characters[0].triggerscript = []
+            if (!edit) installOutputTrigger(seed)
+        })
+        const runtime = current.runtime
+        const access = createProductionPluginDatabaseAccess({
+            owner: 'streaming-plugin',
+            getLiveRuntime: () => runtime,
+            getPersistentRevision: () => runtime.revision,
+            commitPersistentUnitIntent: runtime.commitPersistentUnitIntent,
+            flushPendingData: runtime.flushPendingDataLocally,
+            assertPersistentMutationAllowed: runtime.assertPersistentMutationAllowed,
+            getStorageAuthorityEpoch: runtime.getStorageAuthorityEpoch,
+            getCompatibilityDatabase: () => DBState.db,
+            getSelectedCharacterId: () => 'character-a',
+            captureSelectedConversationTarget: runtime.captureSelectedConversationTarget,
+            acquireCompleteConversation: runtime.acquireCompleteConversation,
+            refreshSelectedConversationAfterReplacement: runtime.refreshSelectedConversationAfterReplacement,
+            invalidateActiveConversationSession: runtime.invalidateActiveConversationSession,
+            reportIdentityReplacementRejected: vi.fn(),
+            getNavigationGeneration: runtime.getNavigationGeneration,
+            readPluginStorageSnapshot: async () => ({}),
+            snapshot: <T>(value: T) => JSON.parse(JSON.stringify(value)) as T,
+        })
+        return { runtime, access, connect, length: MESSAGES, windowed: true, backgroundErrors }
+    }
+
+    it.each(setterCases)('keeps a plugin write to a windowed streaming conversation (%s)', async edit => {
+        const fixture = await pluginFixture(edit)
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
         try {
-            const parsed = parseRisuChat('WRITE:plugin note', { processRegex: true, messageIndex: index })
-            if (!adopted) {
-                // The commit rewrote the row that holds the unsaved reply, so the screen is read again.
-                await expect(parsed).rejects.toMatchObject({ name: 'PersistentMutationFencedError' })
-                expect(runtime.pendingWorkingSetRefreshRevision).not.toBeNull()
-                return
-            }
-            expect(await parsed).toBe('plugin note')
-            expect(grown).toBe(true)
-            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
-            expect(runtime.getActiveConversationViewportSource()).toBe(source)
-            expect(source.snapshot().rowAt(100)?.message.data).toBe('STORED:plugin note')
-            // Parsers that read that message see it changed.
-            expect(source.snapshot().historyChangesSince?.(historyVersion!)).toContainEqual(
-                expect.objectContaining({ start: 100, end: 101, countChanged: false }))
-            await source.ensureRange({ startIndex: MESSAGES - 2, limit: 3, reason: 'viewport' })
-            expect(source.snapshot().rowAt(MESSAGES)?.message).toEqual(full)
-            await runtime.flushPendingData('streamed-reply')
-            const stored = await reopen()
-            expect([stored.message[100].data, stored.message.at(-1)]).toEqual(['STORED:plugin note', full])
-            expect(backgroundErrors).toEqual([])
-        } finally { spy.mockRestore() }
+            await checkStreamingWrite(fixture, edit)
+            expect(fixture.backgroundErrors).toEqual([])
+        } finally { fixture.access.closeReadBaselines() }
+    })
+
+    it('waits for an output trigger before applying a windowed setter and accepts the patch retry', async () => {
+        const fixture = await pluginFixture()
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        try {
+            await checkOutputProcessing(fixture)
+            expect(fixture.backgroundErrors).toEqual([])
+        } finally { fixture.access.closeReadBaselines() }
     })
 
     it('allows parseRisuChat and its variable writes inside the provider callback without waiting for the send', async () => {
@@ -834,6 +883,87 @@ describe('a windowed send through the production runtime', () => {
         expect(inserted.chatId).toEqual(expect.any(String))
         expect(persisted).toHaveLength(MESSAGES + 2)
         expect(current.alertError).not.toHaveBeenCalled()
+        expect(backgroundErrors).toEqual([])
+    })
+
+    it('continues the current stored tail after a competing reorder races a legacy ID assignment', async () => {
+        const original = storedMessages()
+        const tail = original.at(-1)!
+        delete tail.chatId
+        const neighbour = original.at(-2)!
+        neighbour.role = 'char'
+        neighbour.saying = 'character-a'
+        const { store, connect, reopen, backgroundErrors } = await bootWindowedConversation(structuredClone(original), seed => {
+            seed.characters[0].triggerscript = []
+            seed.characters[0].customscript = []
+        })
+        const other = await connect()
+        const read = async () => (await other.readConversation('character-a', 'chat-a'))!
+        let moved = false
+        const commit = store.commit.bind(store)
+        vi.spyOn(store, 'commit').mockImplementation(async request => {
+            if (!moved && request.conversations?.some(range => range.type === 'replace-range'
+                && range.messages.some(message => message.data === tail.data && message.chatId))) {
+                moved = true
+                await other.commit({ expectedRevision: (await read()).revision, conversations: [
+                    { type: 'replace-range', characterId: 'character-a', conversationId: 'chat-a',
+                        start: MESSAGES - 2, deleteCount: 2, messages: [tail, neighbour] },
+                ] })
+            }
+            return commit(request)
+        })
+        const { requestChatData } = await import('./request/request')
+        const { sendChat } = await import('./index.svelte')
+        let atRequest: Message[] | undefined
+        vi.mocked(requestChatData).mockImplementationOnce(async () => {
+            atRequest = (await read()).value.message.slice(-2)
+            return { type: 'streaming', result: new ReadableStream({ start(stream) {
+                stream.enqueue({ response: ' continued' })
+                stream.close()
+            } }) }
+        })
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        expect(await sendChat({ historyLimit: true, continue: true })).toBe(true)
+        await current.runtime.flushPendingData('continued-tail')
+        expect(moved).toBe(true)
+        expect(atRequest).toEqual([{ ...tail, chatId: expect.stringMatching(/\S/) }, neighbour])
+        const stored = (await reopen()).message
+        expect(stored.slice(0, -1)).toEqual([...original.slice(0, -2), atRequest![0]])
+        expect(stored.at(-1)).toMatchObject({ chatId: neighbour.chatId, data: neighbour.data + ' continued' })
+        expect(backgroundErrors).toEqual([])
+    })
+
+    it('finishes a provider stream on a reply moved by another connection during a settings commit', async () => {
+        const original = storedMessages()
+        const { store, connect, reopen, backgroundErrors } = await bootWindowedConversation(structuredClone(original), seed => {
+            seed.characters[0].triggerscript = []
+            seed.characters[0].customscript = []
+        })
+        const { runtime } = current
+        const remote = await connect()
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        const reply = await whileStreaming({ runtime, length: MESSAGES, windowed: true }, async ({ reply, chunk }) => {
+            await runtime.flushPendingDataLocally('first-chunk')
+            const commit = store.commit.bind(store)
+            vi.spyOn(store, 'commit').mockImplementationOnce(async request => {
+                const chat = (await remote.readConversation('character-a', 'chat-a'))!
+                await remote.commit({ expectedRevision: chat.revision, conversations: [
+                    { type: 'replace-range', characterId: 'character-a', conversationId: 'chat-a',
+                        start: MESSAGES - 1, deleteCount: 2, messages: [chat.value.message.at(-1)!, original.at(-1)!] },
+                ] })
+                chunk('chunk during setting')
+                await vi.waitFor(async () => expect((await liveMessage(runtime, MESSAGES))?.data).toBe('chunk during setting'))
+                return commit(request)
+            })
+            const { updateChatBinding } = await import('../chatBindings.svelte')
+            await updateChatBinding(DBState.db.characters[0].chats[0], { note: 'changed' })
+            expect((await liveMessage(runtime, MESSAGES - 1))?.chatId).toBe(reply.chatId)
+        })
+        await runtime.flushPendingDataLocally('completed-stream')
+        const chat = await reopen()
+        expect(chat.note).toBe('changed')
+        expect(chat.message).toEqual([...original.slice(0, -1), expect.objectContaining({ chatId: reply.chatId, data: finalText }), original.at(-1)!])
+        expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
         expect(backgroundErrors).toEqual([])
     })
 })

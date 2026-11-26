@@ -23,12 +23,15 @@ import type { GenerationDiagnosticTrace, GenerationDiagnosticPhase, GenerationDi
 import { createGenerationCheckpoints, type GenerationCheckpointPersistence } from './generationCheckpoints'
 import type { alertData } from '../alert'
 import { alertStore } from '../alertQueue'
+import { beginGenerationOutputScript, openGenerationOutputPhase, type GenerationScriptPosition } from './generationOutputPhase'
+import { isConversationStop } from './conversationStop'
 
 export interface GenerationResponseProcessingOptions {
     onConversationCommit?: ConversationCommitObserver
     cache: 'normal' | 'bypass'
     signal: AbortSignal
     regexWorker: true
+    outputPosition?: GenerationScriptPosition
     /** Holds Lua handler errors for the caller to show, instead of showing them now. */
     luaErrors?: alertData[]
 }
@@ -37,6 +40,8 @@ export interface GenerationResponseOperationContext {
     getCurrentSession(): ActiveConversationSession | null
     getTargetChat(): Chat | null | undefined
     isOwnerCurrent(): boolean
+    prepareOutputPosition?(absoluteIndex: number): Promise<boolean>
+    onLostOutput?(): void
     publishTargetChat(chat: Chat): void
     invalidateSession(): void
     incrementReloadKeys(): void
@@ -96,7 +101,7 @@ export interface GenerationResponseApplication {
     hasOutputOwnership(): boolean
     readOutput(): Message | null
     updateOutput(update: (message: Message) => Message): boolean
-    release(): void
+    release(): void | Promise<void>
 }
 
 export async function applyGenerationResponse(
@@ -127,6 +132,18 @@ export async function applyGenerationResponse(
         return message !== null && target.commitMessage(update(message))
     }
     const hasOutputOwnership = () => getOutputTarget()?.isOwned() ?? false
+    const outputPosition: GenerationScriptPosition = {
+        refresh: options.operation.prepareOutputPosition && (() => {
+            const target = getOutputTarget()
+            return target?.isOwned()
+                ? options.operation.prepareOutputPosition!(target.absoluteIndex)
+                : Promise.resolve(false)
+        }),
+        index() {
+            const target = getOutputTarget()
+            return target?.isOwned() ? target.absoluteIndex : null
+        },
+    }
     const checkpoints = options.checkpoint
         ? createGenerationCheckpoints({ ...options.checkpoint, isOwned: hasOutputOwnership, diagnostics: options.diagnostics })
         : null
@@ -135,13 +152,29 @@ export async function applyGenerationResponse(
         // An unrelated mutation still leaves the old locator invalid.
         getOutputTarget()?.acceptCommit(commit)
     }
+    let outputPhase: ReturnType<typeof openGenerationOutputPhase> | undefined
+    const startOutput = (phase: 'streaming' | 'processing') => {
+        if (!outputPhase && generationChat?.id) {
+            outputPhase = openGenerationOutputPhase(
+                { characterId: options.ownerCharacterId, conversationId: generationChat.id },
+                phase, getOutputTarget, isOwnerCurrent, onConversationCommit, options.operation.onLostOutput,
+            )
+        }
+    }
     let released = false
+    let releasing: Promise<void> | undefined
     const release = () => {
-        if (released) return
+        if (released) return releasing
         released = true
-        outputTarget?.release()
-        legacyFallbackTarget?.release()
-        outputTarget = null
+        if (outputPhase && !hasOutputOwnership()) outputPhase.loseOutput()
+        const releaseTarget = () => {
+            outputTarget?.release()
+            legacyFallbackTarget?.release()
+            outputTarget = null
+        }
+        const writes = outputPhase?.close()
+        if (writes) return releasing = writes.then(releaseTarget)
+        releaseTarget()
     }
     const aggregateOutput = options.response.type === 'multiline' && options.response.result.length > 1
     const phases: GenerationDiagnosticPhase[] = [
@@ -171,6 +204,42 @@ export async function applyGenerationResponse(
     let result = ''
     let emoChanged = false
     let resendChat = false
+
+    const applyOutputTrigger = async (chat: Chat, outputMessageId: string | undefined) => {
+        beginPhase('output-trigger')
+        const finishTrigger = beginGenerationOutputScript(onConversationCommit)
+        try {
+            let trigger: Awaited<ReturnType<GenerationResponseCallbacks['runOutputTrigger']>> = null
+            try {
+                trigger = await options.callbacks.runOutputTrigger(chat, onConversationCommit)
+            } catch (error) {
+                if (!isConversationStop(error)) throw error
+            }
+            if (!hasOutputOwnership()) return null
+            endPhase('output-trigger')
+            if (trigger?.sendAIprompt) resendChat = true
+            const next = trigger?.chat ?? chat
+            if (next !== chat) options.operation.invalidateSession()
+            options.operation.publishTargetChat(next)
+            const published = options.operation.getTargetChat()
+            if (!published || !isOwnerCurrent()) return null
+            if (outputTarget && (chat !== next || !outputTarget.isOwned())) {
+                outputTarget.release()
+                outputTarget = outputMessageId ? recaptureGenerationConversationOperation({
+                    session: options.operation.getCurrentSession(),
+                    getCurrentSession: options.operation.getCurrentSession,
+                    chat: published,
+                    getCurrentChat: options.operation.getTargetChat,
+                    isOwnerCurrent,
+                    messageId: outputMessageId,
+                }) : null
+                if (!outputTarget?.isOwned()) return null
+            }
+            return published
+        } finally {
+            finishTrigger?.()
+        }
+    }
 
     try {
         if (options.abortSignal.aborted) return null
@@ -211,6 +280,7 @@ export async function applyGenerationResponse(
             generationHadOperation = true
             const initialOutput = outputTarget.snapshot()
             if (initialOutput === null) return null
+            startOutput('streaming')
             const prefix = options.continueGeneration ? initialOutput.data : ''
             const outputMessageId = outputTarget.messageId
             const performanceMode = options.streamingDisplayOptimizationMode()
@@ -225,15 +295,25 @@ export async function applyGenerationResponse(
                 try {
                     beginPhase('semantic-output')
                     const luaErrors: alertData[] = []
+                    if (options.operation.prepareOutputPosition
+                        && !await options.operation.prepareOutputPosition(outputTarget!.absoluteIndex)) return null
+                    if (!hasOutputOwnership() || signal.aborted) return null
                     const processed = await options.callbacks.processOutput(
                         prefix + snapshot,
                         outputTarget!.absoluteIndex,
-                        { cache, signal, regexWorker: true, onConversationCommit, luaErrors },
+                        { cache, signal, regexWorker: true, onConversationCommit, luaErrors, outputPosition },
                     )
                     latestLuaErrors = luaErrors
                     return processed
                 } catch (error) {
                     if (signal.aborted) return null
+                    if (isConversationStop(error)) {
+                        // The script's positional edit went stale while it was running.
+                        // A surviving reply still accepts the stream's own text.
+                        return hasOutputOwnership()
+                            ? { data: options.callbacks.reformatContent(prefix + snapshot), emoChanged: false }
+                            : null
+                    }
                     if (
                         outputTarget?.commitData(
                             options.callbacks.reformatContent(prefix + snapshot),
@@ -274,6 +354,7 @@ export async function applyGenerationResponse(
                     onValue: (_value, snapshot) => {
                         result = snapshot
                     },
+                    onEndOfStream: () => outputPhase?.endStream(),
                     processSemantic: async ({ value }, context) => {
                         const cache = performanceMode === 'strong' ? 'normal' : 'bypass'
                         const processed = await processStreamingSnapshot(
@@ -315,38 +396,15 @@ export async function applyGenerationResponse(
             endPhase('semantic-output')
 
             if (!outputTarget.isOwned()) return null
+            if (options.operation.prepareOutputPosition
+                && !await options.operation.prepareOutputPosition(outputTarget.absoluteIndex)) return null
             for (const notice of latestLuaErrors) alertStore.set(notice)
             beginPhase('current-chat-parser')
-            let currentChat = options.callbacks.runCurrentChatParser(targetChat)
+            const currentChat = options.callbacks.runCurrentChatParser(targetChat)
             endPhase('current-chat-parser')
             options.operation.publishTargetChat(currentChat)
             if (!outputTarget.refresh()) return null
-            beginPhase('output-trigger')
-            const triggerResult = await options.callbacks.runOutputTrigger(
-                currentChat,
-                onConversationCommit,
-            )
-            if (!outputTarget.isOwned()) return null
-            endPhase('output-trigger')
-            if (triggerResult?.chat) currentChat = triggerResult.chat
-            if (triggerResult?.sendAIprompt) resendChat = true
-            outputTarget.release()
-            if (!outputMessageId) return null
-            const previousChat = targetChat
-            if (currentChat !== previousChat) options.operation.invalidateSession()
-            options.operation.publishTargetChat(currentChat)
-            const publishedChat = options.operation.getTargetChat()
-            if (!publishedChat || !isOwnerCurrent()) return null
-            currentChat = publishedChat
-            outputTarget = recaptureGenerationConversationOperation({
-                session: options.operation.getCurrentSession(),
-                getCurrentSession: options.operation.getCurrentSession,
-                chat: currentChat,
-                getCurrentChat: options.operation.getTargetChat,
-                isOwnerCurrent,
-                messageId: outputMessageId,
-            })
-            if (!outputTarget || !outputTarget.isOwned()) return null
+            if (!await applyOutputTrigger(currentChat, outputMessageId) || !hasOutputOwnership()) return null
             const outputMessage = outputTarget.snapshot()
             if (outputMessage) {
                 beginPhase('inlay')
@@ -360,6 +418,8 @@ export async function applyGenerationResponse(
             endPhase('inlay')
             const outputChat = options.operation.getTargetChat()
             if (!outputChat || !outputTarget.isOwned()) return null
+            if (options.operation.prepareOutputPosition
+                && !await options.operation.prepareOutputPosition(outputTarget.absoluteIndex)) return null
             beginPhase('output-listener')
             await options.callbacks.runOutputListeners(
                 outputChat,
@@ -401,6 +461,7 @@ export async function applyGenerationResponse(
                     generationHadOperation = true
                     const beforeChat = outputTarget.snapshot()
                     if (!beforeChat) return null
+                    startOutput('processing')
                     continueBaseData = beforeChat.data
                 }
                 let processed: Awaited<ReturnType<GenerationResponseCallbacks['processOutput']>>
@@ -414,7 +475,10 @@ export async function applyGenerationResponse(
                     })
                     if (!isOwnerCurrent()) return null
                     if (continuingFirstMessage) {
-                        messageIndex = outputTarget!.absoluteIndex
+                        if (outputPosition.refresh && !await outputPosition.refresh()) return null
+                        const position = outputPosition.index()
+                        if (position === null) return null
+                        messageIndex = position
                         processed = await options.callbacks.processOutput(
                             continueBaseData + messageText,
                             messageIndex,
@@ -423,6 +487,7 @@ export async function applyGenerationResponse(
                                 signal: options.abortSignal,
                                 regexWorker: true,
                                 onConversationCommit,
+                                outputPosition,
                             },
                         )
                         if (!isOwnerCurrent()) return null
@@ -538,6 +603,7 @@ export async function applyGenerationResponse(
                     })
                     generationHadOperation = true
                     if (!outputTarget.isOwned()) return null
+                    startOutput('processing')
                     options.callbacks.markResponseApplied()
                     await checkpoints?.checkpoint()
                     if (!outputTarget.isOwned()) return null
@@ -572,41 +638,22 @@ export async function applyGenerationResponse(
             const outputChat = options.operation.getTargetChat()
             if (!outputChat || !isOwnerCurrent()) return null
             if (outputTarget && !outputTarget.isOwned()) return null
+            if (outputTarget && options.operation.prepareOutputPosition
+                && !await options.operation.prepareOutputPosition(outputTarget.absoluteIndex)) return null
             beginPhase('current-chat-parser')
-            let currentChat = options.callbacks.runCurrentChatParser(outputChat)
+            const currentChat = options.callbacks.runCurrentChatParser(outputChat)
             endPhase('current-chat-parser')
             options.operation.publishTargetChat(currentChat)
             if (!getOutputTarget()?.refresh()) return null
-            beginPhase('output-trigger')
-            const triggerResult = await options.callbacks.runOutputTrigger(
-                currentChat,
-                onConversationCommit,
-            )
-            if (!hasOutputOwnership()) return null
-            endPhase('output-trigger')
-            if (triggerResult?.sendAIprompt) resendChat = true
-            const previousChat = currentChat
-            const nextChat = triggerResult?.chat ?? currentChat
-            outputTarget?.release()
-            if (nextChat !== previousChat) options.operation.invalidateSession()
-            options.operation.publishTargetChat(nextChat)
-            const publishedChat = options.operation.getTargetChat()
-            if (!publishedChat || !isOwnerCurrent()) return null
-            currentChat = publishedChat
+            const publishedChat = await applyOutputTrigger(currentChat, outputMessageId)
+            if (!publishedChat) return null
             if (generationHadOperation) {
-                if (!outputMessageId) return null
-                outputTarget = recaptureGenerationConversationOperation({
-                    session: options.operation.getCurrentSession(),
-                    getCurrentSession: options.operation.getCurrentSession,
-                    chat: currentChat,
-                    getCurrentChat: options.operation.getTargetChat,
-                    isOwnerCurrent,
-                    messageId: outputMessageId,
-                })
                 if (!outputTarget || !outputTarget.isOwned()) return null
+                if (options.operation.prepareOutputPosition
+                    && !await options.operation.prepareOutputPosition(outputTarget.absoluteIndex)) return null
                 beginPhase('output-listener')
                 await options.callbacks.runOutputListeners(
-                    currentChat,
+                    publishedChat,
                     outputTarget.absoluteIndex,
                 )
                 if (!outputTarget.isOwned()) return null
@@ -640,6 +687,6 @@ export async function applyGenerationResponse(
             if (reason === 'stream-error' && phase === 'semantic-output') options.diagnostics?.phase(phase, 'exit', { outcome, reason })
             else options.diagnostics?.phase(phase, 'exit', { outcome: 'skipped' })
         }
-        if (!handedOff) release()
+        if (!handedOff) await release()
     }
 }

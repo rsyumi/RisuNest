@@ -48,11 +48,14 @@ import { beginDisplayScriptRun, getDisplayRegexTimeoutScope, noticeRegexTimeout 
 import { nextDisplayListenerOrder } from "./luaDisplayTimeouts";
 import { displayRecoveryTarget, isDisplayRecoveryMarked } from "../displayRecovery.svelte";
 import { openHistoryWindowCopy, writeHistoryWindowMessage, type HistoryWindowCopy } from "./historyWindowWrite";
+import type { GenerationScriptPosition } from "./generationOutputPhase";
+import { isConversationStop } from "./conversationStop";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 
 export interface ProcessScriptOptions {
     onConversationCommit?: ConversationCommitObserver
+    outputPosition?: GenerationScriptPosition
     cache?: 'normal' | 'bypass'
     signal?: AbortSignal
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
@@ -737,6 +740,17 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     let readPin: ActiveConversationPin | null = null
     let windowCopy: HistoryWindowCopy | null = null
     try {
+        if (options.outputPosition) {
+            const position = options.outputPosition
+            const ready = !position.refresh || await position.refresh()
+            const index = ready ? position.index() : null
+            if (index === null) {
+                compatibilityPin?.release()
+                return { data, emoChanged }
+            }
+            chatID = index
+            conversationOwner = captureScriptConversationOwner(char)
+        }
         const globalRegexOff = isStartupExcluded(
             'regex',
             getStartupExclusions(),
@@ -860,13 +874,19 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         invocation?.parser?.historyAccess?.assertComplete()
         preparedHistory?.assertComplete()
         if (windowCopy) {
-            if (!windowCopy.commit()) throw new ConversationSessionInactiveError()
+            if (!windowCopy.commit() && options.outputPosition?.index() == null) {
+                throw new ConversationSessionInactiveError()
+            }
             windowCopy = null
         }
         if (conversationOperation && ownsConversationOperation) {
-            conversationOperation.commit(peekActiveConversationSession(), {
-                origin: mode === 'editdisplay' ? 'display' : undefined,
-            })
+            try {
+                conversationOperation.commit(peekActiveConversationSession(), {
+                    origin: mode === 'editdisplay' ? 'display' : undefined,
+                })
+            } catch (error) {
+                if (!isConversationStop(error) || options.outputPosition?.index() == null) throw error
+            }
             conversationOperationCommitted = true
         }
         else if (conversationAccess === 'read-only' && conversationOwner) {

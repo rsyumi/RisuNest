@@ -85,7 +85,7 @@ const { parseRisuChat } = await import('../../../plugins/parseRisuChat')
 const { pluginV2 } = await import('../../../plugins/plugins.svelte')
 const { createMetadataOnlySelectedConversation } = await import('../../../storage/selectedConversationLifecycle')
 const { acquireLiveDisplayParserLease, subscribeLiveDisplayParserSelection, captureLiveDisplayParserInputs } = await import('../../../liveDisplayParserLease')
-const { PersistentConversationViewportSource } = await import('../../../conversationViewportSource')
+const { EditableViewportFixture: PersistentConversationViewportSource } = await import('../../../conversationViewportSource.testSupport')
 const { installDisplayRecovery } = await import('../../../displayRecovery.svelte')
 const { manualTimers, recoveryStore } = await import('../../../displayRecovery.testSupport')
 

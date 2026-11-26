@@ -6,11 +6,12 @@ import { cloneConversationMetadata } from './storage/selectedConversationLifecyc
 import type { Chat, Message } from './storage/database.svelte'
 import { PersistentMutationFencedError } from './storage/saveCoordinator'
 import { safeStructuredClone } from './safeStructuredClone'
-import { toAbsoluteIndex, toWindowIndex } from './process/historyWindowIndex'
+import { toAbsoluteIndex } from './process/historyWindowIndex'
 import {
     captureResponseVariants,
     projectResponseVariant,
     recoverRerollMessages,
+    rerollStart,
     responseRange,
     snapshotResponse,
     type RerollRecovery,
@@ -150,16 +151,23 @@ async function runResponseCandidate(options: GenerateResponseCandidateOptions): 
     await options.flush()
     if (!options.isCurrent()) return false
     chat = (await options.currentChat?.()) ?? chat
-    const start = () => toWindowIndex(chat, recovery.startIndex)
     const prepared = chat.rerollRecovery!
-    if (JSON.stringify(chat.message.slice(start())) !== JSON.stringify(prepared.original)) return false
-    replaceResponseTail(chat, options.session(), start(), [], { ...prepared, phase: 'generating' })
+    const preparedStart = rerollStart(chat, prepared)
+    if (JSON.stringify(chat.message.slice(preparedStart)) !== JSON.stringify(prepared.original)) return false
+    replaceResponseTail(chat, options.session(), preparedStart, [], { ...prepared, phase: 'generating' })
     let success = false
     try {
         success = await options.generate()
         chat = (await options.currentChat?.()) ?? chat
         if (!success || options.aborted() || !options.isCurrent()) return false
-        const generated = chat.message.slice(start())
+        const active = chat.rerollRecovery
+        if (active?.attemptId !== recovery.attemptId) return false
+        const start = rerollStart(chat, active)
+        if (start < 0) return false
+        const followingIds = new Set(active.followingIds)
+        const suffix = chat.message.slice(start)
+        const generated = suffix.filter(message => !followingIds.has(message.chatId))
+        const following = suffix.filter(message => followingIds.has(message.chatId))
         if (
             !generated.some(
                 (message) =>
@@ -189,17 +197,25 @@ async function runResponseCandidate(options: GenerateResponseCandidateOptions): 
         variants.selectedId =
             variants.candidates[variants.candidates.length - generatedVariants.candidates.length].id
         const trailing = original.slice(recovery.responseCount)
+        const projected = projectResponseVariant(variants, variants.selectedId)
         replaceResponseTail(
             chat,
             options.session(),
-            start(),
-            [...projectResponseVariant(variants, variants.selectedId), ...trailing],
+            start,
+            [...projected, ...trailing, ...following],
             null,
         )
         try {
             await options.flush()
         } catch (error) {
-            replaceResponseTail(chat, options.session(), start(), original, null)
+            chat = (await options.currentChat?.()) ?? chat
+            const carrier = chat.message.findIndex(message => message.responseVariants?.selectedId === variants.selectedId
+                && message.responseVariants.groupId === variants.groupId)
+            if (carrier >= projected.length - 1) {
+                replaceResponseTail(chat, options.session(), carrier - projected.length + 1, [
+                    ...original.slice(0, recovery.responseCount), ...chat.message.slice(carrier + 1),
+                ], null)
+            }
             throw error
         }
         return true
@@ -297,8 +313,8 @@ export interface WindowedResponseCandidateResult {
 
 /**
  * Generates a candidate over tail windows. The window is closed while the
- * generation writes the conversation and reopened from the same absolute
- * start afterwards. Returns null when no tail window opens.
+ * generation writes the conversation and reopened over the recorded response
+ * boundary afterwards. Returns null when no tail window opens.
  */
 export async function generateWindowedResponseCandidate(
     options: GenerateWindowedResponseCandidateOptions,
@@ -306,6 +322,7 @@ export async function generateWindowedResponseCandidate(
     let window = await openResponseTail(options.open)
     if (!window) return null
     const start = window.controller.absoluteStartIndex
+    const windowLength = window.chat.message.length
     let generated = false
     let reopenFailed = false
     try {
@@ -321,7 +338,12 @@ export async function generateWindowedResponseCandidate(
                 if (window) return window.chat
                 // A failed reopen is not retried, so the recovery stays stored as it is.
                 if (reopenFailed || !options.isCurrent()) return undefined
-                window = await options.open(() => start)
+                window = await options.open(total => Math.max(0, Math.min(start, total - windowLength)))
+                const boundary = window?.chat.rerollRecovery?.startIndex
+                if (window && boundary !== undefined && window.controller.absoluteStartIndex > boundary) {
+                    window.release()
+                    window = await options.open(() => Math.max(0, boundary - 1))
+                }
                 if (!window) reopenFailed = true
                 return window?.chat
             },

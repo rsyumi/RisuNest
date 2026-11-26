@@ -60,16 +60,19 @@ import {
     captureSelectedConversationAuthority,
     recordSelectedCharacterLastInteraction,
     captureWindowedConversationMutationController,
+    adoptObservedRevision,
     captureSelectedConversationTarget,
     flushPendingData,
     flushPendingDataLocallyForCheckpoint,
     capturesImmutableCharacters,
     pendingConversationMutationDiagnostics,
     getActiveConversationSession,
+    getActiveConversationViewportSource,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { ensureCurrentConversationMessageIds, writeConversationMetadata } from '../conversationMutations'
+import { RevisionConflictError } from '../storage/persistentDataStore'
 import { PersistentMutationFencedError } from '../storage/saveCoordinator'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
@@ -93,6 +96,7 @@ import {
 } from './summaryAwarePromptHistory'
 import { applyGenerationErrorResponse } from './generationErrorResponse'
 import { applyGenerationResponse } from './generationResponseApplication'
+import { getGenerationOutputPhase } from './generationOutputPhase'
 import { prepareSummaryAwareGeneration, type SummaryAwareGenerationPreparation } from './summaryAwareGenerationPreparation'
 import { bindWindowedGenerationController } from './generationConversationOperation'
 import {
@@ -131,7 +135,7 @@ import {
     type HistoryWindowPreparationInput,
 } from './historyWindowGeneration'
 import { readHistoryWindowTail, type HistoryWindowHypaPlan, type HistoryWindowReader } from './historyWindowSelection'
-import { writeHistoryWindowChat } from './historyWindowWrite'
+import { captureHistoryWindowSource, writeHistoryWindowChat } from './historyWindowWrite'
 
 export { doingChat } from './generationState'
 
@@ -149,6 +153,16 @@ export interface OpenAIChat{
 
 const projectPluginChatOutput = createProductionPluginChatOutputProjector(
     <T>(value: T) => $state.snapshot(value) as T,
+    input => {
+        const phase = getGenerationOutputPhase(input)
+        const owner = DBState.db.characters[get(selectedCharID)]
+        const chat = owner?.chats[owner.chatPage]
+        if (!phase || owner?.chaId !== input.characterId || chat?.id !== input.conversationId) return null
+        return {
+            chat, messageIndex: phase.messageIndex, adoptRevision: adoptObservedRevision,
+            source: isMetadataOnlySelectedConversation(chat) ? getActiveConversationViewportSource() : undefined,
+        }
+    },
 )
 
 export async function runChatOutputListeners(char: any, chat: any, messageIndex: number, signal?: AbortSignal, diagnostics?: GenerationDiagnosticTrace){
@@ -414,7 +428,10 @@ function createGenerationHistoryController(
             return current ? conversationFieldsOf(current.conversation) : null
         },
         onLost: () => {
-            if (isTargetCurrent() && !signal.aborted) alertError(language.generationConversationChanged)
+            if (!isTargetCurrent() || signal.aborted) return
+            const output = getGenerationOutputPhase(target)
+            if (output) output.loseOutput()
+            else alertError(language.generationConversationChanged)
         },
     }
     return createHistoryWindowController(environment, chat, start, initial)
@@ -427,6 +444,7 @@ async function prepareGenerationHistoryWindow(
     signal: AbortSignal,
     tailStart?: (totalMessages: number) => number,
     retry = true,
+    continuing = false,
 ): Promise<GenerationHistoryWindow | null> {
     let target = initialTarget
     let authority = captureSelectedConversationAuthority()
@@ -494,9 +512,12 @@ async function prepareGenerationHistoryWindow(
             }
             assertCurrent()
         } catch (error) {
-            if (retry && error instanceof PersistentMutationFencedError && !signal.aborted
-                && isTargetCurrent() && sameConversationTarget(captureSelectedConversationTarget(), initialTarget)) {
-                return prepareGenerationHistoryWindow(initialTarget, memory, isTargetCurrent, signal, tailStart, false)
+            if (retry && (error instanceof RevisionConflictError || error instanceof PersistentMutationFencedError) && !signal.aborted) {
+                if (error instanceof RevisionConflictError) await adoptObservedRevision(error.actualRevision)
+                const current = captureSelectedConversationTarget()
+                if (current && isTargetCurrent() && sameConversationTarget(current, initialTarget)) {
+                    return prepareGenerationHistoryWindow(current, memory, isTargetCurrent, signal, tailStart, false, continuing)
+                }
             }
             throw error
         }
@@ -537,6 +558,7 @@ async function prepareGenerationHistoryWindow(
     const controller = createGenerationHistoryController(target, chat, start, initial, isTargetCurrent, signal)
     // Prompt history and scripts find messages by id, so missing ids are stored
     // first, one write per run of messages without one.
+    let assignedIds = false
     for (let index = 0; index < chat.message.length;) {
         if (chat.message[index].chatId) {
             index += 1
@@ -549,7 +571,24 @@ async function prepareGenerationHistoryWindow(
             controller.release()
             return null
         }
+        assignedIds = true
         index = end
+    }
+    if (authority && continuing && chat.message.length) {
+        try {
+            if (assignedIds) await flushPendingData('generation-message-identity')
+            if (!controller.isCurrent() || !await controller.prepareTarget!(chat.message.length - 1)) {
+                throw new PersistentMutationFencedError()
+            }
+        } catch (error) {
+            controller.release()
+            const current = captureSelectedConversationTarget()
+            if (retry && current && isTargetCurrent() && sameConversationTarget(current, initialTarget)
+                && (error instanceof PersistentMutationFencedError || error instanceof RevisionConflictError)) {
+                return prepareGenerationHistoryWindow(current, memory, isTargetCurrent, signal, tailStart, false, true)
+            }
+            throw error
+        }
     }
     attachHistoryWindow(chat, start)
     return {
@@ -1089,7 +1128,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                     target,
                     historyWindowMemory,
                     lifecycle.isTargetCurrent,
-                    abortSignal,
+                    abortSignal, undefined, true, arg.continue,
                 )
             } catch (error) {
                 if (!(error instanceof PersistentMutationFencedError)) throw error
@@ -1165,6 +1204,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                     target, decision.preparation.chat, decision.preparation.plan.bodyStartIndex,
                     initial, lifecycle.isTargetCurrent, abortSignal, true,
                 )
+                if (arg.continue && !await controller.prepareTarget!(decision.preparation.chat.message.length - 1)) {
+                    controller.release()
+                    await decision.preparation.release()
+                    return false
+                }
                 conversationResources.preparation = decision.preparation
                 conversationResources.windowedController = controller
                 conversationResources.unbindWindowedController =
@@ -1830,10 +1874,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         throw new PersistentMutationFencedError()
     }
     bindGenerationRegexOwner(reservation, nowChatroom.chaId, currentChat.id)
+    const triggerWindowCurrent = historyWindow && captureHistoryWindowSource(historyWindow.controller)
     const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat, regexScope: reservation.regexScope, regexGeneration: abortSignal})
     if(triggerResult){
         if (historyWindow) {
-            if (!writeHistoryWindowChat(historyWindow.controller, triggerResult.chat)) {
+            if (!triggerWindowCurrent?.() || !writeHistoryWindowChat(historyWindow.controller, triggerResult.chat)) {
                 throw new PersistentMutationFencedError()
             }
         } else if (triggerSessionSnapshot && triggerResult.chat !== currentChat) {
@@ -2673,7 +2718,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         DBState.db.characters[requestSourceCharacterIndex]?.chaId === requestSourceCharacterId &&
         DBState.db.characters[requestSourceCharacterIndex]?.chatPage === requestSourceChatPage &&
         (boundedChat && conversationResources.windowedController
-            // The window controller follows a promotion and checks the window's message ids.
+            // A pending request may adopt an admitted metadata patch before output starts.
             ? conversationResources.windowedController.isCurrent()
             : DBState.db.characters[requestSourceCharacterIndex]?.chats[requestSourceChatPage] ===
                 requestSourceShell &&
@@ -2689,6 +2734,19 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         characterId: requestSourceCharacterId,
         conversationId: requestSourceConversation.id ?? '',
     }, {
+        prepareMetadataPatch(expectedRevision) {
+            const controller = conversationResources.windowedController
+            const before = captureSelectedConversationAuthority()
+            if (!controller?.refreshWindow || !before || before.storeRevision !== expectedRevision ||
+                !isRequestSourceCurrent()) return null
+            return async durable => {
+                const after = captureSelectedConversationAuthority()
+                if (!after || after.sessionToken !== before.sessionToken ||
+                    after.sessionVersion !== before.sessionVersion || after.storeRevision !== durable ||
+                    durable !== expectedRevision + 1 || !lifecycle.isTargetCurrent()) return
+                if (!await controller.refreshWindow!()) requestSourceLost = true
+            }
+        },
         prepare() {
             if (!isRequestSourceCurrent()) return null
             const session = getActiveConversationSession()
@@ -2848,6 +2906,8 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         ttsAutoSpeech: () => DBState.db.ttsAutoSpeech,
         operation: {
             getCurrentSession: getActiveConversationSession,
+            prepareOutputPosition: historyWindow?.controller.refreshWindow,
+            onLostOutput: () => alertError(language.generationConversationChanged),
             getTargetChat: () => boundedChat
                 ?? DBState.db.characters[selectedChar]?.chats[selectedChat],
             isOwnerCurrent: () =>
@@ -2894,13 +2954,17 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                       ),
             runCurrentChatParser: runCurrentChatFunction,
             runInlay: (data) => runInlayScreen(currentChar, data),
-            runOutputTrigger: (chat, onConversationCommit) =>
-                runTrigger(currentChar, 'output', {
+            runOutputTrigger: async (chat, onConversationCommit) => {
+                const windowCurrent = historyWindow && captureHistoryWindowSource(historyWindow.controller)
+                const result = await runTrigger(currentChar, 'output', {
                     chat,
                     onConversationCommit,
                     regexGeneration: abortSignal,
                     regexScope: reservation.regexScope,
-                }),
+                })
+                if (result && windowCurrent && !windowCurrent()) return { ...result, chat }
+                return result
+            },
             runOutputListeners: (chat, messageIndex) =>
                 runChatOutputListeners(
                     currentChar,
@@ -2963,7 +3027,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
 
     if(needsAutoContinue){
         await acknowledgeCompletedGeneration()
-        responseApplication.release()
+        await responseApplication.release()
         return await sendChat({
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -2999,6 +3063,21 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     chatProcessStage.set(4)
     stageTimings.stage4Start = Date.now()
 
+    const recordOutputTimings = () => {
+        if (!responseApplication.readOutput()?.generationInfo?.stageTiming) return true
+        return responseApplication.updateOutput((message) => ({
+            ...message,
+            generationInfo: {
+                ...message.generationInfo,
+                stageTiming: {
+                    ...message.generationInfo?.stageTiming,
+                    stage3: stageTimings.stage3Duration,
+                    stage4: stageTimings.stage4Duration,
+                },
+            },
+        }))
+    }
+
     if(resendChat){
         if(!responseApplication.hasOutputOwnership()){
             lifecycle.diagnosticOutcome = 'stale'
@@ -3006,24 +3085,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
         }
         stageTimings.stage4Duration = Date.now() - stageTimings.stage4Start
         
-        if(generationInfo.stageTiming) {
-            generationInfo.stageTiming.stage1 = stageTimings.stage1Duration
-            generationInfo.stageTiming.stage2 = stageTimings.stage2Duration
-            generationInfo.stageTiming.stage3 = stageTimings.stage3Duration
-            generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
-        }
-        
-        const currentOutput = responseApplication.readOutput()
-        if(currentOutput?.generationInfo && !responseApplication.updateOutput((message) => ({
-            ...message,
-            generationInfo,
-        }))) {
+        if(!recordOutputTimings()) {
             lifecycle.diagnosticOutcome = 'stale'
             return false
         }
 
         await acknowledgeCompletedGeneration()
-        responseApplication.release()
+        await responseApplication.release()
         return await sendChat({
             signal: abortSignal,
             historyLimit: arg.historyLimit,
@@ -3257,22 +3325,11 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
 
     stageTimings.stage4Duration = Date.now() - stageTimings.stage4Start
     
-    if(generationInfo.stageTiming) {
-        generationInfo.stageTiming.stage1 = stageTimings.stage1Duration
-        generationInfo.stageTiming.stage2 = stageTimings.stage2Duration
-        generationInfo.stageTiming.stage3 = stageTimings.stage3Duration
-        generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
-    }
-    
     if(!responseApplication.hasOutputOwnership()){
         lifecycle.diagnosticOutcome = 'stale'
         return false
     }
-    const currentOutput = responseApplication.readOutput()
-    if(currentOutput?.generationInfo && !responseApplication.updateOutput((message) => ({
-        ...message,
-        generationInfo,
-    }))) {
+    if(!recordOutputTimings()) {
         lifecycle.diagnosticOutcome = 'stale'
         return false
     }
@@ -3280,7 +3337,7 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
     return await completeGeneration()
     }
     finally {
-        responseApplication.release()
+        await responseApplication.release()
     }
 }
 

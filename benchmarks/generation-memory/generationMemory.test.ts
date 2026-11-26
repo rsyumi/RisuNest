@@ -1,10 +1,12 @@
 import { mkdir, writeFile, readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import { resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { SaveCoordinator, type WindowedConversationPersistenceAuthority } from '../../src/ts/storage/saveCoordinator'
 import { ActiveConversationSession } from '../../src/ts/storage/activeConversationSession'
+import { WindowedConversationOverlay } from '../../src/ts/storage/windowedConversationOverlay'
 import { createPersistenceCanonicalCapture } from '../../src/ts/storage/reactivePersistenceCapture.svelte'
 import { captureRoot as capturePersistentRoot } from '../../src/ts/storage/saveCoordinator.testSupport'
 import { createPersistentStoreHarness } from '../../tests/support/persistentStoreHarness'
@@ -71,8 +73,12 @@ globalThis.structuredClone = ((value: unknown, ...args: unknown[]) => {
         probe.counters.clonedHistoryCharacters += h; probe.counters.clonedResponseCharacters += r }
     return originalClone(value, ...args as [])
 }) as typeof structuredClone
+const overlaySource = 'src/ts/storage/windowedConversationOverlay.ts'
+const hasOverlay = !process.env.GENERATION_MEMORY_BASELINE_SOURCE ||
+    existsSync(resolve(process.env.GENERATION_MEMORY_BASELINE_SOURCE, overlaySource))
 const files = ['src/ts/storage/saveCoordinator.ts', 'src/ts/storage/reactivePersistenceCapture.svelte.ts',
     'src/ts/storage/activeConversationSession.ts', 'src/ts/storage/segmentedConversationResidency.ts',
+    ...(hasOverlay ? [overlaySource] : []),
     'src/ts/process/currentChatParserPass.ts', 'src/ts/plugins/pluginDatabaseAccess.ts',
     'src/ts/process/streamingDisplayScheduler.ts']
 
@@ -110,6 +116,9 @@ async function setup(tokens: number, route: 'complete' | 'windowed', metadataByt
     const metrics: unknown[] = []
     const state = reactiveFixture(fixture.database)
     const database = state.database, character = database.characters[0], chat = character.chats[0]
+    const overlay = route === 'windowed' && hasOverlay
+        ? new WindowedConversationOverlay(character.chaId, chat.id!, storage.revision, chat.message.length)
+        : undefined
     let authority: WindowedConversationPersistenceAuthority | null = null
     let session!: ActiveConversationSession
     const timer = clock()
@@ -152,15 +161,17 @@ async function setup(tokens: number, route: 'complete' | 'windowed', metadataByt
     } else {
         authority = { kind: 'windowed', characterId: character.chaId, conversationId: chat.id!,
             sessionToken: session.sessionToken, storeRevision: storage.revision,
-            persistedSessionVersion: 0, sessionVersion: 0, totalMessages: chat.message.length }
+            persistedSessionVersion: 0, sessionVersion: 0, totalMessages: chat.message.length, overlay }
         expect(coordinator.adoptWindowedSelectedConversation(storage.revision, coordinator.mutationGeneration, character, authority)).toBe(true)
     }
     const projectionDurations: unknown[] = [], rebaseDurations: unknown[] = []
-    const internal = coordinator as unknown as Record<string, (...args: unknown[]) => unknown>
-    for (const [name, values] of [[route === 'complete' ? 'projectConversationMutations' : 'projectWindowedConversationMutations', projectionDurations],
-        ['acknowledgeConversationMutations', rebaseDurations]] as const) {
-        const original = internal[name].bind(coordinator)
-        internal[name] = (...args: unknown[]) => { const start = performance.now(); const before = {...probe.counters}; const result = original(...args)
+    const owner = overlay ?? coordinator
+    const measured = owner as unknown as Record<string, (...args: unknown[]) => unknown>
+    const projectionMethod = overlay ? 'plan' : route === 'complete' ? 'projectConversationMutations' : 'projectWindowedConversationMutations'
+    for (const [name, values] of [[projectionMethod, projectionDurations],
+        [overlay ? 'acknowledge' : 'acknowledgeConversationMutations', rebaseDurations]] as const) {
+        const original = measured[name].bind(owner)
+        measured[name] = (...args: unknown[]) => { const start = performance.now(); const before = {...probe.counters}; const result = original(...args)
             const record = () => values.push({elapsedMs: performance.now() - start,
                 ...(withVolume ? Object.fromEntries(Object.entries(probe.counters).map(([key, value]) => [key, value - before[key as keyof typeof before]])) : {}),
                 comparisonInstrumentation: process.env.GENERATION_MEMORY_COMPARISONS === '1'})
@@ -171,13 +182,29 @@ async function setup(tokens: number, route: 'complete' | 'windowed', metadataByt
         const pending = (coordinator as unknown as {pendingConversationMutations: {event: {mutations: {messages: Message[]}[]}}[]}).pendingConversationMutations
         const dirty = (session as unknown as {residency: {dirtyRecords: {messages: Message[]}[]}}).residency.dirtyRecords
         const volume = (messages: Message[]) => messages.reduce((n, message) => n + message.data.length, 0)
+        const overlayRows = { messages: 0, messageCharacters: 0 }
+        for (const interval of overlay?.intervals(0, overlay.count) ?? []) {
+            if ('messages' in interval) {
+                overlayRows.messages += interval.messages.length
+                overlayRows.messageCharacters += volume(interval.messages)
+            }
+        }
         return { coordinator: { snapshots: pending.length, messageCharacters: pending.reduce((n, p) => n + p.event.mutations.reduce((a, m) => a + volume(m.messages), 0), 0) },
-            residency: { snapshots: dirty.length, messageCharacters: dirty.reduce((n, d) => n + volume(d.messages), 0) } }
+            residency: { snapshots: dirty.length, messageCharacters: dirty.reduce((n, d) => n + volume(d.messages), 0) }, overlayRows }
     }
     function apply(text: string) {
         const last = chat.message.at(-1)!
-        if (last.chatId === 'response') session.edit(session.locate(chat.message.length - 1), { ...last, data: text })
-        else session.append({ role: 'char', chatId: 'response', data: text })
+        const editing = last.chatId === 'response'
+        const index = editing ? chat.message.length - 1 : chat.message.length
+        const next: Message = editing ? { ...last, data: text } : { role: 'char', chatId: 'response', data: text }
+        const undo = overlay?.applyRange(index, editing ? [last] : [], [next], session.version + 1)
+        try {
+            if (editing) session.edit(session.locate(index), next)
+            else session.append(next)
+        } catch (error) {
+            undo?.()
+            throw error
+        }
     }
     return { fixture, storage, database, character, chat, session, coordinator, canonicalCapture, timer, metrics, commits, projectionDurations, rebaseDurations, retention, apply,
         authority: () => authority,
@@ -226,6 +253,8 @@ describe('generation memory evidence using real product modules', () => {
                         const recovered = await run.storage.store.readConversation('character', 'conversation')
                         expect(recovered?.value.message.at(-1)?.data).toBe(response + ' alpha'.repeat(9))
                         expect(run.coordinator.hasPendingPersistenceWork).toBe(false)
+                        expect(run.projectionDurations.length).toBeGreaterThan(0)
+                        expect(run.rebaseDurations.length).toBeGreaterThan(0)
                         evidence.push({kind: 'buffered', ...run.fixture.metrics, responseTokens: countTokens(response), responseCharacters: response.length,
                             responseUtf8Bytes: Buffer.byteLength(response), generationAdmission: route === 'windowed' ? 'history-window-helper' : 'complete-materialization-helper',
                             admittedMessages, actualSaveRoute: route, phases: run.metrics, commits: run.commits, projectionMs: run.projectionDurations,

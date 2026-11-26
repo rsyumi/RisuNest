@@ -5,6 +5,8 @@ import { get, writable } from 'svelte/store'
 import { language } from 'src/lang'
 import { DBState, onboardingModalStore, ScriptDisplayRebuildPointer } from 'src/ts/stores.svelte'
 import { createConversationSummaryStubFromChat } from 'src/ts/storage/conversationResidency'
+import { attachHistoryWindow } from 'src/ts/process/historyWindowIndex'
+import type { Chat } from 'src/ts/storage/database.svelte'
 import DefaultChatScreen from './DefaultChatScreen.svelte'
 import { chatScreenState } from '../../ts/ui/chatScreenState.svelte'
 import { doingChat } from 'src/ts/process/index.svelte'
@@ -256,8 +258,10 @@ it('retains attachments on input failure and preserves files added for the next 
     expect(document.querySelectorAll('button[class*="-right-1"]')).toHaveLength(0)
 })
 
+const windowMetadata = new WeakMap<any[], Record<string, unknown>>()
 function windowOver(store: any[], start: number) {
-    const chat = { id: 'chat', message: structuredClone(store.slice(start)) }
+    const chat = { id: 'chat', ...structuredClone(windowMetadata.get(store)), message: structuredClone(store.slice(start)) }
+    attachHistoryWindow(chat as Chat, start)
     const controller = {
         chat,
         absoluteStartIndex: start,
@@ -265,6 +269,8 @@ function windowOver(store: any[], start: number) {
         applyRange: (localStart: number, deleteCount: number, messages: any[]) => {
             store.splice(start + localStart, deleteCount, ...structuredClone(messages))
             chat.message.splice(localStart, deleteCount, ...structuredClone(messages))
+            const { message: _rows, ...metadata } = chat
+            windowMetadata.set(store, structuredClone(metadata))
             return true
         },
         reconcileMetadata: () => true,

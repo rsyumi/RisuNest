@@ -9,7 +9,7 @@ import {
     type OpenResponseTail,
 } from './durableReroll'
 import { attachHistoryWindow } from './process/historyWindowIndex'
-import { captureResponseVariants, projectResponseVariant, recoverRerollMessages, trackRerollOutput } from './responseVariants'
+import { captureResponseVariants, projectResponseVariant, recoverRerollMessages, rerollAfterPluginRanges, trackRerollOutput } from './responseVariants'
 
 const message = (data: string, role: Message['role'] = 'char', saying = 'bot'): Message => ({
     data,
@@ -41,6 +41,25 @@ function fixture(messages = [message('question', 'user'), message('original')]) 
 }
 
 describe('durable response candidates', () => {
+    it.each([true, false])('keeps the surviving prefix after the reroll anchor is deleted, generation succeeds=%s', async success => {
+        const f = fixture([message('old', 'user'), message('keep', 'user'), message('question', 'user'), message('original')])
+        f.options.generate = async () => {
+            const output = message('next')
+            trackRerollOutput(f.chat, output)
+            f.chat.message.push(output)
+            f.chat.message.splice(2, 1)
+            f.chat.message[0] = message('earlier', 'user')
+            return success
+        }
+        expect(await generateResponseCandidate(f.options)).toBe(success)
+        expect(f.persisted().message.map(row => row.data)).toEqual(['earlier', 'keep', success ? 'next' : 'original'])
+        if (success) {
+            expect(f.persisted().message.at(-1)?.responseVariants?.candidates.at(-1)?.messages.map(row => row.data)).toEqual(['next'])
+            expect(moveResponseCandidate(f.chat, null, -1, f.options.createId)).toBe(true)
+            expect(f.chat.message.map(row => row.data)).toEqual(['earlier', 'keep', 'original'])
+        }
+    })
+
     it('continues against the published conversation after a checkpoint replaces its working copy', async () => {
         const f = fixture()
         let current = f.chat
@@ -247,6 +266,35 @@ const longConversation = (count: number) =>
     Array.from({ length: count }, (_, index) => message(`m${index}`, index % 2 ? 'char' : 'user'))
 
 describe('response candidates over a history window', () => {
+    it.each([true, false])('preserves both sides of a relocated response after generation succeeds=%s', async success => {
+        const conversation = storedConversation(longConversation(100))
+        const stored = conversation.stored
+        const earlier = stored.messages.slice(20, 98)
+        const independent = message('independent', 'user')
+        conversation.options.generate = async () => {
+            const output = message('new')
+            const chat = { ...stored.metadata, message: stored.messages } as Chat
+            trackRerollOutput(chat, output, stored.messages.length)
+            stored.messages.push(output)
+            const ranges = [
+                { start: 0, before: stored.messages.slice(0, 20), messages: [] },
+                { start: 78, before: [stored.messages[98]], messages: [] },
+                { start: 79, before: [], messages: [independent] },
+            ]
+            stored.metadata.rerollRecovery = rerollAfterPluginRanges(chat.rerollRecovery, ranges)
+            for (const range of ranges) stored.messages.splice(range.start, range.before.length, ...range.messages)
+            return success
+        }
+        expect((await generateWindowedResponseCandidate(conversation.options))?.completed).toBe(success)
+        const persisted = conversation.flushed().messages
+        expect(persisted.slice(0, -2)).toEqual(earlier)
+        expect(persisted.at(-1)).toEqual(independent)
+        const carrier = persisted.at(-2)
+        expect(carrier.data).toBe(success ? 'new' : 'm99')
+        expect(carrier.responseVariants.candidates.map(candidate => candidate.messages.map(row => row.data)))
+            .toEqual(success ? [['m99'], ['new']] : [['m99']])
+    })
+
     it('generates a candidate from tail windows and leaves earlier messages untouched', async () => {
         const conversation = storedConversation(longConversation(100))
         const before = structuredClone(conversation.stored.messages.slice(0, 99))

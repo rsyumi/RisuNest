@@ -886,6 +886,17 @@ key, including the characters and chats nested in a newer read.
   backup, or switching libraries) is rejected with a stale read baseline error. Read the
   target again and repeat the edit.
 
+Once the reply message exists, edits to its conversation apply message by message until generation finishes. Keep
+each message's `chatId` when editing or reordering it. A write based on an earlier read can
+update other messages while the reply continues, even if the read predates the reply.
+The next stream chunk updates the reply's `data` and preserves its plugin-owned fields.
+If an output script is editing the conversation, the setter waits for that invocation to
+finish and resolves after its own changes are saved.
+
+`setDatabaseLite` can include `characters` during reply output when all changes within
+`characters` belong to the generating conversation. Use `setDatabase` for other character
+updates.
+
 The usual pattern works as written:
 
 ```javascript

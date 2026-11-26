@@ -258,6 +258,14 @@ export class SegmentedConversationResidency {
         return this.dirtyRecords.length === 0 && this.pendingSaveAttempts.size === 0
     }
 
+    adoptGenerationHead(revision: DataRevision, version: number, count: number): void {
+        this.discardResidentState()
+        this.baseRevision = revision
+        this.messageCount = this.baseMessageCount = count
+        this.sequenceSpans = count ? [{ kind: 'persistent', persistentStartIndex: 0, length: count }] : []
+        this.currentSessionVersion = this.acknowledgedVersion = version
+    }
+
     adoptPersistedMetadata(
         revision: DataRevision,
         version: number,

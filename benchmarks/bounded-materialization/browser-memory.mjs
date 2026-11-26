@@ -203,6 +203,8 @@ try {
         const compiled = await build({
             stdin: { contents: source, loader: 'ts', resolveDir: path.join(repository, name === 'SandboxModule' ? 'src/ts/plugins/apiV3' : 'src/ts/plugins') },
             bundle: true, write: false, platform: 'browser', conditions: ['browser'],
+            // Native log export opens a platform file picker outside the browser snapshot path.
+            external: ['./src/ts/storage/nativeExportFile.ts'],
             format: 'iife', globalName: name, define: { 'import.meta.env.DEV': 'false' },
             plugins: [{ name: 'source-revision', setup(build) {
                 if (baselineRef) build.onLoad({ filter: /\.ts$/ }, async ({ path: filename }) => {

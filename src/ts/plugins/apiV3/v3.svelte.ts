@@ -52,6 +52,7 @@ import {
     assertPersistentMutationAllowed,
     getPersistentStorageAuthorityEpoch,
     acquireCompleteConversation,
+    getPersistentDataRuntime,
     captureSelectedConversationTarget,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
@@ -133,6 +134,7 @@ function getPluginDatabaseAccess(owner: string, storage: PluginOwnerStorage): Pl
         getCompatibilityDatabase: () => DBState.db,
         getSelectedCharacterId: () =>
             getDatabase().characters[get(selectedCharID)]?.chaId ?? null,
+        getLiveRuntime: () => getPersistentDataRuntime(),
         captureSelectedConversationTarget,
         acquireCompleteConversation,
         refreshSelectedConversationAfterReplacement,

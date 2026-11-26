@@ -9,6 +9,7 @@ import { getRegexExecutionPlan } from '../process/regexExecutionPlan'
 import { createLiveChatParserIndirections } from '../liveDisplayParserLease'
 import { captureResidentCbsHistory, prepareCbsHistory } from '../prepareCbsHistory'
 import { getModuleLorebooks, getModuleRegexScripts, getModules } from '../process/modules'
+import type { ConversationWindowQuery, PersistentRevisionReader } from '../storage/persistentDataStore'
 import { findActiveHistoryWindow } from '../process/historyWindowIndex'
 import { writeHistoryWindowMessage } from '../process/historyWindowWrite'
 import { setConversationChatVariable } from '../process/selectedChatVariables'
@@ -76,7 +77,10 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
     const windowed = isMetadataOnlySelectedConversation(sourceChat)
     const runtime = windowed ? getPersistentDataRuntime() : null
     const authority = runtime?.captureSelectedConversationAuthority()
-    const activeWindow = findActiveHistoryWindow(characterId, conversationId)
+    const viewport = runtime?.getActiveConversationViewportSource()
+    const projection = authority?.overlay?.captureProjection()
+    const injectSlot = chatID >= 0 && regexPlan?.entries.some(entry =>
+        entry.actions.includes('inject') || entry.replacement.startsWith('@@inject')) ? projection?.row(chatID) : null
     const totalMessages = windowed
         ? authority?.totalMessages
         : sourceChat.message.length
@@ -112,6 +116,14 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
             throw error
         }
     }
+    async function uniqueStoredIndex(reader: Pick<PersistentRevisionReader, 'readConversationWindow'>, id: string) {
+        const occurrence = async (anchorOccurrence: 'first' | 'last') => {
+            const result = await reader.readConversationWindow({ characterId, conversationId, anchorMessageId: id, anchorOccurrence, before: 0, after: 0 })
+            return result?.value.messages[0]?.chatId === id ? result.value.startIndex : null
+        }
+        const first = await occurrence('first')
+        return first !== null && await occurrence('last') === first ? first : null
+    }
     async function commitPending() {
         if (!pendingVariables.size && !pendingMessages.size) return
         assertPersistentMutationAllowed(epoch)
@@ -127,13 +139,22 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
             for (const [key, value] of variables) scriptstate['$' + key] = value
             const conversations = []
             for (const [index, { expected, data }] of messages) {
-                const result = await reader.readConversationWindow({ characterId, conversationId, startIndex: index, limit: 1 })
+                let storedIndex = injectSlot && 'storedIndex' in injectSlot ? injectSlot.storedIndex : index
+                if (authority && reader.revision !== authority.storeRevision) {
+                    const original = await leasePromise
+                    if (!original || !expected.chatId || await uniqueStoredIndex(original, expected.chatId) !== storedIndex)
+                        throw new PluginParserTargetChangedError()
+                    const relocated = await uniqueStoredIndex(reader, expected.chatId)
+                    if (relocated === null) throw new PluginParserTargetChangedError()
+                    storedIndex = relocated
+                }
+                const result = await reader.readConversationWindow({ characterId, conversationId, startIndex: storedIndex, limit: 1 })
                 const message = result?.value.messages[0]
                 if (!matchesMessage(message, expected)) {
                     throw new PluginParserTargetChangedError()
                 }
                 conversations.push({ type: 'replace-range' as const, characterId, conversationId,
-                    start: index, deleteCount: 1, messages: [{ ...message, data }] })
+                    start: storedIndex, deleteCount: 1, messages: [{ ...message, data }] })
             }
             return {
                 unitMutations: variables.size ? [{ type: 'set' as const,
@@ -153,11 +174,15 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
     const needsRows = options?.processRegex || initialPlan.requiresFullHistory || initialPlan.absoluteMessageIndices.length > 0
         || initialPlan.requirements.some((requirement) => requirement !== 'count')
     if (windowed && needsRows) {
-        for (const row of runtime!.getActiveConversationViewportSource()?.captureResidentRows?.() ?? []) resident.set(row.absoluteIndex, clone(row.message))
-        if (activeWindow) activeWindow.chat.message.forEach((message, index) => resident.set(activeWindow.absoluteStartIndex + index, clone(message)))
+        for (const row of viewport?.captureResidentRows?.() ?? []) resident.set(row.absoluteIndex, clone(row.message))
     }
     let historyAccess: CbsHistoryAccess
     const leasePromise = windowed && needsRows ? runtime!.store.acquireRevision(authority!.storeRevision) : undefined
+    const storedReader = {
+        readConversationWindow: async (query: ConversationWindowQuery) => (await leasePromise)!.readConversationWindow(query),
+        readConversationMessageMetadataWindow: async (query: ConversationWindowQuery) => (await leasePromise)!.readConversationMessageMetadataWindow!(query),
+    }
+    const windowReader = viewport?.captureProjectedReader?.(storedReader) ?? storedReader
     // Keep a rejected acquisition observed while a preceding variable commit finishes.
     void leasePromise?.catch(() => {})
     const prepareHistory = async (source: string, index: number) => {
@@ -170,9 +195,9 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
                     revision: authority!.storeRevision,
                     readResidentMessage: (row) => resident.get(row),
                     readRoleWindow: lease?.messageMetadataReadMode === 'projected' && authority!.sessionVersion === authority!.persistedSessionVersion
-                        ? (query) => lease.readConversationMessageMetadataWindow!(query) : undefined,
+                        ? (query) => windowReader.readConversationMessageMetadataWindow!(query) : undefined,
                     readConversationWindow: async (query) => {
-                        const result = await lease!.readConversationWindow(query)
+                        const result = await windowReader.readConversationWindow(query)
                         return result ? { ...result, value: { ...result.value, totalMessages } } : null
                     },
                 },
@@ -198,6 +223,7 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
             if (variablePhases.get(variableKey) === phase) variablePhases.delete(variableKey)
         })
     }
+    const localTarget = injectSlot && 'message' in injectSlot ? authority!.overlay!.bind(chatID, injectSlot.message) : null
     let waitingForVariables = !!precedingVariables
     let failed = false
     try {
@@ -266,15 +292,34 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
                             const session = peekActiveConversationSession()
                             const selected = DBState.db.characters[get(selectedCharID)]
                             const window = findActiveHistoryWindow(characterId, conversationId)
-                            if (current && session?.matchesConversation(characterId, current)) {
+                            if (localTarget && (!current || runtime?.captureSelectedConversationAuthority()?.overlay !== authority?.overlay))
+                                throw new PluginParserTargetChangedError()
+                            if (!windowed && current && session?.matchesConversation(characterId, current)) {
                                 const locator = session.locate(index)
                                 const message = session.readMessage(locator)
                                 if (!matchesMessage(message, expected)) throw new PluginParserTargetChangedError()
                                 session.edit(locator, { ...message, data })
-                            } else if (current && window && index >= window.absoluteStartIndex) {
+                            } else if (current && localTarget && authority?.overlay) {
+                                const absolute = authority.overlay.locate(localTarget)
+                                const before = authority.overlay.readTarget(localTarget)
+                                const target = runtime?.captureSelectedConversationTarget()
+                                if (absolute === null || !before || !target || runtime?.captureSelectedConversationAuthority()?.overlay !== authority.overlay)
+                                    throw new PluginParserTargetChangedError()
+                                if (window?.isCurrent() && absolute >= window.absoluteStartIndex && absolute < window.absoluteStartIndex + window.chat.message.length) {
+                                    if (!writeHistoryWindowMessage(window, absolute, () => ({ ...before, data }))) throw new PluginParserTargetChangedError()
+                                } else {
+                                    const controller = runtime.captureWindowedConversationMutationController(target,
+                                        { ...cloneConversationMetadata(current), message: [] } as Chat, authority.overlay.count)
+                                    try {
+                                        if (!controller?.applyAbsoluteRanges?.([{ start: absolute, before: [before], messages: [{ ...before, data }] }]))
+                                            throw new PluginParserTargetChangedError()
+                                    } finally { controller?.release() }
+                                }
+                            } else if (current && window?.isCurrent() && projection?.epoch === authority?.overlay?.epoch &&
+                                index >= window.absoluteStartIndex && index < window.absoluteStartIndex + window.chat.message.length) {
                                 if (!matchesMessage(window.chat.message[index - window.absoluteStartIndex], expected)) throw new PluginParserTargetChangedError()
-                                if (!writeHistoryWindowMessage(window, index, (message) => ({ ...message, data }))) throw new PluginParserTargetChangedError()
-                            } else if (current && !isMetadataOnlySelectedConversation(current)
+                                if (!writeHistoryWindowMessage(window, index, message => ({ ...message, data }))) throw new PluginParserTargetChangedError()
+                            } else if (!windowed && current && !isMetadataOnlySelectedConversation(current)
                                 && selected?.chaId === characterId && selected.chats[selected.chatPage] === current) {
                                 if (!matchesMessage(current.message[index], expected)) throw new PluginParserTargetChangedError()
                                 current.message[index].data = data
@@ -295,6 +340,7 @@ export async function parseRisuChat(text: string, options?: ParseRisuChatOptions
         throw error
     } finally {
         releaseVariables?.()
+        if (localTarget) authority!.overlay!.release(localTarget)
         if (leasePromise) {
             const cleanup = leasePromise.then((lease) => lease.release())
             // An aborted waiter must not wait for acquisition or release.

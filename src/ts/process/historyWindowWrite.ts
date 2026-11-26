@@ -97,13 +97,24 @@ export interface HistoryWindowCopy {
     commit(): boolean
 }
 
+/** A script may publish its positional copy only into the window it read. */
+export function captureHistoryWindowSource(controller: HistoryWindowController) {
+    const current = controller.isCurrent()
+    const version = controller.mutationVersion
+    const start = controller.absoluteStartIndex
+    const messages = [...controller.chat.message]
+    return () => current && controller.isCurrent()
+        && version === controller.mutationVersion && start === controller.absoluteStartIndex
+        && messages.length === controller.chat.message.length
+        && messages.every((message, index) => controller.chat.message[index] === message)
+}
+
 /** A copy of the window chat for a script that edits the chat it is handed. */
 export function openHistoryWindowCopy(
     controller: HistoryWindowController,
     onCommit?: ConversationCommitObserver,
 ): HistoryWindowCopy {
-    const current = controller.isCurrent()
-    const sourceVersion = controller.mutationVersion
+    const isSourceCurrent = captureHistoryWindowSource(controller)
     const source = [...controller.chat.message]
     const chat = safeStructuredClone(controller.chat)
     const drafts = [...chat.message]
@@ -112,10 +123,7 @@ export function openHistoryWindowCopy(
     return {
         chat,
         commit() {
-            if (committed || !current || !controller.isCurrent()
-                || sourceVersion !== controller.mutationVersion
-                || source.length !== controller.chat.message.length
-                || source.some((message, index) => controller.chat.message[index] !== message)) return false
+            if (committed || !isSourceCurrent()) return false
             if (!writeHistoryWindowChat(controller, chat)) return false
             committed = true
             const writtenVersion = controller.mutationVersion

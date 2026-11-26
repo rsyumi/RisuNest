@@ -68,6 +68,7 @@ vi.mock('src/ts/process/presetChain', async () => (await import('../process/test
 import type { Database, Message } from '../storage/database.svelte'
 import { getDatabase, setDatabaseLite } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
+import type { WorkingSetCommit } from '../storage/persistentDataStore'
 import {
     acquireCompleteConversation,
     captureSelectedConversationTarget,
@@ -75,6 +76,7 @@ import {
     replacePersistentDatabase,
     flushPendingDataLocally,
     getActiveConversationSession,
+    getPersistentDataRuntime,
     initializeActiveWorkingSet,
 } from '../storage/persistentDataRuntime.svelte'
 import { selectedCharID } from '../stores.svelte'
@@ -83,6 +85,11 @@ import { createRisunestPrivateApi } from './apiV3/risunestPrivateApi'
 import { conversationPatchAccess } from './conversationPatchHost'
 import { normalizeConversationPatchInput } from './conversationPatch'
 import { activeRerollConversations } from '../durableReroll'
+import { whileStreaming, finalText, liveMessage } from '../process/tests/streamingPluginWrites'
+import { getGenerationOutputPhase } from '../process/generationOutputPhase'
+import { applyGenerationConversationRanges } from './generationConversationOwner'
+import { cloneConversationMetadata } from '../storage/selectedConversationLifecycle'
+import { runTrigger } from '../process/triggers'
 
 const target = { characterId: 'character-a', conversationId: 'chat-a' }
 const factory = new IDBFactory()
@@ -375,6 +382,224 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
         expect(stored.message[0]).not.toHaveProperty('__cancelled')
         expect(stored.message[0]).not.toHaveProperty('__reroll')
         expect(stored.message.at(-1)?.data).toBe('answer')
+    })
+
+    it('resolves moved patch targets on the streaming owner and records the result only after saving', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const runtime = getPersistentDataRuntime()
+        const reply = await whileStreaming({ runtime, length: 1, windowed: historyLimit }, async ({ reply, chunk }) => {
+            const patch = {
+                ...target, mutationId: 'stream-addresses',
+                messages: [
+                    { index: 5, messageId: 'user-message', set: { data: 'edited' } },
+                    { index: 0, messageId: reply.chatId, set: { data: 'plugin reply', __origin: 'plugin' } },
+                ],
+                chatVariables: [{ key: '$origin', value: 'stream' }],
+            }
+            await expect(patches.patchConversation({ ...patch, mutationId: 'missing-stream-target',
+                messages: [...patch.messages, { index: 9, messageId: 'missing', set: { data: 'x' } }],
+            })).resolves.toMatchObject({ status: 'conflict', conflict: { target: 'message', index: 9 } })
+            const untouched = await reloadedConversation()
+            expect(untouched.message[0].data).toBe('hello')
+            expect(untouched.scriptstate).toEqual({})
+            const commit = fixture.store.commit.bind(fixture.store)
+            let held = false
+            const storedUserEdits: string[] = []
+            const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+                if (!held && JSON.stringify(input).includes('__origin')) {
+                    held = true
+                    chunk('newer chunk')
+                    await vi.waitFor(async () => expect((await liveMessage(runtime, 1))?.data).toBe('newer chunk'))
+                }
+                const result = await commit(input)
+                for (const range of (input as WorkingSetCommit).conversations ?? []) {
+                    if (range.type !== 'replace-range') continue
+                    for (const row of range.messages) if (row.chatId === 'user-message') storedUserEdits.push(row.data)
+                }
+                return result
+            })
+            try {
+                const applied = await patches.patchConversation(patch)
+                expect(held).toBe(true)
+                expect(applied.status).toBe('applied')
+                await expect(patches.patchConversation(patch)).resolves.toEqual({ ...applied, status: 'already-applied' })
+                expect(storedUserEdits).toEqual(['edited'])
+            } finally {
+                commits.mockRestore()
+            }
+            const stored = await reloadedConversation()
+            expect(stored.message[0].data).toBe('edited')
+            expect(stored.message[1]).toMatchObject({ chatId: reply.chatId, data: 'newer chunk', __origin: 'plugin' })
+            expect(stored.scriptstate).toEqual({ $origin: 'stream' })
+        })
+        await flushPendingDataLocally('patch-stream-test')
+        const stored = await reloadedConversation()
+        expect(stored.message.map(row => row.chatId)).toEqual(['user-message', reply.chatId])
+        expect(stored.message[1]).toMatchObject({ data: finalText, __origin: 'plugin' })
+    })
+
+    it.skipIf(historyLimit)('publishes an admitted patch before the output trigger when complete checkpoints are unavailable', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const runtime = getPersistentDataRuntime()
+        const capability = vi.spyOn(runtime, 'capturesImmutableCharacters').mockReturnValue(false)
+        const seen: unknown[] = []
+        const trigger = vi.mocked(runTrigger)
+        const original = trigger.getMockImplementation()
+        trigger.mockImplementation(async (_character, mode, options) => {
+            if (mode === 'output') seen.push(options.chat.message[0].data)
+            return null
+        })
+        try {
+            await whileStreaming({ runtime, length: 1, windowed: false }, async ({ finishStream }) => {
+                let held = false
+                const commit = fixture.store.commit.bind(fixture.store)
+                const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+                    if (!held && JSON.stringify(input).includes('approved before EOF')) {
+                        held = true
+                        finishStream()
+                        await vi.waitFor(() => expect(getGenerationOutputPhase(target)?.phase).toBe('processing'))
+                    }
+                    return commit(input)
+                })
+                try {
+                    await expect(patches.patchConversation({ ...target, mutationId: 'patch-before-eof',
+                        messages: [{ index: 0, messageId: 'user-message', set: { data: 'approved before EOF' } }],
+                    })).resolves.toMatchObject({ status: 'applied' })
+                    expect(held).toBe(true)
+                } finally {
+                    commits.mockRestore()
+                }
+            })
+            expect(seen).toEqual(['approved before EOF'])
+        } finally {
+            capability.mockRestore()
+            if (original) trigger.mockImplementation(original)
+        }
+    })
+
+    it('publishes a committed patch to a row moved by a local insertion during the write', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const runtime = getPersistentDataRuntime()
+        const reply = await whileStreaming({ runtime, length: 1, windowed: historyLimit }, async () => {
+            let inserted = false
+            const commit = fixture.store.commit.bind(fixture.store)
+            const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+                if (!inserted && JSON.stringify(input).includes('__moved')) {
+                    const selected = runtime.captureSelectedConversationTarget()!
+                    const phase = getGenerationOutputPhase(selected)!
+                    const shell = getDatabase().characters[0].chats[0]
+                    const anchor = (await liveMessage(runtime, 0))!
+                    inserted = applyGenerationConversationRanges(selected, shell, phase, [{
+                        start: 0, before: [], messages: [{ role: 'user', chatId: 'inserted', data: 'new' }], anchor, anchorBefore: true,
+                    }], cloneConversationMetadata(shell), runtime)
+                    expect(inserted).toBe(true)
+                }
+                return commit(input)
+            })
+            try {
+                await expect(patches.patchConversation({ ...target, mutationId: 'insert-during-patch',
+                    messages: [{ index: 0, messageId: 'user-message', set: { __moved: 'stored' } }],
+                })).resolves.toMatchObject({ status: 'applied' })
+                expect(inserted).toBe(true)
+                expect(await liveMessage(runtime, 1)).toMatchObject({ chatId: 'user-message', __moved: 'stored' })
+            } finally {
+                commits.mockRestore()
+            }
+        })
+        await flushPendingDataLocally('insertion-patch-test')
+        const stored = await reloadedConversation()
+        expect(stored.message.map(row => row.chatId)).toEqual(['inserted', 'user-message', reply.chatId])
+        expect(stored.message[0]).not.toHaveProperty('__moved')
+        expect(stored.message[1]).toMatchObject({ __moved: 'stored' })
+    })
+
+    it.skipIf(!historyLimit)('recovers a durable patch with a later chunk after its first publication read fails', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const runtime = getPersistentDataRuntime()
+        const reply = await whileStreaming({ runtime, length: 1, windowed: true }, async ({ reply, chunk }) => {
+            let committedRevision: number | undefined
+            let failed = false
+            const commit = fixture.store.commit.bind(fixture.store)
+            const acquire = fixture.store.acquireRevision.bind(fixture.store)
+            const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+                const patchCommit = committedRevision === undefined && JSON.stringify(input).includes('__durablePatch')
+                if (patchCommit) {
+                    chunk('chunk during commit')
+                    await vi.waitFor(async () => expect((await liveMessage(runtime, 1))?.data).toBe('chunk during commit'))
+                }
+                const result = await commit(input)
+                if (patchCommit) committedRevision = result.revision
+                return result
+            })
+            const leases = vi.spyOn(fixture.store, 'acquireRevision').mockImplementation(async (revision: number) => {
+                if (!failed && revision === committedRevision) {
+                    failed = true
+                    throw new Error('first patch publication read failed')
+                }
+                return acquire(revision)
+            })
+            try {
+                await expect(patches.patchConversation({ ...target, mutationId: 'durable-before-publication',
+                    messages: [{ index: 1, messageId: reply.chatId, set: { __durablePatch: true } }],
+                    chatVariables: [{ key: '$durablePatch', value: true }],
+                })).rejects.toThrow('first patch publication read failed')
+                expect((await reloadedConversation()).message[1]).toMatchObject({ __durablePatch: true })
+                chunk('chunk after publication failure')
+                await vi.waitFor(async () => expect((await liveMessage(runtime, 1))?.data).toBe('chunk after publication failure'))
+                await runtime.flushPendingDataLocally('retry-patch-publication')
+                expect((await reloadedConversation()).message[1]).toMatchObject({
+                    data: 'chunk after publication failure', __durablePatch: true,
+                })
+            } finally {
+                leases.mockRestore()
+                commits.mockRestore()
+            }
+        })
+        const stored = await reloadedConversation()
+        expect(stored.message[1]).toMatchObject({ chatId: reply.chatId, data: finalText, __durablePatch: true })
+    })
+
+    it('refuses the whole streaming patch when another connection deletes its first target during commit', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const remote = new IndexedDbPersistentDataStore(storeName, factory, IDBKeyRange)
+        await remote.open()
+        let deleted = false
+        const commit = fixture.store.commit.bind(fixture.store)
+        const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+            if (!deleted && JSON.stringify(input).includes('__atomic')) {
+                deleted = true
+                const { revision } = await remote.readRoot()
+                await remote.commit({ expectedRevision: revision, conversations: [
+                    { type: 'replace-range', ...target, start: 0, deleteCount: 1, messages: [] },
+                ] })
+            }
+            return commit(input)
+        })
+        try {
+            const reply = await whileStreaming({ runtime: getPersistentDataRuntime(), length: 1, windowed: historyLimit }, async ({ reply }) => {
+                await expect(patches.patchConversation({
+                    ...target, mutationId: 'atomic-stream-patch', chatVariables: [{ key: '$atomic', value: 1 }],
+                    messages: [
+                        { index: 0, messageId: 'user-message', set: { data: 'edited' } },
+                        { index: 1, messageId: reply.chatId, set: { __atomic: true } },
+                    ],
+                })).resolves.toMatchObject({ status: 'conflict', conflict: { target: 'message', reason: 'not-found', index: 0 } })
+                expect(deleted).toBe(true)
+            })
+            await flushPendingDataLocally('atomic-patch-test')
+            const stored = await reloadedConversation()
+            expect(stored.message.map(row => row.chatId)).toEqual([reply.chatId])
+            expect(stored.message[0]).toMatchObject({ data: finalText })
+            expect(stored.message[0]).not.toHaveProperty('__atomic')
+            expect(stored.scriptstate).toEqual({})
+        } finally {
+            commits.mockRestore()
+        }
     })
 
     it('keeps patches outside the loaded history and on its tail without promoting the conversation', async () => {
