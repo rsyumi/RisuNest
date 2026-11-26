@@ -129,6 +129,7 @@ export interface ActiveWorkingSetDependencies {
     canUseWindowedSelectedConversation?(): boolean
     isConversationOperationActive?(): boolean
     subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
+    onConversationOwnerChange?(): void
     conversationViewportRowBudget?: number
     conversationPageSize?: number
 }
@@ -1154,11 +1155,13 @@ export class ActiveWorkingSet {
 
     invalidateNavigation(): void {
         this.navigationGeneration++
+        this.dependencies.onConversationOwnerChange?.()
         this.clearActiveConversationSession()
     }
 
     fenceNavigation(): number {
         this.navigationGeneration++
+        this.dependencies.onConversationOwnerChange?.()
         this.refreshSelectedConversationNavigation(this.navigationGeneration)
         return this.navigationGeneration
     }
@@ -2494,6 +2497,7 @@ export class ActiveWorkingSet {
     }
 
     private notifyActiveConversationViewportSource(): void {
+        this.dependencies.onConversationOwnerChange?.()
         const source = this.activeConversationViewportSource
         for (const listener of [...this.viewportSourceListeners]) {
             try {

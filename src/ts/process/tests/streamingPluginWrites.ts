@@ -5,6 +5,7 @@ import type { IndexedDbPersistentDataStore } from '../../storage/indexedDbPersis
 import type { PluginDatabaseAccess } from '../../plugins/pluginDatabaseAccess'
 import { DBState } from '../../stores.svelte'
 import { beginGenerationEndRun, subscribeGenerationEnd, type GenerationEndRecord } from '../generationEnd'
+import { reserveGeneration } from '../generationState'
 import { sendChat } from '../index.svelte'
 import { requestChatData } from '../request/request'
 import { conversationPatchAccess } from '../../plugins/conversationPatchHost'
@@ -37,9 +38,9 @@ export async function liveMessage(runtime: PersistentDataRuntime, index: number)
 
 export async function whileStreaming(
     fixture: Pick<OutputFixture, 'runtime' | 'length' | 'windowed'>,
-    action: (stream: { reply: Message; signal: AbortSignal; finishStream(): void; chunk(text: string): void }) => Promise<void>,
+    action: (stream: { reply: Message; signal: AbortSignal; cancel(): void; sending: Promise<boolean>; finishStream(): void; chunk(text: string): void }) => Promise<void>,
     beforeProviderResponse?: () => Promise<void>,
-    expectedCompletion = true,
+    expectedCompletion: boolean | RegExp = true,
 ) {
     const { runtime, length, windowed } = fixture
     let stream!: ReadableStreamDefaultController<Record<string, string>>
@@ -63,7 +64,15 @@ export async function whileStreaming(
     const events: GenerationEndRecord[] = []
     const unsubscribe = subscribeGenerationEnd(event => events.push(event))
     const run = beginGenerationEndRun(target)
-    const sending = run.capture(() => sendChat({ historyLimit: windowed, signal: controller.signal }))
+    const reservation = reserveGeneration(() => controller.abort())!
+    expect(reservation).toBeTruthy()
+    let rejection: unknown
+    const sending = run.capture(() => sendChat({ historyLimit: windowed, signal: controller.signal }, reservation))
+        .catch(error => {
+            if (!(expectedCompletion instanceof RegExp)) throw error
+            rejection = error
+            return false
+        }).finally(() => reservation.release())
     try {
         const reply = await vi.waitFor(async () => {
             const row = await liveMessage(runtime, length)
@@ -74,7 +83,7 @@ export async function whileStreaming(
         const initialToken = token()
         expect(initialToken).toEqual(expect.any(String))
         expect(runtime.getSelectedConversationMode()).toBe(windowed ? 'windowed' : 'complete')
-        await action({ reply, signal: controller.signal, finishStream, chunk: text => stream.enqueue({ response: text }) })
+        await action({ reply, signal: controller.signal, cancel: () => controller.abort(), sending, finishStream, chunk: text => stream.enqueue({ response: text }) })
         if (!closed) {
             expect(runtime.getSelectedConversationMode()).toBe(windowed ? 'windowed' : 'complete')
             expect(token()).toBe(initialToken)
@@ -82,16 +91,16 @@ export async function whileStreaming(
         finishStream()
         const completed = await sending
         run.finish(completed ? 'completed' : 'failed')
-        expect(completed).toBe(expectedCompletion)
-        if (expectedCompletion) {
+        if (expectedCompletion instanceof RegExp) expect(String(rejection)).toMatch(expectedCompletion)
+        expect(completed).toBe(expectedCompletion === true)
+        if (expectedCompletion === true) {
             expect(events).toEqual([expect.objectContaining({ ...target, status: 'completed', messageIds: expect.arrayContaining([reply.chatId]) })])
         } else expect(events).toEqual([expect.objectContaining({ ...target, status: 'failed' })])
         return reply
     } finally {
         finishStream()
         controller.abort()
-        await sending
-        unsubscribe()
+        try { await sending } finally { unsubscribe() }
     }
 }
 

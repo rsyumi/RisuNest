@@ -18,7 +18,7 @@ import { HypaProcesser } from "./memory/hypamemory";
 import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
 import { writeInlayImage, getInlayAsset } from "./files/inlays";
 import type { OpenAIChat, MultiModal } from "./index.svelte";
-import { requestChatData, type StreamResponseChunk } from "./request/request";
+import type { StreamResponseChunk } from "./request/request";
 import { v4 } from "uuid";
 import { getModuleLorebooks, getModuleTriggers } from "./modules";
 import { Mutex } from "../mutex";
@@ -56,9 +56,8 @@ import {
     sliceHistory,
     toHistorySpliceIndex,
 } from './historyWindowIndex';
-import { captureHistoryWindowSource, openHistoryWindowCopy, type HistoryWindowCopy } from './historyWindowWrite';
-import { beginGenerationOutputScript } from './generationOutputPhase';
-import { PersistentMutationFencedError } from '../storage/saveCoordinator';
+import { beginGenerationOutputScript, getGenerationOutputScript } from './generationOutputPhase';
+import { OutputScriptConversation, ScriptHistoryWindow, requestScriptChatData } from './outputScriptConversation';
 import {
     createScriptConversationAccess,
     type ScriptConversationAccess,
@@ -129,6 +128,7 @@ interface BasicScriptingEngineState {
     writeChat?: () => Chat
     readDatabase?: () => Database
     flushVariables?: () => void
+    outputConversation?: OutputScriptConversation
     historyJSON?: ReturnType<typeof createLuaHistoryJSON>
     stopSending?: boolean
     /** A host call in this run stopped because its conversation was left or changed. */
@@ -163,6 +163,7 @@ function clearScriptingEngineInvocationState(state: ScriptingEngineState) {
     state.writeChat = undefined
     state.readDatabase = undefined
     state.flushVariables = undefined
+    state.outputConversation = undefined
     state.historyJSON = undefined
     state.stopSending = undefined
 }
@@ -189,6 +190,7 @@ export async function runScripted(code:string, arg:{
     operationContext?: ConversationOperationContext
     /** The selected conversation through a variable scope and copy-on-edit messages. */
     access?: ScriptConversationAccess
+    outputConversation?: OutputScriptConversation
     /** A button or manual trigger the user started, which gets the longer deadline. */
     userStarted?: boolean
     signal?: AbortSignal
@@ -267,6 +269,7 @@ export async function runScripted(code:string, arg:{
         if (displayEngine && skipsDisplayListener(displayEngine, displayListener!, data as string)) {
             return { stopSending: false, chat, res: undefined }
         }
+        let leaveFrame: (() => void) | undefined
         try {
         ScriptingEngineState.chat = chat
         ScriptingEngineState.historyJSON = createLuaHistoryJSON()
@@ -276,6 +279,7 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.operationDatabase = operationDatabase
         ScriptingEngineState.selectedCharacterId = selectedCharacterId
         ScriptingEngineState.capturedCharacterOwner = capturedCharacterOwner
+        ScriptingEngineState.outputConversation = arg.outputConversation
         let invocationChatReady = false
         ScriptingEngineState.ensureConversationOperation = () => {
             if (!arg.createConversationChat || invocationChatReady) return
@@ -287,6 +291,12 @@ export async function runScripted(code:string, arg:{
             ScriptingEngineState.getVar = (key: string) =>
                 getChatVarFromConversation(capturedDatabase, selectedCharacterId, ownedChat, key)
         }
+        leaveFrame = arg.outputConversation?.onReopen(() => {
+            invocationChatReady = false
+            chat = arg.outputConversation.window?.read() ?? access.readChat()
+            ScriptingEngineState.chat = chat
+            ScriptingEngineState.ensureConversationOperation()
+        })
         const legacyChat = () => {
             ScriptingEngineState.ensureConversationOperation?.()
             return ScriptingEngineState.chat
@@ -643,11 +653,12 @@ export async function runScripted(code:string, arg:{
                     if (!entry || used >= entry.count) return { role: v.role, data: v.data, chatId: v4() }
                     kept.set(v.chatId, used + 1)
                     const original = counts.get(v.chatId) === 1 ? entry.message : null
+                    const fields = { role: v.role, data: v.data, chatId: v.chatId }
+                    // The window receipt follows the same unique draft row across a reorder.
+                    if (original && ScriptingEngineState.outputConversation?.window) return Object.assign(original, fields)
                     return {
                         ...original,
-                        role: v.role,
-                        data: v.data,
-                        chatId: v.chatId,
+                        ...fields,
                     }
                 })
             })
@@ -886,6 +897,7 @@ export async function runScripted(code:string, arg:{
             };
 
             declareAPI('LLMMain', async (id:string, promptStr:string, useMultimodal: boolean = false, optionsStr: string = '') => {
+                const outputConversation = ScriptingEngineState.outputConversation
                 let prompt:{
                     role: string,
                     content: string
@@ -955,13 +967,13 @@ export async function runScripted(code:string, arg:{
                 }
 
                 const options = parseLuaOptions(optionsStr) as { streaming?: boolean }
-                const result = await requestChatData({
+                const result = await requestScriptChatData({
                     formated: promptbody,
                     bias: {},
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
-                }, 'model')
+                }, 'model', outputConversation, collectLuaStreamText)
 
                 if(result.type === 'fail'){
                     return JSON.stringify({
@@ -1002,7 +1014,7 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 flushScriptingVariables()
-                const result = await requestChatData({
+                const result = await requestScriptChatData({
                     formated: [{
                         role: 'user',
                         content: prompt
@@ -1010,7 +1022,7 @@ export async function runScripted(code:string, arg:{
                     bias: {},
                     useStreaming: false,
                     noMultiGen: true,
-                }, 'model')
+                }, 'model', ScriptingEngineState.outputConversation)
 
                 if(result.type === 'fail'){
                     return {
@@ -1239,6 +1251,7 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('axLLMMain', async (id:string, promptStr:string, useMultimodal: boolean = false, optionsStr: string = '') => {
+                const outputConversation = ScriptingEngineState.outputConversation
                 let prompt:{
                     role: string,
                     content: string
@@ -1316,13 +1329,13 @@ export async function runScripted(code:string, arg:{
                         success: false
                     })
                 }
-                const result = await requestChatData({
+                const result = await requestScriptChatData({
                     formated: promptbody,
                     bias: {},
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
-                }, mode as 'emotion' | 'memory' | 'otherAx' | 'submodel' | 'translate')
+                }, mode as 'emotion' | 'memory' | 'otherAx' | 'submodel' | 'translate', outputConversation, collectLuaStreamText)
 
                 if(result.type === 'fail'){
                     return JSON.stringify({
@@ -1548,6 +1561,7 @@ export async function runScripted(code:string, arg:{
                 }
             } catch (error) {
                 if (worker?.isClosed()) discardFailedScriptingEngineState(ScriptingEngineState)
+                arg.outputConversation?.requireActive()
                 arg.signal?.throwIfAborted()
                 if (isLuaTimeoutError(error)) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'onFormSubmit', 'editRequest',
@@ -1598,6 +1612,7 @@ export async function runScripted(code:string, arg:{
                 }
             }
         }
+        arg.outputConversation?.requireActive()
         chat = access?.currentChat() ?? ScriptingEngineState.chat
 
         return {
@@ -1611,6 +1626,7 @@ export async function runScripted(code:string, arg:{
             finishScriptingEngineUse(ScriptingEngineState)
         }
         } finally {
+            leaveFrame?.()
             clearScriptingEngineInvocationState(ScriptingEngineState)
         }
     })
@@ -1742,6 +1758,7 @@ function observeConversationStops(state: BasicScriptingEngineState, func: Functi
         throw error
     }
     return function (this: unknown, ...args: unknown[]) {
+        state.outputConversation?.requireActive()
         let value: unknown
         try {
             value = func.apply(this, args)
@@ -1930,7 +1947,8 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     luaErrors?: alertData[],
 ): Promise<T> {
     let operationContext = conversationOperation
-    let historyWindowCopy: HistoryWindowCopy | null = null
+    let window: ScriptHistoryWindow | null = null
+    let outputConversation: OutputScriptConversation | undefined
     let access: ScriptConversationAccess | null = null
     let finishOutputScript: (() => void) | undefined
     try {
@@ -1948,16 +1966,7 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         const historyWindow = !operationContext && mode !== 'editDisplay'
             ? findActiveHistoryWindow(char.chaId, getCurrentChat()?.id)
             : null
-        const sourceCurrent = historyWindow && captureHistoryWindowSource(historyWindow)
-        const createWindowChat = historyWindow ? () => {
-            if (!historyWindowCopy) {
-                if (!sourceCurrent?.()) {
-                    throw new PersistentMutationFencedError()
-                }
-                historyWindowCopy = openHistoryWindowCopy(historyWindow, onConversationCommit)
-            }
-            return historyWindowCopy.chat
-        } : undefined
+        if (historyWindow) window = new ScriptHistoryWindow(historyWindow, onConversationCommit)
         if (!operationContext && !historyWindow) {
             access = createScriptConversationAccess(getCurrentChat(), getDatabase(), {
                 onCommitted: onConversationCommit,
@@ -1968,6 +1977,8 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
             // The listener's supplied index refers to the messages at invocation.
             if (finishOutputScript) access?.readChat()
         }
+        const outputScript = getGenerationOutputScript(onConversationCommit)
+        if (outputScript) outputConversation = new OutputScriptConversation(outputScript, access, window)
 
         for (let trigger of triggers) {
             signal?.throwIfAborted()
@@ -1981,7 +1992,8 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     operationContext,
                     access: access ?? undefined,
                     chat: historyWindow?.chat,
-                    createConversationChat: createWindowChat,
+                    createConversationChat: window ? () => window.read() : undefined,
+                    outputConversation,
                     displayListener: displayRequest,
                     signal,
                     luaErrors,
@@ -1992,17 +2004,21 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
 
         return data
     } catch (error) {
+        outputConversation?.requireActive()
         return content
     } finally {
         try {
-            if (historyWindowCopy && !historyWindowCopy.commit() && !finishOutputScript) {
-                throw new PersistentMutationFencedError()
+            if (outputConversation?.stopped) {
+                access?.discard()
+            } else {
+                window?.commit()
+                // A listener that changed nothing keeps its result after the conversation closes.
+                access?.commitIfChanged()
             }
-            // A listener that changed nothing keeps its result after the conversation closes.
-            access?.commitIfChanged()
         } catch (error) {
             if (!finishOutputScript || !isConversationStop(error)) throw error
         } finally {
+            outputConversation?.finish()
             finishOutputScript?.()
         }
     }

@@ -25,6 +25,9 @@ import { requestGoogleCloudVertex } from './google';
 import { requestOpenAI, requestOpenAILegacyInstruct, requestOpenAIResponseAPI } from "./openAI/requests";
 import { applyAdditionalParameters, applyParameters, getAdditionalParameters, type ModelModeExtended } from './shared';
 import { holdModelCall } from '../generationBackground';
+import { runOutputPluginRequest, type OutputPluginRequestBoundary } from './outputPluginRequest';
+
+export type { OutputPluginRequestBoundary } from './outputPluginRequest';
 
 export type ToolCall = {
     name: string;
@@ -206,11 +209,17 @@ function normalizeOllamaStreamResponse(response: Response): Response {
     })
 }
 
-export async function requestChatData(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
-    return holdModelCall(signal => requestChatDataUnderHold(arg, model, signal ?? null), abortSignal)
+export async function requestChatData(
+    arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null,
+    boundary?: OutputPluginRequestBoundary, collect?: (stream: ReadableStream<StreamResponseChunk>) => Promise<string>,
+):Promise<requestDataResponse> {
+    return holdModelCall(signal => boundary
+        ? runOutputPluginRequest(boundary, signal, (requestSignal, beforePlugin) =>
+            requestChatDataUnderHold(arg, model, requestSignal, beforePlugin), collect)
+        : requestChatDataUnderHold(arg, model, signal ?? null), abortSignal ?? boundary?.signal)
 }
 
-async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
+async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null, beforePlugin?: () => Promise<void>):Promise<requestDataResponse> {
     if (pluginStartupGate.refuse()) return { type: 'fail', result: language.risuNest.pluginStartup.requestRefused }
     const db = getDatabase()
     const fallBackModels:string[] = safeStructuredClone(db?.fallbackModels?.[model] ?? [])
@@ -247,7 +256,12 @@ async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelMode
     
             if(pluginV2.replacerbeforeRequest.size > 0){
                 for(const replacer of pluginV2.replacerbeforeRequest){
+                    if (beforePlugin) {
+                        await beforePlugin()
+                        abortSignal.throwIfAborted()
+                    }
                     arg.formated = await replacer(arg.formated, model)
+                    if (beforePlugin) abortSignal.throwIfAborted()
                 }
             }
             
@@ -263,6 +277,7 @@ async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelMode
                     displayMode: true,
                     displayData: JSON.stringify(arg.formated)
                 })
+                if (beforePlugin) abortSignal.throwIfAborted()
                 if (historyWindowCopy && !historyWindowCopy.commit()) {
                     throw new Error('The conversation changed during the request trigger')
                 }
@@ -279,13 +294,15 @@ async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelMode
             }
             
     
+            if (beforePlugin) abortSignal.throwIfAborted()
             da = await requestChatDataMain({
                 ...arg,
                 staticModel: fallBackModels[fallbackIndex],
                 tools: tools,
-            }, model, abortSignal)
+            }, model, abortSignal, beforePlugin)
 
             if(abortSignal?.aborted){
+                if (beforePlugin && da.type === 'streaming') void da.result.cancel(abortSignal.reason).catch(() => {})
                 return {
                     type: 'fail',
                     result: 'Aborted'
@@ -298,7 +315,12 @@ async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelMode
     
             if(da.type === 'success' && pluginV2.replacerafterRequest.size > 0){
                 for(const replacer of pluginV2.replacerafterRequest){
+                    if (beforePlugin) {
+                        await beforePlugin()
+                        abortSignal.throwIfAborted()
+                    }
                     da.result = await replacer(da.result, model)
+                    if (beforePlugin) abortSignal.throwIfAborted()
                 }
             }
     
@@ -446,7 +468,7 @@ export function reformater(formated:OpenAIChat[],modelInfo:LLMModel|LLMFlags[]){
 }
 
 
-export async function requestChatDataMain(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
+export async function requestChatDataMain(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null, beforePlugin?: () => Promise<void>):Promise<requestDataResponse> {
     if (pluginStartupGate.refuse()) return { type: 'fail', result: language.risuNest.pluginStartup.requestRefused }
     const db = getDatabase()
     const targ:RequestDataArgumentExtended = arg
@@ -514,7 +536,7 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
         case LLMFormat.OobaLegacy:
             return requestOobaLegacy(targ)
         case LLMFormat.Plugin:
-            return requestPlugin(targ)
+            return requestPlugin(targ, beforePlugin)
         case LLMFormat.Ooba:
             return requestOoba(targ)
         case LLMFormat.VertexAIGemini:
@@ -875,7 +897,7 @@ async function requestOoba(arg:RequestDataArgumentExtended):Promise<requestDataR
     
 }
 
-async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDataResponse> {
+async function requestPlugin(arg:RequestDataArgumentExtended, beforePlugin?: () => Promise<void>):Promise<requestDataResponse> {
     const db = getDatabase()
     const isV3Model = arg.aiModel.startsWith('pluginmodel:::')
     const responseModel = isV3Model ? arg.aiModel : 'custom'
@@ -904,7 +926,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             'frequency_penalty','min_p','presence_penalty','repetition_penalty','top_k','top_p','temperature'
         ], {}, arg.mode, {
             modelId: arg.aiModel
-        }) as any, arg.abortSignal)) : await pluginProcess({
+        }) as any, arg.abortSignal, beforePlugin)) : await pluginProcess({
             bias: bias,
             prompt_chat: formated,
             temperature: (db.temperature / 100),
@@ -912,7 +934,11 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             presence_penalty: (db.PresensePenalty / 100),
             frequency_penalty: (db.frequencyPenalty / 100)
         })
-    
+        if (beforePlugin && arg.abortSignal.aborted) {
+            if (d?.content instanceof ReadableStream) void d.content.cancel(arg.abortSignal.reason).catch(() => {})
+            arg.abortSignal.throwIfAborted()
+        }
+
         if(!d){
             return {
                 type: 'fail',
@@ -923,7 +949,9 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
         else if(!d.success){
             return {
                 type: 'fail',
-                result: d.content instanceof ReadableStream ? await (new Response(d.content)).text() : d.content,
+                result: d.content instanceof ReadableStream ? await new Response(beforePlugin
+                    ? d.content.pipeThrough(new TransformStream(), { signal: arg.abortSignal })
+                    : d.content).text() : d.content,
                 model: responseModel
             }
         }
@@ -953,6 +981,7 @@ async function requestPlugin(arg:RequestDataArgumentExtended):Promise<requestDat
             }
         }   
     } catch (error) {
+        if (beforePlugin && arg.abortSignal.aborted) throw error
         console.error(error)
         return {
             type: 'fail',

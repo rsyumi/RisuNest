@@ -86,7 +86,7 @@ import { conversationPatchAccess } from './conversationPatchHost'
 import { normalizeConversationPatchInput } from './conversationPatch'
 import { activeRerollConversations } from '../durableReroll'
 import { whileStreaming, finalText, liveMessage } from '../process/tests/streamingPluginWrites'
-import { getGenerationOutputPhase } from '../process/generationOutputPhase'
+import { getGenerationOutputPhase, getGenerationOutputScript } from '../process/generationOutputPhase'
 import { applyGenerationConversationRanges } from './generationConversationOwner'
 import { cloneConversationMetadata } from '../storage/selectedConversationLifecycle'
 import { runTrigger } from '../process/triggers'
@@ -476,6 +476,118 @@ describe.each([false, true])('plugin conversation patch from a beforeRequest rep
         } finally {
             capability.mockRestore()
             if (original) trigger.mockImplementation(original)
+        }
+    })
+
+    it('drains an admitted background patch before resuming and refuses the next patch after admission closes', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const observed: string[] = []
+        const trigger = vi.mocked(runTrigger)
+        const original = trigger.getMockImplementation()
+        trigger.mockImplementation(async (_character, mode, options) => {
+            if (mode !== 'output') return null
+            const close = getGenerationOutputScript(options.onConversationCommit)!.openInterval()
+            const patch = { ...target, mutationId: 'before-resume', chatVariables: [],
+                messages: [{ index: 0, messageId: 'user-message', set: { data: 'saved before resume' } }] }
+            const first = conversationPatchAccess.patchConversation(patch)
+            const draining = close()
+            const next = await conversationPatchAccess.patchConversation({ ...patch, mutationId: 'after-close' })
+            await draining
+            const published = await liveMessage(getPersistentDataRuntime(), 0)
+            const stored = await reloadedConversation()
+            observed.push(next.status, published!.data, stored.message[0].data, (await first).status)
+            return null
+        })
+        try {
+            await expect(sendChat({ historyLimit })).resolves.toBe(true)
+            expect(observed).toEqual(['busy', 'saved before resume', 'saved before resume', 'applied'])
+        } finally {
+            if (original) trigger.mockImplementation(original)
+        }
+    })
+
+    it('publishes durable patch fields to the same live owner after generation cancellation', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        const runtime = getPersistentDataRuntime()
+        await whileStreaming({ runtime, length: 1, windowed: historyLimit }, async ({ reply, chunk, cancel }) => {
+            let cancelling = false
+            const commit = fixture.store.commit.bind(fixture.store)
+            const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+                const patchCommit = !cancelling && JSON.stringify(input).includes('cancel-after-commit')
+                if (patchCommit) {
+                    cancelling = true
+                    chunk('chunk during patch')
+                    await vi.waitFor(async () => expect((await liveMessage(runtime, 1))?.data).toBe('chunk during patch'))
+                }
+                const result = await commit(input)
+                if (patchCommit) cancel()
+                return result
+            })
+            try {
+                const applied = await patches.patchConversation({ ...target, mutationId: 'cancel-after-commit',
+                    messages: [
+                        { index: 0, messageId: 'user-message', set: { data: 'cancel-after-commit' } },
+                        { index: 1, messageId: reply.chatId, set: { __afterCancellation: true } },
+                    ],
+                    chatVariables: [{ key: '$cancel', value: 'committed' }],
+                })
+                expect(applied.status).toBe('applied')
+                expect(await liveMessage(runtime, 1)).toMatchObject({ data: 'chunk during patch', __afterCancellation: true })
+                expect((await liveMessage(runtime, 0))?.data).toBe('cancel-after-commit')
+                expect(getDatabase().characters[0].chats[0].scriptstate?.$cancel).toBe('committed')
+                expect((await reloadedConversation()).message[0].data).toBe('cancel-after-commit')
+            } finally {
+                commits.mockRestore()
+            }
+        }, undefined, false)
+    })
+
+    it.skipIf(!historyLimit)('ends the plugin interval after a durable publication fails and publishes it on the next flush', async () => {
+        fixture.replacers.clear()
+        await resetDatabase(database())
+        let revisionToFail: number | undefined
+        const commit = fixture.store.commit.bind(fixture.store)
+        const commits = vi.spyOn(fixture.store, 'commit').mockImplementation(async (input: unknown) => {
+            const result = await commit(input)
+            if (JSON.stringify(input).includes('retry-after-interval')) revisionToFail = result.revision
+            return result
+        })
+        const acquire = fixture.store.acquireRevision.bind(fixture.store)
+        const leases = vi.spyOn(fixture.store, 'acquireRevision').mockImplementation((revision: number) => {
+            if (revision === revisionToFail) {
+                revisionToFail = undefined
+                throw new Error('publication read failed')
+            }
+            return acquire(revision)
+        })
+        const trigger = vi.mocked(runTrigger)
+        const original = trigger.getMockImplementation()
+        const observations: string[] = []
+        trigger.mockImplementation(async (_character, mode, options) => {
+            if (mode !== 'output') return null
+            const close = getGenerationOutputScript(options.onConversationCommit)!.openInterval()
+            const result = await conversationPatchAccess.patchConversation({ ...target, mutationId: 'retry-after-interval',
+                messages: [{ index: 0, messageId: 'user-message', set: { data: 'retry-after-interval' } }],
+                chatVariables: [{ key: '$retry', value: 'restored' }],
+            }).catch((error: Error) => error.message)
+            if (typeof result === 'string') observations.push(result)
+            await close().catch(() => { observations.push('interval ended') })
+            return null
+        })
+        try {
+            await sendChat({ historyLimit })
+            expect(observations).toEqual(['publication read failed', 'interval ended'])
+            await flushPendingDataLocally('retry-after-interval')
+            const stored = await reloadedConversation()
+            expect(stored.message[0].data).toBe('retry-after-interval')
+            expect(stored.scriptstate?.$retry).toBe('restored')
+            expect(getDatabase().characters[0].chats[0].scriptstate?.$retry).toBe('restored')
+        } finally {
+            if (original) trigger.mockImplementation(original)
+            leases.mockRestore()
+            commits.mockRestore()
         }
     })
 

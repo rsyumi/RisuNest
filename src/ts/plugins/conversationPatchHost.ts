@@ -50,6 +50,7 @@ function captureStreamingPublication(
 ) {
     const session = runtime.getActiveConversationSession()
     const overlay = runtime.captureSelectedConversationAuthority()?.overlay
+    const authorityEpoch = runtime.getStorageAuthorityEpoch()
     const previousVariables = { ...shell.scriptstate }
     const rows = planned.runs.flatMap(run => run.messages.map((after, offset) => {
         const index = run.start + offset
@@ -93,9 +94,11 @@ function captureStreamingPublication(
         publish() {
             const current = getSelectedConversation()
             const currentTarget = runtime.captureSelectedConversationTarget()
-            if (!current || !currentTarget || currentTarget.navigationGeneration !== target.navigationGeneration ||
-                currentTarget.characterId !== target.characterId || current.id !== target.conversationId) return
             const currentSession = runtime.getActiveConversationSession()
+            if (!current || !currentTarget || currentTarget.navigationGeneration !== target.navigationGeneration ||
+                currentTarget.characterId !== target.characterId || current.id !== target.conversationId ||
+                runtime.getStorageAuthorityEpoch() !== authorityEpoch || currentSession !== session ||
+                (!session && runtime.captureSelectedConversationAuthority()?.overlay !== overlay)) return
             const currentSource = runtime.getActiveConversationViewportSource()
             const ranges = rows.flatMap(row => {
                 const index = row.binding ? overlay!.locate(row.binding) : row.index
@@ -109,14 +112,15 @@ function captureStreamingPublication(
             const metadata = cloneConversationMetadata(current)
             const updated = planned.scriptstate ? { ...metadata, scriptstate:
                 publishFields<Record<string, unknown>>(previousVariables, planned.scriptstate, current.scriptstate ?? {}) } : metadata
-            if (!applyGenerationConversationRanges(currentTarget, current, phase, ranges, updated, runtime)) {
+            const generation = getGenerationOutputPhase(currentTarget) ?? phase
+            if (!applyGenerationConversationRanges(currentTarget, current, generation, ranges, updated, runtime)) {
                 throw new Error('Committed conversation patch could not be published to its owner')
             }
         },
     }
 }
 
-async function commitStreamingPatch(request: ConversationPatchRequest, signal?: AbortSignal): Promise<ConversationPatchResult | null> {
+async function commitStreamingPatch(request: ConversationPatchRequest, signal?: AbortSignal, intervalOwner?: GenerationOutputPhase): Promise<ConversationPatchResult | null> {
     const runtime = getPersistentDataRuntime()
     let outcome: ConversationPatchResult | null = null
     let publication: ReturnType<typeof captureStreamingPublication> | undefined
@@ -137,7 +141,11 @@ async function commitStreamingPatch(request: ConversationPatchRequest, signal?: 
             const phase = getGenerationOutputPhase(request)
             if (!phase) return null
             const busy = { status: 'busy', revision: reader.revision } as const
-            if (phase.phase !== 'streaming') { outcome = busy; return null }
+            // The interval can close while this admitted patch is queued. Its caller holds
+            // admission through publication, and the script waits for that caller before resuming.
+            const admitted = () => getGenerationOutputPhase(request) === phase &&
+                (intervalOwner ? phase === intervalOwner : phase.phase === 'streaming')
+            if (!admitted()) { outcome = busy; return null }
             const target = runtime.captureSelectedConversationTarget()
             const shell = getSelectedConversation()
             if (!target || !shell || target.characterId !== request.characterId || target.conversationId !== request.conversationId) {
@@ -150,7 +158,7 @@ async function commitStreamingPatch(request: ConversationPatchRequest, signal?: 
             const metadata = await reader.readConversationMetadata(request.characterId, request.conversationId)
             if (!metadata) {
                 const current = getGenerationOutputPhase(request)
-                if (current === phase && current.phase === 'streaming') {
+                if (admitted()) {
                     outcome = { status: 'conflict', conflict: { target: 'conversation', reason: 'not-found' }, revision: reader.revision }
                 } else if (current?.phase === 'processing') outcome = busy
                 return null
@@ -158,7 +166,7 @@ async function commitStreamingPatch(request: ConversationPatchRequest, signal?: 
             assertPinnedRevision(reader.revision, metadata.revision, 'Streaming patch conversation')
             const stored = await loadPatchMessages(reader, request, metadata.value.totalMessages)
             throwIfAborted(signal)
-            if (getGenerationOutputPhase(request) !== phase || phase.phase !== 'streaming') {
+            if (!admitted()) {
                 outcome = getGenerationOutputPhase(request)?.phase === 'processing' ? busy : null
                 return null
             }
@@ -200,6 +208,11 @@ async function commitStreamingPatch(request: ConversationPatchRequest, signal?: 
         }, {
             committed: () => { committed = true },
             retire: releasePublication,
+        }).catch(error => {
+            // A later flush retries the committed projection. End the suspended invocation now
+            // so that its drain does not wait for the same provider to schedule that flush.
+            if (committed && publication) intervalOwner?.fail(error)
+            throw error
         }).finally(() => {
             // A durable write whose first projection failed is still owned by the save
             // queue. Retry must publish to the same rows before the generation closes.

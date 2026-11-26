@@ -78,6 +78,7 @@ vi.mock('src/ts/process/presetChain', async () => (await import('../process/test
 import type { Chat, Database, Message } from '../storage/database.svelte'
 import { getDatabase, setDatabaseLite } from '../storage/database.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
+import { ConversationSessionInactiveError } from '../storage/activeConversationSession'
 import {
     acquireCompleteConversation,
     activateCharacter,
@@ -705,9 +706,84 @@ describe('public writes to the complete streaming conversation', () => {
         }
     })
 
+    it('saves a setter already queued when a short plugin interval opens before the trigger resumes', async () => {
+        const fixture = await setup()
+        const { requestChatData } = await import('../process/request/request')
+        const context = { pluginName: 'independent-writer', signal: new AbortController().signal }
+        const resumed: string[] = []
+        try {
+            await whileStreaming(fixture, async ({ finishStream }) => {
+                const chat = (await fixture.access.getChatFromIndex(0, 0, context))!
+                chat.message[0].data = 'queued before request hook'
+                vi.mocked(requestChatData).mockImplementationOnce(async (_arg, _model, _signal, boundary) => {
+                    const writing = fixture.access.setChatToIndex(0, 0, chat, context)
+                    await boundary!.open()
+                    await boundary!.close()
+                    resumed.push((await reopen()).message[0].data)
+                    await writing
+                    return { type: 'success', result: 'trigger result' }
+                })
+                finishStream()
+            })
+            expect(resumed).toEqual(['queued before request hook'])
+            expect((await reopen()).message.map(row => row.data)).toEqual([
+                'queued before request hook', 'second', 'last prompt', 'reply edited by trigger',
+            ])
+        } finally {
+            fixture.access.closeReadBaselines()
+        }
+    })
+
     it('waits for an output trigger before applying a complete setter and accepts the patch retry', async () => {
         const fixture = await setup()
         try { await checkOutputProcessing(fixture) }
         finally { fixture.access.closeReadBaselines() }
+    })
+
+    it.each(['character', 'database', 'database lite'] as const)('keeps only the committed chat edit when a mixed %s setter is cancelled', async kind => {
+        const fixture = await setup()
+        const reader = await fixture.connect()
+        const { requestChatData } = await import('../process/request/request')
+        const context = { pluginName: 'independent-writer', signal: new AbortController().signal }
+        const read = () => reader.materializeDatabase()
+        const original = await read()
+        let atCancellation: Database
+        let writing: Promise<void>
+        try {
+            await whileStreaming(fixture, async ({ cancel, finishStream }) => {
+                vi.mocked(requestChatData).mockImplementationOnce(async (_arg, _model, _signal, boundary) => {
+                    await boundary!.open()
+                    const commit = fixture.runtime.commitPersistentUnitIntent
+                    vi.spyOn(fixture.runtime, 'commitPersistentUnitIntent').mockImplementationOnce(async (...args) => {
+                        atCancellation = await read()
+                        cancel()
+                        return commit(...args)
+                    })
+                    if (kind === 'character') {
+                        const owner = (await fixture.access.getCharacterFromIndex(0, context))!
+                        owner.desc = 'pending character change'
+                        owner.chats[0].message[0].data = 'committed chat edit'
+                        writing = fixture.access.setCharacterToIndex(0, owner, context)
+                    } else {
+                        const keys = ['characters', 'ttsAutoSpeech']
+                        const value = await fixture.access.getDatabaseSnapshot(keys, keys)
+                        const owners = value.characters as Database['characters']
+                        owners[0].chats[0].message[0].data = 'committed chat edit'
+                        value.ttsAutoSpeech = true
+                        writing = Promise.resolve(fixture.access[kind === 'database' ? 'setDatabase' : 'setDatabaseLite'](value, keys))
+                    }
+                    await writing.catch(() => {})
+                    await boundary!.close()
+                    return { type: 'success', result: 'late result' }
+                })
+                finishStream()
+            }, undefined, false)
+            for (const stored of [atCancellation!, await read()]) {
+                expect(stored.characters[0].chats[0].message[0].data).toBe('committed chat edit')
+                expect(stored.characters[0].desc).toBe(original.characters[0].desc)
+                expect(stored.ttsAutoSpeech).toBe(original.ttsAutoSpeech)
+            }
+            await expect(writing!).rejects.toBeInstanceOf(ConversationSessionInactiveError)
+        } finally { fixture.access.closeReadBaselines() }
     })
 })

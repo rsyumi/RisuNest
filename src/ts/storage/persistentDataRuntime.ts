@@ -1,4 +1,4 @@
-import { getGenerationOutputPhase } from '../process/generationOutputPhase'
+import { getGenerationOutputPhase, recheckGenerationOutputOwners } from '../process/generationOutputPhase'
 import { advancePluginStorageRemoteChanges, fenceUnknownPluginStorageDrain } from '../plugins/pluginStorageProtection'
 import type { PluginStorageWriteCheck } from '../plugins/pluginStorageProtection'
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
@@ -747,9 +747,11 @@ export function createPersistentDataRuntime(
         onLocalSaveFailure: dependencies.onLocalSaveFailure,
         onWorkingSetRefreshRequired: (revision) => {
             if (revision === null) pendingRefreshChangeSet = null
+            else recheckGenerationOutputOwners()
             dependencies.onWorkingSetRefreshRequired?.(revision)
         },
         onDestructiveReplacementFenceChanged: (active) => {
+            if (active) recheckGenerationOutputOwners()
             // A projection can request demotion while its input guard still blocks it.
             // Retry only after the final release, preserving all ordinary demotion checks.
             if (!active) {
@@ -788,6 +790,7 @@ export function createPersistentDataRuntime(
         isConversationOperationActive: dependencies.state.isConversationOperationActive,
         subscribeConversationOperationActive:
             dependencies.state.subscribeConversationOperationActive,
+        onConversationOwnerChange: recheckGenerationOutputOwners,
         conversationViewportRowBudget: dependencies.state.conversationViewportRowBudget,
     })
     const activateCharacter = (

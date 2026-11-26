@@ -1,5 +1,5 @@
 import type { Chat } from '../storage/database.svelte'
-import { getGenerationOutputPhase } from '../process/generationOutputPhase'
+import { getGenerationOutputPhase, type GenerationOutputPhase } from '../process/generationOutputPhase'
 import { prepareGenerationMetadataPatch } from '../process/generationRequestPhase'
 import type { ActiveConversationSession } from '../storage/activeConversationSession'
 import type { CompleteConversationLease, SelectedConversationTarget } from '../storage/activeWorkingSet.svelte'
@@ -19,7 +19,7 @@ import { throwIfAborted } from './pluginQueryInput'
 const PATCH_REASON = 'plugin-conversation-patch'
 
 export interface ConversationPatchAccessDependencies {
-    commitStreamingPatch(request: ConversationPatchRequest, signal?: AbortSignal): Promise<ConversationPatchResult | null>
+    commitStreamingPatch(request: ConversationPatchRequest, signal?: AbortSignal, intervalOwner?: GenerationOutputPhase): Promise<ConversationPatchResult | null>
     flushPendingData(reason: string): Promise<void>
     getPersistentRevision(): DataRevision
     captureSelectedConversationTarget(): SelectedConversationTarget | null
@@ -84,9 +84,9 @@ export function createConversationPatchAccess(dependencies: ConversationPatchAcc
 
     const commitToOtherConversation = async (request: ConversationPatchRequest, signal: AbortSignal | undefined) => {
         const result = await commitThroughStore(request, signal, () => !dependencies.isConversationGenerating(request))
-        return result.status === 'busy' && getGenerationOutputPhase(request)?.phase === 'streaming'
-            ? patchConversation(request, signal)
-            : result
+        const phase = getGenerationOutputPhase(request)
+        return result.status === 'busy' && (phase?.phase === 'streaming' || phase?.pluginWritesOpen)
+            ? patchConversation(request, signal) : result
     }
 
     // The session adopts the commit as persisted metadata, which keeps the generation's
@@ -156,7 +156,15 @@ export function createConversationPatchAccess(dependencies: ConversationPatchAcc
 
     async function patchConversation(request: ConversationPatchRequest, signal?: AbortSignal): Promise<ConversationPatchResult> {
         const output = getGenerationOutputPhase(request)
-        if (output?.phase === 'processing') return busy()
+        if (output?.phase === 'processing') {
+            if (!output.pluginWritesOpen) return busy()
+            const write = output.holdWrite()
+            try {
+                return await dependencies.commitStreamingPatch(request, signal, output) ?? busy()
+            } finally {
+                write.release()
+            }
+        }
         if (output?.phase === 'streaming') {
             const result = await dependencies.commitStreamingPatch(request, signal)
             // The generation ended before the queued write could acquire the owner.

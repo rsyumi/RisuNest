@@ -2954,17 +2954,13 @@ conversationResources: GenerationConversationResources):Promise<boolean> {
                       ),
             runCurrentChatParser: runCurrentChatFunction,
             runInlay: (data) => runInlayScreen(currentChar, data),
-            runOutputTrigger: async (chat, onConversationCommit) => {
-                const windowCurrent = historyWindow && captureHistoryWindowSource(historyWindow.controller)
-                const result = await runTrigger(currentChar, 'output', {
-                    chat,
-                    onConversationCommit,
-                    regexGeneration: abortSignal,
-                    regexScope: reservation.regexScope,
-                })
-                if (result && windowCurrent && !windowCurrent()) return { ...result, chat }
-                return result
-            },
+            runOutputTrigger: (chat, onConversationCommit) => runTrigger(currentChar, 'output', {
+                chat,
+                onConversationCommit,
+                historyWindow: historyWindow?.controller,
+                regexGeneration: abortSignal,
+                regexScope: reservation.regexScope,
+            }),
             runOutputListeners: (chat, messageIndex) =>
                 runChatOutputListeners(
                     currentChar,

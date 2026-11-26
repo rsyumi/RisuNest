@@ -383,9 +383,8 @@ function __postToParent(message) {
         expect(mocks.confirm).toHaveBeenCalledTimes(2)
     })
 
-    it('does not invoke a provider callback when provider permission is denied', async () => {
+    it.each(['denied', 'cancelled'])('does not invoke a provider after a %s permission wait', async outcome => {
         const name = 'denied-provider-fixture'
-        mocks.confirm.mockResolvedValue(false)
         await startFixture(name, `
             globalThis.providerCalls = 0;
             globalThis.rpcReady = risuai.addProvider('denied-provider', async () => {
@@ -396,12 +395,23 @@ function __postToParent(message) {
 
         const provider = mocks.providers.get('denied-provider')
         expect(provider).toBeTypeOf('function')
-        const result = await provider!({
+        let answer: (approved: boolean) => void
+        mocks.confirm.mockImplementationOnce(() => new Promise<boolean>(resolve => { answer = resolve }))
+        const caller = new AbortController()
+        const pending = provider!({
             prompt_chat: [{ role: 'user', content: 'sensitive sentinel' }],
             mode: 'chat',
-        })
+        }, caller.signal)
+        await vi.waitFor(() => expect(answer).toBeTypeOf('function'))
+        if (outcome === 'cancelled') {
+            caller.abort(new Error('generation cancelled'))
+            answer(true)
+            await expect(pending).rejects.toThrow('generation cancelled')
+        } else {
+            answer(false)
+            expect(await pending).toEqual({ success: false, content: language.pluginProviderPermissionDenied })
+        }
 
-        expect(result).toEqual({ success: false, content: language.pluginProviderPermissionDenied })
         expect(await guest(name, 'return globalThis.providerCalls')).toBe(0)
     })
 

@@ -158,6 +158,7 @@ export async function applyGenerationResponse(
             outputPhase = openGenerationOutputPhase(
                 { characterId: options.ownerCharacterId, conversationId: generationChat.id },
                 phase, getOutputTarget, isOwnerCurrent, onConversationCommit, options.operation.onLostOutput,
+                options.abortSignal, outputPosition.refresh,
             )
         }
     }

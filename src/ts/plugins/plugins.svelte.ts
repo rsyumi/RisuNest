@@ -436,8 +436,10 @@ export type PluginV2ProviderOptions = {
 
 export type EditFunction = (content: string) => string | null | undefined | Promise<string | null | undefined>
 type ReplacerFunction = (content: OpenAIChat[], type: string) => OpenAIChat[] | Promise<OpenAIChat[]>
+type RegisteredProvider = (arg: PluginV2ProviderArgument, signal?: AbortSignal, admit?: () => Promise<void>) =>
+    Promise<{ success: boolean, content: string | ReadableStream<string> }>
 export const pluginV2 = {
-    providers: new Map<string, (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>>(),
+    providers: new Map<string, RegisteredProvider>(),
     providerOptions: new Map<string, PluginV2ProviderOptions>(),
     editdisplay: new Set<EditFunction>(),
     editoutput: new Set<EditFunction>(),
