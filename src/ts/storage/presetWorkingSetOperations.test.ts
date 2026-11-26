@@ -62,7 +62,10 @@ describe('store-backed preset operations', () => {
             mutatePersistentPresets: vi.fn(async (_reason, mutate) => {
                 const { characters: _characters, botPresets: _botPresets, ...root } = structuredClone(live)
                 const state = { root, presets: structuredClone(persisted) }
+                const unchanged = JSON.stringify(state)
                 await mutate(state)
+                // As the save coordinator, a mutation that changes nothing commits and publishes nothing.
+                if (JSON.stringify(state) === unchanged) return
                 if (failCommit) throw new Error('commit failed')
                 persisted = state.presets
                 Object.assign(live, state.root)
@@ -270,6 +273,40 @@ it.each(['remove', 'copy'] as const)('rejects queued %s after a same-name reorde
     expect(live.botPresets.map(item => item.mainPrompt)).toEqual(['B', 'C', 'A'])
     await controller.copyPreset(0, ['X', 'X', 'X'])
     expect(live.botPresets[3]).toEqual({ ...preset('X Copy', 'B'), id: expect.stringMatching(/^[0-9a-f-]{36}$/) })
+})
+
+it.each(['update', 'remove', 'select', 'copy'] as const)('applies a %s by ID queued behind a reorder to the preset the ID names', async operation => {
+    let live = { botPresetsId: 0, botPresets: ['A', 'B', 'C'].map(name => ({ ...preset(name, name), id: `id-${name}` })) } as Database
+    let queue = Promise.resolve()
+    const controller = createPresetWorkingSetController({
+        getDatabase: () => live,
+        captureCurrentPreset: () => null,
+        applyPreset: () => {},
+        mutatePersistentPresets: (_reason, mutate) => {
+            const task = queue.then(async () => {
+                const state = { root: { botPresetsId: live.botPresetsId } as any, presets: structuredClone(live.botPresets) }
+                await mutate(state)
+                live = { ...live, ...state.root, botPresets: state.presets }
+            })
+            queue = task.catch(() => {})
+            return task
+        },
+    })
+    const moved = controller.movePreset(2, 0)
+    const pending = operation === 'update' ? controller.updatePresetById('id-B', item => { item.mainPrompt = 'written' })
+        : operation === 'remove' ? controller.removePresetById('id-B')
+        : operation === 'select' ? controller.changeToPresetById('id-B')
+        : controller.addPresetFrom('id-B', item => { item.name = 'Copy' })
+    await moved
+    await pending
+    const bodies = live.botPresets.map(item => `${item.name}:${item.mainPrompt}`)
+    expect(bodies).toEqual({
+        update: ['C:C', 'A:A', 'B:written'],
+        remove: ['C:C', 'A:A'],
+        select: ['C:C', 'A:A', 'B:B'],
+        copy: ['C:C', 'A:A', 'B:B', 'Copy:B'],
+    }[operation])
+    expect(live.botPresets[live.botPresetsId].name).toBe(operation === 'select' ? 'B' : 'A')
 })
 
 it('keeps the selection when another preset is removed and names the selection for the icon while another preset is applied', async () => {

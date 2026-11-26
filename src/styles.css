@@ -504,6 +504,13 @@ select optgroup {
   z-index: 100;
 }
 
+/* Floating plugin windows: above every screen and in-screen layer (up to 170), below the z-[1000]
+   work dialogs and a fullscreen plugin frame. The window code sets it inline from
+   floatingWindowGeometry.ts, counting up from here so the window shown or pressed last is on top. */
+@utility z-floating-plugin-window {
+  z-index: 500;
+}
+
 /* Alerts, confirmations, permission prompts, and other full-screen modals. Sits above the
    z-[1000] work dialogs (import progress, screenshot) so errors and confirmations stay visible. */
 @utility z-app-lock {

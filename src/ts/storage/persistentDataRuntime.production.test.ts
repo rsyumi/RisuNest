@@ -1726,6 +1726,33 @@ describe('preset list operations', () => {
         }
         expect(getDatabase().mainPrompt).toBe('Prompt B')
     })
+
+    it('applies selections called back to back in the order they were called', async () => {
+        const initial = normalizeDatabaseDefaults({} as Database)
+        Object.assign(initial.botPresets[0], { id: 'preset-a', name: 'A', mainPrompt: 'Prompt A' })
+        initial.botPresets.push({ ...structuredClone(initial.botPresets[0]), id: 'preset-b', name: 'B', mainPrompt: 'Prompt B' })
+        initial.mainPrompt = 'Prompt A'
+        initial.personas[0].id = 'persona'
+        const store = new IndexedDbPersistentDataStore(`preset-selection-order-${crypto.randomUUID()}`, new IDBFactory(), IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(initial)
+        setDatabaseLite(structuredClone(initial))
+        selectedCharID.set(-1)
+        const runtime = createPersistentDataRuntime({store, state: createProductionStateAdapter(), prepareDatabase: async (value) => value})
+        await runtime.initializeActiveWorkingSet(getDatabase())
+        const controller = createPresetWorkingSetController({
+            getDatabase, captureCurrentPreset, getEffectivePresetId,
+            applyPreset: (root, preset) => setPreset(root as Database, preset),
+            mutatePersistentPresets: (reason, mutate) => runtime.mutatePersistentPresets(reason, mutate),
+        })
+
+        // Two number hotkeys pressed quickly: the second selection comes while the first is still saving.
+        await Promise.all([controller.changeToPreset(1), controller.changeToPreset(0)])
+
+        expect(getDatabase().botPresetsId).toBe(0)
+        expect(getDatabase().mainPrompt).toBe('Prompt A')
+        expect((await store.readRoot()).value.botPresetsId).toBe('preset-a')
+    })
 })
 
 async function receiveCommit(store: PersistentDataStore, runtime: ReturnType<typeof createPersistentDataRuntime>,

@@ -19,6 +19,7 @@ import { workingSetResidency } from './workingSetResidency'
 import { clearStreamingConversation, setStreamingConversation } from './streamingConversationRegistry'
 import { indexSideChatListRows } from '../../lib/SideBars/sideChatListRows'
 import { observePersistentSaveChanges } from './persistentSaveObserver.svelte'
+import { cloneConversationMetadata } from './activeConversationSession'
 
 afterEach(() => {
     workingSetResidency.clear()
@@ -1094,7 +1095,15 @@ describe('selected chat list edits', () => {
         }
     })
 
-    it.each(['create', 'import'] as const)('adds a character by %s while a windowed conversation is open and keeps saving and navigating', async (route) => {
+    // Opening a character leaves its activation edits unsaved until the save debounce runs, and a
+    // streamed reply can land while the addition is being stored.
+    it.each([
+        { route: 'create', unsaved: 'nothing' },
+        { route: 'import', unsaved: 'nothing' },
+        { route: 'create', unsaved: 'its activation' },
+        { route: 'import', unsaved: 'its activation' },
+        { route: 'create', unsaved: 'a reply streamed during the addition' },
+    ] as const)('adds a character by $route while a windowed conversation is open with $unsaved unsaved and keeps saving and navigating', async ({ route, unsaved }) => {
         const indexedDB = new IDBFactory()
         const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
         const ownerId = 'edited-owner'
@@ -1116,13 +1125,28 @@ describe('selected chat list edits', () => {
             const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
             expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
             expect(runtime.getSelectedConversationMode()).toBe('windowed')
-            await runtime.flushPendingData('activation')
+            if (unsaved !== 'its activation') await runtime.flushPendingData('activation')
+            const reply = { role: 'char', data: 'Synthetic streamed reply' } as Message
+            const streamReply = () => {
+                const target = runtime.captureSelectedConversationTarget()!
+                const authority = runtime.captureSelectedConversationAuthority()!
+                const owner = stores.DBState.db.characters[indexOf(ownerId)]
+                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: [] } as unknown as Chat
+                const controller = runtime.captureWindowedConversationMutationController(target, chat, authority.totalMessages)!
+                expect(controller.applyRange(0, 0, [reply], 'append')).toBe(true)
+                controller.release()
+            }
             await reader.open()
             const readConversation = vi.spyOn(runtime.store, 'readConversation')
             const committed: { keys: string[], units: string[], added?: string, replaced?: string }[] = []
             const historiesAfterCommit: Message[][] = []
             const commit = runtime.store.commit.bind(runtime.store)
+            // The row the conversation shows for the reply when the save after the addition starts.
+            let replyRowBeforeItsSave: Message | null | undefined
             vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                if (unsaved === 'a reply streamed during the addition' && replyRowBeforeItsSave === undefined && committed.some((entry) => entry.added)) {
+                    replyRowBeforeItsSave = runtime.getActiveConversationViewportSource()!.snapshot().rowAt(history.length)?.message ?? null
+                }
                 committed.push({
                     keys: Object.keys(request).filter((key) => key !== 'expectedRevision').sort(),
                     units: (request.unitMutations ?? []).map((mutation) => mutation.key),
@@ -1131,6 +1155,7 @@ describe('selected chat list edits', () => {
                 })
                 const result = await commit(request)
                 historiesAfterCommit.push((await reader.readConversation(ownerId, selectedId))!.value.message)
+                if (unsaved === 'a reply streamed during the addition' && request.addCharacter) streamReply()
                 return result
             })
 
@@ -1147,9 +1172,17 @@ describe('selected chat list edits', () => {
             expect(committed.flatMap((entry) => entry.added ? [entry.added] : [])).toEqual([addedId])
             expect(committed.flatMap((entry) => entry.replaced ? [entry.replaced] : [])).toEqual([])
             expect(historiesAfterCommit.length).toBeGreaterThan(0)
-            for (const messages of historiesAfterCommit) expect(messages).toEqual(history)
+            // The addition leaves the conversation alone; the same save then stores a streamed reply.
+            const savedHistory = unsaved === 'a reply streamed during the addition' ? [...history, reply] : history
+            expect(historiesAfterCommit[committed.findIndex((entry) => entry.added)]).toEqual(history)
+            for (const messages of historiesAfterCommit) expect([history, savedHistory]).toContainEqual(messages)
             await reader.open()
             expect((await reader.readRoot()).value.characterOrder).toContain(addedId)
+            if (unsaved === 'a reply streamed during the addition') expect(replyRowBeforeItsSave).toEqual(reply)
+            if (unsaved !== 'nothing') {
+                await runtime.flushPendingData('unsaved')
+                expect(get(app.localSaveFailure)).toBeNull()
+            }
             const additionCommitBoundary = committed.length
 
             stores.DBState.db.username = 'Saved beside the windowed chat'
@@ -1180,7 +1213,220 @@ describe('selected chat list edits', () => {
             if (route === 'import') {
                 expect((await reader.readConversation(addedId, `${addedId}-chat`))?.value.message).toEqual(importedHistory)
             }
-            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual(history)
+            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual(savedHistory)
+        } finally {
+            consoleError.mockRestore()
+            Object.assign(globalThis, previousGlobals)
+        }
+    })
+
+    // A reply keeps streaming into the open conversation while another change is stored: the reply
+    // started before the commit and its text grows while the commit runs.
+    it.each([
+        { change: 'a save of another setting' },
+        { change: 'a plugin settings write' },
+        { change: 'a character detail change' },
+        { change: 'a detail change of the open character' },
+        { change: 'a chat setting change' },
+        { change: 'a preset change' },
+        { change: 'a plugin storage change' },
+    ] as const)('keeps a reply that streams while $change is stored in the open windowed conversation', async ({ change }) => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const otherId = 'second-character'
+        const selectedId = `${ownerId}-chat`
+        const marker = 'Changed while streaming'
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const reader = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        const history = Array.from({ length: 300 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `Synthetic windowed message ${index}`,
+            chatId: `synthetic-windowed-${index}`,
+        })) as Message[]
+        const library = syntheticLibrary('character')
+        library.characters[0].chats[0].message = history
+        try {
+            const app = await bootProductionApp(indexedDB, library)
+            const { stores, runtime, characters } = app
+            const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
+            expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            await runtime.flushPendingData('activation')
+            const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
+            const full = { ...partial, data: 'Synthetic reply, streamed further' }
+            const write = (start: number, deleteCount: number, message: Message) => {
+                const target = runtime.captureSelectedConversationTarget()!
+                const owner = stores.DBState.db.characters[indexOf(ownerId)]
+                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: deleteCount ? [partial] : [] } as unknown as Chat
+                const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
+                expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
+                controller.release()
+            }
+            write(history.length, 0, partial)
+
+            // What the conversation shows, loaded from the store, before anything stores the grown text.
+            let shown: { reply?: Message, first?: Message, total: number } | undefined
+            const inspect = async () => {
+                const source = runtime.getActiveConversationViewportSource()!
+                await source.ensureRange({ startIndex: history.length - 2, limit: 4, reason: 'viewport' })
+                await source.ensureRange({ startIndex: 0, limit: 8, reason: 'viewport' })
+                const snapshot = source.snapshot()
+                shown = { reply: snapshot.rowAt(history.length)?.message, first: snapshot.rowAt(0)?.message, total: snapshot.totalMessages }
+            }
+            const isChange = (request: object) => JSON.stringify(request).includes(change.includes('setting') && !change.includes('chat') ? 'loreBookDepth' : marker)
+            let grown = false
+            const commit = runtime.store.commit.bind(runtime.store)
+            vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                if (grown && !shown) await inspect()
+                const result = await commit(request)
+                if (!grown && isChange(request)) {
+                    grown = true
+                    write(history.length, 1, full)
+                }
+                return result
+            })
+
+            if (change === 'a save of another setting') {
+                stores.DBState.db.loreBookDepth = 7
+                runtime.markPersistentDataDirty(1)
+                await runtime.flushPendingData('settings-change')
+            } else if (change === 'a plugin settings write') {
+                await runtime.commitPersistentUnitIntent('plugin-settings-write', [
+                    { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 7 },
+                ])
+            } else if (change === 'a character detail change') {
+                expect(await runtime.mutateCharacterDetailFields(otherId, 'character-detail', ({ character }) => {
+                    character.desc = marker
+                }, () => stores.DBState.db.characters[indexOf(otherId)])).toBe(true)
+            } else if (change === 'a detail change of the open character') {
+                expect(await runtime.mutateCharacterDetailFields(ownerId, 'character-detail', ({ character }) => {
+                    character.desc = marker
+                }, () => stores.DBState.db.characters[indexOf(ownerId)])).toBe(true)
+            } else if (change === 'a chat setting change') {
+                await runtime.mutateConversationBinding(ownerId, selectedId, { note: marker }, () => {})
+            } else if (change === 'a preset change') {
+                await runtime.mutatePersistentPresets('preset-rename', (state) => {
+                    expect(state.presets.length).toBeGreaterThan(0)
+                    state.presets[0].name = marker
+                })
+            } else {
+                await runtime.mutatePersistentPluginStorage('plugin-storage', [{ type: 'set', owner: 'synthetic-plugin', key: 'note', value: marker }])
+            }
+            expect(grown).toBe(true)
+            if (!shown) await inspect()
+            expect(get(app.localSaveFailure)).toBeNull()
+            expect(runtime.getSelectedConversationMode()).toBe('windowed')
+            expect(shown).toEqual({ reply: full, first: history[0], total: history.length + 1 })
+
+            await runtime.flushPendingData('reply')
+            expect(get(app.localSaveFailure)).toBeNull()
+            await runtime.commitPersistentUnitIntent('plugin-settings-write', [
+                { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 9 },
+            ])
+            expect(consoleError.mock.calls.map((args) => args.map((value) =>
+                value instanceof Error ? `${value.name}: ${value.message}` : String(value).slice(0, 200)))).toEqual([])
+            await reader.open()
+            expect((await reader.readConversation(ownerId, selectedId))?.value.message).toEqual([...history, full])
+            expect((await reader.readRoot()).value.loreBookDepth).toBe(9)
+        } finally {
+            consoleError.mockRestore()
+            Object.assign(globalThis, previousGlobals)
+        }
+    })
+
+    // Another writer (a second connection) moves rows of the open conversation, then this window's
+    // commit retries past that revision. Rows read before the move must not be stored back by index.
+    it.each([
+        { change: 'a plugin settings write', grows: true },
+        { change: 'a preset change', grows: true },
+        { change: 'a plugin settings write', grows: false },
+    ])('keeps every message when another writer moves rows of the open windowed conversation during $change (reply grows: $grows)', async ({ change, grows }) => {
+        const indexedDB = new IDBFactory()
+        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+        const ownerId = 'edited-owner'
+        const selectedId = `${ownerId}-chat`
+        const marker = 'Changed while another writer moved rows'
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const other = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        const history = Array.from({ length: 300 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `Synthetic windowed message ${index}`,
+            chatId: `synthetic-windowed-${index}`,
+        })) as Message[]
+        const library = syntheticLibrary('character')
+        library.characters[0].chats[0].message = history
+        try {
+            const app = await bootProductionApp(indexedDB, library)
+            const { stores, runtime, characters } = app
+            const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
+            expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
+            await runtime.flushPendingData('activation')
+            const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
+            const write = (start: number, deleteCount: number, message: Message) => {
+                const target = runtime.captureSelectedConversationTarget()!
+                const owner = stores.DBState.db.characters[indexOf(ownerId)]
+                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: deleteCount ? [partial] : [] } as unknown as Chat
+                const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
+                expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
+                controller.release()
+            }
+            write(history.length, 0, partial)
+            await runtime.flushPendingData('partial-reply')
+            await other.open()
+            const moved = [...history.slice(0, -1), partial, history.at(-1)!]
+            const isChange = (request: object) => /loreBookDepth|Changed while another writer/.test(JSON.stringify(request))
+            let commits = 0
+            const commit = runtime.store.commit.bind(runtime.store)
+            vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                const counted = isChange(request) ? ++commits : 0
+                if (counted === 1) {
+                    const stored = (await other.readConversation(ownerId, selectedId))!
+                    await other.commit({ expectedRevision: stored.revision, conversations: [{ type: 'replace-range', characterId: ownerId,
+                        conversationId: selectedId, start: history.length - 1, deleteCount: 2, messages: [partial, history.at(-1)!] }] })
+                }
+                const result = await commit(request)
+                if (counted && grows) write(history.length, 1, { ...partial, data: `Synthetic reply, streamed further ${counted}` })
+                return result
+            })
+
+            const saved = change === 'a preset change'
+                ? runtime.mutatePersistentPresets('preset-rename', (state) => { state.presets[0].name = marker })
+                : runtime.commitPersistentUnitIntent('plugin-settings-write', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 7 }])
+            if (grows) {
+                // The rows the screen holds may not show the move, so the change is stored and the screen is
+                // read again before anything else is saved.
+                await expect(saved).rejects.toBeInstanceOf(Error)
+                expect(runtime.pendingWorkingSetRefreshRevision).not.toBeNull()
+            } else {
+                await saved
+                expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                const source = runtime.getActiveConversationViewportSource()!
+                await source.ensureRange({ startIndex: history.length - 2, limit: 3, reason: 'viewport' })
+                expect([history.length - 1, history.length].map((index) => source.snapshot().rowAt(index)?.message)).toEqual(moved.slice(-2))
+                // Once the rows are read again, commits while the next reply streams keep that reply.
+                for (const [index, save] of [
+                    () => runtime.commitPersistentUnitIntent('plugin-settings-write', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 8 }]),
+                    () => runtime.flushPendingData('streaming-save'),
+                ].entries()) {
+                    const next = { role: 'char', data: `Synthetic reply ${index} after the rows were read again`, chatId: `synthetic-next-${index}` } as Message
+                    vi.mocked(runtime.store.commit).mockImplementationOnce(async (request) => {
+                        const result = await commit(request)
+                        write(moved.length, 0, next)
+                        return result
+                    })
+                    await save()
+                    expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                    moved.push(next)
+                }
+            }
+            // Later saves store nothing at the indexes the moved rows had.
+            await Promise.resolve().then(() => runtime.flushPendingData('later-save')).catch(() => {})
+            await Promise.resolve().then(() => runtime.commitPersistentUnitIntent('plugin-settings-write', [
+                { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 9 },
+            ])).catch(() => {})
+            expect((await other.readConversation(ownerId, selectedId))?.value.message).toEqual(moved)
+            if (!grows) expect(consoleError).not.toHaveBeenCalled()
         } finally {
             consoleError.mockRestore()
             Object.assign(globalThis, previousGlobals)

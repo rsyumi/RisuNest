@@ -19,6 +19,7 @@ import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, downloadFile, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
+import { isThemeExcluded } from "src/ts/gui/receivedDisplaySettings";
 import { isTauri } from "src/ts/platform";
 import { get } from "svelte/store";
 import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
@@ -77,6 +78,7 @@ import {
     type PluginFullObjectCallContext,
 } from "../pluginDatabaseAccess";
 import { createRisunestPrivateApi } from './risunestPrivateApi';
+import { createRisunestHostMethods } from '../risunestHostMethods';
 import { chatViewEvents } from '../chatViewHost.svelte';
 import { generationEndEvents } from '../generationEndHost';
 import { conversationPatchAccess } from '../conversationPatchHost';
@@ -811,6 +813,14 @@ const makeRisuaiAPIV3 = (
         hasHostToolPermission: () => getPluginPermission(permissionContext, 'hostTools', 'periodically'),
         lifetimeSignal: pluginLifetime.signal,
     })
+    const risunestHost = createRisunestHostMethods({
+        pluginName: plugin.name,
+        databaseAccess,
+        hasDatabasePermission: () => getPluginPermission(permissionContext, 'db', 'periodically'),
+        hasDatabaseWritePermission,
+        lifetimeSignal: pluginLifetime.signal,
+        iframe,
+    })
     const fullObjectContext = (): PluginFullObjectCallContext => ({
         pluginName: plugin.name,
         signal: pluginLifetime.signal,
@@ -1013,6 +1023,7 @@ const makeRisuaiAPIV3 = (
             risunest.onChatView(callback),
         risunestOnGenerationEnd: (callback?: unknown) =>
             risunest.onGenerationEnd(callback),
+        ...risunestHost.methods,
 
         installPlugin: (plugins: RisuPlugin[]) => handlePluginInstallViaPlugin(plugins, plugin.name, 'installPlugin'),
 
@@ -1055,7 +1066,7 @@ const makeRisuaiAPIV3 = (
             }
             const db = DBState.db
             db.textTheme = name
-            updateTextThemeAndCSS()
+            if (!isThemeExcluded()) updateTextThemeAndCSS()
         },
         setCustomTextTheme: (theme: {
             FontColorStandard: string,
@@ -1076,7 +1087,7 @@ const makeRisuaiAPIV3 = (
             const db = DBState.db
             db.textTheme = 'custom'
             db.customTextTheme = theme
-            updateTextThemeAndCSS()
+            if (!isThemeExcluded()) updateTextThemeAndCSS()
         },
         getTextTheme: () => {
             const db = DBState.db
@@ -1186,6 +1197,7 @@ const makeRisuaiAPIV3 = (
             //more types may be added in future
             type: 'fullscreen' = 'fullscreen'
         ) => {
+            risunestHost.floating.stop();
             iframe.style.display = "block";
             
             switch(type) {
@@ -1211,6 +1223,7 @@ const makeRisuaiAPIV3 = (
             }
         },
         hideContainer: () => {
+            risunestHost.floating.stop();
             iframe.style.display = "none";
         },
         getRootDocument: async () => {

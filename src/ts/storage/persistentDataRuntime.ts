@@ -36,6 +36,7 @@ import { readCurrentRevision, RevisionConflictError } from './persistentDataStor
 import {
     SaveCoordinator,
     PersistentMutationFencedError,
+    unitKeysReachConversationMessages,
     type CharacterAdditionRequest,
     type OfficialRevisionPublisher,
     type PersistentPresetMutation,
@@ -695,13 +696,13 @@ export function createPersistentDataRuntime(
             : undefined,
         clock: dependencies.clock,
         now: dependencies.now,
-        onLocalRevision: (revision) => publishCommittedProjection({ wholeLibrary: true }, () => {
-            workingSet.advanceStoreRevision(revision)
+        onLocalRevision: (revision, storedTotalMessages, rewritten) => publishCommittedProjection({ wholeLibrary: true }, () => {
+            workingSet.advanceStoreRevision(revision, undefined, false, storedTotalMessages, rewritten)
             dependencies.onLocalRevision?.(revision)
         }),
-        onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
-        onWindowedSelectedConversationRevision: (revision, totalMessages, preserveRows) =>
-            workingSet.advanceStoreRevision(revision, totalMessages, preserveRows),
+        onStorageOnlyRevision: (revision, storedTotalMessages) => workingSet.advanceStoreRevision(revision, undefined, false, storedTotalMessages),
+        onWindowedSelectedConversationRevision: (revision, totalMessages, preserveRows, storedTotalMessages) =>
+            workingSet.advanceStoreRevision(revision, totalMessages, preserveRows, storedTotalMessages),
         completeWindowedSelectedConversation: (authority, messages) =>
             workingSet.completeWindowedConversationForSave(authority, messages),
         onConversationMutationPersistenceStarted: (event) =>
@@ -1202,7 +1203,8 @@ export function createPersistentDataRuntime(
             if (kind === 'order') return owner === 'conversations' && id !== selectedTarget!.characterId
             return kind === 'exists' && owner === 'character' && id !== selectedTarget!.characterId
         })
-        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation, preserveSelectedRows)
+        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation, preserveSelectedRows,
+            Boolean(selectedTarget) && !unitKeysReachConversationMessages(result.affectedKeys, selectedTarget!.characterId, selectedTarget!.conversationId))
         adoptWindowedMetadata()
         const changedRootFields = new Set(rootFields.filter((field, index) => rootValue(field) !== rootBefore[index]))
         if (changedRootFields.size > 0) {

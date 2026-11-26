@@ -13,6 +13,14 @@ export class PresetListChangedError extends Error {
     constructor() { super('Preset list changed'); this.name = 'PresetListChangedError' }
 }
 
+export class PresetNotFoundError extends Error {
+    constructor(id: string) { super(`Preset ${id} was not found`); this.name = 'PresetNotFoundError' }
+}
+
+export class LastPresetRemovalError extends Error {
+    constructor() { super('There must be at least one preset'); this.name = 'LastPresetRemovalError' }
+}
+
 export interface PresetListSnapshot {
     names: readonly string[]
     presets: readonly Pick<botPreset, 'name'>[]
@@ -62,6 +70,13 @@ export interface PresetWorkingSetController {
     renamePreset(id: number, name: string, expectedNames?: PresetListExpectation): Promise<void>
     updateActivePresetImage(image: string): Promise<void>
     clearPluginProvider(names: readonly string[]): Promise<void>
+    // The operations by ID find the preset inside the mutation, so a list change queued before them
+    // cannot redirect them. An ID naming no stored preset rejects with PresetNotFoundError.
+    changeToPresetById(id: string): Promise<void>
+    removePresetById(id: string): Promise<void>
+    /** Appends a copy of the stored preset `source` names, or of `source` itself, as `edit` leaves it; resolves to its ID. */
+    addPresetFrom(source: string | botPreset, edit: (preset: botPreset) => void): Promise<string>
+    updatePresetById(id: string, edit: (preset: botPreset) => void): Promise<void>
 }
 
 function clonePreset(preset: botPreset): botPreset {
@@ -72,6 +87,12 @@ function assertPresetIndex(presets: readonly botPreset[], id: number): void {
     if (!Number.isInteger(id) || id < 0 || id >= presets.length) {
         throw new Error(`Preset index ${id} is out of bounds`)
     }
+}
+
+function presetIndexOf(presets: readonly botPreset[], id: string): number {
+    const index = presets.findIndex(preset => preset?.id === id)
+    if (index < 0) throw new PresetNotFoundError(id)
+    return index
 }
 
 export async function readPersistentPresetBody(
@@ -131,6 +152,23 @@ export function createPresetWorkingSetController(
         dependencies.applyPreset(state.root, state.presets[id])
     }
 
+    const remove = (state: PresetWorkingSetMutationState, id: number): string | undefined => {
+        if (state.presets.length <= 1) throw new LastPresetRemovalError()
+        saveActive(state)
+        assertPresetIndex(state.presets, id)
+        const selected = state.root.botPresetsId
+        const removedId = state.presets.splice(id, 1)[0]?.id
+        if (id === selected) select(state, 0)
+        else if (id < selected) state.root.botPresetsId = selected - 1
+        return removedId
+    }
+
+    const forgetRemovedOverride = (removedId: string | undefined): void => {
+        if (removedId && dependencies.getEffectivePresetOverride?.() === removedId) {
+            dependencies.clearEffectivePresetOverride?.()
+        }
+    }
+
     return {
         saveCurrentPreset: (expectedNames) => dependencies.mutatePersistentPresets(
             'save-current-preset',
@@ -143,13 +181,14 @@ export function createPresetWorkingSetController(
             const database = dependencies.getDatabase()
             assertPresetNames(database.botPresets, expectedNames)
             assertPresetIndex(database.botPresets, id)
-            // A conversation's binding may apply another preset; the list still changes the selection.
-            if (database.botPresetsId === id && !dependencies.getEffectivePresetOverride?.()) return
             const before = capturePresetNames(database.botPresets)
             await dependencies.mutatePersistentPresets('change-preset', (state) => {
                 assertPresetNames(dependencies.getDatabase().botPresets, before)
                 assertPresetNames(dependencies.getDatabase().botPresets, expectedNames)
                 assertPresetNames(state.presets, presetNames(expectedNames))
+                // Decided here, after the changes queued before this one. A conversation's binding
+                // may apply another preset; the list still changes the selection.
+                if (state.root.botPresetsId === id && !dependencies.getEffectivePresetOverride?.()) return
                 if (saveCurrent) saveActive(state)
                 select(state, id)
             })
@@ -190,19 +229,9 @@ export function createPresetWorkingSetController(
                 assertPresetNames(dependencies.getDatabase().botPresets, before)
                 assertPresetNames(dependencies.getDatabase().botPresets, expectedNames)
                 assertPresetNames(state.presets, presetNames(expectedNames))
-                if (state.presets.length <= 1) {
-                    throw new Error('There must be at least one preset')
-                }
-                saveActive(state)
-                assertPresetIndex(state.presets, id)
-                const selected = state.root.botPresetsId
-                removedId = state.presets.splice(id, 1)[0]?.id
-                if (id === selected) select(state, 0)
-                else if (id < selected) state.root.botPresetsId = selected - 1
+                removedId = remove(state, id)
             })
-            if (removedId && dependencies.getEffectivePresetOverride?.() === removedId) {
-                dependencies.clearEffectivePresetOverride?.()
-            }
+            forgetRemovedOverride(removedId)
         },
         movePreset(fromIndex, toIndex, expectedNames = capturePresetNames(dependencies.getDatabase().botPresets)) {
             const before = capturePresetNames(dependencies.getDatabase().botPresets)
@@ -253,6 +282,44 @@ export function createPresetWorkingSetController(
                 for (const preset of state.presets) {
                     if (preset?.currentPluginProvider && names.includes(preset.currentPluginProvider)) preset.currentPluginProvider = ''
                 }
+            })
+        },
+        async changeToPresetById(id) {
+            // Decided in the mutation, after the changes queued before this one.
+            await dependencies.mutatePersistentPresets('change-preset', (state) => {
+                const index = presetIndexOf(state.presets, id)
+                if (state.root.botPresetsId === index && !dependencies.getEffectivePresetOverride?.()) return
+                saveActive(state)
+                select(state, index)
+            })
+            dependencies.clearEffectivePresetOverride?.()
+        },
+        async removePresetById(id) {
+            let removedId: string | undefined
+            await dependencies.mutatePersistentPresets('remove-preset', (state) => {
+                removedId = remove(state, presetIndexOf(state.presets, id))
+            })
+            forgetRemovedOverride(removedId)
+        },
+        async addPresetFrom(source, edit) {
+            let addedId = ''
+            await dependencies.mutatePersistentPresets('add-preset', (state) => {
+                const index = typeof source === 'string' ? presetIndexOf(state.presets, source) : -1
+                // A copy of the applied preset carries its unsaved edits.
+                saveActive(state)
+                const added = clonePreset(index < 0 ? source as botPreset : state.presets[index])
+                edit(added)
+                added.id = addedId = v4()
+                state.presets.push(added)
+            })
+            return addedId
+        },
+        updatePresetById(id, edit) {
+            return dependencies.mutatePersistentPresets('update-preset', (state) => {
+                const index = presetIndexOf(state.presets, id)
+                // Unsaved edits of the applied preset are saved first, so they cannot overwrite this one.
+                saveActive(state)
+                edit(state.presets[index])
             })
         },
     }

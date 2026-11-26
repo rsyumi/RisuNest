@@ -500,6 +500,52 @@ describe('ActiveWorkingSet', () => {
         expect(harness.readConversation).not.toHaveBeenCalled()
     })
 
+    it('reads an evicted edited row from the store once a commit stores it while a later edit stays unsaved', async () => {
+        const full = makeChat('chat-a')
+        full.message = Array.from({ length: 40 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char', data: `stored ${index}`, chatId: `m${index}`,
+        })) as Message[]
+        const harness = await makeWindowedHarness({ characters: [makeCharacter('a', [full])] })
+        await expect(harness.workingSet.activateCharacter('a')).resolves.toBe(true)
+        const target = harness.workingSet.captureSelectedConversationTarget()!
+        const edit = (start: number, count: number, data: (index: number) => string) => {
+            const local = { ...structuredClone(full), message: structuredClone(full.message.slice(start, start + count)) }
+            const controller = harness.workingSet.captureWindowedConversationMutationController(target, local, start, true)!
+            expect(controller.applyRange(0, count, local.message.map((message, offset) =>
+                ({ ...message, data: data(start + offset) })), 'edit')).toBe(true)
+            controller.release()
+        }
+        edit(0, 1, () => 'edited first')
+        // A later edit of as many rows as the viewport keeps pushes the first edit's row out.
+        edit(1, 32, (index) => `later ${index}`)
+        const source = harness.workingSet.activeConversationViewportSource!
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+
+        // A commit stores the first edit and reports a revision while the later edit is still unsaved.
+        const { revision } = await harness.storage.store.readRoot()
+        const stored = (await harness.storage.store.commit({
+            expectedRevision: revision,
+            conversations: [{
+                type: 'replace-range', characterId: 'a', conversationId: 'chat-a', start: 0, deleteCount: 1,
+                messages: [{ ...full.message[0], data: 'edited first' }],
+            }],
+        })).revision
+        expect(harness.workingSet.acknowledgeConversationMutationPersisted({
+            characterId: 'a',
+            conversationId: 'chat-a',
+            sessionToken: harness.workingSet.captureSelectedConversationAuthority()!.sessionToken,
+            sessionVersion: 1,
+            revision: stored,
+        })).toBe(true)
+        harness.workingSet.advanceStoreRevision(stored, undefined, false, 40)
+        expect(harness.workingSet.activeConversationViewportSource).toBe(source)
+        await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
+        await source.ensureRange({ startIndex: 31, limit: 2, reason: 'viewport' })
+        const snapshot = source.snapshot()
+        expect([0, 31, 32].map((index) => snapshot.rowAt(index)?.message.data))
+            .toEqual(['edited first', 'later 31', 'later 32'])
+    })
+
     it('writes a script removal inside a generation window through the windowed tail', async () => {
         const full = makeChat('chat-a')
         full.message = [

@@ -1359,8 +1359,8 @@ describe('SaveCoordinator', () => {
         expect(coordinator.mutationGeneration).toBe(generation)
         expect(coordinator.storageAuthorityEpoch).toBe(authorityEpoch)
         expect(coordinator.pendingBytes).toBe(0)
-        expect(onStorageOnlyRevision).toHaveBeenCalledWith(5)
-        expect(onLocalRevision).toHaveBeenCalledWith(5)
+        expect(onStorageOnlyRevision.mock.calls.map(([revision]) => revision)).toEqual([5])
+        expect(onLocalRevision.mock.calls.map(([revision]) => revision)).toEqual([5])
         await coordinator.flushPendingData('storage-only-baseline')
         expect(commit).not.toHaveBeenCalled()
     })
@@ -1557,7 +1557,7 @@ describe('SaveCoordinator', () => {
         await mutation
 
         expect(coordinator.revision).toBe(8)
-        expect(onLocalRevision).toHaveBeenCalledWith(8)
+        expect(onLocalRevision.mock.calls.map(([revision]) => revision)).toContain(8)
     })
 
     it('persists an undefined plugin value as a deletion in a compatibility working set', async () => {

@@ -31,6 +31,7 @@ import type { WindowedConversationPersistenceAuthority } from './saveCoordinator
 import {
     PersistentConversationViewportSource,
     SynchronousSessionConversationViewportSource,
+    type ConversationRowsRewrite,
     type ConversationViewportSource,
 } from '../conversationViewportSource'
 import {
@@ -72,6 +73,7 @@ export interface WorkingSetCoordinator {
     advanceWindowedSelectedConversationRevision?(
         revision: DataRevision,
         authority: WindowedConversationPersistenceAuthority,
+        rowsKept?: boolean,
     ): boolean
     runSelectedConversationTransition?<T>(transition: () => T): T
     recordActiveConversationMutation?(event: ActiveConversationMutationEvent): void
@@ -556,6 +558,7 @@ export class ActiveWorkingSet {
                         absoluteStartIndex + localStart,
                         deleteCount,
                         detachedMessages,
+                        sessionVersion,
                     )
                     this.dependencies.coordinator.recordActiveConversationMutation({
                         characterId: state.characterId,
@@ -907,7 +910,13 @@ export class ActiveWorkingSet {
         return true
     }
 
-    advanceStoreRevision(revision: DataRevision, totalMessages?: number, preserveRows = false): void {
+    advanceStoreRevision(
+        revision: DataRevision,
+        totalMessages?: number,
+        preserveRows = false,
+        storedTotalMessages?: number,
+        rewritten: readonly ConversationRowsRewrite[] = [],
+    ): void {
         const state = this.selectedConversationState
         if (state?.kind !== 'windowed') {
             const previousRevision = this.activeSession?.storeRevision
@@ -928,14 +937,22 @@ export class ActiveWorkingSet {
             throw new Error('Windowed selected conversation revision advance is unavailable')
         }
         const authority = { ...state.authority, storeRevision: revision, totalMessages: totalMessages ?? state.authority.totalMessages }
-        if (preserveRows && authority.totalMessages === state.authority.totalMessages) {
+        // Edits made while the commit was stored are not in the store yet. When it stored nothing in this
+        // conversation but the session's own edits, or rewrote rows that hold none of the later ones, the
+        // rows, which hold those, stay.
+        const ahead = storedTotalMessages !== undefined && totalMessages === undefined &&
+            state.authority.sessionVersion !== state.authority.persistedSessionVersion &&
+            !state.viewportSource.holdsUnsavedRows(rewritten, state.authority.persistedSessionVersion)
+        if (ahead || (preserveRows && authority.totalMessages === state.authority.totalMessages)) {
             const previousAuthority = state.authority
             state.authority = authority
-            if (!advance.call(this.dependencies.coordinator, revision, authority)) {
+            if (!advance.call(this.dependencies.coordinator, revision, authority, true)) {
                 state.authority = previousAuthority
                 throw new Error('Windowed selected conversation revision was not adopted')
             }
-            state.viewportSource.advanceUnchangedRevision(revision)
+            state.viewportSource.advanceUnchangedRevision(revision, ahead
+                ? { totalMessages: storedTotalMessages!, sessionVersion: state.authority.persistedSessionVersion, rewritten }
+                : undefined)
             return
         }
         const viewportSource = new PersistentConversationViewportSource({

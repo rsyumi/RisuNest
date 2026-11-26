@@ -98,8 +98,16 @@ const driver = {
     unloadDownload() { downloadHost?.terminate() },
     get downloadIdle() { return downloadHost?.isIdle() },
     async load(script: string) {
-        fixtureState.database.plugins = [{ name: 'boundary', script, arguments: {}, realArg: {}, version: '3.0', customLink: [], argMeta: {}, enabled: true }]
+        await this.loadAll([script])
+    },
+    /** Runs one plugin per script; their frames follow the script order in the document. */
+    async loadAll(scripts: string[]) {
+        fixtureState.database.plugins = scripts.map((script, index) => ({ name: index ? `boundary-${index}` : 'boundary', script, arguments: {}, realArg: {}, version: '3.0', customLink: [], argMeta: {}, enabled: true }))
         await loadV3Plugins(fixtureState.database.plugins)
+    },
+    /** The app stylesheet, so a spec can compare against the app's real layers. */
+    async loadAppStyles() {
+        await import('../../src/styles.css')
     },
     async unload() {
         oldHost = getV3PluginInstance('boundary')
