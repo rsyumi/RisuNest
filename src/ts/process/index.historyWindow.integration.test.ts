@@ -4,12 +4,22 @@ import '../storage/tests/selectedConversationEvictionNodeDom.setup'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { requestChatData } from './request/request'
+import outputLuaWasmUrl from './lua/worker.wasm?url'
 import { get } from 'svelte/store'
+import { checkOutputProcessing, checkStreamingWrite, finalText, installOutputTrigger, liveMessage, setterCases, whileStreaming, type SetterCase } from './tests/streamingPluginWrites'
+import { createProductionPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
+import { openOutputRequestPlugin, outputPluginName, readPluginChat, runNestedRequest, type OutputRequestPlugin } from './tests/outputRequestPlugin'
+import { registerNestedRequestFailureCases } from './tests/outputRequestFailures'
+import { registerNestedMcpCases } from './tests/outputRequestMcp'
 import { alertStore } from '../alertQueue'
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
-import { DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
+import { CharEmotion, DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
+import { getPluginPermissionStore } from '../storage/nativePluginPermissions'
+import { deferred } from '../storage/saveCoordinator.testSupport'
+import * as clock from '../util'
 import { createConversationSummaryStubFromChat } from '../storage/conversationResidency'
 import {
     capturePersistentRoot,
@@ -26,6 +36,8 @@ const current = vi.hoisted(() => ({
     store: null as unknown as IndexedDbPersistentDataStore,
     alertError: null as unknown as ReturnType<typeof vi.fn>,
     snapshots: ['answer'],
+    pluginApi: null as OutputRequestPlugin | null,
+    windowed: true,
 }))
 
 vi.mock('../storage/persistentDataRuntime.svelte', async (importOriginal) => ({
@@ -45,12 +57,18 @@ vi.mock('../storage/persistentDataRuntime.svelte', async (importOriginal) => ({
     flushPendingData: (reason: string) => current.runtime.flushPendingData(reason),
     flushPendingDataLocally: (reason: string) => current.runtime.flushPendingDataLocally(reason),
     getActiveConversationSession: () => current.runtime.getActiveConversationSession(),
+    getActiveConversationViewportSource: () => current.runtime.getActiveConversationViewportSource(),
     peekActiveConversationSession: () => current.runtime?.getActiveConversationSession() ?? null,
     invalidateActiveConversationSession: () => current.runtime.invalidateActiveConversationSession(),
     getPersistentDataRuntime: () => current.runtime,
+    getPersistentRevision: () => current.runtime.revision,
+    withLiveConversationWrite: <T>(reason: string, operation: () => Promise<T>) => current.runtime.withLiveConversationWrite(reason, operation),
+    commitPreparedUnitIntent: (...args: Parameters<typeof current.runtime.commitPreparedUnitIntent>) => current.runtime.commitPreparedUnitIntent(...args),
+    commitPersistentUnitIntent: (...args: Parameters<typeof current.runtime.commitPersistentUnitIntent>) => current.runtime.commitPersistentUnitIntent(...args),
+    refreshSelectedConversationAfterReplacement: (...args: Parameters<typeof current.runtime.refreshSelectedConversationAfterReplacement>) => current.runtime.refreshSelectedConversationAfterReplacement(...args),
 }))
 vi.mock('../storage/persistentDataStoreFactory', async () => (await import('./tests/sendChatTestHarness')).persistentDataStoreFactoryModule(() => current.store))
-vi.mock('../storage/deviceSettings', async (importOriginal) => (await import('./tests/sendChatTestHarness')).historyWindowDeviceSettingsModule(importOriginal, () => true))
+vi.mock('../storage/deviceSettings', async (importOriginal) => (await import('./tests/sendChatTestHarness')).historyWindowDeviceSettingsModule(importOriginal, () => current.windowed))
 vi.mock('../iosNative', async () => (await import('./tests/sendChatTestHarness')).iosNativeModule())
 vi.mock('../tokenizer', async () => (await import('./tests/sendChatTestHarness')).tokenizerModule({
     // Every message costs ten tokens in the window walk.
@@ -71,11 +89,10 @@ vi.mock('./request/request', async () => (await import('./tests/sendChatTestHarn
         },
     }),
 }))))
-vi.mock('../parser/chatML', async () => (await import('./tests/sendChatTestHarness')).chatMLModule())
-vi.mock('../parser/parser.svelte', async (importOriginal) => ({
-    ...(await import('src/ts/parser/parser.testSupport')).parserStubModule(),
-    risuChatParser: (await importOriginal<typeof import('../parser/parser.svelte')>()).risuChatParser,
-}))
+vi.mock('../parser/parser.svelte', async (importOriginal) => {
+    const original = await importOriginal<typeof import('../parser/parser.svelte')>()
+    return { ...original, ...(await import('src/ts/parser/parser.testSupport')).parserStubModule(), risuChatParser: original.risuChatParser }
+})
 vi.mock('./lorebook.svelte', async () => (await import('./tests/sendChatTestHarness')).lorebookModule())
 vi.mock('./stableDiff', async () => (await import('./tests/sendChatTestHarness')).stableDiffModule({ generateAIImage: vi.fn() }))
 vi.mock('./templates/templates', async () => (await import('./tests/sendChatTestHarness')).templatesModule())
@@ -84,25 +101,27 @@ vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsMo
 vi.mock('./memory/supaMemory', async () => (await import('./tests/sendChatTestHarness')).supaMemoryModule())
 vi.mock('./memory/hypamemory', async () => (await import('./tests/sendChatTestHarness')).hypamemoryModule())
 vi.mock('./embedding/addinfo', async () => (await import('./tests/sendChatTestHarness')).addinfoModule())
-vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness')).inlaysModule({ writeInlayImage: vi.fn() }))
+vi.mock('./files/inlays', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./files/inlays')>(),
+    ...(await import('./tests/sendChatTestHarness')).inlaysModule({ writeInlayImage: vi.fn() }),
+}))
 vi.mock('./models/modelString', async () => (await import('./tests/sendChatTestHarness')).modelStringModule())
 vi.mock('./inlayScreen', async () => (await import('./tests/sendChatTestHarness')).inlayScreenModule())
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
 vi.mock('./memory/hanuraiMemory', async () => (await import('./tests/sendChatTestHarness')).hanuraiMemoryModule())
 vi.mock('./memory/hypav2', async () => (await import('./tests/sendChatTestHarness')).hypav2Module())
 vi.mock('./memory/hypav3', async () => (await import('./tests/sendChatTestHarness')).hypav3Module())
-vi.mock('../model/modellist', async () => (await import('./tests/sendChatTestHarness')).modellistModule())
 vi.mock('./modules', async (importOriginal) => ({
     ...await importOriginal<typeof import('./modules')>(),
     ...(await import('./tests/sendChatTestHarness')).modulesModule(),
 }))
-vi.mock('../globalApi.svelte', async () => (await import('./tests/sendChatTestHarness')).globalApiModule({
+vi.mock('../globalApi.svelte', async (importOriginal) => ({
+    ...await importOriginal<typeof import('../globalApi.svelte')>(),
     fetchNative: vi.fn(),
     downloadFile: vi.fn(),
 }))
-vi.mock('../plugins/plugins.svelte', async () => (await import('./tests/sendChatTestHarness')).pluginsModule())
+vi.mock('../plugins/apiV3/factory', async () => (await import('../plugins/apiV3/v3Host.testSupport')).sandboxHostModule(api => { current.pluginApi = api }))
 vi.mock('./presetChain', async () => (await import('./tests/sendChatTestHarness')).presetChainModule())
-vi.mock('./command', async () => (await import('./tests/sendChatTestHarness')).commandModule())
 
 const MESSAGES = 1_000
 const WINDOW_START = 900
@@ -256,7 +275,7 @@ async function bootWindowedConversation(
         publishConversationReplacement: (result) => {
             publishPersistentConversationReplacementToWorkingSet(DBState.db, result)
         },
-        canUseWindowedSelectedConversation: () => true,
+        canUseWindowedSelectedConversation: () => current.windowed,
         isConversationOperationActive: () => false,
         conversationViewportRowBudget: 64,
     }
@@ -270,22 +289,41 @@ async function bootWindowedConversation(
     })
     await current.runtime.initializeActiveWorkingSet(DBState.db)
     await vi.waitFor(
-        () => expect(current.runtime.getSelectedConversationMode()).toBe('windowed'),
+        () => expect(current.runtime.getSelectedConversationMode()).toBe(current.windowed ? 'windowed' : 'complete'),
         { timeout: 5_000 },
     )
-    return { store, backgroundErrors, async reopen() {
+    async function connect() {
         const reopened = new IndexedDbPersistentDataStore(name, factory, IDBKeyRange)
         await reopened.open()
-        return (await reopened.readConversation('character-a', 'chat-a'))!.value
+        return reopened
+    }
+    return { store, backgroundErrors, connect, async reopen() {
+        return (await (await connect()).readConversation('character-a', 'chat-a'))!.value
     } }
 }
 
 let restoreFetch: (() => void) | null = null
 
+beforeEach(() => {
+    vi.mocked(requestChatData).mockReset()
+    current.windowed = true
+})
+
+afterEach(async () => {
+    if (current.pluginApi) {
+        await (await import('../plugins/apiV3/v3.svelte')).loadV3Plugins([])
+        current.pluginApi = null
+        vi.mocked(getPluginPermissionStore).mockRestore()
+    }
+})
+
 beforeAll(async () => {
     const jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
+    const outputLuaWasm = await readFile(resolve(process.cwd(), 'src/ts/process/lua/worker.wasm'))
     const fetch = globalThis.fetch
-    globalThis.fetch = vi.fn(async () => new Response(jsonLuaSource, { status: 200 })) as typeof globalThis.fetch
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => String(url) === outputLuaWasmUrl
+        ? new Response(new Uint8Array(outputLuaWasm), { headers: { 'Content-Type': 'application/wasm' } })
+        : new Response(jsonLuaSource, { status: 200 })) as typeof globalThis.fetch
     restoreFetch = () => { globalThis.fetch = fetch }
     // The Lua runtime loads its WebAssembly from disk only when no browser globals are present,
     // so its factory is created once here before the send runs with the DOM in place.
@@ -467,66 +505,635 @@ describe('a windowed send through the production runtime', () => {
         } finally { release(); spy.mockRestore() }
     })
 
-    // A reply keeps streaming into the windowed conversation while a plugin's parser call stores an
-    // @@inject write; the reply's text grows while that commit runs.
     it.each([
-        { target: 'an earlier message', index: 100, adopted: true },
-        { target: 'the streaming reply', index: MESSAGES, adopted: false },
-    ])('keeps a streaming reply when a parser inject stores $target of the windowed conversation', async ({ index, adopted }) => {
-        const { store, reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), (seed) => {
+        { target: 'an earlier message', index: 100 },
+        { target: 'the streaming reply', index: MESSAGES },
+    ])('keeps a streaming reply when a parser inject stores $target of the windowed conversation', async ({ index }) => {
+        const { store, connect, reopen, backgroundErrors } = await bootWindowedConversation(storedMessages(), seed => {
             seed.characters[0].triggerscript = []
         })
+        const reader = await connect()
         const { parseRisuChat } = await import('../plugins/parseRisuChat')
-        const { cloneConversationMetadata } = await import('../storage/selectedConversationLifecycle')
         const runtime = current.runtime
-        const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
-        const full = { ...partial, data: 'Synthetic reply, streamed further' }
-        const write = (start: number, deleteCount: number, message: Message) => {
-            const target = runtime.captureSelectedConversationTarget()!
-            const chat = { ...cloneConversationMetadata(DBState.db.characters[0].chats[0]),
-                message: deleteCount ? [partial] : [] } as unknown as Chat
-            const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
-            expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
-            controller.release()
-        }
-        write(MESSAGES, 0, partial)
-        await runtime.flushPendingData('partial-reply')
-        const source = runtime.getActiveConversationViewportSource()!
-        await source.ensureRange({ startIndex: 96, limit: 8, reason: 'viewport' })
-        const historyVersion = source.snapshot().historyVersion
-        let grown = false
-        const commit = store.commit.bind(store)
-        const spy = vi.spyOn(store, 'commit').mockImplementation(async (request) => {
-            const result = await commit(request)
-            if (!grown && JSON.stringify(request).includes('STORED:plugin note')) {
-                grown = true
-                write(MESSAGES, 1, full)
-            }
-            return result
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        const reply = await whileStreaming({ runtime, length: MESSAGES, windowed: true }, async ({ chunk }) => {
+            await runtime.flushPendingData('partial-reply')
+            const source = runtime.getActiveConversationViewportSource()!
+            await source.ensureRange({ startIndex: index, limit: 1, reason: 'viewport' })
+            const version = source.snapshot().historyVersion!
+            const commit = store.commit.bind(store)
+            let grown = false
+            const spy = vi.spyOn(store, 'commit').mockImplementation(async request => {
+                const result = await commit(request)
+                if (!grown && JSON.stringify(request).includes('STORED:plugin note')) {
+                    grown = true
+                    const committed = await reader.readConversationWindow({
+                        characterId: 'character-a', conversationId: 'chat-a', startIndex: index, limit: 1,
+                    })
+                    expect(committed?.value.messages[0].data).toBe('STORED:plugin note')
+                    chunk('next streamed chunk')
+                    await vi.waitFor(() => expect(source.snapshot().rowAt(MESSAGES)?.message.data).toBe('next streamed chunk'))
+                }
+                return result
+            })
+            try {
+                expect(await parseRisuChat('WRITE:plugin note', { processRegex: true, messageIndex: index })).toBe('plugin note')
+                await runtime.flushPendingData('parser-inject')
+                expect(grown).toBe(true)
+                expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                expect(source.snapshot().historyChangesSince?.(version)?.some(change => change.start <= index && index < change.end)).toBe(true)
+                if (index !== MESSAGES) expect((await liveMessage(runtime, index))?.data).toBe('STORED:plugin note')
+                await runtime.mutateConversationBinding('character-a', 'chat-a', { bindedPersona: 'persona-id' },
+                    patch => Object.assign(DBState.db.characters[0].chats[0], patch))
+                await parseRisuChat('{{setvar::during_stream::kept}}', { runVar: true })
+            } finally { spy.mockRestore() }
         })
-        try {
-            const parsed = parseRisuChat('WRITE:plugin note', { processRegex: true, messageIndex: index })
-            if (!adopted) {
-                // The commit rewrote the row that holds the unsaved reply, so the screen is read again.
-                await expect(parsed).rejects.toMatchObject({ name: 'PersistentMutationFencedError' })
-                expect(runtime.pendingWorkingSetRefreshRevision).not.toBeNull()
-                return
+        await runtime.flushPendingData('streamed-reply')
+        const stored = await reopen()
+        expect(stored.message).toHaveLength(MESSAGES + 1)
+        expect(stored.message[100].data).toBe(index === 100 ? 'STORED:plugin note' : 'WRITE:outside')
+        expect(stored.message.at(-1)).toMatchObject({ chatId: reply.chatId, data: finalText })
+        expect(stored).toMatchObject({ bindedPersona: 'persona-id', scriptstate: { $during_stream: 'kept' } })
+        expect(backgroundErrors).toEqual([])
+    })
+
+    async function pluginFixture(edit?: SetterCase) {
+        const messages = storedMessages()
+        if (edit === 'legacy row') delete messages[0].chatId
+        if (edit === 'unread copy predating user message') messages[MESSAGES - 1] = { role: 'user', data: 'latest prompt', chatId: 'latest-user' }
+        const { connect, backgroundErrors } = await bootWindowedConversation(messages, seed => {
+            seed.characters[0].customscript = []
+            seed.characters[0].triggerscript = []
+            if (!edit) installOutputTrigger(seed)
+        })
+        const runtime = current.runtime
+        const access = createStreamingPluginAccess(runtime)
+        return { runtime, access, connect, length: MESSAGES, windowed: true, backgroundErrors }
+    }
+
+    async function nestedFixture(windowed: boolean, configure?: (db: Database) => void) {
+        current.windowed = windowed
+        const result = await bootWindowedConversation(storedMessages(), seed => {
+            seed.characters[0].customscript = []
+            seed.aiModel = seed.subModel = 'pluginmodel:::' + outputPluginName
+            seed.requestRetrys = 0
+            installOutputTrigger(seed)
+            configure?.(seed)
+        })
+        const api = await openOutputRequestPlugin(() => current.pluginApi!)
+        return { ...result, api, runtime: current.runtime, windowed, length: MESSAGES, runNestedRequest }
+    }
+
+    registerNestedRequestFailureCases(nestedFixture)
+    registerNestedMcpCases(nestedFixture)
+
+    it('lets a beforeRequest hook return and repair freshly read rows after generation ends', async () => {
+        const fixture = await nestedFixture(true)
+        let repair: Promise<void> | undefined
+        let scope: string | undefined
+        await fixture.api.addRisuReplacer('beforeRequest', async messages => {
+            scope = (await readPluginChat(fixture.api)).id
+            return messages
+        })
+        fixture.api.risunestOnGenerationEnd(event => {
+            if (event.status !== 'completed' || event.conversationId !== scope) return
+            repair = (async () => {
+                const chat = await readPluginChat(fixture.api)
+                chat.message[0].data = 'repaired after ' + chat.scriptstate.$result
+                await fixture.api.setChatToIndex(0, 0, chat)
+            })()
+            return repair
+        })
+        fixture.api.addProvider(outputPluginName, async () => {
+            const chat = await readPluginChat(fixture.api)
+            chat.message[1].data = 'provider save'
+            await fixture.api.setChatToIndex(0, 0, chat)
+            return { success: true, content: 'direct save' }
+        })
+        await whileStreaming(fixture, async ({ finishStream }) => {
+            await fixture.runNestedRequest()
+            finishStream()
+        })
+        await vi.waitFor(() => expect(repair).toBeDefined())
+        await repair
+        const final = await fixture.reopen()
+        expect(final.message[0].data).toBe('repaired after direct save')
+        expect(final.message[1].data).toBe('provider save')
+    })
+
+    it('keeps script edits pending when the requested provider permission is denied', async () => {
+        const fixture = await nestedFixture(false, seed => {
+            const effects = seed.characters[0].triggerscript[0].effect
+            effects.unshift({ type: 'modifychat', index: '0', value: 'pending script edit' })
+            effects.push({ type: 'showAlert', alertType: 'input', inputVar: 'answer', value: 'Input after denial' })
+        })
+        const { getPluginPermissionStore } = await import('../storage/nativePluginPermissions')
+        const { alertConfirm, alertInput } = await import('../alert')
+        vi.spyOn(getPluginPermissionStore(), 'isGranted').mockResolvedValue(false)
+        let deny: () => void
+        vi.mocked(alertConfirm).mockImplementationOnce(() => new Promise(resolve => { deny = () => resolve(false) }))
+        vi.mocked(alertInput).mockRejectedValueOnce(new Error('dialog closed'))
+        fixture.api.addProvider(outputPluginName, async () => ({ success: true, content: 'unexpected' }))
+        await whileStreaming(fixture, async ({ finishStream }) => {
+            await fixture.runNestedRequest()
+            finishStream()
+            await vi.waitFor(() => expect(deny).toBeTypeOf('function'))
+            try {
+                expect((await fixture.reopen()).message[0].data).toBe('m0')
+            } finally {
+                deny()
             }
-            expect(await parsed).toBe('plugin note')
-            expect(grown).toBe(true)
-            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
-            expect(runtime.getActiveConversationViewportSource()).toBe(source)
-            expect(source.snapshot().rowAt(100)?.message.data).toBe('STORED:plugin note')
-            // Parsers that read that message see it changed.
-            expect(source.snapshot().historyChangesSince?.(historyVersion!)).toContainEqual(
-                expect.objectContaining({ start: 100, end: 101, countChanged: false }))
-            await source.ensureRange({ startIndex: MESSAGES - 2, limit: 3, reason: 'viewport' })
-            expect(source.snapshot().rowAt(MESSAGES)?.message).toEqual(full)
-            await runtime.flushPendingData('streamed-reply')
+        }, undefined, /dialog closed/)
+        expect((await fixture.reopen()).message[0].data).toBe('m0')
+    })
+
+    it("continues a nested provider retry from the first attempt's saved conversation", async () => {
+        const fixture = await nestedFixture(true, seed => { seed.requestRetrys = 1 })
+        fixture.api.addProvider(outputPluginName, async () => {
+            const chat = await readPluginChat(fixture.api)
+            if (chat.message[0].data !== 'saved before retry') {
+                chat.message[0].data = 'saved before retry'
+                await fixture.api.setChatToIndex(0, 0, chat)
+                return { success: false, content: 'retry this request' }
+            }
+            return { success: true, content: chat.message[0].data }
+        })
+        await whileStreaming(fixture, async ({ finishStream }) => {
+            await fixture.runNestedRequest()
+            finishStream()
+        })
+        const saved = await fixture.reopen()
+        expect(saved.message[0].data).toBe('saved before retry')
+        expect(saved.scriptstate.$result).toBe('saved before retry')
+    })
+
+    describe.each([true, false])('a registered plugin in an output request (windowed %s)', windowed => {
+        const overlappingLua = `
+            onOutput = async(function(id)
+                local first = simpleLLM(id, 'first')
+                local second = simpleLLM(id, 'second')
+                setChatVar(id, 'first', first:await().result)
+                setChatVar(id, 'second', second:await().result)
+            end)
+        `
+
+        it('stores both overlapping Lua requests that use the registered provider', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: overlappingLua }]
+            })
+            fixture.api.addProvider(outputPluginName, async ({ prompt_chat }) => ({
+                success: true, content: 'reply to ' + prompt_chat[0].content,
+            }))
+            await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                await fixture.runNestedRequest()
+                finishStream()
+            })
+            expect((await fixture.reopen()).scriptstate).toMatchObject({ $first: 'reply to first', $second: 'reply to second' })
+        })
+
+        it('runs both plugin-free Lua requests before either echo finishes', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.aiModel = 'echo_model'
+                seed.echoDelay = 123
+                seed.echoMessage = 'echo result'
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: overlappingLua }]
+            })
+            const release = deferred<void>()
+            const sleep = clock.sleep
+            let waiting = 0
+            const delay = vi.spyOn(clock, 'sleep').mockImplementation(ms => {
+                if (ms !== 123_000) return sleep(ms)
+                waiting++
+                return release.promise
+            })
+            try {
+                await whileStreaming(fixture, async ({ finishStream }) => {
+                    await fixture.runNestedRequest()
+                    await fixture.runNestedRequest()
+                    finishStream()
+                    try {
+                        await vi.waitFor(() => expect(waiting).toBe(2))
+                    } finally { release.resolve() }
+                })
+            } finally { delay.mockRestore() }
+            expect((await fixture.reopen()).scriptstate).toMatchObject({ $first: 'echo result', $second: 'echo result' })
+        })
+
+        it('settles overlapping Lua requests on cancellation while the first provider is still waiting', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: overlappingLua }]
+            })
+            const release = deferred<void>()
+            const callbacks: string[] = []
+            fixture.api.addProvider(outputPluginName, async ({ prompt_chat }) => {
+                callbacks.push(prompt_chat[0].content)
+                await release.promise
+                return { success: true, content: 'late result' }
+            })
+            await whileStreaming(fixture, async ({ finishStream, cancel, sending }) => {
+                await fixture.runNestedRequest()
+                await fixture.runNestedRequest()
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(callbacks).toContain('first'))
+                    cancel()
+                    let settled = false
+                    void sending.then(() => { settled = true }, () => { settled = true })
+                    await vi.waitFor(() => expect(settled).toBe(true))
+                } finally { release.resolve() }
+            }, undefined, false)
+            expect(callbacks).toEqual(['first'])
+            const stored = await fixture.reopen()
+            expect(stored.scriptstate?.$first).toBeUndefined()
+            expect(stored.scriptstate?.$second).toBeUndefined()
+        })
+
+        it('keeps Lua message and variable edits made while its provider awaits a save', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                    onOutput = async(function(id)
+                        local request = simpleLLM(id, 'save')
+                        alertInput(id, 'wait for save'):await()
+                        alertNormal(id, 'editing')
+                        string.gsub('edit', 'edit', function()
+                            setChat(id, 998, 'Lua edit')
+                            return ''
+                        end)
+                        setChatVar(id, 'luaVar', 'Lua variable')
+                        request:await()
+                        setChatVar(id, 'observed', getChat(id, 999).data .. ' ' .. getChatVar(id, 'pluginVar'))
+                    end)
+                ` }]
+            })
+            const saving = deferred<void>()
+            const release = deferred<void>()
+            const { alertInput, alertNormal } = await import('../alert')
+            vi.mocked(alertNormal).mockClear()
+            vi.mocked(alertInput).mockImplementationOnce(async () => { await saving.promise; return '' })
+            fixture.api.addProvider(outputPluginName, async () => {
+                const chat = await readPluginChat(fixture.api)
+                chat.message[999].data = 'plugin edit'
+                chat.scriptstate = { ...chat.scriptstate, $pluginVar: 'plugin variable' }
+                const commit = fixture.store.commit.bind(fixture.store)
+                vi.spyOn(fixture.store, 'commit').mockImplementationOnce(async intent => {
+                    saving.resolve()
+                    await release.promise
+                    return commit(intent)
+                })
+                await fixture.api.setChatToIndex(0, 0, chat)
+                return { success: true, content: 'saved' }
+            })
+            await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(alertNormal).toHaveBeenCalledWith('editing'), { timeout: 3000 })
+                } finally { saving.resolve(); release.resolve() }
+            })
+            const stored = await fixture.reopen()
+            expect(stored.message[998]).toMatchObject({ chatId: 'id-998', data: 'Lua edit' })
+            expect(stored.message[999]).toMatchObject({ chatId: 'id-999', data: 'plugin edit' })
+            expect(stored.scriptstate).toMatchObject({
+                $luaVar: 'Lua variable', $pluginVar: 'plugin variable', $observed: 'plugin edit plugin variable',
+            })
+        })
+
+        it.each(['plugin', 'ordinary'] as const)('continues after Lua exits with a pending %s request', async provider => {
+            const fixture = await nestedFixture(windowed, seed => {
+                if (provider === 'ordinary') {
+                    seed.aiModel = 'echo_model'
+                    seed.echoDelay = 123
+                }
+                seed.characters[0].triggerscript[0].effect = [
+                    { type: 'triggerlua', code: `
+                        onOutput = async(function(id)
+                            simpleLLM(id, 'run in background')
+                            alertInput(id, 'wait for provider'):await()
+                            alertNormal(id, 'leaving Lua')
+                        end)
+                    ` },
+                    { type: 'v2GetMessageAtIndex', index: '999', indexType: 'value', outputVar: 'observed', indent: 0 },
+                ]
+            })
+            const entered = deferred<void>()
+            const release = deferred<void>()
+            const { alertInput, alertNormal } = await import('../alert')
+            vi.mocked(alertNormal).mockClear()
+            vi.mocked(alertInput).mockImplementationOnce(async () => { await entered.promise; return '' })
+            const sleep = clock.sleep
+            const delay = vi.spyOn(clock, 'sleep').mockImplementation(ms => {
+                if (ms !== 123_000) return sleep(ms)
+                entered.resolve()
+                return release.promise
+            })
+            if (provider === 'plugin') {
+                fixture.api.addProvider(outputPluginName, async () => {
+                    const chat = await readPluginChat(fixture.api)
+                    entered.resolve()
+                    await release.promise
+                    chat.message[999].data = 'saved by detached provider'
+                    await fixture.api.setChatToIndex(0, 0, chat)
+                    return { success: true, content: 'finished' }
+                })
+            }
+            try {
+                await whileStreaming(fixture, async ({ sending, finishStream }) => {
+                    await fixture.runNestedRequest()
+                    finishStream()
+                    try {
+                        await vi.waitFor(() => expect(alertNormal).toHaveBeenCalledWith('leaving Lua'))
+                        if (provider === 'ordinary') {
+                            let finished = false
+                            void sending.then(() => { finished = true }, () => { finished = true })
+                            await vi.waitFor(() => expect(finished).toBe(true))
+                        }
+                    } finally { entered.resolve(); release.resolve() }
+                })
+            } finally { delay.mockRestore() }
+            const stored = await fixture.reopen()
+            const expected = provider === 'plugin' ? 'saved by detached provider' : 'm999'
+            expect(stored.message[999]).toMatchObject({ chatId: 'id-999', data: expected })
+            expect(stored.scriptstate.$observed).toBe(expected)
+        })
+
+        it.each([true, false])('checkpoints a nested command before a later effect fails only when a read-only replacer runs (registered %s)', async withReplacer => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.aiModel = 'echo_model'
+                const triggers = seed.characters[0].triggerscript
+                const request = triggers[0].effect.pop()!
+                triggers.push({ type: 'manual', comment: 'request-model', conditions: [], effect: [request] })
+                triggers[0].effect.push(
+                    { type: 'modifychat', index: '998', value: 'before nested command' },
+                    { type: 'command', value: '/trigger request-model' },
+                    { type: 'showAlert', alertType: 'input', inputVar: 'answer', value: 'Input after model request' },
+                    { type: 'modifychat', index: '999', value: 'unreachable' },
+                )
+            })
+            const { alertInput } = await import('../alert')
+            vi.mocked(alertInput).mockRejectedValueOnce(new Error('dialog closed'))
+            const observed: string[] = []
+            if (withReplacer) await fixture.api.addRisuReplacer('beforeRequest', async messages => {
+                observed.push((await fixture.reopen()).message.at(-1)!.data)
+                return messages
+            })
+            await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+            }, undefined, /dialog closed/)
+            expect(observed).toEqual(withReplacer ? ['reply edited by trigger'] : [])
+            const final = await fixture.reopen()
+            if (withReplacer) expect(final.message.at(-1)?.data).toBe('reply edited by trigger')
+            expect(final.message[998].data).toBe(withReplacer ? 'before nested command' : 'm998')
+            expect(final.message[999].data).toBe('m999')
+        })
+        it.each(['provider', 'replacer'])('awaits a saved %s edit and continues the trigger from the published conversation', async callback => {
+            const fixture = await nestedFixture(windowed, seed => {
+                if (callback === 'replacer') {
+                    seed.aiModel = 'echo_model'
+                    seed.echoMessage = 'nested result'
+                }
+                seed.characters[0].triggerscript[0].effect.push(
+                    { type: 'v2GetMessageAtIndex', index: String(MESSAGES - 1), indexType: 'value', outputVar: 'observed', indent: 0 },
+                    { type: 'modifychat', index: String(MESSAGES - 2), value: 'trigger resumed' },
+                )
+            })
+            let saved: Chat
+            async function edit() {
+                const chat = await readPluginChat(fixture.api)
+                expect(chat.message.at(-1)?.data).toBe('reply edited by trigger')
+                chat.message[0].data = 'saved outside the viewport'
+                chat.message[MESSAGES - 1].data = 'translation'
+                chat.message[MESSAGES].data = 'reply edited by plugin'
+                await fixture.api.setChatToIndex(0, 0, chat)
+                saved = await fixture.reopen()
+            }
+            if (callback === 'provider') {
+                fixture.api.addProvider(outputPluginName, async () => {
+                    await edit()
+                    return { success: true, content: 'nested result' }
+                })
+            } else {
+                await fixture.api.addRisuReplacer('beforeRequest', async messages => { await edit(); return messages })
+                await fixture.api.addRisuReplacer('afterRequest', async value => {
+                    const patch = await fixture.api.risunestPatchConversation({
+                        characterId: 'character-a', conversationId: 'chat-a', mutationId: 'translation',
+                        chatVariables: [], messages: [{ index: 0, messageId: 'id-0', set: { __translated: true } }],
+                    })
+                    expect(patch.status).toBe('applied')
+                    return value + ' after hook'
+                })
+            }
+            const reply = await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+            })
+            const expected = storedMessages().map(row => ({ id: row.chatId, data: row.data }))
+            expected[0].data = 'saved outside the viewport'
+            expected[MESSAGES - 1].data = 'translation'
+            expected.push({ id: reply.chatId, data: 'reply edited by plugin' })
+            const rows = (chat: Chat) => chat.message.map(row => ({ id: row.chatId, data: row.data }))
+            expect(rows(saved!)).toEqual(expected)
+            expected[MESSAGES - 2].data = 'trigger resumed'
+            const final = await fixture.reopen()
+            expect(rows(final)).toEqual(expected)
+            expect(final.scriptstate).toMatchObject({ $observed: 'translation', $result: callback === 'provider' ? 'nested result' : 'nested result after hook' })
+            if (callback === 'replacer') expect(final.message[0]).toMatchObject({ __translated: true })
+        })
+
+        it.each(['runtrigger', 'command', 'v2Command'] as const)('resumes a nested Lua LLM and its enclosing %s after a streaming provider reorders rows', async type => {
+            const fixture = await nestedFixture(windowed, seed => {
+                const triggers = seed.characters[0].triggerscript
+                triggers[0].effect.splice(1, 1,
+                    type === 'runtrigger'
+                        ? { type, value: 'translate' }
+                        : { type, value: '/trigger translate | /trigger observe', valueType: 'value', indent: 0 },
+                    { type: 'v2GetMessageAtIndex', index: '998', indexType: 'value', outputVar: 'outer', indent: 0 },
+                )
+                triggers.push({ type: 'manual', comment: 'observe', conditions: [], effect: [
+                    { type: 'v2GetMessageAtIndex', index: '998', indexType: 'value', outputVar: 'piped', indent: 0 },
+                ] }, { type: 'manual', comment: 'translate', conditions: [], effect: [
+                    { type: 'setvar', var: 'stage', operator: '=', value: 'before Lua' },
+                    { type: 'triggerlua', code: `
+                        translate = async(function(id)
+                            local index = 998
+                            setChat(id, 996, 'before nested request')
+                            setChatVar(id, 'stage', 'from Lua')
+                            local answer = LLM(id, {{role = 'user', content = 'translate'}}, false, {streaming = true})
+                            setChatVar(id, 'observedStage', getChatVar(id, 'stage'))
+                            setChat(id, index, getChat(id, index).data .. ' ' .. answer.result)
+                        end)
+                    ` },
+                ] })
+            })
+            let published: Chat
+            fixture.api.addProvider(outputPluginName, async () => ({
+                success: true, content: new ReadableStream<string>({
+                    async pull(stream) {
+                        published = await fixture.reopen()
+                        const chat = await readPluginChat(fixture.api)
+                        const moved = chat.message.splice(999, 1)[0]
+                        moved.data = 'moved translation'
+                        chat.message.splice(998, 0, moved)
+                        chat.scriptstate.$stage = 'from provider'
+                        await fixture.api.setChatToIndex(0, 0, chat)
+                        stream.enqueue('stream result')
+                        stream.close()
+                    },
+                }, { highWaterMark: 0 }),
+            }))
+            const reply = await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+            })
+            expect(published!.scriptstate.$stage).toBe('from Lua')
+            expect(published!.message[996].data).toBe('before nested request')
+            expect(published!.message.at(-1)!.data).toBe('reply edited by trigger')
+            const expected = storedMessages()
+            expected[996].data = 'before nested request'
+            const moved = expected.pop()!
+            moved.data = 'moved translation stream result'
+            expected.splice(998, 0, moved)
+            const final = await fixture.reopen()
+            expect(final.message.slice(0, -1)).toEqual(expected)
+            expect(final.message.at(-1)).toMatchObject({ chatId: reply.chatId, data: 'reply edited by trigger' })
+            expect(final.scriptstate.$outer).toBe('moved translation stream result')
+            if (type !== 'runtrigger') expect(final.scriptstate.$piped).toBe('moved translation stream result')
+            expect(final.scriptstate.$observedStage).toBe('from provider')
+        })
+
+        it('saves an explicit Lua setFullChat copy taken before the plugin callback in commit order', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                    onOutput = async(function(id)
+                        local original = getFullChat(id)
+                        LLM(id, {{role = 'user', content = 'translate'}})
+                        setChatVar(id, 'observed', getChat(id, 999).data)
+                        setFullChat(id, original)
+                    end)
+                ` }]
+            })
+            fixture.api.addProvider(outputPluginName, async () => {
+                const chat = await readPluginChat(fixture.api)
+                chat.message[999].data = 'saved by plugin'
+                await fixture.api.setChatToIndex(0, 0, chat)
+                return { success: true, content: 'ok' }
+            })
+            const reply = await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+            })
+            const final = await fixture.reopen()
+            expect(final.scriptstate.$observed).toBe('saved by plugin')
+            expect(final.message.slice(0, -1)).toEqual(storedMessages())
+            expect(final.message.at(-1)).toMatchObject({ chatId: reply.chatId, data: finalText })
+        })
+    })
+
+    function createStreamingPluginAccess(runtime: typeof current.runtime) {
+        return createProductionPluginDatabaseAccess({
+            owner: 'streaming-plugin',
+            getLiveRuntime: () => runtime,
+            getPersistentRevision: () => runtime.revision,
+            commitPersistentUnitIntent: runtime.commitPersistentUnitIntent,
+            flushPendingData: runtime.flushPendingDataLocally,
+            assertPersistentMutationAllowed: runtime.assertPersistentMutationAllowed,
+            getStorageAuthorityEpoch: runtime.getStorageAuthorityEpoch,
+            getCompatibilityDatabase: () => DBState.db,
+            getSelectedCharacterId: () => 'character-a',
+            captureSelectedConversationTarget: runtime.captureSelectedConversationTarget,
+            acquireCompleteConversation: runtime.acquireCompleteConversation,
+            refreshSelectedConversationAfterReplacement: runtime.refreshSelectedConversationAfterReplacement,
+            invalidateActiveConversationSession: runtime.invalidateActiveConversationSession,
+            reportIdentityReplacementRejected: vi.fn(),
+            getNavigationGeneration: runtime.getNavigationGeneration,
+            readPluginStorageSnapshot: async () => ({}),
+            snapshot: <T>(value: T) => JSON.parse(JSON.stringify(value)) as T,
+        })
+    }
+
+    it.each(setterCases)('keeps a plugin write to a windowed streaming conversation (%s)', async edit => {
+        const fixture = await pluginFixture(edit)
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        try {
+            await checkStreamingWrite(fixture, edit)
+            expect(fixture.backgroundErrors).toEqual([])
+        } finally { fixture.access.closeReadBaselines() }
+    })
+
+    it.each([false, true])('stores the processed final chunk once when the complete output regex is held (concurrent setter %s)', async concurrentSetter => {
+        const messages = storedMessages().slice(0, 4)
+        const { reopen, backgroundErrors } = await bootWindowedConversation(messages, seed => {
+            seed.characters[0].emotionImages = [['smile', 'synthetic-smile.png']]
+            seed.characters[0].customscript = [
+                { type: 'editoutput', comment: '', in: 'via hook', out: '@@emo smile', flag: 'g', ableFlag: true },
+                { type: 'editoutput', comment: '', in: 'final chunk', out: 'PROCESSED {{lastmessageindex}} / {{previouschatlog::0}}', flag: 'g', ableFlag: true },
+            ]
+            seed.characters[0].triggerscript = []
+        })
+        const runtime = current.runtime
+        const lease = await runtime.acquireCompleteConversation('complete-output-regex-test', runtime.captureSelectedConversationTarget())
+        const access = createStreamingPluginAccess(runtime)
+        const { InMemoryWorker } = await import('../../../tests/support/regexWorker')
+        const workerClient = await import('./regexWorkerClient')
+        const worker = new InMemoryWorker()
+        let releaseWorker: (() => void) | undefined
+        const postMessage = worker.postMessage.bind(worker)
+        vi.spyOn(worker, 'postMessage').mockImplementation(request => {
+            const input = request.type === 'operation' ? request.operation.input : request.type === 'execute' ? request.input : undefined
+            // Hold the text rule after the emotion rule has run on this snapshot.
+            const afterEmotion = request.type === 'execute' || (request.type === 'operation' && request.operation.pattern === 'final chunk')
+            if (!releaseWorker && afterEmotion && input?.includes(finalText)) {
+                releaseWorker = () => postMessage(request)
+            } else postMessage(request)
+        })
+        const client = vi.spyOn(workerClient, 'getSharedRegexWorkerClient').mockReturnValue(new workerClient.RegexWorkerClient(() => worker))
+        const { pluginV2 } = await import('../plugins/plugins.svelte')
+        let hookPass = 0
+        const hook = async (text: string) => text === finalText ? text + ' via hook ' + ++hookPass : text
+        const previousEmotions = get(CharEmotion)
+        CharEmotion.set({})
+        pluginV2.editoutput.add(hook)
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        try {
+            const reply = await whileStreaming({ runtime, length: messages.length, windowed: false }, async ({ signal, finishStream }) => {
+                const call = { pluginName: 'streaming-plugin', signal }
+                const chat = (await access.getChatFromIndex(0, 0, call))!
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(releaseWorker).toBeDefined())
+                    if (concurrentSetter) {
+                        chat.message[0].data = 'edited during final regex'
+                        await access.setChatToIndex(0, 0, chat, call)
+                        expect((await liveMessage(runtime, 0))?.data).toBe('edited during final regex')
+                    }
+                } finally { releaseWorker?.() }
+            })
+            await runtime.flushPendingDataLocally('complete-output-regex-test')
             const stored = await reopen()
-            expect([stored.message[100].data, stored.message.at(-1)]).toEqual(['STORED:plugin note', full])
+            expect(stored.message.map(row => row.chatId)).toEqual([...messages.map(row => row.chatId), reply.chatId])
+            const firstText = concurrentSetter ? 'edited during final regex' : 'm0'
+            expect(stored.message[0].data).toBe(firstText)
+            expect(stored.message.at(-1)?.data).toBe(`streamed prefix and PROCESSED 4 / ${firstText} via hook 1`)
+            expect(hookPass).toBe(1)
+            expect(get(CharEmotion)['character-a']).toEqual([['smile', 'synthetic-smile.png', expect.any(Number)]])
             expect(backgroundErrors).toEqual([])
-        } finally { spy.mockRestore() }
+        } finally {
+            CharEmotion.set(previousEmotions)
+            pluginV2.editoutput.delete(hook)
+            client.mockRestore()
+            access.closeReadBaselines()
+            lease.release()
+        }
+    })
+
+    it('waits for an output trigger before applying a windowed setter and accepts the patch retry', async () => {
+        const fixture = await pluginFixture()
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        try {
+            await checkOutputProcessing(fixture)
+            expect(fixture.backgroundErrors).toEqual([])
+        } finally { fixture.access.closeReadBaselines() }
     })
 
     it('allows parseRisuChat and its variable writes inside the provider callback without waiting for the send', async () => {
@@ -537,7 +1144,6 @@ describe('a windowed send through the production runtime', () => {
         })
         const complete = vi.spyOn(current.runtime, 'acquireCompleteConversation')
         const { sendChat } = await import('./index.svelte')
-        const { requestChatData } = await import('./request/request')
         const { parseRisuChat } = await import('../plugins/parseRisuChat')
         const results: string[] = []
         const { registerDisplayRow, DisplayReadRecord } = await import('./scriptVariableReads')
@@ -596,7 +1202,6 @@ describe('a windowed send through the production runtime', () => {
     it.each(['success', 'streaming'] as const)('persists a delayed %s response while settings remain open', async (type) => {
         const { reopen, backgroundErrors } = await bootWindowedConversation(storedMessages())
         const { sendChat } = await import('./index.svelte')
-        const { requestChatData } = await import('./request/request')
         const { reserveGeneration } = await import('./generationState')
         const { beginGenerationEndRun, subscribeGenerationEnd } = await import('./generationEnd')
         const controller = new AbortController()
@@ -834,6 +1439,86 @@ describe('a windowed send through the production runtime', () => {
         expect(inserted.chatId).toEqual(expect.any(String))
         expect(persisted).toHaveLength(MESSAGES + 2)
         expect(current.alertError).not.toHaveBeenCalled()
+        expect(backgroundErrors).toEqual([])
+    })
+
+    it('continues the current stored tail after a competing reorder races a legacy ID assignment', async () => {
+        const original = storedMessages()
+        const tail = original.at(-1)!
+        delete tail.chatId
+        const neighbour = original.at(-2)!
+        neighbour.role = 'char'
+        neighbour.saying = 'character-a'
+        const { store, connect, reopen, backgroundErrors } = await bootWindowedConversation(structuredClone(original), seed => {
+            seed.characters[0].triggerscript = []
+            seed.characters[0].customscript = []
+        })
+        const other = await connect()
+        const read = async () => (await other.readConversation('character-a', 'chat-a'))!
+        let moved = false
+        const commit = store.commit.bind(store)
+        vi.spyOn(store, 'commit').mockImplementation(async request => {
+            if (!moved && request.conversations?.some(range => range.type === 'replace-range'
+                && range.messages.some(message => message.data === tail.data && message.chatId))) {
+                moved = true
+                await other.commit({ expectedRevision: (await read()).revision, conversations: [
+                    { type: 'replace-range', characterId: 'character-a', conversationId: 'chat-a',
+                        start: MESSAGES - 2, deleteCount: 2, messages: [tail, neighbour] },
+                ] })
+            }
+            return commit(request)
+        })
+        const { sendChat } = await import('./index.svelte')
+        let atRequest: Message[] | undefined
+        vi.mocked(requestChatData).mockImplementationOnce(async () => {
+            atRequest = (await read()).value.message.slice(-2)
+            return { type: 'streaming', result: new ReadableStream({ start(stream) {
+                stream.enqueue({ response: ' continued' })
+                stream.close()
+            } }) }
+        })
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        expect(await sendChat({ historyLimit: true, continue: true })).toBe(true)
+        await current.runtime.flushPendingData('continued-tail')
+        expect(moved).toBe(true)
+        expect(atRequest).toEqual([{ ...tail, chatId: expect.stringMatching(/\S/) }, neighbour])
+        const stored = (await reopen()).message
+        expect(stored.slice(0, -1)).toEqual([...original.slice(0, -2), atRequest![0]])
+        expect(stored.at(-1)).toMatchObject({ chatId: neighbour.chatId, data: neighbour.data + ' continued' })
+        expect(backgroundErrors).toEqual([])
+    })
+
+    it('finishes a provider stream on a reply moved by another connection during a settings commit', async () => {
+        const original = storedMessages()
+        const { store, connect, reopen, backgroundErrors } = await bootWindowedConversation(structuredClone(original), seed => {
+            seed.characters[0].triggerscript = []
+            seed.characters[0].customscript = []
+        })
+        const { runtime } = current
+        const remote = await connect()
+        vi.spyOn(console, 'log').mockImplementation(() => undefined)
+        const reply = await whileStreaming({ runtime, length: MESSAGES, windowed: true }, async ({ reply, chunk }) => {
+            await runtime.flushPendingDataLocally('first-chunk')
+            const commit = store.commit.bind(store)
+            vi.spyOn(store, 'commit').mockImplementationOnce(async request => {
+                const chat = (await remote.readConversation('character-a', 'chat-a'))!
+                await remote.commit({ expectedRevision: chat.revision, conversations: [
+                    { type: 'replace-range', characterId: 'character-a', conversationId: 'chat-a',
+                        start: MESSAGES - 1, deleteCount: 2, messages: [chat.value.message.at(-1)!, original.at(-1)!] },
+                ] })
+                chunk('chunk during setting')
+                await vi.waitFor(async () => expect((await liveMessage(runtime, MESSAGES))?.data).toBe('chunk during setting'))
+                return commit(request)
+            })
+            const { updateChatBinding } = await import('../chatBindings.svelte')
+            await updateChatBinding(DBState.db.characters[0].chats[0], { note: 'changed' })
+            expect((await liveMessage(runtime, MESSAGES - 1))?.chatId).toBe(reply.chatId)
+        })
+        await runtime.flushPendingDataLocally('completed-stream')
+        const chat = await reopen()
+        expect(chat.note).toBe('changed')
+        expect(chat.message).toEqual([...original.slice(0, -1), expect.objectContaining({ chatId: reply.chatId, data: finalText }), original.at(-1)!])
+        expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
         expect(backgroundErrors).toEqual([])
     })
 })

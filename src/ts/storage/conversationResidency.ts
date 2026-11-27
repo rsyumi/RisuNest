@@ -3,6 +3,11 @@ import type { ConversationSummary } from './persistentDataStore'
 
 const conversationSummaryStub = Symbol('conversationSummaryStub')
 
+export function reconcileConversationSummaries(chats: readonly Chat[], summaries: readonly ConversationSummary[]): Chat[] {
+    const byId = new Map(chats.map(chat => [chat.id, chat]))
+    return summaries.map(summary => byId.get(summary.id) ?? createConversationSummaryStub(summary))
+}
+
 export function createConversationSummaryStub(summary: ConversationSummary): Chat {
     const stub: Chat = {
         id: summary.id,

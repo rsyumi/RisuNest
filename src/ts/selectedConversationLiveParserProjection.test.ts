@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from 'vitest'
-import { PersistentConversationViewportSource, type ConversationViewportRow } from './conversationViewportSource'
+import { EditableViewportFixture as PersistentConversationViewportSource } from './conversationViewportSource.testSupport'
+import type { ConversationViewportRow } from './conversationViewportSource'
 import type { ProcessScriptCaptureContext } from './process/scripts'
 import {
     bindCompleteLiveParserContextAuthority,
@@ -277,15 +278,14 @@ describe('selected conversation live parser projection', () => {
         const runtime = testHarness.dependencies.runtime
         const captureTarget = runtime.captureSelectedConversationTarget
         const captureAuthority = runtime.captureSelectedConversationAuthority
-        const snapshot = testHarness.source.snapshot.bind(testHarness.source)
         let revision = 4
         runtime.captureSelectedConversationTarget = () => ({ ...captureTarget()!, storeRevision: revision })
         runtime.captureSelectedConversationAuthority = () => ({ ...captureAuthority()!, storeRevision: revision })
         // Model the storage-only seam, which preserves the source, rows, keys and render version.
-        vi.spyOn(testHarness.source, 'snapshot').mockImplementation(() => ({ ...snapshot(), storeRevision: revision }))
         const selectedRow = testHarness.source.snapshot().rowAt(7)!
         const retained = await testHarness.resolver.resolve({ row: selectedRow, totalMessages: 8 })
         revision = 5
+        testHarness.source.advanceUnchangedRevision(revision)
         const fresh = await testHarness.resolver.resolve({ row: selectedRow, totalMessages: 8 })
 
         expect(retained).toMatchObject({ kind: 'bounded', revision: 4 })
@@ -374,14 +374,13 @@ describe('selected conversation live parser projection', () => {
         const runtime = testHarness.dependencies.runtime
         const captureTarget = runtime.captureSelectedConversationTarget
         const captureAuthority = runtime.captureSelectedConversationAuthority
-        const snapshot = testHarness.source.snapshot.bind(testHarness.source)
         let revision = 4
         runtime.captureSelectedConversationTarget = () => ({ ...captureTarget()!, storeRevision: revision })
         runtime.captureSelectedConversationAuthority = () => ({ ...captureAuthority()!, storeRevision: revision })
-        vi.spyOn(testHarness.source, 'snapshot').mockImplementation(() => ({ ...snapshot(), storeRevision: revision }))
         testHarness.reads.mockImplementation(async (query) => {
             const result = await testHarness.readWindow(query)
             revision = 5
+            testHarness.source.advanceUnchangedRevision(revision)
             return result && { ...result, revision }
         })
         const selectedRow = testHarness.source.snapshot().rowAt(7)!
@@ -450,11 +449,9 @@ describe('selected conversation live parser projection', () => {
         const runtime = testHarness.dependencies.runtime
         const captureTarget = runtime.captureSelectedConversationTarget
         const captureAuthority = runtime.captureSelectedConversationAuthority
-        const snapshot = testHarness.source.snapshot.bind(testHarness.source)
         let revision = 4
         runtime.captureSelectedConversationTarget = () => ({ ...captureTarget()!, storeRevision: revision })
         runtime.captureSelectedConversationAuthority = () => ({ ...captureAuthority()!, storeRevision: revision })
-        vi.spyOn(testHarness.source, 'snapshot').mockImplementation(() => ({ ...snapshot(), storeRevision: revision }))
         const controller = new AbortController()
         const onStale = vi.fn()
         const lease = await testHarness.resolver.acquireConversationStart!({
@@ -487,11 +484,9 @@ describe('selected conversation live parser projection', () => {
         const runtime = testHarness.dependencies.runtime
         const captureTarget = runtime.captureSelectedConversationTarget
         const captureAuthority = runtime.captureSelectedConversationAuthority
-        const snapshot = testHarness.source.snapshot.bind(testHarness.source)
         let revision = 4
         runtime.captureSelectedConversationTarget = () => ({ ...captureTarget()!, storeRevision: revision })
         runtime.captureSelectedConversationAuthority = () => ({ ...captureAuthority()!, storeRevision: revision })
-        vi.spyOn(testHarness.source, 'snapshot').mockImplementation(() => ({ ...snapshot(), storeRevision: revision }))
         const controller = new AbortController()
         const onStale = vi.fn()
         const row = testHarness.source.snapshot().rowAt(5)!

@@ -185,6 +185,61 @@ async function bootProductionApp(indexedDB: IDBFactory, seed?: Database) {
 
 type ProductionApp = Awaited<ReturnType<typeof bootProductionApp>>
 
+const ownerId = 'edited-owner'
+const selectedId = ownerId + '-chat'
+
+function storedHistory(): Message[] {
+    return Array.from({ length: 260 }, (_, index) => ({
+        role: index % 2 === 0 ? 'user' : 'char', data: `Synthetic message ${index}`, chatId: `row-${index}`,
+    }))
+}
+
+async function openWindowedWriters(indexedDB: IDBFactory, history: Message[]) {
+    const library = syntheticLibrary('character')
+    library.characters[0].chats[0].message = history
+    library.characters[0].chats.push(syntheticCharacter('sibling', []).chats[0])
+    const app = await bootProductionApp(indexedDB, library)
+    expect(await app.characters.changeChar(0)).toBe(true)
+    expect(app.runtime.getSelectedConversationMode()).toBe('windowed')
+    await app.runtime.flushPendingData('settle-selection')
+    const reopen = async () => {
+        const connection = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
+        await connection.open()
+        return connection
+    }
+    const other = await reopen()
+    const splice = async (start: number, deleteCount: number, messages: Message[]) => {
+        const { revision } = await other.readRoot()
+        return other.commit({ expectedRevision: revision, conversations: [
+            { type: 'replace-range', characterId: ownerId, conversationId: selectedId, start, deleteCount, messages },
+        ] })
+    }
+    const window = (start: number, messages: Message[]) => {
+        const target = app.runtime.captureSelectedConversationTarget()!
+        const shell = app.getDatabase().characters[0].chats[0]
+        const chat = { ...cloneConversationMetadata(shell), message: structuredClone(messages) } as Chat
+        const controller = app.runtime.captureWindowedConversationMutationController(target, chat, start)
+        expect(controller).not.toBeNull()
+        return controller!
+    }
+    const saveFailures: unknown[] = []
+    const unsubscribe = app.localSaveFailure.subscribe(failure => { if (failure !== null) saveFailures.push(failure) })
+    return { app, other, reopen, splice, window, history, saveFailures, unsubscribe }
+}
+
+async function withWindowedWriters(
+    run: (fixture: Awaited<ReturnType<typeof openWindowedWriters>>) => Promise<void>,
+    history = storedHistory(),
+) {
+    const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
+    try {
+        const fixture = await openWindowedWriters(new IDBFactory(), history)
+        try { await run(fixture) } finally { fixture.unsubscribe() }
+    } finally {
+        Object.assign(globalThis, previousGlobals)
+    }
+}
+
 function settleWithin<T>(promise: Promise<T>, label: string, trace: unknown[]): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined
     return Promise.race([
@@ -1134,6 +1189,8 @@ describe('selected chat list edits', () => {
                 const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: [] } as unknown as Chat
                 const controller = runtime.captureWindowedConversationMutationController(target, chat, authority.totalMessages)!
                 expect(controller.applyRange(0, 0, [reply], 'append')).toBe(true)
+                reply.chatId = chat.message[0].chatId
+                expect(reply.chatId).toMatch(/\S/)
                 controller.release()
             }
             await reader.open()
@@ -1304,7 +1361,8 @@ describe('selected chat list edits', () => {
                     character.desc = marker
                 }, () => stores.DBState.db.characters[indexOf(ownerId)])).toBe(true)
             } else if (change === 'a chat setting change') {
-                await runtime.mutateConversationBinding(ownerId, selectedId, { note: marker }, () => {})
+                const { updateChatBinding } = await import('../chatBindings.svelte')
+                await updateChatBinding(stores.DBState.db.characters[indexOf(ownerId)].chats[0], { note: marker })
             } else if (change === 'a preset change') {
                 await runtime.mutatePersistentPresets('preset-rename', (state) => {
                     expect(state.presets.length).toBeGreaterThan(0)
@@ -1335,103 +1393,498 @@ describe('selected chat list edits', () => {
         }
     })
 
-    // Another writer (a second connection) moves rows of the open conversation, then this window's
-    // commit retries past that revision. Rows read before the move must not be stored back by index.
-    it.each([
-        { change: 'a plugin settings write', grows: true },
-        { change: 'a preset change', grows: true },
-        { change: 'a plugin settings write', grows: false },
-    ])('keeps every message when another writer moves rows of the open windowed conversation during $change (reply grows: $grows)', async ({ change, grows }) => {
-        const indexedDB = new IDBFactory()
-        const previousGlobals = { indexedDB: globalThis.indexedDB, IDBKeyRange: globalThis.IDBKeyRange }
-        const ownerId = 'edited-owner'
-        const selectedId = `${ownerId}-chat`
-        const marker = 'Changed while another writer moved rows'
-        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-        const other = new IndexedDbPersistentDataStore('risuai-persistent-data', indexedDB, IDBKeyRange)
-        const history = Array.from({ length: 300 }, (_, index) => ({
-            role: index % 2 === 0 ? 'user' : 'char',
-            data: `Synthetic windowed message ${index}`,
-            chatId: `synthetic-windowed-${index}`,
-        })) as Message[]
-        const library = syntheticLibrary('character')
-        library.characters[0].chats[0].message = history
-        try {
-            const app = await bootProductionApp(indexedDB, library)
-            const { stores, runtime, characters } = app
-            const indexOf = (id: string) => stores.DBState.db.characters.findIndex((candidate) => candidate.chaId === id)
-            expect(await characters.changeChar(indexOf(ownerId))).toBe(true)
-            await runtime.flushPendingData('activation')
-            const partial = { role: 'char', data: 'Synthetic reply', chatId: 'synthetic-reply' } as Message
-            const write = (start: number, deleteCount: number, message: Message) => {
-                const target = runtime.captureSelectedConversationTarget()!
-                const owner = stores.DBState.db.characters[indexOf(ownerId)]
-                const chat = { ...cloneConversationMetadata(owner.chats.find((value) => value.id === selectedId)!), message: deleteCount ? [partial] : [] } as unknown as Chat
-                const controller = runtime.captureWindowedConversationMutationController(target, chat, start)!
-                expect(controller.applyRange(0, deleteCount, [message], deleteCount ? 'edit' : 'append')).toBe(true)
-                controller.release()
-            }
-            write(history.length, 0, partial)
-            await runtime.flushPendingData('partial-reply')
-            await other.open()
-            const moved = [...history.slice(0, -1), partial, history.at(-1)!]
-            const isChange = (request: object) => /loreBookDepth|Changed while another writer/.test(JSON.stringify(request))
-            let commits = 0
-            const commit = runtime.store.commit.bind(runtime.store)
-            vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
-                const counted = isChange(request) ? ++commits : 0
-                if (counted === 1) {
-                    const stored = (await other.readConversation(ownerId, selectedId))!
-                    await other.commit({ expectedRevision: stored.revision, conversations: [{ type: 'replace-range', characterId: ownerId,
-                        conversationId: selectedId, start: history.length - 1, deleteCount: 2, messages: [partial, history.at(-1)!] }] })
-                }
-                const result = await commit(request)
-                if (counted && grows) write(history.length, 1, { ...partial, data: `Synthetic reply, streamed further ${counted}` })
-                return result
-            })
+    it.each(['routine', 'plugin', 'binding', 'preset', 'settings only'] as const)(
+        'continues saving a moved reply across a %s setting commit and character switch', async (route) => {
+            await withWindowedWriters(async ({ app, history, reopen, window, splice, saveFailures }) => {
+                const { runtime, stores } = app
+                const { captureGenerationConversationOperation } = await import('../process/generationConversationOperation')
+                const controller = window(history.length, [])
+                const partial = { chatId: 'reply', role: 'char', data: 'first' } as Message
+                const output = captureGenerationConversationOperation({
+                    session: null, getCurrentSession: () => null, chat: controller.chat,
+                    getCurrentChat: () => controller.chat, append: partial, windowedController: controller,
+                })
+                await runtime.flushPendingData('store-first-chunk')
+                const setting = 'Synthetic setting changed during a move'
+                const commit = runtime.store.commit.bind(runtime.store)
+                let moved = false
+                vi.spyOn(runtime.store, 'commit').mockImplementation(async (request) => {
+                    if (!moved) {
+                        moved = true
+                        await splice(history.length - 1, 2, [partial, history.at(-1)!])
+                        if (route !== 'settings only') expect(output.commitData('second')).toBe(true)
+                    }
+                    return commit(request)
+                })
 
-            const saved = change === 'a preset change'
-                ? runtime.mutatePersistentPresets('preset-rename', (state) => { state.presets[0].name = marker })
-                : runtime.commitPersistentUnitIntent('plugin-settings-write', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 7 }])
-            if (grows) {
-                // The rows the screen holds may not show the move, so the change is stored and the screen is
-                // read again before anything else is saved.
-                await expect(saved).rejects.toBeInstanceOf(Error)
-                expect(runtime.pendingWorkingSetRefreshRevision).not.toBeNull()
-            } else {
-                await saved
+                if (route === 'binding') {
+                    const { updateChatBinding } = await import('../chatBindings.svelte')
+                    await updateChatBinding(app.getDatabase().characters[0].chats[0], { note: setting })
+                }
+                else if (route === 'preset') await runtime.mutatePersistentPresets('rename-preset', (state) => { state.presets[0].name = setting })
+                else if (route === 'routine') {
+                    stores.DBState.db.loreBookDepth = 7
+                    runtime.markPersistentDataDirty(1)
+                    await runtime.flushPendingData('save-setting')
+                } else await runtime.commitPersistentUnitIntent('plugin-setting', [
+                    { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 7 },
+                ])
+                expect(moved).toBe(true)
                 expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
-                const source = runtime.getActiveConversationViewportSource()!
-                await source.ensureRange({ startIndex: history.length - 2, limit: 3, reason: 'viewport' })
-                expect([history.length - 1, history.length].map((index) => source.snapshot().rowAt(index)?.message)).toEqual(moved.slice(-2))
-                // Once the rows are read again, commits while the next reply streams keep that reply.
-                for (const [index, save] of [
-                    () => runtime.commitPersistentUnitIntent('plugin-settings-write', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 8 }]),
-                    () => runtime.flushPendingData('streaming-save'),
-                ].entries()) {
-                    const next = { role: 'char', data: `Synthetic reply ${index} after the rows were read again`, chatId: `synthetic-next-${index}` } as Message
-                    vi.mocked(runtime.store.commit).mockImplementationOnce(async (request) => {
+                if (route !== 'settings only') expect(output.commitData('complete')).toBe(true)
+                output.release()
+                controller.release()
+                await runtime.flushPendingData('save-reply')
+                const expected = [...history.slice(0, -1), {
+                    ...partial, data: route === 'settings only' ? 'first' : 'complete',
+                }, history.at(-1)!]
+                const appendDuringNextCommit = (id: string) => {
+                    vi.mocked(runtime.store.commit).mockImplementationOnce(async request => {
                         const result = await commit(request)
-                        write(moved.length, 0, next)
+                        const append = window(expected.length, [])
+                        const next: Message = { role: 'char', data: id, chatId: id }
+                        expect(append.applyRange(0, 0, [next], 'append')).toBe(true)
+                        append.release()
+                        expected.push(next)
                         return result
                     })
-                    await save()
-                    expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
-                    moved.push(next)
                 }
-            }
-            // Later saves store nothing at the indexes the moved rows had.
-            await Promise.resolve().then(() => runtime.flushPendingData('later-save')).catch(() => {})
-            await Promise.resolve().then(() => runtime.commitPersistentUnitIntent('plugin-settings-write', [
-                { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 9 },
-            ])).catch(() => {})
-            expect((await other.readConversation(ownerId, selectedId))?.value.message).toEqual(moved)
-            if (!grows) expect(consoleError).not.toHaveBeenCalled()
-        } finally {
-            consoleError.mockRestore()
-            Object.assign(globalThis, previousGlobals)
-        }
+                if (route === 'settings only') {
+                    const source = runtime.getActiveConversationViewportSource()!
+                    await source.ensureRange({ startIndex: history.length - 1, limit: 2, reason: 'viewport' })
+                    expect([history.length - 1, history.length].map(i => source.snapshot().rowAt(i)?.message)).toEqual(expected.slice(-2))
+                    appendDuringNextCommit('reply-during-setting')
+                }
+                await runtime.commitPersistentUnitIntent('second-setting', [
+                    { key: JSON.stringify(['root', 'loreBookToken']), type: 'set', value: 987 },
+                ])
+                if (route === 'settings only') {
+                    stores.DBState.db.maxResponse = 231
+                    runtime.markPersistentDataDirty(1)
+                    appendDuringNextCommit('reply-during-flush')
+                    await runtime.flushPendingData('streaming-save')
+                    expect(expected.slice(-2).map(message => message.chatId)).toEqual(['reply-during-setting', 'reply-during-flush'])
+                }
+                expect(await app.characters.changeChar(1)).toBe(true)
+                expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                expect(get(app.localSaveFailure)).toBeNull()
+                const reader = await reopen()
+                const stored = (await reader.readConversation(ownerId, selectedId))!.value
+                expect(stored.message).toEqual(expected)
+                const root = (await reader.readRoot()).value
+                expect(root.loreBookToken).toBe(987)
+                expect(saveFailures).toEqual([])
+                if (route === 'binding') expect(stored.note).toBe(setting)
+                else if (route === 'preset') expect((await reader.queryPresets()).items[0].name).toBe(setting)
+                else expect(root.loreBookDepth).toBe(7)
+            })
+        },
+    )
+    it.each(['before', 'after', 'cancel', 'retry'] as const)(
+        'retains edits after freezing an append while a second writer appends (%s)', async (timing) => {
+            await withWindowedWriters(async ({ app, history, reopen, window, splice }) => {
+                const { runtime } = app
+                const controller = window(history.length, [])
+                const first: Message = { role: 'char', data: 'first chunk', chatId: 'first' }
+                const next: Message = { role: 'user', data: 'next local', chatId: 'next' }
+                const remote: Message = { role: 'user', data: 'remote', chatId: 'remote' }
+                const full = { ...first, data: 'third chunk' }
+                expect(controller.applyRange(0, 0, [first], 'append')).toBe(true)
+
+                const commit = runtime.store.commit.bind(runtime.store)
+                vi.spyOn(runtime.store, 'commit').mockImplementationOnce(async (request) => {
+                    expect(controller.applyRange(0, 1, [{ ...first, data: 'second chunk' }], 'edit')).toBe(true)
+                    expect(controller.applyRange(0, 1, [full], 'edit')).toBe(true)
+                    expect(controller.applyRange(1, 0, [next], 'append')).toBe(true)
+                    if (timing === 'cancel') expect(controller.applyRange(0, 1, [], 'replace-range')).toBe(true)
+                    if (timing === 'retry') throw new Error('Synthetic quota failure')
+                    if (timing === 'before') await splice(history.length, 0, [remote])
+                    const result = await commit(request)
+                    if (timing !== 'before') await splice(history.length + 1, 0, [remote])
+                    return result
+                })
+                if (timing === 'retry') {
+                    await expect(runtime.flushPendingDataLocally('save')).rejects.toThrow('Synthetic quota failure')
+                    const reader = await reopen()
+                    expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual(history)
+                    await splice(history.length, 0, [remote])
+                    await runtime.flushPendingDataLocally('save-failure-retry')
+                } else await runtime.flushPendingDataLocally('save')
+                controller.release()
+
+                const expected = timing === 'after' ? [full, remote, next]
+                    : timing === 'cancel' ? [remote, next] : [remote, full, next]
+                const reader = await reopen()
+                expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual([...history, ...expected])
+                const edit = window(history.length + expected.length - 1, [next])
+                const edited = { ...next, data: 'later edit' }
+                expect(edit.applyRange(0, 1, [edited], 'edit')).toBe(true)
+                edit.release()
+                await runtime.flushPendingDataLocally('later-edit')
+                expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual([
+                    ...history, ...expected.slice(0, -1), edited,
+                ])
+                expect(get(app.localSaveFailure)).toBeNull()
+                expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            })
+        },
+    )
+
+    it('replans the same row across two consecutive revision conflicts, including a page boundary', async () => {
+        await withWindowedWriters(async ({ app, history, window, splice, reopen }) => {
+            const controller = window(127, history.slice(127))
+            const edited = { ...history[127], data: 'local edit at page boundary' }
+            expect(controller.applyRange(0, 1, [edited], 'edit')).toBe(true)
+            const rows = [...history]
+            let moves = 0
+            const commit = app.runtime.store.commit.bind(app.runtime.store)
+            vi.spyOn(app.runtime.store, 'commit').mockImplementation(async (request) => {
+                if (moves < 2) {
+                    const index = 127 + moves++
+                    const pair = [rows[index + 1], rows[index]]
+                    await splice(index, 2, pair)
+                    rows.splice(index, 2, ...pair)
+                }
+                return commit(request)
+            })
+            await app.runtime.flushPendingDataLocally('save-edit')
+            expect(moves).toBe(2)
+            rows[129] = edited
+            const reader = await reopen()
+            expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual(rows)
+            expect(get(app.localSaveFailure)).toBeNull()
+            controller.release()
+        })
     })
+
+    it.each([
+        ['receive', 'successful projection'], ['deferred drain', 'successful projection'],
+        ['receive', 'failed projection read'], ['deferred drain', 'failed projection read'],
+    ] as const)('rebases an unsaved reply moved by a %s with a %s', async (phase, projection) => {
+        await withWindowedWriters(async ({ app, history, window, splice, reopen }) => {
+            const { runtime } = app
+            const controller = window(history.length - 1, history.slice(-1))
+            await controller.prepareTarget?.(0)
+            const edited = { ...history.at(-1)!, data: 'chunk during sync apply' }
+            // IndexedDB has no native LWW transport. Apply the inbound rows on the second connection.
+            const apply = async () => {
+                expect(controller.applyRange(0, 1, [edited], 'edit')).toBe(true)
+                const result = await splice(history.length - 2, 2, [history.at(-1)!, history.at(-2)!])
+                if (projection === 'failed projection read') {
+                    vi.spyOn(runtime.store, 'acquireRevision').mockRejectedValueOnce(new Error('Synthetic sync projection failure'))
+                }
+                return { ...result, affectedKeys: [JSON.stringify(['messages', ownerId, selectedId])], heldKeys: [], deferredKeys: [] }
+            }
+            let sync: Promise<unknown>
+            if (phase === 'receive') {
+                runtime.store.lwwStageReceive = async () => {}
+                runtime.store.lwwApplyReceive = apply
+                runtime.store.lwwFinishReceive = async () => {}
+                sync = runtime.applyLwwReceive({ bindingAuthority: '1', requestId: 'synthetic', changes: [],
+                    progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
+            } else {
+                runtime.store.lwwBindingState = async () => ({ targetAuthority: '1' })
+                runtime.store.lwwDrainDeferred = apply
+                sync = runtime.drainLwwDeferred()
+            }
+            if (projection === 'failed projection read') {
+                await expect(sync).rejects.toThrow('Synthetic sync projection failure')
+                if (runtime.pendingWorkingSetRefreshRevision !== null) await runtime.retryCommittedWorkingSetRefresh()
+            } else await sync
+            await runtime.flushPendingDataLocally('save-after-sync')
+            const reader = await reopen()
+            expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual([
+                ...history.slice(0, -2), edited, history.at(-2)!,
+            ])
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            expect(get(app.localSaveFailure)).toBeNull()
+            controller.release()
+        })
+    })
+
+    it('keeps a later remote note after projecting a different sync unit against a newer head', async () => {
+        await withWindowedWriters(async ({ app, other }) => {
+            const { runtime } = app
+            const rootKey = JSON.stringify(['root', 'loreBookDepth'])
+            const noteKey = JSON.stringify(['conversation', ownerId, selectedId, 'note'])
+            runtime.store.lwwBindingState = async () => ({ targetAuthority: '1' })
+            runtime.store.lwwDrainDeferred = async () => {
+                const result = await other.commit({ expectedRevision: (await other.readRoot()).revision,
+                    unitMutations: [{ key: rootKey, type: 'set', value: 99 }] })
+                await other.commit({ expectedRevision: result.revision,
+                    unitMutations: [{ key: noteKey, type: 'set', value: 'First remote note' }] })
+                return { ...result, affectedKeys: [rootKey], heldKeys: [], deferredKeys: [] }
+            }
+            await runtime.drainLwwDeferred()
+            expect(app.getDatabase().characters[0].chats[0].note).toBe('First remote note')
+            await other.commit({ expectedRevision: (await other.readRoot()).revision,
+                unitMutations: [{ key: noteKey, type: 'set', value: 'Second remote note' }] })
+            await runtime.flushPendingDataLocally('flush-after-sync')
+            expect((await other.readConversationMetadata(ownerId, selectedId))!.value.conversation.note).toBe('Second remote note')
+        })
+    })
+
+    it('recovers a durable append when reading the newer store head fails before the next chunk can be saved', async () => {
+        await withWindowedWriters(async ({ app, history, window, other, splice }) => {
+            const { runtime } = app
+            const controller = window(history.length, [])
+            const first: Message = { role: 'char', data: 'first chunk', chatId: 'reply' }
+            const full = { ...first, data: 'last chunk' }
+            const remote: Message = { role: 'user', data: 'other writer', chatId: 'remote' }
+            expect(controller.applyRange(0, 0, [first], 'append')).toBe(true)
+            const commit = runtime.store.commit.bind(runtime.store)
+            const writes = vi.spyOn(runtime.store, 'commit').mockImplementationOnce(async request => {
+                const result = await commit(request)
+                expect(controller.applyRange(0, 1, [full], 'edit')).toBe(true)
+                await splice(history.length + 1, 0, [remote])
+                vi.spyOn(runtime.store, 'acquireRevision').mockRejectedValueOnce(new Error('Synthetic projection read failure'))
+                return result
+            })
+            await expect(runtime.flushPendingDataLocally('save')).rejects.toThrow('Synthetic projection read failure')
+            const read = async () => (await other.readConversation(ownerId, selectedId))!.value.message
+            expect(await read()).toEqual([...history, first, remote])
+            await runtime.flushPendingDataLocally('save-failure-retry')
+            expect(await read()).toEqual([...history, full, remote])
+            const retryRows = writes.mock.calls.slice(1).flatMap(([request]) => (request.conversations ?? [])
+                .flatMap(mutation => mutation.type === 'replace-range' ? mutation.messages : []))
+            expect(retryRows).not.toContainEqual(first)
+            expect(get(app.localSaveFailure)).toBeNull()
+            controller.release()
+        })
+    })
+
+    it.each(['newer head', 'metadata read failure', 'unit projection read failure'] as const)('projects every committed unit after a %s', async (timing) => {
+        await withWindowedWriters(async ({ app, history, window, splice, reopen }) => {
+            const { runtime } = app
+            const controller = window(history.length - 1, history.slice(-1))
+            await controller.prepareTarget?.(0)
+            const { captureGenerationConversationOperation } = await import('../process/generationConversationOperation')
+            const output = captureGenerationConversationOperation({
+                session: null, getCurrentSession: () => null, chat: controller.chat, getCurrentChat: () => controller.chat,
+                continueLast: true, windowedController: controller,
+            })
+            const chunk = { ...history.at(-1)!, data: 'continued after unit commit' }
+            const remote: Message = { role: 'user', data: 'later append', chatId: 'remote' }
+            const commit = runtime.store.commit.bind(runtime.store)
+            vi.spyOn(runtime.store, 'commit').mockImplementationOnce(async (input) => {
+                const result = await commit(input)
+                expect(output.commitData(chunk.data)).toBe(true)
+                if (timing === 'newer head') await splice(history.length, 0, [remote])
+                else vi.spyOn(runtime.store, 'acquireRevision').mockRejectedValueOnce(new Error('Synthetic read failure'))
+                return result
+            })
+            const originalNote = app.getDatabase().characters[0].chats[0].note
+            const intent = runtime.commitPersistentUnitIntent('mixed-units', [
+                ...(timing === 'unit projection read failure' ? [] : [
+                    { key: JSON.stringify(['conversation', ownerId, selectedId, 'note']), type: 'set' as const, value: 'changed during output' },
+                ]),
+                { key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 99 },
+            ])
+            if (timing === 'newer head') await intent
+            else await expect(intent).rejects.toThrow('Synthetic read failure')
+            if (runtime.pendingWorkingSetRefreshRevision !== null) await runtime.retryCommittedWorkingSetRefresh()
+            await runtime.flushPendingDataLocally('retry-after-unit-commit')
+            expect(app.getDatabase().loreBookDepth).toBe(99)
+            const note = timing === 'unit projection read failure' ? originalNote : 'changed during output'
+            expect(app.getDatabase().characters[0].chats[0].note).toBe(note)
+            const reader = await reopen()
+            expect((await reader.readRoot()).value.loreBookDepth).toBe(99)
+            expect((await reader.readConversation(ownerId, selectedId))!.value).toMatchObject({
+                note,
+                message: [...history.slice(0, -1), chunk, ...(timing === 'newer head' ? [remote] : [])],
+            })
+            expect(output.commitData('final chunk after retry')).toBe(true)
+            await runtime.flushPendingDataLocally('save-later-chunk')
+            expect((await reader.readConversation(ownerId, selectedId))!.value.message[history.length - 1].data).toBe('final chunk after retry')
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            expect(get(app.localSaveFailure)).toBeNull()
+            output.release()
+            controller.release()
+        })
+    })
+
+    it('saves an append at the new tail when another connection commits before the first projection read', async () => {
+        await withWindowedWriters(async ({ app, history, window, reopen, splice }) => {
+            const local: Message = { role: 'char', data: 'local', chatId: 'local' }
+            const remote: Message = { role: 'user', data: 'remote', chatId: 'remote' }
+            const controller = window(history.length, [])
+            expect(controller.applyRange(0, 0, [local], 'append')).toBe(true)
+            await splice(history.length, 0, [remote])
+            await app.runtime.flushPendingDataLocally('save')
+            const reader = await reopen()
+            expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual([...history, remote, local])
+            expect(app.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            controller.release()
+        })
+    })
+
+    it('reconciles selection when a conditional binding finds the clean selected conversation deleted', async () => {
+        await withWindowedWriters(async ({ app, other }) => {
+            const { updateChatBinding } = await import('../chatBindings.svelte')
+            const selected = app.getDatabase().characters[0].chats[0]
+            await other.commit({ expectedRevision: (await other.readRoot()).revision,
+                conversations: [{ type: 'delete', characterId: ownerId, conversationId: selectedId }] })
+            await updateChatBinding(selected, { note: 'Discarded note' }, { note: selected.note })
+            await app.runtime.flushPendingDataLocally('after-missing-binding')
+            await vi.waitFor(() => expect(app.runtime.captureSelectedConversationTarget()).toMatchObject({
+                characterId: ownerId, conversationId: 'sibling-chat',
+            }))
+            expect(await other.readConversationMetadata(ownerId, selectedId)).toBeNull()
+            expect((await other.readConversationMetadata(ownerId, 'sibling-chat'))!.value.conversation.note).toBe('')
+        })
+    })
+
+    it.each([
+        ['character', 'flush'], ['conversation', 'flush'], ['conversation and sibling', 'flush'],
+        ['conversation and sibling', 'sync projection'],
+    ] as const)('drops a dirty reply and a late chunk when the other writer deletes its %s during %s', async (kind, phase) => {
+        await withWindowedWriters(async ({ app, history, window, other }) => {
+            const { runtime } = app
+            const { captureGenerationConversationOperation } = await import('../process/generationConversationOperation')
+            const controller = window(history.length, [])
+            const output = captureGenerationConversationOperation({
+                session: null, getCurrentSession: () => null, chat: controller.chat, getCurrentChat: () => controller.chat,
+                append: { role: 'char', data: 'partial', chatId: 'deleted-owner-reply' }, windowedController: controller,
+            })
+            const removeOwner = async () => {
+                const expectedRevision = (await other.readRoot()).revision
+                if (kind === 'character') await other.commit({ expectedRevision, deleteCharacterIds: [ownerId] })
+                else if (kind === 'conversation') await other.commit({ expectedRevision, conversations: [{ type: 'delete', characterId: ownerId, conversationId: selectedId }] })
+                else await other.commit({ expectedRevision, conversations: [
+                    { type: 'delete', characterId: ownerId, conversationId: selectedId },
+                    { type: 'delete', characterId: ownerId, conversationId: 'sibling-chat' },
+                    { type: 'replace-range', characterId: ownerId, conversationId: 'remaining', configuredIndex: 0,
+                        start: 0, deleteCount: 0, messages: [], conversation: { id: 'remaining', name: 'Remaining', note: '', localLore: [] } },
+                ] })
+            }
+            if (phase === 'sync projection') {
+                const rootKey = JSON.stringify(['root', 'loreBookDepth'])
+                runtime.store.lwwBindingState = async () => ({ targetAuthority: '1' })
+                runtime.store.lwwDrainDeferred = async () => {
+                    const result = await other.commit({ expectedRevision: (await other.readRoot()).revision,
+                        unitMutations: [{ key: rootKey, type: 'set', value: 7 }] })
+                    expect(output.commitData('chunk during sync')).toBe(true)
+                    await removeOwner()
+                    return { ...result, affectedKeys: [rootKey], heldKeys: [], deferredKeys: [] }
+                }
+                await runtime.drainLwwDeferred()
+                expect(app.getDatabase().loreBookDepth).toBe(7)
+            } else {
+                const commit = runtime.store.commit.bind(runtime.store)
+                vi.spyOn(runtime.store, 'commit').mockImplementationOnce(async request => {
+                    await removeOwner()
+                    return commit(request)
+                })
+                await runtime.flushPendingDataLocally('owner-deleted')
+            }
+            expect(output.commitData('late chunk')).toBe(false)
+            await runtime.flushPendingDataLocally('late-chunk')
+            if (kind === 'character') {
+                expect(await other.readCharacter(ownerId)).toBeNull()
+                expect(get(app.stores.selectedCharID)).toBe(-1)
+                expect(runtime.captureSelectedConversationTarget()).toBeNull()
+            } else {
+                expect(get(app.stores.selectedCharID)).toBe(0)
+                const expectedChat = kind === 'conversation' ? 'sibling-chat' : 'remaining'
+                await vi.waitFor(() => expect(runtime.captureSelectedConversationTarget()).toMatchObject({ characterId: ownerId, conversationId: expectedChat }))
+                expect(app.getDatabase().characters[0].chats.map(chat => chat.id)).toEqual([expectedChat])
+                expect((await other.readConversation(ownerId, expectedChat))!.value.message).toEqual([])
+            }
+            await runtime.commitPersistentUnitIntent('save-after-removal', [{ key: JSON.stringify(['root', 'loreBookDepth']), type: 'set', value: 11 }])
+            expect((await other.readRoot()).value.loreBookDepth).toBe(11)
+            expect(await other.readConversation(ownerId, selectedId)).toBeNull()
+            expect(get(app.localSaveFailure)).toBeNull()
+            expect(runtime.pendingWorkingSetRefreshRevision).toBeNull()
+            output.release()
+            controller.release()
+        })
+    })
+
+    it('opens legacy rows unchanged and assigns an ID only to edited unidentified rows on a proved base', async () => {
+        const history = storedHistory()
+        delete history[127].chatId
+        history[128].chatId = ''
+        history[129].chatId = history[130].chatId
+        await withWindowedWriters(async ({ app, window, other }) => {
+            const read = async () => (await other.readConversation(ownerId, selectedId))!.value.message
+            expect(await read()).toEqual(history)
+            expect((await other.materializeDatabase()).characters[0].chats[0].message).toEqual(history)
+            const controller = window(127, history.slice(127))
+            for (const local of [0, 1, 3]) {
+                expect(controller.applyRange(local, 1, [{ ...history[127 + local], data: 'local ' + local }], 'edit')).toBe(true)
+            }
+            await app.runtime.flushPendingDataLocally('save-legacy-rows')
+            const expected = [...history]
+            expected[127] = { ...history[127], data: 'local 0', chatId: expect.stringMatching(/\S/) }
+            expected[128] = { ...history[128], data: 'local 1', chatId: expect.stringMatching(/\S/) }
+            expected[130] = { ...history[130], data: 'local 3' }
+            const stored = await read()
+            expect(stored).toEqual(expected)
+            expect(stored[127].chatId).not.toBe(stored[128].chatId)
+            controller.release()
+        }, history)
+    })
+
+    it.each(['missing ID', 'empty ID', 'duplicate removed', 'duplicate introduced', 'target deleted',
+        'split reorder', 'tail splice', 'append collision', 'rewrite ID'] as const)(
+        'saves independent work across a competing change (%s)', async (kind) => {
+            const history = storedHistory()
+            const start = history.length - 4
+            if (kind === 'missing ID') delete history[start].chatId
+            if (kind === 'empty ID') history[start].chatId = ''
+            if (kind === 'duplicate removed') history[start + 1].chatId = history[start].chatId
+            await withWindowedWriters(async ({ app, window, splice, reopen, saveFailures }) => {
+                const controller = window(start, history.slice(start))
+                const expected = [...history]
+                const changed = { ...history[start], data: 'local edit', ...(kind === 'rewrite ID' ? { chatId: 'rewritten' } : {}) }
+                const extra: Message = { role: 'user', data: 'local append', chatId: 'new-id' }
+                // The splice owns the tail group. Put its independent edit just before that group.
+                const unaffectedIndex = kind === 'tail splice' ? 0 : 3
+                const independentEdit = { ...history[start + unaffectedIndex], data: 'independent edit' }
+                expect(controller.applyRange(unaffectedIndex, 1, [independentEdit], 'edit')).toBe(true)
+                if (kind === 'split reorder') {
+                    expect(controller.applyRange(0, 2, [history[start + 1], history[start]], 'replace-range')).toBe(true)
+                } else if (kind === 'tail splice') {
+                    expect(controller.applyRange(2, 2, [extra], 'replace-range')).toBe(true)
+                } else if (kind === 'append collision') {
+                    expect(controller.applyRange(4, 0, [extra], 'append')).toBe(true)
+                } else {
+                    expect(controller.applyRange(0, 1, [changed], 'edit')).toBe(true)
+                }
+                const commit = app.runtime.store.commit.bind(app.runtime.store)
+                vi.spyOn(app.runtime.store, 'commit').mockImplementationOnce(async (request) => {
+                    const remoteSplice = async (index: number, count: number, rows: Message[]) => {
+                        await splice(index, count, rows)
+                        expected.splice(index, count, ...rows)
+                    }
+                    if (kind === 'duplicate removed' || kind === 'target deleted') await remoteSplice(start, 1, [])
+                    else if (kind === 'duplicate introduced') await remoteSplice(start + 1, 1, [{ ...history[start + 1], chatId: history[start].chatId }])
+                    else if (kind === 'split reorder' || kind === 'tail splice' || kind === 'append collision') {
+                        await remoteSplice(kind === 'split reorder' ? start + 1 : history.length, 0, [
+                            { ...extra, data: 'other writer', chatId: kind === 'append collision' ? extra.chatId : 'remote-row' },
+                        ])
+                    } else await remoteSplice(start, 2, [history[start + 1], history[start]])
+                    return commit(request)
+                })
+                await app.runtime.flushPendingDataLocally('save-overlapping-changes')
+                const match = expected.findIndex(message => message.chatId === independentEdit.chatId)
+                expected[match] = independentEdit
+                if (kind === 'rewrite ID') expected[start + 1] = changed
+                expect(get(app.localSaveFailure)).toBeNull()
+                expect(app.runtime.pendingWorkingSetRefreshRevision).toBeNull()
+                const reader = await reopen()
+                expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual(expected)
+                controller.release()
+                const append = window(expected.length, [])
+                const next = { ...extra, chatId: 'after-overlap' }
+                expect(append.applyRange(0, 0, [next], 'append')).toBe(true)
+                append.release()
+                await app.runtime.flushPendingDataLocally('after-overlap')
+                expect((await reader.readConversation(ownerId, selectedId))!.value.message).toEqual([...expected, next])
+                expect(saveFailures).toEqual([])
+            }, history)
+        },
+    )
 
     it('keeps the saved body of a summarized chat when it moves into a folder', async () => {
         const indexedDB = new IDBFactory()

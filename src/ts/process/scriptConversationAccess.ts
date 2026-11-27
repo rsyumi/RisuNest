@@ -222,6 +222,22 @@ export class ScriptConversationAccess {
         this.finish(true)
     }
 
+    /** Publishes the segment read before a nested request, including a read-only baseline check. */
+    checkpoint(): void {
+        this.requireCurrent()
+        this.requireMessagesSinceRead()
+        this.commit()
+    }
+
+    discard(): void {
+        this.operation?.release()
+        this.operation = null
+        this.edits = null
+        this.pendingVariables.clear()
+        this.firstReadMessageVersion = null
+        this.failure = null
+    }
+
     /** Commits like `commit`, but with nothing to commit it finishes even if the conversation closed. */
     commitIfChanged(): void {
         this.finish(true, false)

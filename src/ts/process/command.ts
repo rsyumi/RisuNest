@@ -11,6 +11,7 @@ import { runTrigger } from "./triggers";
 import { setSelectedChatVariable } from './selectedChatVariables'
 import { getActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
 import type { ConversationOperationContext } from './conversationOperationContext'
+import type { OutputScriptConversation } from './outputScriptConversation'
 import type { GenerationReservation } from './generationState'
 import { ConversationSessionInactiveError } from '../storage/activeConversationSession'
 import {
@@ -29,7 +30,12 @@ export interface CommandGeneration {
     reservation: GenerationReservation
 }
 
-export async function processMultiCommand(command:string, conversationOperation?: ConversationOperationContext, generation?: CommandGeneration) {
+export async function processMultiCommand(
+    command: string,
+    conversationOperation?: ConversationOperationContext,
+    generation?: CommandGeneration,
+    outputConversation?: OutputScriptConversation,
+) {
     let pipe = ''
     const splited:string[] = []
     let lastIndex = 0
@@ -48,7 +54,8 @@ export async function processMultiCommand(command:string, conversationOperation?
     console.log(splited)
     for(let i = 0; i<splited.length; i++){
         if (generation?.signal.aborted) return pipe
-        const result = await processCommand(splited[i].trim(), pipe, conversationOperation, generation)
+        outputConversation?.requireActive()
+        const result = await processCommand(splited[i].trim(), pipe, conversationOperation, generation, outputConversation)
         console.log(pipe)
         if(result === false){
             return false
@@ -61,12 +68,20 @@ export async function processMultiCommand(command:string, conversationOperation?
 }
 
 
-async function processCommand(command:string, pipe:string, conversationOperation?: ConversationOperationContext, generation?: CommandGeneration):Promise<false | string>{
+async function processCommand(
+    command: string,
+    pipe: string,
+    conversationOperation?: ConversationOperationContext,
+    generation?: CommandGeneration,
+    outputConversation?: OutputScriptConversation,
+): Promise<false | string> {
     const db = getDatabase()
     const selectedCharacterIndex = get(selectedCharID)
     const currentChar = db.characters[selectedCharacterIndex]
     const currentChat = currentChar.chats[currentChar.chatPage]
-    let mutationTarget = captureConversationMutationTarget(
+    // /trigger can run against an output window while the selected chat contains only metadata.
+    let mutationTarget: ReturnType<typeof captureConversationMutationTarget>
+    const getMutationTarget = () => mutationTarget ??= captureConversationMutationTarget(
         currentChar,
         currentChat,
         getActiveConversationSession(),
@@ -77,7 +92,7 @@ async function processCommand(command:string, pipe:string, conversationOperation
         const currentIndex = get(selectedCharID)
         const character = currentDatabase.characters[currentIndex]
         return isConversationMutationTargetCurrent(
-            mutationTarget,
+            getMutationTarget(),
             character,
             character?.chats[character.chatPage],
             getActiveConversationSession(),
@@ -88,7 +103,7 @@ async function processCommand(command:string, pipe:string, conversationOperation
         const currentIndex = get(selectedCharID)
         const character = currentDatabase.characters[currentIndex]
         const refreshedTarget = refreshConversationMutationTarget(
-            mutationTarget,
+            getMutationTarget(),
             character,
             character?.chats[character.chatPage],
             getActiveConversationSession(),
@@ -153,7 +168,7 @@ async function processCommand(command:string, pipe:string, conversationOperation
             return pipe
         }
         case 'send': {
-            appendConversationMessage(mutationTarget, {
+            appendConversationMessage(getMutationTarget(), {
                 role: "user",
                 data: arg
             })
@@ -162,7 +177,7 @@ async function processCommand(command:string, pipe:string, conversationOperation
         }
         case 'sendas': {
             //name not implemented
-            appendConversationMessage(mutationTarget, {
+            appendConversationMessage(getMutationTarget(), {
                 role: "char",
                 data: arg
             })
@@ -172,17 +187,17 @@ async function processCommand(command:string, pipe:string, conversationOperation
         case 'comment': {
             //works differently, but its close enough
             const addition = `<Comment>\n${arg}\n</Comment>`
-            appendConversationComment(mutationTarget, addition)
+            appendConversationComment(getMutationTarget(), addition)
             setDatabase(db)
             return pipe
         }
         case 'cut':{
-            cutConversationMessages(mutationTarget, arg)
+            cutConversationMessages(getMutationTarget(), arg)
             setDatabase(db)
             return pipe
         }
         case 'del': {
-            retainConversationDeleteSlice(mutationTarget, arg)
+            retainConversationDeleteSlice(getMutationTarget(), arg)
             if(!isNaN(parseInt(arg))) setDatabase(db)
             return pipe
         }
@@ -210,8 +225,8 @@ async function processCommand(command:string, pipe:string, conversationOperation
                     role: 'user',
                     data: e
                 } as const
-                if(clearMode) resetConversationWithMessage(mutationTarget, message)
-                else appendConversationMessage(mutationTarget, message)
+                if(clearMode) resetConversationWithMessage(getMutationTarget(), message)
+                else appendConversationMessage(getMutationTarget(), message)
                 if (!refreshMutationTarget()) return false
                 if (generation) await sendChat({ signal: generation.signal }, generation.reservation)
                 else await sendChat()
@@ -254,14 +269,15 @@ async function processCommand(command:string, pipe:string, conversationOperation
                 throw new ConversationSessionInactiveError()
             }
             const triggerResult = await runTrigger(currentChar, 'manual', {
-                chat: conversationOperation?.chat ?? getCurrentChat(),
+                chat: outputConversation?.window?.read() ?? outputConversation?.access?.currentChat() ?? conversationOperation?.chat ?? getCurrentChat(),
                 manualName: arg,
-                conversationOperation,
+                conversationOperation: outputConversation ? undefined : conversationOperation,
+                outputConversation,
                 generation,
             });
 
             if (generation?.signal.aborted) return pipe
-            if(triggerResult && !conversationOperation){
+            if(triggerResult && !conversationOperation && !outputConversation){
                setCurrentChat(triggerResult.chat);
             }
             return

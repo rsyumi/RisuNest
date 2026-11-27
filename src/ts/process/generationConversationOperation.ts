@@ -130,6 +130,12 @@ export function captureGenerationConversationOperation(
         : captureFullArrayFallback(options)
 }
 
+function uniqueMessageIndex(messages: readonly Message[], id: string | undefined): number {
+    if (!id) return -1
+    const first = messages.findIndex(message => message.chatId === id)
+    return first >= 0 && messages.findLastIndex(message => message.chatId === id) === first ? first : -1
+}
+
 function captureWindowedOperation(
     controller: WindowedConversationMutationController,
     options: GenerationConversationOperationOptions,
@@ -139,7 +145,7 @@ function captureWindowedOperation(
     let localIndex: number
     if (options.append !== undefined) {
         localIndex = chat.message.length
-        trackRerollOutput(chat, options.append)
+        trackRerollOutput(chat, options.append, controller.absoluteStartIndex + localIndex)
         if (!controller.applyRange(localIndex, 0, [options.append], 'append')) {
             throw new RangeError('Windowed generation operation owner is no longer current')
         }
@@ -147,7 +153,7 @@ function captureWindowedOperation(
         localIndex = chat.message.length - 1
         if (!chat.message[localIndex]) throw new RangeError('Cannot continue an empty conversation')
     } else {
-        localIndex = chat.message.findIndex((message) => message.chatId === options.messageId)
+        localIndex = uniqueMessageIndex(chat.message, options.messageId)
         if (localIndex < 0) {
             throw new RangeError(`Generation message ${options.messageId} was not found`)
         }
@@ -155,18 +161,28 @@ function captureWindowedOperation(
     let released = false
     let currentMessageId = chat.message[localIndex]?.chatId
     let target = chat.message[localIndex]
+    let stable = controller.bindTarget?.(localIndex) ?? null
     const operation: GenerationConversationOperation = {
-        get absoluteIndex() { return controller.absoluteStartIndex + localIndex },
+        get absoluteIndex() { return stable ? stable.absoluteIndex ?? -1 : controller.absoluteStartIndex + localIndex },
         get messageId() { return currentMessageId },
         usesFullArrayFallback: false,
         isOwned() {
+            if (stable) {
+                const index = stable.absoluteIndex
+                if (released || options.isOwnerCurrent?.() === false || index === null) return false
+                if (controller.isCurrent()) {
+                    localIndex = index - controller.absoluteStartIndex
+                    target = chat.message[localIndex]
+                }
+                return true
+            }
             return !released
                 && controller.isCurrent()
                 && options.isOwnerCurrent?.() !== false
                 && chat.message[localIndex]?.chatId === currentMessageId
         },
         snapshot() {
-            return operation.isOwned() ? safeStructuredClone(chat.message[localIndex]) : null
+            return operation.isOwned() ? safeStructuredClone(stable ? stable.read() : chat.message[localIndex]) : null
         },
         commitData(data) {
             const current = operation.snapshot()
@@ -174,15 +190,23 @@ function captureWindowedOperation(
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
-            trackRerollOutput(chat, message)
+            trackRerollOutput(chat, message, operation.absoluteIndex)
+            if (stable) {
+                if (!stable.replace(message)) return false
+                currentMessageId = message.chatId
+                localIndex = stable.absoluteIndex! - controller.absoluteStartIndex
+                target = chat.message[localIndex]
+                return true
+            }
             if (!controller.applyRange(localIndex, 1, [message], 'edit')) return false
             currentMessageId = chat.message[localIndex]?.chatId
             target = chat.message[localIndex]
             return true
         },
         refresh() {
+            if (stable) return operation.isOwned()
             if (!controller.isCurrent() || currentMessageId === undefined) return false
-            const nextIndex = chat.message.findIndex((message) => message.chatId === currentMessageId)
+            const nextIndex = uniqueMessageIndex(chat.message, currentMessageId)
             if (nextIndex < 0) return false
             localIndex = nextIndex
             target = chat.message[localIndex]
@@ -191,10 +215,22 @@ function captureWindowedOperation(
         acceptCommit(commit) {
             if (released || options.isOwnerCurrent?.() === false) return false
             const nextIndex = commit.remapWindowTarget?.(controller, target)
-            if (nextIndex === undefined) return operation.isOwned()
+            if (nextIndex === undefined) {
+                if (!stable && currentMessageId && controller.adoptSessionCommit) {
+                    const adopted = controller.adoptSessionCommit(commit, localIndex, currentMessageId)
+                    if (adopted !== null) {
+                        localIndex = adopted
+                        target = chat.message[adopted]
+                    }
+                }
+                return operation.isOwned()
+            }
             if (nextIndex === null) {
                 released = true
                 return false
+            }
+            if (stable && stable.absoluteIndex !== controller.absoluteStartIndex + nextIndex) {
+                stable = controller.bindTarget?.(nextIndex) ?? null
             }
             localIndex = nextIndex
             target = chat.message[localIndex]
@@ -205,7 +241,7 @@ function captureWindowedOperation(
             if (changes.length === 0) return
             writeMetadata(chat, changes)
             // The window copies its chat's metadata to the selected conversation only in a recorded range.
-            if (controller.isCurrent()) controller.applyRange(0, 0, [], 'update-metadata')
+            if (controller.isOwnerCurrent?.() ?? controller.isCurrent()) controller.applyRange(0, 0, [], 'update-metadata')
         },
         release() { released = true },
     }
@@ -248,7 +284,7 @@ function captureSessionOperation(
     let locator: MessageLocator
     try {
         if (options.append !== undefined) {
-            trackRerollOutput(options.chat, options.append)
+            trackRerollOutput(options.chat, options.append, session.totalMessages)
             locator = session.append(options.append)
         } else if (options.continueLast) {
             if (session.totalMessages === 0) {
@@ -256,7 +292,9 @@ function captureSessionOperation(
             }
             locator = session.locate(session.totalMessages - 1)
         } else {
-            const found = session.findMessageLocatorById(options.messageId!)
+            const first = session.findMessageTargetsByIds([options.messageId!], 'first')[0]
+            const last = session.findMessageTargetsByIds([options.messageId!], 'last')[0]
+            const found = first && last && first.absoluteIndex === last.absoluteIndex ? first.locator : null
             if (found === null) {
                 throw new RangeError(`Generation message ${options.messageId} was not found`)
             }
@@ -303,22 +341,30 @@ function captureSessionOperation(
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
-            trackRerollOutput(options.chat, message)
+            trackRerollOutput(options.chat, message, operation.absoluteIndex)
             locator = session.edit(locator, message)
             currentMessageId = message.chatId
             return true
         },
         refresh() {
             if (!ownerIsCurrent() || currentMessageId === undefined) return false
-            const refreshed = session.findMessageLocatorById(currentMessageId)
-            if (refreshed === null) return false
-            locator = refreshed
+            const first = session.findMessageTargetsByIds([currentMessageId], 'first')[0]
+            const last = session.findMessageTargetsByIds([currentMessageId], 'last')[0]
+            if (!first || !last || first.absoluteIndex !== last.absoluteIndex) return false
+            locator = first.locator
             return true
         },
         acceptCommit(commit) {
-            return (
-                commit.follows(session, locator.sessionVersion, options.chat) && operation.refresh()
-            )
+            if (!commit.follows(session, locator.sessionVersion, options.chat)) return false
+            if (commit.mapSessionIndex) {
+                const index = commit.mapSessionIndex(locator.absoluteIndex)
+                if (index === null || !ownerIsCurrent()) return false
+                const next = session.locate(index)
+                if (session.readMessage(next).chatId !== currentMessageId) return false
+                locator = next
+                return true
+            }
+            return operation.refresh()
         },
         commitMetadata(values) {
             const owned = operation.isOwned()
@@ -345,7 +391,7 @@ function captureFullArrayFallback(
     if (options.append !== undefined) {
         target = safeStructuredClone(options.append)
         absoluteIndex = chat.message.length
-        trackRerollOutput(chat, target)
+        trackRerollOutput(chat, target, absoluteIndex)
         chat.message.push(target)
         target = chat.message[absoluteIndex]
         options.onFallbackMutation?.()
@@ -354,7 +400,7 @@ function captureFullArrayFallback(
         target = chat.message[absoluteIndex]
         if (!target) throw new RangeError('Cannot continue an empty conversation')
     } else {
-        absoluteIndex = chat.message.findIndex((message) => message.chatId === options.messageId)
+        absoluteIndex = uniqueMessageIndex(chat.message, options.messageId)
         target = chat.message[absoluteIndex]
         if (!target) throw new RangeError(`Generation message ${options.messageId} was not found`)
     }
@@ -384,7 +430,7 @@ function captureFullArrayFallback(
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
-            trackRerollOutput(chat, message)
+            trackRerollOutput(chat, message, operation.absoluteIndex)
             chat.message[absoluteIndex] = safeStructuredClone(message)
             target = chat.message[absoluteIndex]
             currentMessageId = target.chatId

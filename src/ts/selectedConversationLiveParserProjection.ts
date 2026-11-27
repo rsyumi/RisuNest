@@ -158,10 +158,11 @@ export function createSelectedConversationLiveParserProjectionResolver(
                     captureExactCurrent(dependencies, target)
                     if (source?.snapshot().version !== version || historyChanged()) throw new ChatParserHistoryProjectionStaleError()
                 }
+                const windowReader = source?.captureProjectedReader?.(dependencies.runtime.store) ?? dependencies.runtime.store
                 const reader: CbsHistoryReader = { revision: target.storeRevision,
                     readResidentMessage: (index) => source?.snapshot().rowAt(index)?.message,
                     readConversationWindow: async (query) => {
-                        const result = await dependencies.runtime.store.readConversationWindow(query)
+                        const result = await windowReader.readConversationWindow(query)
                         return result ? { ...result, value: { ...result.value, totalMessages: input.totalMessages,
                             hasMoreAfter: result.value.endIndex < input.totalMessages } } : null
                     } }
@@ -256,6 +257,8 @@ export function createSelectedConversationLiveParserProjectionResolver(
                 || authority.totalMessages !== input.totalMessages
             ) throw new ChatParserHistoryProjectionStaleError()
 
+            const source = dependencies.runtime.getActiveConversationViewportSource?.()
+            const windowReader = source?.captureProjectedReader?.(dependencies.runtime.store) ?? dependencies.runtime.store
             const revisionAdvanced = captureRevisionAdvance(dependencies.runtime, target)
             let resident = captureResidentParserRows(dependencies, target, input)
             try {
@@ -275,10 +278,10 @@ export function createSelectedConversationLiveParserProjectionResolver(
                         revision: authority.storeRevision,
                         readRoleWindow: dependencies.runtime.store.messageMetadataReadMode === 'projected'
                             && authority.sessionVersion === authority.persistedSessionVersion
-                            ? (query) => dependencies.runtime.store.readConversationMessageMetadataWindow!(query) : undefined,
+                            ? (query) => windowReader.readConversationMessageMetadataWindow!(query) : undefined,
                         readResidentMessage: resident ? (index) => resident?.readMessage(index) : undefined,
                         readConversationWindow: async (query) => {
-                            const result = await dependencies.runtime.store.readConversationWindow(query)
+                            const result = await windowReader.readConversationWindow(query)
                             return result ? { ...result, value: { ...result.value, totalMessages: input.totalMessages,
                                 hasMoreAfter: result.value.endIndex < input.totalMessages } } : null
                         },
@@ -333,7 +336,10 @@ export function createSelectedConversationLiveParserProjectionResolver(
                 }
                 return projection
             } catch (error) {
-                if (!input.signal?.aborted && revisionAdvanced()) input.onStale?.()
+                if (!input.signal?.aborted && revisionAdvanced()) {
+                    input.onStale?.()
+                    if (error instanceof DOMException && error.name === 'AbortError') throw new ChatParserHistoryProjectionStaleError()
+                }
                 throw error
             } finally {
                 resident?.release()

@@ -1,5 +1,5 @@
+import { projectConversationWindows } from './projectedConversationWindowReader'
 import { ChatRenderIdentityRegistry } from './chatRenderIdentity'
-import { safeStructuredClone } from './safeStructuredClone'
 import type {
     CapturedChatMessageTarget,
     CurrentChatMessageTarget,
@@ -17,9 +17,10 @@ import type {
     DataRevision,
     Versioned,
 } from './storage/persistentDataStore'
-import { validateConversationWindowQuery } from './storage/persistentDataStore'
+import { CONVERSATION_RANGE_MAX_LIMIT, validateConversationWindowQuery } from './storage/persistentDataStore'
 import { replaceArrayRange } from './arrayRange'
 import { yieldToMainThread } from './ui/yieldToUi'
+import type { WindowedConversationOverlay } from './storage/windowedConversationOverlay'
 import type { CbsHistoryChange } from './cbsHistoryAccess'
 
 declare const conversationViewportKeyBrand: unique symbol
@@ -44,6 +45,7 @@ export interface ConversationViewportSnapshot {
     readonly storeRevision: DataRevision
     readonly totalMessages: number
     keyAt(absoluteIndex: number): ConversationViewportKey | undefined
+    positionKeyAt?(absoluteIndex: number): string | undefined
     indexOfKey(key: ConversationViewportKey): number
     rowAt(absoluteIndex: number): ConversationViewportRow | undefined
 }
@@ -74,6 +76,8 @@ export interface ConversationViewportPin {
 
 export interface ConversationViewportSource {
     snapshot(): ConversationViewportSnapshot
+    projectedLocalRow?(index: number): Readonly<Message> | undefined
+    captureProjectedReader?(reader: PersistentConversationWindowReader): PersistentConversationWindowReader
     captureResidentRows?(): readonly ConversationViewportRow[]
     ensureRange(input: ConversationViewportRangeRequest): Promise<void>
     findLatestMessagePair?(signal: AbortSignal): Promise<number[]>
@@ -102,6 +106,7 @@ export interface PersistentConversationWindowReader {
 }
 
 export interface PersistentConversationViewportSourceOptions {
+    overlay?: WindowedConversationOverlay
     reader: PersistentConversationWindowReader
     characterId: string
     conversationId: string
@@ -152,6 +157,8 @@ implements ConversationViewportSource {
     private readonly unsubscribeSession: () => void
     private keys: ConversationViewportKey[]
     private keyIndices = new Map<ConversationViewportKey, number>()
+    private positionVersions = new Map<ConversationViewportKey, number>()
+    private positionEpoch = 0
     private rows = new Map<number, ConversationViewportRow>()
     private currentVersion: number
     private lastSessionVersion: number
@@ -174,6 +181,8 @@ implements ConversationViewportSource {
     snapshot(): ConversationViewportSnapshot {
         const keys = this.keys
         const keyIndices = this.keyIndices
+        const positionVersions = this.positionVersions
+        const positionEpoch = this.positionEpoch
         const rows = this.rows
         return {
             sourceToken: this.sourceToken,
@@ -181,6 +190,10 @@ implements ConversationViewportSource {
             storeRevision: this.session.storeRevision,
             totalMessages: keys.length,
             keyAt: (absoluteIndex) => keys[absoluteIndex],
+            positionKeyAt: (index) => {
+                const key = keys[index]
+                return key === undefined ? undefined : JSON.stringify([key, positionEpoch, positionVersions.get(key) ?? 0])
+            },
             indexOfKey: (key) => keyIndices.get(key) ?? -1,
             rowAt: (absoluteIndex) => rows.get(absoluteIndex),
         }
@@ -346,9 +359,25 @@ implements ConversationViewportSource {
     }
 
     private reconcileKeys(event: ActiveConversationMutationEvent): void {
-        if (event.previousVersion !== this.lastSessionVersion) {
-            this.keys = this.createInitialKeys()
+        if (event.previousVersion !== this.lastSessionVersion || event.commands.includes('replace-conversation')) {
+            this.resetKeyProofs()
             return
+        }
+
+        let versions: Map<ConversationViewportKey, number> | undefined
+        // A splice may reuse a render key for a different legacy message. Retire only
+        // the affected proofs; retained snapshots keep the pre-splice map.
+        const updateProofs = (keys: readonly ConversationViewportKey[], mutation: ActiveConversationMutationEvent['mutations'][number]) => {
+            const retained = Math.min(mutation.deleteCount, mutation.messages.length)
+            const ambiguous = retained > 0 && (mutation.deleteCount !== 1 || mutation.messages.length !== 1)
+            if (ambiguous) {
+                versions ??= new Map(this.positionVersions)
+                for (let i = 0; i < retained; i++) versions.set(keys[mutation.start + i], event.sessionVersion)
+            }
+            for (let i = retained; i < mutation.deleteCount && (versions ?? this.positionVersions).size > 0; i++) {
+                versions ??= new Map(this.positionVersions)
+                versions.delete(keys[mutation.start + i])
+            }
         }
 
         // Streaming replaces text without moving rows. Keep the immutable key
@@ -361,8 +390,11 @@ implements ConversationViewportSource {
                     mutation.start >= 0 &&
                     mutation.start + mutation.deleteCount <= this.keys.length,
             )
-        )
+        ) {
+            for (const mutation of event.mutations) updateProofs(this.keys, mutation)
+            if (versions) this.positionVersions = versions
             return
+        }
 
         const nextKeys = [...this.keys]
         for (const mutation of event.mutations) {
@@ -370,9 +402,10 @@ implements ConversationViewportSource {
                 mutation.start > nextKeys.length ||
                 mutation.deleteCount > nextKeys.length - mutation.start
             ) {
-                this.keys = this.createInitialKeys()
+                this.resetKeyProofs()
                 return
             }
+            updateProofs(nextKeys, mutation)
             const retainedCount = Math.min(mutation.deleteCount, mutation.messages.length)
             const replacements = nextKeys.slice(
                 mutation.start,
@@ -383,9 +416,16 @@ implements ConversationViewportSource {
             }
             replaceArrayRange(nextKeys, mutation.start, mutation.deleteCount, replacements)
         }
-        this.keys = nextKeys.length === this.session.totalMessages
-            ? nextKeys
-            : this.createInitialKeys()
+        if (nextKeys.length === this.session.totalMessages) {
+            this.keys = nextKeys
+            if (versions) this.positionVersions = versions
+        } else this.resetKeyProofs()
+    }
+
+    private resetKeyProofs(): void {
+        this.keys = this.createInitialKeys()
+        this.positionVersions = new Map()
+        this.positionEpoch++
     }
 
     private rebuildKeyIndices(): void {
@@ -419,6 +459,28 @@ interface PersistentCachedRow {
     lastUsed: number
 }
 
+interface ProjectionChange {
+    start: number
+    end: number
+    structureChanged: boolean
+    pairChanged?: boolean
+    previousCount?: number
+    nextCount?: number
+}
+
+interface PositionProofBoundary { start: number; epoch: number }
+
+function positionProofEpoch(boundaries: readonly PositionProofBoundary[], index: number): number {
+    let low = 0
+    let high = boundaries.length
+    while (low < high) {
+        const middle = Math.floor((low + high) / 2)
+        if (boundaries[middle].start <= index) low = middle + 1
+        else high = middle
+    }
+    return boundaries[low - 1]?.epoch ?? 0
+}
+
 interface PersistentRangePinState {
     startIndex: number
     endIndex: number
@@ -429,6 +491,7 @@ export class PersistentConversationViewportSource
 implements ConversationViewportSource {
     readonly sourceToken = createSourceToken()
 
+    private readonly overlay?: WindowedConversationOverlay
     private readonly reader: PersistentConversationWindowReader
     private readonly characterId: string
     private readonly conversationId: string
@@ -436,14 +499,13 @@ implements ConversationViewportSource {
     private readonly listeners = new Set<() => void>()
     private readonly pins = new Map<number, PersistentRangePinState>()
     private rows = new Map<number, PersistentCachedRow>()
-    // The session version of the edit each unsaved row holds.
-    private optimisticRows = new Map<number, number>()
     private historyVersion = 0
     private readonly historyChanges: (CbsHistoryChange & { version: number })[] = []
     private currentRevision: DataRevision
     private persistedTotalMessages: number
     private totalMessages: number
     private epoch = 0
+    private positionProofs: PositionProofBoundary[] = []
     private accessClock = 0
     private nextPinId = 0
     private disposed = false
@@ -461,17 +523,19 @@ implements ConversationViewportSource {
         if (!Number.isSafeInteger(options.rowBudget) || options.rowBudget <= 0) {
             throw new RangeError('Conversation viewport row budget must be a positive safe integer')
         }
+        this.overlay = options.overlay
         this.reader = options.reader
         this.characterId = options.characterId
         this.conversationId = options.conversationId
         this.currentRevision = options.revision
         this.persistedTotalMessages = options.totalMessages
-        this.totalMessages = options.totalMessages
+        this.totalMessages = options.overlay?.count ?? options.totalMessages
         this.rowBudget = options.rowBudget
     }
 
     snapshot(): ConversationViewportSnapshot {
         const epoch = this.epoch
+        const proofs = this.positionProofs
         const historyVersion = this.historyVersion
         const totalMessages = this.disposed ? 0 : this.totalMessages
         return {
@@ -485,6 +549,8 @@ implements ConversationViewportSource {
             storeRevision: this.currentRevision,
             totalMessages,
             keyAt: (absoluteIndex) => this.keyAt(epoch, totalMessages, absoluteIndex),
+            positionKeyAt: index => Number.isSafeInteger(index) && index >= 0 && index < totalMessages
+                ? JSON.stringify([this.sourceToken, positionProofEpoch(proofs, index), index]) : undefined,
             indexOfKey: (key) => this.indexOfKey(epoch, totalMessages, key),
             rowAt: (absoluteIndex) => this.rowAt(epoch, absoluteIndex),
         }
@@ -493,6 +559,127 @@ implements ConversationViewportSource {
     captureResidentRows(): readonly ConversationViewportRow[] {
         this.assertUsable()
         return [...this.rows.values()].map(({ row }) => row)
+    }
+
+    projectedLocalRow(index: number): Readonly<Message> | undefined {
+        const row = this.overlay?.row(index)
+        return row && 'message' in row ? row.message : undefined
+    }
+
+    captureProjectedReader(reader: PersistentConversationWindowReader, sameRevision?: (revision: number) => boolean): PersistentConversationWindowReader {
+        const projection = this.overlay?.captureProjection()
+        if (!projection) return reader
+        return projectConversationWindows(reader, projection, this.characterId, this.conversationId, this.persistedTotalMessages, sameRevision)
+    }
+
+    async readProjectedRange(startIndex: number, limit: number): Promise<Message[]> {
+        this.assertUsable()
+        if (!Number.isSafeInteger(startIndex) || startIndex < 0 || !Number.isSafeInteger(limit) || limit < 0)
+            throw new RangeError('Invalid projected conversation range')
+        const historyVersion = this.historyVersion
+        const revision = this.currentRevision
+        const reader = this.captureProjectedReader(this.reader)
+        const messages: Message[] = []
+        const end = Math.min(this.totalMessages, startIndex + limit)
+        for (let cursor = startIndex; cursor < end; cursor += CONVERSATION_RANGE_MAX_LIMIT) {
+            const result = await reader.readConversationWindow({
+                characterId: this.characterId, conversationId: this.conversationId,
+                startIndex: cursor, limit: Math.min(end - cursor, CONVERSATION_RANGE_MAX_LIMIT),
+            })
+            if (!result) throw new Error(`Conversation ${this.conversationId} was not found`)
+            if (result.revision !== revision || this.currentRevision !== revision || this.historyVersion !== historyVersion || this.disposed)
+                throw new DOMException('Conversation changed during window read', 'AbortError')
+            messages.push(...result.value.messages)
+        }
+        return messages
+    }
+
+    refreshProjection(change: ProjectionChange): void {
+        this.refreshProjections([change])
+    }
+
+    refreshProjections(changes: readonly ProjectionChange[]): void {
+        this.assertUsable()
+        if (!changes.length) return
+        const overlay = this.overlay
+        if (!overlay) throw new Error('Conversation overlay is missing')
+        let previousCount = this.totalMessages
+        this.totalMessages = overlay.count
+        if (changes.some(change => change.structureChanged || change.pairChanged !== false)) this.latestPair = null
+        if (changes.some(change => change.structureChanged)) this.resetPositions()
+        for (const change of changes) {
+            const before = change.previousCount ?? previousCount
+            const after = change.nextCount ?? this.totalMessages
+            if (change.structureChanged && change.start < before) {
+                // A known append leaves all earlier slots proven. A middle splice
+                // can displace the suffix; a reorder affects only its own range.
+                this.invalidatePositionProofs(change.start, before === after ? change.end : undefined)
+            }
+            for (const interval of overlay.intervals(change.start, Math.max(0, Math.min(change.end, this.totalMessages) - change.start))) {
+                if ('messages' in interval) {
+                    interval.messages.forEach((message, offset) => this.cacheRow(interval.start + offset, message))
+                } else {
+                    for (let index = interval.start; index < interval.start + interval.length; index++) this.rows.delete(index)
+                }
+            }
+            this.recordHistoryChange(change.start, before !== after ? Math.max(before, after) : change.end, before !== after)
+            previousCount = after
+        }
+        this.evictUnpinnedRows()
+        this.notifyListeners()
+    }
+
+    private invalidatePositionProofs(start: number, end?: number): void {
+        const previous = this.positionProofs
+        const next = previous.filter(boundary => boundary.start < start)
+        next.push({ start, epoch: this.epoch })
+        if (end !== undefined) {
+            next.push({ start: end, epoch: positionProofEpoch(previous, end) })
+            next.push(...previous.filter(boundary => boundary.start > end))
+        }
+        this.positionProofs = next
+    }
+
+    installProjection(revision: DataRevision, storedCount: number, structureChanged: boolean, rewritten: readonly ConversationRowsRewrite[] = []): void {
+        this.assertUsable()
+        this.validateRevision(revision)
+        this.validateMessageCount(storedCount)
+        if (revision < this.currentRevision) throw new RangeError('Persistent conversation revision moved backwards')
+        const previousCount = this.totalMessages
+        const previousStoredCount = this.persistedTotalMessages
+        this.currentRevision = revision
+        this.persistedTotalMessages = storedCount
+        this.totalMessages = this.overlay?.count ?? storedCount
+        if (!structureChanged && previousCount === this.totalMessages && previousStoredCount === storedCount && !rewritten.length) return
+        this.latestPair = null
+        if (structureChanged) {
+            this.resetPositions()
+            this.invalidatePositionProofs(0)
+            this.recordHistoryChange(0, Math.max(previousCount, this.totalMessages), previousCount !== this.totalMessages)
+        } else for (const { start, messages } of rewritten) {
+            messages.forEach((message, offset) => {
+                const index = this.overlay ? this.overlay.storedToVisible(start + offset) : start + offset
+                if (index === null) return
+                const dirty = this.overlay?.row(index)
+                if (this.rows.has(index)) this.cacheRow(index, dirty && 'message' in dirty ? dirty.message : message)
+                this.recordHistoryChange(index, index + 1, false)
+            })
+        }
+        this.notifyListeners()
+    }
+
+    private resetPositions(): void {
+        this.epoch++
+        this.pins.clear()
+        this.rows.clear()
+    }
+
+    private cacheRow(index: number, message: Message): void {
+        const key = this.keyAt(this.epoch, this.totalMessages, index)
+        if (key) this.rows.set(index, {
+            row: { key, absoluteIndex: index, message, sourceVersion: this.epoch },
+            lastUsed: ++this.accessClock,
+        })
     }
 
     findLatestMessagePair(signal: AbortSignal): Promise<number[]> {
@@ -507,26 +694,38 @@ implements ConversationViewportSource {
                 resident.set(message.role, index)
             }
         }
-        if (resident.size === 2 || index < 0) return this.latestPair = Promise.resolve([...resident.values()].sort((left, right) => left - right))
+        if (resident.size === 2 || index < 0) {
+            const lookup = Promise.resolve().then(() => {
+                signal.throwIfAborted()
+                if (this.disposed || this.latestPair !== lookup) throw new DOMException('Conversation changed during pair lookup', 'AbortError')
+                return [...resident.values()].sort((left, right) => left - right)
+            }).catch(error => {
+                if (this.latestPair === lookup) this.latestPair = null
+                throw error
+            })
+            return this.latestPair = lookup
+        }
         const revision = this.currentRevision
         const epoch = this.epoch
         // A later revision that stores a different count also changes the windows this lookup checks.
+        const expectedTotal = this.overlay ? this.totalMessages : this.persistedTotalMessages
         const persistedTotalMessages = this.persistedTotalMessages
         const sameConversationRevision = (value: number | undefined) => !this.disposed && epoch === this.epoch &&
             persistedTotalMessages === this.persistedTotalMessages &&
             value !== undefined && value >= revision && value <= this.currentRevision
+        const reader = this.captureProjectedReader(this.reader, sameConversationRevision)
         const lookup = scanLatestMessagePair(this.totalMessages, async (start, limit, found) => {
             const query = { characterId: this.characterId, conversationId: this.conversationId, startIndex: start, limit }
-            if (this.reader.readConversationMessageMetadataWindow) {
-                const metadata = await this.reader.readConversationMessageMetadataWindow(query)
+            if (reader.readConversationMessageMetadataWindow) {
+                const metadata = await reader.readConversationMessageMetadataWindow(query)
                 if (!sameConversationRevision(metadata?.revision) || !metadata) {
                     throw new DOMException('Conversation changed during pair lookup', 'AbortError')
                 }
                 if (metadata.value.characterId !== this.characterId || metadata.value.conversationId !== this.conversationId ||
-                    metadata.value.startIndex !== Math.min(start, this.persistedTotalMessages) ||
-                    metadata.value.endIndex !== Math.min(start + limit, this.persistedTotalMessages) ||
+                    metadata.value.startIndex !== Math.min(start, expectedTotal) ||
+                    metadata.value.endIndex !== Math.min(start + limit, expectedTotal) ||
                     metadata.value.messages.length !== metadata.value.endIndex - metadata.value.startIndex ||
-                    metadata.value.totalMessages !== this.persistedTotalMessages) {
+                    metadata.value.totalMessages !== expectedTotal) {
                     throw new Error('Conversation pair lookup returned mismatched metadata')
                 }
                 const messages: (Readonly<Message> | undefined)[] = new Array(limit)
@@ -534,16 +733,15 @@ implements ConversationViewportSource {
                 for (let offset = limit - 1; offset >= 0 && roles.size < 2; offset--) {
                     signal.throwIfAborted()
                     const index = start + offset
-                    const optimistic = this.optimisticRows.has(index) ? this.rows.get(index)?.row.message : undefined
-                    const summary = optimistic ?? metadata.value.messages[offset]
+                    const summary = metadata.value.messages[offset]
                     if (!summary || summary.disabled || (summary.role !== 'char' && summary.role !== 'user') || roles.has(summary.role)) continue
-                    let message = optimistic ?? this.rows.get(index)?.row.message
+                    let message = this.rows.get(index)?.row.message
                     if (!message) {
-                        const body = await this.reader.readConversationWindow({ ...query, startIndex: index, limit: 1 })
+                        const body = await reader.readConversationWindow({ ...query, startIndex: index, limit: 1 })
                         if (!sameConversationRevision(body?.revision) || !body || body.value.startIndex !== index ||
                             body.value.endIndex !== index + 1 || body.value.messages.length !== 1 ||
                             body.value.characterId !== this.characterId || body.value.conversationId !== this.conversationId ||
-                            body.value.totalMessages !== this.persistedTotalMessages) {
+                            body.value.totalMessages !== expectedTotal) {
                             throw new DOMException('Conversation changed during pair lookup', 'AbortError')
                         }
                         message = body.value.messages[0]
@@ -555,22 +753,18 @@ implements ConversationViewportSource {
                 }
                 return messages
             }
-            const result = await this.reader.readConversationWindow(query)
+            const result = await reader.readConversationWindow(query)
             if (!sameConversationRevision(result?.revision) || !result) {
                 throw new DOMException('Conversation changed during pair lookup', 'AbortError')
             }
             if (result.value.characterId !== this.characterId || result.value.conversationId !== this.conversationId ||
-                result.value.startIndex !== Math.min(start, this.persistedTotalMessages) ||
-                result.value.endIndex !== Math.min(start + limit, this.persistedTotalMessages) ||
+                result.value.startIndex !== Math.min(start, expectedTotal) ||
+                result.value.endIndex !== Math.min(start + limit, expectedTotal) ||
                 result.value.messages.length !== result.value.endIndex - result.value.startIndex ||
-                result.value.totalMessages !== this.persistedTotalMessages) {
+                result.value.totalMessages !== expectedTotal) {
                 throw new Error('Conversation pair lookup returned a mismatched window')
             }
-            return Array.from({ length: limit }, (_, offset) => {
-                const index = start + offset
-                return (this.optimisticRows.has(index) ? this.rows.get(index)?.row.message : undefined)
-                    ?? result.value.messages[offset]
-            })
+            return result.value.messages
         }, signal).then((indices) => {
             if (this.disposed || this.latestPair !== lookup) throw new DOMException('Conversation changed during pair lookup', 'AbortError')
             return indices
@@ -590,19 +784,28 @@ implements ConversationViewportSource {
         validateConversationWindowQuery(query)
         const epoch = this.epoch
         const revision = this.currentRevision
-        const result = await this.reader.readConversationWindow(query)
+        const historyVersion = this.historyVersion
+        const expectedTotal = this.overlay ? this.totalMessages : this.persistedTotalMessages
+        let result: Versioned<ConversationWindow> | null
+        try {
+            result = await this.captureProjectedReader(this.reader).readConversationWindow(query)
+        } catch (error) {
+            if (error instanceof DOMException && error.name === 'AbortError') return
+            throw error
+        }
         if (
             input.signal?.aborted ||
             this.disposed ||
             epoch !== this.epoch ||
+            (historyVersion !== this.historyVersion && this.rangeChangedSince(historyVersion, input.startIndex, input.limit)) ||
             revision !== this.currentRevision
         ) return
         if (!result) throw new Error(`Conversation ${this.conversationId} was not found`)
         if (result.revision !== revision) return
         const window = result.value
-        const expectedStartIndex = Math.min(this.persistedTotalMessages, input.startIndex)
+        const expectedStartIndex = Math.min(expectedTotal, input.startIndex)
         const expectedEndIndex = Math.min(
-            this.persistedTotalMessages,
+            expectedTotal,
             expectedStartIndex + input.limit,
         )
         if (
@@ -610,14 +813,13 @@ implements ConversationViewportSource {
             window.conversationId !== this.conversationId ||
             window.startIndex !== expectedStartIndex ||
             window.endIndex !== expectedEndIndex ||
-            window.totalMessages !== this.persistedTotalMessages ||
+            window.totalMessages !== expectedTotal ||
             window.messages.length !== expectedEndIndex - expectedStartIndex
         ) {
             throw new Error(`Conversation ${this.conversationId} returned a mismatched window`)
         }
         for (let offset = 0; offset < window.messages.length; offset++) {
             const absoluteIndex = window.startIndex + offset
-            if (this.optimisticRows.has(absoluteIndex)) continue
             const key = this.keyAt(epoch, this.totalMessages, absoluteIndex)
             if (key === undefined) continue
             this.rows.set(absoluteIndex, {
@@ -634,64 +836,9 @@ implements ConversationViewportSource {
         this.notifyListeners()
     }
 
-    applyOptimisticRange(
-        startIndex: number,
-        deleteCount: number,
-        messages: readonly Message[],
-        sessionVersion = Number.POSITIVE_INFINITY,
-    ): () => void {
-        this.assertUsable()
-        if (
-            !Number.isSafeInteger(startIndex)
-            || startIndex < 0
-            || !Number.isSafeInteger(deleteCount)
-            || deleteCount < 0
-            || startIndex + deleteCount > this.totalMessages
-            // Keys follow the absolute index, so a range may change the message
-            // count only at the end of the conversation.
-            || (messages.length !== deleteCount && startIndex + deleteCount !== this.totalMessages)
-        ) throw new RangeError('Optimistic conversation range is unsupported')
-        this.recordHistoryChange(startIndex, startIndex + Math.max(deleteCount, messages.length), deleteCount !== messages.length)
-        this.latestPair = null
-        const previousRows = new Map(this.rows)
-        const previousOptimisticRows = new Map(this.optimisticRows)
-        const previousTotalMessages = this.totalMessages
-        this.totalMessages = this.totalMessages - deleteCount + messages.length
-        for (let offset = 0; offset < Math.max(deleteCount, messages.length); offset += 1) {
-            const absoluteIndex = startIndex + offset
-            if (offset >= messages.length) {
-                this.rows.delete(absoluteIndex)
-                this.optimisticRows.delete(absoluteIndex)
-                continue
-            }
-            const key = this.keyAt(this.epoch, this.totalMessages, absoluteIndex)
-            if (key === undefined) continue
-            this.rows.set(absoluteIndex, {
-                row: {
-                    key,
-                    absoluteIndex,
-                    message: safeStructuredClone(messages[offset]),
-                    sourceVersion: this.epoch,
-                },
-                lastUsed: ++this.accessClock,
-            })
-            this.optimisticRows.set(absoluteIndex, sessionVersion)
-        }
-        this.evictUnpinnedRows()
-        this.notifyListeners()
-        let restored = false
-        return () => {
-            if (restored || this.disposed) return
-            restored = true
-            this.latestPair = null
-            const restoredEnd = Math.max(this.totalMessages, previousTotalMessages)
-            const countChanged = this.totalMessages !== previousTotalMessages
-            this.rows = previousRows
-            this.optimisticRows = previousOptimisticRows
-            this.totalMessages = previousTotalMessages
-            this.recordHistoryChange(0, restoredEnd, countChanged)
-            this.notifyListeners()
-        }
+    private rangeChangedSince(version: number, start: number, limit: number): boolean {
+        return version < this.historyVersion - this.historyChanges.length ||
+            this.historyChanges.some(change => change.version > version && change.start < start + limit && change.end > start)
     }
 
     private recordHistoryChange(start: number, end: number, countChanged: boolean): void {
@@ -711,54 +858,14 @@ implements ConversationViewportSource {
         this.persistedTotalMessages = totalMessages
         this.totalMessages = totalMessages
         this.epoch += 1
+        this.invalidatePositionProofs(0)
         this.pins.clear()
         this.rows = new Map()
-        this.optimisticRows = new Map()
         this.notifyListeners()
     }
 
-    /**
-     * Moves to a later revision whose stored messages the rows already show. When that revision stored
-     * edits the rows hold, `stored` gives the count it stores and the session version it stores up to,
-     * and rows of those edits are read from the store again once evicted. Rows it `rewritten` take the
-     * stored messages.
-     */
-    advanceUnchangedRevision(revision: DataRevision, stored?: {
-        totalMessages: number
-        sessionVersion: number
-        rewritten?: readonly ConversationRowsRewrite[]
-    }): void {
-        this.assertUsable()
-        this.validateRevision(revision)
-        if (stored) this.validateMessageCount(stored.totalMessages)
-        if (revision < this.currentRevision) throw new RangeError('Persistent conversation revision moved backwards')
-        this.currentRevision = revision
-        if (!stored) return
-        this.persistedTotalMessages = stored.totalMessages
-        for (const [index, sessionVersion] of this.optimisticRows) {
-            if (sessionVersion <= stored.sessionVersion) this.optimisticRows.delete(index)
-        }
-        for (const { start, messages } of stored.rewritten ?? []) {
-            if (!messages.length) continue
-            for (let offset = 0; offset < messages.length; offset++) {
-                const cached = this.rows.get(start + offset)
-                if (cached) cached.row = { ...cached.row, message: safeStructuredClone(messages[offset]) }
-            }
-            this.recordHistoryChange(start, start + messages.length, false)
-        }
-        // Evicted rows of the stored edits now read the store, which may change the latest pair.
-        this.latestPair = null
-        this.notifyListeners()
-    }
-
-    /** Whether a row in these ranges holds an edit later than the stored session version. */
-    holdsUnsavedRows(ranges: readonly ConversationRowsRewrite[], storedSessionVersion: number): boolean {
-        return ranges.some(({ start, messages }) => {
-            for (let index = start; index < start + messages.length; index++) {
-                if ((this.optimisticRows.get(index) ?? -1) > storedSessionVersion) return true
-            }
-            return false
-        })
+    advanceUnchangedRevision(revision: DataRevision): void {
+        this.installProjection(revision, this.persistedTotalMessages, false)
     }
 
     acquireRangePin(

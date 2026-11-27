@@ -306,7 +306,7 @@ export function resolveChatMessageTarget(
     const current = context.captureCurrent()
     if (target.kind === 'windowed') {
         return current?.character === target.character && current.conversation === target.conversation && target.controller.isCurrent()
-            ? { ...target, message: target.controller.chat.message[0] }
+            ? { ...target, ...(target.controller.editorRow?.() ?? { message: target.controller.chat.message[0] }) }
             : null
     }
     if (target.kind === 'session') {

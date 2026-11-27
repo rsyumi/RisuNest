@@ -175,6 +175,51 @@ class ValueNode {
     constructor(readonly digest: number, readonly identity?: unknown) {}
 }
 
+export const pluginMessageDigest = (value: unknown): number => digestValue(value)
+export const pluginMessageIdDigest = (id?: string): number => typeof id === 'string' && id.length > 0 ? digestValue(id) : -1
+
+export interface PluginMessageFingerprints {
+    positionKeys?: Map<number, number>
+    ids: Float64Array
+    digests: Float64Array
+}
+
+class MessageListNode extends ValueNode {
+    constructor(readonly rows: PluginMessageFingerprints) {
+        super(arrayDigest(rows.digests))
+    }
+}
+
+const admissionPositions = new WeakMap<object, (index: number) => string | undefined>()
+export function bindPluginAdmissionMessages(messages: object, keyAt: (index: number) => string | undefined): void {
+    admissionPositions.set(messages, keyAt)
+}
+
+const messageBaselines = new WeakMap<object, PluginMessageFingerprints>()
+export const getPluginMessageBaseline = (messages: object) => messageBaselines.get(messages)
+
+export type PluginReadPositionProof = (conversation: string, index: number) => string | undefined
+
+function bindReadPosition(node: BaselineNode, target: string, proof?: PluginReadPositionProof) {
+    const list = node instanceof ObjectNode && node.children.get('message')
+    if (!(list instanceof MessageListNode)) return
+    bindFingerprintPositions(list.rows, proof && (index => proof(target, index)))
+}
+
+function bindFingerprintPositions(rows: PluginMessageFingerprints, keyAt?: (index: number) => string | undefined) {
+    if (!keyAt) return
+    const seen = new Set<number>(), duplicates = new Set<number>()
+    for (const id of rows.ids) {
+        if (seen.has(id)) duplicates.add(id)
+        seen.add(id)
+    }
+    rows.ids.forEach((id, index) => {
+        if (id >= 0 && !duplicates.has(id)) return
+        const key = keyAt(index)
+        if (key !== undefined) (rows.positionKeys ??= new Map()).set(index, digestValue(key))
+    })
+}
+
 class ObjectNode {
     constructor(
         readonly digest: number,
@@ -201,7 +246,7 @@ function objectNode(keys: readonly string[], nodes: readonly BaselineNode[], dat
     const children = new Map<string, BaselineNode>()
     keys.forEach((key, index) => {
         digests[index] = nodes[index].digest
-        if (descendsInto(key, databaseRoot)) children.set(key, nodes[index])
+        if (nodes[index] instanceof MessageListNode || descendsInto(key, databaseRoot)) children.set(key, nodes[index])
     })
     return new ObjectNode(objectDigest(keys, digests), keys, digests, children, identity)
 }
@@ -211,6 +256,18 @@ function recordsNode(items: readonly BaselineNode[], identity?: unknown): Record
 }
 
 function fieldNode(value: unknown, field: string, databaseRoot: boolean, cost?: DigestCost): BaselineNode {
+    if (field === 'message' && Array.isArray(value)) {
+        accountValue(value, cost)
+        const ids = new Float64Array(value.length), digests = new Float64Array(value.length)
+        value.forEach((message, index) => {
+            ids[index] = pluginMessageIdDigest(message?.chatId)
+            digests[index] = digestValue(message, undefined, cost)
+        })
+        const rows = { ids, digests }
+        const admission = admissionPositions.get(value)
+        if (admission) bindFingerprintPositions(rows, admission)
+        return new MessageListNode(rows)
+    }
     return descendsInto(field, databaseRoot) ? buildNode(value, field, false, undefined, cost) : new ValueNode(digestValue(value, undefined, cost))
 }
 
@@ -312,7 +369,9 @@ function diffBaselineNode(baseline: BaselineNode, submitted: unknown, kind: Plug
             }
             return
         }
-        intents.push({ path, type: 'set', value: structuredClone(after) })
+        const value = structuredClone(after)
+        if (before instanceof MessageListNode && Array.isArray(value)) messageBaselines.set(value, before.rows)
+        intents.push({ path, type: 'set', value })
     }
     visit(baseline, submitted, [], kind === 'database')
     return intents.sort((a, b) => canonical(a.path) < canonical(b.path) ? -1 : canonical(a.path) > canonical(b.path) ? 1 : 0)
@@ -342,7 +401,7 @@ export class PluginSnapshotBaseline {
     private readonly records = new Map<string, Map<string, BaselineNode>>()
     private readonly arrays = new Map<string, BaselineNode[]>()
     private character?: { target: string; index: number; chats: string[] }
-    private conversation?: { read: PreparedRead; metadata: ObjectNode; digests: number[] }
+    private conversation?: { read: PreparedRead; metadata: ObjectNode; ids: number[]; digests: number[] }
     private characterIndex = -1
     private finished = false
 
@@ -356,8 +415,8 @@ export class PluginSnapshotBaseline {
 
     private finishConversation(): void {
         if (!this.conversation) return
-        const { read, metadata, digests } = this.conversation
-        read.stored = { kind: 'conversation', node: withRecordField(metadata, 'message', new ValueNode(arrayDigest(digests))) }
+        const { read, metadata, ids, digests } = this.conversation
+        read.stored = { kind: 'conversation', node: withRecordField(metadata, 'message', new MessageListNode({ ids: Float64Array.from(ids), digests: Float64Array.from(digests) })) }
         this.conversation = undefined
     }
 
@@ -420,8 +479,10 @@ export class PluginSnapshotBaseline {
             this.reads.push(read)
             const metadata = buildNode({ ...value, message: undefined }, undefined, false, identityValue(value?.id), cost) as ObjectNode
             if (value?.message !== undefined) digestValue(value.message, undefined, cost)
-            this.conversation = { read, metadata, digests: [] }
+            this.conversation = { read, metadata, ids: [], digests: [] }
         } else if (chunk.type === 'message') {
+            const id = (chunk.value as { chatId?: unknown })?.chatId
+            this.conversation!.ids.push(pluginMessageIdDigest(typeof id === 'string' ? id : undefined))
             this.conversation!.digests.push(digestValue(chunk.value, undefined, cost))
         }
         return cost.bytes
@@ -480,18 +541,19 @@ export class PluginReadBaselines {
         return this.history.has(JSON.stringify([this.owner, kind, target]))
     }
 
-    track<T>(value: T, kind: PluginReadKind, target: string, _revision: number, expectedAuthority = this.authority()): T {
+    track<T>(value: T, kind: PluginReadKind, target: string, _revision: number, expectedAuthority = this.authority(), proof?: PluginReadPositionProof): T {
         if (this.closed) throw new PluginReadBaselineError('closed')
         if (expectedAuthority !== this.authority()) throw new PluginReadBaselineError('stale')
-        this.store(value, kind, target, expectedAuthority)
+        this.store(value, kind, target, expectedAuthority, proof)
         return value
     }
 
-    beginSnapshot(kind: 'database' | 'character' | 'conversation', target: string, expectedAuthority = this.authority()): PluginSnapshotBaseline {
+    beginSnapshot(kind: 'database' | 'character' | 'conversation', target: string, expectedAuthority = this.authority(), proof?: PluginReadPositionProof): PluginSnapshotBaseline {
         return new PluginSnapshotBaseline(kind, target, reads => {
             this.assertOpen()
             if (expectedAuthority !== this.authority()) throw new PluginReadBaselineError('stale')
             return reads.map(read => {
+                if (read.stored.kind === 'conversation') bindReadPosition(read.stored.node, read.target, proof)
                 const baseline = this.ensure(read.kind, read.target, expectedAuthority)
                 if (read.stored.kind === 'database' && baseline.stored.kind === 'database') {
                     for (const [key, value] of read.stored.fields) baseline.stored.fields.set(key, value)
@@ -514,7 +576,7 @@ export class PluginReadBaselines {
         return baseline
     }
 
-    private store(value: unknown, kind: PluginReadKind, target: string, authority: number): void {
+    private store(value: unknown, kind: PluginReadKind, target: string, authority: number, proof?: PluginReadPositionProof): void {
         const baseline = this.ensure(kind, target, authority)
         if (value && typeof value === 'object') provenance.set(value, baseline.token)
         const record = value as any
@@ -525,17 +587,21 @@ export class PluginReadBaselines {
                 const nested = nestedRecords.find(([name]) => name === field)
                 if (nested && Array.isArray(record[field])) {
                     const [, childKind, id] = nested
-                    for (const child of record[field]) this.store(child, childKind, child?.[id], authority)
+                    for (const child of record[field]) this.store(child, childKind, child?.[id], authority, proof)
                     fields.set(field, { childKind, targets: record[field].map((child: any) => child?.[id]) })
                 } else fields.set(field, fieldNode(record[field], field, true))
             }
         } else if (kind === 'character' && record && typeof record === 'object' && Array.isArray(record.chats)) {
             const { chats, ...detail } = record
             const targets = chats.map((chat: any) => JSON.stringify([target, chat?.id]))
-            chats.forEach((chat: unknown, index: number) => this.store(chat, 'conversation', targets[index], authority))
+            chats.forEach((chat: unknown, index: number) => this.store(chat, 'conversation', targets[index], authority, proof))
             baseline.stored = { kind, detail: buildNode(detail, undefined, false, identityValue(record.chaId)), chats: targets }
         } else if (kind === 'character') baseline.stored = { kind, detail: buildNode(value, undefined, false, identityValue(record?.chaId)) }
-        else baseline.stored = { kind: kind as 'conversation' | 'preset', node: buildNode(value, undefined, false, identityValue(record?.id)) }
+        else {
+            const node = buildNode(value, undefined, false, identityValue(record?.id))
+            if (kind === 'conversation') bindReadPosition(node, target, proof)
+            baseline.stored = { kind: kind as 'conversation' | 'preset', node }
+        }
     }
 
     private current(kind: PluginReadKind, target: string): Baseline | undefined {

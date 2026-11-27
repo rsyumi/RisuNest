@@ -18,7 +18,7 @@ import { HypaProcesser } from "./memory/hypamemory";
 import { generateAIImage, type ImageGenerationOptions } from "./stableDiff";
 import { writeInlayImage, getInlayAsset } from "./files/inlays";
 import type { OpenAIChat, MultiModal } from "./index.svelte";
-import { requestChatData, type StreamResponseChunk } from "./request/request";
+import type { requestDataResponse, StreamResponseChunk } from "./request/request";
 import { v4 } from "uuid";
 import { getModuleLorebooks, getModuleTriggers } from "./modules";
 import { Mutex } from "../mutex";
@@ -31,7 +31,8 @@ import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory, runLuaSource } from './luaRuntime';
 import { LuaWorkerExecutor, LuaWorkerUnavailableError } from './luaWorkerExecutor';
-import { luaErrorMessage } from './luaWorkerProtocol';
+import { LuaDeferredReply, luaErrorMessage } from './luaWorkerProtocol';
+import type { LuaLocalOutputExecutor } from './luaLocalOutputExecutor';
 import { createLuaHistoryJSON } from './luaHistoryJSON';
 import { luaCodeWrapper } from './luaCodeWrapper';
 import { scriptLineNumbers } from './luaScriptLines';
@@ -56,8 +57,8 @@ import {
     sliceHistory,
     toHistorySpliceIndex,
 } from './historyWindowIndex';
-import { openHistoryWindowCopy, type HistoryWindowCopy } from './historyWindowWrite';
-import { PersistentMutationFencedError } from '../storage/saveCoordinator';
+import { beginGenerationOutputScript, getGenerationOutputScript } from './generationOutputPhase';
+import { OutputScriptConversation, ScriptHistoryWindow, requestScriptChatData } from './outputScriptConversation';
 import {
     createScriptConversationAccess,
     type ScriptConversationAccess,
@@ -128,6 +129,8 @@ interface BasicScriptingEngineState {
     writeChat?: () => Chat
     readDatabase?: () => Database
     flushVariables?: () => void
+    outputConversation?: OutputScriptConversation
+    outputFrame?: ReturnType<OutputScriptConversation['beginLuaFrame']>
     historyJSON?: ReturnType<typeof createLuaHistoryJSON>
     stopSending?: boolean
     /** A host call in this run stopped because its conversation was left or changed. */
@@ -137,7 +140,7 @@ interface BasicScriptingEngineState {
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
     engine?: LuaEngine;
-    worker?: LuaWorkerExecutor;
+    executor?: LuaWorkerExecutor | LuaLocalOutputExecutor;
     type: 'lua';
 }
 
@@ -162,6 +165,8 @@ function clearScriptingEngineInvocationState(state: ScriptingEngineState) {
     state.writeChat = undefined
     state.readDatabase = undefined
     state.flushVariables = undefined
+    state.outputConversation = undefined
+    state.outputFrame = undefined
     state.historyJSON = undefined
     state.stopSending = undefined
 }
@@ -188,6 +193,7 @@ export async function runScripted(code:string, arg:{
     operationContext?: ConversationOperationContext
     /** The selected conversation through a variable scope and copy-on-edit messages. */
     access?: ScriptConversationAccess
+    outputConversation?: OutputScriptConversation
     /** A button or manual trigger the user started, which gets the longer deadline. */
     userStarted?: boolean
     signal?: AbortSignal
@@ -266,6 +272,7 @@ export async function runScripted(code:string, arg:{
         if (displayEngine && skipsDisplayListener(displayEngine, displayListener!, data as string)) {
             return { stopSending: false, chat, res: undefined }
         }
+        let leaveFrame: (() => void) | undefined
         try {
         ScriptingEngineState.chat = chat
         ScriptingEngineState.historyJSON = createLuaHistoryJSON()
@@ -275,6 +282,8 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.operationDatabase = operationDatabase
         ScriptingEngineState.selectedCharacterId = selectedCharacterId
         ScriptingEngineState.capturedCharacterOwner = capturedCharacterOwner
+        ScriptingEngineState.outputConversation = arg.outputConversation
+        ScriptingEngineState.outputFrame = arg.outputConversation?.beginLuaFrame()
         let invocationChatReady = false
         ScriptingEngineState.ensureConversationOperation = () => {
             if (!arg.createConversationChat || invocationChatReady) return
@@ -286,6 +295,12 @@ export async function runScripted(code:string, arg:{
             ScriptingEngineState.getVar = (key: string) =>
                 getChatVarFromConversation(capturedDatabase, selectedCharacterId, ownedChat, key)
         }
+        leaveFrame = arg.outputConversation?.onReopen(() => {
+            invocationChatReady = false
+            chat = arg.outputConversation.window?.read() ?? access.readChat()
+            ScriptingEngineState.chat = chat
+            ScriptingEngineState.ensureConversationOperation()
+        })
         const legacyChat = () => {
             ScriptingEngineState.ensureConversationOperation?.()
             return ScriptingEngineState.chat
@@ -305,35 +320,15 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.flushVariables = access ? () => { access.flushVariables() } : undefined
         ScriptingEngineState.stopSending = false
         ScriptingEngineState.conversationStopped = false
-        if (code !== ScriptingEngineState.code || (ScriptingEngineState.type === 'lua' && ScriptingEngineState.worker?.isClosed())) {
+        if (code !== ScriptingEngineState.code || (ScriptingEngineState.type === 'lua' && ScriptingEngineState.executor?.isClosed())) {
             try {
             let declareAPI:(name: string, func:Function) => void
             const luaCallbacks = new Map<string, Function>()
 
             if(ScriptingEngineState.type === 'lua'){
                 console.log('Creating new Lua engine for mode:', mode)
-                ScriptingEngineState.engine?.global.close()
-                ScriptingEngineState.worker?.close()
-                ScriptingEngineState.worker = undefined
-                if (canUseLuaWorker()) {
-                    try { ScriptingEngineState.worker = new LuaWorkerExecutor(functionTimeout, createScriptDisplayRefreshBatch()) }
-                    catch (error) {
-                        if (!(error instanceof LuaWorkerUnavailableError)) throw error
-                        luaWorkerUnavailable = true
-                    }
-                }
-                if (!ScriptingEngineState.worker) {
-                    ScriptingEngineState.engine = await (await ensureLocalLuaFactory()).createEngine({
-                        injectObjects: true,
-                        enableProxy: false,
-                        functionTimeout,
-                    })
-                }
                 declareAPI = (name: string, func: Function) => {
-                    func = observeConversationStops(ScriptingEngineState, func)
-                    luaCallbacks.set(name, func)
-                    if (ScriptingEngineState.worker) ScriptingEngineState.worker.register(name, func)
-                    else ScriptingEngineState.engine.global.set(name, func)
+                    luaCallbacks.set(name, observeConversationStops(ScriptingEngineState, func))
                 }
             }
             if(ScriptingEngineState.type === 'py'){
@@ -343,6 +338,17 @@ export async function runScripted(code:string, arg:{
                 declareAPI = (name:string, func:Function) => {
                     ScriptingEngineState.pyodide?.declareAPI(name, func as any)
                 }
+            }
+            const declareChatAPI = (name: string, func: Function, returnsPromise = false) => {
+                declareAPI(name, (...args: unknown[]) => {
+                    const invocation = ScriptingEngineState.outputFrame
+                    if (!invocation) return func(...args)
+                    let deferred: LuaDeferredReply | undefined
+                    const value = invocation.withScriptView(() => deferred ? deferred.resume(() => func(...args)) : func(...args))
+                    if (returnsPromise || !(value instanceof Promise)) return value
+                    deferred = new LuaDeferredReply(value)
+                    return deferred
+                })
             }
             const ensureScriptingVariables = () => {
                 if (!ScriptingEngineState.access) {
@@ -421,18 +427,18 @@ export async function runScripted(code:string, arg:{
                 }
                 return true
             }
-            declareAPI('getChatVar', (id:string,key:string) => {
+            declareChatAPI('getChatVar', (id:string,key:string) => {
                 ensureScriptingVariables()
                 return ScriptingEngineState.getVar(key)
             })
-            declareAPI('setChatVar', (id:string,key:string, value:string) => {
+            declareChatAPI('setChatVar', (id:string,key:string, value:string) => {
                 if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
                     return
                 }
                 ensureScriptingVariables()
                 ScriptingEngineState.setVar(key, value)
             })
-            declareAPI('setChatVarChanged', (id:string,key:string, value:string) => {
+            declareChatAPI('setChatVarChanged', (id:string,key:string, value:string) => {
                 if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
                     return
                 }
@@ -484,7 +490,7 @@ export async function runScripted(code:string, arg:{
                 return alertConfirm(value).then(res => res ? true : false)
             })
 
-            declareAPI('getChatMain', (id:string, index:number) => {
+            declareChatAPI('getChatMain', (id:string, index:number) => {
                 const chat = getHistoryMessageAt(readScriptingChat(), index)
                 if(!chat){
                     return JSON.stringify(null)
@@ -497,17 +503,17 @@ export async function runScripted(code:string, arg:{
                 return JSON.stringify(data)
             })
 
-            declareAPI('getChatData', (id:string, index:number) => {
+            declareChatAPI('getChatData', (id:string, index:number) => {
                 const chat = getHistoryMessageAt(readScriptingChat(), index)
                 return chat?.data ?? ''
             })
 
-            declareAPI('getChatRole', (id:string, index:number) => {
+            declareChatAPI('getChatRole', (id:string, index:number) => {
                 const chat = getHistoryMessageAt(readScriptingChat(), index)
                 return chat?.role ?? ''
             })
 
-            declareAPI('getRecentChatsMain', (id:string, count:number) => {
+            declareChatAPI('getRecentChatsMain', (id:string, count:number) => {
                 const chats = readScriptingChat().message
                 const safeCount = Math.max(0, Math.floor(count || 0))
                 const start = Math.max(0, chats.length - safeCount)
@@ -518,7 +524,7 @@ export async function runScripted(code:string, arg:{
                 })))
             })
 
-            declareAPI('setChat', (id:string, index:number, value:string) => {
+            declareChatAPI('setChat', (id:string, index:number, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -526,7 +532,7 @@ export async function runScripted(code:string, arg:{
                     message.data = value ?? ''
                 })
             })
-            declareAPI('setChatRole', (id:string, index:number, value:string) => {
+            declareChatAPI('setChatRole', (id:string, index:number, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -534,14 +540,14 @@ export async function runScripted(code:string, arg:{
                     message.role = value === 'user' ? 'user' : 'char'
                 })
             })
-            declareAPI('cutChat', (id:string, start:number, end:number) => {
+            declareChatAPI('cutChat', (id:string, start:number, end:number) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
                 const chat = writeScriptingChat()
                 chat.message = sliceHistory(chat, start, end)
             })
-            declareAPI('removeChat', (id:string, index:number) => {
+            declareChatAPI('removeChat', (id:string, index:number) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -550,7 +556,7 @@ export async function runScripted(code:string, arg:{
                 if (start === null) return
                 chat.message.splice(start, 1)
             })
-            declareAPI('addChat', (id:string, role:string, value:string) => {
+            declareChatAPI('addChat', (id:string, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -562,7 +568,7 @@ export async function runScripted(code:string, arg:{
                 }
                 writeScriptingChat().message.push(message)
             })
-            declareAPI('insertChat', (id:string, index:number, role:string, value:string) => {
+            declareChatAPI('insertChat', (id:string, index:number, role:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -580,11 +586,11 @@ export async function runScripted(code:string, arg:{
                 return await tokenize(value)
             })
 
-            declareAPI('getChatLength', (id:string) => {
+            declareChatAPI('getChatLength', (id:string) => {
                 return historyLength(readScriptingChat())
             })
 
-            declareAPI('getFullChatMain', (id:string) => {
+            declareChatAPI('getFullChatMain', (id:string) => {
                 return ScriptingEngineState.historyJSON(readScriptingChat().message)
             })
 
@@ -600,7 +606,7 @@ export async function runScripted(code:string, arg:{
                 })
             })
 
-            declareAPI('cbs', (value) => {
+            declareChatAPI('cbs', (value) => {
                 const database = getScriptingDatabase()
                 const operationCharacter = ScriptingEngineState.operationCharacter
                 const parserCharacter = operationCharacter?.type === 'simple'
@@ -612,7 +618,7 @@ export async function runScripted(code:string, arg:{
                 })
             })
             
-            declareAPI('setFullChatMain', (id:string, value:string) => {
+            declareChatAPI('setFullChatMain', (id:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -642,11 +648,12 @@ export async function runScripted(code:string, arg:{
                     if (!entry || used >= entry.count) return { role: v.role, data: v.data, chatId: v4() }
                     kept.set(v.chatId, used + 1)
                     const original = counts.get(v.chatId) === 1 ? entry.message : null
+                    const fields = { role: v.role, data: v.data, chatId: v.chatId }
+                    // The window receipt follows the same unique draft row across a reorder.
+                    if (original && ScriptingEngineState.outputConversation?.window) return Object.assign(original, fields)
                     return {
                         ...original,
-                        role: v.role,
-                        data: v.data,
-                        chatId: v.chatId,
+                        ...fields,
                     }
                 })
             })
@@ -778,7 +785,7 @@ export async function runScripted(code:string, arg:{
                 return `{{inlay::${inlay}}}`
             })
 
-            declareAPI('getCharacterImageMain', async (id:string) => {
+            declareChatAPI('getCharacterImageMain', async (id:string) => {
                 try {
                     const db = getScriptingDatabase()
                     const selectedChar = getScriptingCharacterIndex(db)
@@ -815,7 +822,7 @@ export async function runScripted(code:string, arg:{
                     console.error('Error in getCharacterImageMain:', error)
                     return ''
                 }
-            })
+            }, true)
 
             declareAPI('getPersonaImageMain', async (id:string) => {
                 try {
@@ -863,7 +870,7 @@ export async function runScripted(code:string, arg:{
                 }
             };
 
-            const collectLuaStreamText = async (stream: ReadableStream<StreamResponseChunk>) => {
+            const collectLuaStream = async (stream: ReadableStream<StreamResponseChunk>) => {
                 const reader = stream.getReader();
                 let text = '';
 
@@ -877,14 +884,24 @@ export async function runScripted(code:string, arg:{
                             text = value['0'];
                         }
                     }
+                    return { type: 'success' as const, result: text }
+                } catch (error) {
+                    return { type: 'fail' as const, result: String(error) }
                 } finally {
                     reader.releaseLock();
                 }
-
-                return text;
             };
 
+            const formatLuaLLMResult = async (response: requestDataResponse) => {
+                const value = response.type === 'streaming' ? await collectLuaStream(response.result) : response
+                return JSON.stringify({
+                    success: value.type === 'success',
+                    result: value.type === 'fail' ? 'Error: ' + value.result : value.result,
+                })
+            }
+
             declareAPI('LLMMain', async (id:string, promptStr:string, useMultimodal: boolean = false, optionsStr: string = '') => {
+                const outputConversation = ScriptingEngineState.outputFrame
                 let prompt:{
                     role: string,
                     content: string
@@ -954,46 +971,14 @@ export async function runScripted(code:string, arg:{
                 }
 
                 const options = parseLuaOptions(optionsStr) as { streaming?: boolean }
-                const result = await requestChatData({
+                const result = await requestScriptChatData({
                     formated: promptbody,
                     bias: {},
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
-                }, 'model')
-
-                if(result.type === 'fail'){
-                    return JSON.stringify({
-                        success: false,
-                        result: 'Error: ' + result.result
-                    })
-                }
-
-                if(result.type === 'streaming'){
-                    try {
-                        return JSON.stringify({
-                            success: true,
-                            result: await collectLuaStreamText(result.result)
-                        })
-                    } catch (error) {
-                        return JSON.stringify({
-                            success: false,
-                            result: 'Error: ' + error
-                        })
-                    }
-                }
-
-                if(result.type === 'multiline'){
-                    return JSON.stringify({
-                        success: false,
-                        result: result.result
-                    })
-                }
-
-                return JSON.stringify({
-                    success: true,
-                    result: result.result
-                })
+                }, 'model', outputConversation, collectLuaStream)
+                return formatLuaLLMResult(result)
             })
 
             declareAPI('simpleLLM', async (id:string, prompt:string) => {
@@ -1001,7 +986,7 @@ export async function runScripted(code:string, arg:{
                     return
                 }
                 flushScriptingVariables()
-                const result = await requestChatData({
+                const result = await requestScriptChatData({
                     formated: [{
                         role: 'user',
                         content: prompt
@@ -1009,7 +994,7 @@ export async function runScripted(code:string, arg:{
                     bias: {},
                     useStreaming: false,
                     noMultiGen: true,
-                }, 'model')
+                }, 'model', ScriptingEngineState.outputFrame)
 
                 if(result.type === 'fail'){
                     return {
@@ -1031,7 +1016,7 @@ export async function runScripted(code:string, arg:{
                 }
             })
             
-            declareAPI('getName', (id:string) => {
+            declareChatAPI('getName', (id:string) => {
                 const db = getScriptingDatabase()
                 const selectedChar = getScriptingCharacterIndex(db)
                 const char = db.characters[selectedChar]
@@ -1089,7 +1074,7 @@ export async function runScripted(code:string, arg:{
                 return getUserName()
             })
 
-            declareAPI('getPersonaDescription', (id:string) => {
+            declareChatAPI('getPersonaDescription', (id:string) => {
                 const db = getScriptingDatabase()
                 const selectedChar = getScriptingCharacterIndex(db)
                 const char = db.characters[selectedChar]
@@ -1097,12 +1082,12 @@ export async function runScripted(code:string, arg:{
                 return risuChatParser(getPersonaPrompt(), { chara: char, ...scriptingParserOptions(db) })
             })
 
-            declareAPI('getAuthorsNote', (id:string) => {
+            declareChatAPI('getAuthorsNote', (id:string) => {
                 const chat = readScriptingChat()
                 return chat ? effectiveAuthorNote(getScriptingDatabase().authorNotePresets, chat) : ''
             })
 
-            declareAPI('getBackgroundEmbedding', (id:string) => {
+            declareChatAPI('getBackgroundEmbedding', (id:string) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -1123,7 +1108,7 @@ export async function runScripted(code:string, arg:{
             })
 
             // Lore books
-            declareAPI('getLoreBooksMain', (id:string, search:string) => {
+            declareChatAPI('getLoreBooksMain', (id:string, search:string) => {
                 const db = getScriptingDatabase()
                 const selectedChar = db.characters[getScriptingCharacterIndex(db)]
 
@@ -1154,7 +1139,7 @@ export async function runScripted(code:string, arg:{
                 regex?: boolean
             }
 
-            declareAPI('upsertLocalLoreBook', (id:string, name:string, content:string, options:upsertLoreBookOptions) => {
+            declareChatAPI('upsertLocalLoreBook', (id:string, name:string, content:string, options:upsertLoreBookOptions) => {
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
@@ -1195,20 +1180,23 @@ export async function runScripted(code:string, arg:{
                 currentChat.localLore = newLocalLoreBooks
             })
 
-            declareAPI('loadLoreBooksMain', async (id:string, reserve:number) => {
+            declareChatAPI('loadLoreBooksMain', async (id:string, reserve:number) => {
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
                 flushScriptingVariables()
 
-                const db = getScriptingDatabase()
-
-                const selectedChar = db.characters[getScriptingCharacterIndex(db)]
+                const frame = ScriptingEngineState.outputFrame
+                const initialDatabase = getScriptingDatabase()
+                const parseBook = (prompt: string, db = initialDatabase) => {
+                    const chara = db.characters[getScriptingCharacterIndex(db)]
+                    return risuChatParser(prompt, { chara, ...scriptingParserOptions(db) }).trim()
+                }
+                const maxContext = initialDatabase.maxContext - reserve
 
 
 
                 const fullLoreBooks = (await loadLoreBookV3PromptFromCompatibilitySnapshot()).actives
-                const maxContext = db.maxContext - reserve
                 if (maxContext < 0) {
                     return JSON.stringify([])
                 }
@@ -1217,7 +1205,9 @@ export async function runScripted(code:string, arg:{
                 const loreBooks = []
 
                 for (const book of fullLoreBooks) {
-                    const parsed = risuChatParser(book.prompt, { chara: selectedChar, ...scriptingParserOptions(db) }).trim()
+                    const parsed = frame
+                        ? await frame.withScriptView(() => parseBook(book.prompt, getScriptingDatabase()))
+                        : parseBook(book.prompt)
                     if (parsed.length === 0) {
                         continue
                     }
@@ -1235,9 +1225,10 @@ export async function runScripted(code:string, arg:{
                 }
 
                 return JSON.stringify(loreBooks)
-            })
+            }, true)
 
             declareAPI('axLLMMain', async (id:string, promptStr:string, useMultimodal: boolean = false, optionsStr: string = '') => {
+                const outputConversation = ScriptingEngineState.outputFrame
                 let prompt:{
                     role: string,
                     content: string
@@ -1315,49 +1306,17 @@ export async function runScripted(code:string, arg:{
                         success: false
                     })
                 }
-                const result = await requestChatData({
+                const result = await requestScriptChatData({
                     formated: promptbody,
                     bias: {},
                     useStreaming: options.streaming === true,
                     forceStreaming: options.streaming === true,
                     noMultiGen: true,
-                }, mode as 'emotion' | 'memory' | 'otherAx' | 'submodel' | 'translate')
-
-                if(result.type === 'fail'){
-                    return JSON.stringify({
-                        success: false,
-                        result: 'Error: ' + result.result
-                    })
-                }
-
-                if(result.type === 'streaming'){
-                    try {
-                        return JSON.stringify({
-                            success: true,
-                            result: await collectLuaStreamText(result.result)
-                        })
-                    } catch (error) {
-                        return JSON.stringify({
-                            success: false,
-                            result: 'Error: ' + error
-                        })
-                    }
-                }
-
-                if(result.type === 'multiline'){
-                    return JSON.stringify({
-                        success: false,
-                        result: result.result
-                    })
-                }
-
-                return JSON.stringify({
-                    success: true,
-                    result: result.result
-                })
+                }, mode as 'emotion' | 'memory' | 'otherAx' | 'submodel' | 'translate', outputConversation, collectLuaStream)
+                return formatLuaLLMResult(result)
             })
 
-            declareAPI('getCharacterLastMessage', (id: string) => {
+            declareChatAPI('getCharacterLastMessage', (id: string) => {
                 const chat = readScriptingChat()
                 if (!chat) {
                     return ''
@@ -1377,7 +1336,7 @@ export async function runScripted(code:string, arg:{
                 return selchar?.firstMessage ?? ''
             })
 
-            declareAPI('getUserLastMessage', (id: string) => {
+            declareChatAPI('getUserLastMessage', (id: string) => {
                 const chat = readScriptingChat()
                 if (!chat) {
                     return ''
@@ -1395,7 +1354,7 @@ export async function runScripted(code:string, arg:{
                 return ''
             })
 
-            declareAPI('getCharacterLastMessage', (id: string) => {
+            declareChatAPI('getCharacterLastMessage', (id: string) => {
                 const chat = readScriptingChat()
                 if (!chat) {
                     return ''
@@ -1415,7 +1374,7 @@ export async function runScripted(code:string, arg:{
                 return selchar?.firstMessage ?? ''
             })
 
-            declareAPI('getUserLastMessage', (id: string) => {
+            declareChatAPI('getUserLastMessage', (id: string) => {
                 const chat = readScriptingChat()
                 if (!chat) {
                     return ''
@@ -1434,22 +1393,8 @@ export async function runScripted(code:string, arg:{
 
             console.log('Running Lua code:', code)
             if(ScriptingEngineState.type === 'lua'){
-                if (ScriptingEngineState.worker) {
-                    try { await ScriptingEngineState.worker.initialize(luaCodeWrapper(code), luaJSONSource, arg.signal) }
-                    catch (error) {
-                        if (!(error instanceof LuaWorkerUnavailableError)) throw error
-                        luaWorkerUnavailable = true
-                        ScriptingEngineState.worker.close()
-                        ScriptingEngineState.worker = undefined
-                        arg.signal?.throwIfAborted()
-                        const engine = await (await ensureLocalLuaFactory()).createEngine({
-                            injectObjects: true, enableProxy: false, functionTimeout,
-                        })
-                        ScriptingEngineState.engine = engine
-                        for (const [name, func] of luaCallbacks) engine.global.set(name, func)
-                        await runLuaSource(engine, luaCodeWrapper(code))
-                    }
-                } else await runLuaSource(ScriptingEngineState.engine, luaCodeWrapper(code))
+                await initializeLuaScript(ScriptingEngineState, code, luaCallbacks, functionTimeout,
+                    mode === 'output' || arg.userStarted === true, arg.signal)
             }
             if(ScriptingEngineState.type === 'py'){
                 await ScriptingEngineState.pyodide?.init(code)
@@ -1476,9 +1421,9 @@ export async function runScripted(code:string, arg:{
         let res:any
         if(ScriptingEngineState.type === 'lua'){
             const luaEngine = ScriptingEngineState.engine
-            const worker = ScriptingEngineState.worker
-            const getFunction = (name: string) => worker
-                ? (...args: unknown[]) => worker.invoke(name, args, arg.signal)
+            const executor = ScriptingEngineState.executor
+            const getFunction = (name: string) => executor
+                ? (...args: unknown[]) => executor.invoke(name, args, arg.signal)
                 : luaEngine.global.get(name)
             const listenerStartedAt = performance.now()
             try {
@@ -1546,7 +1491,8 @@ export async function runScripted(code:string, arg:{
                     ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
-                if (worker?.isClosed()) discardFailedScriptingEngineState(ScriptingEngineState)
+                if (executor?.isClosed()) discardFailedScriptingEngineState(ScriptingEngineState)
+                arg.outputConversation?.requireActive()
                 arg.signal?.throwIfAborted()
                 if (isLuaTimeoutError(error)) {
                     const diagnosticMode = ['input', 'output', 'start', 'onButtonClick', 'onFormSubmit', 'editRequest',
@@ -1563,6 +1509,9 @@ export async function runScripted(code:string, arg:{
                         else alertStore.set(notice)
                     }
                 }
+            } finally {
+                const drain = ScriptingEngineState.outputFrame?.finish()
+                if (drain) await drain
             }
         }
         if(ScriptingEngineState.type === 'py'){
@@ -1597,6 +1546,7 @@ export async function runScripted(code:string, arg:{
                 }
             }
         }
+        arg.outputConversation?.requireActive()
         chat = access?.currentChat() ?? ScriptingEngineState.chat
 
         return {
@@ -1610,6 +1560,7 @@ export async function runScripted(code:string, arg:{
             finishScriptingEngineUse(ScriptingEngineState)
         }
         } finally {
+            leaveFrame?.()
             clearScriptingEngineInvocationState(ScriptingEngineState)
         }
     })
@@ -1620,6 +1571,46 @@ export async function runScripted(code:string, arg:{
     }
 }
 
+async function initializeLuaScript(
+    state: LuaScriptingEngineState, code: string, callbacks: Map<string, Function>,
+    timeout: number, canRunOutputRequest: boolean, signal?: AbortSignal,
+) {
+    state.engine?.global.close()
+    state.engine = undefined
+    state.executor?.close()
+    state.executor = undefined
+    const source = luaCodeWrapper(code)
+    const initialize = async (executor: LuaWorkerExecutor | LuaLocalOutputExecutor) => {
+        state.executor = executor
+        for (const [name, callback] of callbacks) executor.register(name, callback)
+        await executor.initialize(source, luaJSONSource, signal)
+    }
+    if (canUseLuaWorker()) {
+        try {
+            await initialize(new LuaWorkerExecutor(timeout, createScriptDisplayRefreshBatch()))
+            return
+        } catch (error) {
+            if (!(error instanceof LuaWorkerUnavailableError)) throw error
+            luaWorkerUnavailable = true
+            state.executor?.close()
+            state.executor = undefined
+            signal?.throwIfAborted()
+        }
+    }
+    // An output trigger can invoke a named manual trigger. Pick by engine cache key so
+    // a manual trigger called independently keeps its globals when a generation calls it.
+    if (canRunOutputRequest) {
+        const { LuaLocalOutputExecutor } = await import('./luaLocalOutputExecutor')
+        await initialize(new LuaLocalOutputExecutor(timeout))
+        return
+    }
+    const engine = await (await ensureLocalLuaFactory()).createEngine({
+        injectObjects: true, enableProxy: false, functionTimeout: timeout,
+    })
+    state.engine = engine
+    for (const [name, callback] of callbacks) engine.global.set(name, callback)
+    await runLuaSource(engine, source)
+}
 async function makeLuaFactory(){
     const _luaFactory = canUseLuaWorker() ? undefined : await createLuaFactory()
     async function mountFile(name:string){
@@ -1696,8 +1687,8 @@ function evictIdleScriptingEngines() {
         if (oldest.type === 'lua') {
             oldest.engine?.global.close()
             oldest.engine = undefined
-            oldest.worker?.close()
-            oldest.worker = undefined
+            oldest.executor?.close()
+            oldest.executor = undefined
         } else {
             oldest.pyodide?.close()
             oldest.pyodide = undefined
@@ -1736,20 +1727,24 @@ function luaHandlerErrorNotice(mode: string, error: unknown): alertData {
 
 /** Marks the run when a host call stops on a conversation change, which Lua sees only as an error message. */
 function observeConversationStops(state: BasicScriptingEngineState, func: Function): Function {
-    const note = (error: unknown): never => {
-        if (isConversationStop(error)) state.conversationStopped = true
-        throw error
-    }
     return function (this: unknown, ...args: unknown[]) {
+        const frame = state.outputFrame
+        const note = (error: unknown): never => {
+            if (state.outputFrame === frame && isConversationStop(error)) state.conversationStopped = true
+            throw error
+        }
+        state.outputConversation?.requireActive()
         let value: unknown
         try {
             value = func.apply(this, args)
         } catch (error) {
             note(error)
         }
-        return typeof (value as PromiseLike<unknown> | null | undefined)?.then === 'function'
-            ? Promise.resolve(value).catch(note)
-            : value
+        if (typeof (value as PromiseLike<unknown> | null | undefined)?.then !== 'function') return value
+        const result = Promise.resolve(value).catch(note)
+        // Lua can keep a second request promise without awaiting it until the first returns.
+        if (frame) void result.catch(() => {})
+        return result
     }
 }
 
@@ -1765,8 +1760,8 @@ function discardFailedScriptingEngineState(state: ScriptingEngineState) {
     if (state.type === 'lua') {
         state.engine?.global.close()
         state.engine = undefined
-        state.worker?.close()
-        state.worker = undefined
+        state.executor?.close()
+        state.executor = undefined
     } else {
         state.pyodide?.close()
         state.pyodide = undefined
@@ -1929,8 +1924,10 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
     luaErrors?: alertData[],
 ): Promise<T> {
     let operationContext = conversationOperation
-    let historyWindowCopy: HistoryWindowCopy | null = null
+    let window: ScriptHistoryWindow | null = null
+    let outputConversation: OutputScriptConversation | undefined
     let access: ScriptConversationAccess | null = null
+    let finishOutputScript: (() => void) | undefined
     try {
         let data = content
 
@@ -1941,25 +1938,12 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
         if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
             return content
         }
+        finishOutputScript = beginGenerationOutputScript(onConversationCommit)
         // A send that builds from a history window hands its edit listeners the window.
         const historyWindow = !operationContext && mode !== 'editDisplay'
             ? findActiveHistoryWindow(char.chaId, getCurrentChat()?.id)
             : null
-        const sourceCurrent = historyWindow?.isCurrent()
-        const sourceVersion = historyWindow?.mutationVersion
-        const sourceMessages = historyWindow ? [...historyWindow.chat.message] : null
-        const createWindowChat = historyWindow ? () => {
-            if (!historyWindowCopy) {
-                if (!sourceCurrent || !historyWindow.isCurrent()
-                    || sourceVersion !== historyWindow.mutationVersion
-                    || sourceMessages!.length !== historyWindow.chat.message.length
-                    || sourceMessages!.some((message, index) => historyWindow.chat.message[index] !== message)) {
-                    throw new PersistentMutationFencedError()
-                }
-                historyWindowCopy = openHistoryWindowCopy(historyWindow, onConversationCommit)
-            }
-            return historyWindowCopy.chat
-        } : undefined
+        if (historyWindow) window = new ScriptHistoryWindow(historyWindow, onConversationCommit)
         if (!operationContext && !historyWindow) {
             access = createScriptConversationAccess(getCurrentChat(), getDatabase(), {
                 onCommitted: onConversationCommit,
@@ -1967,7 +1951,11 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     ? { origin: 'display' as const }
                     : { onVariablesCommitted: (keys) => requestScriptDisplayRefresh({ keys }) }),
             })
+            // The listener's supplied index refers to the messages at invocation.
+            if (finishOutputScript) access?.readChat()
         }
+        const outputScript = getGenerationOutputScript(onConversationCommit)
+        if (outputScript) outputConversation = new OutputScriptConversation(outputScript, access, window)
 
         for (let trigger of triggers) {
             signal?.throwIfAborted()
@@ -1981,7 +1969,8 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
                     operationContext,
                     access: access ?? undefined,
                     chat: historyWindow?.chat,
-                    createConversationChat: createWindowChat,
+                    createConversationChat: window ? () => window.read() : undefined,
+                    outputConversation,
                     displayListener: displayRequest,
                     signal,
                     luaErrors,
@@ -1992,13 +1981,23 @@ async function runLuaEditTriggerBatch<T extends string | OpenAIChat[]>(
 
         return data
     } catch (error) {
+        outputConversation?.requireActive()
         return content
     } finally {
-        if (historyWindowCopy && !historyWindowCopy.commit()) {
-            throw new PersistentMutationFencedError()
+        try {
+            if (outputConversation?.stopped) {
+                access?.discard()
+            } else {
+                window?.commit()
+                // A listener that changed nothing keeps its result after the conversation closes.
+                access?.commitIfChanged()
+            }
+        } catch (error) {
+            if (!finishOutputScript || !isConversationStop(error)) throw error
+        } finally {
+            outputConversation?.finish()
+            finishOutputScript?.()
         }
-        // A listener that changed nothing keeps its result after the conversation closes.
-        access?.commitIfChanged()
     }
 }
 

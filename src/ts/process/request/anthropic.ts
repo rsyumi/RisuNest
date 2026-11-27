@@ -1118,7 +1118,7 @@ async function requestClaudeHTTP(replacerURL:string, headers:{[key:string]:strin
             }
 
             if(content.type === 'tool_use'){
-                const used = await callTool(content.name, content.input)
+                const used = await callTool(content.name, content.input, arg.pluginDispatch)
                 const r:Claude3ToolResponseBlock = {
                     type: 'tool_result',
                     tool_use_id: content.id,

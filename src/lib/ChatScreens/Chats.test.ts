@@ -11,6 +11,7 @@ import {
     PersistentConversationViewportSource,
     SynchronousSessionConversationViewportSource,
 } from 'src/ts/conversationViewportSource'
+import { EditableViewportFixture } from 'src/ts/conversationViewportSource.testSupport'
 import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
 import type {
     LiveChatParserProjection,
@@ -218,7 +219,7 @@ function makeMetadataOnlyCharacter(): character {
 }
 
 function makePersistentViewportSource(messages: readonly Message[]) {
-    return new PersistentConversationViewportSource({
+    return new EditableViewportFixture({
         reader: {
             async readConversationWindow({ characterId, conversationId, startIndex, limit }) {
                 const endIndex = Math.min(messages.length, startIndex + limit)

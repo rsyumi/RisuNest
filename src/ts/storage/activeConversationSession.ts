@@ -1,6 +1,8 @@
 import type { Chat, Message } from './database.svelte'
 import { CONVERSATION_RANGE_MAX_LIMIT, type DataRevision } from './persistentDataStore'
 import { safeStructuredClone } from '../safeStructuredClone'
+import { WindowedConversationOverlay } from './windowedConversationOverlay'
+import { messageReplaceRange } from './saveCoordinatorHelpers'
 import { replaceArrayRange } from '../arrayRange'
 import {
     SegmentedConversationResidency,
@@ -1295,6 +1297,75 @@ export class ActiveConversationSession {
             conversation: metadata,
         })
         return true
+    }
+
+    /** Install a changed durable conversation underneath pending writes without replacing the live owner. */
+    adoptGenerationHead(base: Chat, stored: Chat, revision: number, outputIndex: number, publishedPatch: boolean): number | null {
+        this.assertActive()
+        const live = this.conversation
+        const storedMetadata = cloneConversationMetadata(stored)
+        const baseMetadata = cloneConversationMetadata(base)
+        const localMetadata = cloneConversationMetadata(live)
+        const metadata = publishedPatch ? localMetadata : mergeOperationVariables(storedMetadata, baseMetadata, localMetadata)
+        if (!publishedPatch) {
+            for (const key of new Set([...Object.keys(baseMetadata), ...Object.keys(storedMetadata), ...Object.keys(localMetadata)])) {
+                if (VARIABLE_METADATA_KEYS.some(field => field === key) || !valuesEqual(baseMetadata[key], localMetadata[key])) continue
+                if (Object.hasOwn(storedMetadata, key)) metadata[key] = storedMetadata[key]
+                else delete metadata[key]
+            }
+        }
+
+        let mappedIndex: number | null = outputIndex >= 0 ? outputIndex : null
+        let ranges: { start: number; deleteCount: number; messages: Message[] }[]
+        if (publishedPatch || valuesEqual(base.message, stored.message)) {
+            // Membership is known. Keep positional writes, including rows with old or duplicate IDs.
+            ranges = []
+            if (live.message.length === stored.message.length) {
+                live.message.forEach((message, index) => {
+                    if (!valuesEqual(message, stored.message[index])) ranges.push({ start: index, deleteCount: 1, messages: [message] })
+                })
+            } else ranges.push(messageReplaceRange(stored.message, live.message))
+        } else {
+            const overlay = new WindowedConversationOverlay(this.characterId, this.conversationId, this.storeRevision, base.message.length)
+            const previous = base.message.slice()
+            const replay = (range: { start: number; deleteCount: number; messages: Message[] }) => {
+                const before = previous.slice(range.start, range.start + range.deleteCount)
+                overlay.applyRange(range.start, before, range.messages, 0, { anchor: previous[range.start] })
+                replaceArrayRange(previous, range.start, range.deleteCount, range.messages)
+            }
+            for (const range of this.pendingMutations) replay(range)
+            // Direct compatibility edits need not have a session event.
+            const remaining = messageReplaceRange(previous, live.message)
+            if (remaining.messages.length || remaining.deleteCount) replay(remaining)
+            const output = mappedIndex === null ? null : overlay.bind(mappedIndex, live.message[mappedIndex])
+            const projected = overlay.projectCompleteRows(base.message, stored.message)
+            mappedIndex = output && projected.locate(output)
+            ranges = projected.mutations
+        }
+
+        const previousVersion = this.sessionVersion++
+        const version = this.sessionVersion
+        this.residency.adoptGenerationHead(revision, version, stored.message.length)
+        this.compatibilityBaselineMessageCount = stored.message.length
+        this.locatorRegistry.clear()
+        this.currentStoreRevision = revision
+        this.persistedSessionVersion = this.lastContentChangeVersion = this.lastMessageChangeVersion = this.generationContinuationStart = version
+        const previousCount = live.message.length
+        live.message = safeStructuredClone(stored.message)
+        replaceConversationMetadata(live, storedMetadata)
+        this.notifySubscribers({ characterId: this.characterId, conversationId: this.conversationId, sessionToken: this.sessionToken,
+            previousVersion, sessionVersion: version, commands: ['replace-conversation'], conversation: storedMetadata,
+            mutations: [{ start: 0, deleteCount: previousCount, messages: live.message, sessionVersion: version }] })
+
+        // Only the residual local ranges and metadata are dirty on the new base.
+        if (ranges.length === 0 && !valuesEqual(metadata, storedMetadata))
+            this.applyOperation({ expectedVersion: version, expectedMetadata: storedMetadata, metadata })
+        for (const range of ranges) {
+            const expectedMetadata = cloneConversationMetadata(live)
+            this.applyOperation({ expectedVersion: this.version, expectedMetadata, metadata,
+                range: { position: this.positionAt(range.start), deleteCount: range.deleteCount, messages: range.messages } })
+        }
+        return mappedIndex
     }
 
     advanceStoreRevision(revision: DataRevision): boolean {

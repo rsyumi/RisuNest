@@ -1,5 +1,7 @@
 import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
+import { discardEditorDraft, keepEditorDraft, takeEditorDraft, type ChatEditorDraft } from '../../chatEditorDrafts'
+import { createSelectedConversationOperations } from '../../selectedConversationOperations'
 import { writeHistoryWindow } from '../../process/historyWindowWrite'
 import { ActiveWorkingSet } from '../activeWorkingSet.svelte'
 import type { Chat, Database, Message, character } from '../database.svelte'
@@ -11,7 +13,6 @@ import {
 import { isCatalogCharacterStub } from '../workingSetCatalog'
 import { WorkingSetResidencyRegistry } from '../workingSetResidency'
 import type { PersistentConversationMetadata } from '../persistentDataStore'
-import { createLeaseStub } from '../persistentDataStore.testSupport'
 import { fixtureDatabase } from './persistentDataFixtures'
 import { createPersistentStoreHarness } from '../../../../tests/support/persistentStoreHarness'
 
@@ -375,6 +376,62 @@ describe('ActiveWorkingSet', () => {
         controller!.release()
     })
 
+    it.each([false, true])('uses the identity proved when an editor opened after a competing move (duplicate %s)', async duplicate => {
+        const full = makeChat('chat-a')
+        full.message = [
+            { role: 'user', chatId: duplicate ? 'edit' : 'first', data: 'first' },
+            { role: 'user', chatId: 'edit', data: 'draft source' },
+        ]
+        const harness = await makeWindowedHarness({ characters: [makeCharacter('a', [full])] })
+        const ws = harness.workingSet
+        await ws.activateCharacter('a')
+        const source = ws.activeConversationViewportSource!
+        await source.ensureRange({ startIndex: 1, limit: 1, reason: 'viewport' })
+        const before = source.snapshot()
+        const row = before.rowAt(1)!
+        const ops = createSelectedConversationOperations({
+            captureWindowedMessageMutation: ws.captureWindowedMessageMutation.bind(ws),
+            captureSelectedConversationTarget: () => ws.captureSelectedConversationTarget(),
+            captureCurrent: () => ({ character: harness.database.characters[0], conversation: harness.database.characters[0].chats[0] }),
+            getCurrentSession: () => ws.activeConversationSession, getCurrentViewportSource: () => source,
+            acquireCompleteConversation: ws.acquireCompleteConversation.bind(ws),
+        })
+        const intent = ops.captureMessageEditIntent({
+            sourceToken: before.sourceToken, sourceVersion: row.sourceVersion, rowKey: row.key,
+            absoluteIndex: 1, message: row.message,
+        })!
+        await intent.windowedEditor!.controller
+        const draft: ChatEditorDraft = { kind: 'original', draft: 'saved draft', index: 1, evidence: row.message, intent }
+        keepEditorDraft('a', 'chat-a', draft)
+        intent.windowedEditor!.release()
+        const store = harness.storage.store
+        const overlay = ws.captureSelectedConversationAuthority()!.overlay!
+        const { revision } = await store.commit({ expectedRevision: overlay.revision,
+            conversations: [{ type: 'replace-range', characterId: 'a', conversationId: 'chat-a',
+                start: 0, deleteCount: 2, messages: duplicate ? [{ ...full.message[0], chatId: 'other' }, full.message[1]] : [full.message[1], full.message[0]] }] })
+        const lease = await store.acquireRevision(revision)
+        try { await overlay.rebase(lease, 2) } finally { await lease.release() }
+        ws.advanceStoreRevision(revision)
+        const remounted = takeEditorDraft('a', 'chat-a', duplicate ? 1 : 0, row.message)
+        const acquired = await ops.acquireCompleteMessageTargetForIntent(draft.intent!, 'edit-message')
+        try {
+            if (duplicate) {
+                expect(remounted).toBeNull()
+                expect(acquired).toBeNull()
+            } else {
+                expect(remounted?.draft).toBe('saved draft')
+                expect(acquired?.target.absoluteIndex).toBe(0)
+                if (acquired?.target.kind !== 'windowed') throw new Error('Expected a windowed editor')
+                expect(acquired.target.controller.applyRange(0, 1, [{ ...row.message, data: 'saved draft' }], 'edit')).toBe(true)
+                expect(source.snapshot().rowAt(0)?.message.data).toBe('saved draft')
+            }
+        } finally {
+            acquired?.release()
+            if (remounted) remounted.intent!.windowedEditor!.release()
+            else discardEditorDraft('a', 'chat-a', draft)
+        }
+    })
+
     it('refuses a middle-row editor whose original evidence changed', async () => {
         const { harness, target } = await activateWindowedChatList()
         await expect(harness.workingSet.captureWindowedMessageMutation(target, 0, { role: 'user', data: 'stale', chatId: 'a' })).resolves.toBeNull()
@@ -393,32 +450,23 @@ describe('ActiveWorkingSet', () => {
         const target = harness.workingSet.captureSelectedConversationTarget()!
         const local = { ...structuredClone(full), message: [structuredClone(full.message[1])] }
         const controller = harness.workingSet.captureWindowedConversationMutationController(target, local, 1)!
-        const reader = createLeaseStub({
-            revision: 2,
-            readConversation: vi.fn(),
-            readConversationWindow: vi.fn(async () => ({
-                revision: 2,
-                value: {
-                    characterId: 'a', conversationId: 'chat-a', startIndex: 1, endIndex: 2, totalMessages: 2,
-                    hasMoreBefore: true, hasMoreAfter: false,
-                    messages: [{ ...full.message[1], data: change === 'content' ? 'changed' : 'tail', __plugin: 'stored' }],
-                },
-            })),
+        const updated = { ...full.message[1], data: change === 'content' ? 'changed' : 'tail', __plugin: 'stored' }
+        const { revision } = await harness.storage.store.commit({
+            expectedRevision: target.storeRevision,
+            conversations: [{ type: 'replace-range', characterId: 'a', conversationId: 'chat-a',
+                start: 1, deleteCount: 1, messages: [updated] }],
         })
-        const adopt = await harness.workingSet.prepareWindowedMetadataAdoption(reader)
+        const overlay = harness.workingSet.captureSelectedConversationAuthority()!.overlay!
+        const reader = await harness.storage.store.acquireRevision(revision)
+        try { await overlay.rebase(reader, 2) } finally { await reader.release() }
+        harness.workingSet.advanceStoreRevision(revision)
         if (change === 'navigation') harness.workingSet.fenceNavigation()
-        else harness.workingSet.advanceStoreRevision(2)
-        adopt()
-        expect(reader.readConversationWindow).toHaveBeenCalledExactlyOnceWith({
-            characterId: 'a', conversationId: 'chat-a', startIndex: 1, limit: 1,
-        })
-        expect(reader.readConversation).not.toHaveBeenCalled()
-        if (change === 'metadata') {
-            expect(local.message[0]).toMatchObject({ data: 'tail', __plugin: 'stored' })
+        expect(controller.isCurrent()).toBe(false)
+        expect(controller.applyRange(0, 1, [local.message[0]], 'edit')).toBe(false)
+        expect(await controller.refreshWindow!(1)).toBe(change !== 'navigation')
+        if (change !== 'navigation') {
+            expect(local.message[0]).toEqual(updated)
             expect(controller.applyRange(1, 0, [{ role: 'char', data: 'reply', chatId: 'c' }], 'append')).toBe(true)
-        } else {
-            expect(local.message[0]).not.toHaveProperty('__plugin')
-            expect(controller.isCurrent()).toBe(false)
         }
         controller.release()
     })
@@ -460,6 +508,13 @@ describe('ActiveWorkingSet', () => {
         expect(controller.applyRange(1, 0, [{
             role: 'char', data: '', chatId: 'generated',
         }], 'append')).toBe(true)
+        const overlay = harness.workingSet.captureSelectedConversationAuthority()!.overlay!
+        const prefix = overlay.freeze()
+        const lease = await harness.storage.store.acquireRevision(overlay.revision)
+        const plan = await overlay.plan(prefix, lease, 3)
+        await lease.release()
+        const durable = await harness.storage.store.commit({ expectedRevision: overlay.revision, conversations: plan.mutations })
+        overlay.acknowledge(plan, durable.revision)
         expect(harness.workingSet.acknowledgeConversationMutationPersisted({
             characterId: 'a',
             conversationId: 'chat-a',
@@ -516,6 +571,11 @@ describe('ActiveWorkingSet', () => {
             controller.release()
         }
         edit(0, 1, () => 'edited first')
+        const overlay = harness.workingSet.captureSelectedConversationAuthority()!.overlay!
+        const prefix = overlay.freeze()
+        const lease = await harness.storage.store.acquireRevision(overlay.revision)
+        const plan = await overlay.plan(prefix, lease, 40)
+        await lease.release()
         // A later edit of as many rows as the viewport keeps pushes the first edit's row out.
         edit(1, 32, (index) => `later ${index}`)
         const source = harness.workingSet.activeConversationViewportSource!
@@ -537,6 +597,7 @@ describe('ActiveWorkingSet', () => {
             sessionVersion: 1,
             revision: stored,
         })).toBe(true)
+        overlay.acknowledge(plan, stored)
         harness.workingSet.advanceStoreRevision(stored, undefined, false, 40)
         expect(harness.workingSet.activeConversationViewportSource).toBe(source)
         await source.ensureRange({ startIndex: 0, limit: 1, reason: 'viewport' })
@@ -870,6 +931,9 @@ describe('ActiveWorkingSet', () => {
         harness.coordinator.flushPendingData.mockImplementationOnce(
             async () => {
                 harness.coordinator.revision = 2
+                const overlay = harness.workingSet.captureSelectedConversationAuthority()!.overlay!
+                const reader = await harness.storage.store.acquireRevision(2)
+                try { await overlay.rebase(reader, 1) } finally { await reader.release() }
                 harness.workingSet.advanceStoreRevision(2)
                 postFlushSource =
                     harness.workingSet.activeConversationViewportSource!
@@ -883,7 +947,7 @@ describe('ActiveWorkingSet', () => {
             harness.workingSet.activateCharacter('char-b'),
         ).resolves.toBe(false)
 
-        expect(preFlushSource.snapshot().totalMessages).toBe(0)
+        expect(preFlushSource.snapshot().storeRevision).toBe(2)
         expect(harness.workingSet.activeConversationViewportSource).toBe(
             postFlushSource,
         )

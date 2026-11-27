@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { Chat, character } from './database.svelte'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
+import { WindowedConversationOverlay } from './windowedConversationOverlay'
+import type { Chat, Message, character } from './database.svelte'
 import type {
     CharacterDetail,
     WorkingSetCommit,
@@ -58,6 +61,8 @@ describe('SaveCoordinator', () => {
         function makeWindowedHarness(options: {
             totalMessages?: number
             readRevision?: number
+            overlay?: WindowedConversationOverlay
+            pageBytes?: number
             commit?: Parameters<typeof makeStore>[0]
             store?: Parameters<typeof makeStore>[1]
         } = {}) {
@@ -70,7 +75,8 @@ describe('SaveCoordinator', () => {
                 characterId: 'char-a',
                 conversationId: 'two',
                 sessionToken,
-                storeRevision: 2,
+                storeRevision: options.overlay?.revision ?? 2,
+                overlay: options.overlay,
                 persistedSessionVersion: 0,
                 sessionVersion: 0,
                 totalMessages: options.totalMessages ?? 10_000,
@@ -107,6 +113,7 @@ describe('SaveCoordinator', () => {
             const windowedRevisions: [number, number | undefined][] = []
             const coordinator = new SaveCoordinator({
                 store,
+                conversationInsertPageBytes: options.pageBytes,
                 captureRoot: () => captureRoot(database),
                 captureSelectedCharacter: () => selected,
                 captureSelectedConversationAuthority: () => authority,
@@ -117,14 +124,15 @@ describe('SaveCoordinator', () => {
                 onConversationMutationPersisted: onPersisted,
                 onWindowedSelectedConversationRevision: (revision, _totalMessages, _preserveRows, storedTotalMessages) => {
                     windowedRevisions.push([revision, storedTotalMessages])
-                    if (authority) authority = { ...authority, storeRevision: revision }
+                    if (authority) authority = { ...authority, storeRevision: revision,
+                        ...(options.overlay ? { totalMessages: options.overlay.count, persistedSessionVersion: options.overlay.persistedVersion } : {}) }
                 },
                 onLocalRevision: (revision, storedTotalMessages, rewritten) =>
                     localRevisions.push([revision, storedTotalMessages, rewritten]),
             })
-            coordinator.initialize(2, database)
+            coordinator.initialize(authority.storeRevision, database)
             expect(coordinator.adoptWindowedSelectedConversation(
-                2,
+                authority.storeRevision,
                 coordinator.mutationGeneration,
                 projection,
                 authority,
@@ -1471,6 +1479,130 @@ describe('SaveCoordinator', () => {
                 conversations: [{ type: 'delete', characterId: 'char-a', conversationId: 'added' }],
             })
             expect(harness.coordinator.pendingWorkingSetRefreshRevision).toBe(4)
+        })
+
+        async function makeDurableWindowedHarness(messages: Message[], fail?: (request: WorkingSetCommit) => boolean) {
+            const database = makeDatabase()
+            database.characters[0].chats = [{ id: 'two', name: 'Two', localLore: [], note: '', message: messages } as Chat]
+            const indexedDB = new IDBFactory()
+            const name = `windowed-save-${crypto.randomUUID()}`
+            const store = new IndexedDbPersistentDataStore(name, indexedDB, IDBKeyRange)
+            await store.open()
+            const { revision } = await store.replaceFromDatabase(database)
+            const overlay = new WindowedConversationOverlay('char-a', 'two', revision, messages.length)
+            const commit = vi.fn(async (request: WorkingSetCommit) => {
+                if (fail?.(request)) throw new Error('Page write failed')
+                return store.commit(request)
+            })
+            const harness = makeWindowedHarness({ commit, totalMessages: messages.length, overlay, pageBytes: 64,
+                store: {
+                    acquireRevision: (revision) => store.acquireRevision(revision),
+                    readConversationMetadata: (owner, id) => store.readConversationMetadata(owner, id),
+                    readRoot: () => store.readRoot(),
+                    queryPresets: () => store.queryPresets(),
+                    readPreset: (id) => store.readPreset(id),
+                } })
+            const other = new IndexedDbPersistentDataStore(name, indexedDB, IDBKeyRange)
+            await other.open()
+            return { harness, overlay, store, other, revision }
+        }
+
+        it('relocates the dirty reply when a storage-only read observes another writer one revision ahead', async () => {
+            const first: Message = { role: 'user', data: 'neighbour', chatId: 'first' }
+            const reply: Message = { role: 'char', data: 'partial', chatId: 'reply' }
+            const { harness, overlay, store, other, revision } = await makeDurableWindowedHarness([first, reply])
+            const handle = overlay.bind(1, reply)
+            const lease = await store.acquireRevision(revision)
+            try {
+                await overlay.prove(handle, lease)
+            } finally {
+                await lease.release()
+            }
+            const completed = { ...reply, data: 'completed reply' }
+            overlay.applyRange(1, [reply], [completed], 1)
+            harness.replaceAuthority({ ...harness.authority()!, sessionVersion: 1 })
+            recordWindowedMutation(harness.coordinator, { sessionToken: harness.sessionToken, previousVersion: 0,
+                sessionVersion: 1, start: 1, deleteCount: 1, messages: [completed] })
+            await other.commit({ expectedRevision: revision, conversations: [{ type: 'replace-range', characterId: 'char-a',
+                conversationId: 'two', start: 0, deleteCount: 2, messages: [reply, first] }] })
+            await harness.coordinator.runStorageOnlyMutation(async () => (await store.readRoot()).revision)
+            await harness.coordinator.flushPendingDataLocally('observed-remote-head')
+            expect((await other.readConversation('char-a', 'two'))?.value.message).toEqual([completed, first])
+            overlay.release(handle)
+        })
+
+        it.each(['protected binding', 'empty prepared intent', 'unchanged presets'] as const)(
+            'adopts a newer head discovered by %s without writing another revision', async (route) => {
+                const neighbour: Message = { role: 'user', data: 'neighbour', chatId: 'user' }
+                const reply: Message = { role: 'char', data: 'reply', chatId: 'reply' }
+                const { harness, overlay, store, other, revision } = await makeDurableWindowedHarness([neighbour, reply])
+                const handle = overlay.bind(1, reply)
+                const lease = await store.acquireRevision(revision)
+                try { await overlay.prove(handle, lease) } finally { await lease.release() }
+                const moved = await other.commit({ expectedRevision: revision, conversations: [{ type: 'replace-range',
+                    characterId: 'char-a', conversationId: 'two', start: 0, deleteCount: 2, messages: [reply, neighbour] }] })
+                if (route === 'protected binding') {
+                    await harness.coordinator.mutateConversationBinding('char-a', 'two', { note: 'unaccepted' },
+                        () => { throw new Error('Binding lost its precondition') }, { note: 'outdated' })
+                } else if (route === 'empty prepared intent') {
+                    expect(await harness.coordinator.commitPreparedUnitIntent('empty', async () => null)).toBeNull()
+                } else await harness.coordinator.mutatePersistentPresets('unchanged', () => {})
+                expect((await store.readRoot()).revision).toBe(moved.revision)
+                expect(harness.coordinator.revision).toBe(moved.revision)
+                expect(overlay.locate(handle)).toBe(0)
+                overlay.release(handle)
+            },
+        )
+
+        it.each(['retry', 'reset'] as const)('transfers a durable patch publication to the queue across a read error and %s', async (recovery) => {
+            const { harness, store, other } = await makeDurableWindowedHarness([])
+            const observations: string[] = []
+            const commit = store.commit.bind(store)
+            vi.spyOn(store, 'commit').mockImplementationOnce(async (input) => {
+                const result = await commit(input)
+                vi.spyOn(store, 'acquireRevision').mockRejectedValueOnce(new Error('Metadata temporarily unavailable'))
+                return result
+            })
+            await expect(harness.coordinator.commitPreparedUnitIntent('patch', async () => ({
+                unitMutations: [{ type: 'set', key: JSON.stringify(['conversation', 'char-a', 'two', 'note']), value: 'durable note' }],
+                conversations: [],
+            }), async () => { observations.push('published') }, true, {
+                committed: () => { observations.push('durable') },
+                retire: () => { observations.push('retired') },
+            })).rejects.toThrow('Metadata temporarily unavailable')
+            const persisted = await other.readConversationMetadata('char-a', 'two')
+            expect(persisted?.value.conversation.note).toBe('durable note')
+            expect(observations).toEqual(['durable'])
+            if (recovery === 'retry') {
+                await harness.coordinator.flushPendingDataLocally('retry-patch-publication')
+                await harness.coordinator.flushPendingDataLocally('unchanged')
+                expect(observations).toEqual(['durable', 'published'])
+            } else {
+                harness.coordinator.initialize(persisted!.revision, harness.database)
+                harness.coordinator.initialize(persisted!.revision, harness.database)
+                expect(observations).toEqual(['durable', 'retired'])
+            }
+            expect((await other.readRoot()).revision).toBe(persisted!.revision)
+        })
+
+        it('keeps the acknowledged reply when a later page of a newly created conversation fails', async () => {
+            const { harness, overlay, other } = await makeDurableWindowedHarness([], (request) =>
+                request.conversations?.some((mutation) => mutation.type === 'replace-range' &&
+                    mutation.conversationId === 'added' && mutation.start > 0) ?? false)
+            expect(recordAddedChat(harness, ['first page', 'second page'].map((data) => ({
+                role: 'char', data: data.padEnd(64), chatId: data,
+            }))).recorded).toBe(true)
+            const reply = { role: 'char' as const, data: 'completed reply', chatId: 'reply' }
+            overlay.applyRange(0, [], [reply], 1)
+            harness.replaceAuthority({ ...harness.authority()!, sessionVersion: 1, totalMessages: 1 })
+            recordWindowedMutation(harness.coordinator, { sessionToken: harness.sessionToken, previousVersion: 0,
+                sessionVersion: 1, start: 0, deleteCount: 0, messages: [reply] })
+            await expect(harness.coordinator.flushPendingDataLocally('split-reply')).rejects.toThrow('Page write failed')
+
+            expect((await other.readConversation('char-a', 'two'))?.value.message).toEqual([reply])
+            expect(await other.readConversation('char-a', 'added')).toBeNull()
+            expect(harness.onPersisted.mock.calls.map(([event]) => event.sessionVersion)).toEqual([1])
+            expect(overlay.dirty).toBe(false)
         })
 
         it('reports a save that is too large without creating anything', async () => {

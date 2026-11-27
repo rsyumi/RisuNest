@@ -1,6 +1,6 @@
 import type { Chat, Message } from './storage/database.svelte'
 import { safeStructuredClone } from './safeStructuredClone'
-import { toWindowIndex } from './process/historyWindowIndex'
+import { toAbsoluteIndex, toWindowIndex } from './process/historyWindowIndex'
 
 export type MessageSnapshot = Omit<Message, 'responseVariants'>
 export interface ResponseVariantSet {
@@ -73,23 +73,90 @@ export interface RerollRecovery {
     responseCount: number
     // Latest owned writes let recovery retain independently edited plugin output.
     outputs: Record<string, Message>
+    firstOutput?: { id: string; offset: number }
+    /** Independent rows that a plugin inserted after the response began. */
+    followingIds?: string[]
 }
 
-export function trackRerollOutput(chat: Chat, message: Message): void {
-    if (chat.rerollRecovery?.phase === 'generating' && message.chatId) {
-        chat.rerollRecovery.outputs[message.chatId] = safeStructuredClone(message)
+export function trackRerollOutput(chat: Chat, message: Message, index?: number): void {
+    const recovery = chat.rerollRecovery
+    if (recovery?.phase === 'generating' && message.chatId) {
+        if (!recovery.firstOutput && Object.keys(recovery.outputs).length === 0) {
+            const position = index ?? toAbsoluteIndex(chat, chat.message.length)
+            recovery.firstOutput = { id: message.chatId, offset: Math.max(0, position - recovery.startIndex) }
+        }
+        if (index !== undefined && recovery.firstOutput?.id === message.chatId) {
+            recovery.startIndex = Math.max(0, index - recovery.firstOutput.offset)
+        }
+        recovery.outputs[message.chatId] = safeStructuredClone(message)
     }
+}
+
+function uniqueMessageIndex(messages: readonly Message[], id: string | undefined): number {
+    if (!id) return -1
+    const first = messages.findIndex(message => message.chatId === id)
+    return first >= 0 && messages.findLastIndex(message => message.chatId === id) === first ? first : -1
+}
+
+export function rerollStart(chat: Chat, recovery: RerollRecovery): number {
+    const first = recovery.firstOutput
+    if (first) {
+        const position = uniqueMessageIndex(chat.message, first.id)
+        if (position >= 0) return Math.max(0, position - first.offset)
+        return -1
+    }
+    const anchor = uniqueMessageIndex(chat.message, recovery.anchorId)
+    if (anchor >= 0) return anchor + 1
+    return Math.min(Math.max(toWindowIndex(chat, recovery.startIndex), 0), chat.message.length)
+}
+
+export function rerollProtectedIndexes(messages: readonly Message[], recovery: RerollRecovery, replyIndex: number): number[] {
+    const first = recovery.firstOutput
+    const firstIndex = uniqueMessageIndex(messages, first?.id)
+    const start = firstIndex >= 0 ? firstIndex - first.offset
+        : replyIndex >= 0 ? Math.min(recovery.startIndex, replyIndex) : recovery.startIndex
+    const following = new Set(recovery.followingIds)
+    const indexes: number[] = []
+    for (let index = Math.max(0, start); index < messages.length; index++) {
+        if (!following.has(messages[index].chatId)) indexes.push(index)
+    }
+    return indexes
+}
+
+/** Setter ranges are in application order. The protected response stays contiguous across each edit. */
+export function rerollAfterPluginRanges(
+    recovery: RerollRecovery,
+    ranges: readonly { start: number; before: readonly Message[]; messages: readonly Message[] }[],
+): RerollRecovery {
+    if (!ranges.length) return recovery
+    let start = recovery.startIndex
+    const following = new Set(recovery.followingIds)
+    for (const range of ranges) {
+        if (range.before.length === range.messages.length &&
+            range.before.every((row, index) => row.chatId === range.messages[index].chatId)) continue
+        const previous = new Set<string>()
+        for (const row of range.before) {
+            if (row.chatId && following.delete(row.chatId)) previous.add(row.chatId)
+        }
+        if (range.start + range.before.length <= start) {
+            start += range.messages.length - range.before.length
+        } else if (range.start >= start) {
+            const existing = new Set(range.before.map(row => row.chatId))
+            for (const row of range.messages) {
+                if (row.chatId && (!existing.has(row.chatId) || previous.has(row.chatId))) following.add(row.chatId)
+            }
+        }
+    }
+    if (start === recovery.startIndex && following.size === (recovery.followingIds?.length ?? 0)
+        && (recovery.followingIds ?? []).every(id => following.has(id))) return recovery
+    return { ...recovery, startIndex: start, followingIds: [...following] }
 }
 
 export function recoverRerollMessages(chat: Chat): Message[] {
     const recovery = chat.rerollRecovery
     if (!recovery || recovery.phase === 'prepared') return chat.message
-    const anchor = recovery.anchorId
-        ? chat.message.findIndex((message) => message.chatId === recovery.anchorId)
-        : -1
-    const start = anchor >= 0
-        ? anchor + 1
-        : Math.min(Math.max(toWindowIndex(chat, recovery.startIndex), 0), chat.message.length)
+    const start = rerollStart(chat, recovery)
+    if (start < 0) return chat.message
     const retained = chat.message.slice(start).filter((message) => {
         const owned = message.chatId ? recovery.outputs[message.chatId] : undefined
         return !owned || JSON.stringify(message) !== JSON.stringify(owned)

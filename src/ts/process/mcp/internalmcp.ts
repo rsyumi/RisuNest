@@ -1,5 +1,6 @@
 //Although these are TECHNICALLY not MCPs, but for the users, we will stick to that name
 
+import type { OutputPluginDispatch } from "../request/request";
 import type { MCPTool, RPCToolCallContent } from "./mcplib";
 
 //template for MCPClient-like classes that can be used in the MCP system
@@ -37,11 +38,11 @@ export class MCPClientLike {
         return this.serverInfo;
     }
 
-    async getToolList(): Promise<MCPTool[]> {
+    async getToolList(_dispatch?: OutputPluginDispatch): Promise<MCPTool[]> {
         return [];
     }
 
-    async callTool(toolName: string, args: any): Promise<RPCToolCallContent[]> {
+    async callTool(toolName: string, args: any, _dispatch?: OutputPluginDispatch): Promise<RPCToolCallContent[]> {
         return [{
             type: 'text',
             text: `Tool ${toolName} not implemented`

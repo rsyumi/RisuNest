@@ -1,6 +1,8 @@
 import type { Chat, Database, Message, character } from './database.svelte'
 import type { CommittedApplyOutcome } from './persistentDataRuntime'
 import { safeStructuredClone } from '../safeStructuredClone'
+import type { ConversationOperationCommit } from '../process/conversationOperationContext'
+import { WindowedConversationOverlay, type WindowedRowTarget } from './windowedConversationOverlay'
 import { replaceArrayRange } from '../arrayRange'
 import {
     ActiveConversationSession,
@@ -16,7 +18,7 @@ import type {
     PersistentDataStore,
     PersistentRevisionReader,
 } from './persistentDataStore'
-import { readCurrentRevision } from './persistentDataStore'
+import { readCurrentRevision, RevisionConflictError } from './persistentDataStore'
 import {
     createConversationSummaryFromMetadata,
     createConversationSummaryStub,
@@ -54,6 +56,7 @@ export interface WorkingSetCoordinator {
     readonly mutationGeneration: number
     initialize(revision: DataRevision, database?: Database): void
     flushPendingData(reason: string): Promise<void>
+    adoptObservedRevision?(revision: DataRevision): Promise<void>
     retireWindowedSelectedConversation?(): void
     replacePersistentDatabase(database: Database, reason: string): Promise<CommittedApplyOutcome>
     adoptHydratedCharacter(
@@ -126,6 +129,7 @@ export interface ActiveWorkingSetDependencies {
     canUseWindowedSelectedConversation?(): boolean
     isConversationOperationActive?(): boolean
     subscribeConversationOperationActive?(listener: (active: boolean) => void): () => void
+    onConversationOwnerChange?(): void
     conversationViewportRowBudget?: number
     conversationPageSize?: number
 }
@@ -158,7 +162,33 @@ export interface CompleteConversationLease {
     release(): void
 }
 
+export interface WindowedConversationRowEdit {
+    start: number
+    before: readonly Message[]
+    messages: readonly Message[]
+    anchor?: Message
+    anchorBefore?: boolean
+    head?: boolean
+    compound?: boolean
+    tail?: boolean
+}
+
+export interface WindowedConversationWriteTarget {
+    readonly absoluteIndex: number | null
+    read(): Message | null
+    replace(message: Message): boolean
+}
+
 export interface WindowedConversationMutationController {
+    readonly mutationVersion?: number
+    isOwnerCurrent?(): boolean
+    adoptRewrittenRows?(rewritten: readonly ConversationRowsRewrite[]): void
+    editorRow?(): { absoluteIndex: number; message: Message } | null
+    adoptSessionCommit?(commit: ConversationOperationCommit, localIndex: number, messageId: string): number | null
+    bindTarget?(localIndex: number): WindowedConversationWriteTarget | null
+    prepareTarget?(localIndex: number, reader?: PersistentRevisionReader): Promise<boolean>
+    refreshWindow?(anchorIndex?: number): Promise<boolean>
+    applyAbsoluteRanges?(ranges: readonly WindowedConversationRowEdit[]): boolean
     readonly chat: Chat
     readonly absoluteStartIndex: number
     isCurrent(): boolean
@@ -199,6 +229,7 @@ interface WindowedSelectedConversationState {
     authority: WindowedConversationPersistenceAuthority
     summary: ConversationSummary
     viewportSource: PersistentConversationViewportSource
+    viewportEpoch: number
 }
 
 type SelectedConversationState =
@@ -360,18 +391,20 @@ export class ActiveWorkingSet {
     async acquireCompleteConversation(
         reason: string,
         target = this.captureSelectedConversationTarget(),
+        assertPublicationAllowed?: () => void,
     ): Promise<CompleteConversationLease> {
         const state = this.selectedConversationState
         if (!state || !target || !this.matchesTarget(state, target)) {
             throw new SelectedConversationPromotionStaleError()
         }
+        assertPublicationAllowed?.()
         let complete: CompleteSelectedConversationState
         if (state.kind === 'complete') {
             complete = state
         } else {
             let flight = this.promotionFlight
             if (!flight) {
-                flight = this.promoteWindowedConversation(state, target, reason)
+                flight = this.promoteWindowedConversation(state, target, reason, assertPublicationAllowed)
                 this.promotionFlight = flight
                 const clearFlight = () => {
                     if (this.promotionFlight === flight) this.promotionFlight = null
@@ -402,54 +435,6 @@ export class ActiveWorkingSet {
         }
     }
 
-    async prepareWindowedMetadataAdoption(reader: PersistentRevisionReader): Promise<() => void> {
-        const state = this.selectedConversationState
-        if (state?.kind !== 'windowed' ||
-            state.authority.sessionVersion !== state.authority.persistedSessionVersion ||
-            reader.revision < state.authority.storeRevision) return () => {}
-        const authority = state.authority
-        const adoptions: Array<{ controller: WindowedConversationMutationController; messages: Message[] }> = []
-        for (const controller of this.windowedControllers) {
-            if (!controller.isCurrent()) {
-                this.windowedControllers.delete(controller)
-                continue
-            }
-            const messages: Message[] = []
-            const length = controller.chat.message.length
-            for (let offset = 0; offset < length;) {
-                const startIndex = controller.absoluteStartIndex + offset
-                const page = await reader.readConversationWindow({
-                    characterId: state.characterId, conversationId: state.conversationId,
-                    startIndex, limit: Math.min(100, length - offset),
-                })
-                if (!page || page.revision !== reader.revision || page.value.startIndex !== startIndex ||
-                    page.value.characterId !== state.characterId || page.value.conversationId !== state.conversationId ||
-                    page.value.totalMessages !== authority.totalMessages || page.value.messages.length === 0) {
-                    controller.release()
-                    break
-                }
-                messages.push(...page.value.messages)
-                offset += page.value.messages.length
-            }
-            const contentKeys = ['role', 'data', 'saying', 'chatId', 'name', 'disabled', 'isComment'] as const
-            if (messages.length !== length || !messages.every((message, index) =>
-                contentKeys.every((key) => Object.is(message[key], controller.chat.message[index]?.[key])))) {
-                controller.release()
-                continue
-            }
-            adoptions.push({ controller, messages })
-        }
-        return () => {
-            const current = this.selectedConversationState
-            if (current?.kind !== 'windowed' || current.authority.sessionToken !== authority.sessionToken ||
-                current.authority.sessionVersion !== authority.sessionVersion ||
-                current.authority.storeRevision !== reader.revision) return
-            for (const { controller, messages } of adoptions) {
-                if (controller.isCurrent()) replaceArrayRange(controller.chat.message, 0, messages.length, safeStructuredClone(messages))
-            }
-        }
-    }
-
     captureWindowedConversationMutationController(
         target: SelectedConversationTarget,
         chat: Chat,
@@ -466,136 +451,263 @@ export class ActiveWorkingSet {
                 ? absoluteStartIndex + chat.message.length > initialState.authority.totalMessages
                 : absoluteStartIndex + chat.message.length !== initialState.authority.totalMessages)
         ) return null
+        const state = initialState
+        const { store, coordinator } = this.dependencies
+        const overlay = state.authority.overlay!
+        const generation = state.navigationGeneration
+        const capturedTargets = new Set<WindowedRowTarget>()
+        let editorTarget: WindowedRowTarget | undefined
         let released = false
-        const navigationGeneration = initialState.navigationGeneration
-        let expectedSessionVersion = initialState.authority.sessionVersion
-        const requireState = (): WindowedSelectedConversationState | null => {
-            const state = this.selectedConversationState
-            return !released
-                && state?.kind === 'windowed'
-                && state.navigationGeneration === navigationGeneration
-                && state.characterId === initialState.characterId
-                && state.conversationId === initialState.conversationId
-                && state.authority.sessionToken === initialState.authority.sessionToken
-                && state.authority.sessionVersion === expectedSessionVersion
-                && (countPreserving
-                    ? state.authority.totalMessages === initialState.authority.totalMessages
-                    : state.authority.totalMessages === absoluteStartIndex + chat.message.length)
-                ? state
-                : null
+        let start = absoluteStartIndex
+        let windowVersion = state.authority.sessionVersion
+        let windowEpoch = overlay.epoch
+        const metadataBaseline = cloneConversationMetadata(chat) as Record<string, unknown>
+        const ownerCurrent = () => !released && this.selectedConversationState === state &&
+            this.navigationGeneration === generation && state.navigationGeneration === generation
+        const current = () => ownerCurrent() && windowEpoch === overlay.epoch &&
+            windowVersion === state.authority.sessionVersion
+        const acceptedVersion = () => {
+            windowVersion = state.authority.sessionVersion
+            windowEpoch = overlay.epoch
         }
-        const syncMetadata = (state: WindowedSelectedConversationState) => {
-            const metadata = cloneConversationMetadata(chat) as Record<string, unknown>
-            const shell = state.conversation as unknown as Record<string, unknown>
-            for (const key of Object.keys(shell)) {
-                if (key !== 'message' && !Object.hasOwn(metadata, key)) delete shell[key]
-            }
-            for (const [key, value] of Object.entries(metadata)) {
-                if (key !== 'message') shell[key] = safeStructuredClone(value)
-            }
-            return metadata
-        }
-        const restoreObject = (
-            target: Record<string, unknown>,
-            snapshot: Record<string, unknown>,
+        const normalizedMessages = (at: number, submitted: readonly Message[]) =>
+            overlay.intervals(at, submitted.length).flatMap(interval => 'messages' in interval
+                ? interval.messages : submitted.slice(interval.start - at, interval.start - at + interval.length))
+        const apply = (
+            edits: readonly WindowedConversationRowEdit[],
+            command: Parameters<WindowedConversationMutationController['applyRange']>[3],
+            metadataKeys?: readonly string[],
         ) => {
-            for (const key of Object.keys(target)) {
-                if (!Object.hasOwn(snapshot, key)) delete target[key]
+            const coordinator = this.dependencies.coordinator
+            if (!ownerCurrent() || !coordinator.recordActiveConversationMutation) return false
+            const authority = state.authority
+            const shell = state.conversation as unknown as Record<string, unknown>
+            const fields = chat as unknown as Record<string, unknown>
+            const keys = metadataKeys ?? [...new Set([...Object.keys(fields), ...Object.keys(metadataBaseline)])]
+            const changedKeys = keys.filter(key => key !== 'message' && !isEqual(metadataBaseline[key], fields[key]))
+            const previous = new Map(changedKeys.filter(key => Object.hasOwn(shell, key)).map(key => [key, shell[key]]))
+            const owned: Record<string, unknown> = {}
+            const undo: Array<() => void> = []
+            const mutations: ActiveConversationMutationEvent['mutations'][number][] = []
+            const changes: Array<{
+                start: number; end: number; structureChanged: boolean; pairChanged: boolean
+                previousCount: number; nextCount: number
+            }> = []
+            let version = authority.sessionVersion
+            try {
+                for (const edit of edits) {
+                    const epoch = overlay.epoch
+                    const previousCount = overlay.count
+                    version++
+                    undo.push(overlay.applyRange(edit.start, edit.before, edit.messages, version, {
+                        compound: edit.compound, anchor: edit.anchor, anchorBefore: edit.anchorBefore, head: edit.head,
+                        tail: edit.tail,
+                    }))
+                    const messages = normalizedMessages(edit.start, edit.messages)
+                    mutations.push({ start: edit.start, deleteCount: edit.before.length, messages, sessionVersion: version })
+                    changes.push({
+                        start: edit.start, end: edit.start + messages.length, previousCount, nextCount: overlay.count,
+                        structureChanged: overlay.epoch !== epoch,
+                        pairChanged: edit.before.length !== messages.length || edit.before.some((row, i) =>
+                            row.role !== messages[i].role || !!row.isComment !== !!messages[i].isComment ||
+                            !!row.disabled !== !!messages[i].disabled),
+                    })
+                }
+                if (!edits.length) {
+                    undo.push(overlay.applyRange(0, [], [], ++version))
+                    mutations.push({ start: 0, deleteCount: 0, messages: [], sessionVersion: version })
+                }
+                for (const key of changedKeys) {
+                    if (Object.hasOwn(fields, key)) shell[key] = owned[key] = safeStructuredClone(fields[key])
+                    else delete shell[key]
+                }
+                state.authority = { ...authority, sessionVersion: version, totalMessages: overlay.count }
+                coordinator.recordActiveConversationMutation({
+                    characterId: state.characterId, conversationId: state.conversationId,
+                    sessionToken: authority.sessionToken, previousVersion: authority.sessionVersion,
+                    sessionVersion: version, commands: [command], mutations,
+                    conversation: owned,
+                })
+            } catch (error) {
+                for (const rollback of undo.reverse()) rollback()
+                for (const key of changedKeys) {
+                    if (previous.has(key)) shell[key] = previous.get(key)
+                    else delete shell[key]
+                }
+                state.authority = authority
+                throw error
             }
-            for (const [key, value] of Object.entries(snapshot)) {
-                target[key] = safeStructuredClone(value)
+            for (const key of changedKeys) {
+                if (Object.hasOwn(owned, key)) metadataBaseline[key] = safeStructuredClone(owned[key])
+                else delete metadataBaseline[key]
             }
+            state.summary = { ...state.summary, messageCount: overlay.count,
+                recentAt: state.conversation.lastDate ?? mutations.at(-1)?.messages.at(-1)?.time ?? state.summary.recentAt }
+            if (state.authority.storeRevision === overlay.revision) {
+                state.viewportEpoch = overlay.epoch
+                if (changes.length) state.viewportSource.refreshProjections(changes)
+            } else {
+                // The save installed its overlay base and has not published the matching viewport yet.
+                state.viewportEpoch = -1
+            }
+            return true
+        }
+        const bind = (localIndex: number) => {
+            if (!ownerCurrent()) return null
+            if (countPreserving && localIndex === 0 && editorTarget) return editorTarget
+            if (!current() || !chat.message[localIndex]) return null
+            const absoluteIndex = start + localIndex
+            for (const target of capturedTargets) {
+                if (overlay.locate(target) === absoluteIndex) return target
+            }
+            const target = overlay.bind(absoluteIndex, chat.message[localIndex])
+            capturedTargets.add(target)
+            if (countPreserving && localIndex === 0) editorTarget = target
+            return target
         }
         const controller: WindowedConversationMutationController = {
-            chat,
-            absoluteStartIndex,
-            isCurrent: () => requireState() !== null,
-            applyRange: (localStart, deleteCount, messages, command) => {
-                const state = requireState()
-                if (
-                    !state
-                    || !this.dependencies.coordinator.recordActiveConversationMutation
-                    || !Number.isSafeInteger(localStart)
-                    || localStart < 0
-                    || !Number.isSafeInteger(deleteCount)
-                    || deleteCount < 0
-                    || localStart + deleteCount > chat.message.length
-                    || (countPreserving && deleteCount !== messages.length)
-                ) return false
-                const replacedMessages = chat.message.slice(localStart, localStart + deleteCount)
-                const shellSnapshot = safeStructuredClone(
-                    state.conversation,
-                ) as unknown as Record<string, unknown>
-                const authoritySnapshot = state.authority
-                const summarySnapshot = state.summary
-                const previousVersion = state.authority.sessionVersion
-                const sessionVersion = previousVersion + 1
-                const detachedMessages = safeStructuredClone([...messages])
-                let rollbackViewport = () => {}
-                try {
-                    replaceArrayRange(
-                        chat.message,
-                        localStart,
-                        deleteCount,
-                        safeStructuredClone(detachedMessages),
-                    )
-                    const metadata = syncMetadata(state)
-                    state.authority = {
-                        ...state.authority,
-                        sessionVersion,
-                        totalMessages:
-                            state.authority.totalMessages - deleteCount + detachedMessages.length,
+            chat, get absoluteStartIndex() { return start },
+            get mutationVersion() { return state.authority.sessionVersion + (state.viewportSource.snapshot().historyVersion ?? 0) },
+            isOwnerCurrent: ownerCurrent,
+            adoptRewrittenRows(rewritten) {
+                if (!current()) return
+                for (const range of rewritten) {
+                    for (const [offset, stored] of range.messages.entries()) {
+                        const index = overlay.storedToVisible(range.start + offset)
+                        if (index === null || index < start || index >= start + chat.message.length) continue
+                        const projected = overlay.row(index)
+                        const body = projected && 'message' in projected ? projected.message : stored
+                        if (!isEqual(chat.message[index - start], body)) chat.message[index - start] = safeStructuredClone(body)
                     }
-                    state.summary = {
-                        ...state.summary,
-                        messageCount: state.authority.totalMessages,
-                        recentAt:
-                            chat.lastDate
-                            ?? detachedMessages.at(-1)?.time
-                            ?? state.summary.recentAt,
-                    }
-                    rollbackViewport = state.viewportSource.applyOptimisticRange(
-                        absoluteStartIndex + localStart,
-                        deleteCount,
-                        detachedMessages,
-                        sessionVersion,
-                    )
-                    this.dependencies.coordinator.recordActiveConversationMutation({
-                        characterId: state.characterId,
-                        conversationId: state.conversationId,
-                        sessionToken: state.authority.sessionToken,
-                        previousVersion,
-                        sessionVersion,
-                        commands: [command],
-                        mutations: [{
-                            start: absoluteStartIndex + localStart,
-                            deleteCount,
-                            messages: detachedMessages,
-                            sessionVersion,
-                        }],
-                        conversation: metadata,
-                    })
-                    expectedSessionVersion = sessionVersion
-                    return true
-                } catch (error) {
-                    rollbackViewport()
-                    replaceArrayRange(chat.message, localStart, detachedMessages.length, replacedMessages)
-                    restoreObject(
-                        state.conversation as unknown as Record<string, unknown>,
-                        shellSnapshot,
-                    )
-                    state.authority = authoritySnapshot
-                    state.summary = summarySnapshot
-                    throw error
                 }
+            },
+            isCurrent: () => editorTarget ? ownerCurrent() && overlay.locate(editorTarget) !== null : current(),
+            editorRow() {
+                if (!editorTarget || !ownerCurrent()) return null
+                const absoluteIndex = overlay.locate(editorTarget)
+                const message = overlay.readTarget(editorTarget)
+                return absoluteIndex !== null && message ? { absoluteIndex, message } : null
+            },
+            async prepareTarget(localIndex, pinned) {
+                const target = bind(localIndex)
+                if (!target) return false
+                const revision = state.authority.storeRevision
+                try {
+                    if (pinned) await overlay.prove(target, pinned)
+                    else {
+                        const reader = await store.acquireRevision(revision)
+                        try { await overlay.prove(target, reader) } finally { await reader.release() }
+                    }
+                    return ownerCurrent() && state.authority.storeRevision === revision && overlay.locate(target) !== null
+                } catch (error) {
+                    if (!(error instanceof RevisionConflictError) || !coordinator.adoptObservedRevision) throw error
+                    await coordinator.adoptObservedRevision(error.actualRevision)
+                    return false
+                }
+            },
+            bindTarget(localIndex) {
+                const target = bind(localIndex)
+                if (!target) return null
+                return {
+                    get absoluteIndex() { return ownerCurrent() ? overlay.locate(target) : null },
+                    read: () => ownerCurrent() ? overlay.readTarget(target) : null,
+                    replace(message) {
+                        const index = overlay.locate(target)
+                        const before = overlay.readTarget(target)
+                        if (!before || index === null) return false
+                        const wasCurrent = current()
+                        if (!apply([{ start: index, before: [before], messages: [message] }], 'edit',
+                            countPreserving ? undefined : chat.rerollRecovery ? ['rerollRecovery'] : [])) return false
+                        if (wasCurrent && index >= start && index < start + chat.message.length) {
+                            chat.message[index - start] = safeStructuredClone(message)
+                            acceptedVersion()
+                        }
+                        return true
+                    },
+                }
+            },
+            async refreshWindow(anchorIndex) {
+                if (!ownerCurrent()) return false
+                if (current() && (anchorIndex === undefined ||
+                    (anchorIndex >= start && anchorIndex < start + chat.message.length))) return true
+                const anchor = anchorIndex === undefined ? null : [...capturedTargets.values()]
+                    .find(target => overlay.locate(target) === anchorIndex)
+                while (ownerCurrent()) {
+                    const index = anchor ? overlay.locate(anchor) : anchorIndex
+                    if (index === null) return false
+                    const count = overlay.count
+                    const length = Math.min(count, Math.max(1, chat.message.length))
+                    const nextStart = Math.max(0, Math.min(index ?? count, count - length))
+                    const revision = overlay.revision
+                    const version = state.authority.sessionVersion
+                    const rows: Message[] = []
+                    try {
+                        const lease = await store.acquireRevision(revision)
+                        try {
+                            const reader = state.viewportSource.captureProjectedReader(lease)
+                            while (rows.length < length) {
+                                const page = await reader.readConversationWindow({
+                                    characterId: state.characterId, conversationId: state.conversationId,
+                                    startIndex: nextStart + rows.length, limit: Math.min(128, length - rows.length),
+                                })
+                                if (!page || page.revision !== revision || !page.value.messages.length) return false
+                                rows.push(...page.value.messages)
+                            }
+                        } finally {
+                            await lease.release()
+                        }
+                    } catch (error) {
+                        if (!ownerCurrent()) return false
+                        if (error instanceof RevisionConflictError && coordinator.adoptObservedRevision) {
+                            await coordinator.adoptObservedRevision(error.actualRevision)
+                            continue
+                        }
+                        if (revision !== overlay.revision || version !== state.authority.sessionVersion) continue
+                        throw error
+                    }
+                    if (!ownerCurrent()) return false
+                    if (revision !== overlay.revision || version !== state.authority.sessionVersion) continue
+                    start = nextStart
+                    replaceArrayRange(chat.message, 0, chat.message.length, rows)
+                    acceptedVersion()
+                    return true
+                }
+                return false
+            },
+            applyAbsoluteRanges: ranges => current() && apply(ranges, ranges.length ? 'replace-range' : 'update-metadata'),
+            applyRange: (localStart, deleteCount, messages, command) => {
+                if (!Number.isSafeInteger(localStart) || !Number.isSafeInteger(deleteCount) || localStart < 0 ||
+                    deleteCount < 0 || localStart + deleteCount > chat.message.length ||
+                    (countPreserving && deleteCount !== messages.length)) return false
+                if (countPreserving && localStart === 0 && deleteCount === 1 && editorTarget) {
+                    return controller.bindTarget!(0)?.replace(messages[0]) ?? false
+                }
+                const metadataOnly = deleteCount === 0 && messages.length === 0
+                if (!current() && !metadataOnly) return false
+                const before = chat.message.slice(localStart, localStart + deleteCount)
+                const absolute = start + localStart
+                const wasCurrent = current()
+                if (!apply(metadataOnly ? [] : [{
+                    start: absolute, before, messages, anchor: chat.message[localStart],
+                    tail: command === 'replace-range' && absolute + deleteCount === overlay.count &&
+                        deleteCount !== messages.length && !(deleteCount === 1 && !messages.length),
+                }], command)) return false
+                if (!metadataOnly) {
+                    const normalized = normalizedMessages(absolute, messages)
+                    replaceArrayRange(chat.message, localStart, deleteCount, safeStructuredClone(normalized))
+                }
+                if (wasCurrent) acceptedVersion()
+                return true
             },
             release: () => {
                 released = true
+                for (const target of capturedTargets.values()) overlay.release(target)
+                capturedTargets.clear()
                 this.windowedControllers.delete(controller)
             },
         }
-        for (const previous of this.windowedControllers) {
-            if (!previous.isCurrent()) this.windowedControllers.delete(previous)
+        for (const prior of this.windowedControllers) {
+            if (!prior.isOwnerCurrent?.()) prior.release()
         }
         this.windowedControllers.add(controller)
         return controller
@@ -608,31 +720,23 @@ export class ActiveWorkingSet {
     ): Promise<WindowedConversationMutationController | null> {
         const state = this.selectedConversationState
         if (state?.kind !== 'windowed' || !this.matchesTarget(state, target) ||
-            state.authority.sessionVersion !== state.authority.persistedSessionVersion ||
             !Number.isSafeInteger(absoluteIndex) || absoluteIndex < 0 || absoluteIndex >= state.authority.totalMessages) return null
         const version = state.authority.sessionVersion
-        const lease = await this.dependencies.store.acquireRevision(target.storeRevision)
+        const reader = await this.dependencies.store.acquireRevision(target.storeRevision)
         try {
-            const row = await lease.readConversationWindow({
-                characterId: target.characterId, conversationId: target.conversationId, startIndex: absoluteIndex, limit: 1,
+            const projected = state.viewportSource.captureProjectedReader(reader)
+            const read = (startIndex: number, limit: number) => projected.readConversationWindow({
+                characterId: state.characterId, conversationId: state.conversationId, startIndex, limit,
             })
-            if (!row || row.revision !== target.storeRevision || row.value.characterId !== target.characterId ||
-                row.value.conversationId !== target.conversationId || row.value.totalMessages !== state.authority.totalMessages ||
-                row.value.startIndex !== absoluteIndex || row.value.endIndex !== absoluteIndex + 1 ||
-                row.value.messages.length !== 1 || !isEqual(row.value.messages[0], evidence)) return null
-            // A later response carrier can own this row; keep its multi-row edit on the complete path.
+            const row = await read(absoluteIndex, 1)
+            if (!row || row.revision !== target.storeRevision || !isEqual(row.value.messages[0], evidence)) return null
+            // A later response carrier can own this row. Its entire variant is edited together.
             let cursor = absoluteIndex
             let stopped = false
             while (cursor < state.authority.totalMessages && !stopped) {
-                const page = await lease.readConversationWindow({
-                    characterId: target.characterId, conversationId: target.conversationId, startIndex: cursor, limit: 64,
-                })
-                if (!page || page.revision !== target.storeRevision || page.value.characterId !== target.characterId ||
-                    page.value.conversationId !== target.conversationId || page.value.totalMessages !== state.authority.totalMessages ||
-                    page.value.startIndex !== cursor || page.value.messages.length === 0 || page.value.messages.length > 64 ||
-                    page.value.endIndex !== cursor + page.value.messages.length || page.value.endIndex > state.authority.totalMessages) return null
-                for (let index = 0; index < page.value.messages.length; index++) {
-                    const message = page.value.messages[index]
+                const page = await read(cursor, 64)
+                if (!page || page.value.messages.length === 0) return null
+                for (const [index, message] of page.value.messages.entries()) {
                     const end = cursor + index
                     if (end > absoluteIndex && message.role === 'user' && !message.isComment) { stopped = true; break }
                     const variants = message.responseVariants
@@ -643,9 +747,17 @@ export class ActiveWorkingSet {
             }
             if (this.selectedConversationState !== state || !this.matchesTarget(state, target) || state.authority.sessionVersion !== version) return null
             const chat = { ...cloneConversationMetadata(state.conversation), message: safeStructuredClone(row.value.messages) } as Chat
-            return this.captureWindowedConversationMutationController(target, chat, absoluteIndex, true)
+            const controller = this.captureWindowedConversationMutationController(target, chat, absoluteIndex, true)
+            try {
+                if (controller && await controller.prepareTarget!(0, reader)) return controller
+                controller?.release()
+                return null
+            } catch (error) {
+                controller?.release()
+                throw error
+            }
         } finally {
-            await lease.release()
+            await reader.release()
         }
     }
 
@@ -808,8 +920,10 @@ export class ActiveWorkingSet {
                 sessionVersion: state.session.version,
                 totalMessages: state.session.totalMessages,
             }
+            const overlay = new WindowedConversationOverlay(authority.characterId, authority.conversationId, authority.storeRevision, authority.totalMessages, authority.persistedSessionVersion)
+            authority.overlay = overlay
             const viewportSource = new PersistentConversationViewportSource({
-                reader: this.dependencies.store,
+                overlay, reader: this.dependencies.store,
                 characterId: state.characterId,
                 conversationId: state.conversationId,
                 revision: authority.storeRevision,
@@ -823,7 +937,7 @@ export class ActiveWorkingSet {
                 summary,
                 viewportSource,
                 windowedState: {
-                    kind: 'windowed',
+                    kind: 'windowed', viewportEpoch: overlay.epoch,
                     stateToken: Symbol('windowed selected conversation'),
                     navigationGeneration: state.navigationGeneration,
                     characterId: state.characterId,
@@ -927,57 +1041,34 @@ export class ActiveWorkingSet {
             ) this.notifyActiveConversationViewportSource()
             return
         }
-        if (revision < state.authority.storeRevision) {
-            throw new RangeError('Selected conversation store revision moved backwards')
-        }
-        if (revision === state.authority.storeRevision) return
+        if (revision < state.authority.storeRevision) return
+        const overlay = state.authority.overlay!
+        const previous = state.authority
+        const changedPositions = state.viewportEpoch !== overlay.epoch || previous.totalMessages !== overlay.count
+        if (revision === previous.storeRevision && !changedPositions &&
+            previous.persistedSessionVersion >= overlay.persistedVersion && !rewritten.length) return
         const advance = this.dependencies.coordinator
             .advanceWindowedSelectedConversationRevision
         if (!advance) {
             throw new Error('Windowed selected conversation revision advance is unavailable')
         }
-        const authority = { ...state.authority, storeRevision: revision, totalMessages: totalMessages ?? state.authority.totalMessages }
-        // Edits made while the commit was stored are not in the store yet. When it stored nothing in this
-        // conversation but the session's own edits, or rewrote rows that hold none of the later ones, the
-        // rows, which hold those, stay.
-        const ahead = storedTotalMessages !== undefined && totalMessages === undefined &&
-            state.authority.sessionVersion !== state.authority.persistedSessionVersion &&
-            !state.viewportSource.holdsUnsavedRows(rewritten, state.authority.persistedSessionVersion)
-        if (ahead || (preserveRows && authority.totalMessages === state.authority.totalMessages)) {
-            const previousAuthority = state.authority
-            state.authority = authority
-            if (!advance.call(this.dependencies.coordinator, revision, authority, true)) {
-                state.authority = previousAuthority
-                throw new Error('Windowed selected conversation revision was not adopted')
-            }
-            state.viewportSource.advanceUnchangedRevision(revision, ahead
-                ? { totalMessages: storedTotalMessages!, sessionVersion: state.authority.persistedSessionVersion, rewritten }
-                : undefined)
-            return
+        if (overlay.revision !== revision) {
+            throw new Error('Selected conversation revision was not prepared')
         }
-        const viewportSource = new PersistentConversationViewportSource({
-            reader: this.dependencies.store,
-            characterId: state.characterId,
-            conversationId: state.conversationId,
-            revision,
-            totalMessages: authority.totalMessages,
-            rowBudget: this.dependencies.conversationViewportRowBudget ?? 64,
-        })
-        const advancedState: WindowedSelectedConversationState = {
-            ...state,
-            stateToken: Symbol('advanced windowed selected conversation'),
-            authority,
-            summary: authority.totalMessages === state.authority.totalMessages
-                ? state.summary : { ...state.summary, messageCount: authority.totalMessages },
-            viewportSource,
-        }
-        this.selectedConversationState = advancedState
-        if (!advance.call(this.dependencies.coordinator, revision, authority)) {
-            this.selectedConversationState = state
-            viewportSource.dispose()
+        const authority = { ...previous, storeRevision: revision, totalMessages: overlay.count,
+            persistedSessionVersion: Math.max(previous.persistedSessionVersion, overlay.persistedVersion) }
+        const structural = changedPositions
+        state.authority = authority
+        if (!advance.call(this.dependencies.coordinator, revision, authority, !structural)) {
+            state.authority = previous
             throw new Error('Windowed selected conversation revision was not adopted')
         }
-        state.viewportSource.dispose()
+        state.summary = { ...state.summary, messageCount: overlay.count }
+        state.viewportEpoch = overlay.epoch
+        if (rewritten.length && !structural) {
+            for (const controller of this.windowedControllers) controller.adoptRewrittenRows?.(rewritten)
+        }
+        state.viewportSource.installProjection(revision, overlay.storedCount, structural, rewritten)
         this.notifyActiveConversationViewportSource()
     }
 
@@ -1064,11 +1155,13 @@ export class ActiveWorkingSet {
 
     invalidateNavigation(): void {
         this.navigationGeneration++
+        this.dependencies.onConversationOwnerChange?.()
         this.clearActiveConversationSession()
     }
 
     fenceNavigation(): number {
         this.navigationGeneration++
+        this.dependencies.onConversationOwnerChange?.()
         this.refreshSelectedConversationNavigation(this.navigationGeneration)
         return this.navigationGeneration
     }
@@ -1178,14 +1271,16 @@ export class ActiveWorkingSet {
                 sessionToken: createConversationSessionToken(), storeRevision: revision,
                 persistedSessionVersion: 0, sessionVersion: 0, totalMessages: metadata.totalMessages,
             }
+            const overlay = new WindowedConversationOverlay(authority.characterId, authority.conversationId, authority.storeRevision, authority.totalMessages, authority.persistedSessionVersion)
+            authority.overlay = overlay
             const viewportSource = new PersistentConversationViewportSource({
-                reader: this.dependencies.store, characterId: selected.chaId,
+                overlay, reader: this.dependencies.store, characterId: selected.chaId,
                 conversationId: metadata.conversationId, revision, totalMessages: metadata.totalMessages,
                 rowBudget: this.dependencies.conversationViewportRowBudget ?? 64,
             })
             this.clearActiveConversationSession()
             this.selectedConversationState = {
-                kind: 'windowed', stateToken: Symbol('committed windowed selected conversation'),
+                kind: 'windowed', viewportEpoch: overlay.epoch, stateToken: Symbol('committed windowed selected conversation'),
                 navigationGeneration: this.navigationGeneration, characterId: selected.chaId,
                 conversationId: metadata.conversationId, conversation, authority, viewportSource,
                 summary: createConversationSummaryFromMetadata(selected.chaId, metadata.conversation,
@@ -2064,8 +2159,10 @@ export class ActiveWorkingSet {
         const adopt =
             this.dependencies.coordinator.adoptWindowedSelectedConversation
         if (!restorePublication || !transition || !adopt) return false
+        const overlay = new WindowedConversationOverlay(authority.characterId, authority.conversationId, authority.storeRevision, authority.totalMessages, authority.persistedSessionVersion)
+        authority.overlay = overlay
         const viewportSource = new PersistentConversationViewportSource({
-            reader: this.dependencies.store,
+            overlay, reader: this.dependencies.store,
             characterId: authority.characterId,
             conversationId: authority.conversationId,
             revision: authority.storeRevision,
@@ -2073,7 +2170,7 @@ export class ActiveWorkingSet {
             rowBudget: this.dependencies.conversationViewportRowBudget ?? 64,
         })
         const windowedState: WindowedSelectedConversationState = {
-            kind: 'windowed',
+            kind: 'windowed', viewportEpoch: overlay.epoch,
             stateToken: Symbol('direct windowed selected conversation'),
             navigationGeneration: input.generation,
             characterId: authority.characterId,
@@ -2219,6 +2316,7 @@ export class ActiveWorkingSet {
         initialState: WindowedSelectedConversationState,
         initialTarget: SelectedConversationTarget,
         reason: string,
+        assertPublicationAllowed?: () => void,
     ): Promise<CompleteSelectedConversationState> {
         const flushReason = `complete-selected-conversation:${reason}`
         await this.dependencies.coordinator.flushPendingData(flushReason)
@@ -2277,6 +2375,7 @@ export class ActiveWorkingSet {
         if (!transition) {
             throw new Error('Selected conversation transition is unavailable')
         }
+        assertPublicationAllowed?.()
         let complete: CompleteSelectedConversationState | null = null
         try {
             transition.call(this.dependencies.coordinator, () => {
@@ -2352,98 +2451,6 @@ export class ActiveWorkingSet {
         return complete
     }
 
-    /**
-     * Publishes the selected windowed conversation with the given complete messages and its live
-     * metadata. The coordinator calls this inside a save and keeps its persisted baseline, so
-     * nothing here adopts the published character.
-     */
-    completeWindowedConversationForSave(
-        authority: WindowedConversationPersistenceAuthority,
-        messages: Message[],
-    ): CompleteCharacter | null {
-        const state = this.selectedConversationState
-        if (
-            state?.kind !== 'windowed' ||
-            state.characterId !== authority.characterId ||
-            state.conversationId !== authority.conversationId ||
-            state.authority.sessionToken !== authority.sessionToken ||
-            state.authority.sessionVersion !== authority.sessionVersion ||
-            state.authority.totalMessages !== authority.totalMessages ||
-            state.authority.storeRevision !== authority.storeRevision
-        ) return null
-        const resident = this.dependencies.getResidentCharacter?.(state.characterId)
-        const conversationIndex = resident?.chats.findIndex(
-            (conversation) => conversation === state.conversation,
-        ) ?? -1
-        if (!resident || conversationIndex < 0) return null
-        const conversation = {
-            ...cloneConversationMetadata(state.conversation),
-            message: messages,
-        } as Chat
-        const nextCharacter = {
-            ...resident,
-            chats: resident.chats.map((candidate, index) =>
-                index === conversationIndex ? conversation : candidate),
-        } as CompleteCharacter
-        let complete: CompleteSelectedConversationState | null = null
-        let publishedCharacter: CompleteCharacter | undefined
-        try {
-            this.selectedConversationState = null
-            this.activeSession = null
-            this.dependencies.publishConversation(
-                state.characterId,
-                conversation,
-                nextCharacter,
-                { representationOnly: true },
-            )
-            publishedCharacter = this.dependencies.getResidentCharacter?.(state.characterId)
-            const publishedConversation =
-                publishedCharacter?.chats[publishedCharacter.chatPage ?? 0]
-            if (
-                !publishedCharacter ||
-                publishedCharacter.chaId !== state.characterId ||
-                !matchesPublishedCharacter(
-                    nextCharacter,
-                    publishedCharacter,
-                    state.conversationId,
-                    true,
-                ) ||
-                !publishedConversation ||
-                publishedConversation.id !== state.conversationId ||
-                isMetadataOnlySelectedConversation(publishedConversation)
-            ) {
-                throw new Error('Complete selected conversation publication diverged')
-            }
-            complete = this.createCompleteSelectedConversationState(
-                state.characterId,
-                publishedConversation,
-                state.authority.storeRevision,
-                state.navigationGeneration,
-            )
-            this.selectedConversationState = complete
-            this.activeSession = complete.session
-        } catch (error) {
-            this.selectedConversationState = state
-            this.activeSession = null
-            complete?.viewportSource.dispose()
-            complete?.session.invalidate()
-            try {
-                this.dependencies.publishConversation(
-                    state.characterId,
-                    state.conversation,
-                    resident,
-                    { representationOnly: true },
-                )
-            } catch {
-                this.clearActiveConversationSession()
-            }
-            throw error
-        }
-        state.viewportSource.dispose()
-        this.notifyActiveConversationViewportSource()
-        return publishedCharacter
-    }
-
     private createCompleteSelectedConversationState(
         characterId: string,
         conversation: Chat,
@@ -2490,6 +2497,7 @@ export class ActiveWorkingSet {
     }
 
     private notifyActiveConversationViewportSource(): void {
+        this.dependencies.onConversationOwnerChange?.()
         const source = this.activeConversationViewportSource
         for (const listener of [...this.viewportSourceListeners]) {
             try {
@@ -2518,7 +2526,6 @@ export class ActiveWorkingSet {
         | { complete: CompleteSelectedConversationState }
         | { state: WindowedSelectedConversationState; target: SelectedConversationTarget } {
         const current = this.selectedConversationState
-        // A save completes the conversation itself when its edits have to be written whole.
         if (
             current?.kind === 'complete' &&
             current.characterId === state.characterId &&

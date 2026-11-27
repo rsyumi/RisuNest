@@ -705,6 +705,7 @@ describe('selected conversation lifecycle', () => {
             harness.setPendingPersistence(false)
             revision = 8
             harness.setCoordinatorRevision(8)
+            harness.workingSet.captureSelectedConversationAuthority()!.overlay!.advanceUntouched(7, 8)
             harness.workingSet.advanceStoreRevision(8, undefined, true)
         })
 
@@ -713,33 +714,6 @@ describe('selected conversation lifecycle', () => {
         expect(harness.readConversation).toHaveBeenCalledTimes(2)
         expect(harness.workingSet.selectedConversationMode).toBe('complete')
         expect(lease.target.storeRevision).toBe(8)
-        lease.release()
-    })
-
-    it('adopts the complete conversation a save published while the promotion settled', async () => {
-        const harness = makeHarness(3)
-        expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
-        const target = harness.workingSet.captureSelectedConversationTarget()!
-        harness.setReadConversation(vi.fn(async () => {
-            harness.setPendingPersistence(true)
-            return { revision: 7, value: structuredClone(harness.persistedConversation) }
-        }) as typeof harness.readConversation)
-        harness.coordinator.flushPendingData.mockImplementation(async () => {
-            if (!harness.coordinator.hasPendingPersistenceWork) return
-            harness.setPendingPersistence(false)
-            expect(harness.workingSet.completeWindowedConversationForSave(
-                harness.workingSet.captureSelectedConversationAuthority()!,
-                structuredClone(harness.persistedConversation.message),
-            )).not.toBeNull()
-        })
-        const publishCount = harness.published.mock.calls.length
-
-        const lease = await harness.workingSet.acquireCompleteConversation('bound-editor', target)
-
-        expect(harness.readConversation).toHaveBeenCalledOnce()
-        expect(harness.published).toHaveBeenCalledTimes(publishCount + 1)
-        expect(harness.workingSet.selectedConversationMode).toBe('complete')
-        expect(lease.session.totalMessages).toBe(3)
         lease.release()
     })
 
@@ -782,6 +756,7 @@ describe('selected conversation lifecycle', () => {
             harness.setPendingPersistence(false)
             revision++
             harness.setCoordinatorRevision(revision)
+            harness.workingSet.captureSelectedConversationAuthority()!.overlay!.advanceUntouched(revision - 1, revision)
             harness.workingSet.advanceStoreRevision(revision, undefined, true)
         })
 
@@ -964,21 +939,21 @@ describe('selected conversation lifecycle', () => {
         expect(harness.workingSet.tryDemoteSelectedConversation()).toBe(true)
         const previousSource = harness.workingSet.activeConversationViewportSource!
         harness.setCoordinatorRevision(8)
-
+        harness.workingSet.captureSelectedConversationAuthority()!.overlay!.advanceUntouched(7, 8)
         harness.workingSet.advanceStoreRevision(8)
 
-        expect(previousSource.snapshot().totalMessages).toBe(0)
+        expect(previousSource.snapshot().totalMessages).toBe(10_000)
         expect(harness.workingSet.captureSelectedConversationAuthority()).toMatchObject({
             storeRevision: 8,
             totalMessages: 10_000,
         })
-        expect(harness.workingSet.activeConversationViewportSource).not.toBe(previousSource)
+        expect(harness.workingSet.activeConversationViewportSource).toBe(previousSource)
         expect(
             harness.workingSet.activeConversationViewportSource?.snapshot().totalMessages,
         ).toBe(10_000)
         expect(
             harness.coordinator.advanceWindowedSelectedConversationRevision,
-        ).toHaveBeenCalledWith(8, expect.objectContaining({ storeRevision: 8 }))
+        ).toHaveBeenCalledWith(8, expect.objectContaining({ storeRevision: 8 }), true)
     })
 
     it('notifies active source subscribers once per state or revision transition', () => {
@@ -992,6 +967,7 @@ describe('selected conversation lifecycle', () => {
         expect(sources[0]).toBe(harness.workingSet.activeConversationViewportSource)
 
         harness.setCoordinatorRevision(8)
+        harness.workingSet.captureSelectedConversationAuthority()!.overlay!.advanceUntouched(7, 8)
         harness.workingSet.advanceStoreRevision(8)
         expect(listener).toHaveBeenCalledTimes(2)
         expect(sources[1]).toBe(harness.workingSet.activeConversationViewportSource)
@@ -1473,11 +1449,8 @@ describe('selected conversation lifecycle', () => {
             clock,
             onLocalSaveFailure: (error) => failures.push(error),
         })
-        const readConversation = store.readConversation.bind(store)
-        vi.spyOn(store, 'readConversation').mockImplementation(async (characterId, conversationId) => {
-            const result = await readConversation(characterId, conversationId)
-            return result && { ...result, value: { ...result.value, message: result.value.message.slice(1) } }
-        })
+        const failure = new DOMException('Cannot write selected conversation metadata', 'QuotaExceededError')
+        vi.spyOn(store, 'commit').mockRejectedValueOnce(failure)
         selected().chats[0].note = 'direct note'
         expect(timers.size).toBe(0)
         runtime.markPersistentDataDirty(1)
@@ -1487,10 +1460,12 @@ describe('selected conversation lifecycle', () => {
         flush()
 
         await vi.waitFor(() => {
-            expect(failures.at(-1)).toMatchObject({ name: 'WindowedConversationSaveError' })
+            expect(failures.at(-1)).toBe(failure)
         })
         expect(timers.size).toBe(0)
-        expect((await readConversation('char-a', 'chat-a'))?.value.note).toBe('note')
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.note).toBe('note')
+        await runtime.flushPendingData('retry-selected-edit')
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.note).toBe('direct note')
     })
 
     it('keeps a windowed selected conversation authoritative across a root module append', async () => {

@@ -1,3 +1,4 @@
+import { setImmediate } from 'node:timers/promises'
 import { bench, expect, vi } from 'vitest'
 import type { character, customscript } from '../storage/database.svelte'
 import { createStreamingDisplayController } from './streamingDisplayScheduler'
@@ -227,8 +228,9 @@ class ReplayClock {
     }
 }
 
-async function settleScheduler() {
-    for(let index = 0; index < 8; index++) await Promise.resolve()
+function settleScheduler() {
+    // Let all promise continuations register their virtual timers before inspecting the clock.
+    return setImmediate()
 }
 
 function makeCharacter(fixture: FixtureName): character {

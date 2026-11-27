@@ -11,6 +11,7 @@ export class StalePluginStorageError extends Error {
 export interface PluginStorageWriteCheck {
     validate(): void
     committed(writtenKeys?: readonly { owner: string; key: string }[]): void
+    saveFailed?(error: unknown): void
 }
 
 const sequences = new Map<string, number>()

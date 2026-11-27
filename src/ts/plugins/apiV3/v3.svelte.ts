@@ -52,6 +52,7 @@ import {
     assertPersistentMutationAllowed,
     getPersistentStorageAuthorityEpoch,
     acquireCompleteConversation,
+    getPersistentDataRuntime,
     captureSelectedConversationTarget,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
@@ -133,6 +134,7 @@ function getPluginDatabaseAccess(owner: string, storage: PluginOwnerStorage): Pl
         getCompatibilityDatabase: () => DBState.db,
         getSelectedCharacterId: () =>
             getDatabase().characters[get(selectedCharID)]?.chaId ?? null,
+        getLiveRuntime: () => getPersistentDataRuntime(),
         captureSelectedConversationTarget,
         acquireCompleteConversation,
         refreshSelectedConversationAfterReplacement,
@@ -795,13 +797,19 @@ const makeRisuaiAPIV3 = (
         decisions: new Map(),
     }
     // An unload waits for the write calls in flight, so they stop waiting for the answer when it starts.
-    const hasDatabaseWritePermission = () => new Promise<boolean>((resolve, reject) => {
-        const unloaded = () => resolve(false)
-        pluginLifetime.signal.addEventListener('abort', unloaded, { once: true })
-        getPluginPermission(permissionContext, 'dbWrite', 'periodically')
-            .then(resolve, reject)
-            .finally(() => pluginLifetime.signal.removeEventListener('abort', unloaded))
-    })
+    const hasDatabaseWritePermission = async () => {
+        const authority = getPersistentStorageAuthorityEpoch()
+        const granted = await new Promise<boolean>((resolve, reject) => {
+            const unloaded = () => resolve(false)
+            pluginLifetime.signal.addEventListener('abort', unloaded, { once: true })
+            getPluginPermission(permissionContext, 'dbWrite', 'periodically')
+                .then(resolve, reject)
+                .finally(() => pluginLifetime.signal.removeEventListener('abort', unloaded))
+        })
+        if (!granted || pluginLifetime.signal.aborted) return false
+        assertPersistentMutationAllowed(authority)
+        return true
+    }
     const risunest = createRisunestPrivateApi({
         databaseAccess,
         patchAccess: conversationPatchAccess,
@@ -875,10 +883,19 @@ const makeRisuaiAPIV3 = (
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             if (pluginLifetime.signal.aborted) return
-            const provider: (typeof pluginV2.providers extends Map<string, infer V> ? V : never) = async (arg, abortSignal) => {
+            const provider: (typeof pluginV2.providers extends Map<string, infer V> ? V : never) = async (arg, abortSignal, admit) => {
+               const epoch = permissionEpoch
                const allowed = await getPluginPermission(permissionContext, 'provider', 'periodically');
                if(!allowed || pluginLifetime.signal.aborted){
                    return { success: false, content: language.pluginProviderPermissionDenied };
+               }
+               abortSignal?.throwIfAborted()
+               if (admit) {
+                   await admit()
+                   abortSignal.throwIfAborted()
+                   if (pluginLifetime.signal.aborted || epoch !== permissionEpoch) {
+                       return { success: false, content: language.pluginProviderPermissionDenied }
+                   }
                }
                //mode is overridden to v3, due to vulnerabilities using mode.
                //Alternative to mode will be added in future

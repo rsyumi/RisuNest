@@ -112,6 +112,7 @@ async function setup(database = makeDatabase()) {
     const generation = { target: null as GeneratingConversation | null, rerolls: new Set<string>(), windowed: false }
     const commitGate = { current: null as Promise<void> | null }
     const access = createConversationPatchAccess({
+        commitStreamingPatch: async () => { throw new Error('No streaming output in this fixture') },
         flushPendingData: (reason) => runtime.flushPendingDataLocally(reason),
         getPersistentRevision: () => runtime.revision,
         captureSelectedConversationTarget: () => runtime.captureSelectedConversationTarget(),
@@ -271,6 +272,7 @@ describe('risunestPatchConversation', () => {
             { role: 'user', data: 'unnamed' },
             { role: 'char', data: 'b', chatId: 'b' },
             { role: 'char', data: 'z', chatId: 'z' },
+            { role: 'user', data: 'empty ID', chatId: '' },
         ]
         const harness = await setup(database)
         await deleteFirstMessage(harness, target)
@@ -283,6 +285,10 @@ describe('risunestPatchConversation', () => {
         ] })).resolves.toMatchObject({ status: 'applied' })
         await expect(harness.patch({ ...target, mutationId: 'unnamed', messages: [{ index: 2, messageId: null, set: { __x: 'unnamed' } }] }))
             .resolves.toMatchObject({ status: 'applied' })
+        await expect(harness.patch({ ...target, mutationId: 'empty-id', messages: [{ index: 5, messageId: null, set: { __x: 'empty' } }] }))
+            .resolves.toMatchObject({ status: 'applied' })
+        await expect(harness.patch({ ...target, mutationId: 'misplaced-empty-id', messages: [{ index: 4, messageId: '', set: { data: 'wrong' } }] }))
+            .resolves.toMatchObject({ status: 'conflict', conflict: { target: 'message', index: 4 } })
         for (const entry of [{ index: 2, messageId: 'dup' }, { index: 3, messageId: null }]) {
             await expect(harness.patch({ ...target, mutationId: `not-found-${entry.index}`, messages: [{ ...entry, set: { __x: 1 } }] }))
                 .resolves.toMatchObject({ status: 'conflict', conflict: { target: 'message', reason: 'not-found', index: entry.index } })
@@ -293,7 +299,7 @@ describe('risunestPatchConversation', () => {
         ] })).resolves.toMatchObject({ status: 'applied' })
 
         const stored = (await harness.stored(target)).message as unknown as Array<Record<string, unknown>>
-        expect(stored.map((message) => message.__x)).toEqual([undefined, 'dup', 'unnamed', 'b', 'second'])
+        expect(stored.map((message) => message.__x)).toEqual([undefined, 'dup', 'unnamed', 'b', 'second', 'empty'])
         expect(stored[4]).toMatchObject({ __y: 1 })
     })
 

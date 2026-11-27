@@ -1,3 +1,4 @@
+import { getGenerationOutputPhase, recheckGenerationOutputOwners } from '../process/generationOutputPhase'
 import { advancePluginStorageRemoteChanges, fenceUnknownPluginStorageDrain } from '../plugins/pluginStorageProtection'
 import type { PluginStorageWriteCheck } from '../plugins/pluginStorageProtection'
 import { canonicalJson, canonicalClone } from './saveCoordinatorHelpers'
@@ -36,7 +37,6 @@ import { readCurrentRevision, RevisionConflictError } from './persistentDataStor
 import {
     SaveCoordinator,
     PersistentMutationFencedError,
-    unitKeysReachConversationMessages,
     type CharacterAdditionRequest,
     type OfficialRevisionPublisher,
     type PersistentPresetMutation,
@@ -54,6 +54,7 @@ import {
     type PersistentReplacementOptions,
     type PersistentScopedReplacementOptions,
     type PreparedUnitIntent,
+    type PreparedUnitPublicationLifecycle,
     type SaveCoordinatorClock,
     type SaveCoordinatorDependencies,
     type WindowedConversationPersistenceAuthority,
@@ -87,11 +88,13 @@ import {
 import {
     createConversationSummaryStubFromChat,
     isConversationSummaryStub,
+    reconcileConversationSummaries,
 } from './conversationResidency'
 import { createMetadataOnlySelectedConversation, isMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 
 type CompleteCharacter = character
 type RootDatabase = PersistentRoot
+type UnitProjectionBaseline = Omit<ReturnType<typeof captureLwwWorkingSetBaseline>, 'characters'>
 
 export type CommittedApplyOutcome = Readonly<{
     kind: 'committed'
@@ -378,6 +381,8 @@ export interface PersistentUnitIntentProjectionObserver {
 }
 
 export interface PersistentDataRuntime {
+    adoptObservedRevision(revision: DataRevision): Promise<void>
+    withLiveConversationWrite<T>(reason: string, operation: () => Promise<T>, saveFailed?: (error: unknown) => void): Promise<T>
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
     beginActivatedLibraryGuard(token: PersistentMutationToken): PersistentActivatedLibraryGuard
     setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
@@ -386,7 +391,7 @@ export interface PersistentDataRuntime {
     drainLwwDeferred(expectedAuthorityEpoch?: number): Promise<void>
     commitPersistentUnitIntent(reason: string, mutations: readonly PersistentUnitMutation[], conversations?: readonly ConversationMutation[], wholeMessages?: readonly WholeMessageIntent[], projectionObserver?: PersistentUnitIntentProjectionObserver, check?: PluginStorageWriteCheck): Promise<void>
     /** Prepares at the revision the commit expects, through a reader pinned there; `null` commits nothing. */
-    commitPreparedUnitIntent(reason: string, prepare: (reader: PersistentRevisionReader) => Promise<PreparedUnitIntent | null>): Promise<DataRevision | null>
+    commitPreparedUnitIntent(reason: string, prepare: (reader: PersistentRevisionReader) => Promise<PreparedUnitIntent | null>, applyToLive?: (revision: DataRevision) => Promise<void>, lifecycle?: PreparedUnitPublicationLifecycle): Promise<DataRevision | null>
 
     readonly store: PersistentDataStore
     readonly revision: DataRevision
@@ -433,6 +438,7 @@ export interface PersistentDataRuntime {
     acquireCompleteConversation(
         reason: string,
         target?: SelectedConversationTarget | null,
+        assertPublicationAllowed?: () => void,
     ): Promise<CompleteConversationLease>
     captureWindowedConversationMutationController(
         target: SelectedConversationTarget,
@@ -635,6 +641,11 @@ export function createPersistentDataRuntime(
         }
     }
     const coordinator = new SaveCoordinator({
+        getCompleteGenerationOwner: () => {
+            const session = workingSet.activeConversationSession
+            const phase = session && getGenerationOutputPhase(session)
+            return session && phase ? { session, phase } : null
+        },
         onRoutineUnitsCommitted: dependencies.state.captureWorkingSetDatabase ? async (revision, affectedKeys) => {
             await projectAppliedUnits({revision, affectedKeys: [...affectedKeys], heldKeys: [], deferredKeys: []}, undefined, true)
         } : undefined,
@@ -701,10 +712,26 @@ export function createPersistentDataRuntime(
             dependencies.onLocalRevision?.(revision)
         }),
         onStorageOnlyRevision: (revision, storedTotalMessages) => workingSet.advanceStoreRevision(revision, undefined, false, storedTotalMessages),
-        onWindowedSelectedConversationRevision: (revision, totalMessages, preserveRows, storedTotalMessages) =>
-            workingSet.advanceStoreRevision(revision, totalMessages, preserveRows, storedTotalMessages),
-        completeWindowedSelectedConversation: (authority, messages) =>
-            workingSet.completeWindowedConversationForSave(authority, messages),
+        onWindowedSelectedConversationRevision: (revision, totalMessages, preserveRows, storedTotalMessages, rewritten) =>
+            workingSet.advanceStoreRevision(revision, totalMessages, preserveRows, storedTotalMessages, rewritten),
+        onSelectedConversationRemoved: (characterId, conversationId, remaining) => {
+            const database = dependencies.state.captureWorkingSetDatabase?.()
+            const character = dependencies.state.captureCharacter(characterId)
+            const pinned = { characterId, conversationId }
+            if (!remaining && database) {
+                database.characters = database.characters.filter((owner) => owner.chaId !== characterId)
+            } else if (character && remaining) {
+                character.chats = reconcileConversationSummaries(character.chats, remaining)
+            }
+            if (database) {
+                openReconciledConversation(reconcileAppliedSelection(database, pinned))
+            } else {
+                workingSet.invalidateNavigation()
+                const next = remaining?.[0]?.id ?? null
+                dependencies.state.restoreSelection?.(remaining ? characterId : null, next)
+                openReconciledConversation(next)
+            }
+        },
         onConversationMutationPersistenceStarted: (event) =>
             workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {
@@ -720,9 +747,11 @@ export function createPersistentDataRuntime(
         onLocalSaveFailure: dependencies.onLocalSaveFailure,
         onWorkingSetRefreshRequired: (revision) => {
             if (revision === null) pendingRefreshChangeSet = null
+            else recheckGenerationOutputOwners()
             dependencies.onWorkingSetRefreshRequired?.(revision)
         },
         onDestructiveReplacementFenceChanged: (active) => {
+            if (active) recheckGenerationOutputOwners()
             // A projection can request demotion while its input guard still blocks it.
             // Retry only after the final release, preserving all ordinary demotion checks.
             if (!active) {
@@ -761,6 +790,7 @@ export function createPersistentDataRuntime(
         isConversationOperationActive: dependencies.state.isConversationOperationActive,
         subscribeConversationOperationActive:
             dependencies.state.subscribeConversationOperationActive,
+        onConversationOwnerChange: recheckGenerationOutputOwners,
         conversationViewportRowBudget: dependencies.state.conversationViewportRowBudget,
     })
     const activateCharacter = (
@@ -1041,8 +1071,13 @@ export function createPersistentDataRuntime(
             }
         })()
     }
+    let deferredConversationOpen: (() => void) | null = null
     dependencies.state.subscribeConversationOperationActive?.((active) => {
-        if (!active) retryDeferredContent()
+        if (active) return
+        retryDeferredContent()
+        const open = deferredConversationOpen
+        deferredConversationOpen = null
+        open?.()
     })
     const withCompleteCharacter = async <T>(characterId: string, operation: () => Promise<T>): Promise<T> => {
         const target = workingSet.captureSelectedConversationTarget()
@@ -1080,16 +1115,65 @@ export function createPersistentDataRuntime(
         coordinator.releaseRemovedSelectedConversation(false)
         return character.chats[0]?.id ?? null
     }
-    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: ReturnType<typeof captureLwwWorkingSetBaseline>, localIntent = false, preserveWindowMetadata = false, projectionObserver?: PersistentUnitIntentProjectionObserver): Promise<void> => {
-        if (!localIntent && result.affectedKeys.length === 0) {
-            // Nothing reached the library, so the working set and its mirrors stay untouched.
-            coordinator.adoptAppliedUnitState(result.revision, null, null, [], [], undefined, true)
+    const openReconciledConversation = (id: string | null) => {
+        if (!id) return
+        const generation = workingSet.navigationGenerationToken
+        const epoch = coordinator.storageAuthorityEpoch
+        const open = () => {
+            // Activation flushes first. Yield past this save queue operation, and wait out the
+            // generation's navigation gate if the removed conversation was still streaming.
+            void Promise.resolve().then(() => {
+                if (workingSet.navigationGenerationToken !== generation || coordinator.storageAuthorityEpoch !== epoch) return
+                if (dependencies.state.canActivateWorkingSet?.() === false && dependencies.state.isConversationOperationActive?.() &&
+                    dependencies.state.subscribeConversationOperationActive) {
+                    deferredConversationOpen = open
+                    return
+                }
+                return workingSet.activateConversation(id)
+            }).catch((error) => dependencies.onBackgroundError?.(error))
+        }
+        open()
+    }
+    const projectAppliedUnits = async (result: LwwApplyResult, baseline?: UnitProjectionBaseline, localIntent = false, projectionObserver?: PersistentUnitIntentProjectionObserver): Promise<void> => {
+        const windowed = workingSet.selectedConversationMode === 'windowed'
+        const observedRevision = Math.max(result.revision, coordinator.revision)
+        if (!localIntent && result.affectedKeys.length === 0 && (!windowed || observedRevision === coordinator.revision)) {
+            coordinator.adoptAppliedUnitState(observedRevision, null, null, [])
             await commitContentCursor(result.revision)
             return
         }
         const database = dependencies.state.captureWorkingSetDatabase?.()
-        if (!database) { coordinator.adoptAppliedUnitState(result.revision, null, null, []); return }
-        baseline ??= captureLwwWorkingSetBaseline(database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline())
+        if (!database && !windowed) { coordinator.adoptAppliedUnitState(observedRevision, null, null, []); return }
+        let revision = observedRevision
+        let lease: PersistentRevisionLease
+        for (;;) {
+            try {
+                lease = await dependencies.store.acquireRevision(revision)
+                break
+            } catch (error) {
+                if (!windowed || !(error instanceof RevisionConflictError) || error.actualRevision <= revision) throw error
+                revision = error.actualRevision
+            }
+        }
+        let reopen: string | null = null
+        try {
+            if (windowed) await coordinator.prepareWindowedRevision(revision, lease)
+            if (!database || result.affectedKeys.length === 0) {
+                coordinator.adoptAppliedUnitState(revision, null, null, [])
+            } else {
+                reopen = await projectPinnedUnits(database, lease, result, baseline, localIntent, projectionObserver)
+            }
+        } finally { await releasePersistentRevisionLease(lease) }
+        // Only the reported keys were projected, even if we had to read them at a newer head.
+        await commitContentCursor(result.revision)
+        openReconciledConversation(reopen)
+    }
+    const projectPinnedUnits = async (database: Database, lease: PersistentRevisionLease, result: LwwApplyResult, baseline: UnitProjectionBaseline | undefined, localIntent: boolean, projectionObserver?: PersistentUnitIntentProjectionObserver): Promise<string | null> => {
+        // The pinned handoff can retire an owner or change its metadata before the received units are applied.
+        const characters = coordinator.captureMaterializedBaseline()
+        const projectionBaseline = baseline ? { ...baseline, characters } : captureLwwWorkingSetBaseline(
+            database, coordinator.capturePersistentBaselineRoot(), dependencies.state.capturePresets?.() ?? null, characters, coordinator.capturePresetRecordBaseline(),
+        )
         const selectedTarget = workingSet.captureSelectedConversationTarget()
         const selectedSession = workingSet.activeConversationSession
         // Remote values are patched into the live conversation in place; the
@@ -1106,14 +1190,12 @@ export function createPersistentDataRuntime(
         const refreshSelectedSession = () => {
             if (selectedFields && [...selectedFields].some(([field, value]) => (selectedChat as unknown as Record<string, unknown>)[field] !== value) &&
                 selectedSession!.matchesConversation(selectedTarget!.characterId, selectedChat!) &&
-                !selectedSession!.adoptPersistedMetadata(selectedChat!, result.revision)) {
+                !selectedSession!.adoptPersistedMetadata(selectedChat!, lease.revision)) {
                 const index = selectedOwner!.chats.indexOf(selectedChat!)
                 if (index >= 0) selectedOwner!.chats[index] = { ...selectedChat! }
             }
             if (selectedTarget && selectedSession) workingSet.refreshSelectedConversationAfterReplacement(selectedTarget, selectedSession)
         }
-        const lease = await dependencies.store.acquireRevision(result.revision)
-        const projectionBaseline = baseline
         const rootFields = [...new Set(result.affectedKeys.flatMap((key) => {
             const [kind, field] = JSON.parse(key) as string[]
             return kind === 'root' ? [field] : []
@@ -1137,75 +1219,49 @@ export function createPersistentDataRuntime(
         })
         let pinnedSelection: { characterId: string | null; conversationId: string | null } | null = null
         let reopenConversation: string | null = null
-        let applied: ReturnType<typeof captureLwwWorkingSetBaseline>
-        let adoptWindowedMetadata = () => {}
-        let windowedConversation: { characterId: string; conversationId: string; totalMessages: number } | undefined
-        try {
-            if (preserveWindowMetadata && selectedTarget && result.affectedKeys.some((key) => {
-                const [kind, characterId, conversationId] = JSON.parse(key) as string[]
-                return kind === 'messages' && characterId === selectedTarget.characterId && conversationId === selectedTarget.conversationId
-            })) adoptWindowedMetadata = await workingSet.prepareWindowedMetadataAdoption(lease)
-            applied = await applyLwwWorkingSetUnits(database, projectionBaseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent, () => {
-                coordinator.assertPersistentMutationAllowed(authorityEpoch)
-                if (dependencies.state.captureWorkingSetDatabase?.() !== database) throw new Error('Persistent working set changed during unit projection')
-                dependencies.state.beforeCapture?.()
-                rootBefore = rootFields.map(rootValue)
-                if (receivedPlugins.length) pluginsBefore = pluginLoadInputs()
-                if (reselect) pinnedSelection = {
-                    characterId: dependencies.state.getSelectedCharacterId() ?? null,
-                    conversationId: dependencies.state.getSelectedConversationId?.() ?? null,
-                }
-                projectionObserver?.beforeProjection()
-            }, () => {
-                // Corrected in the same turn as the projection, before any view reads the indexes.
-                if (pinnedSelection) reopenConversation = reconcileAppliedSelection(database, pinnedSelection)
-                pluginsChanged = receivedPlugins.length > 0 && pluginLoadInputs() !== pluginsBefore
-                const canonicalCapture = dependencies.state.canonicalCapture
-                const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
-                if (rootFields.length > 0) dependencies.state.fillRootFieldDefaults?.(rootFields)
-                dependencies.state.afterRemoteApply?.()
-                const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
-                const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
-                    ? canonicalCapture.diffRoot(beforeDerive, afterDerive)
-                    : diffRootMutations(JSON.parse(beforeDerive), JSON.parse(afterDerive))
-                for (const mutation of derivedMutations) {
-                    const root = projectionBaseline.root as unknown as Record<string, unknown>
-                    if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
-                    else delete root[mutation.key]
-                }
-                if (projectionObserver) {
-                    // Capture ownership in the publication turn, before lease release or cursor I/O can yield.
-                    refreshSelectedSession()
-                    const session = workingSet.activeConversationSession
-                    projectionObserver.afterProjection({
-                        revision: result.revision,
-                        authorityEpoch,
-                        target: workingSet.captureSelectedConversationTarget(),
-                        session,
-                        sessionVersion: session?.version ?? null,
-                        generationInvalidationVersion: session?.generationInvalidationVersion ?? null,
-                    })
-                }
-            })
-            // A windowed shell holds no messages to patch; its row source needs the received count instead.
-            if (selectedTarget && workingSet.selectedConversationMode === 'windowed' && result.affectedKeys.some((key) => {
-                const [kind, characterId, conversationId] = JSON.parse(key) as string[]
-                return kind === 'messages' && characterId === selectedTarget.characterId && conversationId === selectedTarget.conversationId
-            })) {
-                const stored = await lease.readConversationMetadata(selectedTarget.characterId, selectedTarget.conversationId)
-                if (stored) windowedConversation = { characterId: selectedTarget.characterId, conversationId: selectedTarget.conversationId, totalMessages: stored.value.totalMessages }
+        const applied = await applyLwwWorkingSetUnits(database, projectionBaseline, lease, result.affectedKeys, dependencies.state.captureCharacterIndex?.(), localIntent, () => {
+            coordinator.assertPersistentMutationAllowed(authorityEpoch)
+            if (dependencies.state.captureWorkingSetDatabase?.() !== database) throw new Error('Persistent working set changed during unit projection')
+            dependencies.state.beforeCapture?.()
+            rootBefore = rootFields.map(rootValue)
+            if (receivedPlugins.length) pluginsBefore = pluginLoadInputs()
+            if (reselect) pinnedSelection = {
+                characterId: dependencies.state.getSelectedCharacterId() ?? null,
+                conversationId: dependencies.state.getSelectedConversationId?.() ?? null,
             }
-        } finally { await releasePersistentRevisionLease(lease) }
-        const preserveSelectedRows = Boolean(selectedTarget) && result.affectedKeys.every((key) => {
-            const [kind, owner, id] = JSON.parse(key) as string[]
-            if (kind === 'root' || kind === 'preset' || kind === 'preset-protected' || kind === 'record' || kind === 'toggle' || kind === 'variable') return false
-            if (kind === 'character' || kind === 'conversation' || kind === 'messages') return owner !== selectedTarget!.characterId
-            if (kind === 'order') return owner === 'conversations' && id !== selectedTarget!.characterId
-            return kind === 'exists' && owner === 'character' && id !== selectedTarget!.characterId
+            projectionObserver?.beforeProjection()
+        }, () => {
+            // Corrected in the same turn as the projection, before any view reads the indexes.
+            if (pinnedSelection) reopenConversation = reconcileAppliedSelection(database, pinnedSelection)
+            pluginsChanged = receivedPlugins.length > 0 && pluginLoadInputs() !== pluginsBefore
+            const canonicalCapture = dependencies.state.canonicalCapture
+            const beforeDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+            if (rootFields.length > 0) dependencies.state.fillRootFieldDefaults?.(rootFields)
+            dependencies.state.afterRemoteApply?.()
+            const afterDerive = canonicalCapture?.root() ?? canonicalJson(dependencies.state.captureRoot())
+            const derivedMutations = beforeDerive === afterDerive ? [] : canonicalCapture
+                ? canonicalCapture.diffRoot(beforeDerive, afterDerive)
+                : diffRootMutations(JSON.parse(beforeDerive), JSON.parse(afterDerive))
+            for (const mutation of derivedMutations) {
+                const root = projectionBaseline.root as unknown as Record<string, unknown>
+                if (mutation.type === 'set') root[mutation.key] = canonicalClone(mutation.value)
+                else delete root[mutation.key]
+            }
+            if (projectionObserver) {
+                // Capture ownership in the publication turn, before lease release or cursor I/O can yield.
+                refreshSelectedSession()
+                const session = workingSet.activeConversationSession
+                projectionObserver.afterProjection({
+                    revision: lease.revision,
+                    authorityEpoch,
+                    target: workingSet.captureSelectedConversationTarget(),
+                    session,
+                    sessionVersion: session?.version ?? null,
+                    generationInvalidationVersion: session?.generationInvalidationVersion ?? null,
+                })
+            }
         })
-        coordinator.adoptAppliedUnitState(result.revision, applied.root, applied.presets, applied.characters, applied.presetRecords, windowedConversation, preserveSelectedRows,
-            Boolean(selectedTarget) && !unitKeysReachConversationMessages(result.affectedKeys, selectedTarget!.characterId, selectedTarget!.conversationId))
-        adoptWindowedMetadata()
+        coordinator.adoptAppliedUnitState(lease.revision, applied.root, applied.presets, applied.characters, applied.presetRecords)
         const changedRootFields = new Set(rootFields.filter((field, index) => rootValue(field) !== rootBefore[index]))
         if (changedRootFields.size > 0) {
             try { dependencies.state.afterRemoteRootChange?.(changedRootFields) }
@@ -1224,11 +1280,7 @@ export function createPersistentDataRuntime(
                 dependencies.state.onPluginStorageChanged?.(name, '')
             }
         }
-        await commitContentCursor(result.revision)
-        // Activation flushes first, so it waits for the operation that applied these units.
-        const reopened = reopenConversation
-        if (reopened) void Promise.resolve().then(() => workingSet.activateConversation(reopened))
-            .catch((error) => dependencies.onBackgroundError?.(error))
+        return reopenConversation
     }
     const fenceReceivedPluginStorage = (keys: readonly string[]) => {
         for (const unit of keys) {
@@ -1238,6 +1290,17 @@ export function createPersistentDataRuntime(
         }
         advancePluginStorageRemoteChanges(keys)
     }
+    const captureReceiveBaseline = (database: Database): UnitProjectionBaseline =>
+        captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, [], coordinator.capturePresetRecordBaseline())
+    const projectReceivedUnits = async (result: LwwApplyResult, baseline?: UnitProjectionBaseline) => {
+        const windowed = workingSet.selectedConversationMode === 'windowed'
+        try {
+            await coordinator.projectCommittedUnits(result.revision, () => projectAppliedUnits(result, baseline))
+        } catch (error) {
+            if (!windowed) coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error)
+            throw error
+        }
+    }
     const drainLwwDeferred = async (authorityEpoch = coordinator.storageAuthorityEpoch): Promise<void> => {
         coordinator.assertPersistentMutationAllowed(authorityEpoch)
         if (!dependencies.store.lwwBindingState || !dependencies.store.lwwDrainDeferred) return
@@ -1246,7 +1309,7 @@ export function createPersistentDataRuntime(
             const binding = await dependencies.store.lwwBindingState!()
             coordinator.assertPersistentMutationAllowed(authorityEpoch)
             const database = dependencies.state.captureWorkingSetDatabase?.()
-            const baseline = database ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
+            const baseline = database ? captureReceiveBaseline(database) : undefined
             let result: LwwApplyResult
             try {
                 result = await dependencies.store.lwwDrainDeferred!({ bindingAuthority: binding.targetAuthority, requestId: crypto.randomUUID(), generating: generating() })
@@ -1255,18 +1318,15 @@ export function createPersistentDataRuntime(
                 throw error
             }
             fenceReceivedPluginStorage(result.pluginStorageChangedKeys ?? result.affectedKeys)
-            try {
-                coordinator.assertPersistentMutationAllowed(authorityEpoch)
-                await projectAppliedUnits(result, baseline)
-                coordinator.assertPersistentMutationAllowed(authorityEpoch)
-            } catch (error) {
-                coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error)
-                throw error
-            }
+            coordinator.assertPersistentMutationAllowed(authorityEpoch)
+            await projectReceivedUnits(result, baseline)
+            coordinator.assertPersistentMutationAllowed(authorityEpoch)
         })
     }
     const runtime: PersistentDataRuntime = {
         store: dependencies.store,
+        adoptObservedRevision: (revision) => coordinator.adoptObservedRevision(revision),
+        withLiveConversationWrite: (reason, operation, saveFailed) => coordinator.withLiveConversationWrite(reason, operation, saveFailed),
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
         setActivatedLibraryRecoveryLifecycle(token, lifecycle) {
             const guard = activatedLibraryGuard
@@ -1322,7 +1382,7 @@ export function createPersistentDataRuntime(
                 if (!store.lwwStageReceive || !store.lwwApplyReceive || !store.lwwFinishReceive) throw new Error('LWW receive is unavailable')
                 const database = dependencies.state.captureWorkingSetDatabase?.()
                 // An empty pull leaves the library alone; any key it still reports is projected against a lazy baseline.
-                const baseline = database && staged.changes.length > 0 ? captureLwwWorkingSetBaseline(database, dependencies.state.captureRoot(), dependencies.state.capturePresets?.() ?? null, coordinator.captureMaterializedBaseline(), coordinator.capturePresetRecordBaseline()) : undefined
+                const baseline = database && staged.changes.length > 0 ? captureReceiveBaseline(database) : undefined
                 await store.lwwStageReceive(staged)
                 const header = { bindingAuthority: staged.bindingAuthority, requestId: staged.requestId }
                 let result: LwwApplyResult
@@ -1332,8 +1392,7 @@ export function createPersistentDataRuntime(
                     throw error
                 }
                 fenceReceivedPluginStorage(result.pluginStorageChangedKeys ?? result.affectedKeys)
-                try { await projectAppliedUnits(result, baseline) }
-                catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(result.revision, error); throw error }
+                try { await projectReceivedUnits(result, baseline) }
                 finally { await store.lwwFinishReceive(header) }
                 return result
             })
@@ -1347,11 +1406,15 @@ export function createPersistentDataRuntime(
             const affectedKeys = unitIntentAffectedKeys(translated, conversations ?? [])
             for (const value of wholeMessages ?? []) affectedKeys.push(JSON.stringify(['messages', value.characterId, value.conversationId]))
             await coordinator.commitPersistentUnitIntent(reason, translated, conversations, wholeMessages, async (revision) => {
-                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true, false, projectionObserver) }
-                catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
+                const windowed = workingSet.selectedConversationMode === 'windowed'
+                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true, projectionObserver) }
+                catch (error) {
+                    if (!windowed) coordinator.markCommittedWorkingSetRefreshRequired(revision, error)
+                    throw error
+                }
             }, check)
         },
-        async commitPreparedUnitIntent(reason, prepare) {
+        async commitPreparedUnitIntent(reason, prepare, applyToLive, lifecycle) {
             dependencies.state.beforeCapture?.()
             let affectedKeys: string[] = []
             return coordinator.commitPreparedUnitIntent(reason, async (revision) => {
@@ -1364,9 +1427,15 @@ export function createPersistentDataRuntime(
                 affectedKeys = unitIntentAffectedKeys(translated, prepared.conversations)
                 return { unitMutations: translated, conversations: prepared.conversations }
             }, async (revision) => {
-                try { await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true, true) }
-                catch (error) { coordinator.markCommittedWorkingSetRefreshRequired(revision, error); throw error }
-            })
+                const windowed = workingSet.selectedConversationMode === 'windowed'
+                try {
+                    if (applyToLive) await applyToLive(revision)
+                    else await projectAppliedUnits({ revision, affectedKeys, heldKeys: [], deferredKeys: [] }, undefined, true)
+                } catch (error) {
+                    if (!windowed) coordinator.markCommittedWorkingSetRefreshRequired(revision, error)
+                    throw error
+                }
+            }, Boolean(applyToLive), lifecycle)
         },
         get revision() {
             return coordinator.revision
@@ -1471,8 +1540,8 @@ export function createPersistentDataRuntime(
             workingSet.captureSelectedConversationAuthority(),
         recordSelectedCharacterLastInteraction: (authority, before, after) =>
             coordinator.recordSelectedCharacterLastInteraction(authority, before, after),
-        acquireCompleteConversation: (reason, target) =>
-            workingSet.acquireCompleteConversation(reason, target ?? undefined),
+        acquireCompleteConversation: (reason, target, assertPublicationAllowed) =>
+            workingSet.acquireCompleteConversation(reason, target ?? undefined, assertPublicationAllowed),
         captureWindowedMessageMutation: (target, absoluteIndex, evidence) => workingSet.captureWindowedMessageMutation(target, absoluteIndex, evidence),
         captureWindowedConversationMutationController: (target, chat, absoluteStartIndex) =>
             workingSet.captureWindowedConversationMutationController(

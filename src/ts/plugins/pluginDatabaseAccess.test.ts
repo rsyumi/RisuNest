@@ -28,6 +28,9 @@ import {
     PluginIdentityReplacementRejectedError,
 } from './pluginDatabaseAccess'
 import { createPinnedConversationPositionResolver } from './pinnedConversationPosition'
+import { PersistentConversationViewportSource } from '../conversationViewportSource'
+import { WindowedConversationOverlay } from '../storage/windowedConversationOverlay'
+import { createMetadataOnlySelectedConversation } from '../storage/selectedConversationLifecycle'
 
 vi.mock('../storage/persistentDataStoreFactory', () => ({
     getPersistentDataStore: vi.fn(),
@@ -657,6 +660,37 @@ describe('plugin database access', () => {
             .toThrow('Persistent mutation fenced')
         expect(harness.applyCompatibilityDatabaseLite).not.toHaveBeenCalled()
         expect(harness.mutatePluginStorage).not.toHaveBeenCalled()
+    })
+
+    it('projects a middle-window reply with dirty earlier rows and its stored suffix', async () => {
+        const harness = createHarness()
+        const durable = makeCharacter('active')
+        const chat = durable.chats[0]
+        chat.message = ['first', 'output', 'last'].map(chatId => ({ role: 'char', data: chatId, chatId }))
+        harness.pinnedDatabases.push(makeFullObjectDatabase([durable]))
+        vi.mocked(getPersistentDataStore).mockReturnValue(harness.store)
+        const overlay = new WindowedConversationOverlay(durable.chaId, chat.id, 4, 3)
+        const first = { ...chat.message[0], data: 'edited' }
+        overlay.applyRange(0, [chat.message[0]], [first], 1)
+        const source = new PersistentConversationViewportSource({
+            overlay, reader: harness.store, characterId: durable.chaId, conversationId: chat.id,
+            revision: 4, totalMessages: 3, rowBudget: 1,
+        })
+        try {
+            const project = createProductionPluginChatOutputProjector(structuredClone, () => ({
+                chat: createMetadataOnlySelectedConversation(chat), source, messageIndex: 1,
+                adoptRevision: async () => { throw new Error('unexpected revision') },
+            }))
+            const event = await project({
+                characterId: durable.chaId, conversationId: chat.id, liveCharacter: durable,
+                liveConversation: { ...chat, message: [chat.message[1]] }, windowStart: 1, history: 'full',
+            })
+            expect(event.messageIndex).toBe(1)
+            expect(event.chat.message).toEqual([first, ...chat.message.slice(1)])
+            expect(event.char.chats[0].message).toEqual(event.chat.message)
+        } finally {
+            source.dispose()
+        }
     })
 
     it('projector overlays durable, dirty resident, and exact live output without flushing', async () => {

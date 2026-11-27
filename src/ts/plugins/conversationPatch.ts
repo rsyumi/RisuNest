@@ -116,7 +116,7 @@ function normalizeMessage(input: unknown, position: number): ConversationPatchMe
     if (input.messageId !== null && typeof input.messageId !== 'string') {
         throw new TypeError(`${path}.messageId must be a string or null`)
     }
-    const messageId = input.messageId as string | null
+    const messageId = (input.messageId as string | null) || null
     if (!isPlainObject(input.set)) throw new TypeError(`${path}.set must be an object`)
     const set: Record<string, unknown> = {}
     for (const [field, value] of Object.entries(input.set)) {
@@ -224,7 +224,7 @@ interface ConversationPatchSource {
 }
 
 function holdsMessage(entry: ConversationPatchMessage, source: ConversationPatchSource): boolean {
-    return entry.index < source.totalMessages && (source.message(entry.index).chatId ?? null) === entry.messageId
+    return entry.index < source.totalMessages && (source.message(entry.index).chatId || null) === entry.messageId
 }
 
 /** The message at `index` when it has the ID, else the only message with the ID; a null ID matches only at `index`. */
@@ -281,7 +281,7 @@ function planScriptstate(request: ConversationPatchRequest, current: Record<stri
     return jsonEqual(next, current ?? {}) ? null : next
 }
 
-function plan(request: ConversationPatchRequest, source: ConversationPatchSource): ConversationPatchPlan {
+export function planConversationPatch(request: ConversationPatchRequest, source: ConversationPatchSource): ConversationPatchPlan {
     const targets: PatchTarget[] = []
     for (const entry of request.messages) {
         const index = locateMessage(entry, source)
@@ -297,8 +297,12 @@ export function planLiveConversationPatch(
     messages: readonly Message[],
     scriptstate: Record<string, unknown> | undefined,
 ): ConversationPatchPlan {
+    return planConversationPatch(request, livePatchSource(request, messages, scriptstate))
+}
+
+export function livePatchSource(request: ConversationPatchRequest, messages: readonly Message[], scriptstate?: Record<string, unknown>): ConversationPatchSource {
     let unique: Map<string, number | undefined> | undefined
-    return plan(request, {
+    return {
         totalMessages: messages.length,
         message: (index) => messages[index],
         uniqueMessageIndex(messageId) {
@@ -314,7 +318,7 @@ export function planLiveConversationPatch(
             return unique.get(messageId)
         },
         scriptstate,
-    })
+    }
 }
 
 /** Plans a patch at the reader's pinned revision, reading only the addressed responses. */
@@ -326,14 +330,24 @@ export async function planStoredConversationPatch(
     const metadata = await reader.readConversationMetadata(characterId, conversationId)
     if (!metadata) return { kind: 'conflict', conflict: { target: 'conversation', reason: 'not-found' } }
     assertPinnedRevision(reader.revision, metadata.revision, 'Patch conversation')
-    const totalMessages = metadata.value.totalMessages
+    const source = await loadPatchMessages(reader, request, metadata.value.totalMessages)
+    return planConversationPatch(request, { ...source, scriptstate: metadata.value.conversation.scriptstate })
+}
+
+/** Load only the addressed turns and ID lookups from one immutable projection. */
+export async function loadPatchMessages(
+    reader: Pick<PersistentRevisionReader, 'revision' | 'readConversationWindow'>,
+    request: ConversationPatchRequest,
+    totalMessages: number,
+) {
+    const { characterId, conversationId } = request
     const loaded = new Map<number, Message>()
     const unique = new Map<string, number | undefined>()
     const source: ConversationPatchSource = {
         totalMessages,
         message: (index) => loaded.get(index)!,
         uniqueMessageIndex: (messageId) => unique.get(messageId),
-        scriptstate: metadata.value.conversation.scriptstate as Record<string, unknown> | undefined,
+        scriptstate: undefined,
     }
     const load = async (startIndex: number) => {
         const window = await reader.readConversationWindow({ characterId, conversationId, startIndex, limit: SPAN_READ_LIMIT })
@@ -362,7 +376,27 @@ export async function planStoredConversationPatch(
             if (index > target && isTurnStart(loaded.get(index)!)) break
         }
     }
-    return plan(request, source)
+    return {
+        ...source,
+        // An indexed lookup and its response-variant span refer to positions at this
+        // revision. Reuse them only if the live owner still addresses the same rows.
+        matchesLive(live: ConversationPatchSource, replyIndex: number, replyId: string | undefined) {
+            if (source.totalMessages !== live.totalMessages) return false
+            for (const [index, row] of loaded) {
+                const effective = live.message(index)
+                if (!effective) return false
+                if (index === replyIndex && replyId && effective.chatId === replyId && row.chatId === replyId) {
+                    if (isTurnStart(effective) !== isTurnStart(row)) return false
+                } else if (!jsonEqual(row, effective)) return false
+            }
+            for (const entry of request.messages) {
+                const index = locateMessage(entry, source)
+                if (index !== locateMessage(entry, live)) return false
+                if (index === undefined) break
+            }
+            return true
+        },
+    }
 }
 
 /** The store writes for a planned patch: one count-preserving range per run and the `scriptstate` unit. */

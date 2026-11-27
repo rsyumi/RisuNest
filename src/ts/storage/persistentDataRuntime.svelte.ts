@@ -583,8 +583,9 @@ export const recordSelectedCharacterLastInteraction = (
 export const acquireCompleteConversation = (
     reason: string,
     target?: SelectedConversationTarget | null,
+    assertPublicationAllowed?: () => void,
 ): Promise<CompleteConversationLease> =>
-    getPersistentDataRuntime().acquireCompleteConversation(reason, target)
+    getPersistentDataRuntime().acquireCompleteConversation(reason, target, assertPublicationAllowed)
 export const captureWindowedConversationMutationController = (
     target: SelectedConversationTarget,
     chat: Chat,
@@ -813,12 +814,15 @@ export const hasPendingOfficialPublication = (): boolean =>
     getPersistentDataRuntime().hasPendingOfficialPublication()
 
 export const getPersistentRevision = (): DataRevision => getPersistentDataRuntime().revision
+export const adoptObservedRevision = (revision: DataRevision) => getPersistentDataRuntime().adoptObservedRevision(revision)
 export const applyPersistentLwwReceive = (request: LwwStageReceive): Promise<LwwApplyResult> => getPersistentDataRuntime().applyLwwReceive(request)
 export const commitPersistentUnitIntent: PersistentDataRuntime['commitPersistentUnitIntent'] = (reason, mutations, conversations, wholeMessages, projectionObserver, check) =>
     getPersistentDataRuntime().commitPersistentUnitIntent(reason, mutations, conversations, wholeMessages, projectionObserver, check)
-export const commitPreparedUnitIntent: PersistentDataRuntime['commitPreparedUnitIntent'] = (reason, prepare) =>
-    getPersistentDataRuntime().commitPreparedUnitIntent(reason, prepare)
+export const commitPreparedUnitIntent: PersistentDataRuntime['commitPreparedUnitIntent'] = (reason, prepare, applyToLive, lifecycle) =>
+    getPersistentDataRuntime().commitPreparedUnitIntent(reason, prepare, applyToLive, lifecycle)
 export const withPausedPersistentWrites = <T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T> => getPersistentDataRuntime().withPausedPersistentWrites(reason, operation)
+export const withLiveConversationWrite: PersistentDataRuntime['withLiveConversationWrite'] = (reason, operation, saveFailed) =>
+    getPersistentDataRuntime().withLiveConversationWrite(reason, operation, saveFailed)
 
 export const beginActivatedLibraryGuard = (token: PersistentMutationToken) => getPersistentDataRuntime().beginActivatedLibraryGuard(token)
 

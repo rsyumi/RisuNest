@@ -1,15 +1,22 @@
 import { PluginStorageObservation, type PluginStorageWriteCheck } from './pluginStorageProtection'
 import type { PluginStorageValueCursor } from "../storage/persistentDataStore"
 import { reconcilePluginListUpdate } from './pluginListUpdate'
+import { getGenerationOutputPhase, type GenerationOutputWrite } from '../process/generationOutputPhase'
+import { rerollAfterPluginRanges, rerollProtectedIndexes } from '../responseVariants'
+import { planGenerationSetterRanges } from './generationSetterMessages'
+import { bindPluginAdmissionMessages, getPluginMessageBaseline, pluginMessageDigest, type PluginReadPositionProof } from './pluginReadBaselines'
+import { cloneConversationMetadata } from '../storage/activeConversationSession'
+import { applyGenerationConversationRanges, readGenerationConversation } from './generationConversationOwner'
 import { captureGenerationPublicWrite } from '../process/generationRequestPhase'
 import type { RisuPlugin } from "./plugins.svelte"
 import type { Chat, Database } from '../storage/database.svelte'
+import type { ConversationViewportSource, PersistentConversationWindowReader } from '../conversationViewportSource'
 import type {
     CompleteConversationLease,
     SelectedConversationTarget,
 } from '../storage/activeWorkingSet.svelte'
 import type { ActiveConversationSession } from '../storage/activeConversationSession'
-import type { PersistentUnitIntentProjectionObserver } from '../storage/persistentDataRuntime'
+import type { PersistentDataRuntime, PersistentUnitIntentProjectionObserver } from '../storage/persistentDataRuntime'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { isWorkingSetCharacterStub } from '../storage/workingSetCatalog'
 import type {
@@ -22,7 +29,7 @@ import type {
     PluginStorageValue,
     ConversationMutation,
 } from '../storage/persistentDataStore'
-import { readCurrentRevision } from '../storage/persistentDataStore'
+import { readCurrentRevision, RevisionConflictError } from '../storage/persistentDataStore'
 import {
     acquireCurrentRevisionWithRetry,
     assertPinnedRevision,
@@ -102,6 +109,7 @@ export interface PluginChatOutputProjectionInput {
 export interface PluginChatOutputProjection {
     char: PluginCompleteCharacter
     chat: Chat
+    messageIndex?: number
 }
 
 export type PluginChatOutputProjector = (
@@ -169,6 +177,7 @@ export interface PluginDatabaseAccessDependencies {
         projectionObserver?: PersistentUnitIntentProjectionObserver,
         check?: PluginStorageWriteCheck,
     ): Promise<void>
+    getLiveRuntime?(): PersistentDataRuntime
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
     getSelectedCharacterId(): string | null
@@ -176,6 +185,7 @@ export interface PluginDatabaseAccessDependencies {
     acquireCompleteConversation(
         reason: string,
         target?: SelectedConversationTarget | null,
+        assertPublicationAllowed?: () => void,
     ): Promise<CompleteConversationLease>
     refreshSelectedConversationAfterReplacement(
         target: SelectedConversationTarget,
@@ -327,6 +337,7 @@ const SYNCHRONOUS_CHARACTER_SET_ERROR =
 const STALE_DATABASE_SET_ERROR =
     'Plugin database update became stale because navigation state changed.'
 class PluginApprovalOvertakenError extends Error {}
+class PluginOutputPhaseStarted extends Error {}
 const DANGEROUS_DATABASE_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 export function linkPluginQueryAbortSignals(
@@ -418,13 +429,30 @@ async function resolvePinnedConversationTarget(
 async function readPinnedCompleteCharacter(
     reader: PersistentRevisionLease,
     characterId: string,
+    live?: { target: SelectedConversationTarget; chat: Promise<Chat> } | null,
 ): Promise<PluginCompleteCharacter | null> {
     const detail = await reader.readCharacter(characterId)
     if (!detail) return null
     assertPinnedRevision(reader.revision, detail.revision, `Character ${characterId}`)
     const chats: Chat[] = []
-    for await (const conversation of iteratePinnedConversations(reader, characterId)) {
-        chats.push(conversation.value)
+    if (live && live.target.characterId === characterId) {
+        let cursor: string | undefined
+        do {
+            const page = await reader.queryConversations({ characterId, order: 'configured', limit: 100, cursor })
+            assertPinnedRevision(reader.revision, page.revision, 'Plugin admission conversation catalog')
+            for (const summary of page.items) {
+                if (summary.id === live.target.conversationId) chats.push(await live.chat)
+                else {
+                    const chat = await reader.readConversation(characterId, summary.id)
+                    if (!chat) throw new PluginReadBaselineError('target')
+                    assertPinnedRevision(reader.revision, chat.revision, 'Plugin admission conversation')
+                    chats.push(chat.value)
+                }
+            }
+            cursor = page.nextCursor
+        } while (cursor !== undefined)
+    } else {
+        for await (const conversation of iteratePinnedConversations(reader, characterId)) chats.push(conversation.value)
     }
     return { ...detail.value, chats } as PluginCompleteCharacter
 }
@@ -628,12 +656,131 @@ export function createPluginDatabaseAccess(
             : { ...intent, path: ['pluginCustomStorage', ...intent.path] })
         return pluginUnitIntents(normalized, 'database', dependencies.owner, submitted)
     }
+    const captureLiveAdmission = (characterId?: string, conversationId?: string) => {
+        if (!dependencies.getLiveRuntime) return null
+        const target = dependencies.captureSelectedConversationTarget()
+        if (!target || (characterId && characterId !== target.characterId) ||
+            (conversationId && conversationId !== target.conversationId) || !getGenerationOutputPhase(target)) return null
+        const shell = dependencies.getCompatibilityDatabase().characters.find(char => char.chaId === target.characterId)
+            ?.chats.find(chat => chat.id === target.conversationId)
+        if (!shell) return null
+        const runtime = dependencies.getLiveRuntime()
+        const view = runtime.getActiveConversationViewportSource()?.snapshot()
+        const chat = readGenerationConversation(target, shell, dependencies.store, runtime).then(projected => {
+            if (view) bindPluginAdmissionMessages(projected.message, view.positionKeyAt ?? view.keyAt)
+            return projected
+        })
+        return { target, chat }
+    }
+    type Changes = ReturnType<typeof pluginUnitIntents>
+    const routeGeneratingWrite = async (
+        reason: string, target: SelectedConversationTarget | null, changes: Changes,
+        assertCurrent: () => void, reserved: GenerationOutputWrite | null, lite = false,
+    ): Promise<false | Pick<PluginStorageWriteCheck, 'saveFailed'>> => {
+        reserved?.assertIntervalOwner()
+        if (!target || !dependencies.getLiveRuntime) return false
+        const runtime = dependencies.getLiveRuntime()
+        const metadataFields = changes.units.flatMap(unit => {
+            const [kind, characterId, conversationId, field] = JSON.parse(unit.key) as string[]
+            return kind === 'conversation' && target.characterId === characterId && target.conversationId === conversationId
+                ? [{ unit, field }] : []
+        })
+        const whole = changes.wholeMessages.find(intent => intent.characterId === target.characterId && intent.conversationId === target.conversationId)
+        if (lite && (changes.wholeMessages.some(intent => intent !== whole) || changes.units.some(unit => {
+            const [kind, owner] = JSON.parse(unit.key) as string[]
+            return (kind === 'character' || kind === 'conversation' ||
+                (['order', 'exists'].includes(kind) && ['characters', 'conversations', 'character', 'conversation'].includes(owner))) &&
+                !metadataFields.some(entry => entry.unit === unit)
+        }))) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
+        let local: GenerationOutputWrite | undefined
+        const saveFailed = whole || metadataFields.length
+            ? (error: unknown) => (reserved ?? local)?.failIntervalSave(error) : undefined
+        try {
+            for (;;) {
+                const result = await runtime.withLiveConversationWrite(reason, async () => {
+                    assertCurrent()
+                    const selected = dependencies.captureSelectedConversationTarget()
+                    const phase = getGenerationOutputPhase(target)
+                    const write = reserved ?? local
+                    write?.assertIntervalOwner()
+                    if (write && phase && write.phase !== phase) throw new PluginReadBaselineError('stale')
+                    if (!phase || selected?.navigationGeneration !== target.navigationGeneration ||
+                        selected.characterId !== target.characterId || selected.conversationId !== target.conversationId) return false
+                    const admission = write ?? (local = phase.holdWrite())
+                    if (admission.scriptWait) return { wait: admission.scriptWait }
+                    if (!whole && !metadataFields.length) return true
+                    const shell = dependencies.getCompatibilityDatabase().characters.find(char => char.chaId === target.characterId)
+                        ?.chats.find(chat => chat.id === target.conversationId)
+                    if (!shell) return false
+                    const source = runtime.getActiveConversationViewportSource()
+                    const overlay = runtime.captureSelectedConversationAuthority()?.overlay
+                    const epoch = overlay?.epoch
+                    const chat = whole && overlay ? await readGenerationConversation(selected, shell, dependencies.store, runtime) : shell
+                    assertCurrent()
+                    admission.assertIntervalOwner()
+                    if (getGenerationOutputPhase(target) !== phase) return false
+                    if (admission.scriptWait) return { wait: admission.scriptWait }
+                    if (whole && overlay) {
+                        if (runtime.captureSelectedConversationAuthority()?.overlay !== overlay || overlay.epoch !== epoch ||
+                            overlay.revision !== selected.storeRevision) return { retry: true }
+                        // A long read may span many stream chunks. Overlay bodies remain available after viewport eviction.
+                        for (const interval of overlay.intervals(0, overlay.count)) {
+                            if ('messages' in interval) interval.messages.forEach((message, offset) => {
+                                chat.message[interval.start + offset] = message
+                            })
+                        }
+                    }
+                    const protectedRows = new Set<number>([phase.messageIndex])
+                    const reroll = shell.rerollRecovery
+                    if (whole && reroll?.phase === 'generating') {
+                        for (const index of rerollProtectedIndexes(chat.message, reroll, phase.messageIndex)) protectedRows.add(index)
+                    }
+                    const metadata = cloneConversationMetadata(shell)
+                    for (const { unit, field } of metadataFields) {
+                        if (unit.type === 'delete') delete metadata[field]
+                        else defineOwnEnumerableProperty(metadata, field, unit.value)
+                    }
+                    const baseline = whole && getPluginMessageBaseline(whole.messages)
+                    const positionView = source?.snapshot()
+                    const ranges = whole ? planGenerationSetterRanges(baseline,
+                        whole.messages, chat.message, protectedRows,
+                        index => {
+                            const key = (positionView?.positionKeyAt ?? positionView?.keyAt)?.(index)
+                            const proof = baseline?.positionKeys?.get(index)
+                            return key !== undefined && proof !== undefined && pluginMessageDigest(key) === proof
+                        }) : []
+                    if (reroll?.phase === 'generating') metadata.rerollRecovery = rerollAfterPluginRanges(reroll, ranges)
+                    return applyGenerationConversationRanges(selected, shell, phase, ranges, metadata, runtime) ? true : { retry: true }
+                }, saveFailed)
+                if (typeof result !== 'boolean') {
+                    if ('wait' in result) await result.wait
+                    continue
+                }
+                if (result) {
+                    const routed = new Set(metadataFields.map(item => item.unit))
+                    changes.units = changes.units.filter(unit => !routed.has(unit))
+                    changes.wholeMessages = changes.wholeMessages.filter(intent => intent !== whole)
+                }
+                return result && { saveFailed }
+            }
+        } finally {
+            local?.release()
+        }
+    }
     const captureCharacterAdmission = (characterId: string, characterIndex?: number): Promise<unknown> => {
         const live = dependencies.getCompatibilityDatabase().characters?.find(value => value.chaId === characterId)
         const hydratedDetail = Boolean(live && !isWorkingSetCharacterStub(live))
         const hydratedChats = new Set(live?.chats.filter(chat => !isConversationSummaryStub(chat)).map(chat => chat.id))
+        const liveAdmission = captureLiveAdmission(characterId)
         const admission = live ? dependencies.snapshot(live) : undefined
-        if (admission && hydratedDetail && admission.chats.every(chat => hydratedChats.has(chat.id))) return Promise.resolve(admission)
+        const project = async (character: typeof admission) => {
+            if (character && liveAdmission) {
+                const projected = await liveAdmission.chat
+                character.chats = character.chats.map(chat => chat.id === projected.id ? projected : chat)
+            }
+            return character
+        }
+        if (admission && hydratedDetail && admission.chats.every(chat => hydratedChats.has(chat.id))) return project(admission)
         const revision = dependencies.getPersistentRevision()
         const authority = dependencies.getStorageAuthorityEpoch()
         const pin = dependencies.store.acquireRevision(revision)
@@ -642,18 +789,18 @@ export function createPluginDatabaseAccess(
             dependencies.assertPersistentMutationAllowed(authority)
             const target = characterIndex === undefined ? { characterId } : await resolvePinnedCharacterTarget(reader, characterIndex)
             if (!target) return {}
-            const persisted = await readPinnedCompleteCharacter(reader, target.characterId)
+            const persisted = await readPinnedCompleteCharacter(reader, target.characterId, liveAdmission)
             dependencies.assertPersistentMutationAllowed(authority)
             if (!persisted) throw new PluginReadBaselineError('target')
-            if (!admission || !hydratedDetail) return dependencies.snapshot(persisted)
+            if (!admission || !hydratedDetail) return project(dependencies.snapshot(persisted))
             const { chats, ...detail } = admission
-            return {
+            return project({
                 ...dependencies.snapshot(persisted), ...detail,
                 chats: persisted.chats.map(chat => {
                     const captured = chats.find(value => value.id === chat.id)
                     return captured && hydratedChats.has(captured.id) ? captured : dependencies.snapshot(chat)
                 }),
-            }
+            })
         })).catch(error => {
             if (error instanceof PluginReadBaselineError) throw error
             throw new PluginReadBaselineError('stale')
@@ -663,6 +810,16 @@ export function createPluginDatabaseAccess(
         characterId: string
         conversation: Chat | undefined
     } | null> => {
+        const selected = dependencies.captureSelectedConversationTarget()
+        if (selected?.conversationId === conversationId &&
+            readBaselines.hasRead('conversation', JSON.stringify([selected.characterId, conversationId]))) {
+            const character = dependencies.getCompatibilityDatabase().characters?.[characterIndex]
+            if (character?.chaId === selected.characterId) return Promise.resolve({ characterId: selected.characterId, conversation: undefined })
+        }
+        const liveAdmission = selected ? captureLiveAdmission(selected.characterId, conversationId) : null
+        if (liveAdmission && dependencies.getCompatibilityDatabase().characters?.[characterIndex]?.chaId === liveAdmission.target.characterId) {
+            return liveAdmission.chat.then(conversation => ({ characterId: liveAdmission.target.characterId, conversation }))
+        }
         const captured = new Map<string, Chat>()
         for (const character of dependencies.getCompatibilityDatabase().characters ?? []) {
             if (readBaselines.hasRead('conversation', JSON.stringify([character.chaId, conversationId]))) continue
@@ -683,7 +840,7 @@ export function createPluginDatabaseAccess(
             if (readBaselines.hasRead('conversation', JSON.stringify([target.characterId, conversationId]))) {
                 return { characterId: target.characterId, conversation: undefined }
             }
-            let conversation = captured.get(target.characterId)
+            let conversation = liveAdmission?.target.characterId === target.characterId ? await liveAdmission.chat : captured.get(target.characterId)
             if (!conversation) {
                 const persisted = await reader.readConversation(target.characterId, conversationId)
                 dependencies.assertPersistentMutationAllowed(authority)
@@ -699,6 +856,7 @@ export function createPluginDatabaseAccess(
         })
     }
     const captureDatabaseAdmission = (submitted: Record<string, unknown>): Promise<Record<string, unknown>> => {
+        const liveAdmission = Object.hasOwn(submitted, 'characters') ? captureLiveAdmission() : null
         const liveHydration = new Map(dependencies.getCompatibilityDatabase().characters?.map(character => [character.chaId, { detail: !isWorkingSetCharacterStub(character), chats: new Set(character.chats.filter(chat => !isConversationSummaryStub(chat)).map(chat => chat.id)) }]))
         const captured = admissionDatabase() as unknown as Record<string, any>
         const needsPinned = ['characters', 'botPresets', 'pluginCustomStorage'].some(key => Object.hasOwn(submitted, key))
@@ -712,7 +870,7 @@ export function createPluginDatabaseAccess(
             if (Object.hasOwn(submitted, 'characters')) {
                 const characters: PluginCompleteCharacter[] = []
                 for await (const item of iteratePinnedCharacters(reader)) {
-                    const character = await readPinnedCompleteCharacter(reader, item.summary.id)
+                    const character = await readPinnedCompleteCharacter(reader, item.summary.id, liveAdmission)
                     if (!character) throw new PluginReadBaselineError('target')
                     const live = (captured.characters as PluginCompleteCharacter[] | undefined)?.find(value => value.chaId === item.summary.id)
                     const hydration = live && liveHydration.get(live.chaId)
@@ -721,6 +879,11 @@ export function createPluginDatabaseAccess(
                         const chats = complete.chats.map(chat => hydration.chats.has(chat.id) ? live.chats.find(value => value.id === chat.id)! : chat)
                         characters.push(hydration.detail ? { ...live, chats } : { ...complete, chats })
                     } else characters.push(complete)
+                }
+                if (liveAdmission) {
+                    const projected = await liveAdmission.chat
+                    const character = characters.find(value => value.chaId === liveAdmission.target.characterId)
+                    if (character) character.chats = character.chats.map(chat => chat.id === projected.id ? projected : chat)
                 }
                 captured.characters = characters
             }
@@ -752,11 +915,31 @@ export function createPluginDatabaseAccess(
     const openStore = () => (openPromise ??= dependencies.store.open().finally(() => {
         openPromise = undefined
     }))
-    const acquireCurrentRevisionReader = (): Promise<PersistentRevisionLease> =>
-        acquireCurrentRevisionWithRetry(
+    const positionProofs = new WeakMap<PersistentRevisionLease, PluginReadPositionProof>()
+    const acquireCurrentRevisionReader = async (): Promise<PersistentRevisionLease> => {
+        const reader = await acquireCurrentRevisionWithRetry(
             (revision) => dependencies.store.acquireRevision(revision),
             () => readCurrentRevision(dependencies.store),
         )
+        try {
+            const selected = dependencies.getLiveRuntime ? dependencies.captureSelectedConversationTarget() : null
+            if (dependencies.getLiveRuntime && selected && selected.storeRevision === reader.revision) {
+                const runtime = dependencies.getLiveRuntime()
+                const authority = runtime.captureSelectedConversationAuthority()
+                const session = runtime.getActiveConversationSession()
+                const clean = session ? session.version === session.persistedVersion : authority && authority.sessionVersion === authority.persistedSessionVersion
+                const view = clean ? runtime.getActiveConversationViewportSource()?.snapshot() : undefined
+                if (view && view.storeRevision === reader.revision) {
+                    const target = JSON.stringify([selected.characterId, selected.conversationId])
+                    positionProofs.set(reader, (conversation, index) => conversation === target ? (view.positionKeyAt ?? view.keyAt)(index) : undefined)
+                }
+            }
+        } catch (error) {
+            await releasePersistentRevisionLease(reader)
+            throw error
+        }
+        return reader
+    }
     const prepareQuery = async (signal?: AbortSignal) => {
         throwIfQueryAborted(signal)
         await dependencies.flushPendingData('plugin-database-query')
@@ -780,14 +963,28 @@ export function createPluginDatabaseAccess(
         dependencies.reportIdentityReplacementRejected(diagnostic)
         throw new PluginIdentityReplacementRejectedError(diagnostic)
     }
+    // Reserve admission before the setter starts its asynchronous index and baseline reads.
+    // The script can then finish and commit; the generation releases its reply after the admitted write.
+    const holdProcessingWrite = (target: SelectedConversationTarget | null) => {
+        const phase = target && dependencies.getLiveRuntime && getGenerationOutputPhase(target)
+        return phase?.scriptRunning ? phase.holdWrite() : null
+    }
+    const flushScopedSetter = async (write: GenerationOutputWrite | null) => {
+        try { await dependencies.flushPendingData('plugin-full-object-write') }
+        catch (error) { write?.failIntervalSave(error); throw error }
+    }
     const acquireSelectedLease = async (
         selectedTarget: SelectedConversationTarget | null,
         characterId: string,
         conversationId?: string,
+        assertPublicationAllowed?: () => void,
     ): Promise<CompleteConversationLease | null> => {
         if (!selectedTarget || selectedTarget.characterId !== characterId) return null
         if (conversationId !== undefined && selectedTarget.conversationId !== conversationId) {
             return null
+        }
+        if (assertPublicationAllowed) {
+            return dependencies.acquireCompleteConversation('plugin-full-object-setter', selectedTarget, assertPublicationAllowed)
         }
         return dependencies.acquireCompleteConversation(
             'plugin-full-object-setter',
@@ -839,6 +1036,61 @@ export function createPluginDatabaseAccess(
         dependencies.invalidateActiveConversationSession?.()
     }
 
+    const commitScopedChanges = async (
+        reason: string, boundary: ReturnType<typeof captureSelectedCallBoundary>,
+        target: PluginResolvedCharacterTarget | PluginResolvedConversationTarget, changes: Changes,
+        context: PluginFullObjectCallContext, reserved: GenerationOutputWrite | null,
+        publicWrite?: ReturnType<typeof captureGenerationPublicWrite>,
+    ) => {
+        const conversationId = 'conversationId' in target ? target.conversationId : undefined
+        const assertCurrent = () => {
+            throwIfFullObjectCallAborted(context.signal)
+            dependencies.assertPersistentMutationAllowed(boundary.authorityEpoch)
+            readBaselines.assertOpen()
+            reserved?.assertIntervalOwner()
+        }
+        for (;;) {
+            const selected = recaptureSelectedTarget(boundary)
+            const current = dependencies.getLiveRuntime ? dependencies.captureSelectedConversationTarget() : selected
+            const scoped = current?.characterId === target.characterId &&
+                (conversationId === undefined || current.conversationId === conversationId) ? current : null
+            const routed = await routeGeneratingWrite(reason, scoped, changes, assertCurrent, reserved)
+            if (routed) {
+                if (changes.units.length || changes.wholeMessages.length)
+                    await dependencies.commitPersistentUnitIntent(reason, changes.units, [], changes.wholeMessages, undefined,
+                        { ...routed, validate: assertCurrent, committed() {} })
+                return true
+            }
+            const assertOrdinary = () => {
+                assertCurrent()
+                if (dependencies.getLiveRuntime && scoped && getGenerationOutputPhase(scoped)) throw new PluginOutputPhaseStarted()
+            }
+            let lease: CompleteConversationLease | null = null
+            let redirected = false
+            try {
+                assertOrdinary()
+                lease = await acquireSelectedLease(selected, target.characterId, conversationId,
+                    scoped && dependencies.getLiveRuntime ? assertOrdinary : undefined)
+                assertOrdinary()
+                if (publicWrite && 'conversationId' in target) publicWrite.prepare(target)
+                if (scoped && dependencies.getLiveRuntime) {
+                    await dependencies.commitPersistentUnitIntent(reason, changes.units, [], changes.wholeMessages, publicWrite ?? undefined,
+                        { validate: assertOrdinary, committed() {} })
+                } else if (publicWrite) {
+                    await dependencies.commitPersistentUnitIntent(reason, changes.units, [], changes.wholeMessages, publicWrite)
+                } else await dependencies.commitPersistentUnitIntent(reason, changes.units, [], changes.wholeMessages)
+                if (!lease) invalidateLeaselessSelectedWrite(target.characterId, conversationId)
+                return true
+            } catch (error) {
+                if (!(error instanceof PluginOutputPhaseStarted)) throw error
+                redirected = true
+            } finally {
+                lease?.release()
+                if (lease && !redirected) dependencies.refreshSelectedConversationAfterReplacement(lease.target, lease.session)
+            }
+        }
+    }
+
     return {
         expireReadBaselines: () => readBaselines.expire(),
         closeReadBaselines: () => { readBaselines.close(); if (!dependencies.storageObservation) storageObservation.dispose() },
@@ -873,8 +1125,8 @@ export function createPluginDatabaseAccess(
                     }
                 })()
                 const baseline = 'conversationId' in resolved
-                    ? readBaselines.beginSnapshot('conversation', JSON.stringify([resolved.characterId, resolved.conversationId]), readAuthority)
-                    : readBaselines.beginSnapshot('character', resolved.characterId, readAuthority)
+                    ? readBaselines.beginSnapshot('conversation', JSON.stringify([resolved.characterId, resolved.conversationId]), readAuthority, positionProofs.get(reader))
+                    : readBaselines.beginSnapshot('character', resolved.characterId, readAuthority, positionProofs.get(reader))
                 const value = createPluginSnapshotStream(chunks, baseline, () => releasePersistentRevisionLease(reader), { signal: context.signal })
                 transferred = true
                 return {
@@ -901,7 +1153,7 @@ export function createPluginDatabaseAccess(
                 throwIfFullObjectCallAborted(context.signal)
                 const value = await readPinnedCompleteCharacter(reader, characterId)
                 throwIfFullObjectCallAborted(context.signal)
-                return value === null ? undefined : readBaselines.track(dependencies.snapshot(value), 'character', characterId, reader.revision, readAuthority)
+                return value === null ? undefined : readBaselines.track(dependencies.snapshot(value), 'character', characterId, reader.revision, readAuthority, positionProofs.get(reader))
             })
         },
 
@@ -919,7 +1171,7 @@ export function createPluginDatabaseAccess(
                     ? await readPinnedCompleteCharacter(reader, target.characterId)
                     : null
                 throwIfFullObjectCallAborted(context.signal)
-                return value === null ? null : readBaselines.track(dependencies.snapshot(value), 'character', target!.characterId, reader.revision, readAuthority)
+                return value === null ? null : readBaselines.track(dependencies.snapshot(value), 'character', target!.characterId, reader.revision, readAuthority, positionProofs.get(reader))
             })
         },
 
@@ -948,174 +1200,122 @@ export function createPluginDatabaseAccess(
                     )
                 }
                 throwIfFullObjectCallAborted(context.signal)
-                return found === null ? null : readBaselines.track(dependencies.snapshot(found.value), 'conversation', JSON.stringify([target!.characterId, target!.conversationId]), reader.revision, readAuthority)
+                return found === null ? null : readBaselines.track(dependencies.snapshot(found.value), 'conversation', JSON.stringify([target!.characterId, target!.conversationId]), reader.revision, readAuthority, positionProofs.get(reader))
             })
         },
 
         async setCurrentCharacter(character, context) {
-            validatePluginCompleteCharacter(character)
-            const admission = readBaselines.hasRead('character', character.chaId) ? undefined : captureCharacterAdmission(dependencies.getSelectedCharacterId() ?? character.chaId)
-            const candidate = snapshotWithProvenance(character)
-            const selectedBoundary = captureSelectedCallBoundary()
-            throwIfFullObjectCallAborted(context.signal)
-            const intents = readBaselines.intent(candidate, 'character', candidate.chaId, admission ? await admission : {})
-            await dependencies.flushPendingData('plugin-full-object-write')
-            throwIfFullObjectCallAborted(context.signal)
-            dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
-            const characterId = selectedBoundary.characterId
-            if (characterId === null) return
-            await openStore()
-            const lease = await acquireCurrentRevisionReader()
-            const target = await withPersistentRevisionLease(lease, async (reader) => {
-                const found = await reader.readCharacter(characterId)
-                if (!found) return null
-                assertPinnedRevision(reader.revision, found.revision, `Character ${characterId}`)
-                return { revision: reader.revision, characterId }
-            })
-            if (!target) throw new PluginFullObjectTargetStaleError(characterId)
-            throwIfFullObjectCallAborted(context.signal)
-            if (candidate.chaId !== target.characterId) {
-                rejectIdentityReplacement(
-                    context,
-                    'setCharacter',
-                    target.characterId,
-                    candidate.chaId,
-                )
-            }
-            let completeLease: CompleteConversationLease | null = null
+            const hold = holdProcessingWrite(dependencies.captureSelectedConversationTarget())
             try {
-                completeLease = await acquireSelectedLease(
-                    recaptureSelectedTarget(selectedBoundary),
-                    target.characterId,
-                )
+                validatePluginCompleteCharacter(character)
+                const admission = readBaselines.hasRead('character', character.chaId) ? undefined : captureCharacterAdmission(dependencies.getSelectedCharacterId() ?? character.chaId)
+                const candidate = snapshotWithProvenance(character)
+                const selectedBoundary = captureSelectedCallBoundary()
+                throwIfFullObjectCallAborted(context.signal)
+                const intents = readBaselines.intent(candidate, 'character', candidate.chaId, admission ? await admission : {})
+                const changesChat = intents.some(intent => intent.path[0] === 'chats' && intent.path[1] === selectedBoundary.target?.conversationId)
+                await flushScopedSetter(changesChat && candidate.chaId === selectedBoundary.characterId ? hold : null)
                 throwIfFullObjectCallAborted(context.signal)
                 dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
-                readBaselines.assertOpen()
-                const changes = pluginUnitIntents(intents, 'character', dependencies.owner, candidate, target.characterId)
-                await dependencies.commitPersistentUnitIntent('plugin-setCharacter', changes.units, [], changes.wholeMessages)
-                if (!completeLease) invalidateLeaselessSelectedWrite(target.characterId)
-            } finally {
-                if (completeLease) {
-                    completeLease.release()
-                    dependencies.refreshSelectedConversationAfterReplacement(
-                        completeLease.target,
-                        completeLease.session,
+                const characterId = selectedBoundary.characterId
+                if (characterId === null) return
+                await openStore()
+                const lease = await acquireCurrentRevisionReader()
+                const target = await withPersistentRevisionLease(lease, async (reader) => {
+                    const found = await reader.readCharacter(characterId)
+                    if (!found) return null
+                    assertPinnedRevision(reader.revision, found.revision, `Character ${characterId}`)
+                    return { revision: reader.revision, characterId }
+                })
+                if (!target) throw new PluginFullObjectTargetStaleError(characterId)
+                throwIfFullObjectCallAborted(context.signal)
+                if (candidate.chaId !== target.characterId) {
+                    rejectIdentityReplacement(
+                        context,
+                        'setCharacter',
+                        target.characterId,
+                        candidate.chaId,
                     )
                 }
+                const changes = pluginUnitIntents(intents, 'character', dependencies.owner, candidate, target.characterId)
+                await commitScopedChanges('plugin-setCharacter', selectedBoundary, target, changes, context, hold)
+            } finally {
+                hold?.release()
             }
         },
 
         async setCharacterToIndex(index, character, context) {
             validatePluginCompleteCharacter(character)
-            const admission = readBaselines.hasRead('character', character.chaId) ? undefined : captureCharacterAdmission(character.chaId, index)
-            const candidate = snapshotWithProvenance(character)
-            const selectedBoundary = captureSelectedCallBoundary()
-            throwIfFullObjectCallAborted(context.signal)
-            const intents = readBaselines.intent(candidate, 'character', candidate.chaId, admission ? await admission : {})
-            await dependencies.flushPendingData('plugin-full-object-write')
-            throwIfFullObjectCallAborted(context.signal)
-            dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
-            await openStore()
-            const lease = await acquireCurrentRevisionReader()
-            const target = await withPersistentRevisionLease(lease, async (reader) =>
-                resolvePinnedCharacterTarget(reader, index))
-            if (!target) return
-            throwIfFullObjectCallAborted(context.signal)
-            if (candidate.chaId !== target.characterId) {
-                rejectIdentityReplacement(
-                    context,
-                    'setCharacterToIndex',
-                    target.characterId,
-                    candidate.chaId,
-                )
-            }
-            let completeLease: CompleteConversationLease | null = null
+            const hold = holdProcessingWrite(character.chaId === dependencies.getSelectedCharacterId() ? dependencies.captureSelectedConversationTarget() : null)
             try {
-                completeLease = await acquireSelectedLease(
-                    recaptureSelectedTarget(selectedBoundary),
-                    target.characterId,
-                )
+                const admission = readBaselines.hasRead('character', character.chaId) ? undefined : captureCharacterAdmission(character.chaId, index)
+                const candidate = snapshotWithProvenance(character)
+                const selectedBoundary = captureSelectedCallBoundary()
+                throwIfFullObjectCallAborted(context.signal)
+                const intents = readBaselines.intent(candidate, 'character', candidate.chaId, admission ? await admission : {})
+                const changesChat = intents.some(intent => intent.path[0] === 'chats' && intent.path[1] === selectedBoundary.target?.conversationId)
+                await flushScopedSetter(changesChat && candidate.chaId === selectedBoundary.characterId ? hold : null)
                 throwIfFullObjectCallAborted(context.signal)
                 dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
-                readBaselines.assertOpen()
-                const changes = pluginUnitIntents(intents, 'character', dependencies.owner, candidate, target.characterId)
-                await dependencies.commitPersistentUnitIntent('plugin-setCharacterToIndex', changes.units, [], changes.wholeMessages)
-                if (!completeLease) invalidateLeaselessSelectedWrite(target.characterId)
-            } finally {
-                if (completeLease) {
-                    completeLease.release()
-                    dependencies.refreshSelectedConversationAfterReplacement(
-                        completeLease.target,
-                        completeLease.session,
+                await openStore()
+                const lease = await acquireCurrentRevisionReader()
+                const target = await withPersistentRevisionLease(lease, async (reader) =>
+                    resolvePinnedCharacterTarget(reader, index))
+                if (!target) return
+                throwIfFullObjectCallAborted(context.signal)
+                if (candidate.chaId !== target.characterId) {
+                    rejectIdentityReplacement(
+                        context,
+                        'setCharacterToIndex',
+                        target.characterId,
+                        candidate.chaId,
                     )
                 }
+                const changes = pluginUnitIntents(intents, 'character', dependencies.owner, candidate, target.characterId)
+                await commitScopedChanges('plugin-setCharacterToIndex', selectedBoundary, target, changes, context, hold)
+            } finally {
+                hold?.release()
             }
         },
 
         async setChatToIndex(characterIndex, chatIndex, chat, context) {
             validatePluginCompleteChat(chat)
-            const admission = captureConversationAdmission(characterIndex, chat.id!)
-            const candidate = snapshotWithProvenance(chat)
-            const selectedBoundary = captureSelectedCallBoundary()
-            const publicWrite = captureGenerationPublicWrite(selectedBoundary.target)
-            let committed = false
+            const hold = holdProcessingWrite(chat.id === dependencies.captureSelectedConversationTarget()?.conversationId ? dependencies.captureSelectedConversationTarget() : null)
             try {
-            throwIfFullObjectCallAborted(context.signal)
-            const admitted = await admission
-            await dependencies.flushPendingData('plugin-full-object-write')
-            throwIfFullObjectCallAborted(context.signal)
-            dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
-            await openStore()
-            const lease = await acquireCurrentRevisionReader()
-            const target = await withPersistentRevisionLease(lease, async (reader) =>
-                resolvePinnedConversationTarget(reader, characterIndex, chatIndex))
-            if (!target) return
-            throwIfFullObjectCallAborted(context.signal)
-            if (candidate.id !== target.conversationId) {
-                rejectIdentityReplacement(
-                    context,
-                    'setChatToIndex',
-                    target.conversationId,
-                    candidate.id!,
-                )
-            }
-            if (admitted && admitted.characterId !== target.characterId) throw new PluginReadBaselineError('target')
-            const intents = readBaselines.intent(candidate, 'conversation', JSON.stringify([target.characterId, target.conversationId]), admitted?.conversation ?? {})
-            let completeLease: CompleteConversationLease | null = null
-            try {
-                completeLease = await acquireSelectedLease(
-                    recaptureSelectedTarget(selectedBoundary),
-                    target.characterId,
-                    target.conversationId,
-                )
-                throwIfFullObjectCallAborted(context.signal)
-                dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
-                readBaselines.assertOpen()
-                const changes = pluginUnitIntents(intents, 'conversation', dependencies.owner, candidate, target.characterId, target.conversationId)
-                publicWrite?.prepare(target)
-                if (publicWrite) {
-                    await dependencies.commitPersistentUnitIntent('plugin-setChatToIndex', changes.units, [], changes.wholeMessages, publicWrite)
-                } else {
-                    await dependencies.commitPersistentUnitIntent('plugin-setChatToIndex', changes.units, [], changes.wholeMessages)
-                }
-                committed = true
-                if (!completeLease) {
-                    invalidateLeaselessSelectedWrite(
-                        target.characterId,
-                        target.conversationId,
-                    )
+                const admission = captureConversationAdmission(characterIndex, chat.id!)
+                const candidate = snapshotWithProvenance(chat)
+                const selectedBoundary = captureSelectedCallBoundary()
+                const publicWrite = captureGenerationPublicWrite(selectedBoundary.target)
+                let committed = false
+                try {
+                    throwIfFullObjectCallAborted(context.signal)
+                    const admitted = await admission
+                    await flushScopedSetter(admitted && admitted.characterId === selectedBoundary.characterId ? hold : null)
+                    throwIfFullObjectCallAborted(context.signal)
+                    dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
+                    await openStore()
+                    const lease = await acquireCurrentRevisionReader()
+                    const target = await withPersistentRevisionLease(lease, async (reader) =>
+                        resolvePinnedConversationTarget(reader, characterIndex, chatIndex))
+                    if (!target) return
+                    throwIfFullObjectCallAborted(context.signal)
+                    if (candidate.id !== target.conversationId) {
+                        rejectIdentityReplacement(
+                            context,
+                            'setChatToIndex',
+                            target.conversationId,
+                            candidate.id!,
+                        )
+                    }
+                    if (admitted && admitted.characterId !== target.characterId) throw new PluginReadBaselineError('target')
+                    const intents = readBaselines.intent(candidate, 'conversation', JSON.stringify([target.characterId, target.conversationId]), admitted?.conversation ?? {})
+                    const changes = pluginUnitIntents(intents, 'conversation', dependencies.owner, candidate, target.characterId, target.conversationId)
+                    committed = await commitScopedChanges('plugin-setChatToIndex', selectedBoundary, target, changes, context, hold, publicWrite)
+                } finally {
+                    await publicWrite?.finish(committed)
                 }
             } finally {
-                if (completeLease) {
-                    completeLease.release()
-                    dependencies.refreshSelectedConversationAfterReplacement(
-                        completeLease.target,
-                        completeLease.session,
-                    )
-                }
-            }
-            } finally {
-                await publicWrite?.finish(committed)
+                hold?.release()
             }
         },
 
@@ -1255,7 +1455,7 @@ export function createPluginDatabaseAccess(
                     }
                 }
             })()
-            return createPluginSnapshotStream(iterator, readBaselines.beginSnapshot('database', 'database', readAuthority), release)
+            return createPluginSnapshotStream(iterator, readBaselines.beginSnapshot('database', 'database', readAuthority, positionProofs.get(reader)), release)
         },
 
         async getDatabaseSnapshot(includeOnly, allowedKeys) {
@@ -1344,7 +1544,7 @@ export function createPluginDatabaseAccess(
                         (pinnedRoot.value as unknown as Record<string, unknown>)[key],
                     )
                 }
-                return readBaselines.track(result, 'database', 'database', reader.revision, readAuthority)
+                return readBaselines.track(result, 'database', 'database', reader.revision, readAuthority, positionProofs.get(reader))
             })
         },
 
@@ -1353,104 +1553,159 @@ export function createPluginDatabaseAccess(
             const authority = dependencies.getStorageAuthorityEpoch()
             dependencies.assertPersistentMutationAllowed(authority)
             validatePluginDatabaseUpdate(database)
-            if (hasCharacterUpdate(database)) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
+            const hasCharacters = hasCharacterUpdate(database)
+            const target = hasCharacters && dependencies.getLiveRuntime ? dependencies.captureSelectedConversationTarget() : null
+            if (hasCharacters) {
+                if (!target || !getGenerationOutputPhase(target) || !allowedKeys.includes('characters')) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
+                validateCompleteCharacters(database.characters)
+            }
             const submitted = snapshotWithProvenance(database)
             normalizeSubmittedPluginStorage(submitted, allowedKeys)
+            const hold = holdProcessingWrite(target)
             const commit = (baseline: unknown) => {
                 dependencies.assertPersistentMutationAllowed(authority)
                 const intents = readBaselines.intent(submitted, 'database', 'database', baseline)
                 const changes = databaseUnitChanges(intents.filter(intent => intent.path[0] !== 'plugins'), submitted, allowedKeys)
-                return dependencies.commitPersistentUnitIntent('plugin-setDatabaseLite', changes.units, [], changes.wholeMessages, undefined, storageWriteCheck(prepareStorageWrite, changes.units))
+                const check = storageWriteCheck(prepareStorageWrite, changes.units)
+                if (hasCharacters) {
+                    const validate = () => {
+                        dependencies.assertPersistentMutationAllowed(authority)
+                        readBaselines.assertOpen()
+                        hold?.assertIntervalOwner()
+                        check.validate()
+                    }
+                    return routeGeneratingWrite('plugin-setDatabaseLite', target, changes, validate, hold, true).then(handled => {
+                        if (!handled) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
+                        if (changes.units.length) return dependencies.commitPersistentUnitIntent('plugin-setDatabaseLite', changes.units, [], [], undefined, { ...check, ...handled, validate })
+                    })
+                }
+                return dependencies.commitPersistentUnitIntent('plugin-setDatabaseLite', changes.units, [], changes.wholeMessages, undefined, check)
+            }
+            if (hasCharacters) {
+                return (async () => {
+                    try {
+                        const baseline = readBaselines.hasRead('database', 'database') ? {} : await captureDatabaseAdmission(submitted)
+                        return await commit(baseline)
+                    } finally {
+                        hold?.release()
+                    }
+                })()
             }
             if (Object.hasOwn(submitted, 'pluginCustomStorage') && !readBaselines.hasRead('database', 'database')) return captureDatabaseAdmission(submitted).then(commit)
             return commit(admissionDatabase())
         },
 
         async setDatabase(database, allowedKeys) {
-            const prepareStorageWrite = storageObservation.captureWrite()
-            const authorityEpoch = dependencies.getStorageAuthorityEpoch()
-            dependencies.assertPersistentMutationAllowed(authorityEpoch)
             validatePluginDatabaseUpdate(database)
-            if (hasCharacterUpdate(database)) validateCompleteCharacters(database.characters)
-            allowedKeys = [...allowedKeys]
-            const initialNavigationGeneration = dependencies.getNavigationGeneration()
-            const detachedSubmission = snapshotWithProvenance(database)
-            normalizeSubmittedPluginStorage(detachedSubmission, allowedKeys)
-            const admission = readBaselines.hasRead('database', 'database') ? undefined : captureDatabaseAdmission(detachedSubmission)
-            const intents = readBaselines.intent(detachedSubmission, 'database', 'database', admission ? await admission : {})
-            readBaselines.assertOpen()
-            if (hasCharacterUpdate(detachedSubmission)) {
-                validateCompleteCharacters(detachedSubmission.characters)
-            }
-            const changedKeys = new Set(intents.map(intent => String(intent.path[0])))
-            const detachedUpdate = Object.fromEntries(Object.entries(detachedSubmission).filter(([key]) => changedKeys.has(key)))
-            const isPluginRecordSet = (intent: (typeof intents)[number]) =>
-                intent.path[0] === 'plugins' && intent.path.length === 2 && intent.path[1] !== '$order' && intent.type === 'set'
-            // Only records the plugin changed are requested: omissions, reordering and unchanged copies are ignored.
-            const requestedPlugins = intents.filter(isPluginRecordSet).map(intent => intent.value as RisuPlugin)
-            if (requestedPlugins.length) detachedUpdate.plugins = requestedPlugins
-            else delete detachedUpdate.plugins
-            const scriptsBeforeConfirmation = new Map((dependencies.getCompatibilityDatabase().plugins ?? []).map(plugin => [plugin.name, plugin.script]))
-            const preparedUpdate = dependencies.prepareAuthoritativeDatabaseUpdate
-                ? await dependencies.prepareAuthoritativeDatabaseUpdate(detachedUpdate)
-                : detachedUpdate
-            dependencies.assertPersistentMutationAllowed(authorityEpoch)
-            readBaselines.assertOpen()
-            validatePluginDatabaseUpdate(preparedUpdate)
-            if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
-                throw new Error(STALE_DATABASE_SET_ERROR)
-            }
-            if (hasCharacterUpdate(preparedUpdate)) {
-                validateCompleteCharacters(preparedUpdate.characters)
-            }
-            const approved = new Map((preparedUpdate.plugins as RisuPlugin[] | undefined ?? []).map(plugin => [plugin.name, plugin]))
-            const installedPlugins = () => dependencies.getCompatibilityDatabase().plugins ?? []
-            // An approval applies only to the list it was asked about: an install while the name is
-            // still free, a replacement while the installed script is still the one it replaces.
-            const approvalHolds = (name: string, installed: readonly RisuPlugin[]) => {
-                const current = installed.find(plugin => plugin.name === name)
-                return scriptsBeforeConfirmation.has(name)
-                    ? !!current && current.script === scriptsBeforeConfirmation.get(name)
-                    : !current
-            }
-            while (true) {
-                let acceptedIntents = intents
-                let acceptedNames: string[] = []
-                if (changedKeys.has('plugins')) {
-                    const installed = installedPlugins()
-                    acceptedNames = intents
-                        .filter(intent => isPluginRecordSet(intent) && approved.has(String(intent.path[1])))
-                        .map(intent => String(intent.path[1]))
-                        .filter(name => approvalHolds(name, installed))
-                    const accepted = intents.filter(intent => isPluginRecordSet(intent) && acceptedNames.includes(String(intent.path[1])))
-                        .map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
-                    // Whole-list API submissions request installation or replacement, while addressed storage deletes remain independent.
-                    acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...accepted]
-                    const addedNames = new Set(acceptedNames.filter(name => !installed.some(plugin => plugin.name === name)))
-                    if (addedNames.size) {
-                        acceptedIntents.push({ path: ['plugins', '$order'], type: 'set', value: [...installed.map(plugin => plugin.name), ...[...approved.keys()].filter(name => addedNames.has(name))] })
+            const selected = hasCharacterUpdate(database) && dependencies.getLiveRuntime
+                ? dependencies.captureSelectedConversationTarget() : null
+            const hold = holdProcessingWrite(selected)
+            try {
+                const prepareStorageWrite = storageObservation.captureWrite()
+                const authorityEpoch = dependencies.getStorageAuthorityEpoch()
+                dependencies.assertPersistentMutationAllowed(authorityEpoch)
+                if (hasCharacterUpdate(database)) validateCompleteCharacters(database.characters)
+                allowedKeys = [...allowedKeys]
+                const initialNavigationGeneration = dependencies.getNavigationGeneration()
+                const detachedSubmission = snapshotWithProvenance(database)
+                normalizeSubmittedPluginStorage(detachedSubmission, allowedKeys)
+                const admission = readBaselines.hasRead('database', 'database') ? undefined : captureDatabaseAdmission(detachedSubmission)
+                const intents = readBaselines.intent(detachedSubmission, 'database', 'database', admission ? await admission : {})
+                readBaselines.assertOpen()
+                if (hasCharacterUpdate(detachedSubmission)) {
+                    validateCompleteCharacters(detachedSubmission.characters)
+                }
+                const changedKeys = new Set(intents.map(intent => String(intent.path[0])))
+                const detachedUpdate = Object.fromEntries(Object.entries(detachedSubmission).filter(([key]) => changedKeys.has(key)))
+                const isPluginRecordSet = (intent: (typeof intents)[number]) =>
+                    intent.path[0] === 'plugins' && intent.path.length === 2 && intent.path[1] !== '$order' && intent.type === 'set'
+                // Only records the plugin changed are requested: omissions, reordering and unchanged copies are ignored.
+                const requestedPlugins = intents.filter(isPluginRecordSet).map(intent => intent.value as RisuPlugin)
+                if (requestedPlugins.length) detachedUpdate.plugins = requestedPlugins
+                else delete detachedUpdate.plugins
+                const scriptsBeforeConfirmation = new Map((dependencies.getCompatibilityDatabase().plugins ?? []).map(plugin => [plugin.name, plugin.script]))
+                const preparedUpdate = dependencies.prepareAuthoritativeDatabaseUpdate
+                    ? await dependencies.prepareAuthoritativeDatabaseUpdate(detachedUpdate)
+                    : detachedUpdate
+                dependencies.assertPersistentMutationAllowed(authorityEpoch)
+                readBaselines.assertOpen()
+                validatePluginDatabaseUpdate(preparedUpdate)
+                if (dependencies.getNavigationGeneration() !== initialNavigationGeneration) {
+                    throw new Error(STALE_DATABASE_SET_ERROR)
+                }
+                if (hasCharacterUpdate(preparedUpdate)) {
+                    validateCompleteCharacters(preparedUpdate.characters)
+                }
+                const approved = new Map((preparedUpdate.plugins as RisuPlugin[] | undefined ?? []).map(plugin => [plugin.name, plugin]))
+                const installedPlugins = () => dependencies.getCompatibilityDatabase().plugins ?? []
+                // An approval applies only to the list it was asked about: an install while the name is
+                // still free, a replacement while the installed script is still the one it replaces.
+                const approvalHolds = (name: string, installed: readonly RisuPlugin[]) => {
+                    const current = installed.find(plugin => plugin.name === name)
+                    return scriptsBeforeConfirmation.has(name)
+                        ? !!current && current.script === scriptsBeforeConfirmation.get(name)
+                        : !current
+                }
+                let routed: false | Pick<PluginStorageWriteCheck, 'saveFailed'> = false
+                while (true) {
+                    let acceptedIntents = intents
+                    let acceptedNames: string[] = []
+                    if (changedKeys.has('plugins')) {
+                        const installed = installedPlugins()
+                        acceptedNames = intents
+                            .filter(intent => isPluginRecordSet(intent) && approved.has(String(intent.path[1])))
+                            .map(intent => String(intent.path[1]))
+                            .filter(name => approvalHolds(name, installed))
+                        const accepted = intents.filter(intent => isPluginRecordSet(intent) && acceptedNames.includes(String(intent.path[1])))
+                            .map(intent => ({ ...intent, value: approved.get(String(intent.path[1]))! }))
+                        // Whole-list API submissions request installation or replacement, while addressed storage deletes remain independent.
+                        acceptedIntents = [...intents.filter(intent => intent.path[0] !== 'plugins'), ...accepted]
+                        const addedNames = new Set(acceptedNames.filter(name => !installed.some(plugin => plugin.name === name)))
+                        if (addedNames.size) {
+                            acceptedIntents.push({ path: ['plugins', '$order'], type: 'set', value: [...installed.map(plugin => plugin.name), ...[...approved.keys()].filter(name => addedNames.has(name))] })
+                        }
+                    }
+                    const changes = databaseUnitChanges(acceptedIntents, preparedUpdate, allowedKeys)
+                    const storageCheck = storageWriteCheck(prepareStorageWrite, changes.units)
+                    if (hasCharacterUpdate(detachedSubmission) && !routed) {
+                        routed = await routeGeneratingWrite('plugin-setDatabase', selected, changes, () => {
+                            dependencies.assertPersistentMutationAllowed(authorityEpoch)
+                            readBaselines.assertOpen()
+                            storageCheck.validate()
+                        }, hold)
+                    } else if (routed && selected) {
+                        changes.wholeMessages = changes.wholeMessages.filter(intent => intent.characterId !== selected.characterId || intent.conversationId !== selected.conversationId)
+                        changes.units = changes.units.filter(unit => {
+                            const [kind, owner, chat] = JSON.parse(unit.key)
+                            return !(kind === 'conversation' && owner === selected.characterId && chat === selected.conversationId)
+                        })
+                    }
+                    if (routed && !changes.units.length && !changes.wholeMessages.length) break
+                    try {
+                        await dependencies.commitPersistentUnitIntent('plugin-setDatabase', changes.units, [], changes.wholeMessages, undefined, {
+                            saveFailed: routed ? routed.saveFailed : undefined,
+                            // The write can wait behind other saves, so every attempt checks the approvals again.
+                            validate: () => {
+                                dependencies.assertPersistentMutationAllowed(authorityEpoch)
+                                hold?.assertIntervalOwner()
+                                if (dependencies.getLiveRuntime && !routed && hasCharacterUpdate(detachedSubmission) && selected && getGenerationOutputPhase(selected))
+                                    throw new PluginOutputPhaseStarted()
+                                const installed = installedPlugins()
+                                if (!acceptedNames.every(name => approvalHolds(name, installed))) throw new PluginApprovalOvertakenError()
+                                storageCheck.validate()
+                            },
+                            committed: storageCheck.committed,
+                        })
+                        break
+                    } catch (error) {
+                        // Nothing was written; commit again without the approvals the plugin list overtook.
+                        if (!(error instanceof PluginApprovalOvertakenError || error instanceof PluginOutputPhaseStarted)) throw error
                     }
                 }
-                const changes = databaseUnitChanges(acceptedIntents, preparedUpdate, allowedKeys)
-                const storageCheck = storageWriteCheck(prepareStorageWrite, changes.units)
-                try {
-                    await dependencies.commitPersistentUnitIntent('plugin-setDatabase', changes.units, [], changes.wholeMessages, undefined, {
-                        // The write can wait behind other saves, so every attempt checks the approvals again.
-                        validate: () => {
-                            const installed = installedPlugins()
-                            if (!acceptedNames.every(name => approvalHolds(name, installed))) throw new PluginApprovalOvertakenError()
-                            storageCheck.validate()
-                        },
-                        committed: storageCheck.committed,
-                    })
-                    break
-                } catch (error) {
-                    // Nothing was written; commit again without the approvals the plugin list overtook.
-                    if (!(error instanceof PluginApprovalOvertakenError)) throw error
-                }
+                dependencies.assertPersistentMutationAllowed(authorityEpoch)
+            } finally {
+                hold?.release()
             }
-            dependencies.assertPersistentMutationAllowed(authorityEpoch)
-
         },
     }
 }
@@ -1469,19 +1724,18 @@ function withoutMessages(chat: Chat): Chat {
     return metadata as Chat
 }
 
-/** Stored messages before a history window, read through the listener's lease. */
-async function readListenerMessagePrefix(
-    reader: PersistentRevisionLease,
+async function readListenerMessages(
+    reader: PersistentConversationWindowReader, revision: number, count: number,
     input: PluginChatOutputProjectionInput,
 ): Promise<Chat['message']> {
     const messages: Chat['message'] = []
-    for (let startIndex = 0; startIndex < input.windowStart; startIndex += PLUGIN_MESSAGE_QUERY_MAX_LIMIT) {
-        const limit = Math.min(PLUGIN_MESSAGE_QUERY_MAX_LIMIT, input.windowStart - startIndex)
+    for (let startIndex = 0; startIndex < count; startIndex += PLUGIN_MESSAGE_QUERY_MAX_LIMIT) {
+        const limit = Math.min(PLUGIN_MESSAGE_QUERY_MAX_LIMIT, count - startIndex)
         const page = await reader.readConversationWindow({
             characterId: input.characterId, conversationId: input.conversationId, startIndex, limit,
         })
         if (!page) throw new Error(`Missing listener conversation ${input.conversationId}`)
-        assertPinnedRevision(reader.revision, page.revision, 'Listener messages')
+        assertPinnedRevision(revision, page.revision, 'Listener messages')
         if (page.value.startIndex !== startIndex || page.value.messages.length !== limit) {
             throw new Error('Incomplete listener message page')
         }
@@ -1492,6 +1746,12 @@ async function readListenerMessagePrefix(
 
 export function createProductionPluginChatOutputProjector(
     snapshot: <T>(value: T) => T,
+    captureOwner?: (input: PluginChatOutputProjectionInput) => {
+        chat: Chat
+        messageIndex: number
+        source?: ConversationViewportSource
+        adoptRevision(revision: number): Promise<void>
+    } | null,
 ): PluginChatOutputProjector {
     let openPromise: Promise<void> | undefined
     return async (input) => {
@@ -1499,19 +1759,44 @@ export function createProductionPluginChatOutputProjector(
         await (openPromise ??= persistentStore.open().finally(() => {
             openPromise = undefined
         }))
-        const lease = await acquireCurrentRevisionWithRetry(
-            (revision) => persistentStore.acquireRevision(revision),
-            () => readCurrentRevision(persistentStore),
-        )
+        let lease: PersistentRevisionLease
+        let effective: PersistentConversationWindowReader | undefined
+        let count = 0
+        let chat: Chat
+        let messageIndex: number | undefined
+        for (;;) {
+            const owner = captureOwner?.(input)
+            if (owner && owner.messageIndex < 0) throw new Error('Listener output is no longer owned')
+            messageIndex = owner?.messageIndex
+            const view = owner?.source?.snapshot()
+            // Snapshot the row overlay and the reply's index in the same turn as its metadata.
+            effective = owner?.source?.captureProjectedReader?.({ readConversationWindow: query => lease.readConversationWindow(query) })
+            count = view?.totalMessages ?? 0
+            chat = effective ? { ...cloneConversationMetadata(owner.chat), message: [] } as Chat
+                : snapshot(owner?.chat ?? input.liveConversation)
+            if (!effective) {
+                lease = await acquireCurrentRevisionWithRetry(
+                    revision => persistentStore.acquireRevision(revision), () => readCurrentRevision(persistentStore))
+                break
+            }
+            try {
+                lease = await persistentStore.acquireRevision(view.storeRevision)
+                break
+            } catch (error) {
+                if (!(error instanceof RevisionConflictError)) throw error
+                await owner.adoptRevision(error.actualRevision)
+            }
+        }
         return withPersistentRevisionLease(lease, async (reader) => {
             const detail = await reader.readCharacter(input.characterId)
             if (!detail) throw new Error(`Missing listener character ${input.characterId}`)
             assertPinnedRevision(reader.revision, detail.revision, 'Listener character')
 
             // Store reads are already detached values; only live state is copied.
-            const chat = snapshot(input.liveConversation)
-            if (input.windowStart > 0) {
-                chat.message = (await readListenerMessagePrefix(reader, input)).concat(chat.message)
+            if (effective) {
+                chat.message = await readListenerMessages(effective, reader.revision, count, input)
+            } else if (messageIndex === undefined && input.windowStart > 0) {
+                chat.message = (await readListenerMessages(reader, reader.revision, input.windowStart, input)).concat(chat.message)
             }
             const { chats: liveChats, ...liveFields } = input.liveCharacter
             const hydrated = new Map(
@@ -1556,7 +1841,7 @@ export function createProductionPluginChatOutputProjector(
                 ...snapshot(liveFields),
                 chats,
             } as PluginCompleteCharacter
-            return { char, chat }
+            return messageIndex === undefined ? { char, chat } : { char, chat, messageIndex }
         })
     }
 }

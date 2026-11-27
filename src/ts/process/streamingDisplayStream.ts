@@ -25,6 +25,7 @@ interface ConsumeStreamingDisplayStreamOptions<T> {
         context: StreamingDisplayProcessContext,
     ): Promise<void>
     onValue?(value: T, snapshot: string): void
+    onEndOfStream?(): void | Promise<void>
     /** Runs once the stream's latest snapshot is applied, before completion-only display work. */
     beforeCompletion?(): Promise<void>
 }
@@ -70,7 +71,7 @@ export async function consumeStreamingDisplayStream<T>(
     options.abortSignal.addEventListener('abort', abort, { once: true })
     if (options.abortSignal.aborted) abort()
     try {
-        while (!aborted) {
+        while (!aborted && options.isOwned()) {
             let read: ReadableStreamReadResult<T>
             try {
                 read = await options.reader.read()
@@ -79,6 +80,11 @@ export async function consumeStreamingDisplayStream<T>(
                 if (options.abortSignal.aborted || aborted) break
                 await abortDisplay()
                 throw error
+            }
+            if (!options.isOwned()) break
+            if (read.done) {
+                const admitted = options.onEndOfStream?.()
+                if (admitted) await admitted
             }
             if (read.value !== undefined) {
                 lastValue = read.value

@@ -1,7 +1,8 @@
 import { beforeEach, expect, test, vi } from 'vitest'
+import { get } from 'svelte/store'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import type { Chat, character } from '../storage/database.svelte'
-import { DBState, selectedCharID } from '../stores.svelte'
+import { CurrentTriggerIdStore, DBState, selectedCharID } from '../stores.svelte'
 import { processMultiCommand } from './command'
 import { createConversationOperationContext } from './conversationOperationContext'
 import { createChatParserDependencyStamp } from '../chatRenderIdentity'
@@ -419,8 +420,9 @@ test.each(['runtrigger', 'v2RunTrigger'] as const)('carries preparation cancella
     expect(session.activePinReasons).toEqual([])
 })
 
-test('keeps eager Trigger metadata on its original owner after a later error', async () => {
+test.each(['manual', 'output'] as const)('keeps eager %s trigger metadata on its original owner after a later error', async mode => {
     const { chat, char, session } = fixture()
+    char.triggerscript[0].type = mode
     char.triggerscript[0].effect = [
         { type: 'setvar', var: 'state', value: '', operator: '=' },
         { type: 'v2SetAuthorNote', value: 'partial note', valueType: 'value' },
@@ -433,10 +435,13 @@ test('keeps eager Trigger metadata on its original owner after a later error', a
     } as never
     vi.mocked(processMultiCommand).mockRejectedValueOnce(new Error('command failed'))
 
-    await expect(runTrigger(char, 'manual', {
-        chat,
-        manualName: 'ordered',
-    })).rejects.toThrow('command failed')
+    CurrentTriggerIdStore.set('clicked-button')
+    try {
+        await expect(runTrigger(char, mode, {
+            chat, manualName: mode === 'manual' ? 'ordered' : undefined,
+        })).rejects.toThrow('command failed')
+        if (mode === 'output') expect(get(CurrentTriggerIdStore)).toBe('clicked-button')
+    } finally { CurrentTriggerIdStore.set(null) }
 
     expect(chat.scriptstate).toEqual({ '$state': '' })
     expect(chat.note).toBe('partial note')

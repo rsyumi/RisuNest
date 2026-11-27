@@ -1,3 +1,4 @@
+import type { OutputPluginDispatch } from "../request/request";
 import { MCPClientLike } from "./internalmcp";
 import type { MCPTool, RPCToolCallContent } from "./mcplib";
 
@@ -23,12 +24,20 @@ export class CustomPluginMCPClient extends MCPClientLike {
         this.#callTool = arg.callTool;
     }
 
-    async getToolList() {
+    async getToolList(dispatch?: OutputPluginDispatch) {
+        if (dispatch && this.#getToolList) {
+            await dispatch.beforePlugin();
+            dispatch.signal.throwIfAborted();
+        }
         if (!this.#getToolList) return [];
         return await this.#getToolList();
     }
 
-    async callTool(toolName: string, args: any) {
+    async callTool(toolName: string, args: any, dispatch?: OutputPluginDispatch) {
+        if (dispatch && this.#callTool) {
+            await dispatch.beforePlugin();
+            dispatch.signal.throwIfAborted();
+        }
         if (!this.#callTool) throw new Error('Plugin MCP is no longer registered');
         return await this.#callTool(toolName, args);
     }

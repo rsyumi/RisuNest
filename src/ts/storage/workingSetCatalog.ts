@@ -451,7 +451,7 @@ export interface PinnedScalableWorkingSetOptions {
     prepareRoot?: (root: PersistentRoot) => Promise<PersistentRoot>
 }
 
-async function readPinnedConversationSummaries(
+export async function readPinnedConversationSummaries(
     reader: PersistentRevisionReader,
     characterId: string,
 ): Promise<ConversationSummary[]> {

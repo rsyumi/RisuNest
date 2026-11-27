@@ -10,6 +10,7 @@ const openPhases = new Map<string, number>()
 const patchesInFlight = new Map<string, Set<Promise<void>>>()
 interface PublicWriteObserver {
     prepare(): (() => boolean) | null
+    prepareMetadataPatch?(expectedRevision: number): ((durableRevision: number) => Promise<void>) | null
     invalidate(): void
     adopt(receipt: PersistentUnitIntentProjectionReceipt): Promise<void>
 }
@@ -40,6 +41,17 @@ export function openGenerationRequestPhase(target: GeneratingConversation, publi
         if (publicWrites) observers.delete(publicWrites)
         if (!observers.size && publicWriteObservers.get(identity) === observers) publicWriteObservers.delete(identity)
     }
+}
+
+/** A request may reload its input window after an admitted plugin-field-only patch. */
+export function prepareGenerationMetadataPatch(target: GeneratingConversation, expectedRevision: number) {
+    const accepted = [...publicWriteObservers.get(key(target)) ?? []].flatMap(observer => {
+        const adopt = observer.prepareMetadataPatch?.(expectedRevision)
+        return adopt ? [adopt] : []
+    })
+    return accepted.length ? async (durableRevision: number) => {
+        for (const adopt of accepted) await adopt(durableRevision)
+    } : null
 }
 
 /** Public setters retain their write semantics and let an admitted request adopt their result. */

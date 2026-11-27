@@ -48,11 +48,14 @@ import { beginDisplayScriptRun, getDisplayRegexTimeoutScope, noticeRegexTimeout 
 import { nextDisplayListenerOrder } from "./luaDisplayTimeouts";
 import { displayRecoveryTarget, isDisplayRecoveryMarked } from "../displayRecovery.svelte";
 import { openHistoryWindowCopy, writeHistoryWindowMessage, type HistoryWindowCopy } from "./historyWindowWrite";
+import type { GenerationScriptPosition } from "./generationOutputPhase";
+import { isConversationStop } from "./conversationStop";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 
 export interface ProcessScriptOptions {
     onConversationCommit?: ConversationCommitObserver
+    outputPosition?: GenerationScriptPosition
     cache?: 'normal' | 'bypass'
     signal?: AbortSignal
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
@@ -651,21 +654,10 @@ async function processScriptFullWithOwner(
 async function processScriptFullImpl(char:character|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     options.signal?.throwIfAborted()
     const captureContext = options.captureContext
-    let preparedHistory = captureContext?.parserContext.historyAccess ?? options.invocationContext?.parser?.historyAccess
-    const prepareHistory = captureContext?.parserContext.prepareHistory ?? options.invocationContext?.prepareHistory
-    let historyPreparationError: unknown
-    const prepareFor = async (value: string) => {
-        if (!prepareHistory) return
-        try { preparedHistory = await prepareHistory(value, chatID, false) }
-        catch (error) { historyPreparationError = error; throw error }
-        options.signal?.throwIfAborted()
-    }
-    options.signal?.throwIfAborted()
     const invocation = options.invocationContext
     if (invocation && mode !== 'editprocess') throw new Error('Owned script invocations require editprocess mode')
     const promptOperationScope = captureContext ? undefined : options.promptOperationScope
-    let db = captureContext?.parserContext.database ?? invocation?.database ?? promptOperationScope?.database ?? getDatabase()
-    let emoChanged = false
+    const db = captureContext?.parserContext.database ?? invocation?.database ?? promptOperationScope?.database ?? getDatabase()
     // A chat that froze the app while its display ran opens without the Modify Display step.
     const displayRecovery = mode === 'editdisplay' &&
         isDisplayRecoveryMarked(displayRecoveryTarget(() => getCurrentCharacter(), char.chaId))
@@ -704,7 +696,7 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     }
     options.signal?.throwIfAborted()
 
-    let conversationOwner = captureContext || invocation
+    const conversationOwner = captureContext || invocation
         ? null
         : promptOperationScope?.getOwner() ?? captureScriptConversationOwner(char)
     const usesPluginCompatibility = !captureContext && !displayRecovery &&
@@ -713,10 +705,10 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         !promptOperationScope?.usesPluginCompatibility && conversationOwner?.session
         ? conversationOwner.session.acquirePin('compatibility')
         : null
-    if(usesPluginCompatibility){
-        // A plugin hook can read chat variables without notice.
-        options.variableReads?.markUntracked()
-        try {
+    try {
+        if (usesPluginCompatibility) {
+            // A plugin hook can read chat variables without notice.
+            options.variableReads?.markUntracked()
             for(const plugin of pluginV2[mode]){
                 const res = await plugin(data)
                 options.signal?.throwIfAborted()
@@ -724,12 +716,41 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                     data = res
                 }
             }
-        } catch (error) {
-            compatibilityPin?.release()
-            throw error
         }
+        // Lua and plugin listeners have already run for this snapshot. Only a history
+        // read invalidated by another session edit needs the regex pass again.
+        const context = { db, conversationOwner, compatibilityPin, displayRecovery }
+        for (;;) {
+            options.signal?.throwIfAborted()
+            const result = await applyScriptRegex(char, data, mode, chatID, cbsConditions, options, context)
+            if (result !== null) return result
+        }
+    } finally {
+        compatibilityPin?.release()
     }
+}
 
+async function applyScriptRegex(
+    char: character | simpleCharacterArgument, data: string, mode: ScriptMode, chatID: number,
+    cbsConditions: CbsConditions, options: ProcessScriptOptions,
+    { db, conversationOwner, compatibilityPin, displayRecovery }: {
+        db: Database, conversationOwner: ScriptConversationOwner | null,
+        compatibilityPin: ActiveConversationPin | null, displayRecovery: boolean,
+    },
+) {
+    const captureContext = options.captureContext
+    const invocation = options.invocationContext
+    const promptOperationScope = captureContext ? undefined : options.promptOperationScope
+    let preparedHistory = captureContext?.parserContext.historyAccess ?? invocation?.parser?.historyAccess
+    const prepareHistory = captureContext?.parserContext.prepareHistory ?? invocation?.prepareHistory
+    let historyPreparationError: unknown
+    const prepareFor = async (value: string) => {
+        if (!prepareHistory) return
+        try { preparedHistory = await prepareHistory(value, chatID, false) }
+        catch (error) { historyPreparationError = error; throw error }
+        options.signal?.throwIfAborted()
+    }
+    let emoChanged = false
     let scripts: customscript[]
     let plan: ReturnType<typeof getRegexExecutionPlan>
     let conversationOperation: ConversationOperationContext | null = null
@@ -737,6 +758,14 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     let readPin: ActiveConversationPin | null = null
     let windowCopy: HistoryWindowCopy | null = null
     try {
+        if (options.outputPosition) {
+            const position = options.outputPosition
+            const ready = !position.refresh || await position.refresh()
+            const index = ready ? position.index() : null
+            if (index === null) return { data, emoChanged }
+            chatID = index
+            conversationOwner = captureScriptConversationOwner(char)
+        }
         const globalRegexOff = isStartupExcluded(
             'regex',
             getStartupExclusions(),
@@ -790,7 +819,6 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
     } catch (error) {
         conversationOperation?.release()
         readPin?.release()
-        compatibilityPin?.release()
         throw error
     }
     const needsConversationOperation = conversationAccess === 'mutating'
@@ -855,23 +883,37 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                 : undefined,
         }))
     let conversationOperationCommitted = false
-    const finish = <T>(result: T): T => {
+    const retryableRead = !!options.outputPosition && conversationAccess === 'read-only' && !!conversationOwner?.session
+    let pendingEmotions: [string, string, number][] | undefined
+    const finish = <T>(result: T): T | null => {
         options.signal?.throwIfAborted()
         invocation?.parser?.historyAccess?.assertComplete()
         preparedHistory?.assertComplete()
         if (windowCopy) {
-            if (!windowCopy.commit()) throw new ConversationSessionInactiveError()
+            if (!windowCopy.commit() && options.outputPosition?.index() == null) {
+                throw new ConversationSessionInactiveError()
+            }
             windowCopy = null
         }
         if (conversationOperation && ownsConversationOperation) {
-            conversationOperation.commit(peekActiveConversationSession(), {
-                origin: mode === 'editdisplay' ? 'display' : undefined,
-            })
+            try {
+                conversationOperation.commit(peekActiveConversationSession(), {
+                    origin: mode === 'editdisplay' ? 'display' : undefined,
+                })
+            } catch (error) {
+                if (!isConversationStop(error) || options.outputPosition?.index() == null) throw error
+            }
             conversationOperationCommitted = true
         }
         else if (conversationAccess === 'read-only' && conversationOwner) {
-            requireScriptConversationOwner(conversationOwner)
+            try {
+                requireScriptConversationOwner(conversationOwner)
+            } catch (error) {
+                if (error instanceof ConversationSessionStaleError && options.outputPosition?.index() != null) return null
+                throw error
+            }
         }
+        if (pendingEmotions) for (const emotion of pendingEmotions) recordScriptEmotion(char.chaId, emotion)
         return result
     }
 
@@ -880,7 +922,8 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
         ...scripts.filter((script) => script.type === mode && script.flag?.includes('<cbs>')).map((script) => script.in),
     ].join('\n'))
     data = parseCbs(data)
-    const useResultCache = options.cache !== 'bypass'
+    // A history-dependent replacement can change with the session even for the same input and index.
+    const useResultCache = options.cache !== 'bypass' && !retryableRead
     const hash = useResultCache
         ? generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions, parseCbs)
         : undefined
@@ -950,21 +993,12 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
                 if(await regex('test')){
                     if(outScript.startsWith('@@emo ')){
                         const emoName = script.out.substring(6).trim()
-                        let charemotions = get(CharEmotion)
-                        let tempEmotion = charemotions[char.chaId]
-                        if(!tempEmotion){
-                            tempEmotion = []
-                        }
-                        if(tempEmotion.length > 4){
-                            tempEmotion.splice(0, 1)
-                        }
                         if(char.type !== 'simple'){
                             for(const emo of char.emotionImages){
                                 if(emo[0] === emoName){
                                     const emos:[string, string,number] = [emo[0], emo[1], Date.now()]
-                                    tempEmotion.push(emos)
-                                    charemotions[char.chaId] = tempEmotion
-                                    CharEmotion.set(charemotions)
+                                    if (retryableRead) (pendingEmotions ??= []).push(emos)
+                                    else recordScriptEmotion(char.chaId, emos)
                                     emoChanged = true
                                     break
                                 }
@@ -1196,8 +1230,15 @@ async function processScriptFullImpl(char:character|simpleCharacterArgument, dat
             conversationOperation.release()
         }
         readPin?.release()
-        compatibilityPin?.release()
     }
+}
+
+function recordScriptEmotion(characterId: string, emotion: [string, string, number]) {
+    const emotions = get(CharEmotion)
+    const history = emotions[characterId] ??= []
+    if (history.length > 4) history.shift()
+    history.push(emotion)
+    CharEmotion.set(emotions)
 }
 
 

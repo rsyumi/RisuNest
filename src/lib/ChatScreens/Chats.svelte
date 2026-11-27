@@ -1877,6 +1877,17 @@
         if (!conversationId) return
         for (const draft of pendingEditorDrafts(currentCharacter.chaId, conversationId)) {
             if (relocatingDrafts.has(draft)) continue
+            if (draft.intent?.windowedEditor) {
+                const position = draft.intent.windowedEditor.location()
+                if (position === undefined) {
+                    relocatingDrafts.add(draft)
+                    const settled = () => { relocatingDrafts.delete(draft); if (!destroyed) reconcileViewport() }
+                    void draft.intent.windowedEditor.controller.then(settled, settled)
+                    continue
+                }
+                if (position === null) { discardEditorDraft(currentCharacter.chaId, conversationId, draft); continue }
+                draft.index = position
+            }
             const key = currentMessageKey(draft.index, sourceSnapshot)
             if (key === undefined) {
                 relocateEditorDraft(conversationId, draft)
@@ -1888,7 +1899,7 @@
             blurredEditorPins.add(key)
             const message = sourceSnapshot ? sourceSnapshot.rowAt(draft.index)?.message : messages?.[draft.index]
             if (!message) continue
-            if (!isEqual(message, draft.evidence)) {
+            if (!draft.intent?.windowedEditor && !isEqual(message, draft.evidence)) {
                 relocateEditorDraft(conversationId, draft)
                 continue
             }

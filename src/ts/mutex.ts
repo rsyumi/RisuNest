@@ -23,9 +23,24 @@ export class Mutex {
      * Wait until the lock is acquired.
      * @returns A function that releases the acquired lock.
      */
-    acquire() {
-        return new Promise<ReleaseFunction>((resolve) => {
-            this._queue.push({resolve})
+    acquire(signal?: AbortSignal) {
+        return new Promise<ReleaseFunction>((resolve, reject) => {
+            signal?.throwIfAborted()
+            if (signal && this._isLocked) {
+                const waiter = { resolve: (release: ReleaseFunction) => {
+                    signal.removeEventListener('abort', cancel)
+                    resolve(release)
+                } }
+                const cancel = () => {
+                    const index = this._queue.indexOf(waiter)
+                    if (index !== -1) this._queue.splice(index, 1)
+                    reject(signal.reason)
+                }
+                this._queue.push(waiter)
+                signal.addEventListener('abort', cancel, { once: true })
+                return
+            }
+            this._queue.push({ resolve })
             this._dispatch()
         });
     }

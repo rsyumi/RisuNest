@@ -140,7 +140,7 @@ describe('LWW renderer save path', () => {
         for (const chat of added.chats) expect((await store.readConversation(added.chaId, chat.id!))!.value.message).toEqual(chat.message)
     })
 
-    it('persists windowed recency and retains selected rows across an unrelated receive with later reads', async () => {
+    it('persists windowed recency and reads the latest rows when a receive reports only another character', async () => {
         const factory = new IDBFactory()
         const name = `recency-unrelated-receive-${crypto.randomUUID()}`
         const store = new IndexedDbPersistentDataStore(name, factory, IDBKeyRange) as PersistentDataStore
@@ -182,21 +182,23 @@ describe('LWW renderer save path', () => {
         const source = runtime.getActiveConversationViewportSource()!
         await source.ensureRange({ startIndex: 0, limit: 2, reason: 'viewport' })
         const pin = source.acquireRangePin(0, 2, 'editor')
-        const snapshot = source.snapshot()
-        const row = snapshot.rowAt(0)
+        expect(source.snapshot().rowAt(0)?.message.data).toBe('synthetic-0')
+        await reopened.commit({ expectedRevision: runtime.revision, conversations: [{
+            type: 'replace-range', characterId: 'selected', conversationId: 'selected-chat', start: 0, deleteCount: 1,
+            messages: [{ role: 'user', chatId: 'message-0', data: 'Other connection' }],
+        }] })
         let mutations: NonNullable<WorkingSetCommit['unitMutations']> = [{ key: '["character","other","name"]', type: 'set', value: 'Received other' }]
         store.lwwStageReceive = async () => undefined
         store.lwwApplyReceive = async () => {
-            const result = await store.commit({ expectedRevision: runtime.revision, unitMutations: mutations })
+            const result = await store.commit({ expectedRevision: (await store.readRoot()).revision, unitMutations: mutations })
             return { ...result, affectedKeys: mutations.map((value) => value.key), heldKeys: [], deferredKeys: [] }
         }
         store.lwwFinishReceive = async () => undefined
         const receive = () => runtime.applyLwwReceive({ bindingAuthority: '1', requestId: crypto.randomUUID(), changes: [], progress: { kind: 'server', cursor: '1' }, admittedTimeUpperMs: '100' })
         await receive()
         expect(runtime.getActiveConversationViewportSource()).toBe(source)
-        expect(source.snapshot().version).toBe(snapshot.version)
-        expect(source.snapshot().rowAt(0)).toBe(row)
-        expect(source.snapshot().keyAt(0)).toBe(snapshot.keyAt(0))
+        await source.ensureRange({ startIndex: 0, limit: 2, reason: 'viewport' })
+        expect(source.snapshot().rowAt(0)?.message.data).toBe('Other connection')
         expect(source.snapshot().storeRevision).toBe(runtime.revision)
         expect(runtime.captureSelectedConversationTarget()!.storeRevision).toBe(runtime.revision)
         await source.ensureRange({ startIndex: 8, limit: 2, reason: 'viewport' })
@@ -207,7 +209,7 @@ describe('LWW renderer save path', () => {
             { key: '["conversation","selected","selected-chat","authorNotePreset"]', type: 'set', value: link },
         ]
         await receive()
-        expect(runtime.getActiveConversationViewportSource()).not.toBe(source)
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
         expect(selected().chats[0].note).toBe('Received note')
         expect(selected().chats[0].authorNotePreset).toEqual(link)
         const afterReceiveRevision = runtime.revision
@@ -276,7 +278,7 @@ describe('LWW renderer save path', () => {
     })
 
     it('captures receive baselines only for a pull that carries changes', async () => {
-        const {store,runtime} = await runtimeHarness()
+        const {database,store,runtime} = await runtimeHarness()
         const materialized = vi.spyOn(SaveCoordinator.prototype,'captureMaterializedBaseline')
         const presetRecords = vi.spyOn(SaveCoordinator.prototype,'capturePresetRecordBaseline')
         try {
@@ -287,9 +289,15 @@ describe('LWW renderer save path', () => {
             await runtime.applyLwwReceive(request([]))
             expect(materialized).not.toHaveBeenCalled()
             expect(presetRecords).not.toHaveBeenCalled()
-            await runtime.applyLwwReceive(request([{key:'["character","char-a","notes"]',stamp:{physicalMs:'1',logical:'0',writerId:'remote'},value:{kind:'inline',bytes:'InJlbW90ZSI='}}]))
+            const key = '["character","char-a","notes"]'
+            store.lwwApplyReceive = async () => {
+                const {revision} = await store.commit({expectedRevision:runtime.revision,unitMutations:[{key,type:'set',value:'remote'}]})
+                return {revision,affectedKeys:[key],heldKeys:[],deferredKeys:[]}
+            }
+            await runtime.applyLwwReceive(request([{key,stamp:{physicalMs:'1',logical:'0',writerId:'remote'},value:{kind:'inline',bytes:'InJlbW90ZSI='}}]))
             expect(materialized).toHaveBeenCalledOnce()
             expect(presetRecords).toHaveBeenCalledOnce()
+            expect(database.characters.find(value => value.chaId === 'char-a')?.notes).toBe('remote')
         } finally {
             materialized.mockRestore()
             presetRecords.mockRestore()

@@ -57,7 +57,15 @@ export interface AcquiredMessageMutationTarget {
     release(): void
 }
 
+export interface PreparedWindowedMessageEditor {
+    readonly controller: Promise<WindowedConversationMutationController | null>
+    location(): number | null | undefined
+    retain(): PreparedWindowedMessageEditor
+    release(): void
+}
+
 export interface SelectedConversationMessageEditIntent {
+    readonly windowedEditor?: PreparedWindowedMessageEditor
     readonly selection: SelectedConversationTarget
     readonly absoluteIndex: number
     readonly sourceToken: string
@@ -140,14 +148,14 @@ export function createSelectedConversationOperations(
         async acquireMessageMutation(input, reason) {
             const intent = this.captureMessageEditIntent(input)
             if (!intent) return null
-            const controller = await dependencies.captureWindowedMessageMutation?.(intent.selection, input.absoluteIndex, intent.messageEvidence)
-            if (controller) {
-                const current = dependencies.captureCurrent()
-                if (!current || !controller.isCurrent()) { controller.release(); return null }
-                return { target: { ...current, kind: 'windowed' as const, session: null, locator: null,
-                    absoluteIndex: input.absoluteIndex, message: controller.chat.message[0], controller }, release: () => controller.release() }
+            try {
+                const acquired = await this.acquireCompleteMessageTargetForIntent(intent, reason)
+                if (!acquired) { intent.windowedEditor?.release(); return null }
+                return { target: acquired.target, release() { acquired.release(); intent.windowedEditor?.release() } }
+            } catch (error) {
+                intent.windowedEditor?.release()
+                throw error
             }
-            return this.acquireCompleteMessageTargetForIntent(intent, reason)
         },
         async withCompleteSelectedConversation<T>(reason, operation): Promise<T | null> {
             const started = await startCompleteConversation(
@@ -199,7 +207,40 @@ export function createSelectedConversationOperations(
             } catch {
                 return null
             }
+            let windowedEditor: SelectedConversationMessageEditIntent['windowedEditor']
+            if (!dependencies.getCurrentSession() && dependencies.captureWindowedMessageMutation) {
+                let controller: WindowedConversationMutationController | null | undefined
+                let references = 0
+                const preparation = dependencies.captureWindowedMessageMutation(selection, input.absoluteIndex, messageEvidence).then(value => {
+                    if (!references) value?.release()
+                    controller = references ? value : null
+                    return controller
+                })
+                // Preparation begins on editor open. The save or remount observes its rejection.
+                void preparation.catch(() => { controller = null })
+                const location = () => {
+                    if (!references) return null
+                    if (!controller) {
+                        // A compound editor may promote only while its captured row key still holds.
+                        const live = dependencies.getCurrentViewportSource()?.snapshot()
+                        return live?.sourceToken === input.sourceToken && live.keyAt(input.absoluteIndex) === input.rowKey
+                            ? input.absoluteIndex : controller === undefined ? undefined : null
+                    }
+                    return controller.editorRow?.()?.absoluteIndex ?? (controller.isCurrent() ? input.absoluteIndex : null)
+                }
+                const retain = (): PreparedWindowedMessageEditor => {
+                    references++
+                    let released = false
+                    return { controller: preparation, location, retain, release() {
+                        if (released) return
+                        released = true
+                        if (--references === 0) controller?.release()
+                    } }
+                }
+                windowedEditor = retain()
+            }
             return Object.freeze({
+                ...(windowedEditor ? { windowedEditor } : {}),
                 selection,
                 absoluteIndex: input.absoluteIndex,
                 sourceToken: input.sourceToken,
@@ -210,7 +251,7 @@ export function createSelectedConversationOperations(
         },
 
         rebindMessageEditIntent(intent, input) {
-            if (!isEqual(intent.messageEvidence, input.message)) return intent
+            if (intent.windowedEditor || !isEqual(intent.messageEvidence, input.message)) return intent
             const rebound = this.captureMessageEditIntent(input)
             if (!rebound || !matchesConversation(intent.selection, rebound.selection)) return intent
             return Object.freeze({ ...rebound, messageEvidence: intent.messageEvidence })
@@ -225,13 +266,17 @@ export function createSelectedConversationOperations(
             if (!selection || !matchesConversation(intent.selection, selection)) {
                 throw new SelectedConversationPromotionStaleError()
             }
-            const controller = await dependencies.captureWindowedMessageMutation?.(selection, intent.absoluteIndex, intent.messageEvidence)
+            const editor = intent.windowedEditor
+            const controller = editor ? await editor.controller :
+                await dependencies.captureWindowedMessageMutation?.(selection, intent.absoluteIndex, intent.messageEvidence)
             if (controller) {
                 const current = dependencies.captureCurrent()
-                if (!current || !controller.isCurrent()) { controller.release(); return null }
+                if (!current || !controller.isCurrent()) { if (!editor) controller.release(); return null }
+                const row = controller.editorRow?.() ?? { absoluteIndex: intent.absoluteIndex, message: controller.chat.message[0] }
                 return { target: { ...current, kind: 'windowed' as const, session: null, locator: null,
-                    absoluteIndex: intent.absoluteIndex, message: controller.chat.message[0], controller }, release: () => controller.release() }
+                    ...row, controller }, release: () => { if (!editor) controller.release() } }
             }
+            if (editor && editor.location() !== intent.absoluteIndex) return null
             const acquired = await acquireCompleteMessageTarget(
                 selection,
                 intent.absoluteIndex,
