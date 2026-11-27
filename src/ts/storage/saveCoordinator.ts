@@ -4226,6 +4226,8 @@ export class SaveCoordinator {
                     const prepared = await withPersistentRevisionLease(await this.dependencies.store.acquireRevision(revision), async (reader) => {
                         await this.prepareWindowedRevision(revision, reader)
                         if (this.windowedCharacterBaseline !== baseline) return null
+                        // The stored count below is the overlay's, which holds only at the overlay's own revision.
+                        if (overlay.revision !== revision) throw new Error('Selected conversation revision was not prepared')
                         const stored = baseline.shell.chats.find((chat) => chat.id === authority.conversationId)!
                         const metadata = mergeWindowedMetadata(expectedMetadata, localMetadata, stored)
                         const units = diffFields(['conversation', authority.characterId, authority.conversationId], stored, metadata)
