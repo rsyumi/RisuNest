@@ -664,6 +664,7 @@ export interface PreparedUnitPublicationLifecycle {
     committed(revision: DataRevision): void
     /** Releases the unpublished operation when its authority is retired. */
     retire(): void
+    saveFailed?(error: unknown): void
 }
 
 export interface PreparedUnitIntent {
@@ -1519,15 +1520,20 @@ export class SaveCoordinator {
         return this.enqueue(() => this.observeNewHead(Math.max(this.revision, revision)))
     }
 
-    withLiveConversationWrite<T>(reason: string, operation: () => Promise<T>): Promise<T> {
+    private async flushForWrite(reason: string, saveFailed?: (error: unknown) => void): Promise<void> {
+        try { await this.flushIterations(reason, false) }
+        catch (error) { saveFailed?.(error); throw error }
+    }
+
+    withLiveConversationWrite<T>(reason: string, operation: () => Promise<T>, saveFailed?: (error: unknown) => void): Promise<T> {
         this.assertPersistentMutationAllowed()
         return this.enqueue(async () => {
             await this.readAtCurrentHead(async (revision) => withPersistentRevisionLease(
                 await this.dependencies.store.acquireRevision(revision), async (reader) => this.assertReadRevision(revision, reader.revision),
             ))
-            await this.flushIterations(reason, false)
+            await this.flushForWrite(reason, saveFailed)
             const result = await this.readAtCurrentHead(operation)
-            await this.flushIterations(reason, false)
+            await this.flushForWrite(reason, saveFailed)
             return result
         })
     }
@@ -5833,7 +5839,7 @@ export class SaveCoordinator {
         const ranges = canonicalClone([...conversations])
         const messages = canonicalClone([...wholeMessages])
         return this.enqueue(async () => {
-            await this.flushIterations(reason, false)
+            await this.flushForWrite(reason, check?.saveFailed)
             if (!mutations.length && !ranges.length && !messages.length) return this.revision
             return (await this.commitUnitIntentAttempts(async (revision) => {
                 const replacements: ConversationMutation[] = []
@@ -5859,7 +5865,8 @@ export class SaveCoordinator {
     commitPreparedUnitIntent(reason: string, prepare: (revision: DataRevision) => Promise<PreparedUnitIntent | null>, onCommitted?: (revision: DataRevision) => Promise<void>, flushAfterCommit = false, lifecycle?: PreparedUnitPublicationLifecycle): Promise<DataRevision | null> {
         this.assertPersistentMutationAllowed()
         return this.enqueue(async () => {
-            await this.flushIterations(reason, false)
+            const flush = () => this.flushForWrite(reason, lifecycle?.saveFailed)
+            await flush()
             let accepted: PreparedUnitIntent | null = null
             const result = await this.commitUnitIntentAttempts(async (revision) => {
                 const prepared = await prepare(revision)
@@ -5868,8 +5875,8 @@ export class SaveCoordinator {
             }, async revision => {
                 await onCommitted?.(revision)
                 if (flushAfterCommit && accepted) this.acknowledgeCompleteGenerationPatch(accepted, revision)
-            }, undefined, flushAfterCommit ? () => this.flushIterations(reason, false) : undefined, lifecycle)
-            if (flushAfterCommit && result !== null) await this.flushIterations(reason, false)
+            }, undefined, flushAfterCommit ? flush : undefined, lifecycle)
+            if (flushAfterCommit && result !== null) await flush()
             return result
         })
     }
@@ -5878,6 +5885,7 @@ export class SaveCoordinator {
         while (true) {
             const revision = this.revision
             let committedRevision: DataRevision | undefined
+            let saving = false
             try {
                 const prepared = await prepare(revision)
                 if (!prepared || (!prepared.unitMutations.length && !prepared.conversations.length)) {
@@ -5888,6 +5896,7 @@ export class SaveCoordinator {
                     return prepared ? revision : null
                 }
                 check?.validate()
+                saving = true
                 const result = await this.commitAtRevision({ expectedRevision: revision, unitMutations: [...prepared.unitMutations], conversations: [...prepared.conversations] })
                 committedRevision = result.revision
                 this.currentRevision = result.revision
@@ -5908,7 +5917,10 @@ export class SaveCoordinator {
                 })
                 return result.revision
             } catch (error) {
-                if (committedRevision !== undefined || !(error instanceof RevisionConflictError) || error.actualRevision <= revision) throw error
+                if (committedRevision !== undefined || !(error instanceof RevisionConflictError) || error.actualRevision <= revision) {
+                    if (saving) (check?.saveFailed ?? lifecycle?.saveFailed)?.(error)
+                    throw error
+                }
                 await this.observeNewHead(error.actualRevision)
                 await beforeRetry?.()
             }

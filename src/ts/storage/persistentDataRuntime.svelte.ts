@@ -821,8 +821,8 @@ export const commitPersistentUnitIntent: PersistentDataRuntime['commitPersistent
 export const commitPreparedUnitIntent: PersistentDataRuntime['commitPreparedUnitIntent'] = (reason, prepare, applyToLive, lifecycle) =>
     getPersistentDataRuntime().commitPreparedUnitIntent(reason, prepare, applyToLive, lifecycle)
 export const withPausedPersistentWrites = <T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T> => getPersistentDataRuntime().withPausedPersistentWrites(reason, operation)
-export const withLiveConversationWrite: PersistentDataRuntime['withLiveConversationWrite'] = (reason, operation) =>
-    getPersistentDataRuntime().withLiveConversationWrite(reason, operation)
+export const withLiveConversationWrite: PersistentDataRuntime['withLiveConversationWrite'] = (reason, operation, saveFailed) =>
+    getPersistentDataRuntime().withLiveConversationWrite(reason, operation, saveFailed)
 
 export const beginActivatedLibraryGuard = (token: PersistentMutationToken) => getPersistentDataRuntime().beginActivatedLibraryGuard(token)
 

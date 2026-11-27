@@ -8,7 +8,7 @@ import ts from 'typescript'
 /** Node's real message boundary, using the same worker entry and WASM as the browser. */
 export async function nodeLuaWorkers(options: { failWasm?: boolean } = {}) {
     const directory = await mkdtemp(join(tmpdir(), 'risunest-lua-worker-'))
-    const names = ['luaWorkerProtocol', 'luaExecutionBudget', 'luaAsyncifyRuntime', 'luaWorker']
+    const names = ['luaWorkerProtocol', 'luaExecutionBudget', 'luaAsyncifyModule', 'luaAsyncifyRuntime', 'luaWorker']
     const wasmoon = pathToFileURL(resolve('node_modules/wasmoon/dist/index.js')).href
     for (const name of names) {
         const source = await readFile(resolve(`src/ts/process/${name}.ts`), 'utf8')

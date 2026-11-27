@@ -382,7 +382,7 @@ export interface PersistentUnitIntentProjectionObserver {
 
 export interface PersistentDataRuntime {
     adoptObservedRevision(revision: DataRevision): Promise<void>
-    withLiveConversationWrite<T>(reason: string, operation: () => Promise<T>): Promise<T>
+    withLiveConversationWrite<T>(reason: string, operation: () => Promise<T>, saveFailed?: (error: unknown) => void): Promise<T>
     withPausedPersistentWrites<T>(reason: string, operation: (token: PersistentMutationToken) => Promise<T>): Promise<T>
     beginActivatedLibraryGuard(token: PersistentMutationToken): PersistentActivatedLibraryGuard
     setActivatedLibraryRecoveryLifecycle(token: PersistentMutationToken, lifecycle: ActivatedLibraryRecoveryLifecycle): void
@@ -1326,7 +1326,7 @@ export function createPersistentDataRuntime(
     const runtime: PersistentDataRuntime = {
         store: dependencies.store,
         adoptObservedRevision: (revision) => coordinator.adoptObservedRevision(revision),
-        withLiveConversationWrite: (reason, operation) => coordinator.withLiveConversationWrite(reason, operation),
+        withLiveConversationWrite: (reason, operation, saveFailed) => coordinator.withLiveConversationWrite(reason, operation, saveFailed),
         withPausedPersistentWrites: (reason, operation) => coordinator.withPausedPersistentWrites(reason, operation),
         setActivatedLibraryRecoveryLifecycle(token, lifecycle) {
             const guard = activatedLibraryGuard

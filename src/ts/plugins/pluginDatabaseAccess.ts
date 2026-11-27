@@ -676,7 +676,7 @@ export function createPluginDatabaseAccess(
     const routeGeneratingWrite = async (
         reason: string, target: SelectedConversationTarget | null, changes: Changes,
         assertCurrent: () => void, reserved: GenerationOutputWrite | null, lite = false,
-    ): Promise<boolean> => {
+    ): Promise<false | Pick<PluginStorageWriteCheck, 'saveFailed'>> => {
         reserved?.assertIntervalOwner()
         if (!target || !dependencies.getLiveRuntime) return false
         const runtime = dependencies.getLiveRuntime()
@@ -693,6 +693,8 @@ export function createPluginDatabaseAccess(
                 !metadataFields.some(entry => entry.unit === unit)
         }))) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
         let local: GenerationOutputWrite | undefined
+        const saveFailed = whole || metadataFields.length
+            ? (error: unknown) => (reserved ?? local)?.failIntervalSave(error) : undefined
         try {
             for (;;) {
                 const result = await runtime.withLiveConversationWrite(reason, async () => {
@@ -749,7 +751,7 @@ export function createPluginDatabaseAccess(
                         }) : []
                     if (reroll?.phase === 'generating') metadata.rerollRecovery = rerollAfterPluginRanges(reroll, ranges)
                     return applyGenerationConversationRanges(selected, shell, phase, ranges, metadata, runtime) ? true : { retry: true }
-                })
+                }, saveFailed)
                 if (typeof result !== 'boolean') {
                     if ('wait' in result) await result.wait
                     continue
@@ -759,7 +761,7 @@ export function createPluginDatabaseAccess(
                     changes.units = changes.units.filter(unit => !routed.has(unit))
                     changes.wholeMessages = changes.wholeMessages.filter(intent => intent !== whole)
                 }
-                return result
+                return result && { saveFailed }
             }
         } finally {
             local?.release()
@@ -967,6 +969,10 @@ export function createPluginDatabaseAccess(
         const phase = target && dependencies.getLiveRuntime && getGenerationOutputPhase(target)
         return phase?.scriptRunning ? phase.holdWrite() : null
     }
+    const flushScopedSetter = async (write: GenerationOutputWrite | null) => {
+        try { await dependencies.flushPendingData('plugin-full-object-write') }
+        catch (error) { write?.failIntervalSave(error); throw error }
+    }
     const acquireSelectedLease = async (
         selectedTarget: SelectedConversationTarget | null,
         characterId: string,
@@ -1048,10 +1054,11 @@ export function createPluginDatabaseAccess(
             const current = dependencies.getLiveRuntime ? dependencies.captureSelectedConversationTarget() : selected
             const scoped = current?.characterId === target.characterId &&
                 (conversationId === undefined || current.conversationId === conversationId) ? current : null
-            if (await routeGeneratingWrite(reason, scoped, changes, assertCurrent, reserved)) {
+            const routed = await routeGeneratingWrite(reason, scoped, changes, assertCurrent, reserved)
+            if (routed) {
                 if (changes.units.length || changes.wholeMessages.length)
                     await dependencies.commitPersistentUnitIntent(reason, changes.units, [], changes.wholeMessages, undefined,
-                        { validate: assertCurrent, committed() {} })
+                        { ...routed, validate: assertCurrent, committed() {} })
                 return true
             }
             const assertOrdinary = () => {
@@ -1206,7 +1213,8 @@ export function createPluginDatabaseAccess(
                 const selectedBoundary = captureSelectedCallBoundary()
                 throwIfFullObjectCallAborted(context.signal)
                 const intents = readBaselines.intent(candidate, 'character', candidate.chaId, admission ? await admission : {})
-                await dependencies.flushPendingData('plugin-full-object-write')
+                const changesChat = intents.some(intent => intent.path[0] === 'chats' && intent.path[1] === selectedBoundary.target?.conversationId)
+                await flushScopedSetter(changesChat && candidate.chaId === selectedBoundary.characterId ? hold : null)
                 throwIfFullObjectCallAborted(context.signal)
                 dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                 const characterId = selectedBoundary.characterId
@@ -1245,7 +1253,8 @@ export function createPluginDatabaseAccess(
                 const selectedBoundary = captureSelectedCallBoundary()
                 throwIfFullObjectCallAborted(context.signal)
                 const intents = readBaselines.intent(candidate, 'character', candidate.chaId, admission ? await admission : {})
-                await dependencies.flushPendingData('plugin-full-object-write')
+                const changesChat = intents.some(intent => intent.path[0] === 'chats' && intent.path[1] === selectedBoundary.target?.conversationId)
+                await flushScopedSetter(changesChat && candidate.chaId === selectedBoundary.characterId ? hold : null)
                 throwIfFullObjectCallAborted(context.signal)
                 dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                 await openStore()
@@ -1281,7 +1290,7 @@ export function createPluginDatabaseAccess(
                 try {
                     throwIfFullObjectCallAborted(context.signal)
                     const admitted = await admission
-                    await dependencies.flushPendingData('plugin-full-object-write')
+                    await flushScopedSetter(admitted && admitted.characterId === selectedBoundary.characterId ? hold : null)
                     throwIfFullObjectCallAborted(context.signal)
                     dependencies.assertPersistentMutationAllowed(selectedBoundary.authorityEpoch)
                     await openStore()
@@ -1567,7 +1576,7 @@ export function createPluginDatabaseAccess(
                     }
                     return routeGeneratingWrite('plugin-setDatabaseLite', target, changes, validate, hold, true).then(handled => {
                         if (!handled) throw new Error(SYNCHRONOUS_CHARACTER_SET_ERROR)
-                        if (changes.units.length) return dependencies.commitPersistentUnitIntent('plugin-setDatabaseLite', changes.units, [], [], undefined, { ...check, validate })
+                        if (changes.units.length) return dependencies.commitPersistentUnitIntent('plugin-setDatabaseLite', changes.units, [], [], undefined, { ...check, ...handled, validate })
                     })
                 }
                 return dependencies.commitPersistentUnitIntent('plugin-setDatabaseLite', changes.units, [], changes.wholeMessages, undefined, check)
@@ -1637,7 +1646,7 @@ export function createPluginDatabaseAccess(
                         ? !!current && current.script === scriptsBeforeConfirmation.get(name)
                         : !current
                 }
-                let routedChanges: Changes | undefined
+                let routed: false | Pick<PluginStorageWriteCheck, 'saveFailed'> = false
                 while (true) {
                     let acceptedIntents = intents
                     let acceptedNames: string[] = []
@@ -1658,28 +1667,28 @@ export function createPluginDatabaseAccess(
                     }
                     const changes = databaseUnitChanges(acceptedIntents, preparedUpdate, allowedKeys)
                     const storageCheck = storageWriteCheck(prepareStorageWrite, changes.units)
-                    if (hasCharacterUpdate(detachedSubmission) && !routedChanges) {
-                        const handled = await routeGeneratingWrite('plugin-setDatabase', selected, changes, () => {
+                    if (hasCharacterUpdate(detachedSubmission) && !routed) {
+                        routed = await routeGeneratingWrite('plugin-setDatabase', selected, changes, () => {
                             dependencies.assertPersistentMutationAllowed(authorityEpoch)
                             readBaselines.assertOpen()
                             storageCheck.validate()
                         }, hold)
-                        if (handled) routedChanges = changes
-                    } else if (routedChanges && selected) {
+                    } else if (routed && selected) {
                         changes.wholeMessages = changes.wholeMessages.filter(intent => intent.characterId !== selected.characterId || intent.conversationId !== selected.conversationId)
                         changes.units = changes.units.filter(unit => {
                             const [kind, owner, chat] = JSON.parse(unit.key)
                             return !(kind === 'conversation' && owner === selected.characterId && chat === selected.conversationId)
                         })
                     }
-                    if (routedChanges && !changes.units.length && !changes.wholeMessages.length) break
+                    if (routed && !changes.units.length && !changes.wholeMessages.length) break
                     try {
                         await dependencies.commitPersistentUnitIntent('plugin-setDatabase', changes.units, [], changes.wholeMessages, undefined, {
+                            saveFailed: routed ? routed.saveFailed : undefined,
                             // The write can wait behind other saves, so every attempt checks the approvals again.
                             validate: () => {
                                 dependencies.assertPersistentMutationAllowed(authorityEpoch)
                                 hold?.assertIntervalOwner()
-                                if (dependencies.getLiveRuntime && !routedChanges && hasCharacterUpdate(detachedSubmission) && selected && getGenerationOutputPhase(selected))
+                                if (dependencies.getLiveRuntime && !routed && hasCharacterUpdate(detachedSubmission) && selected && getGenerationOutputPhase(selected))
                                     throw new PluginOutputPhaseStarted()
                                 const installed = installedPlugins()
                                 if (!acceptedNames.every(name => approvalHolds(name, installed))) throw new PluginApprovalOvertakenError()

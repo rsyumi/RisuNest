@@ -2,7 +2,7 @@ import { LUA_REGISTRYINDEX, LuaReturn, LuaType, type LuaEngine, type LuaThread }
 import { getLuaExecutionBudget } from './luaExecutionBudget'
 import { decodeLuaFailure, encodeLuaFailure, type LuaWorkerFailure } from './luaWorkerProtocol'
 
-type Reply = { value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; elapsed?: number }
+type Reply = { value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; elapsed?: number; waited?: number }
 type AsyncifyExports = {
     asyncify_get_state(): number
     asyncify_start_unwind(data: number): void
@@ -261,6 +261,7 @@ export class LuaAsyncifyRuntime {
                     this.reply = await this.pending!
                     this.pending = undefined
                     if (this.closed) throw new Error('Lua executor closed')
+                    if (this.reply.waited) this.budget.excludeHostWait(this.engine, this.reply.waited)
                     this.exports.asyncify_start_rewind(this.data)
                     status = this.execution.run(() => this.lua.lua_resume(thread.address, null, count, pointer))
                 }

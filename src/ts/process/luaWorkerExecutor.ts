@@ -1,4 +1,4 @@
-import { LuaWorkerStrings, decodeLuaFailure, encodeLuaFailure, type LuaWorkerCommand, type LuaWorkerEvent } from './luaWorkerProtocol'
+import { LuaDeferredReply, LuaWorkerStrings, decodeLuaFailure, encodeLuaFailure, type LuaWorkerCommand, type LuaWorkerEvent } from './luaWorkerProtocol'
 import { LuaWorkerInterruptedError, LuaWorkerTransport } from './luaWorkerTransport'
 
 type HostBoundary = { run<T>(callback: () => T): T; flush(): void }
@@ -102,7 +102,13 @@ export class LuaWorkerExecutor {
             const callback = this.callbacks.get(message.name)
             if (!callback) throw new Error('Unknown Lua host API')
             const value = this.boundary ? this.boundary.run(() => callback(...message.args)) : callback(...message.args)
-            if (value && typeof value.then === 'function') {
+            if (value instanceof LuaDeferredReply) {
+                this.boundary?.flush()
+                const elapsed = performance.now() - started
+                void value.read(elapsed).then(({ value, ...timingAndFailure }) => {
+                    this.send({ kind: 'reply', call: message.call, ...this.strings.encode(value), ...timingAndFailure })
+                })
+            } else if (value && typeof value.then === 'function') {
                 this.boundary?.flush()
                 const promise = ++this.promise
                 this.send({ kind: 'reply', call: message.call, promise, elapsed: performance.now() - started })

@@ -36,6 +36,7 @@ import { createChatParserDependencyStamp } from '../chatRenderIdentity'
 import { alertConfirm, alertNormal, alertToast } from '../alert'
 import { alertStore } from '../alertQueue'
 import { LuaWorkerExecutor } from './luaWorkerExecutor'
+import outputLuaWasmUrl from './lua/worker.wasm?url'
 import { language } from '../../lang'
 import { DisplayReadRecord, recordAmbientChatVariableReads, registerDisplayRow } from './scriptVariableReads'
 import { pluginV2 } from '../plugins/plugins.svelte'
@@ -84,8 +85,8 @@ vi.mock('./luaRuntime', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./luaRuntime')>()
   return {
     ...actual,
-    async createLuaFactory() {
-      const factory = await actual.createLuaFactory()
+    async createLuaFactory(...args: Parameters<typeof actual.createLuaFactory>) {
+      const factory = await actual.createLuaFactory(...args)
       const createEngine = factory.createEngine.bind(factory)
       factory.createEngine = async (options) => {
         createdLuaEngineOptions.push(options)
@@ -160,7 +161,10 @@ function installOperationCharacterFixture(
 
 beforeAll(async () => {
   jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
-  vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLuaSource, { status: 200 })))
+  const outputLuaWasm = await readFile(resolve(process.cwd(), 'src/ts/process/lua/worker.wasm'))
+  vi.stubGlobal('fetch', vi.fn(async (url: RequestInfo | URL) => String(url) === outputLuaWasmUrl
+    ? new Response(new Uint8Array(outputLuaWasm), { headers: { 'Content-Type': 'application/wasm' } })
+    : new Response(jsonLuaSource, { status: 200 })))
   const scriptings = await import('./scriptings')
   runScripted = scriptings.runScripted
 })

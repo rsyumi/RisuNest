@@ -2,7 +2,7 @@ export type LuaWorkerCommand =
     | { kind: 'prepare'; sequence: number; json: string; names: string[]; timeout: number }
     | { kind: 'initialize'; sequence: number; source: string }
     | { kind: 'invoke'; sequence: number; name: string; args: unknown[] }
-    | { kind: 'reply'; call: number; value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; stringId?: number; resetStrings?: boolean; elapsed?: number }
+    | { kind: 'reply'; call: number; value?: unknown; error?: string; failure?: LuaWorkerFailure; promise?: number; stringId?: number; resetStrings?: boolean; elapsed?: number; waited?: number }
     | { kind: 'settled'; promise: number; value?: unknown; failure?: LuaWorkerFailure }
 
 export type LuaWorkerEvent =
@@ -17,6 +17,25 @@ export type LuaWorkerRequest = { engine: number; command: LuaWorkerCommand | { k
 export type LuaWorkerResponse = { engine: number; event: LuaWorkerEvent }
 
 export type LuaWorkerFailure = { kind: 'error'; message: string } | { kind: 'value'; value: unknown }
+
+/** A synchronous Lua API waiting for its conversation view to reopen. */
+export class LuaDeferredReply {
+    private readonly started = performance.now()
+    private resumed?: number
+
+    constructor(private readonly value: Promise<unknown>) {}
+
+    resume() { this.resumed = performance.now() }
+
+    async read(elapsed: number) {
+        let reply: { value?: unknown; failure?: LuaWorkerFailure }
+        try { reply = { value: await this.value } }
+        catch (error) { reply = { failure: encodeLuaFailure(error) } }
+        const end = performance.now()
+        const resumed = this.resumed ?? end
+        return { ...reply, elapsed: elapsed + end - resumed, waited: resumed - this.started }
+    }
+}
 
 export function encodeLuaFailure(error: unknown): LuaWorkerFailure {
     return error instanceof Error ? { kind: 'error', message: error.message } : { kind: 'value', value: error }

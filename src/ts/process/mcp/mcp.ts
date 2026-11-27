@@ -1,3 +1,4 @@
+import type { OutputPluginDispatch } from "../request/request";
 import { approveLocalMCP } from './stdioApproval';
 import { getCurrentChat, getDatabase } from "src/ts/storage/database.svelte";
 import { MCPClient, type JsonRPC, type MCPTool, type RPCToolCallContent } from "./mcplib";
@@ -240,11 +241,15 @@ export async function initializeMCPs(additionalMCPs?:string[]) {
     }
 }
 
-export async function getMCPTools(additionalMCPs?:string[]) {
+export async function getMCPTools(additionalMCPs?:string[], dispatch?: OutputPluginDispatch) {
+    dispatch?.signal.throwIfAborted();
     await initializeMCPs(additionalMCPs);
+    dispatch?.signal.throwIfAborted();
     const tools:MCPToolWithURL[] = [];
     for(const key of Object.keys(MCPs)) {
-        const t = (await MCPs[key].getToolList()).map(tool => {
+        const list = await MCPs[key].getToolList(dispatch);
+        dispatch?.signal.throwIfAborted();
+        const t = list.map(tool => {
             return {
                 ...tool,
                 mcpURL: key
@@ -265,14 +270,17 @@ export async function getMCPMeta(additionalMCPs?:string[]) {
     return meta;
 }
 
-export async function callMCPTool(methodName:string, args:any):Promise<RPCToolCallContent[]> {
+export async function callMCPTool(methodName:string, args:any, dispatch?: OutputPluginDispatch):Promise<RPCToolCallContent[]> {
+    dispatch?.signal.throwIfAborted();
     await initializeMCPs();
+    dispatch?.signal.throwIfAborted();
     const combinedMCPs = {...MCPs, ...callOnlyMCPs};
     for(const key of Object.keys(combinedMCPs)) {
-        const tools = await combinedMCPs[key].getToolList();
+        const tools = await combinedMCPs[key].getToolList(dispatch);
+        dispatch?.signal.throwIfAborted();
         const tool = tools.find(t => t.name === methodName);
         if(tool) {
-            return await combinedMCPs[key].callTool(methodName, args);
+            return await combinedMCPs[key].callTool(methodName, args, dispatch);
         }
     }
     return  [{
@@ -282,13 +290,13 @@ export async function callMCPTool(methodName:string, args:any):Promise<RPCToolCa
 }
 
 //Currently just a wrapper for getMCPTools, but can be extended later for more than MCPs
-export async function getTools(){
-    return await getMCPTools();
+export async function getTools(dispatch?: OutputPluginDispatch){
+    return await getMCPTools(undefined, dispatch);
 }
 
 //Currently just a wrapper for callMCPTool, but can be extended later for more than MCPs
-export async function callTool(methodName:string, args:any) {
-    return await callMCPTool(methodName, args);
+export async function callTool(methodName:string, args:any, dispatch?: OutputPluginDispatch) {
+    return await callMCPTool(methodName, args, dispatch);
 }
 
 export async function importMCPModule(){

@@ -6,7 +6,7 @@ import { nodeLuaWorkers } from './tests/luaWorkerNode'
 import type { Chat } from '../storage/database.svelte'
 import { LuaWorkerExecutor } from './luaWorkerExecutor'
 import { luaCodeWrapper } from './luaCodeWrapper'
-import type { LuaWorkerResponse } from './luaWorkerProtocol'
+import { LuaDeferredReply, type LuaWorkerResponse } from './luaWorkerProtocol'
 
 vi.mock('../storage/persistentDataRuntime.svelte', async () => (await import('./tests/scriptingsTestHarness')).persistentRuntimeModule())
 vi.mock('../parser/parser.svelte', async () => (await import('./tests/scriptingsTestHarness')).parserModule())
@@ -101,19 +101,18 @@ test('does not renew a handler deadline on synchronous RPC and retains globals a
     } finally { executor.close() }
 }, 10_000)
 
-test('keeps the handler deadline separate from a genuine async wait', async () => {
+test.each(['async API', 'synchronous API in a C callback'] as const)('excludes a pending host wait from the handler deadline (%s)', async kind => {
     const executor = new LuaWorkerExecutor(30)
-    let finish!: (value: string) => void
-    let started!: () => void
-    const ready = new Promise<void>(resolve => { started = resolve })
-    executor.register('wait', () => { started(); return new Promise<string>(resolve => { finish = resolve }) })
+    executor.register('wait', () => {
+        const pending = new Promise<string>(resolve => setTimeout(() => resolve('completed'), 180))
+        return kind === 'async API' ? pending : new LuaDeferredReply(pending)
+    })
     try {
-        await executor.initialize(luaCodeWrapper('onOutput=async(function() return wait():await() end)'), await readFile('public/lua/json.lua', 'utf8'))
-        const result = executor.invoke('onOutput', [])
-        await ready
-        await new Promise(resolve => setTimeout(resolve, 180))
-        finish('completed')
-        expect(await result).toBe('completed')
+        const source = kind === 'async API'
+            ? 'onOutput=async(function() return wait():await() end)'
+            : "function onOutput() return ('x'):gsub('x', function() return wait() end) end"
+        await executor.initialize(luaCodeWrapper(source), await readFile('public/lua/json.lua', 'utf8'))
+        expect(await executor.invoke('onOutput', [])).toBe('completed')
     } finally { executor.close() }
 })
 

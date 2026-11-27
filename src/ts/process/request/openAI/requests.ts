@@ -766,7 +766,7 @@ export async function requestHTTPOpenAI(
                             }
                             else{
                                 const parsed = functionArgs
-                                const x = (await callTool(tool.name, parsed)).filter(m => m.type === 'text')
+                                const x = (await callTool(tool.name, parsed, arg.pluginDispatch)).filter(m => m.type === 'text')
                                 if(x.length > 0){
                                     messages.push({
                                         role: 'tool',
@@ -1212,7 +1212,7 @@ function wrapToolStream(
                                     }
                                     else{
                                         const parsed = functionArgs
-                                        const x = (await callTool(tool.name, parsed)).filter(m => m.type === 'text')
+                                        const x = (await callTool(tool.name, parsed, arg.pluginDispatch)).filter(m => m.type === 'text')
                                         if(x.length > 0){
                                             messages.push({
                                                 role: 'tool',

@@ -1,6 +1,7 @@
 import { IDBObjectStore as FakeObjectStore } from 'fake-indexeddb'
 import { expect, it, vi } from 'vitest'
-import type { Database, Message } from '../../storage/database.svelte'
+import { language } from 'src/lang'
+import type { Chat, Database, Message } from '../../storage/database.svelte'
 import { getPluginPermissionStore } from '../../storage/nativePluginPermissions'
 import * as clock from '../../util'
 import { getGenerationOutputPhase } from '../generationOutputPhase'
@@ -156,6 +157,82 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
         }
     })
 
+    function abortFirstPut<T>(store: string, matches: (value: T) => boolean) {
+        let aborted = false
+        const put = FakeObjectStore.prototype.put
+        const spy = vi.spyOn(FakeObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
+            const request = put.call(this, value, key)
+            if (!aborted && this.name === store && matches(value.value)) {
+                aborted = true
+                this.transaction.abort()
+            }
+            return request
+        })
+        return { get aborted() { return aborted }, restore: () => spy.mockRestore() }
+    }
+
+    it.each(['setter', 'patch'] as const)('stops the output trigger when the provider catches a failed %s save', async kind => {
+        const fixture = await nestedFixture(kind === 'patch', seed => {
+            seed.characters[0].triggerscript[0].effect.push({ type: 'modifychat', index: '1', value: 'after failed save' })
+        })
+        let rejected = false
+        fixture.api.addProvider(outputPluginName, async () => {
+            try {
+                if (kind === 'setter') {
+                    const chat = await readPluginChat(fixture.api)
+                    chat.message[0].data = 'faulted edit'
+                    await fixture.api.setChatToIndex(0, 0, chat)
+                } else {
+                    await fixture.api.risunestPatchConversation({
+                        ...target, mutationId: 'faulted-patch', chatVariables: [],
+                        messages: [{ index: 0, messageId: 'id-0', set: { data: 'faulted edit' } }],
+                    })
+                }
+            } catch { rejected = true }
+            return { success: true, content: 'provider recovered' }
+        })
+        const fault = abortFirstPut('messagePages', (rows: Message[]) => rows.some(row => row.data === 'faulted edit'))
+        try {
+            await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() }, undefined, /AbortError|TransactionInactiveError|InvalidStateError/)
+            expect(fault.aborted).toBe(true)
+            await vi.waitFor(() => expect(rejected).toBe(true))
+            const stored = await fixture.reopen()
+            expect(stored.message.at(-1)?.data).toBe('reply edited by trigger')
+            expect(stored.message[1].data).toBe('m1')
+            expect(stored.scriptstate?.$result).toBeUndefined()
+            if (kind === 'patch') expect(stored.message[0].data).toBe('m0')
+        } finally { fault.restore() }
+        await verifySubsequentSave(fixture)
+    })
+
+    it.each([true, false])('propagates a character save failure according to whether the setter also edited this chat (%s)', async changesChat => {
+        const fixture = await nestedFixture(false)
+        const reader = await fixture.connect()
+        const { getDatabase } = await import('../../storage/database.svelte')
+        const { safeStructuredClone } = await import('../../safeStructuredClone')
+        let rejected = false
+        fixture.api.addProvider(outputPluginName, async () => {
+            const character = safeStructuredClone(getDatabase().characters[0])
+            character.desc = 'faulted character edit'
+            if (changesChat) character.chats[0].message[0].data = 'saved by mixed setter'
+            try { await fixture.api.setCharacterToIndex(0, character) }
+            catch { rejected = true }
+            return { success: true, content: 'provider recovered' }
+        })
+        const fault = abortFirstPut('characters', (character: { desc: string }) => character.desc === 'faulted character edit')
+        try {
+            await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() }, undefined,
+                changesChat ? /AbortError|TransactionInactiveError|InvalidStateError/ : true)
+            expect(fault.aborted).toBe(true)
+            await vi.waitFor(() => expect(rejected).toBe(true))
+            const character = (await reader.materializeDatabase()).characters[0]
+            expect(character.desc).not.toBe('faulted character edit')
+            expect(character.chats[0].message[0].data).toBe(changesChat ? 'saved by mixed setter' : 'm0')
+            expect(character.chats[0].scriptstate?.$result).toBe(changesChat ? undefined : 'provider recovered')
+        } finally { fault.restore() }
+        await verifySubsequentSave(fixture)
+    })
+
     it('aborts a failed IndexedDB pre-dispatch save before calling the registered provider', async () => {
         const fixture = await nestedFixture(false)
         let invoked = false
@@ -163,26 +240,191 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
             invoked = true
             return { success: true, content: 'unexpected callback' }
         })
-        let failed = false
-        const put = FakeObjectStore.prototype.put
-        const fault = vi.spyOn(FakeObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
-            const request = put.call(this, value, key)
-            if (!failed && this.name === 'messagePages' && value.value?.some((row: Message) => row.data === 'reply edited by trigger')) {
-                failed = true
-                this.transaction.abort()
-            }
-            return request
-        })
+        const fault = abortFirstPut<Message[]>('messagePages', rows => rows.some(row => row.data === 'reply edited by trigger'))
         try {
             await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() }, undefined, /AbortError|TransactionInactiveError|InvalidStateError/)
-            expect(failed).toBe(true)
+            expect(fault.aborted).toBe(true)
             expect(invoked).toBe(false)
             expect((await fixture.reopen()).scriptstate?.$result).toBeUndefined()
-        } finally { fault.mockRestore() }
+        } finally { fault.restore() }
         await verifySubsequentSave(fixture)
     })
 
-    it.each(['provider failure', 'cancellation', 'owner deletion', 'library replacement'] as const)(
+    it('ends a pending ordinary Lua request when a sibling plugin checkpoint fails', async () => {
+        const fixture = await nestedFixture(false, seed => {
+            seed.aiModel = 'echo_model'
+            seed.echoDelay = 123
+            seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                onOutput = async(function(id)
+                    local echo = simpleLLM(id, 'echo')
+                    alertInput(id, 'wait for echo'):await()
+                    setChat(id, 999, 'sibling checkpoint')
+                    local plugin = axLLMMain(id, '[{"role":"user","content":"save"}]', false, '{}')
+                    setChatVar(id, 'result', echo:await().result)
+                    plugin:await()
+                end)
+            ` }]
+        })
+        const entered = gate()
+        const release = gate()
+        const sleep = clock.sleep
+        const delay = vi.spyOn(clock, 'sleep').mockImplementation(ms => {
+            if (ms !== 123_000) return sleep(ms)
+            entered.resolve()
+            return release.promise
+        })
+        const { alertInput } = await import('../../alert')
+        vi.mocked(alertInput).mockImplementationOnce(async () => { await entered.promise; return '' })
+        const provider = vi.fn(async () => ({ success: true, content: 'unexpected callback' }))
+        fixture.api.addProvider(outputPluginName, provider)
+        const fault = abortFirstPut<Message[]>('messagePages', rows => rows.some(row => row.data === 'sibling checkpoint'))
+        try {
+            await whileStreaming(fixture, async ({ finishStream, sending }) => {
+                await fixture.runNestedRequest()
+                await fixture.runNestedRequest()
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(fault.aborted).toBe(true))
+                    await expectSendFinished(sending)
+                } finally { release.resolve() }
+            }, undefined, /AbortError|TransactionInactiveError|InvalidStateError/)
+            expect(provider).not.toHaveBeenCalled()
+            expect((await fixture.reopen()).scriptstate?.$result).toBeUndefined()
+        } finally { delay.mockRestore(); fault.restore(); release.resolve() }
+        await verifySubsequentSave(fixture)
+    })
+
+    it.each(['returns', 'reads'] as const)('cancels while Lua %s during a pending plugin checkpoint', async action => {
+        const fixture = await nestedFixture(false, seed => {
+            seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                onOutput = async(function(id)
+                    setChat(id, 999, 'checkpoint before cancel')
+                    simpleLLM(id, 'save')
+                    alertInput(id, 'wait for checkpoint'):await()
+                    alertNormal(id, 'checkpoint pending')
+                    ${action === 'reads' ? "setChatVar(id, 'result', getChatData(id, 999))" : ''}
+                end)
+            ` }]
+        })
+        const entered = gate()
+        const release = gate()
+        const flush = fixture.runtime.flushPendingDataLocally.bind(fixture.runtime)
+        const checkpoint = vi.spyOn(fixture.runtime, 'flushPendingDataLocally').mockImplementation(async reason => {
+            await flush(reason)
+            if (reason === 'output-script-plugin-request') { entered.resolve(); await release.promise }
+        })
+        const { alertInput, alertNormal } = await import('../../alert')
+        vi.mocked(alertInput).mockImplementationOnce(async () => { await entered.promise; return '' })
+        vi.mocked(alertNormal).mockClear()
+        const provider = vi.fn(async () => ({ success: true, content: 'unexpected callback' }))
+        fixture.api.addProvider(outputPluginName, provider)
+        try {
+            await whileStreaming(fixture, async ({ finishStream, cancel, sending }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(alertNormal).toHaveBeenCalledWith('checkpoint pending'))
+                    cancel()
+                    await expectSendFinished(sending)
+                } finally { release.resolve() }
+            }, undefined, false)
+            expect(provider).not.toHaveBeenCalled()
+            expect((await fixture.reopen()).scriptstate?.$result).toBeUndefined()
+        } finally { checkpoint.mockRestore(); release.resolve() }
+    })
+
+    it('returns a registered provider failure to the trigger and runs its remaining effects and output listener', async () => {
+        const fixture = await nestedFixture(false, seed => {
+            seed.characters[0].triggerscript[0].effect.push({ type: 'modifychat', index: '1', value: 'after failure' })
+        })
+        fixture.api.addProvider(outputPluginName, async () => {
+            const chat = await readPluginChat(fixture.api)
+            chat.message[0].data = 'saved before failure'
+            await fixture.api.setChatToIndex(0, 0, chat)
+            return { success: false, content: 'provider failure' }
+        })
+        const { pluginV2 } = await import('../../plugins/plugins.svelte')
+        const observed: string[] = []
+        const listener = async ({ chat }: { chat: Chat }) => { observed.push(chat.message[1].data) }
+        pluginV2.chatOutput.add(listener)
+        try {
+            await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() })
+            const stored = await fixture.reopen()
+            expect(stored.scriptstate.$result).toBe('Error: provider failure')
+            expect(stored.message[0].data).toBe('saved before failure')
+            expect(stored.message[1].data).toBe('after failure')
+            expect(observed).toEqual(['after failure'])
+        } finally { pluginV2.chatOutput.delete(listener) }
+    })
+
+    it('returns an ordinary provider HTTP error to Lua after a read-only request hook', async () => {
+        const fixture = await nestedFixture(true, seed => {
+            seed.aiModel = 'gpt4'
+            seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                onOutput = async(function(id)
+                    local response = simpleLLM(id, 'translate'):await()
+                    if not response.success then setChatVar(id, 'failure', response.result) end
+                end)
+            ` }]
+        })
+        await fixture.api.addRisuReplacer('beforeRequest', async messages => messages)
+        const network = await import('../../globalApi.svelte')
+        const fetch = vi.spyOn(network, 'globalFetch').mockResolvedValue({
+            ok: false, status: 429, headers: {}, data: { error: { message: 'rate limited' } },
+        })
+        try {
+            await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() })
+            expect((await fixture.reopen()).scriptstate.$failure).toBe('Error: ' + language.errors.httpError + 'rate limited')
+        } finally { fetch.mockRestore() }
+    })
+
+    it('returns a provider stream error to Lua and refreshes its view of the saved chat', async () => {
+        const fixture = await nestedFixture(true, seed => {
+            seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                onOutput = async(function(id)
+                    local response = LLM(id, {{role = 'user', content = 'translate'}}, false, {streaming = true})
+                    if not response.success then setChatVar(id, 'failure', response.result) end
+                    setChatVar(id, 'observed', getChat(id, 999).data)
+                end)
+            ` }]
+        })
+        fixture.api.addProvider(outputPluginName, async () => {
+            const chat = await readPluginChat(fixture.api)
+            chat.message[999].data = 'saved before stream error'
+            await fixture.api.setChatToIndex(0, 0, chat)
+            return { success: true, content: new ReadableStream<string>({
+                pull(controller) { controller.error('stream interrupted') },
+            }) }
+        })
+        await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() })
+        expect((await fixture.reopen()).scriptstate).toMatchObject({
+            $failure: 'Error: stream interrupted', $observed: 'saved before stream error',
+        })
+    })
+
+    it('stops v2RunLLM when its ordinary provider stream cannot be read', async () => {
+        const fixture = await nestedFixture(false, seed => {
+            seed.aiModel = 'gpt4o'
+            seed.useStreaming = true
+            seed.characters[0].triggerscript[0].effect.splice(1, 1,
+                { type: 'v2RunLLM', value: 'translate', valueType: 'value', model: 'model', streaming: true, outputVar: 'result', indent: 0 },
+                { type: 'modifychat', index: '1', value: 'after stream error' },
+            )
+        })
+        const { fetchNative } = await import('../../globalApi.svelte')
+        vi.mocked(fetchNative).mockResolvedValueOnce(new Response(new ReadableStream({
+            pull(controller) { controller.error(new Error('stream interrupted')) },
+        }), { headers: { 'Content-Type': 'text/event-stream' } }))
+        await whileStreaming(fixture, async ({ finishStream }) => {
+            await fixture.runNestedRequest()
+            finishStream()
+        }, undefined, /stream interrupted/)
+        const stored = await fixture.reopen()
+        expect(stored.scriptstate?.$result).toBeUndefined()
+        expect(stored.message[1].data).toBe('m1')
+    })
+
+    it.each(['cancellation', 'owner deletion', 'library replacement'] as const)(
         'fences the suspended output invocation after %s', async reason => {
             const fixture = await nestedFixture(false, seed => {
                 const owner = seed.characters[0]
@@ -200,7 +442,6 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
                 chat.message[0].data = 'saved before failure'
                 await fixture.api.setChatToIndex(0, 0, chat)
                 saved = true
-                if (reason === 'provider failure') return { success: false, content: 'provider failure' }
                 if (reason === 'library replacement') {
                     const beforeReplacement = await readPluginChat(fixture.api)
                     beforeReplacement.note = 'note from the former owner'
@@ -241,7 +482,7 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
                         }
                         await expectSendFinished(sending)
                     } finally { release.resolve() }
-                }, undefined, reason === 'provider failure' ? /provider failure/ : false)
+                }, undefined, false)
                 const currentId = reason === 'owner deletion' ? 'sibling' : target.conversationId
                 await verifySubsequentSave(fixture, currentId)
                 const stored = (await read(currentId))!.value

@@ -25,13 +25,19 @@ import { requestGoogleCloudVertex } from './google';
 import { requestOpenAI, requestOpenAILegacyInstruct, requestOpenAIResponseAPI } from "./openAI/requests";
 import { applyAdditionalParameters, applyParameters, getAdditionalParameters, type ModelModeExtended } from './shared';
 import { holdModelCall } from '../generationBackground';
-import { runOutputPluginRequest, type OutputPluginRequestBoundary } from './outputPluginRequest';
+import { runOutputPluginRequest, type OutputPluginRequestBoundary, type ScriptStreamCollector } from './outputPluginRequest';
 
 export type { OutputPluginRequestBoundary } from './outputPluginRequest';
 
 export type ToolCall = {
     name: string;
     arguments: string;
+}
+
+/** Shared with any model request started by a tool during this output script request. */
+export interface OutputPluginDispatch {
+    signal: AbortSignal
+    beforePlugin(): Promise<void>
 }
 
 interface requestDataArgument{
@@ -58,6 +64,7 @@ interface requestDataArgument{
     tools?: MCPTool[]
     rememberToolUsage?: boolean
     blockPlugins?:boolean
+    pluginDispatch?: OutputPluginDispatch
 }
 
 export interface RequestDataArgumentExtended extends requestDataArgument{
@@ -211,19 +218,20 @@ function normalizeOllamaStreamResponse(response: Response): Response {
 
 export async function requestChatData(
     arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null,
-    boundary?: OutputPluginRequestBoundary, collect?: (stream: ReadableStream<StreamResponseChunk>) => Promise<string>,
+    boundary?: OutputPluginRequestBoundary, collect?: ScriptStreamCollector,
 ):Promise<requestDataResponse> {
     return holdModelCall(signal => boundary
         ? runOutputPluginRequest(boundary, signal, (requestSignal, beforePlugin) =>
-            requestChatDataUnderHold(arg, model, requestSignal, beforePlugin), collect)
-        : requestChatDataUnderHold(arg, model, signal ?? null), abortSignal ?? boundary?.signal)
+            requestChatDataUnderHold({ ...arg, pluginDispatch: { signal: requestSignal, beforePlugin } }, model, requestSignal), collect)
+        : requestChatDataUnderHold(arg, model, signal ?? null), abortSignal ?? boundary?.signal ?? arg.pluginDispatch?.signal)
 }
 
-async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null, beforePlugin?: () => Promise<void>):Promise<requestDataResponse> {
+async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     if (pluginStartupGate.refuse()) return { type: 'fail', result: language.risuNest.pluginStartup.requestRefused }
+    const beforePlugin = arg.pluginDispatch?.beforePlugin
     const db = getDatabase()
     const fallBackModels:string[] = safeStructuredClone(db?.fallbackModels?.[model] ?? [])
-    const tools = arg.tools ?? (await getTools())
+    const tools = arg.tools ?? (await getTools(arg.pluginDispatch))
     fallBackModels.push('')
     let da:requestDataResponse
 
@@ -299,7 +307,7 @@ async function requestChatDataUnderHold(arg:requestDataArgument, model:ModelMode
                 ...arg,
                 staticModel: fallBackModels[fallbackIndex],
                 tools: tools,
-            }, model, abortSignal, beforePlugin)
+            }, model, abortSignal)
 
             if(abortSignal?.aborted){
                 if (beforePlugin && da.type === 'streaming') void da.result.cancel(abortSignal.reason).catch(() => {})
@@ -468,7 +476,7 @@ export function reformater(formated:OpenAIChat[],modelInfo:LLMModel|LLMFlags[]){
 }
 
 
-export async function requestChatDataMain(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null, beforePlugin?: () => Promise<void>):Promise<requestDataResponse> {
+export async function requestChatDataMain(arg:requestDataArgument, model:ModelModeExtended, abortSignal:AbortSignal=null):Promise<requestDataResponse> {
     if (pluginStartupGate.refuse()) return { type: 'fail', result: language.risuNest.pluginStartup.requestRefused }
     const db = getDatabase()
     const targ:RequestDataArgumentExtended = arg
@@ -536,7 +544,7 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
         case LLMFormat.OobaLegacy:
             return requestOobaLegacy(targ)
         case LLMFormat.Plugin:
-            return requestPlugin(targ, beforePlugin)
+            return requestPlugin(targ, arg.pluginDispatch?.beforePlugin)
         case LLMFormat.Ooba:
             return requestOoba(targ)
         case LLMFormat.VertexAIGemini:

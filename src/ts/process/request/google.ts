@@ -844,7 +844,7 @@ async function requestGoogle(url:string, body:any, headers:{[key:string]:string}
             
             const tool = tools.find((t) => t.name === functionName)
             if(tool){
-                const result = (await callTool(tool.name, functionArgs)).filter((r) => {
+                const result = (await callTool(tool.name, functionArgs, arg.pluginDispatch)).filter((r) => {
                     return r.type === 'text'
                 })
                 if(result.length === 0){
@@ -1158,7 +1158,7 @@ function wrapToolStream(
                             const functionArgs = call.args
                             const tool = tools.find((t) => t.name === functionName)
                             if(tool){
-                                const result = (await callTool(tool.name, functionArgs)).filter((r) => {
+                                const result = (await callTool(tool.name, functionArgs, arg.pluginDispatch)).filter((r) => {
                                     return r.type === 'text'
                                 })
                                 if(result.length === 0){

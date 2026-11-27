@@ -12,6 +12,7 @@ export interface GenerationOutputWrite {
     readonly phase: GenerationOutputPhase
     readonly scriptWait: Promise<void> | null
     assertIntervalOwner(): void
+    failIntervalSave(error: unknown): void
     release(): void
 }
 
@@ -32,6 +33,7 @@ const key = (target: GeneratingConversation) => JSON.stringify([target.character
 const phases = new Map<string, { state: GenerationOutputPhase; isCurrent(): boolean; checkScriptOwner(): void }>()
 export interface GenerationOutputScript {
     readonly signal: AbortSignal
+    fail(error: unknown): void
     assertOwner(): void
     openInterval(): () => Promise<void>
     refresh(): Promise<void>
@@ -96,6 +98,7 @@ export function openGenerationOutputPhase(
             phase: state,
             get scriptWait() { return permission.intervalWrite ? null : scriptWait },
             assertIntervalOwner() { if (permission.intervalWrite) assertOwner() },
+            failIntervalSave(error) { if (permission.intervalWrite) state.fail(error) },
             release() {
                 writes.delete(done)
                 streamingPatches.delete(done)
@@ -119,7 +122,7 @@ export function openGenerationOutputPhase(
             stop()
             if (report) onLost?.()
         },
-        fail: error => stop(error),
+        fail(error) { if (!lifetime.signal.aborted) stop(error) },
         holdWrite: () => hold(false),
         holdStreamingPatch: () => hold(true).release,
     }
@@ -152,6 +155,7 @@ export function openGenerationOutputPhase(
     phases.set(identity, entry)
     const script: GenerationOutputScript = {
         signal: lifetime.signal,
+        fail: state.fail,
         assertOwner,
         openInterval() {
             assertOwner()
@@ -165,6 +169,7 @@ export function openGenerationOutputPhase(
                 intervalOpen = false
                 updateWait()
                 await Promise.all(writes.keys())
+                lifetime.signal.throwIfAborted()
                 assertOwner()
             }
         },

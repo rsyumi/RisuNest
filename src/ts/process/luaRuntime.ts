@@ -12,10 +12,10 @@ export async function runLuaSource(
 
 export function createLuaFactoryLoader(
     loadWasmoon: () => Promise<typeof import('wasmoon')>,
-): () => Promise<LuaFactory> {
+): (compiled?: { url: string; module: WebAssembly.Module }) => Promise<LuaFactory> {
     let wasmoonModulePromise: Promise<typeof import('wasmoon')> | undefined
 
-    return async () => {
+    return async compiled => {
         const pendingImport = (wasmoonModulePromise ??= loadWasmoon())
         let wasmoonModule: typeof import('wasmoon')
         try {
@@ -28,12 +28,13 @@ export function createLuaFactoryLoader(
         }
 
         const { LuaFactory } = wasmoonModule
-        const factory = new LuaFactory(wasmUrl)
+        const factory = new LuaFactory(compiled?.url ?? wasmUrl, undefined, compiled?.module)
         const createEngine = factory.createEngine
         factory.createEngine = async (options) => {
             const { getLuaExecutionBudget } = await import('./luaExecutionBudget')
             const { functionTimeout, ...engineOptions } = options ?? {}
             const engine = await createEngine.call(factory, engineOptions)
+            if (compiled) return engine
             try {
                 getLuaExecutionBudget(engine.global.lua).attach(engine, functionTimeout)
                 return engine

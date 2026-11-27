@@ -6,16 +6,20 @@ import { resolve } from 'node:path'
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { requestChatData } from './request/request'
+import outputLuaWasmUrl from './lua/worker.wasm?url'
 import { get } from 'svelte/store'
 import { checkOutputProcessing, checkStreamingWrite, finalText, installOutputTrigger, liveMessage, setterCases, whileStreaming, type SetterCase } from './tests/streamingPluginWrites'
 import { createProductionPluginDatabaseAccess } from '../plugins/pluginDatabaseAccess'
 import { openOutputRequestPlugin, outputPluginName, readPluginChat, runNestedRequest, type OutputRequestPlugin } from './tests/outputRequestPlugin'
 import { registerNestedRequestFailureCases } from './tests/outputRequestFailures'
+import { registerNestedMcpCases } from './tests/outputRequestMcp'
 import { alertStore } from '../alertQueue'
 import type { Chat, Database, Message, character } from '../storage/database.svelte'
 import { CharEmotion, DBState, selectedCharID, settingsOpen, ReloadChatPointer } from '../stores.svelte'
 import { IndexedDbPersistentDataStore } from '../storage/indexedDbPersistentDataStore'
 import { getPluginPermissionStore } from '../storage/nativePluginPermissions'
+import { deferred } from '../storage/saveCoordinator.testSupport'
+import * as clock from '../util'
 import { createConversationSummaryStubFromChat } from '../storage/conversationResidency'
 import {
     capturePersistentRoot,
@@ -97,7 +101,10 @@ vi.mock('./tts', async () => (await import('./tests/sendChatTestHarness')).ttsMo
 vi.mock('./memory/supaMemory', async () => (await import('./tests/sendChatTestHarness')).supaMemoryModule())
 vi.mock('./memory/hypamemory', async () => (await import('./tests/sendChatTestHarness')).hypamemoryModule())
 vi.mock('./embedding/addinfo', async () => (await import('./tests/sendChatTestHarness')).addinfoModule())
-vi.mock('./files/inlays', async () => (await import('./tests/sendChatTestHarness')).inlaysModule({ writeInlayImage: vi.fn() }))
+vi.mock('./files/inlays', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./files/inlays')>(),
+    ...(await import('./tests/sendChatTestHarness')).inlaysModule({ writeInlayImage: vi.fn() }),
+}))
 vi.mock('./models/modelString', async () => (await import('./tests/sendChatTestHarness')).modelStringModule())
 vi.mock('./inlayScreen', async () => (await import('./tests/sendChatTestHarness')).inlayScreenModule())
 vi.mock('./transformers', async () => (await import('./tests/sendChatTestHarness')).transformersModule())
@@ -312,8 +319,11 @@ afterEach(async () => {
 
 beforeAll(async () => {
     const jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
+    const outputLuaWasm = await readFile(resolve(process.cwd(), 'src/ts/process/lua/worker.wasm'))
     const fetch = globalThis.fetch
-    globalThis.fetch = vi.fn(async () => new Response(jsonLuaSource, { status: 200 })) as typeof globalThis.fetch
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => String(url) === outputLuaWasmUrl
+        ? new Response(new Uint8Array(outputLuaWasm), { headers: { 'Content-Type': 'application/wasm' } })
+        : new Response(jsonLuaSource, { status: 200 })) as typeof globalThis.fetch
     restoreFetch = () => { globalThis.fetch = fetch }
     // The Lua runtime loads its WebAssembly from disk only when no browser globals are present,
     // so its factory is created once here before the send runs with the DOM in place.
@@ -575,6 +585,7 @@ describe('a windowed send through the production runtime', () => {
     }
 
     registerNestedRequestFailureCases(nestedFixture)
+    registerNestedMcpCases(nestedFixture)
 
     it('lets a beforeRequest hook return and repair freshly read rows after generation ends', async () => {
         const fixture = await nestedFixture(true)
@@ -657,6 +668,195 @@ describe('a windowed send through the production runtime', () => {
     })
 
     describe.each([true, false])('a registered plugin in an output request (windowed %s)', windowed => {
+        const overlappingLua = `
+            onOutput = async(function(id)
+                local first = simpleLLM(id, 'first')
+                local second = simpleLLM(id, 'second')
+                setChatVar(id, 'first', first:await().result)
+                setChatVar(id, 'second', second:await().result)
+            end)
+        `
+
+        it('stores both overlapping Lua requests that use the registered provider', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: overlappingLua }]
+            })
+            fixture.api.addProvider(outputPluginName, async ({ prompt_chat }) => ({
+                success: true, content: 'reply to ' + prompt_chat[0].content,
+            }))
+            await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                await fixture.runNestedRequest()
+                finishStream()
+            })
+            expect((await fixture.reopen()).scriptstate).toMatchObject({ $first: 'reply to first', $second: 'reply to second' })
+        })
+
+        it('runs both plugin-free Lua requests before either echo finishes', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.aiModel = 'echo_model'
+                seed.echoDelay = 123
+                seed.echoMessage = 'echo result'
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: overlappingLua }]
+            })
+            const release = deferred<void>()
+            const sleep = clock.sleep
+            let waiting = 0
+            const delay = vi.spyOn(clock, 'sleep').mockImplementation(ms => {
+                if (ms !== 123_000) return sleep(ms)
+                waiting++
+                return release.promise
+            })
+            try {
+                await whileStreaming(fixture, async ({ finishStream }) => {
+                    await fixture.runNestedRequest()
+                    await fixture.runNestedRequest()
+                    finishStream()
+                    try {
+                        await vi.waitFor(() => expect(waiting).toBe(2))
+                    } finally { release.resolve() }
+                })
+            } finally { delay.mockRestore() }
+            expect((await fixture.reopen()).scriptstate).toMatchObject({ $first: 'echo result', $second: 'echo result' })
+        })
+
+        it('settles overlapping Lua requests on cancellation while the first provider is still waiting', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: overlappingLua }]
+            })
+            const release = deferred<void>()
+            const callbacks: string[] = []
+            fixture.api.addProvider(outputPluginName, async ({ prompt_chat }) => {
+                callbacks.push(prompt_chat[0].content)
+                await release.promise
+                return { success: true, content: 'late result' }
+            })
+            await whileStreaming(fixture, async ({ finishStream, cancel, sending }) => {
+                await fixture.runNestedRequest()
+                await fixture.runNestedRequest()
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(callbacks).toContain('first'))
+                    cancel()
+                    let settled = false
+                    void sending.then(() => { settled = true }, () => { settled = true })
+                    await vi.waitFor(() => expect(settled).toBe(true))
+                } finally { release.resolve() }
+            }, undefined, false)
+            expect(callbacks).toEqual(['first'])
+            const stored = await fixture.reopen()
+            expect(stored.scriptstate?.$first).toBeUndefined()
+            expect(stored.scriptstate?.$second).toBeUndefined()
+        })
+
+        it('keeps Lua message and variable edits made while its provider awaits a save', async () => {
+            const fixture = await nestedFixture(windowed, seed => {
+                seed.characters[0].triggerscript[0].effect = [{ type: 'triggerlua', code: `
+                    onOutput = async(function(id)
+                        local request = simpleLLM(id, 'save')
+                        alertInput(id, 'wait for save'):await()
+                        alertNormal(id, 'editing')
+                        string.gsub('edit', 'edit', function()
+                            setChat(id, 998, 'Lua edit')
+                            return ''
+                        end)
+                        setChatVar(id, 'luaVar', 'Lua variable')
+                        request:await()
+                        setChatVar(id, 'observed', getChat(id, 999).data .. ' ' .. getChatVar(id, 'pluginVar'))
+                    end)
+                ` }]
+            })
+            const saving = deferred<void>()
+            const release = deferred<void>()
+            const { alertInput, alertNormal } = await import('../alert')
+            vi.mocked(alertNormal).mockClear()
+            vi.mocked(alertInput).mockImplementationOnce(async () => { await saving.promise; return '' })
+            fixture.api.addProvider(outputPluginName, async () => {
+                const chat = await readPluginChat(fixture.api)
+                chat.message[999].data = 'plugin edit'
+                chat.scriptstate = { ...chat.scriptstate, $pluginVar: 'plugin variable' }
+                const commit = fixture.store.commit.bind(fixture.store)
+                vi.spyOn(fixture.store, 'commit').mockImplementationOnce(async intent => {
+                    saving.resolve()
+                    await release.promise
+                    return commit(intent)
+                })
+                await fixture.api.setChatToIndex(0, 0, chat)
+                return { success: true, content: 'saved' }
+            })
+            await whileStreaming(fixture, async ({ finishStream }) => {
+                await fixture.runNestedRequest()
+                finishStream()
+                try {
+                    await vi.waitFor(() => expect(alertNormal).toHaveBeenCalledWith('editing'), { timeout: 3000 })
+                } finally { saving.resolve(); release.resolve() }
+            })
+            const stored = await fixture.reopen()
+            expect(stored.message[998]).toMatchObject({ chatId: 'id-998', data: 'Lua edit' })
+            expect(stored.message[999]).toMatchObject({ chatId: 'id-999', data: 'plugin edit' })
+            expect(stored.scriptstate).toMatchObject({
+                $luaVar: 'Lua variable', $pluginVar: 'plugin variable', $observed: 'plugin edit plugin variable',
+            })
+        })
+
+        it.each(['plugin', 'ordinary'] as const)('continues after Lua exits with a pending %s request', async provider => {
+            const fixture = await nestedFixture(windowed, seed => {
+                if (provider === 'ordinary') {
+                    seed.aiModel = 'echo_model'
+                    seed.echoDelay = 123
+                }
+                seed.characters[0].triggerscript[0].effect = [
+                    { type: 'triggerlua', code: `
+                        onOutput = async(function(id)
+                            simpleLLM(id, 'run in background')
+                            alertInput(id, 'wait for provider'):await()
+                            alertNormal(id, 'leaving Lua')
+                        end)
+                    ` },
+                    { type: 'v2GetMessageAtIndex', index: '999', indexType: 'value', outputVar: 'observed', indent: 0 },
+                ]
+            })
+            const entered = deferred<void>()
+            const release = deferred<void>()
+            const { alertInput, alertNormal } = await import('../alert')
+            vi.mocked(alertNormal).mockClear()
+            vi.mocked(alertInput).mockImplementationOnce(async () => { await entered.promise; return '' })
+            const sleep = clock.sleep
+            const delay = vi.spyOn(clock, 'sleep').mockImplementation(ms => {
+                if (ms !== 123_000) return sleep(ms)
+                entered.resolve()
+                return release.promise
+            })
+            if (provider === 'plugin') {
+                fixture.api.addProvider(outputPluginName, async () => {
+                    const chat = await readPluginChat(fixture.api)
+                    entered.resolve()
+                    await release.promise
+                    chat.message[999].data = 'saved by detached provider'
+                    await fixture.api.setChatToIndex(0, 0, chat)
+                    return { success: true, content: 'finished' }
+                })
+            }
+            try {
+                await whileStreaming(fixture, async ({ sending, finishStream }) => {
+                    await fixture.runNestedRequest()
+                    finishStream()
+                    try {
+                        await vi.waitFor(() => expect(alertNormal).toHaveBeenCalledWith('leaving Lua'))
+                        if (provider === 'ordinary') {
+                            let finished = false
+                            void sending.then(() => { finished = true }, () => { finished = true })
+                            await vi.waitFor(() => expect(finished).toBe(true))
+                        }
+                    } finally { entered.resolve(); release.resolve() }
+                })
+            } finally { delay.mockRestore() }
+            const stored = await fixture.reopen()
+            const expected = provider === 'plugin' ? 'saved by detached provider' : 'm999'
+            expect(stored.message[999]).toMatchObject({ chatId: 'id-999', data: expected })
+            expect(stored.scriptstate.$observed).toBe(expected)
+        })
+
         it.each([true, false])('checkpoints a nested command before a later effect fails only when a read-only replacer runs (registered %s)', async withReplacer => {
             const fixture = await nestedFixture(windowed, seed => {
                 seed.aiModel = 'echo_model'

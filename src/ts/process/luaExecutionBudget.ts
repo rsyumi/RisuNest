@@ -118,6 +118,11 @@ class LuaExecutionBudget {
         if (owner.remaining !== undefined) owner.remaining -= Math.max(0, elapsed)
     }
 
+    excludeHostWait(engine: LuaEngine, elapsed: number): void {
+        const owner = this.owner(engine.global.address)!
+        if (owner.segmentDeadline !== undefined) owner.segmentDeadline += elapsed
+    }
+
     expired(engine: LuaEngine): boolean {
         const owner = this.owner(engine.global.address)!
         if ((owner.remaining !== undefined && owner.remaining <= 0)

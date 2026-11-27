@@ -208,11 +208,8 @@ async function commitStreamingPatch(request: ConversationPatchRequest, signal?: 
         }, {
             committed: () => { committed = true },
             retire: releasePublication,
-        }).catch(error => {
-            // A later flush retries the committed projection. End the suspended invocation now
-            // so that its drain does not wait for the same provider to schedule that flush.
-            if (committed && publication) intervalOwner?.fail(error)
-            throw error
+            // A callback may catch a rejected save. Its suspended script still needs to stop.
+            saveFailed: intervalOwner?.fail,
         }).finally(() => {
             // A durable write whose first projection failed is still owned by the save
             // queue. Retry must publish to the same rows before the generation closes.

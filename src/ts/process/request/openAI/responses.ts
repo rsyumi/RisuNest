@@ -488,7 +488,7 @@ async function appendResponsesToolOutputs(body:any, calls:ResponseFunctionCallIt
                 output = 'No tool found with name: ' + toolCall.name
             }
             else{
-                const used = (await callTool(tool.name, parsed)).filter((m) => m.type === 'text')
+                const used = (await callTool(tool.name, parsed, arg.pluginDispatch)).filter((m) => m.type === 'text')
                 if(used.length > 0){
                     output = used[0].text
                     if(arg.rememberToolUsage){

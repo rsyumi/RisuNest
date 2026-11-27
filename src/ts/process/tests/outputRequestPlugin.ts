@@ -5,11 +5,13 @@ import type { ConversationPatchRequest, ConversationPatchResult } from '../../pl
 import type { PluginIframeSnapshot } from '../../plugins/pluginDatabaseAccess'
 import type { GenerationEndEvent } from '../../plugins/generationEndEvents'
 import { attachPluginReadProvenance } from '../../plugins/pluginReadBaselines'
-import type { Chat, Message } from '../../storage/database.svelte'
+import type { Chat, Database, Message } from '../../storage/database.svelte'
 import type { IndexedDbPersistentDataStore } from '../../storage/indexedDbPersistentDataStore'
 import type { PersistentDataRuntime } from '../../storage/persistentDataRuntime'
 import * as permissions from '../../storage/nativePluginPermissions'
 import { requestChatData } from '../request/request'
+import type { registerMCPModule } from '../mcp/pluginmcp'
+import type { MCPTool } from '../mcp/mcplib'
 
 export const outputPluginName = 'synthetic-output-provider'
 
@@ -18,10 +20,12 @@ type BeforeRequest = typeof pluginV2.replacerbeforeRequest extends Set<infer Cal
 type AfterRequest = typeof pluginV2.replacerafterRequest extends Set<infer Callback> ? Callback : never
 
 export interface OutputRequestPlugin {
+    registerMCP(...args: Parameters<typeof registerMCPModule>): Promise<void>
     addProvider(name: string, callback: Provider): void
     addRisuReplacer(name: 'beforeRequest', callback: BeforeRequest): Promise<void>
     addRisuReplacer(name: 'afterRequest', callback: AfterRequest): Promise<void>
     setChatToIndex(characterIndex: number, chatIndex: number, chat: Chat): Promise<void>
+    setCharacterToIndex(index: number, character: Database['characters'][number]): Promise<void>
     getChatFromIndex(characterIndex: number, chatIndex: number): Promise<PluginIframeSnapshot>
     risunestPatchConversation(request: ConversationPatchRequest): Promise<ConversationPatchResult>
     risunestOnGenerationEnd(callback: (event: GenerationEndEvent) => unknown): { id: string }
@@ -35,7 +39,7 @@ export interface OutputRequestFixture {
     connect(): Promise<IndexedDbPersistentDataStore>
     length: number
     windowed: boolean
-    runNestedRequest(): Promise<void>
+    runNestedRequest(tools?: MCPTool[] | 'discover'): Promise<void>
 }
 
 export async function openOutputRequestPlugin(getHostApi: () => OutputRequestPlugin) {
@@ -51,10 +55,10 @@ export async function openOutputRequestPlugin(getHostApi: () => OutputRequestPlu
     return getHostApi()
 }
 
-export async function runNestedRequest() {
+export async function runNestedRequest(tools: MCPTool[] | 'discover' = []) {
     const actual = await vi.importActual<typeof import('../request/request')>('../request/request')
     vi.mocked(requestChatData).mockImplementationOnce((arg, ...options) =>
-        actual.requestChatData({ ...arg, tools: [] }, ...options))
+        actual.requestChatData(tools === 'discover' ? arg : { ...arg, tools }, ...options))
 }
 
 /** Consume the conversation and its read provenance at the simulated iframe boundary. */

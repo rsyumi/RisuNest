@@ -1055,24 +1055,23 @@ export const requestAllowList = [
     ...safeSubset
 ]
 
-async function collectStreamingText(stream: ReadableStream<{ [key: string]: string }>): Promise<string> {
+async function collectStreamingText(stream: ReadableStream<{ [key: string]: string }>) {
     const reader = stream.getReader()
     let lastChunk = ''
 
-    while (true) {
-        const { done, value } = await reader.read()
-        if (value) {
-            const firstKey = Object.keys(value)[0]
-            if (firstKey) {
-                lastChunk = value[firstKey] ?? lastChunk
+    try {
+        while (true) {
+            const { done, value } = await reader.read()
+            if (value) {
+                const firstKey = Object.keys(value)[0]
+                if (firstKey) lastChunk = value[firstKey] ?? lastChunk
             }
+            if (done) break
         }
-        if (done) {
-            break
-        }
+        return { type: 'success' as const, result: lastChunk }
+    } finally {
+        reader.releaseLock()
     }
-
-    return lastChunk
 }
 
 function cloneChatMetadata(chat: Chat): Chat {
@@ -2126,12 +2125,9 @@ async function runTriggerImpl(char: character, mode: triggerMode, arg: RunTrigge
                         noMultiGen: true,
                     }, effect.model, outputConversation, collectStreamingText)
 
+                    if(result.type === 'streaming') result = await collectStreamingText(result.result)
                     if(result.type === 'fail' || result.type === 'multiline'){
                         setVar(risuChatParser(effect.outputVar, {chara:char}), 'null')
-                    }
-                    else if(result.type === 'streaming'){
-                        const text = await collectStreamingText(result.result)
-                        setVar(risuChatParser(effect.outputVar, {chara:char}), text)
                     }
                     else{
                         setVar(risuChatParser(effect.outputVar, {chara:char}), result.result)

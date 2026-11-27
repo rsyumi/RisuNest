@@ -1,19 +1,9 @@
 import { LuaFactory } from 'wasmoon'
-import wasmUrl from './lua/worker.wasm?url'
+import { loadLuaAsyncifyModule } from './luaAsyncifyModule'
 import { LuaAsyncifyRuntime } from './luaAsyncifyRuntime'
 import { LuaWorkerStrings, luaErrorMessage, encodeLuaFailure, decodeLuaFailure, type LuaWorkerCommand, type LuaWorkerEvent, type LuaWorkerRequest, type LuaWorkerResponse } from './luaWorkerProtocol'
 
 let totalExecutionMs = 0
-let compiledModule: Promise<WebAssembly.Module> | undefined
-
-async function loadModule(): Promise<WebAssembly.Module> {
-    const pending = compiledModule ??= fetch(wasmUrl).then(async response => {
-        if (!response.ok) throw new Error('Lua Worker WASM could not be loaded')
-        return WebAssembly.compile(await response.arrayBuffer())
-    })
-    try { return await pending }
-    catch (error) { if (compiledModule === pending) compiledModule = undefined; throw error }
-}
 
 class WorkerEngine {
     active = false
@@ -69,7 +59,8 @@ class WorkerEngine {
             let value: unknown
             if (message.kind === 'prepare') {
                 if (this.runtime) throw new Error('Lua worker already initialized')
-                const factory = new LuaFactory(wasmUrl, undefined, await loadModule())
+                const { url, module } = await loadLuaAsyncifyModule()
+                const factory = new LuaFactory(url, undefined, module)
                 await factory.mountFile('json.lua', message.json)
                 if (this.disposed) return
                 const engine = await factory.createEngine({ injectObjects: true, enableProxy: false })

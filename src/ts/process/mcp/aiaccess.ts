@@ -1,6 +1,6 @@
 
 
-import { requestChatData } from "../request/request";
+import { requestChatData, type OutputPluginDispatch } from "../request/request";
 import { MCPClientLike } from "./internalmcp";
 import type { MCPTool, RPCToolCallContent } from "./mcplib";
 
@@ -50,7 +50,7 @@ export class AIAccessClient extends MCPClientLike {
         }]
     }
 
-    async callTool(methodName: string, args: any): Promise<RPCToolCallContent[]> {
+    async callTool(methodName: string, args: any, dispatch?: OutputPluginDispatch): Promise<RPCToolCallContent[]> {
         if (methodName === 'runLLM') {
             const { model, messages } = args;
             if (!model || !messages || !Array.isArray(messages)) {
@@ -64,8 +64,13 @@ export class AIAccessClient extends MCPClientLike {
                     role: msg.role,
                     content: msg.content
                 })),
-                bias: {}
+                bias: {},
+                pluginDispatch: dispatch
             }, model === 'lite' ? 'otherAx' : 'model')
+            if (dispatch && r.type === 'streaming') {
+                // This tool returns only a completed model result.
+                void r.result.cancel().catch(() => {});
+            }
 
             return [{
                 type: 'text',
