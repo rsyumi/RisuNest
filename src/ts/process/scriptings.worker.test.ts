@@ -116,6 +116,35 @@ test.each(['async API', 'synchronous API in a C callback'] as const)('excludes a
     } finally { executor.close() }
 })
 
+test('batches a waiting synchronous API with the host calls after it and returns its failure to Lua', async () => {
+    const batches: string[][] = [[]]
+    let batching = false
+    const executor = new LuaWorkerExecutor(1_000, {
+        run(callback) {
+            batching = true
+            try { return callback() } finally { batching = false }
+        },
+        flush() { if (batches.at(-1)!.length) batches.push([]) },
+    })
+    const record = (name: string) => batches.at(-1)!.push(batching ? name : `${name} outside the batch`)
+    const waitFor = (read: () => string) => {
+        const reply: LuaDeferredReply = new LuaDeferredReply(new Promise(resolve => setTimeout(resolve, 20)).then(() => reply.resume(read)))
+        return reply
+    }
+    executor.register('write', (name: string) => record(name))
+    executor.register('read', () => waitFor(() => { record('read'); return 'reopened' }))
+    executor.register('fail', () => waitFor(() => { throw new Error('view closed') }))
+    try {
+        await executor.initialize(luaCodeWrapper(`
+            function onOutput() write('before'); local value = read(); write('after'); return value end
+            function onFailure() local ok, message = pcall(fail); return tostring(ok) .. ' ' .. tostring(message) end
+        `), await readFile('public/lua/json.lua', 'utf8'))
+        expect(await executor.invoke('onOutput', [])).toBe('reopened')
+        expect(batches.filter(batch => batch.length)).toEqual([['before'], ['read', 'after']])
+        expect(await executor.invoke('onFailure', [])).toMatch(/^false .*view closed/)
+    } finally { executor.close() }
+})
+
 test('finishes an aborted invocation without replaying effects or discarding the engine', async () => {
     const executor = new LuaWorkerExecutor(1_000)
     const other = new LuaWorkerExecutor(1_000)

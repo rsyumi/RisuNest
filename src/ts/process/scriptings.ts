@@ -344,10 +344,7 @@ export async function runScripted(code:string, arg:{
                     const invocation = ScriptingEngineState.outputFrame
                     if (!invocation) return func(...args)
                     let deferred: LuaDeferredReply | undefined
-                    const value = invocation.withScriptView(() => {
-                        deferred?.resume()
-                        return func(...args)
-                    })
+                    const value = invocation.withScriptView(() => deferred ? deferred.resume(() => func(...args)) : func(...args))
                     if (returnsPromise || !(value instanceof Promise)) return value
                     deferred = new LuaDeferredReply(value)
                     return deferred

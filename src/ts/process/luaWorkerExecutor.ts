@@ -103,7 +103,9 @@ export class LuaWorkerExecutor {
             if (!callback) throw new Error('Unknown Lua host API')
             const value = this.boundary ? this.boundary.run(() => callback(...message.args)) : callback(...message.args)
             if (value instanceof LuaDeferredReply) {
-                this.boundary?.flush()
+                const boundary = this.boundary
+                boundary?.flush()
+                if (boundary) value.runIn(read => boundary.run(read))
                 const elapsed = performance.now() - started
                 void value.read(elapsed).then(({ value, ...timingAndFailure }) => {
                     this.send({ kind: 'reply', call: message.call, ...this.strings.encode(value), ...timingAndFailure })

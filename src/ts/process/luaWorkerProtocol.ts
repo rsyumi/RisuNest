@@ -18,14 +18,23 @@ export type LuaWorkerResponse = { engine: number; event: LuaWorkerEvent }
 
 export type LuaWorkerFailure = { kind: 'error'; message: string } | { kind: 'value'; value: unknown }
 
+type HostCall = <T>(read: () => T) => T
+
 /** A synchronous Lua API waiting for its conversation view to reopen. */
 export class LuaDeferredReply {
     private readonly started = performance.now()
     private resumed?: number
+    private host: HostCall = read => read()
 
     constructor(private readonly value: Promise<unknown>) {}
 
-    resume() { this.resumed = performance.now() }
+    /** Runs the API, once its view reopens, where the executor runs its other host calls. */
+    runIn(host: HostCall) { this.host = host }
+
+    resume<T>(read: () => T): T {
+        this.resumed = performance.now()
+        return this.host(read)
+    }
 
     async read(elapsed: number) {
         let reply: { value?: unknown; failure?: LuaWorkerFailure }
