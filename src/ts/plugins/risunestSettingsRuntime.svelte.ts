@@ -74,6 +74,9 @@ export const productionRisunestSettingsDependencies: RisunestSettingsDependencie
     async findUnknownValue(values) {
         const action = values.find(([key, value]) => Object.hasOwn(risunestSettingActionChoices, key) && risunestSettingActionChoices[key].includes(value))
         if (action) return action[0]
+        // A persona is selected by its place in the list, so the place has to hold one.
+        const persona = values.find(([key]) => key === 'selectedPersona')
+        if (persona && !DBState.db.personas[persona[1] as number]?.id) return 'selectedPersona'
         const name = values.find(([key]) => key === 'colorSchemeName')
         if (!name || name[1] === 'custom') return null
         const { colorSchemeList } = await import('../gui/colorscheme')

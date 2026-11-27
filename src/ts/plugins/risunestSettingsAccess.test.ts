@@ -302,6 +302,10 @@ describe('settings by key', { timeout: 60_000 }, () => {
         await expect(settings.writeSettings({ constructor: 1 })).resolves.toEqual({ status: 'rejected', reason: 'unavailable', key: 'constructor' })
         await expect(settings.writeSettings({ loreBookDepth: 3, colorSchemeName: 'missing-scheme' })).resolves.toEqual({ status: 'rejected', reason: 'value', key: 'colorSchemeName' })
         await expect(settings.writeSettings({ loreBookDepth: 3, language: 'translang' })).resolves.toEqual({ status: 'rejected', reason: 'value', key: 'language' })
+        // A place in the persona list that holds no persona.
+        for (const selectedPersona of [99, -1, 0.5]) {
+            await expect(settings.writeSettings({ loreBookDepth: 3, selectedPersona })).resolves.toEqual({ status: 'rejected', reason: 'value', key: 'selectedPersona' })
+        }
         await expect(settings.writeSettings([['loreBookDepth', 3]])).rejects.toThrow(TypeError)
         await expect(settings.writeSettings('loreBookDepth')).rejects.toThrow(TypeError)
 
