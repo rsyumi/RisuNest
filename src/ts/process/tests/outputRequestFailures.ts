@@ -157,12 +157,16 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
         }
     })
 
-    function abortFirstPut<T>(store: string, matches: (value: T) => boolean) {
+    const abortFirstPut = <T>(store: string, matches: (value: T) => boolean) => abortPuts(store, matches, false)
+
+    // A script's edit is saved by whichever save runs next, which can be a background save instead of
+    // the request's own, so a case that fails that save fails every save of the edit.
+    function abortPuts<T>(store: string, matches: (value: T) => boolean, every: boolean) {
         let aborted = false
         const put = FakeObjectStore.prototype.put
         const spy = vi.spyOn(FakeObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
             const request = put.call(this, value, key)
-            if (!aborted && this.name === store && matches(value.value)) {
+            if ((every || !aborted) && this.name === store && matches(value.value)) {
                 aborted = true
                 this.transaction.abort()
             }
@@ -240,7 +244,7 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
             invoked = true
             return { success: true, content: 'unexpected callback' }
         })
-        const fault = abortFirstPut<Message[]>('messagePages', rows => rows.some(row => row.data === 'reply edited by trigger'))
+        const fault = abortPuts<Message[]>('messagePages', rows => rows.some(row => row.data === 'reply edited by trigger'), true)
         try {
             await whileStreaming(fixture, async ({ finishStream }) => { await fixture.runNestedRequest(); finishStream() }, undefined, /AbortError|TransactionInactiveError|InvalidStateError/)
             expect(fault.aborted).toBe(true)
@@ -277,7 +281,7 @@ export function registerNestedRequestFailureCases(nestedFixture: NestedFixture) 
         vi.mocked(alertInput).mockImplementationOnce(async () => { await entered.promise; return '' })
         const provider = vi.fn(async () => ({ success: true, content: 'unexpected callback' }))
         fixture.api.addProvider(outputPluginName, provider)
-        const fault = abortFirstPut<Message[]>('messagePages', rows => rows.some(row => row.data === 'sibling checkpoint'))
+        const fault = abortPuts<Message[]>('messagePages', rows => rows.some(row => row.data === 'sibling checkpoint'), true)
         try {
             await whileStreaming(fixture, async ({ finishStream, sending }) => {
                 await fixture.runNestedRequest()
